@@ -90,7 +90,8 @@ def build_output_program(program: str) -> bool:
         return False
     import sweep
 
-    return any(sweep.is_cargo_target(str(parent)) for parent in executable.resolve().parents)
+    target = sweep.enclosing_cargo_target(str(executable.resolve().parent))
+    return isinstance(target, sweep.EnclosingCargoTarget)
 
 
 @dataclass(frozen=True)

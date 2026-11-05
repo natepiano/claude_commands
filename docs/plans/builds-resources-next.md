@@ -66,3 +66,15 @@
   - Completion condition: a fresh-interpreter test shows that importing `session_owner` loads no build queue module; `mac_test.py` claim and release are measured before and after (126-132 ms of `admission_service` import today).
   - Start: when natedev says the send.py freeze on `build_hold.py` ends (the showrunner tells us).
   - Revealed by: Phase 67 (builds showrunner 2026-11-05: next)
+
+- [ ] **One owner for Cargo target detection in scripts/lib/cargo_output.py** (after the held 63-64 hash lands)
+  - Target: move `RUSTC_INFO`, `FINGERPRINT_DIR`, `has_cargo_tag`, `build_trees`, `is_cargo_target`, `enclosing_cargo_target` and its two result types from `scripts/lint/sweep.py` to `scripts/lib/cargo_output.py`; switch every caller (`sweep.py`, `scripts/buildlog/disk.py`, `scripts/buildlog/memory.py`) and their tests.
+  - Why needed: `memory.py` loads the whole sweeper to ask whether a folder is Cargo output, and the sweeper imports buildlog modules back. One owner in `scripts/lib` removes that cycle.
+  - Completion condition: no copy of the detection is left in `sweep.py`; `memory.py` imports it at the top and drops its run-time `import sweep`. This replaces the Phase 67 import rule for `memory.py`. The change reports `memory.py` import time before and after, and the sweep, memory, disk and offload tests pass.
+  - Revealed by: Phase 70 simplify review F008 (builds showrunner 2026-11-05: next; run after the held 63-64 hash lands, so `sweep.py` changes in one place at a time)
+
+- [ ] **Measure the ANON_SHARE estimate share again after the legacy rows expire** (on or after 2026-11-12)
+  - Target: rerun the Phase 19 source measurement (`count_queue_sources` over 7 days of `admission/queue_times.jsonl`, and the `expected_peak` replay) on a copy of the natedev state; update `#### Phase 19 source shares` in `docs/as-built/build-memory-admission.md`.
+  - Why needed: Phase 19 stopped at Spec 2 because `ANON_SHARE` estimates were 0% of recorded admissions and 3.4% of replayed estimates, under the 5% bar. Recorded admissions then covered only 16 hours, and the recovered legacy test rows were still inside the window.
+  - Completion condition: the table shows the share by step kind after the legacy rows leave the window. If the share is above 5% of estimates, Phase 19 Specs 3-4 (remove or narrow the `ANON_SHARE` tiers, with the unknown-source boundary) come back as a phase.
+  - Revealed by: Phase 19 Spec 2 (builds showrunner 2026-11-05: stop at Spec 2; "small" means under 5% of estimates)

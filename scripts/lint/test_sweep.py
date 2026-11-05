@@ -4990,6 +4990,20 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
                     record = self.saved_record()
                     self.assertIsInstance(record.push_history, sweep.DeliveredAlert)
 
+    def test_enclosing_cargo_target_finds_a_cache_tagged_target(self) -> None:
+        tree, program = cargo_tag_target(self.base(), "tagged", APP, time.time())
+        self.assertEqual(
+            sweep.enclosing_cargo_target(str(program)),
+            sweep.EnclosingCargoTarget(str(tree.parent)),
+        )
+
+    def test_enclosing_cargo_target_includes_the_path_itself(self) -> None:
+        base = self.base()
+        outer_tree, _ = cargo_target(base, "outer", APP, time.time())
+        inner_tree, _ = cargo_target(outer_tree, "inner", DEMO, time.time())
+        inner = inner_tree.parent
+        self.assertEqual(sweep.enclosing_cargo_target(str(inner)), sweep.EnclosingCargoTarget(str(inner)))
+
     def test_target_dirs_finds_cargo_tag_beside_a_build_tree(self) -> None:
         base = self.base()
         _, _ = cargo_tag_target(base, "repo", APP, time.time())
@@ -5875,6 +5889,21 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(sweep.build_hold_targets([str(tree.parent)], {}),
                                  {str(tree.parent): sweep.BuildHoldTarget("build-speed")})
+
+    def test_target_delete_records_the_nearest_enclosing_target(self) -> None:
+        base = self.base()
+        now = time.time()
+        outer_tree, _ = cargo_target(base, "outer", APP, now)
+        inner_tree, removed = cargo_target(outer_tree, "inner", DEMO, now)
+        with mock.patch.object(time, "time", return_value=now):
+            sweep.record_target_deletes([str(removed)])
+        self.assertEqual(json.loads(sweep.target_deletes_path().read_text()), {str(inner_tree.parent): now})
+
+    def test_target_delete_outside_cargo_targets_records_nothing(self) -> None:
+        base = self.base()
+        plain = write(base / "plain/debug/app")
+        sweep.record_target_deletes([str(plain)])
+        self.assertFalse(sweep.target_deletes_path().exists())
 
     def test_delete_records_drop_missing_roots_and_roots_older_than_a_day(self) -> None:
         base = self.base()

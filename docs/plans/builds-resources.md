@@ -1737,7 +1737,7 @@ Each estimate decodes `admission/anon_peaks.jsonl` once and asks the index once,
 
 **Ruled out:** a byte-offset start of the history read (the file is only close to append order); moving `program_peak_estimate` onto the shared read (it raises on an unreadable file); the fresh zero-compile rule inside the shared join (it changes fresh estimates).
 
-### Phase 70 — Memory and sweep find the enclosing Cargo target with one function  · status: todo
+### Phase 70 — Memory and sweep find the enclosing Cargo target with one function  · status: done
 **Depends on:** report-unit Phase 25 (`9ae49ff1f`) on `origin/builds`. Start only when `git merge-base --is-ancestor 9ae49ff1f origin/builds` succeeds.
 
 **Approved:** showrunner 2026-11-05 03:45 EST, with report's held F013 test case added.

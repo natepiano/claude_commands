@@ -941,6 +941,27 @@ def is_cargo_target(directory: str, *,
 
 
 @dataclass(frozen=True)
+class EnclosingCargoTarget:
+    folder: str
+
+
+@dataclass(frozen=True)
+class NoEnclosingCargoTarget:
+    pass
+
+
+def enclosing_cargo_target(path: str, *,
+    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> EnclosingCargoTarget | NoEnclosingCargoTarget:
+    """Find the nearest Cargo target that contains the resolved path."""
+    directory = Path(path).resolve()
+    for ancestor in (directory, *directory.parents):
+        if is_cargo_target(str(ancestor), lint_settings=lint_settings):
+            return EnclosingCargoTarget(str(ancestor))
+    return NoEnclosingCargoTarget()
+
+
+@dataclass(frozen=True)
 class TargetLocksAcquired:
     held: list[int]
 
@@ -2787,13 +2808,11 @@ def record_target_deletes(paths: Sequence[str], *, known_targets: Sequence[str] 
         lint_settings = conf.read("lint")
     roots = {os.path.realpath(root) for root in known_targets}
     for path in paths:
-        directory = Path(path).resolve()
-        if str(directory) in roots:
+        if os.path.realpath(path) in roots:
             continue
-        for ancestor in (directory, *directory.parents):
-            if is_cargo_target(str(ancestor), lint_settings=lint_settings):
-                roots.add(str(ancestor))
-                break
+        target = enclosing_cargo_target(path, lint_settings=lint_settings)
+        if isinstance(target, EnclosingCargoTarget):
+            roots.add(target.folder)
     if not roots:
         return
     path = target_deletes_path()
