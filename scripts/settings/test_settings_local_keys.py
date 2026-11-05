@@ -98,7 +98,7 @@ class SettingsFilterTests(unittest.TestCase):
             source = KEYS.parents[2] / "config" / f"{name}.conf"
             _ = shutil.copy2(source, self.root / "config" / source.name)
         _ = shutil.copy2(KEYS.with_name("local_key_notices.py"), self.root / "scripts/settings/local_key_notices.py")
-        for name in ("send_result.py", "send_budget.py"):
+        for name in ("send_result.py", "send_budget.py", "session_send.py"):
             _ = shutil.copy2(KEYS.parents[1] / "message" / name, self.root / "scripts/message" / name)
         _ = (self.root / "scripts/message/send.py").write_text('''import json, sys, runpy
 from pathlib import Path
@@ -233,6 +233,14 @@ else:
         self.assertEqual(len(sends), 2)
         self.assertEqual(sends[1][1], "fixture-destination")
         self.assertEqual(sends[1][-1], f"Settings key secondKey is local on {socket.gethostname().split(".")[0]}.")
+
+    def test_notices_deliver_without_the_source_checkout_on_the_import_path(self) -> None:
+        _ = self.env.pop("PYTHONPATH", None)
+        self.write_settings({"shared": 1, "freshKey": True})
+        result = self.refresh()
+        self.assertEqual(len(self.sends()), 1, result.stderr)
+        self.assertIn("freshKey", self.sends()[0][-1])
+        self.assertIn('"accepted"', self.history.read_text())
 
     def test_missing_budget_config_reports_an_error_and_keeps_the_notice_pending(self) -> None:
         (self.root / "config/postmaster.conf").unlink()

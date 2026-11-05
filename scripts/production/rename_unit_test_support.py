@@ -411,7 +411,7 @@ class FolderSessionFixture:
             raise AssertionError("The move must resume current_session")
         from scripts.shutdown import restart
 
-        kind, _environment, arguments = restart.session_launch(row.current_session)
+        kind, _environment, arguments = restart.session_launch(str(row.current_session), row.name)
         self.resumes.append((kind, arguments))
         if not isinstance(row.worktree, staff.PresentWorktree) or not row.worktree.path.is_dir():
             raise OSError("The resume directory is absent")
