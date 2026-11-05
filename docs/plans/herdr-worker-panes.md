@@ -64,7 +64,7 @@ Written by herdr-unit on 2026-10-29 for the sdlc showrunner, from the user's req
     `observe` consumes `Herdr.scan_row_panes(record, panes)`, which returns `RowPaneScan`; it adds no identity join.
     `WorkerPane` has five states: `OpenWorker`, `StoppedWorker`, `ClosedWorker`, `ProcessUnknownWorker`, and `UncertainWorker`.
   - `scripts/herdr/side_pane.py` — the pane beside a caller outside the staff hierarchy, for ask-a-friend and for such a caller's Astra role (new in Phase 12)
-  - `scripts/agents/detached_runs.py` — detached runs that type their result into the worker pane (renamed from `mesh_runs.py` in Phase 9)
+  - `scripts/agents/detached_runs.py` — detached runs that type their result into the worker pane (renamed from `mesh_runs.py` in Phase 18; sdlc, 2026-11-05)
   - `scripts/direct/assign.sh` — the one door that starts a worker (decision 11); devtools 3t merges `implement.sh` and `review.sh` into it
   - `scripts/lib/unit_runs.py` — run folders; `worker_transport(run)` and the run pin (added in Phase 8; they and the run `workers` log reader go in Phase 18)
   - `config/direct.conf` holds `WORKER_TRANSPORT`: mesh in Phase 8, herdr in Phase 15, then removal in Phase 18.
@@ -168,6 +168,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 ## Questions for the user
 
 1. **The NixOS edits (settled 2026-10-30: natedev makes them and tells the user when to rebuild; herdr-unit tells natedev when each is due; no diff files for the user).** (a) `modules/common/claude-git-filters.nix:35` `watchPaths`: `agents.conf` → `models.conf`. It is functional: until it changes, the git filter does not refresh on a `models.conf` change. (b) Comments in `modules/common/codex-catalog-sync.nix`, `modules/common/codex.nix:47`, `modules/common/shell.nix:139` (`/agent`) and `README.md:410`. (c) `modules/common/herdr-skill-local.md:7`: the rule "start a new agent in a new tab, not a split pane" must permit worker panes in the director's tab (`skills/herdr/SKILL.md:221` is built from it). (d) The sign-in path unit (natedev) and the launchd agent (Mac) that run `codex_mesh.py signin-changed`: they retire at cleanup, or point at the pane restart if Phase 6's Codex sign-in probe is negative. (e) Only if Phase 6's probe shows that herdr's own resume does not keep each pane's `--env` (its account): add `[session] resume_agents_on_restore = false` to `~/.config/herdr/config.toml` on natedev and the Mac, so our restore owns split tabs; if the probe is positive, herdr restores split tabs and our per-pane restore code retires for them. **Status (2026-11-03):** (a) and (b) are done in the NixOS source: natedev applied the Phase 5 edits to `/etc/nixos` main with the Phase 5 merge (main `731dd21aa`). natedev owns the rebuild notice and the check that the installed git-filter job watches `config/models.conf`; the repository's old-name test cannot see the installed job. Phase 10's probe result is negative, so (e) applies before the default switch (Phase 15). (c) is due before the default switch; (d) at cleanup (Phase 18). herdr-unit tells natedev when each is due.
+2. **Phase 9a, a result cut off between pane input and its typed mark (settled by sdlc, 2026-11-05; no user question).** Take (a): a rerun types it again. It adds no saved mark and no check; a worker that sees one result twice loses nothing.
 
 ## Phases
 
@@ -2120,7 +2121,7 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
 
 **Ruled out:** additional checks absent from an explicit requirement; refusal of herdr `--model` or `--effort`; a second `last_dispatch` reader; a separate submission store.
 
-### Phase 9 — Messages, detached runs and review Stage 2  · status: todo
+### Phase 9 — Messages, detached runs and review Stage 2  · status: done
 
 **Depends on:** Phase 7, Phase 8
 
@@ -2139,9 +2140,7 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
    Route blocked, stopped, closed, or uncertain workers' messages to their holder with one reason line.
    For `ProcessUnknownWorker`, print one anomaly line and route the text to the holder without unproved pane input.
    Unknown evidence proves neither stopped nor absent.
-3. Rename `scripts/agents/mesh_runs.py` and its test to `detached_runs.py` and its test.
-   Update every caller within this phase.
-   Change the `mesh_runs` import and live-run check in `worker_panes.py` to `detached_runs`.
+3. Build the result delivery inside `scripts/agents/mesh_runs.py`. The rename to `detached_runs.py` moves to Phase 18 (sdlc, 2026-11-05).
    Find the worker from its native Claude session or Codex thread and the current staff snapshot.
    Address only its observed pane; inherited launch identity is not current-session proof.
    Include the run id in each result message.
@@ -2152,26 +2151,26 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
    Preserve Phase 8's startup outcomes, transcript receipt, and rerun behavior.
 5. Extend `refusal_watch.transcript_refusal` for Codex transcripts and pane screen text.
    Keep transcript evidence first; use pane text only when transcript evidence is unavailable.
-   `settle.py` already calls this classifier; add no second classifier.
-   Mark a refused pass `refused` and retain the open pass for redispatch after the account move.
+   No module outside `refusal_watch.py` calls it today (no `settle.py` exists); add no second classifier.
+   Marking a refused pass `refused` moves to Phase 11.
 
 6. **Delete replaced paths.** Delete superseded pane recipient lookup, mesh result delivery, and Stage 2 submission code in this phase.
-   Keep one pane recipient lookup in `send.py` and one transcript-first result path in `detached_runs.py`.
-   Retain `send.py`'s `MeshWorker` delivery and `detached_runs.py`'s `MeshCaller` and `codex_mesh.hold_message` paths only for mesh-pinned runs.
+   Keep one pane recipient lookup in `send.py` and one transcript-first result path in `mesh_runs.py`.
+   Retain `send.py`'s `MeshWorker` delivery and `mesh_runs.py`'s `MeshCaller` and `codex_mesh.hold_message` paths only for mesh-pinned runs.
    Retain the mesh Stage 2 branch in `assign.py` under the same pin until Phase 18.
    Only those retained branches join the group ending at Phase 18.
 
 **Files:**
 
 - `scripts/message/send.py`, `scripts/message/test_send.py` — `worker:` addresses; delete superseded lookup and delivery paths.
-- `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py` — become `scripts/agents/detached_runs.py` and its test; every `mesh_runs` reference follows in the same commit; delete superseded delivery code.
+- `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py` — transcript-first pane result delivery; delete superseded delivery code.
 - `scripts/direct/assign.py`, `scripts/direct/test_assign_launcher.py` — Stage 2 through `dispatch`; delete the replaced pane submission path.
 - `scripts/accounts/refusal_watch.py`, `scripts/accounts/test_refusal_watch.py` — the one classifier: `transcript_refusal` (:464) gains Codex transcripts and screen text as the fallback; agreed with the accounts unit.
 - `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — rename the detached-run import and test close afterward.
 - `scripts/production/staff.py`, `scripts/lib/atomic_file.py` — read only: `snapshot` and the one file writer.
 
 **Workers:** `2 writers` — split files without overlap.
-- `impl` owns `send.py`, `detached_runs.py`, `worker_panes.py`, and their tests.
+- `impl` owns `send.py`, `mesh_runs.py`, `worker_panes.py`, and their tests.
 - `test` (opens as impl) owns `assign.py`, the classifier, and their tests.
 
 **State:** none new.
@@ -2202,13 +2201,36 @@ Do not delete unrelated code to meet a count.
 
 Require basedpyright 0/0 on changed files and every caller module.
 Test message arrival during a turn.
-Test worker close after the `mesh_runs` import becomes `detached_runs`; keep live-run blockers and completed close behavior.
 Route blocked, stopped, closed, or uncertain workers' messages to the director with the reason.
 Refuse a `worker:` address with no row through exit 2 and reach nobody.
 Stage 2 waits for its own completion line.
 `test_delivery_rerun_after_type` interrupts after result delivery; its rerun types nothing.
 Two delivery runs type one result; a Stage 2 rerun after submission types nothing.
 Require the full gate to pass.
+
+### Phase 9a — Delivery after an interrupted pane input  · status: todo
+
+**Depends on:** Phase 9
+
+#### Work Order
+
+**Goal:** a rerun of detached-run delivery has one simple rule: it types the result again when the transcript has no result line.
+
+**Spec:**
+
+1. Phase 9 types the result, then writes `pane_result_typed` into the run record under the delivery lock. A stop between the two leaves no mark; a rerun with no transcript line types again (Phase 9 review, F005 and F011). No order of the two writes gives exactly-once delivery over this interface (Astra, 2026-11-05).
+2. sdlc ruling (2026-11-05): "take (a), type it again. It adds no saved mark and no check. The window is a rare stop; a worker that sees one result twice loses nothing."
+3. Delete `pane_result_typed`, its write and its read. A rerun checks the transcript line only; with no line, it types the result again.
+4. Add no other mark, check or holder fallback.
+
+**Files:** `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py`.
+
+**Acceptance gate:**
+
+Test: a rerun after a stop between the pane input and the record write types the result once more and finishes the run.
+Change `test_result_queued_during_a_turn_finishes_without_a_transcript_receipt` to the new rule; keep `test_delivery_rerun_after_type_types_nothing` (transcript line present).
+Require basedpyright 0/0 on changed files and every caller module, and the full gate.
+Record added and deleted source lines; require a source decrease.
 
 ### Phase 10 — Shutdown and restore of split tabs (shutdown unit)  · status: todo
 
@@ -2298,7 +2320,7 @@ Require the full gate to pass.
 
 **State:** shutdown records; retained stopped worker rows; deletion only through permanent end or unit removal.
 
-**Constraints from prior phases:** Phase 2 `staff.snapshot()`; Phase 3r retains removed unit rows. Retire, promote, and wrap stop workers for resume. Only a proved live target blocks removal; a structural fault leaves that worker alone with one anomaly line (review, 2026-11-04). Phase 4 names from rows; Phase 3h native runtime lookup with no copied staff identity; Phase 3n (native worker admission and backend discovery; no stored role); Phase 6 (the restore probe; `ExistingPane`); Phase 7 (`start_or_resume(parent, name, role) -> WorkerStart`, `close`, `observe(parent, record) -> list[OpenWorker | StoppedWorker | ClosedWorker | ProcessUnknownWorker | UncertainWorker]`, each open or stopped pane with its `terminal`); Phase 8 (`dispatch` reads the transcript first); Phase 9 (a busy review Stage 2 pass has the dispatch id `<dispatch id>-2`, and `detached_runs.py` finds its worker by native runtime identity and reads the transcript before it types, so both reach a restored pane). Every file write this phase adds or changes calls `scripts/lib/atomic_file.py` (`write_text_atomic`; `sync_folder` for the folder step alone) and makes no temp-file, `fsync` and replace steps of its own (Delegation Context → One file writer). Phase 3's pending retirement (ids a wrap could not retire while worker rows were left) lives in the staff record; shutdown and restore keep it unchanged. `shutdown_record.py` `_write_record` (:1154) makes its own temp file (`mkstemp` at :1156) and `os.replace` (:1167); this phase changes the shutdown record, so `_write_record` calls `atomic_file.write_text_atomic` instead, inside the same `_record_deadline` checks. Shutdown's checkpoint (2026-10-30): every resume runs in the session's own tab with `Herdr.run_in_pane` (`herdr.py:1080`) through `accounts.py exec <account>`. Ordinary and split restores keep conversation id, account environment, identity, tab label and position, and their tests show it. Phase 4f: multi-pane tab order is `Herdr.sort_tabs` (herdr.py, about line 1662), with `tab.move`; reuse it. Own the worker transfer-to-restart test: the old shell stays in the source group and restart opens the worker in the new group. Changing `fake_unit_host.py`, `transfer_unit_test_support.py` or `LayoutHerdr` runs the whole `scripts/production` suite in the gate; a live-to-stopped fixture step updates the foreground evidence and keeps every other reply, such as an installed close failure.
+**Constraints from prior phases:** Phase 2 `staff.snapshot()`; Phase 3r retains removed unit rows. Retire, promote, and wrap stop workers for resume. Only a proved live target blocks removal; a structural fault leaves that worker alone with one anomaly line (review, 2026-11-04). Phase 4 names from rows; Phase 3h native runtime lookup with no copied staff identity; Phase 3n (native worker admission and backend discovery; no stored role); Phase 6 (the restore probe; `ExistingPane`); Phase 7 (`start_or_resume(parent, name, role) -> WorkerStart`, `close`, `observe(parent, record) -> list[OpenWorker | StoppedWorker | ClosedWorker | ProcessUnknownWorker | UncertainWorker]`, each open or stopped pane with its `terminal`); Phase 8 (`dispatch` reads the transcript first); Phase 9 (a busy review Stage 2 pass has the dispatch id `<dispatch id>-2`, and `mesh_runs.py` finds its worker by native runtime identity and reads the transcript before it types, so both reach a restored pane). Every file write this phase adds or changes calls `scripts/lib/atomic_file.py` (`write_text_atomic`; `sync_folder` for the folder step alone) and makes no temp-file, `fsync` and replace steps of its own (Delegation Context → One file writer). Phase 3's pending retirement (ids a wrap could not retire while worker rows were left) lives in the staff record; shutdown and restore keep it unchanged. `shutdown_record.py` `_write_record` (:1154) makes its own temp file (`mkstemp` at :1156) and `os.replace` (:1167); this phase changes the shutdown record, so `_write_record` calls `atomic_file.write_text_atomic` instead, inside the same `_record_deadline` checks. Shutdown's checkpoint (2026-10-30): every resume runs in the session's own tab with `Herdr.run_in_pane` (`herdr.py:1080`) through `accounts.py exec <account>`. Ordinary and split restores keep conversation id, account environment, identity, tab label and position, and their tests show it. Phase 4f: multi-pane tab order is `Herdr.sort_tabs` (herdr.py, about line 1662), with `tab.move`; reuse it. Own the worker transfer-to-restart test: the old shell stays in the source group and restart opens the worker in the new group. Changing `fake_unit_host.py`, `transfer_unit_test_support.py` or `LayoutHerdr` runs the whole `scripts/production` suite in the gate; a live-to-stopped fixture step updates the foreground evidence and keeps every other reply, such as an installed close failure.
 - Phase 4r (review, 2026-11-04): a Claude launch writes no pane launch record; only `Herdr.start_agent` still writes the Codex compatibility record. Assert `current_session`, the process generation, the terminal and a confirmed close, not a launch publication. Keep a compatibility-record test only where a caller still reads that record.
 - Phase 4r (review, 2026-11-04): a missing terminal, an unreadable pane list or a duplicate pane is not an operation refusal. Each destructive action goes through `herdr.check_target`; an unproved target is left alone with one anomaly line, and unrelated known work continues. Test that case.
 - Phase 4r (review, 2026-11-04): pane input and close take the current-session target: `Herdr.prompt(pane, text, *, target)`, `Herdr.send_keys(pane, *keys, target)`, `Herdr.close_pane(pane, *, target) -> bool`. Carry the target through each operation. Test a changed `current_session`, a reused pane and sibling protection.
@@ -2442,6 +2464,7 @@ Keep only the named mesh-pinned account paths until Phase 18.
 **State:** account homes; moves log.
 
 **Constraints from prior phases:** Phases 7–9 provide native admission, explicit role arguments, and last-dispatch restore.
+- Phase 9 (herdr-unit, 2026-11-05): mark a pass that `refusal_watch.transcript_refusal` classes as refused `refused`, and keep the open pass for redispatch after the account move. Phase 9 left this out because no caller of the classifier exists.
 Phase 7 owns `start_or_resume(parent, name, role, account=DestinationWorkerAccount(target)) -> WorkerStart`.
 Use `observe(parent, record)` with all five `WorkerPane` variants.
 Reuse a stopped pane through `ExistingPane`.
@@ -2552,7 +2575,7 @@ Keep complete move messages unchanged; test account-move recovery before publica
    Do not call `start_or_resume` directly from `design_roles.py`.
 2. **Ask-a-friend** remains outside worker admission, as Phase 1 specifies.
    It opens a pane beside the caller through `scripts/herdr/side_pane.py` (new; `open <label>` and `close <label>`), which calls `launch_prepared_agent` with a `SplitPane` and the `consultation` key of `[ask_a_friend.<caller family>]` (`[assignments] ask_a_friend=caller`: the caller's family from its staff row, or from its runtime id for a caller outside the staff hierarchy), writes no staff row, and closes its pane at `end`. It finds its pane by its label in the caller's tab with one `Herdr.panes()` read, by the same evidence rules as Phase 7 (a non-empty `terminal_id`, one pane with the label, a fresh `pane_activity`). A rerun of an open stopped after the split reuses the labelled pane at its shell through `ExistingPane(pane, terminal)`: no pane closes and no second split opens. Structural faults refuse with the reason; unknown process evidence prints the named anomaly and continues. `close` ends the agent, then closes the pane only after a second read finds the same terminal and a fresh `pane_activity` reads `PaneAtShell`. A rerun of `end` finds no pane and reports done.
-3. **The friend conversation.** Replace `launch_friend.sh` and `end_friend.sh` with `side_pane.py` in this phase.
+3. **The friend conversation.** Replace `launch_friend.sh` and the command's `worker_fill.py end-friend` call with `side_pane.py` in this phase.
    `open <label> --question-file <path>` starts the friend with its opening question.
    `send <label> --message-file <path>` types a follow-up into the same pane.
    The friend replies through `send.py --to <caller>` for both families.
@@ -2560,7 +2583,7 @@ Keep complete move messages unchanged; test account-move recovery before publica
    Keep the caller's family.
    Convert `commands/ask_a_friend.md` and every script caller to `side_pane.py` in this phase.
    Regenerate its Codex mirror through `scripts/claude_to_codex/sync.py`.
-   Delete both friend scripts after caller conversion; add no wrapper.
+   Delete `launch_friend.sh` after caller conversion; add no wrapper.
 4. Update the friend command calls in this phase; Phase 14 updates the remaining instruction text.
 5. Delete held-role mesh launch, follow, and end paths from `design_roles.py` when the worker command replaces them.
    Keep its ownership fences and worker history.
@@ -2570,7 +2593,7 @@ Keep complete move messages unchanged; test account-move recovery before publica
 
 - `scripts/astra/design_roles.py`, `scripts/astra/test_design_roles.py` — Astra roles; delete replaced held-role mesh launch, follow, and end paths.
 - `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py` — new: the one pane beside a caller outside the staff hierarchy, for ask-a-friend and for such a caller's Astra role.
-- `scripts/ask_a_friend/launch_friend.sh`, `scripts/ask_a_friend/end_friend.sh` — delete after converting all callers to `side_pane.py`.
+- `scripts/ask_a_friend/launch_friend.sh` — delete after converting all callers to `side_pane.py`, including `scripts/agents/test_launcher_tasks.sh` and `docs/as-built/agent-registry.md`.
 - `scripts/ask_a_friend/test_end_friend.py` — preserve the shared `worker_fill` command tests until Phase 18 retires that tool.
   Retain consultation stop and rerun behavior in the side-pane tests before deleting script-specific tests.
 - `commands/ask_a_friend.md` — convert friend command calls; regenerate its Codex mirror through `scripts/claude_to_codex/sync.py`.
@@ -2579,7 +2602,7 @@ Keep complete move messages unchanged; test account-move recovery before publica
   This phase leaves these source files unchanged.
 
 **Workers:** `2 writers` — split by module.
-- `impl` — `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py`, `scripts/ask_a_friend/launch_friend.sh`, `scripts/ask_a_friend/end_friend.sh`; friend command calls, generated mirror, and script-specific test conversion; hub: `scripts/herdr/side_pane.py` (`design_roles.py` calls it for a caller outside the staff hierarchy).
+- `impl` — `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py`, `scripts/ask_a_friend/launch_friend.sh`; friend command calls, generated mirror, and script-specific test conversion; hub: `scripts/herdr/side_pane.py` (`design_roles.py` calls it for a caller outside the staff hierarchy).
 - `test` (opens as impl) — `scripts/astra/design_roles.py`, `scripts/astra/test_design_roles.py`.
 
 **State:** panes; held Astra roles use worker rows through Phase 8's command API.
@@ -2652,7 +2675,7 @@ Signal or close only through the shared target check.
 Refuse destructive work only when the required target is proved live.
 Test named output, continued known work, and protection of sibling panes.
 
-### Phase 13 — Displays read workers through observe  · status: todo
+### Phase 13 — Displays read workers through observe  · status: moved: hierarchies-unit (sdlc, 2026-11-05)
 
 **Depends on:** Phase 7, Phase 8, Phase 9. Shared gate with Phases 10/12/13 over the exact final batch.
 
@@ -2767,7 +2790,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 8 landed the transport-aware text in `commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerRuns/>`, `<WorkerLaunchFailure/>`, `<FixDispatch/>`, `<PhaseCleanup/>`), branched once on the run's pin. Phase 9 `send.py worker:<unit>/<short name>` and `detached_runs.py`; Phase 10 shutdown and restore of split tabs; Phase 11 account moves of pane workers; Phase 12 Astra roles in panes and `side_pane.py open|close` for ask-a-friend; Phase 13 displays read workers through `observe`. Phase 4f accepted limit (F008): an interrupted multi-pane rebuild can lose the split ratio and leave panes in the source workspace; the anomaly line names the tab and the panes. The instructions tell the user to inspect those panes; a retry does not rebuild the split.
+**Constraints from prior phases:** Phase 8 landed the transport-aware text in `commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerRuns/>`, `<WorkerLaunchFailure/>`, `<FixDispatch/>`, `<PhaseCleanup/>`), branched once on the run's pin. Phase 9 `send.py worker:<unit>/<short name>` and `mesh_runs.py` pane delivery; Phase 10 shutdown and restore of split tabs; Phase 11 account moves of pane workers; Phase 12 Astra roles in panes and `side_pane.py open|close` for ask-a-friend; Phase 13 displays read workers through `observe`. Phase 4f accepted limit (F008): an interrupted multi-pane rebuild can lose the split ratio and leave panes in the source workspace; the anomaly line names the tab and the panes. The instructions tell the user to inspect those panes; a retry does not rebuild the split.
 - Phase 3h review (2026-11-01): keep the 4b header, Hub files and Gates deletions; do not generate them again.
 
 **Acceptance gate:** Search the listed instructions for unguarded mesh commands and paths.
@@ -2861,7 +2884,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
 - `scripts/lib/resume_message.py`, `scripts/lib/test_resume_message.py` — Phase 10 adds the tests; remove the `PausedSeat` branch and obsolete mesh command tests after the drain.
   Preserve pane-worker messages and complete account-move messages.
 - `scripts/message/send.py`, `scripts/message/test_send.py` — delete the pinned `MeshWorker` delivery retained by Phase 9.
-- `scripts/agents/detached_runs.py`, `scripts/agents/test_detached_runs.py` — delete the pinned `MeshCaller` and `codex_mesh.hold_message` delivery retained by Phase 9.
+- `scripts/agents/mesh_runs.py`, `scripts/agents/test_mesh_runs.py` — rename to `detached_runs.py` and its test, with every caller and the `worker_panes.py` import (moved from Phase 9; sdlc, 2026-11-05). Delete the pinned `MeshCaller` and `codex_mesh.hold_message` delivery retained by Phase 9. Test worker close after the rename; keep live-run blockers and completed close behavior.
 - `scripts/production/staff.py`, `scripts/production/session_staff.py` — inspect staff membership and discovered backend evidence; leave their readers unchanged.
 - `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py` — inspect Phase 13's converted display; assign no replacement deletion again.
   Preserve `RecordedWorker | WorkerBackendUnavailable` and incomplete output.
@@ -2984,7 +3007,7 @@ Keep no compatibility wrapper without a named external caller. The one launcher 
 | 12 | `stop --pause` | Shutdown stops panes (Phase 10) |
 | 13-14 | `reopen`/`adopt`; unit worker ledger (workers.py:422-545) | `start-or-resume`; the staff record |
 | 16 | Pass recording in launchers | Keep |
-| 17 | `mesh_runs.py` | `detached_runs.py` (Phase 9) |
+| 17 | `mesh_runs.py` | `detached_runs.py` (Phase 18) |
 | 18 | Wait markers | Drop markers; recorder waits stay |
 | 19-20 | Usage limits; account moves | Phases 9 and 11 |
 | 21 | Model per turn (710a6adb) | Lookup at start or resume only; a `/model` by hand holds (decision 2) |
@@ -3015,7 +3038,7 @@ Config: `config/agents.conf`, `config/README.md:7, 14, 15, 20`, `.gitignore:23-2
 
 ### Cleanup list (Phase 18)
 
-`codex_mesh.py` and its tests; the mesh parts of `workers.py` and the unit worker ledger; `scripts/direct/remove_workers.py`; the run `workers` log (`<run>/workers`, read at `scripts/lib/unit_runs.py:136-145`, `remove_workers.py:65`, `worker_state.py:50`); `mesh_roster.json`, `*.pending.json`, `mesh_*` run files; follow-claim code; `launch_friend.sh`, `end_friend.sh`; `[direct.options] codex_mesh`, `UNIT_CODEX_MESH`, `UNIT_COMPACT_ABOVE_TOKENS`, `WORKER_TRANSPORT`; shutdown's `CodexServer`, the mesh parts of `codex_seats` and `PausedSeat` (keep the Claude child resume branch, models 3s), `_CODEX_HEADLESS`, mesh pause and paused-workers note; accounts' server lines; display mesh code (the mesh-source readers of `staff_sources.py`; `production_tree.py` is already gone in Phase 3n; `process_table.py`, `waste_watch.py`, `hierarchies/*`, `shot_report/transcripts.py:1680`, `lint/tmp_sweep.py`); the Codex app-server homes; docs: rewrite `long-lived-workers.md`, update `herdr-adoption.md`, `session-roster.md`, `agent-registry.md`, `shutdown-and-restart.md`, `unit-board.md`, `usage-ledger.md`.
+`codex_mesh.py` and its tests; the mesh parts of `workers.py` and the unit worker ledger; `scripts/direct/remove_workers.py`; the run `workers` log (`<run>/workers`, read at `scripts/lib/unit_runs.py:136-145`, `remove_workers.py:65`, `worker_state.py:50`); `mesh_roster.json`, `*.pending.json`, `mesh_*` run files; follow-claim code; `[direct.options] codex_mesh`, `UNIT_CODEX_MESH`, `UNIT_COMPACT_ABOVE_TOKENS`, `WORKER_TRANSPORT`; shutdown's `CodexServer`, the mesh parts of `codex_seats` and `PausedSeat` (keep the Claude child resume branch, models 3s), `_CODEX_HEADLESS`, mesh pause and paused-workers note; accounts' server lines; display mesh code (the mesh-source readers of `staff_sources.py`; `production_tree.py` is already gone in Phase 3n; `process_table.py`, `waste_watch.py`, `hierarchies/*`, `shot_report/transcripts.py:1680`, `lint/tmp_sweep.py`); the Codex app-server homes; docs: rewrite `long-lived-workers.md`, update `herdr-adoption.md`, `session-roster.md`, `agent-registry.md`, `shutdown-and-restart.md`, `unit-board.md`, `usage-ledger.md`.
 
 ### Probe results (Phase 6 writes them)
 

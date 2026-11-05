@@ -9,10 +9,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from importlib import import_module
 from typing import cast, final
 
 if not __package__:
@@ -304,7 +305,7 @@ def observe(parent: StaffId, record: staff.StaffSnapshot) -> list[WorkerPane]:
     return _evidence(parent, record, _client()).states
 
 
-def _run(parent: staff.StaffRow) -> Path:
+def worker_run(parent: staff.StaffRow) -> Path:
     runs = unit_runs.held(str(parent.current_session))
     if runs:
         return Path(runs[0])
@@ -333,7 +334,7 @@ def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
     parent = staff.snapshot().parent_of(row)
     if parent is None:
         return WorkerRoleUnavailable("worker parent is unavailable")
-    role = _worker_pass(row, _run(parent)).get("kind")
+    role = _worker_pass(row, worker_run(parent)).get("kind")
     return role if isinstance(role, str) and role in staff.WORKER_ROLES else WorkerRoleUnavailable("dispatch role is unavailable")
 
 
@@ -355,8 +356,8 @@ def _idle_checks(row: staff.StaffRow, run: Path,
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     return Kept("dispatch lock is held")
-    from scripts.agents import mesh_runs
-    if mesh_runs.live_runs(run / "mesh_runs", row.name):
+    live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.mesh_runs").live_runs)
+    if live_runs(run / "mesh_runs", row.name):
         return Kept("a detached run is live")
     return CloseAllowed()
 
@@ -372,7 +373,7 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
     parent = record.parent_of(worker.row)
     if parent is None:
         return Kept("worker parent is unavailable")
-    run = _run(parent)
+    run = worker_run(parent)
     idle = _idle_checks(worker.row, run, lock)
     if isinstance(idle, Kept) or isinstance(worker, StoppedWorker):
         return idle
@@ -529,7 +530,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
     existing = worker_admission.find_worker(record, parent, name.value)
-    run = _run(owner)
+    run = worker_run(owner)
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     try:
@@ -693,7 +694,7 @@ def close(parent: StaffId, name: WorkerName, *,
                 _layout(parent, evidence)
                 return Closed()
             owner = record.parent_of(row)
-            closable = (_idle_checks(row, _run(owner), held) if isinstance(observed, ProcessUnknownWorker) and owner is not None
+            closable = (_idle_checks(row, worker_run(owner), held) if isinstance(observed, ProcessUnknownWorker) and owner is not None
                         else can_close(observed, lock=held) if isinstance(observed, (OpenWorker, StoppedWorker))
                         else Kept("worker parent is unavailable"))
             if isinstance(closable, Kept):

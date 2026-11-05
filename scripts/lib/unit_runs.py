@@ -27,9 +27,6 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.lib import conf
-from scripts.lib.atomic_file import write_text_atomic
-
 RUN_TEMP_NAME = "tmp"
 RUN_ROOT = Path("/tmp/claude/unit")
 FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
@@ -82,6 +79,9 @@ def run_temp_path(run: Path) -> Path:
 
 def worker_transport(run: Path) -> Literal["mesh", "herdr"]:
     """Pin the configured worker transport for this run."""
+    from scripts.lib import conf
+    from scripts.lib.atomic_file import write_text_atomic
+
     run.mkdir(parents=True, exist_ok=True)
     pin = run / "worker_transport"
     with (run / "worker_transport.lock").open("a") as lock:

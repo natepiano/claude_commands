@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from scripts.message.sessions import RegistryRead, SessionRecord
     from scripts.lib.names import JobKey
 
-from scripts.agents import worker_lifecycle
+from scripts.agents import mesh_run_process, worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.usage import agents_log
@@ -688,12 +688,11 @@ def _runs(ledger: UnitWorkers) -> tuple[Path, ...]:
 
 def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
     """Recorded supervisors only; no process discovery by name."""
-    from scripts.agents import mesh_runs
     records: list[tuple[Path, dict[str, object]]] = []
     for path in sorted((run / "mesh_runs").glob("*.json")):
         record = worker_lifecycle.read_json_object(path)
         pid = record.get("pid")
-        if record.get("status") == "running" and isinstance(pid, int) and mesh_runs.supervises(pid, path):
+        if record.get("status") == "running" and isinstance(pid, int) and mesh_run_process.supervises(pid, path):
             records.append((path, record))
     return tuple(records)
 
@@ -724,7 +723,7 @@ def held_claude_sessions() -> set[str]:
 
 
 def end_unit(owner: staff.StaffRow) -> None:
-    from scripts.agents import codex_mesh, mesh_runs
+    from scripts.agents import codex_mesh
     # Run cleanup reads this ledger too; load only its binary lookup interface
     # here so neither module owns a static import cycle.
     with worker_lifecycle.operation_deadline(timeout=codex_mesh.THREAD_RELEASE_TIMEOUT_SECS):
@@ -765,7 +764,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                     if detached.get("worker") != name:
                                         continue
                                     pid = detached["pid"]
-                                    if isinstance(pid, int) and mesh_runs.supervises(pid, path):
+                                    if isinstance(pid, int) and mesh_run_process.supervises(pid, path):
                                         try:
                                             os.kill(pid, signal.SIGTERM)
                                         except ProcessLookupError:

@@ -64,13 +64,14 @@ from typing import Literal, NotRequired, TypedDict, cast
 from uuid import NAMESPACE_URL, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.agents import codex_mesh, worker_lifecycle
+from scripts.agents import codex_mesh, mesh_run_process, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.lib import conf, unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.message import repeat_guard
 from scripts.message import send_budget
-from scripts.production import staff, session_staff
+from scripts.production import staff, session_staff, worker_admission
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
 NOT_A_MESH_WORKER = 3
@@ -120,6 +121,7 @@ class RunRecord(TypedDict):
     exit_code: NotRequired[int]
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
+    pane_result_typed: NotRequired[Literal[True]]
     # Set when the run ended without its supervisor: "supervisor gone".
     ended: NotRequired[str]
 
@@ -138,7 +140,16 @@ class NotMeshWorker:
     """The caller is not a live mesh worker, so its command runs attached."""
 
 
-Caller = MeshCaller | NotMeshWorker
+@dataclass(frozen=True)
+class PaneCaller:
+    """A published worker in a run pinned to herdr."""
+
+    session_dir: str
+    name: str
+    staff_id: staff.StaffId
+
+
+Caller = MeshCaller | PaneCaller | NotMeshWorker
 
 
 
@@ -153,12 +164,19 @@ def _roster_folders() -> Iterator[Path]:
 
 
 def caller_from_environment(environment: dict[str, str]) -> Caller:
-    """The worker whose thread CODEX_THREAD_ID names. The server and port are never recorded:
-    delivery looks the worker up again when the run finishes."""
-    thread_id = environment.get("CODEX_THREAD_ID", "")
+    """Find the caller through its current native session and the run's transport pin."""
+    membership = staff.local_snapshot()
+    native_member = membership.by_current_session(staff.runtime_id())
+    if native_member is not None and native_member.kind == "worker":
+        from scripts.herdr import worker_panes
+        parent = membership.parent_of(native_member)
+        if parent is not None:
+            run = worker_panes.worker_run(parent)
+            if unit_runs.worker_transport(run) == "herdr":
+                return PaneCaller(str(run), native_member.name, native_member.id)
+    thread_id = environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
     if not thread_id:
         return NotMeshWorker()
-    membership = staff.local_snapshot()
     member = membership.by_current_session(thread_id)
     if member is None or member.kind != "worker":
         return NotMeshWorker()
@@ -180,6 +198,9 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
 
 
 def _worker_reference(session_dir: str, name: str) -> str:
+    if unit_runs.worker_transport(Path(session_dir)) == "herdr":
+        member = worker_admission.member(Path(session_dir), name)
+        return str(member.id) if member is not None else ""
     roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)
     entry = codex_mesh._as_dict(roster.get(name))  # pyright: ignore[reportPrivateUsage]
     return str(entry["staff_id"])
@@ -199,9 +220,7 @@ def _runs_dir(session_dir: str) -> Path:
 
 
 def _write_record(path: Path, record: RunRecord) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    _ = temporary.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, path)
+    write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
 def _read_record(path: Path) -> RunRecord:
@@ -223,28 +242,6 @@ def seat_name(session_dir: str, name: str) -> str:
     return matches[0] if len(matches) == 1 else name
 
 
-def _process_args(pid: int) -> list[str]:
-    """The pid's command line; ps where there is no /proc (the Mac). Empty when it is gone."""
-    if Path("/proc/self").exists():
-        try:
-            return Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
-        except OSError:
-            return []
-    shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True, check=False)
-    return shown.stdout.split()
-
-
-def supervises(pid: int, record_path: Path) -> bool:
-    """Whether pid is the `supervise` process of this record, so a reused pid does not match."""
-    if pid <= 0:
-        return False
-    parts = _process_args(pid)
-    if "supervise" not in parts or not any(part.endswith("mesh_runs.py") for part in parts):
-        return False
-    expected = record_path.resolve()
-    return any(Path(part).resolve() == expected for part in parts if part)
-
-
 def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
     """A running record that no supervisor runs. A record with no pid yet is still starting for its
     first minute: `start` writes the record before it spawns the supervisor."""
@@ -252,7 +249,7 @@ def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
         return False
     pid = codex_mesh._as_int(raw.get("pid"))  # pyright: ignore[reportPrivateUsage]
     if pid > 0:
-        return not supervises(pid, path)
+        return not mesh_run_process.supervises(pid, path)
     started = codex_mesh._as_float(raw.get("started_at"), now)  # pyright: ignore[reportPrivateUsage]
     return now - started >= codex_mesh.DETACHED_RUN_START_GRACE_SECS
 
@@ -295,8 +292,12 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> list[str]:
                         and other.get("staff_id") == record["staff_id"]
                         and codex_mesh._as_float(other.get("started_at"), 0.0) > record["started_at"]  # pyright: ignore[reportPrivateUsage]
                         for _, other in records)
-            delivery = ("nothing delivered: the supervisor is gone and a newer run of the same command answers"
-                        if newer else deliver(record, None))
+            try:
+                delivery = ("nothing delivered: the supervisor is gone and a newer run of the same command answers"
+                            if newer else deliver(record, record.get("exit_code")))
+            except RunDeliveryFailed as error:
+                print(f"mesh_runs: {record['run_id']}: {error}", file=sys.stderr)
+                continue
             record = _read_record(path)
             record.update({
                 "status": "finished", "ended": "supervisor gone", "delivery": delivery,
@@ -319,7 +320,7 @@ def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> Run
         raw = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
         if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
                 and raw.get("tree_key") == tree_key
-                and supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
+                and mesh_run_process.supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
             return cast(RunRecord, cast(object, raw))
     return None
 
@@ -330,7 +331,7 @@ def live_runs(runs: Path, worker: str) -> list[RunRecord]:
     for path in sorted(runs.glob("*.json")):
         raw = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
         if (raw.get("status") == "running" and raw.get("worker") == worker
-                and supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
+                and mesh_run_process.supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
             found.append(cast(RunRecord, cast(object, raw)))
     return found
 
@@ -347,11 +348,14 @@ def command_start(args: argparse.Namespace) -> int:
     if bool(session_dir) != bool(name):
         print("mesh_runs: --session-dir and --to go together", file=sys.stderr)
         return 2
+    reference = ""
     if not session_dir:
         caller = caller_from_environment(dict(os.environ))
         if isinstance(caller, NotMeshWorker):
             return NOT_A_MESH_WORKER
         session_dir, name = caller.session_dir, caller.name
+        if isinstance(caller, PaneCaller):
+            reference = caller.staff_id
     else:
         name = seat_name(session_dir, name)
     label = str(getattr(args, "label", "") or "") or " ".join(command)
@@ -387,7 +391,7 @@ def command_start(args: argparse.Namespace) -> int:
         log_path = runs / f"{run_id}.log"
         record: RunRecord = {
             "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
-            "staff_id": _worker_reference(session_dir, name), "label": label, "command": command,
+            "staff_id": reference or _worker_reference(session_dir, name), "label": label, "command": command,
             "log": str(log_path), "started_at": time.time(), "pid": 0,
             "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
         }
@@ -510,10 +514,23 @@ def _director_sessions(record: RunRecord) -> list[str]:
     return [parent.current_session] if parent is not None else []
 
 
-def deliver(record: RunRecord, exit_code: int | None) -> str:
-    """Hand the result to the worker's attached launcher, else to its unit director.
+class RunDeliveryFailed(RuntimeError):
+    """The running record still needs result delivery."""
 
-    exit_code is None for a run whose supervisor is gone. Returns the delivery outcome the record keeps.
+
+def _result_received(member: staff.StaffRow, membership: staff.StaffSnapshot, marker: str) -> bool:
+    backend = membership.backends.get(member.id, staff.BACKEND_UNAVAILABLE)
+    if isinstance(backend, staff.BackendUnavailable):
+        raise ValueError("worker transcript backend is unavailable")
+    source = worker_admission.transcript_source(member, backend)
+    return any(isinstance(entry, str) and entry.startswith("user:\n") and marker in entry.splitlines()
+               for entry in worker_admission.transcript_entries(source, set()))
+
+
+def deliver(record: RunRecord, exit_code: int | None) -> str:
+    """Deliver through the run's transport and return the delivery outcome.
+
+    A missing exit code means the supervisor disappeared.
     """
     done_file = record["done_message_file"]
     if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS):
@@ -530,6 +547,33 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
     member = _run_worker(record, membership)
     if member is None:
         return "finished: worker retired"
+    if unit_runs.worker_transport(Path(session_dir)) == "herdr":
+        from scripts.message import send
+
+        marker = f"Detached run: {record['run_id']}"
+        runs = _runs_dir(session_dir)
+        runs.mkdir(parents=True, exist_ok=True)
+        with (runs / f".{record['run_id']}.delivery.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            reason = ""
+            try:
+                if _result_received(member, membership, marker):
+                    return f"already delivered: {record['run_id']}"
+            except (OSError, ValueError) as error:
+                reason = f"worker transcript is unavailable: {error}"
+            record_path = runs / f"{record['run_id']}.json"
+            record = _read_record(record_path)
+            if record.get("pane_result_typed"):
+                return f"already delivered: {record['run_id']}"
+            timeout = send_budget.seconds()
+            result = send.deliver_worker_text(member, membership, marker + "\n" + text,
+                                              sender="mesh-runs", timeout=timeout, reason=reason)
+            if result.outcome in ("failed", "refused"):
+                raise RunDeliveryFailed(f"{result.outcome}: {result.detail}")
+            if isinstance(result, send.PaneTextDelivered):
+                record["pane_result_typed"] = True
+                _write_record(record_path, record)
+            return f"{result.outcome}: {result.detail}"
     thread_id = member.current_session
     roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)
     entry = codex_mesh._as_dict(roster.get(name))  # pyright: ignore[reportPrivateUsage]
@@ -629,7 +673,13 @@ def command_supervise(args: argparse.Namespace) -> int:
     marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.
-    delivery = deliver(record, exit_code)
+    record["exit_code"] = exit_code
+    _write_record(record_path, record)
+    try:
+        delivery = deliver(record, exit_code)
+    except RunDeliveryFailed as error:
+        print(f"mesh_runs: {record['run_id']}: {error}", file=sys.stderr)
+        return 1
     record = _read_record(record_path)
     record.update({
         "status": "finished", "exit_code": exit_code,

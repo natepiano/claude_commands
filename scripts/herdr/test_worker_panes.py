@@ -404,6 +404,31 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
         self.assertEqual(self.world.closed, [])
 
+    def test_live_detached_run_keeps_its_pane_until_the_result_finishes(self) -> None:
+        from scripts.agents import mesh_run_process
+
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        run = self.root / "run"
+        runs = run / "mesh_runs"
+        runs.mkdir(parents=True)
+        write_text_atomic(run / "worker_transport", "herdr\n")
+        record = runs / "private-run.json"
+        write_text_atomic(record, json.dumps({"worker": row.name, "staff_id": row.id,
+                                             "status": "running", "pid": 998901}))
+
+        def supervisor(pid: int, path: Path) -> bool:
+            return pid == 998901 and path == record
+
+        with patch.object(mesh_run_process, "supervises", supervisor):
+            result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
+        self.assertEqual(result, worker_panes.Kept("a detached run is live"))
+        self.assertEqual(self.world.closed, [])
+        write_text_atomic(record, json.dumps({"worker": row.name, "staff_id": row.id,
+                                             "status": "finished", "pid": 998901}))
+        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Closed)
+        self.assertEqual(self.world.closed, [("w1:p1", "terminal-w1:p1")])
+
     def test_close_holder_keeps_the_fixed_id_locked_until_row_retirement(self) -> None:
         row = self.worker()
         self.world.add(row, "w1:p1", live=False)
