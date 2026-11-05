@@ -167,6 +167,21 @@ class SessionSendTests(unittest.TestCase):
                 missing.append(str(path.relative_to(scripts)))
         self.assertEqual(missing, [], "Sender tests must install forbid_real_sender in setUpModule")
 
+    def test_general_command_keeps_arguments_and_accepts_a_sender_override(self) -> None:
+        arguments = ("retire", "--to", "session:fixture", "--key", "fixture key")
+        for sender in (session_send.SEND_SCRIPT, Path("/fixture/sender.py")):
+            with self.subTest(sender=sender):
+                self.assertEqual(session_send.send_argv(*arguments, send_script=sender),
+                                 [sys.executable, str(sender), *arguments])
+        self.assertEqual(session_send.send_argv(*arguments),
+                         [sys.executable, str(session_send.SEND_SCRIPT), *arguments])
+
+    def test_general_command_reads_the_current_sender_at_call_time(self) -> None:
+        sender = Path("/fixture/patched-send.py")
+        with mock.patch.object(session_send, "SEND_SCRIPT", sender):
+            command = session_send.send_argv("x")
+        self.assertEqual(command, [sys.executable, str(sender), "x"])
+
     def test_command_uses_the_selected_sender_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
