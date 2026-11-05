@@ -131,9 +131,12 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 
 1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
    It resolves the natedev and Mac addresses from local Tailscale status.
+   The network rule permits only these addresses on port 22.
+   The SSH rule permits `autogroup:member` as `natepiano`; the network rule still limits access to these devices.
    It changes only `tag:build-aws` owners and destination rules.
    It prints each proposed change and uses the policy ETag to prevent concurrent overwrites.
    It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
+   HTTP refusals include the status and validation details without user fields; network refusals include the failure reason.
 2. `box-join` checks SSM and the instance's Tailscale identity.
    It starts a stopped instance through the existing guarded setup path.
    It creates a single-use, pre-approved key and revokes it after the join attempt.
