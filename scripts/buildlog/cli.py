@@ -13,7 +13,7 @@
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog sync pause <why>         pause Mac contact while hourly keeps running
   buildlog sync resume              resume Mac contact
-  buildlog vault                    fast-forward the Mac's hanadocs vault
+  buildlog vault                    sync the Mac's hanadocs vault
   buildlog ci                       record new GitHub Actions run attempts
   buildlog launches                 collect example build and start times from Claude Code
   buildlog disk                     measure disk usage for the next report

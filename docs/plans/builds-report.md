@@ -619,7 +619,7 @@ Director decision: a record with no pair is unknown for both columns, old record
 **Ruled out:**
 - Reading the test-path metadata without an export, and an export through a `verify_metadata.py` request: routed to verify-unit, which owns `verify.sh`.
 
-### Phase 29 — The Mac's hanadocs vault syncs both ways and asks a question only on a conflict  · status: todo
+### Phase 29 — The Mac's hanadocs vault syncs both ways and asks a question only on a conflict  · status: done
 **Depends on:** none (urgent, from the user via natedev and the builds showrunner, 2026-11-05)
 
 The Mac copy of `~/rust/hanadocs` stopped at 2026-11-04 17:58 EST, 233 commits behind. Obsidian on the Mac saved column widths in `home-base/vault map.base`, and the hourly fast-forward stops on any uncommitted change.
@@ -633,6 +633,8 @@ Director decisions:
 - From the builds showrunner (from natedev, not the user), 2026-11-05: change row C927 (the Mac's hanadocs vault updates itself each hour, ddf835c4) came back with the user's words "this is an issue that is happening right now". This phase closes it; no separate fix. The checkpoint carries a new Change-Review line for it.
 - The Mac needs no GitHub credentials: natedev carries the Mac's commits to GitHub.
 - From natedev (not the user), 2026-11-05: a good run clears the question with a separate `withdraw` verb that sdlc adds to `update_registration.py`. Do not import its internals; file with the public `ask` command. If this phase lands before `withdraw` is on main, leave the clear out; natedev clears the question by hand until then.
+- Director, 2026-11-05 (review round 1): a natedev `merge-tree` conflict defers to the next hour's Mac merge. Reason: no working tree holds natedev's merge, so a question there sends the user to a tree with no conflict. This changes natedev's note (a) for the conflict case only.
+- From the user (via the showrunner), 2026-11-05: "a) — add check." An open merge on the Mac (`MERGE_HEAD`, an interrupted conflict) stops the Mac script before staging. It prints the unmerged file names (or, when none is unmerged, the files that differ from HEAD) as the conflict outcome. It runs no abort, add or commit. natedev files the Mac conflict question.
 
 #### Work Order
 
@@ -644,7 +646,7 @@ Director decisions:
   2. The ssh script on the Mac:
      1. Stops with `branch` when the vault is not on main.
      2. Runs `git add -A`. When the index differs from HEAD, it commits once with the message `vault: Mac edits`.
-     3. Runs `git merge --no-edit refs/remotes/origin/main` (a real merge, not `--ff-only`).
+     3. Runs `git merge --no-edit --no-overwrite-ignore refs/remotes/origin/main` (a real merge, not `--ff-only`; an incoming file never replaces an ignored Mac file).
      4. On a conflict, it reads `git diff --name-only --diff-filter=U`, runs `git merge --abort`, and prints the conflict outcome with the file names.
      5. Keeps the `index.lock` retries (`vault.lock_retries`, `vault.lock_retry_delay_s`) for the commit and the merge.
      6. Prints the merged count and the Mac's main commit in the `VAULT_OUTCOME=` marker.
@@ -652,10 +654,12 @@ Director decisions:
      - Cold credentials: one printed line, exit 0; the next hour tries again. No question.
   4. When `mac/main` is already in `origin/main`: nothing to push.
   5. When `mac/main` is a fast-forward of `origin/main`: push it to GitHub `main`.
-  6. Else: `git merge-tree --write-tree origin/main mac/main`. With no conflict, `git commit-tree` with both parents, then push that commit to GitHub `main`. A conflict stops with the file names, machine `natedev`.
-  7. A rejected push (GitHub moved) is not a stop: the next hour tries again.
-- Stop causes after this phase: `conflict` (files, machine), `not_on_main`, `mac_unreachable` (after 24 h), `vault_locked`, `command_failed`. Remove `tracked_files_changed`, `untracked_would_be_overwritten` and `history_diverged`.
-- A stop files one question with `python3 ~/.claude/scripts/production/update_registration.py ask --production ~/.claude/docs/plans/natedev-production.md --text <one line> --question <full text> --urgency soon`, run as a subprocess with a timeout. It is filed once per outage; the state file keeps that it was filed. A failed or held `ask` leaves it not filed, and the next hour tries again. The question names the cause, the files (for a conflict), the machine, where the user acts, and the choices.
+  6. Else: `git merge-tree --write-tree origin/main mac/main`. With no conflict, `git commit-tree` with both parents, then push that commit to GitHub `main`. A conflict is a deferral (one printed line, exit 0): the next hour the Mac merges that GitHub main, finds the same conflict in its working tree and files the Mac conflict question (director decision, review round 1).
+  7. A rejected push (`git push --porcelain` reports `[rejected]`) is not a stop: the next hour tries again.
+  8. Every Mac contact (the first push, the ssh script, the `mac/main` fetch) uses one unreachable rule. The Mac ssh options apply to Mac contacts only; GitHub calls use the default ssh.
+  9. A deferral after a Mac merge records the Mac contact time in `last_good`; the open outage stays.
+- Stop causes after this phase: `conflict` (files; always on the Mac), `not_on_main`, `mac_unreachable` (after 24 h), `vault_locked`, `command_failed`. Remove `tracked_files_changed`, `untracked_would_be_overwritten` and `history_diverged`.
+- A stop files one question with `python3 ~/.claude/scripts/production/update_registration.py ask --production ~/.claude/docs/plans/natedev-production.md --text <one line> --question <full text> --urgency soon --due <one day after the outage start>`, run as a subprocess with a timeout (`soon` requires `--due`). It is filed once per outage; the state file keeps that it was filed. The run saves `asked` before it runs `ask`, as the old push did; a failed or held `ask` saves it as not filed, and the next hour tries again. The question names the cause, the files (for a conflict), the machine, where the user acts, and the choices.
 - A good run closes the outage. `withdraw` is not on main at dispatch (2026-11-05 12:50 EST), so the clear is left out; natedev clears the question by hand.
 - Remove the `vault.stopped` push: `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, its test in `scripts/notify/test_push_texts.py`, and the push call in `vault_pull.py`.
 - `scripts/buildlog/cli.py`: the usage line says the job syncs the Mac's vault.
@@ -663,7 +667,9 @@ Director decisions:
 **Files:**
 - `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`
 - `scripts/buildlog/cli.py`
+- `scripts/buildlog/test_target_sync.py` — its vault stand-in uses the new marker and transport calls; every assertion stays.
 - `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py`
+- `config/build_targets.conf`, `config/README.md` — the retry text says "tries after a busy vault index lock".
 
 **Workers:** 1 writer owns all files.
 
@@ -680,3 +686,41 @@ Director decisions:
 - `scripts.buildlog.test_vault_pull`, `scripts.notify.test_push_texts`, and each module that imports `vault_pull`, with and without `PYTHONPATH`.
 - `basedpyright` over each changed Python file: 0 errors, 0 warnings, 0 notes.
 - After landing: one `buildlog vault` run on natedev commits the Mac's `vault map.base` change and brings the Mac to GitHub's main.
+
+### Phase 30 — The Mac idle watch sends one alert per idle episode  · status: todo
+**Depends on:** none (urgent, from the builds showrunner, 2026-11-05; runs beside Phase 29, no shared files)
+
+From the builds showrunner (from natedev, not the user), 2026-11-05: between 12:50 and 13:09 EST the watch sent the same text 3 times: "MAC IDLE 3 min: 3 steps wait for the Mac. Claim of port (clippy cargo-port) runs no build or test on the Mac." send-repeat-guard held the copies. "Send one alert per idle episode. A new alert goes only when the episode ends and a new one starts, or when its cause changes. Add a test."
+
+Cause (director, 2026-11-05): `watch_once` (scripts/buildlog/mac_idle.py:466-467) moves the episode start to the `claims` folder time. Any claim file written or removed changes that time, also another repository's claim (`cargo-liner.json` at 13:05 moved the start to 13:05:56). A new start is a new key, so 3 minutes later the same alert goes again.
+
+#### Work Order
+
+**Goal:** One idle episode sends one showrunner message and at most one phone push. A new episode starts only when the Mac did work. A changed cause or holder in the same episode sends one new message.
+
+**Spec:**
+- `scripts/buildlog/mac_idle.py` `watch_once`:
+  1. Remove the `claims` folder time from the episode start.
+  2. The episode ends when the Mac runs natedev work (`NatedevJobOnMac`, as today), or when the Mac did work between two passes: a live claim that started before the episode start has a `work_idle_since` later than the episode start. `mac_test` checks Mac activity once for each host and writes it into every live claim, so this holds for every cause, blocked included. No claim path is saved.
+  3. A change of `cause` or holder in the same episode keeps `since` and sends one new showrunner message. The alert record saves `changed`, the time the current cause and holder started. `changed` is a required `SavedAlert` field that `read_alert` validates like `since`; a record without it is unreadable, so the first pass after deploy starts clean (no old-record reader). One `outage_key` gives the message key `mac-idle-showrunner-<since>-<changed>`, so a cause that returns to an earlier value also sends. The phone push stays once per episode (key `mac-idle-<since>`, as today).
+  4. Another repository's claim record that is written or removed does not change the episode.
+- Keep the `cleared --since` command and the push `--clears-when` as they are.
+
+Director decisions:
+- Director, 2026-11-05 (review round 1): spec items 2 and 3 changed. Reason: a saved claim path missed work in a blocked episode and took another repository's claim; a cause-and-holder key repeated when a cause came back.
+
+**Files:**
+- `scripts/buildlog/mac_idle.py`, `scripts/buildlog/test_mac_idle.py`
+- `scripts/buildlog/mac_idle_alert.py`, `scripts/buildlog/test_mac_idle_alert.py`, `scripts/buildlog/mac_idle_test_support.py`
+
+**Workers:** 1 writer owns all five files.
+
+**Acceptance gate:**
+- Tests in `scripts/buildlog/test_mac_idle.py`:
+  1. The 12:50-13:09 case: one idle claim, another repository's claim file written and removed during the episode; three watch passes past 3 minutes send one message.
+  2. A cause change in one episode (claim idle, then blocked) sends one new message, then no repeat.
+  3. The Mac runs work, then goes idle again: a new episode sends a new message.
+  4. `test_claim_folder_change_restarts_the_idle_interval` changes to the new rule (Mac work ends the episode) and is renamed `test_own_claim_work_restarts_the_idle_interval`; list the changed expected values.
+  5. Review round 1: a blocked episode ends on Mac work between passes; a live claim of another repository that sorts first does not restart the episode; the cause sequence claim idle, blocked, claim idle sends three messages.
+- `scripts.buildlog.test_mac_idle`, `scripts.buildlog.test_mac_idle_alert` and each module that imports `mac_idle`, with and without `PYTHONPATH`.
+- `basedpyright` over each changed Python file: 0 errors, 0 warnings, 0 notes.

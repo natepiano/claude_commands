@@ -14,6 +14,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+import ci
 import health
 import record
 import store
@@ -344,16 +345,18 @@ class TargetSyncTests(unittest.TestCase):
 
         def reply(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
             self.assertEqual(timeout, vault_pull.COMMAND_TIMEOUT_S)
-            commands.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "VAULT_OUTCOME=pulled:0\n" if argv[0] == "ssh" else "", "")
+            if argv[0] == "ssh" or f"{sync.peer_name()}:rust/hanadocs" in argv:
+                commands.append(argv)
+            outcome = f"VAULT_OUTCOME=merged:0:{'a' * 40}\n" if argv[0] == "ssh" else ""
+            return subprocess.CompletedProcess(argv, 0, outcome, "")
 
-        with mock.patch.object(vault_pull, "run", side_effect=reply):
+        with mock.patch.object(vault_pull, "run", side_effect=reply), mock.patch.object(ci, "warm", return_value=True):
             self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
         self.assertTrue(all("ConnectTimeout=3" in " ".join(argv) for argv in commands))
         commands.clear()
         _ = self.registry.write_text(self.registry.read_text().replace(
             "sync.connect_timeout_s=3", "sync.connect_timeout_s=9"))
-        with mock.patch.object(vault_pull, "run", side_effect=reply):
+        with mock.patch.object(vault_pull, "run", side_effect=reply), mock.patch.object(ci, "warm", return_value=True):
             self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
         self.assertTrue(all("ConnectTimeout=9" in " ".join(argv) for argv in commands))
 
