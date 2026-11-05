@@ -590,7 +590,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the existing evidence-order and recorded-identity tests in `test_index.py` stay green
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 23 — `test_show.py` passes in a checkout with no origin  · status: todo
+### Phase 23 — `test_show.py` passes in a checkout with no origin  · status: done
 **Depends on:** none
 
 #### Work Order
