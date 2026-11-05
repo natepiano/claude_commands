@@ -506,43 +506,48 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Gotchas:**
 - `serve_forever` pays its poll interval on each `shutdown()`. A fixture that starts a server for each test pays it for each test.
 
-### Phase 21 — The merge gate fails a test module that starts the real `send.py`  · status: todo
+### Phase 21 — The merge gate fails a test module that starts the real `send.py`  · status: done
 **Depends on:** none
-**Blocked by:** builds-queue Phase 10z on builds — the audit-hook guard and its patch point in `scripts/message/session_send.py`
 
 #### Work Order
 
-**Goal:** In the merge gate, a test module that starts the real `scripts/message/send.py` fails with one line that names the module, and the gate time cost is measured in same-load pairs.
+**Goal:** A test that starts the real `scripts/message/send.py` fails, by any path to it. In the merge gate, its module fails with one line that names the module, also when the test caught the error.
 
-**Spec:** The builds showrunner asked for this on 2026-11-05. That night a builds-queue 10z test reached the real `send.py` and sent natedev two live messages. builds-queue Phase 10z adds an audit-hook guard for the sender modules (sweep, admission service, disk) through one patch point in `scripts/message/session_send.py`.
+**Spec:** The builds showrunner asked for this on 2026-11-05. That night a hand-run builds-queue 10z test reached the real `send.py` and sent natedev two live messages. 10z (`66a34ca16` on builds) added an audit hook, `forbid_real_sender()` in `scripts/message/session_send_test_support.py`, installed in `setUpModule` of four test modules, with a scan test that requires it.
 
-1. The gate runs each module through `scripts/test_times/module_run.py` (`RUNNER` in `merge_gate.py`, about line 110). Install the 10z guard in `module_run.py` `main()` before discovery, through 10z's patch point. Make no copy of its hook. Read the hook and the patch point from builds after 10z lands. Name them, the sender test modules and the scan test in this Spec and Files before dispatch.
-2. A module that starts the real `send.py` fails. The gate prints one line for it: `<module>: started the real scripts/message/send.py`. Other modules run as before.
-3. A test that needs `send.py` uses the fake sender that 10z names. Do not add an allow list.
-4. One guard remains: 10z puts `forbid_real_sender()` into each sender test module, with a scan test that requires it. Once the gate-wide guard covers every module, remove those per-module installs and the scan test in this phase. Keep `session_send.SEND_SCRIPT` as the one patch point (showrunner, 2026-11-05).
-5. A test can catch the guard's exception (`assertRaises`, `expectedFailure`) and still pass. Keep the violation as module state with named states (`NoSenderViolation`, `RealSenderStarted`), and fail the module from that state after its run, whatever the test did with the exception. Keep the timing output and the one diagnostic line.
-6. Measure the gate time cost: run a group of modules with and without the guard in same-load pairs (`pairs.sh`), and report the medians.
+Route (showrunner, 2026-11-05, after the review): the first route, a check in `session_send_argv`, covered one of about 20 production paths to `send.py`; `sweep.send_floor_alert` builds its phone command with its own path. The audit hook sees every process start, so it covers all of them. One hook, one install mechanism.
+
+1. Keep the hook in 10z's `scripts/message/session_send_test_support.py`, and add to it `RealSenderForbidden` (an `AssertionError` subclass) and the state `NoSenderViolation | RealSenderRefused`. A `_test_support.py` name keeps the hook out of the line collector's production sources (Phase 15); a production-named module added 14 guard lines to coverage sets (review, 2026-11-05). `RealSenderRefused` names the test that asked. The hook records the state before it raises. A test that catches the exception (`assertRaises`, `expectedFailure`) does not clear it. Keep every path form 10z blocks: `str`, `Path` and `bytes` paths, a relative path with `cwd`, and a symlink. Also block the other process-start audit events (`os.posix_spawn`, `os.exec`, `os.spawn`, `os.system`) and a path inside a shell command string.
+2. Install it one way only: the 10z per-module installs in `setUpModule`, which the scan test enforces. They cover plain `python3 -m unittest` runs and gate runs alike. The three sender test modules stay as on builds.
+3. `scripts/test_times/module_run.py` installs no hook. After the module runs, when `session_send_test_support` is already loaded and its state is `RealSenderRefused`, it prints `<module>: started the real scripts/message/send.py` once to stderr, and the module run exits non-zero. Other modules, the timing output and the discovery and cleanup error reports stay as before.
+4. `scripts/message/session_send.py` keeps no check: revert it to its builds version. Revert the five `test_sweep.py` fixture patches that the first route needed.
+5. Measure: run `test_sweep.py` before and after in same-load pairs (`pairs.sh`), and report the medians.
+6. "One path to `send.py`" is a separate cleanup after this phase (showrunner, 2026-11-05).
 
 **Files:**
-- `scripts/test_times/module_run.py` — install the guard through the patch point
-- `scripts/test_times/test_module_run.py` — a fixture module that starts the real `send.py` fails with the one line; a module that does not passes
+- `scripts/message/session_send_test_support.py` — the hook, the exception and the state
+- `scripts/test_times/module_run.py` — read the state, print the one line, exit non-zero
+- `scripts/message/session_send.py` — revert to builds
+- `scripts/message/test_session_send.py` — the 10z hook tests, plus the other process-start events, a shell command string, and a caught refusal keeps the state
+- `scripts/test_times/test_module_run.py` — a fixture module that installs the guard and starts the real sender fails with the one line, also when its test catches the exception; a clean module passes
+- Callers to verify: every test module that imports `session_send`, `sweep`, `admission_service`, `disk`, `module_run` or `coverage_overlap`
 
 **Workers:** 1 writer + 1 tester
-- `impl` — `module_run.py`
-- `test` — `test_module_run.py`: the failing fixture module and its one line; a clean module stays green
-
-**Guard route (showrunner, 2026-11-05):** `coverage_overlap.collect()` calls `TimedRunner.run()` directly, and a plain `python3 -m unittest discover` run does not pass through `module_run.main()`. Put the one guard at a point every route reaches, the send path in `scripts/message/session_send.py`, and remove the per-module installs. If 10z gives no reliable place there, keep the per-module installs and the scan test, and add the gate guard as a second layer. Decide when 10z lands, and name the choice in the checkpoint notice.
+- `impl` — `session_send_test_support.py`, `module_run.py`, `session_send.py`
+- `test` — `test_session_send.py`, `test_module_run.py`
 
 **Constraints from prior phases:**
 - Phase 1: `module_run.py` matches the import path of `python -m unittest` and writes each test's time to `TEST_TIMES_OUT`. Keep both.
-- Phase 15: `line_collector.py` uses an audit hook in coverage runs. The guard must not change what the collector records.
+- Phase 15: `line_collector.py` uses an audit hook in coverage runs. The sender hook must not change what the collector records.
+- Phase 19: `coverage_overlap.collect()` calls `TimedRunner.run()` directly. The per-module installs cover that route.
+- resources Phase 63-64 also touches `test_sweep.py` with the 10z `forbid_real_sender` install. The second lander keeps the one 10z install (showrunner, 2026-11-05).
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/test_times -p 'test_module_run.py'` green
-- a fixture module that starts the real `send.py` fails in a gate run with the one line; no message is sent
-- a fixture test that catches the guard's exception still fails its module; discovery and cleanup errors keep their own reports
-- same-load pair medians with and without the guard, in the checkpoint notice
+- `python3 -m unittest discover -s scripts/message -p 'test_session_send.py'` and `python3 -m unittest discover -s scripts/test_times -p 'test_module_run.py'` green
+- `test_disk.py`, `test_sweep.py` and `test_admission_service.py` green with the same test names and assertions
+- a fixture module that starts the real `send.py` fails its `module_run.py` run with the one line, also when its test catches the exception; no message is sent
+- same-load pair medians for `test_sweep.py` before and after, in the checkpoint notice
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 22 — Mirror step rows store the sent repository identity, and `show.py` loads a light repository module  · status: todo
@@ -593,33 +598,21 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 23 — `test_show.py` passes in a checkout with no origin  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/test_times/test_show.py` reads nothing from the real checkout's remote, and passes in a clone with an origin and in a clone with no origin.
-
-**Spec:** The builds showrunner asked for this on 2026-11-05 (reported by devtools-unit through sdlc). In a clone with no origin, `test_show.py` has 10 failures.
-
-1. Cause: `test_show.py:48` sets `TOOL_IDENTITY = record.recorded_repository_key(["git"], <real checkout root>)` at import. `setUp` (about line 112) sets the fixture repository's origin to that value, and `test_top_keeps_the_module_view_from_the_claude_working_directory` (about line 297) records steps under it. `show.py` `main()` (about line 438) picks the module view when the identity of `--repo` equals the identity of `show.TOOL_REPOSITORY`, the real checkout. With no origin, the real key is `git-root:<real root>`, and the fixture repository cannot match it.
-2. Fix: in `setUp`, patch `show.TOOL_REPOSITORY` to the fixture repository `self.repo` with `mock.patch.object`. Remove `TOOL_IDENTITY` and the `remote set-url` call. The fixture repository keeps the origin that `initialize_repository` gives it. Where a test needs the tool identity, use `record.recorded_repository_key(["git"], str(self.repo))`, computed once in `setUp`.
-3. Change no production file. Keep every test and assertion.
+- `test_show.py` read the real checkout's origin at import (`TOOL_IDENTITY`), so a clone with no origin gave 10 failures: `show.py` `main()` picks the module view when `--repo` has the identity of `show.TOOL_REPOSITORY`.
+- `setUp` patches `show.TOOL_REPOSITORY` to the fixture repository `self.repo`, and computes `self.tool_identity` from it. `TOOL_IDENTITY` and the `remote set-url` call are gone. No production file changed; every test and assertion stays.
+- 24 tests green in a checkout with an origin and in a `copies.py` clone with its origin removed.
 
 **Files:**
 - `scripts/test_times/test_show.py` — the fixture tool repository
 
-**Workers:** 1 writer (one test file; there is nothing to split)
-- `impl` — `test_show.py`
-
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `/tmp/claude`.
-- Phase 22 later changes `show.py` `main()` to call `repository_key(directory)` from a light module. The patch target stays `show.TOOL_REPOSITORY`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/test_times -p 'test_show.py'` green in a `copies.py` clone with an origin, and in a clone with its origin removed (`git remote remove origin`)
-- `basedpyright scripts/test_times/test_show.py` prints `0 errors, 0 warnings, 0 notes`
+**Binds later work:**
+- A test reads no identity from the real checkout. Patch `show.TOOL_REPOSITORY` to a fixture repository.
 
 ### Phase 24 — `test_verify_ssh_targets_routing.py` runs in half its time  · status: todo
 **Depends on:** none
-**Blocked by:** verify-unit remake 1-24 on builds (notice ETA 04:00 EST, 2026-11-05) — code edits only; it changes `scripts/direct/verify_ssh_targets_test_support.py`
+**Blocked by:** verify-unit remake 1-24 on builds (notice ETA 04:45 EST, 2026-11-05) — code edits only; it changes `build_targets.py`, `offload.py`, `verify.sh` and the test support files
 
 #### Work Order
 
@@ -631,11 +624,27 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 2. Make no code edit to `test_verify_ssh_targets_routing.py` or `verify_ssh_targets_test_support.py` until verify's remake 1-24 is on builds. Then merge origin/builds and build on it. Never merge verify's unlanded branch.
 3. Phase 13 found no removal candidate in this module, and Phase 19 runs all 13 tests under the coverage collector. Do not run another overlap sweep. Look first for fixed waits that a published state can end, and for setup that each test repeats.
 
-**Files:**
-- `scripts/direct/test_verify_ssh_targets_routing.py`, `scripts/direct/verify_ssh_targets_test_support.py` — named after step 1 (verify-unit's files)
+**Profile result (step 1, 2026-11-05, load1 about 46):** the module passes 13 tests in 163.5 s (126.5 CPU s). The full report is in the session folder, `phases/24/profile_report.md`.
+- Python start-up is the cost. The 13 tests start 453 Python interpreters, 2,464 child processes and 691 git stubs. The slowest test (pinned-target refusal, 40.8 s) checks four refusal cases. Keep all four.
+- `build_targets.py platform` runs 69 times, at 0.89 s median for each cold start. Its handler takes 0.0012 s. The start-up imports `targets`, `build_hold`, the admission service, `roster`, `memory_admit` and `offload` to print one field of the target config.
+- Fixed waits and fixture setup are not the cost. The class seed is already shared. The 13 fixture copies take 0.7 s. The pinned-wait and memory-hook tests already end their waits on a published state. Tree-watcher sleeps overlap other work.
+- `verify.sh` `target_platform` (`verify.sh:1942`) calls `build_targets.py platform`. Production `verify.sh` runs pay the same start-up cost for each call.
 
-**Workers:** 1 writer (a test module and its support file; the profile decides the split)
-- `impl` — the files that step 1 names
+**Code step (after the remake merges into this branch):** The showrunner approved this step on 2026-11-05. resources owns `scripts/build_targets/`, and its held work does not touch `build_targets.py`, `target_config.py` or `offload.py`.
+1. Fix the cause in the production code, not in the fixture. `build_targets.py platform` answers from `target_config` and imports no coordination module. Make `build_targets.py` a light command entry point: it parses the arguments, answers `platform`, and imports the coordination modules only for the commands that use them. Move the name check from `offload.configured_ssh_target` (`offload.py:849`) into `target_config`, and let `offload` call it there. Keep the command name and output, so that `verify.sh` `target_platform` and every fixture that wraps `BUILD_TARGETS_SCRIPT` keep working unchanged. Keep each module-level name that tests import from `build_targets`.
+2. Measure the module again with same-load pairs. Expected saving: 35-45 s.
+3. If the module is not at half time, profile the next repeated start-ups: `step_record.py state` (82 starts), `build_targets.py eligible` (24) and `reserve` (11). Apply the same rule: a short query imports only what it reads. The showrunner approved these three on 2026-11-05 with no further go. Tell the showrunner only if another unit holds those files on the berth board at dispatch.
+4. Do not build a warm command server in the fixture. It would test a different process boundary than production uses. Do not cache git identity in the fixture, and do not change the shared cleanup scans. The profile puts each of these at less than 6 s.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — the light command entry point
+- `scripts/build_targets/target_config.py` — the moved name check
+- `scripts/mac_test/offload.py` — `configured_ssh_target` calls the moved name check
+- `scripts/build_targets/test_targets.py` — a test that `platform` loads no coordination module
+- Callers to verify: every test module that runs `build_targets.py` or imports `build_targets`, `offload.configured_ssh_target` or `target_config`
+
+**Workers:** 1 writer (one cross-module change; the files do not split)
+- `impl` — all files above
 
 **Constraints from prior phases:**
 - Phase 19: the module runs under the coverage collector with a mocked `subprocess.Popen`. Keep that working.
@@ -644,4 +653,6 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets_routing.py'` green, with the same test names and assertions
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- the checkpoint notice gives the measured module time before and after, and the cost of one `verify.sh` `target_platform` call before and after
+- a test proves that `build_targets.py platform` loads no coordination module
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
