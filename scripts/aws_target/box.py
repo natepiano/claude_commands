@@ -212,7 +212,9 @@ class BoxSetup:
         result = self.execute(arguments, capture_output=True, text=True,
                               timeout=conf.read(self.settings).whole('box_setup_timeout_s'), check=False)
         if result.returncode:
-            raise BoxRefused(f'{arguments[0]} failed during box setup (exit {result.returncode})')
+            last = next((line for line in reversed(result.stderr.splitlines()) if line.strip()), '')
+            detail = ': ' + ' '.join(last.split())[:300] if last else ''
+            raise BoxRefused(f'{arguments[0]} failed during box setup (exit {result.returncode}){detail}')
         return result.stdout.strip()
 
     def _api(self) -> AwsCli:
@@ -340,11 +342,28 @@ class BoxSetup:
         if address not in ipaddress.ip_network('100.64.0.0/10') and address not in ipaddress.ip_network('fd7a:115c:a1e0::/48'):
             raise BoxRefused('SSM returned an address outside Tailscale')
         self.joined = JoinedBox(str(address), ledger.text(state, 'id'))
+        self._write_host_keys(self.joined)
         saved = deployment_record(self.directory)
         if (saved.get('tailscale_node_id'), saved.get('tailscale_instance_id')) != (self.joined.node_id, self._instance()):
             saved.update(tailscale_node_id=self.joined.node_id, tailscale_instance_id=self._instance())
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
         return True
+
+    def _write_host_keys(self, joined: JoinedBox) -> None:
+        peers = (ledger.mapping(peer) for peer in ledger.mapping(self._status().get('Peer')).values())
+        peer = next((peer for peer in peers if peer.get('ID') == joined.node_id), dict[str, object]())
+        keys = public_strings(peer.get('sshHostKeys'))
+        if not keys:
+            return
+        names = (offload.read_connection_settings(self.settings).host, joined.address)
+        known_hosts = Path.home() / '.ssh' / 'known_hosts'
+        known_hosts.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        known_hosts.touch(mode=0o600, exist_ok=True)
+        for name in names:
+            _ = self._run(['ssh-keygen', '-R', name, '-f', str(known_hosts)])
+        with known_hosts.open('a') as handle:
+            for key in keys:
+                _ = handle.write(','.join(names) + ' ' + key + '\n')
 
     def join(self) -> None:
         _ = self.start()

@@ -138,6 +138,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
    It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
    HTTP refusals include the status and validation details without user fields; network refusals include the failure reason.
 2. `box-join` checks SSM and the instance's Tailscale identity.
+   `box-join` writes the box host keys from Tailscale to `~/.ssh/known_hosts` for the host name and address; box setup refusals show the last stderr line.
    It starts a stopped instance through the existing guarded setup path.
    It creates a single-use, pre-approved key and revokes it after the join attempt.
    SSM disables terminal echo before the helper sends the key through stdin.
