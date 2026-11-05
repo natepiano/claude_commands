@@ -12,8 +12,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
@@ -22,10 +23,10 @@ from unittest.mock import MagicMock, call as mock_call, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment
+    from ..lint.memory_test_support import config_environment, write_config_fixture
     from ..lint.test_build_shape import create_step_index, record_root_attempt
 else:
-    from memory_test_support import config_environment
+    from memory_test_support import config_environment, write_config_fixture
     from test_build_shape import create_step_index, record_root_attempt
 
 import index
@@ -779,15 +780,37 @@ class BuildOutputRootsTests(unittest.TestCase):
                       host: str = "natedev", argv: tuple[str, ...] = ("cargo", "check")) -> None:
         record_root_attempt(self.index_file, worktree, target, build, cwd=cwd, host=host, argv=argv)
 
+    def probe(self, side_effect: Callable[[Path], CargoOutputRoots | CargoOutputUnavailable] | Exception,
+              index_file: Path | None = None) -> tuple[frozenset[Path], MagicMock]:
+        with patch.object(memory, "read_cargo_output_roots", side_effect=side_effect) as metadata:
+            roots = memory.build_output_roots(index_file if index_file is not None else self.index_file,
+                                             self.current, "natedev")
+        return roots, metadata
+
     def build_roots(self, outputs: Mapping[Path, CargoOutputRoots],
                     index_file: Path | None = None) -> tuple[frozenset[Path], MagicMock]:
         def read(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
             return outputs.get(checkout, CargoOutputUnavailable("fixture"))
 
-        with patch.object(memory, "read_cargo_output_roots", side_effect=read) as metadata:
-            roots = memory.build_output_roots(index_file if index_file is not None else self.index_file,
-                                             self.current, "natedev")
-        return roots, metadata
+        return self.probe(read, index_file)
+
+    def configure_workers(self, workers: int) -> None:
+        environment = config_environment(self.base / "config")
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "buildlog.conf",
+                                 f"METADATA_PROBE_WORKERS={workers}\n")
+        _ = cast(Mapping[str, str], self.enterContext(patch.dict(os.environ, environment)))
+
+    def probes_meet(self, workers: int, *, timeout: float) -> frozenset[Path]:
+        recorded = self.checkout("recorded")
+        self.recorded_step("", "", worktree=str(recorded))
+        self.configure_workers(workers)
+        together = threading.Barrier(2, timeout=timeout)
+
+        def read(checkout: Path) -> CargoOutputRoots:
+            _ = together.wait()
+            return CargoOutputRoots(checkout, checkout / "target", checkout / "build")
+
+        return self.probe(read)[0]
 
     def test_recorded_pair_resolves_paths_and_uses_one_workspace(self) -> None:
         workspace = self.checkout("recorded")
@@ -856,6 +879,20 @@ class BuildOutputRootsTests(unittest.TestCase):
         roots, metadata = self.build_roots({})
         self.assertEqual(roots, frozenset())
         metadata.assert_called_once_with(self.current)
+
+    def test_metadata_probes_run_at_the_same_time(self) -> None:
+        recorded = self.base / "recorded"
+        roots = self.probes_meet(2, timeout=2)
+        self.assertEqual(roots, frozenset((self.current / "target", self.current / "build",
+                                          recorded / "target", recorded / "build")))
+
+    def test_one_configured_worker_runs_metadata_probes_in_sequence(self) -> None:
+        with self.assertRaises(threading.BrokenBarrierError):
+            _ = self.probes_meet(1, timeout=0.1)
+
+    def test_metadata_probe_exception_reaches_the_caller(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "probe failed"):
+            _ = self.probe(RuntimeError("probe failed"))
 
 
 if __name__ == "__main__":

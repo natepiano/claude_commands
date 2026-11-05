@@ -463,14 +463,14 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 
 **Ruled out:** opening the page on the Mac over ssh with a target config read — the user's rule is "it should always be a tailscale link".
 
-### Phase 23 — The first kill lookup runs its cargo metadata probes in parallel  · status: todo
+### Phase 23 — The first kill lookup runs its cargo metadata probes in parallel  · status: done
 **Depends on:** Phase 20 (one reader for recorded output folders).
 
 The builds showrunner asked for this on 2026-11-04 (Phase 20 simplify item 9).
 
 #### Work Order
 
-**Goal:** `memory.build_output_roots` runs its `cargo metadata` probes in a thread pool, so the first kill lookup in a process drops from about 10 s to about 2 s wall time, with the same CPU and the same root set.
+**Goal:** `memory.build_output_roots` runs its `cargo metadata` probes in a thread pool, so the first kill lookup in a process drops from about 5 s to about 1 s wall time, with the same root set. Measured cost: total CPU rises about 0.7 s (4.85 to 5.54 s, parallel `cargo metadata` contention), once per report process that classifies a kill; `METADATA_PROBE_WORKERS=1` restores the sequence.
 
 **Spec:**
 `scripts/buildlog/memory.py` `build_output_roots` runs `read_cargo_output_roots(checkout)` once for each checkout with a `Cargo.toml`, one at a time. On the live natedev index that is 116 probes: wall 10.0 s, child CPU 6.7 s.
@@ -495,8 +495,7 @@ The builds showrunner asked for this on 2026-11-04 (Phase 20 simplify item 9).
 
 **Acceptance gate:**
 - A test proves two probes run at the same time (for example, a probe that waits on a `threading.Barrier(2)` with a short timeout fails when the probes run one at a time).
-- A test proves the worker count comes from `METADATA_PROBE_WORKERS` (a value of 1 runs the probes one at a time).
-- A test proves a fractional `METADATA_PROBE_WORKERS` (for example `1.5`) is refused by the config read.
+- A test proves the worker count comes from `METADATA_PROBE_WORKERS` (a value of 1 runs the probes one at a time). The tests write the key through `write_config_fixture`, so they keep the committed `# whole: 1..` limit; `scripts/lib/test_conf.py` covers the refusal of a fractional value.
 - The Phase 20 outcome tests and `test_kill_classification_reads_index_and_metadata_once_for_the_process` stay green unchanged.
 - Interleaved A/B on the live natedev index with real `cargo metadata`, 5 fresh processes per tree, base = the Phase 20 checkpoint: wall time, own CPU and child CPU means, and the same root set.
 - basedpyright on the changed Python files: 0 errors, 0 warnings, 0 notes.

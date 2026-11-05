@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -97,12 +98,12 @@ def build_output_roots(index_file: Path, current_checkout: Path, host: str) -> f
         roots.update(path.resolve() for path in paths)
         checkouts.update(workspace.path for workspace in recorded.workspaces
                          if isinstance(workspace, build_shape.AbsoluteRecordedRoot))
-    for checkout in checkouts:
-        if not (checkout / "Cargo.toml").is_file():
-            continue
-        outputs = read_cargo_output_roots(checkout)
-        if isinstance(outputs, CargoOutputRoots):
-            roots.update((outputs.target_directory, outputs.build_directory))
+    workers = conf.read("buildlog").whole("METADATA_PROBE_WORKERS")
+    manifests = [checkout for checkout in checkouts if (checkout / "Cargo.toml").is_file()]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for outputs in executor.map(read_cargo_output_roots, manifests):
+            if isinstance(outputs, CargoOutputRoots):
+                roots.update((outputs.target_directory, outputs.build_directory))
     return frozenset(roots)
 
 
