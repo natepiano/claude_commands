@@ -461,7 +461,8 @@ Rsync replaces complete files and preserves this host's append files.
 
 ## test_times.conf
 
-`SLOW_TEST_S` sets the minimum test time retained in the build log.
+`SLOW_TEST_S` sets the minimum gate test time retained in the build log.
+`NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
 `TOP_RUNS` sets the number of recent gate runs used to rank each module by its median wall time.
 Callers read these settings through `scripts/lib/conf.py` at each use.

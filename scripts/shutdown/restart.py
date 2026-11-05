@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -174,11 +175,30 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
         return []
 
 
-def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
-              resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
+def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
+                 resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
+    """Read only the supplied rows and return their live local conversations."""
     import remote
 
     selected: list[staff.StaffRow] = []
+    resolver = session_staff.RowResolver(record) if resolver is None else resolver
+    for row in rows:
+        try:
+            machine, _folder = shutdown_record.row_folder(row, record, resolver=resolver)
+            if machine != remote.local_machine():
+                continue
+            observed = herdr.read_conversation(str(row.current_session))
+            if isinstance(observed, herdr.LiveConversation):
+                selected.append(row)
+            elif isinstance(observed, herdr.UnknownConversation):
+                herdr.conversation_note(observed)
+        except (OSError, ValueError) as error:
+            _anomaly(row, error)
+    return selected
+
+
+def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
+              resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     # The registry supplies candidate names; the reader proves each conversation.
     try:
@@ -193,18 +213,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     for identity in sorted(candidates.keys() - owned):
         if isinstance(herdr.read_conversation(identity), herdr.LiveConversation):
             print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
-    for row in record.rows:
-        try:
-            machine, _folder = shutdown_record.row_folder(row, record, resolver=resolver)
-            if machine != remote.local_machine():
-                continue
-            observed = herdr.read_conversation(str(row.current_session))
-            if isinstance(observed, herdr.LiveConversation):
-                selected.append(row)
-            elif isinstance(observed, herdr.UnknownConversation):
-                herdr.conversation_note(observed)
-        except (OSError, ValueError) as error:
-            _anomaly(row, error)
+    selected = live_members(record.rows, record, resolver=resolver)
     if save_tabs:
         try:
             client.save_layout()

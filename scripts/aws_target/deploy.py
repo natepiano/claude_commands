@@ -924,6 +924,19 @@ class Deployment:
                 raise DeploymentRefused('target removal is incomplete; run deploy.py down --approve-destroy first')
             path = self.directory / 'up.json'
             results = remote.read_record(path) if path.exists() else {}
+            started = int(self.clock())
+            try:
+                status = self.execute(['tailscale', 'status', '--json'], capture_output=True, text=True,
+                                      timeout=conf.read(self.settings_path).whole('box_setup_timeout_s'), check=False)
+                if status.returncode:
+                    raise box.BoxRefused(f'tailscale status failed (exit {status.returncode})')
+                _ = box.policy_device_bindings(box.policy_source(), box.json_record(status.stdout))
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                result = StageResult('refused', started, int(self.clock()), self.admin.redact(str(error)))
+                results['up'] = {field.name: cast(object, getattr(result, field.name)) for field in fields(result)}
+                write_text_atomic(path, json.dumps(results, sort_keys=True) + '\n')
+                print('up: refused: ' + result.reason)
+                return False
             for stage in stages:
                 started = int(self.clock())
                 try:
@@ -935,6 +948,7 @@ class Deployment:
                     reason = 'scaler credential stage failed' if stage.name == 'scaler-key' else self.admin.redact(str(error))
                     result = StageResult('refused', started, int(self.clock()), reason)
                 results = remote.read_record(path) if path.exists() else results
+                _ = results.pop('up', None)
                 previous = ledger.mapping(results.get(stage.name, {}))
                 results[stage.name] = {**previous, **{field.name: cast(object, getattr(result, field.name)) for field in fields(result)}}
                 write_text_atomic(path, json.dumps(results, sort_keys=True) + '\n')
