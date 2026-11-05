@@ -1589,43 +1589,18 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** phone pushes for low space and sweep failure in this phase (text review failed; builds ruling 2026-11-04); an override of the text review with `--user-spec`; a persistent Cargo metadata cache.
 
-### Phase 59 — Idle hana runners hold no swap: the runner home moves from tmpfs to disk  · status: todo
-**Depends on:** none. Runs beside Phases 11 and 58 (showrunner request 2026-11-04 10:1x EST). It changes only the nixos repository.
+### Phase 59 — Idle hana runners hold no swap: the runner home moves from tmpfs to disk  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** while CI is idle, each hana runner service holds near zero swap, and the NVIDIA shader cache stays useful.
-
-**Measured:**
-1. At 10:1x EST on 2026-11-04, each idle hana runner service held about 1.0 GiB of swap.
-2. Shmem resident was 2-5 MiB. The two `Runner.Listener` processes held only 0.14 GiB of swap together.
-3. The runner home is the RuntimeDirectory `/run/github-runner/hana-linux-N` on the `/run` tmpfs, about 1.8 GiB used, mode 700.
-4. It holds `_actions`, `_diag`, `.nv` (NVIDIA shader cache), `.config` and `.dbus`. Tmpfs files are charged to the runner cgroup and swap out.
-5. `modules/linux/hana-runners.nix` keeps build caches under `cacheRoot = "/var/lib/hana-ci"` on disk, one `cacheDir` per runner.
-
-**Spec:**
-1. Confirm from `modules/linux/hana-runners.nix` and the upstream nixpkgs `github-runner` module which settings put each listed folder on the tmpfs. Record the source line of each.
-2. Move the runner home to disk under the runner's `cacheDir` (decision: disk keeps the shader cache across restarts, and a hook cleanup would delete it). Keep mode 700 and the per-runner account as owner.
-3. If upstream ties the work directory to the RuntimeDirectory, move `_actions` and `_diag` to disk by the same setting. Keep registration state on the tmpfs.
-4. Keep the existing `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` sweep hook unchanged.
-5. Commit the change on branch `resources-runner-home` in a plain git copy of `/etc/nixos` and push that branch. Never push or edit the `/etc/nixos` main checkout. Send the hash to natedev through the director.
-6. After the user's rebuild, read `memory.swap.current` of each `github-runner-hana-linux-N.service` while CI is idle. Save the values to `phases/59/swap_after.txt`.
-
-**Constraints from prior phases:**
-- The nixos main checkout belongs to natedev. Units push only branches.
-- The unit has no sudo. Read the live files with ordinary user access only.
+- In the nixos repository, `modules/linux/hana-runners.nix` gives each hana runner `homeDir = "${cacheDir}/home"` and `workDir = "${cacheDir}/work"` under `cacheRoot = "/var/lib/hana-ci"`. The service `HOME` is `homeDir` (`.nv` shader cache, `.config`, `.dbus`); its working directory is `workDir` (`_actions`, `_diag`). tmpfiles rules create both with mode 0700 and the runner account as owner.
+- Registration state stays on the tmpfs at `%S/github-runner/hana-linux-N`. The passwd home stays at `cacheDir`, so `cargo-tile install --all-accounts` finds `.rustup` as before. The `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` sweep hook is unchanged.
+- Branch `resources-runner-home` (7eaeba1) is on nixos main as cb366fc. After the rebuild, `memory.swap.current` of `hana-ci.slice` and both `github-runner-hana-linux-N.service` units read 0 while CI was idle (2026-11-04 16:33 EST).
 
 **Files:**
-- `phases/59/runner_home.md` — in the unit run folder: the source line of each folder, the branch, the commit hash and the nix diff.
-- `phases/59/swap_after.txt` — in the unit run folder: the swap of each runner service after the rebuild.
+- `modules/linux/hana-runners.nix` (nixos repository) — the runner home and work directory on disk.
 
-**Workers:** `1 writer`
-- `sweep-impl` owns the nix change, the branch push and both run-folder files.
-
-**Acceptance gate:**
-- `nix-instantiate --parse` of the changed file succeeds, and `nixos-rebuild dry-build` in the copy succeeds or its failure is unrelated and named.
-- The runner home, `_actions` and `_diag` resolve to paths under `/var/lib/hana-ci` in the built unit files.
-- After the rebuild, each idle runner service shows `memory.swap.current` under 64 MiB.
+**Gotchas:** the shader cache starts cold once after the move, and the first job refills `_actions`.
 
 ### Phase 60 — A filtered compile run's promise comes near what that run uses  · status: done
 
