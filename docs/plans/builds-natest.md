@@ -668,6 +668,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Phase 25: `MergeGateFixture.build_fixture` commits the real `module_run.py` into each fixture checkout, and the gate refuses a checkout with no runner.
 - Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- Architect review after Phase 34: `merge_gate_test_support.py:273` casts `None` to `AdmissionFixture`, and `admission_started` tracks its lifetime apart. A change to that lifetime uses named states (for example `AdmissionNotStarted | RunningAdmission`). A change that only measures needs no refactor.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/production -p 'test_merge_gate_ledger.py'` green, with the same test names and assertions
@@ -791,28 +792,50 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 34 — Every test module imports from the repo root with no PYTHONPATH  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** every documented way to run a test module uses the gate's form, `discover -s scripts/<folder> -p <module>.py` from the repo root, with no PYTHONPATH and no new package file.
-
-**Spec:** natedev found modules that fail with an import error unless PYTHONPATH names their folder (via the showrunner, 2026-11-05).
-
-1. Survey result (2026-11-05, 708 modules on 58dbae565): the path form, `python3 -m unittest scripts/<folder>/<module>.py` with PYTHONPATH unset, fails on import for 143 modules in 17 folders. They import siblings by bare name, and the path form puts only the repo root on `sys.path`. The gate's form (`scripts/test_times/module_run.py` → `discover -s <folder>`) puts the folder first, and every module passes that way.
-2. Fix at the caller (showrunner, 2026-11-05): no code runs the path form. `module_run.py`, `fast_track.py` and `coverage_overlap.py` already use discover. `docs/as-built/herdr-adoption.md:343` runs Mac suites with `PYTHONPATH=<clone>`; drop it and run from the clone root, where `-m` puts the clone first on `sys.path`. Proof: the herdr suite in that form with PYTHONPATH unset, in a `copies.py` clone.
-3. `docs/plans/builds-report.md:76` carries a Test line with `PYTHONPATH=scripts/buildlog`. The report unit owns that plan and changes the line (showrunner, 2026-11-05).
-4. Add no `__init__.py`, no `sys.path` change and no check.
-5. Ruled out:
-   - An `__init__.py` in each of the 17 folders that appends its folder to `sys.path` (sdlc, 2026-11-05). The 17 folders then share one bare-name space: `inventory` is in `feature_log` and `shutdown`, and `report` is in `buildlog` and `model_study`.
-   - Qualified imports in every folder: a runtime change in 17 folders of many units.
+- `docs/as-built/herdr-adoption.md:343` runs Mac suites from the clone root as `~/.claude/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`, with no PYTHONPATH. Proof: the herdr suite in that form with PYTHONPATH unset, 408 tests OK in 89.5 s in a `copies.py` clone.
+- Survey (708 modules on 58dbae565): the path form `python3 -m unittest scripts/<folder>/<module>.py` fails on import for 143 modules in 17 folders, because they import siblings by bare name. The gate's form (`discover -s <folder>`) passes for every module. No code runs the path form: `module_run.py`, `fast_track.py` and `coverage_overlap.py` use discover.
+- The report unit owns the `PYTHONPATH=scripts/buildlog` Test line at `docs/plans/builds-report.md:76`.
+- Next item filed: three `scripts/lib` helpers named `test_*.py` hold no tests (rename proposal, held).
 
 **Files:**
 - `docs/as-built/herdr-adoption.md` — the Mac suite command at line 343
 
-**Workers:** none (one doc line; the director makes it)
+**Ruled out:**
+- An `__init__.py` in each of the 17 folders that appends its folder to `sys.path` (sdlc, 2026-11-05): the folders then share one bare-name space, and `inventory` (`feature_log`, `shutdown`) and `report` (`buildlog`, `model_study`) clash.
+- Qualified imports in every folder: a runtime change in 17 folders of many units.
+
+### Phase 35 — A checkpoint merge writes its unit as the Producer of each change-review row  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** each change-review row that `merge_checkpoint.py` writes for a unit merge names that unit's staff id in Producer, whatever the checkpoint subject slug says.
+
+**Spec:** defect from the user through natedev and the showrunner (2026-11-05). The builds merge of `f05b9fcc2` (aws nextest-parity) wrote row C1017 with an empty Producer.
+- Cause: `change_review.publication_changes` finds the unit only from the subject slug `checkpoint(<slug>):`, through branch, plan stem, unit name and worktree name. aws's slugs are `builds-aws-plan` and `builds-aws-up`, its branch is `builds-aws` and its plan is `standby`. No alias matches, so Producer stays empty.
+- Fix at the source: `merge_checkpoint.py` already knows the unit it merges. `unit_from_row` reads the unit's staff row, so `Unit` carries the row's `staff.StaffId`. Pass that id to `publication_changes` for every merge of a unit. Each row of that merge then gets that id as Producer. The slug lookup stays only for callers that do not know the unit (the child hand-off path, `change_review.py` command line).
+- Keep the row owner (production doc) as it is today.
+- Test (asked by the showrunner for this defect): a unit merge whose checkpoint subject slug matches no alias writes the unit's staff id in Producer.
+- `merge_gate.py` also writes rows from `publication_changes` (line ~1445, `args.unit`). It is outside this phase's files. Report whether it has the same fault; do not edit it.
+- Add no other guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/production/merge_checkpoint.py` — `Unit` gains the staff id; `unit_from_row`; `record_changes`, `record_publication_changes` and the `ChangesReadBeforePush` call pass it (owner outside builds; the showrunner holds it for this fix)
+- `scripts/production/change_review.py` — `publication_changes` takes the known producer (owner outside builds; the showrunner holds it for this fix)
+- `scripts/production/test_merge_checkpoint*.py`, `scripts/production/test_change_review.py` — the new test and each `Unit(...)` fixture that needs the new field
+
+**Workers:** 1 writer (two files and their tests; too small to split)
+- `impl` — all files above
+- `test` — opens as impl
 
 **Constraints from prior phases:**
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
 
 **Acceptance gate:**
-- `env -u PYTHONPATH scripts/lib/py -m unittest discover -s scripts/herdr -p 'test_*.py'` green from the root of a `copies.py` clone
-- no `__init__.py` or `folder_imports.py` added
+- the new test fails on the base commit and passes on the phase commit
+- `test_change_review.py`, `test_change_routing.py`, `test_merge_gate.py` and every `test_merge_checkpoint*.py` green in the gate form `python3 scripts/test_times/module_run.py scripts/production <module>`
+- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
