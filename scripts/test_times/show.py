@@ -425,17 +425,17 @@ def main(argv: list[str] | None = None) -> int:
         match request.command:
             case "top":
                 if TYPE_CHECKING:
-                    from ..buildlog import record
+                    from ..buildlog import repository
                 else:
-                    import record
+                    import repository
 
                 repo = request.repo.expanduser().resolve()
                 repo = Path(treekey.worktree(str(repo)) or str(repo))
-                identity = record.recorded_repository_key(["git"], str(repo))
+                identity = repository.repository_key(str(repo))
                 if identity == store.UNKNOWN_IDENTITY:
                     print(f"repository identity unavailable for {repo}", file=sys.stderr)
                     return 1
-                if identity == record.recorded_repository_key(["git"], str(TOOL_REPOSITORY)):
+                if identity == repository.repository_key(str(TOOL_REPOSITORY)):
                     top(connection, request.host, request.limit, repo)
                 else:
                     nextest_top(connection, request.host, request.limit, repo, identity)
