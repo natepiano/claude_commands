@@ -328,7 +328,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
    - The collector joins each child's set to its test's set. Each process records each child it starts (audit hook) and writes the list with its set. Each child also writes its exit time.
    - A child launch is verified in two cases. (a) Its program is Python, or a `#!` script whose interpreter is Python, with no `-I`, `-S` or `-E`; this child must write a set. (b) Its program is a binary (not a `#!` script) whose name is in `COVERAGE_LEAF_PROGRAMS` in `config/test_times.conf` (default `git`); its Python descendants write sets through the inherited variables. Every other launch is unverified: a shell, `env`, a non-Python `#!` script, or a Python with `-I`, `-S` or `-E`.
    - A test is `child: unknown`, with the cause, when one of these occurs: a verified Python child wrote no set (an `env=` without the variables, a child killed before exit); it made an unverified launch; it forked with no exec; or a child of an earlier test was still alive when it started.
-   - A child that exits after its test stops makes that test unknown (cause `child outlived its test`), and also each later test that started before the child exit. A child that starts outside a test (`setUpClass`, module setup) makes every test of its class unknown (cause `shared child`).
+   - A child that exits after its test stops makes that test unknown (cause `child outlived its test`), and also each later test that started before the child exit. A Python child that starts outside a test (`setUpClass`, module setup) makes unknown each test that starts before its exit (cause `shared child`). A child from setup that exited before a test started has no effect on that test: no test owns setup lines. A leaf or unverified launch from setup has no exit time; it has no effect (risk: a background process from setup that serves later tests).
    - An unknown test is never a candidate, and its lines do not cover another test.
 3. Candidates: a test is a candidate when a kept test, or the union of kept tests, runs every line it runs. Decide the tests slowest first. After each candidate, take it out of the kept set and check again, so two tests that cover each other cannot both be candidates.
 4. Output: one JSON file (`COVERAGE_OUT=<path>`) with the tree sha, the interpreter, and for each test: id, status, seconds, line count, `child`, and for a candidate the covering test ids. Also print a table: candidate, covering tests, seconds. Use `terminal_cells.py` for alignment.
@@ -340,12 +340,12 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/test_times/test_coverage_overlap.py` — new tests, with small fixture modules written in a temporary folder
 - `scripts/test_times/coverage_child/sitecustomize.py` — new child collector (the folder holds only this file)
 - `scripts/test_times/line_collector.py` — new: the `LINE` collector, its path filter and the child launch record, used by the parent and by each child (one place)
-- `config/test_times.conf` — `COVERAGE_LEAF_PROGRAMS` (Phase 14 also edits this file; when Phase 14 checkpoints first, its commit can carry this key before any code reads it)
+- `config/test_times.conf` — read only here: Phase 14 adds `COVERAGE_LEAF_PROGRAMS` (one phase owns each file)
 - `docs/plans/builds-natest.md` — the Speed method line (director)
 
 **Workers:** 1 writer + 1 tester
-- `impl` — `coverage_overlap.py`, `coverage_child/sitecustomize.py`, `line_collector.py`, hub: `config/test_times.conf`
-- `test` — `test_coverage_overlap.py`, from the Spec: a repeat test is a candidate; a test with one line of its own is not; two tests that cover each other give one candidate; a Python child's lines join its test's set; a child under `-I` makes the test `child: unknown`, and it covers nothing; a shell child (`sh -c 'python3 -I …'`) makes the test unknown; a git child keeps the test known; a child that outlives its test makes that test and each overlapped later test unknown; a child started in `setUpClass` makes its class's tests unknown; a child still sees `NIX_PYTHONPATH` entries on `sys.path`; with no `NATEST_COVERAGE_TEST`, the child writes nothing; lines in test files are not counted
+- `impl` — `coverage_overlap.py`, `coverage_child/sitecustomize.py`, `line_collector.py`
+- `test` — `test_coverage_overlap.py`, from the Spec: a repeat test is a candidate; a test with one line of its own is not; two tests that cover each other give one candidate; a Python child's lines join its test's set; a child under `-I` makes the test `child: unknown`, and it covers nothing; a shell child (`sh -c 'python3 -I …'`) makes the test unknown; a git child keeps the test known; a child that outlives its test makes that test and each overlapped later test unknown; a Python child from `setUpClass` that is still alive at a test's start makes that test unknown; a git child or a Python child from `setUpClass` that exited before the first test keeps the tests known; a child still sees `NIX_PYTHONPATH` entries on `sys.path`; with no `NATEST_COVERAGE_TEST`, the child writes nothing; lines in test files are not counted
 
 **State:** none
 
@@ -388,8 +388,10 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - each removal names a covering test that checks the same result
 - the pair medians show each changed module's wall and CPU time not higher than before
 
-### Phase 14 — `test_times top` ranks only valid runs  · status: todo
+### Phase 14 — `test_times top` ranks only valid runs  · status: done
 **Depends on:** none (runs beside Phase 12; the two share no file)
+
+**Result:** `test_times top` counts only passed, complete runs on the builds checkout from the last 7 days, and names each live module that has no counted run. Each new gate run stores `slow_test_s` and `tests_run`. `top` prints in 0.2 s on the live index.
 
 #### Work Order
 
@@ -409,7 +411,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 4. `show.py suites` prints `tests run` for each run. A test row that is not kept shows the run's `slow_test_s` and says that the test was faster than it or did not run. A record holds no list of the tests that ran, so the tool cannot tell these two cases apart; the text says so.
 
 **Files:**
-- `scripts/test_times/show.py`, `config/test_times.conf` — ranking filters and the unmeasured line
+- `scripts/test_times/show.py`, `config/test_times.conf` — ranking filters and the unmeasured line; the config also gets `COVERAGE_LEAF_PROGRAMS=git`, which Phase 12 reads
 - `scripts/test_times/gate_record.py`, `scripts/buildlog/index.py` — the two run fields
 - `scripts/production/merge_gate.py` — `record_gate_run` reads the threshold once and passes it in (owner: sdlc devtools-unit)
 - `scripts/test_times/test_show.py`, `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_gate_index.py`, `scripts/buildlog/test_index.py`, `scripts/test_times/gate_record_test_support.py` — tests and their shared helpers

@@ -48,6 +48,11 @@ def query_rows(connection: sqlite3.Connection, sql: str,
 
 
 @dataclass(frozen=True)
+class ThresholdNotRecorded:
+    """The legacy run does not record its test threshold."""
+
+
+@dataclass(frozen=True)
 class ModuleAttempt:
     run_id: str
     started_at: str
@@ -63,14 +68,17 @@ class ModuleAttempt:
     tests_run: int
     tests_s: float
     aborted: bool
+    slow_test_s: float | ThresholdNotRecorded
 
     @classmethod
     def from_row(cls, row: dict[str, object]) -> ModuleAttempt:
+        threshold = row["slow_test_s"]
         return cls(str(row["run_id"]), str(row["started_at"]), str(row["suite"]), str(row["module"]),
                    int(str(row["attempt"])), str(row["restart"]), str(row["times_missing"]),
                    float(str(row["wall_s"])), float(str(row["cpu_s"])), float(str(row["peak_mib"])),
                    int(str(row["status"])), int(str(row["tests_run"])), float(str(row["tests_s"])),
-                   bool(row["aborted"]))
+                   bool(row["aborted"]),
+                   ThresholdNotRecorded() if threshold is None else float(str(threshold)))
 
     @property
     def key(self) -> tuple[str, str]:
@@ -79,6 +87,11 @@ class ModuleAttempt:
     @property
     def name(self) -> str:
         return f"{self.suite}/{self.module}"
+
+
+MODULE_ATTEMPTS_QUERY = """
+    SELECT m.*, r.aborted, r.slow_test_s FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+"""
 
 
 @dataclass(frozen=True)
@@ -129,19 +142,26 @@ def print_table(headers: Sequence[str], rows: Sequence[Sequence[str]],
 
 
 def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> None:
-    live = {(suite, test_module_name(repo, suite, path))
-            for suite, path in discover_test_modules(repo)}
-    live.add(TYPE_CHECK_JOB)
-    count = conf.read("test_times").whole("TOP_RUNS")
+    modules = {(suite, test_module_name(repo, suite, path))
+               for suite, path in discover_test_modules(repo)}
+    config = conf.read("test_times")
+    count = config.whole("TOP_RUNS")
+    checkout = Path(config.text("TOP_CHECKOUT")).expanduser().resolve()
+    checkouts = [str(row["checkout"]) for row in query(connection,
+                 "SELECT DISTINCT checkout FROM gate_runs WHERE host = ?", (host,))
+                 if Path(str(row["checkout"])).expanduser().resolve() == checkout]
+    checkout_parameters = ", ".join(["?"] * len(checkouts))
+    oldest = cutoff(config.whole("TOP_MAX_AGE_DAYS"))
     histories: list[list[ModuleAttempt]] = []
-    for folder, filename in sorted(live):
+    for folder, filename in sorted(modules | {TYPE_CHECK_JOB}):
         history: list[ModuleAttempt] = []
         seen: set[str] = set()
-        for row in query_rows(connection, """
-            SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+        for row in query_rows(connection, MODULE_ATTEMPTS_QUERY + f"""
             WHERE m.suite = ? AND m.module = ? AND m.host = ? AND m.restart = ''
+              AND m.status = 0 AND r.aborted = 0 AND r.checkout IN ({checkout_parameters})
+              AND m.started_at >= ?
             ORDER BY m.started_at DESC, m.run_id DESC, m.attempt ASC
-        """, (folder, filename, host)):
+        """, (folder, filename, host, *checkouts, oldest)):
             attempt = ModuleAttempt.from_row(row)
             if attempt.run_id in seen:
                 continue
@@ -151,6 +171,8 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
                 break
         if history:
             histories.append(history)
+    unmeasured = [f"{folder}/{filename}"
+                  for folder, filename in sorted(modules - {history[0].key for history in histories})]
     ranked = sorted(((statistics.median(attempt.wall_s for attempt in history), history)
                      for history in histories), key=lambda item: (-item[0], item[1][0].name))[:limit]
     output: list[list[str]] = []
@@ -173,6 +195,8 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
                  "slowest kept test", "runs counted"], output, "no modules recorded yet")
     if output:
         print(f"{len(output)} modules; sum of medians {seconds(sum(item[0] for item in ranked))} s")
+    if unmeasured:
+        print(f"unmeasured: {len(unmeasured)} live modules: {', '.join(unmeasured)}")
 
 
 def cutoff(days: int) -> str:
@@ -187,9 +211,10 @@ def suites(connection: sqlite3.Connection, host: str, days: int) -> None:
         ) AS slowest FROM gate_runs r
         WHERE r.host = ? AND r.started_at >= ? ORDER BY r.started_at DESC, r.id DESC
     """, (host, cutoff(days)))
-    print_table(["start", "host", "selection", "modules run", "wall s", "status", "slowest module", "run"], [
+    print_table(["start", "host", "selection", "modules run", "tests run", "wall s", "status", "slowest module", "run"], [
         [local_time(str(row["started_at"])), str(row["host"]), str(row["selection"]),
-         str(row["modules_run"]), seconds(float(str(row["wall_s"]))), verdict(int(str(row["status"]))),
+         str(row["modules_run"]), "" if row["tests_run"] is None else str(row["tests_run"]),
+         seconds(float(str(row["wall_s"]))), verdict(int(str(row["status"]))),
          str(row["slowest"] or ""), run_mark(bool(row["aborted"]))] for row in rows])
 
 
@@ -207,8 +232,7 @@ def suite(connection: sqlite3.Connection, host: str, folder: str, days: int) -> 
 
 def module(connection: sqlite3.Connection, host: str, name: str, runs: int) -> None:
     folder, filename = name.split("/", 1)
-    attempts = [ModuleAttempt.from_row(row) for row in query(connection, """
-        SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+    attempts = [ModuleAttempt.from_row(row) for row in query(connection, MODULE_ATTEMPTS_QUERY + """
         WHERE m.host = ? AND m.suite = ? AND m.module = ?
         ORDER BY m.started_at DESC, m.run_id DESC, m.attempt DESC LIMIT ?
     """, (host, folder, filename, runs))]
@@ -245,8 +269,7 @@ def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> Non
     candidates: list[ModuleAttempt] = []
     for (folder, filename), names in identities.items():
         seen: set[str] = set()
-        for row in query_rows(connection, """
-            SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+        for row in query_rows(connection, MODULE_ATTEMPTS_QUERY + """
             WHERE m.suite = ? AND m.module = ? AND m.host = ? AND m.started_at >= ?
             ORDER BY m.started_at DESC, m.run_id DESC, m.attempt DESC
         """, (folder, filename, host, min(names.values()))):
@@ -270,12 +293,15 @@ def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> Non
             if attempt.started_at < first_at:
                 continue
             duration = ""
-            status = "not kept"
             if attempt.times_missing:
                 status = "times missing"
             elif name in kept:
                 row = kept[name]
                 duration, status = seconds(float(str(row["duration_s"]))), str(row["status"])
+            elif isinstance(attempt.slow_test_s, ThresholdNotRecorded):
+                status = "not kept (slow_test_s unknown)"
+            else:
+                status = f"not kept (faster than {seconds(attempt.slow_test_s)} s or did not run)"
             output.append([local_time(attempt.started_at), attempt.name, name, duration, status,
                            run_mark(attempt.aborted)])
     print_table(["start", "suite/module", "test", "duration s", "status", "run"],
