@@ -364,7 +364,7 @@ class MergeGateFixture(unittest.TestCase):
         readings.mkdir(exist_ok=True)
         self.environment.update(fake_memory_readings(readings))
         self.environment.update({
-            "BUILDLOG_DIR": str(root / "buildlog"), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+            "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "merge-gate",
             "NOTIFIER_SESSIONS_DIR": str(home / "sessions"),

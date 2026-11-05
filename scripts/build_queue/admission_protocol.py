@@ -265,20 +265,11 @@ def parse_record(text: str, schema: type[T]) -> T:
     return cast(T, gate.parse_snapshot_value(value, schema))
 
 
-def _encode(value: object, variants: dict[str, type], *, main_service: bool = False) -> str:
+def _encode(value: object, variants: dict[str, type]) -> str:
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
     data = gate.snapshot_value(value)
-    if main_service and isinstance(value, (AdmitRequest, LaunchRequest)):
-        identity = cast(dict[str, object], cast(dict[str, object], data)["identity"])
-        del identity["unit"]
-    # Remove these main-service field omissions after the admission cut-over.
-    omitted: set[str] = {"run"} if isinstance(value, AdmitRequest) and isinstance(value.run, NoRun) else set()
-    if main_service and isinstance(value, CallerCode):
-        omitted.add("code_version")
-    for field_name in omitted:
-        del cast(dict[str, object], data)[field_name]
     return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
 
 
@@ -294,13 +285,7 @@ def _parse(line: str | bytes, variants: dict[str, type]) -> object:
         if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
         data = envelope["data"]
-        if variants is _REQUESTS and isinstance(data, dict):
-            data = {"code_version": "", **cast(dict[str, object], data)}
-        if variants[name] is Admitted and isinstance(data, dict):
-            data = {"cleanup_timing": gate.snapshot_value(PROTOCOL_CLEANUP_TIMING), **cast(dict[str, object], data)}
-        if variants[name] is AdmitRequest and isinstance(data, dict) and "run" not in data:
-            data = {**cast(dict[str, object], data), "run": gate.snapshot_value(NO_RUN)}
-        return gate.parse_snapshot_value(cast(object, data), variants[name])
+        return gate.parse_snapshot_value(data, variants[name])
     except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
@@ -315,9 +300,9 @@ def _validate_cleanup(request: Request) -> None:
         raise ValueError("cleanup status exceeds signed 64-bit range")
 
 
-def encode_request(request: Request, *, main_service: bool = False) -> str:
+def encode_request(request: Request) -> str:
     _validate_cleanup(request)
-    return _encode(request, _REQUESTS, main_service=main_service)
+    return _encode(request, _REQUESTS)
 
 
 def parse_request(line: str | bytes) -> Request:

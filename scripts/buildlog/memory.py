@@ -401,8 +401,7 @@ def window_report(connection: sqlite3.Connection, start: datetime, end: datetime
     recorded = queue_snapshot.read_queue_snapshot(store.root() / "admission")
     cap_line = ""
     if isinstance(recorded, queue_snapshot.QueueSnapshot) and start.timestamp() <= recorded.written_at < end.timestamp():
-        cap_line = room_text(gate.head_policy(recorded.inputs, recorded.written_at,
-                            gate.AdmissionLimits(recorded.policy.safety_bytes), recorded.policy).room)
+        cap_line = room_text(gate.inputs_room(recorded.inputs, recorded.policy))
     lines.append(cap_line or "Cap: no recorded admission pass in this window")
     early = earlyoom_kills(start, end)
     if early is JournalUnavailable.VALUE:

@@ -81,7 +81,7 @@ only I can bump
 7. **Constraints from 10r (checkpoint 64615a2c5).** Measured memory is resident only (cgroup memory.current minus inactive_file; RSS for processes); `swap_bytes` is kept apart and is never charged. Service rows (hana CI, compiler cache) are tagged in `scripts/build_queue/scope_activity.py`. An empty service row (no live process, zero RAM) is not a running step (`scripts/lint/memory_admit.py:1816`); idle CI with RAM still charges it. The design and rulings are in the session file phases/10t/design.md; ruling 8 adds `build_free_check_calm`.
 ### Phase 10u — Gate copies belong to a staff row  · status: todo
 
-**Depends on:** none. It touches `scripts/copies/*` and its callers only, so it can run beside the admission phases.
+**Depends on:** verify-unit Phase 35 on GitHub builds. At that checkpoint queue-unit takes `scripts/copies/` (copies.py, copy_guard.py, their tests, `docs/as-built/copies.md`), its cleanup and the `scripts/mac_test/floor_claims.py` lock order (mirror lease, then floor claim lock, then copy-record lock); confirmed to verify-unit 2026-11-05 under the builds ruling of 2026-11-03. It touches `scripts/copies/*` and its callers only, so it can run beside the admission phases.
 
 1. **The ask (user, 2026-11-04; sdlc ruling as staff owner; builds assigned copies.py to queue-unit).** Everything tracks back to the staff file.
 2. **The change.** `copies.py --owner` takes a staff row and refuses a name or id that staff.json does not hold. The copies registry stores the owner's staff id. Readers show the current staff short name, looked up from the id at read time. No reader parses the owner from a folder name.
@@ -190,9 +190,9 @@ only I can bump
 
 **Ruled out:** a service lock (tests use the loop thread instead).
 
-### Phase 10x — The admission code keeps one way to do each thing  · status: todo
+### Phase 10x — The admission code keeps one way to do each thing  · status: done
 
-**Depends on:** 10z and 10s. Runs before 10d, 10h, 10k and 10v, which change the same admission files. **Order after 10x (architect review, 2026-11-05):** 10d, 10h, 10k, 10v, then 10e, one at a time; 10e runs after 10v because both change the merge gate caller and its history identity.
+**Depends on:** 10z and 10s. Runs before 10d, 10h, 10k and 10v, which change the same admission files. **Order after 10x (builds showrunner ruling, 2026-11-05, after the user's question on merge-gate keep-aside):** 12 and 13 side by side (user ask, 2026-11-05 12:5x), then 10k, then 14, then 10o, 10d, 10h and 10v, one at a time. 10k runs first because merge gates keep about 5 GiB each aside while they use a fraction of it; 10k now covers merge gates and replaces 10e. 10v changes the merge gate caller and its history identity after 10k and keeps 10k's profile evidence.
 
 #### Work Order
 
@@ -231,6 +231,60 @@ only I can bump
 
 **Acceptance gate:** memory, queue, buildlog, hooks, direct `test_verify_*` and merge-gate admission suites pass; basedpyright 0/0/0 on each slot's files; the diff deletes more lines than it adds. Change-Review: none — the queue view, card and waits show the same text and numbers as before.
 
+Added during the phase (user ruling, 2026-11-05, after review round 1): the main system keeps no code that converts old records. This replaces the snapshot and state readers in items 2, 4 and 7. Delete every old-shape conversion from the readers. Old data at rest is converted once, at deploy, by a program outside the repository (`/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/10x/migrate_10x.py`), which is then deleted. The checkpoint notice names the deploy steps: stop the admission service, run the program, start the service. Replies from a service that still runs the old code are not converted; the restart ends them.
+
+### Phase 12 — The merge gate reserves 4 GiB from config and no longer kills on memory  · status: done
+
+#### As-built
+
+- `config/build_admission.conf` has two keys, each 4 GiB. `merge_gate_reservation_gib` sizes the merge gate's build queue reservation (`gate_reservation` reads it when the gate joins the queue, `FixedCapSizing`). `merge_gate_governor_gib` bounds the gate's own test runner (`run_suites` reads it at start). `merge_gate_memory_gib(key)` reads both and turns an unusable value into `GateRefused` naming the key.
+- `SampledRSSAdmission.governor_mib` starts a job only when latest + reserved + expected stays within it and a CPU slot is free; with no job running it always starts one. At 4 GiB the full type check (4.76 GiB reservation) runs with no test module beside it.
+- The gate has no memory kill and no memory fail: the result and the reservation status depend only on test results. A module still running at the time limit still fails the gate. `--memory-cap-mib`, `DEFAULT_MEMORY_CAP_MIB` and `GateRun.memory_within_cap` are gone.
+- The runner prints `memory governor N GiB`; the summary prints the sampled peak with no cap. Gate ledger records keep the field `cap_mib`, which now holds the governor bound.
+
+**Files:**
+- `scripts/production/merge_gate.py` — the two key readers, the governor, no memory kill or fail
+- `config/build_admission.conf` — `merge_gate_reservation_gib`, `merge_gate_governor_gib`
+- `scripts/production/merge_gate_test_support.py` — `MergeGateFixture.configure_gate`
+- `scripts/production/test_merge_gate*.py` — key, governor and no-kill tests
+- `scripts/buildlog/index.py` — the `cap_mib` column label
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/build-memory-admission.md`
+
+**Binds later work:** the percent-done keep-aside phase deletes `merge_gate_reservation_gib` and its reader when the gate switches to the profile rule; `merge_gate_governor_gib` stays.
+
+**Ruled out:** one key for both uses; a `--memory-cap-mib` override beside config.
+
+### Phase 13 — A caller test's fake clock skips the start spacing when no caller run is live  · status: todo
+
+**Asked by:** the builds showrunner, 2026-11-05, from natest's simplify review. First item after 10x, before 10o.
+
+**Cause:** the caller fixture's fake clock moves with real time, and its memory readings are static. So the production start spacing (5 s) becomes a real wait of about 2 s between independent verify or merge-gate runs. This happens in all 30 modules that call `caller_admission()`.
+
+**Work:**
+1. First check: do the steps of one `verify.sh` run keep a live reservation or between-steps slot from step to step (Phase 11)? Record the answer with its evidence. If they do not, the rule in item 2 also removes the spacing inside one run; then stop and report to the director before you build item 2.
+2. In `ObservedAdmissionServer.handle_request` and `caller_admission` (`scripts/build_queue/admission_test_support.py`): when a caller fixture gets an `AdmitRequest` or `LaunchRequest` and no caller reservation or waiter is live, move the fake clock to `NextStartAt.at`. Scenery reservations do not count as live callers.
+3. `caller_admission` gets an opt-out for tests that check the spacing. Name each test that uses it.
+4. `allow_next_start()` takes `loop_turn()` itself (`loop_access` is an RLock). Delete every `with loop_turn(): allow_next_start()` copy (4 today). `test_record.py:845` and `test_memory_admit.py:4574` call it without the lock today; they now get it.
+5. Do not set `recovery_start_seconds=0`. Do not mock the admission result.
+
+**Proof:** measure `test_verify_lint_judgment.py`, `test_verify_cache_versions.py` and `test_verify_token_loss.py` before and after, on the same load. natest's manual advance measured 219.8 -> 204.5 s, 116.3 -> 112.8 s and 11.8 -> 9.5 s. Run every `caller_admission()` caller suite.
+
+**Overlap:** natest's plan (`docs/plans/builds-natest.md` step 7) puts one `allow_next_start()` advance in `merge_gate_test_support.run_gate`. After 13, that advance is not needed; tell natest the builds commit.
+
+**Depends on:** 10x (it changes `admission_test_support.py`). Runs beside 10k. 13 lands first if both touch `test_memory_admit.py`; 10k's tester takes the merge.
+
+### Phase 10o — The admission client starts with only what it uses  · status: todo
+
+**Depends on:** 10x. Runs before 10d, which changes `admission_client.py`. Source: builds showrunner, 2026-11-05 08:1x EST (natest trace).
+
+**Outline (compose the Work Order at phase start):**
+1. **Cause.** `scripts/build_queue/admission_client.py` imports `admission_service` (for `SystemClock`), `queue_view` (for `reason_phrase`) and `scripts.lint.memory_admit` at load (`:23-28`). Every `verify.sh` admit and release starts the client through `scripts/lint/memory_gate.sh:17-22`. natest traced 2.9 s of admit and release spans per run with no repair and 6.6 s per run with repairs; its estimate of the saving is 0.2-0.5 s per run.
+2. **Fix.** The client start loads only what the called command uses. Commands that talk to the service (`admit`, `release`, `launch`, `width`, `token_wait`) load no service, view or admission rule module. Move a shared small type to a module the client can load alone, or load the module inside the command that needs it.
+3. **build_hold.py stays out (builds, 2026-11-05).** The `build_hold.py` freeze is natedev's send.py cleanup, with no end time. natest's `build_hold.py` import proposal becomes its own item when builds sends natedev's main hash; natest sends the proposal text to this unit.
+4. **SystemClock home (natest proposal).** Give `SystemClock` a module that imports no service code, so `admission_client.py` imports no server code. Do not copy the clock. natest profile: `admission_service` is 211-275 ms of a `build_hold` import; `admission_protocol` 161 ms; `memory_admit` 143 ms. Tell natest the builds commit when 10o lands.
+5. **Measure.** Measure the client start before and after (cold `python -X importtime` and wall time of `admit`/`release` against a fixture service), and report both numbers in the notice.
+6. **Proof.** Measure before and after (item 5); client, queue and verify suites stay green. Add no new import test: a new check goes to the user first (user, 2026-11-05 09:17 EST, via sdlc), and natest is asking the user about import tests.
+
 ### Phase 10h — A memory wait names what holds it  · status: todo
 
 **Depends on:** 10z and 10x (it rewrites the admission client and service).
@@ -247,21 +301,54 @@ only I can bump
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `admission_client.py`, `admission_service.py`, the pass record in `memory_admit.py`; `test` owns their tests.
 
-### Phase 10k — Rust runs keep aside memory by percent done  · status: todo
+### Phase 10k — Rust runs and merge gates keep aside memory by percent done  · status: todo
 
-**Depends on:** 10z and 10x (same admission files; one change at a time). Run every caller suite (direct `test_verify_*`, buildlog, hooks, merge admission) before the full gate, with `occupy_host` and `allow_next_start` where a fixture needs them.
+**Depends on:** 10z and 10x (same admission files; one change at a time). Runs after 12 and 13 (builds ruling, 2026-11-05; 12 added by the user ask, 12:5x). Run every caller suite (direct `test_verify_*`, buildlog, hooks, merge admission) before the full gate, with `occupy_host` and `allow_next_start` where a fixture needs them.
 
 1. **The ask (user, 2026-11-04 adhoc review, A4).** Reserve what a run still needs. For Rust builds and tests, use percent done; other runs keep their history peak.
-2. **Group 1 and its counters.** cargo build and check, clippy, cargo mend and nextest. Merge gates stay out: they hold one slot and peak at 4.1-4.7 GiB of 6. Callers set `CARGO_TERM_PROGRESS_WHEN=always` and `CARGO_TERM_PROGRESS_WIDTH` (cargo refuses `always` on a pipe without a width); reuse the cargo-tile capture path where it applies. A counter is a phase plus done of total: nextest has a build phase, then a test phase; a counter that starts again (mend's second check) is a new phase. Parser fixtures cover carriage-return frames and missing counters.
+   **Merge gates (user, 2026-11-05, via builds):** "if it sizes it to the peak of what it used it will still be using too much - i've watched many of these merge gates MOST of the time they do not take the peak - most of the time they take a fraction of it - if we're running 3 then we're wasting massive amounts - when do we get the % relative memory reservation capability -?" Builds ruling: 10k covers merge gates, and 10e folds into it.
+2. **Group 1 and its counters.** cargo build and check, clippy, cargo mend, nextest and merge gates. A merge gate's counter is its suites done of its suites total. Callers set `CARGO_TERM_PROGRESS_WHEN=always` and `CARGO_TERM_PROGRESS_WIDTH` (cargo refuses `always` on a pipe without a width); reuse the cargo-tile capture path where it applies. A counter is a phase plus done of total: nextest has a build phase, then a test phase; a counter that starts again (mend's second check) is a new phase. Parser fixtures cover carriage-return frames and missing counters.
 3. **The profile.** Each group 1 run records its highest use in each 5% of each phase, under the key history already uses for the step's need, with the same retention. Failed runs and the existing margins keep their current treatment.
-4. **The keep-aside.** While a run runs, keep aside max(0, the highest recorded use from its phase and percent now to the end of its last phase − its use now). With no counter, or no matching profile, the run keeps its full 10z keep-aside.
+4. **The keep-aside (user ruling, 2026-11-05 12:3x EST).** While a run runs, keep aside max(0, the highest recorded use from its percent now to its percent now + the look-ahead − its use now). The look-ahead is a new key, `progress_lookahead_percent`, in `config/build_admission.conf`, read at use, initial value 20. The window crosses into the next phase when the current phase ends inside it. A merge gate uses the same rule. Example from the user: readings 0.1, 0.1, 0.1, 0.1, 4.9, 0.1 keep aside nothing extra until the 4.9 GiB peak is within 20% ahead. With no counter, or no matching profile, the run keeps its full 10z keep-aside. The pressure watch stays.
+   - **Risk the user accepted.** A run cannot get memory back after it starts. When the window reaches a peak, the keep-aside grows and new starts wait for it. Runs that already started can still meet their peaks at the same time. Item 7's replay measures this: three gates at once, with the peak memory sum and any OOM kill.
 5. **Shown.** Hovering a running run shows its phase, its percent done, what it keeps aside and why.
 6. **Test phase contract (architect reviews, 2026-11-05).** A nextest test phase keeps 10z's rule: need = max(test peak, N) × `test_phase_margin`. Freeze the baseline N and the margin when the test phase starts. Do not freeze the test peak: `test_phase_charge` (`memory_admit.py:3713`) reads the current test peak at each pass, and that stays. Progress data may lower the remaining need only from measured anonymous use, never from an estimate. A phase reset, a missing counter or an unmatched profile falls back to the frozen N and margin.
-7. **Proof.** Unit tests for the profile, each counter parser, each transition in item 6 and the fallback. One test grows the observed test peak past N after the test phase starts; the need follows the peak with the frozen margin. Measured runs after landing show lower keep-aside late in a build and no OOM kill.
+7. **Proof.** Unit tests for the profile, each counter parser, each transition in item 6 and the fallback. A replay of today's merge-gate runs shows reserved GiB against used GiB for three gates at once, with no OOM kill (builds ruling, 2026-11-05). One test grows the observed test peak past N after the test phase starts; the need follows the peak with the frozen margin. Measured runs after landing show lower keep-aside late in a build and no OOM kill.
 8. **Measured use (architect review of 10s, 2026-11-05).** Profiles and the use-now subtraction read the anonymous use that `run_memories` attributes, never resident bytes or swap. A run with `RunUseUnavailable` keeps its full keep-aside: it writes no profile sample and does not lower the remaining need. Name the no-counter and no-profile states as types, not `None`, and test them beside the phase-reset and growing-peak cases.
 9. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:407` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns the counter parsers, the profile writer, `memory_admit.py` and the caller files that set the cargo progress variables (`scripts/build_hold/cargo` and each nextest or clippy launch path the design finds; name outside owners in the notice); `test` owns the parser fixtures, the transition tests and the caller suites, with production caller fixtures that use `loop_turn()`.
+10. **Merge-gate caller (folded from 10e, builds ruling 2026-11-05).** `merge_gate.py:342` picks `FixedCapSizing` from `merge_gate_reservation_gib` (4 GiB since 12). Switch the gate to the 10k profile rule. Its suite counter feeds the profile.
+   - Valid evidence is the 10s anonymous reading of the gate's process tree. `merge_gate.py:484` measures resident memory plus swap, and `merge_gate.py:1036` sends that peak to the reservation sampler; profiles never read it.
+   - Records written before the change are legacy. A legacy record does not size a keep-aside. With no valid profile, the gate keeps its full keep-aside.
+   - The gate's own internal memory limit stays apart from its keep-aside.
+   - Tests: a valid profile lowers the keep-aside late in a gate; a legacy record and no record keep the full keep-aside; the internal limit does not change.
+   - **Delete 12's key (user, 2026-11-05: "until 10k lands").** In the same change that switches the gate to the profile rule, delete `merge_gate_reservation_gib` from `config/build_admission.conf` and its reader in `merge_gate.py`. 12 already removed the gate's memory kill and memory fail; 10k does not add them back. With no valid profile the gate keeps aside its full need, as item 4 says. The user approved this deletion with the 12 ask.
+11. **Folded from 10e (10c round 6).** F014: `_read_need_record` in `memory_admit.py` keeps three identical rejection returns; make one. F044: move the `struct` import in `admission_service.py` `_record_caller_version` to the module imports.
+12. **CI follows the look-ahead (user, 2026-11-05, on change row C1092, via builds).** "this is fine for the time being, but when the 10k fix comes in, then we should have it follow the 10k approach that i specified to the queue unit". A CI cargo call that has a counter and a profile keeps aside by item 4's look-ahead rule, not the fixed 7 GiB. Before 10d a CI job is not a registered run, so it has no counter: it keeps the 7 GiB keep-aside by item 4's fallback. 10d gives each CI cargo call a reservation and a counter. Record the user's words with `findings.py decision` on a held 10k finding when 10k opens.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns the counter parsers, the profile writer, `memory_admit.py`, `admission_service.py` (F044), `scripts/production/merge_gate.py` (sdlc devtools-unit's file: name it in the notice's also-touches line) and the caller files that set the cargo progress variables (`scripts/build_hold/cargo` and each nextest or clippy launch path the design finds; name outside owners in the notice); `test` owns the parser fixtures, the transition tests, `scripts/production/test_merge_gate*.py`, the merge gate admission suites and the caller suites, with production caller fixtures that use `loop_turn()`.
+
+### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: todo
+
+**Depends on:** 10k (runs after it; both may touch the client). Source: the 10x deploy check, 2026-11-05. User approval: "fix then" (2026-11-05, answer to the question whether a waiting build may stop with a clear message when the service keeps failing to start).
+
+#### Work Order
+
+**Goal:** A build that waits for memory never waits forever with no message while the admission service fails to start.
+
+**Spec:**
+1. **Cause (10x deploy check).** systemd keeps `build-admission.socket` active while `build-admission.service` fails at start each second. The client connects, the socket accepts, and the connection closes with no reply. The client treats `ECONNRESET`, `EPIPE` and `TransportUnavailable` as "admission service restarted; waiting again" and retries with no limit (`admission_client.py`, the `except (OSError, TransportUnavailable)` branch). Each connect also sets `retry.unreachable_deadline` back to no limit. Only a missing socket or a refused connect starts the unreachable time limit.
+2. **Fix.** A restart error starts the same unreachable time limit as a missing socket (`unreachable_limit_seconds`, today 60 s). Only a valid reply from the service clears it, not a connect. At the limit the client stops with the existing text: "build queue unreachable for <time>; step stopped; cargo token given back". Add no config key.
+3. **Keep.** A service restart that answers again within the limit keeps the wait, as today. Launch clients keep their launch time limit. `/build:queue` keeps its bounded query.
+4. **Proof.** Tests with a fake socket that accepts and closes with no reply: a waiting client stops at the limit with the text above; a service that answers within the limit keeps the wait and its place.
+
+**Files:**
+- `scripts/build_queue/admission_client.py` — the retry loop.
+- `scripts/build_queue/test_admission_client.py` — the tests.
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** queue and caller suites pass; basedpyright 0/0/0. Change-Review: none (the fault needs a failing service; the tests show it).
 
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 
@@ -766,7 +853,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **What /etc/nixos must change (natedev pushes it; no unit edits /etc/nixos):**
 1. `modules/linux/development.nix` `build-admission.socket`: `SocketGroup = "build-admission"`, `SocketMode = "0660"`; add group `build-admission` with natepiano and the hana runner accounts. This changes the "runner accounts are in no group" rule in `hana-runners.nix` for this one socket; record it there.
 2. `modules/linux/hana-runners.nix`: put the pinned admission cargo front on each runner's PATH ahead of the cargo-tile shim; add `ADMISSION_SOCKET` only if the path differs from the default; `BindPaths` for `/run/build-admission` if the runner units' sandbox hides `/run`.
-3. `hana-ci.slice`: raise `MemoryMax` from 18G to the admission budget (24G), so admission decides and the slice only catches a wrong estimate. Keep `MemorySwapMax=2G` and the `steve-ci` slot pool (CPU slots, not memory).
+3. `hana-ci.slice`: keep `MemoryMax=34G` (user, 2026-11-05). Keep `MemorySwapMax=2G` and the `steve-ci` slot pool (CPU slots, not memory).
 4. Order: the nixos change lands only after the admission cut-over enables the socket; until then CI keeps today's slice.
 
 **Constraints from the Phase 10 architect review (2026-11-03):**
@@ -783,7 +870,9 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - Service estimate request: `AdmitRequest` requires an estimated profile (`admission_protocol.py:67`), and build admission refuses a missing or stale generation (`admission_service.py:762`). Add a named request variant for a service-made estimate, not an optional profile. State its refresh, generation, replay and `NoRun` behavior. `impl` owns `admission_protocol.py`; `test` owns protocol compatibility tests, including a client from the pinned store package.
 - Deployment order: the socket exists already, so "after the socket" is no gate. The runner group gets socket access, and the slice cap rises, only after the service with authorization and a compatible protocol is on main and live. natedev owns the NixOS activation and the account-level acceptance.
 
-**Slice cap (builds ruling, 2026-11-05).** 10z deleted the admission budget, so nixos item 3 has no 24G value to copy. The `hana-ci.slice` cap is host RAM less the 3 GiB safety, and admission alone decides. Registered CI reservations replace the CI keep-aside, so CI is not charged twice. Order: 10d runs after 10q and 10x. **Last step, held for the user's go (builds filed the question):** delete `ci_memory_margin_gib` and send natedev the slice note with the new `MemoryMax`. If the user says keep, that step keeps `MemoryMax=34G` and the keep-aside.
+**Slice cap (builds ruling, 2026-11-05).** The `hana-ci.slice` cap stays 34G (user answer below). Registered CI reservations replace the CI keep-aside for registered jobs, so CI is not charged twice (see the accounting transition). Order: 10d runs after 10q and 10x. **User answer (2026-11-05, via builds):** "57GiB is impossible if we're running other programs - this doesn't make sense". The user rejected a fixed 57G limit. **User answer to the CI limit question (2026-11-05, via builds):** "keep the safety net" (choice 1). `MemoryMax=34G` stays, and 10d sends natedev no slice note. When 10d gives each CI build its own queue reservation, that reservation replaces the 7 GiB keep-aside, and 10d deletes `ci_memory_margin_gib` and its reader (the user approved the deletion with this choice). At 10d start, record these words with `findings.py decision` on a held 10d finding.
+
+**CI look-ahead (user, 2026-11-05, via builds; see 10k item 12).** The CI cargo front sets `CARGO_TERM_PROGRESS_WHEN=always` and `CARGO_TERM_PROGRESS_WIDTH` and feeds the counter, so each CI reservation keeps aside by the 10k look-ahead rule. A CI call with no counter or no profile keeps its full need. Test: a CI reservation with a profile keeps aside only the use inside the look-ahead window.
 
 **CI accounting transition (architect review of 10q, 2026-11-05).** Today `ci_keep_aside` (`memory_admit.py:1967`) adds the configured margin whenever any CI job runs, and it does not look at reservations. Before any key deletion or `MemoryMax` change:
 1. A running CI job with a registered reservation is charged only through its reservation.
@@ -801,24 +890,8 @@ This rule holds under both answers to the held last step; the answer changes onl
 
 **Acceptance.** Two hana CI jobs that cannot fit together under the admission checks run one after the other, and two that fit run at the same time, shown in `/build:queue` with the CI label; no CI rustc dies at the slice cap. Change-Review: in the Build queue pane during a hana CI run, the CI step shows as "hana CI · <runner> · <job>" and waits behind a session build when memory is short.
 
-### Phase 10e — A merge gate's grant comes from its recorded peak, not a fixed 6 GiB  · status: todo
-**Why.** Showrunner decision, 2026-11-03 (builds), after the 14:18 EST queue stall: two merge gates each held 6 GiB of the 24 GiB budget while they used 0.2 to 1.5 GiB. The Work Order follows before dispatch.
-
-**Moved here from 10c (round 6).** These items are not regressions, so 10c lands without them:
-1. F014: `_read_need_record` in `scripts/lint/memory_admit.py` keeps three identical rejection returns. Make one.
-2. F044: move the `struct` import in `admission_service.py` `_record_caller_version` to the module imports.
-
-**Existing path (architect review, 2026-11-05).** `HistoryPeakSizing`, `program_peak_estimate` and the program refresh path exist; `merge_gate.py:342` still picks `FixedCapSizing`. The change is the caller switch and its evidence. Agree history handling with 10v's `full-tests` split. 10e runs after 10v (see 10x's order line).
-
-**Anonymous peak evidence (architect review of 10q, 2026-11-05).** `merge_gate.py:484` measures resident memory plus swap, and `merge_gate.py:1036` sends that peak to the reservation sampler. `program_peak_estimate` (`memory_admit.py:1741`) reads those records as `anon_peak_bytes`. Before the caller switch:
-1. Define valid anonymous peak evidence for a merge gate: the 10s anonymous reading of the gate's process tree.
-2. Mark records written before the change as legacy. A legacy record does not size a grant. With no valid record, the gate keeps today's fixed grant.
-3. Keep the gate's own internal memory limit apart from its grant.
-4. Tests: a valid record sizes the grant; a legacy record and no record keep the fixed grant; the internal limit does not change.
-
-**Workers:** `1 writer + 1 tester` — `impl` owns `memory_admit.py`, `admission_service.py` (F044) and `scripts/production/merge_gate.py` (sdlc devtools-unit's file: name it in the notice's also-touches line); `test` owns the history tests in `scripts/lint/test_memory_admit.py`, `scripts/production/test_merge_gate.py` and the merge gate admission suites.
-
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
+**Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`, which no other open phase changes).
 **Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The naming map is a design call that the builds showrunner settles. The showrunner approved it on 2026-11-03 (map and rulings: the 10f design in the unit's phase folder), with one change: a remote mirror ends when its copies.py remote lease from verify P35 ends.
 
 **Scope (showrunner limits, 2026-11-03).** 10f does not change the callers that verify P18 moves to copies.py (merge_gate, bump_gate, fast_track, waiting, the style runs, rust_release). Its sweep never touches copies.py standing checkouts. Two checkpoints:
@@ -832,6 +905,7 @@ This rule holds under both answers to the held last step; the answer changes onl
 **Workers (checkpoint B):** `1 writer + 1 tester` — `impl` owns `scripts/lib/build_folders.py` (sweep and the record writer), the `tmp_sweep` call and the `linux_runner.py` record call (aws-unit reads the record: name it in the notice); `test` owns `scripts/lib/test_build_folders.py`, the `tmp_sweep` tests and the `linux_runner` record tests. B keeps the standing-copy exclusion and the remote-lease ownership.
 
 ### Phase 10g — The queue decides where every step runs  · status: todo
+**Depends on:** verify-unit's Phase 27 hotfix on builds (the Work Order follows it), 10z and 10x (it changes the admission request and the queue service).
 **Why.** The user, 2026-11-03: "should verify be handling this or should the build queue be handling what goes where - why is verify involved?" Showrunner ruling (builds, 2026-11-03): the queue owns placement; one owner decides where every step runs. Today `verify.sh` picks the host once at start and the queue admits memory only on natedev; at 14:04-14:17 a disk decline sent two hana tests to natedev and nothing sent them back to the free Mac.
 
 **Outline (the Work Order follows at phase start, after verify's Phase 27 hotfix lands):**
@@ -840,7 +914,7 @@ This rule holds under both answers to the held last step; the answer changes onl
 3. `verify.sh` and the offload path run the step where the queue says; they make no host choice.
 4. `build_targets.py` eligibility, slot reserve and the spending-guard exclusion move behind the queue decision.
 5. Owners: queue-unit switches every caller; verify-unit owns `verify.sh` routing and offload today, aws-unit owns target selection; the edits are agreed with both at phase start.
-6. Runs beside 10e and 10f where the file sets are disjoint.
+6. Runs beside 10f where the file sets are disjoint.
 7. **Slots per host (architect review, 2026-11-05).** A local 10z slot cannot stand for memory kept on the Mac or an SSH target. Define placement, reservation and departure states per host. Tests: a move to another host releases the local claim, and a local claim is never reused on a remote host.
 8. **Workers:** `impl` and `test` for the queue; adapter owners verify-unit (verify.sh routing and offload), aws-unit (target selection) and sdlc (lifecycle callers), agreed at phase start.
 

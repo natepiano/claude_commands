@@ -136,7 +136,7 @@ class MemoryWindowTests(unittest.TestCase):
         _ = index.update()
         with index.read_only() as connection:
             text = memory.window_report(connection, start, end)
-        room = gate.memory_room(inputs.host, (), start.timestamp(), configuration.policy)
+        room = gate.memory_room(inputs.host, (), configuration.policy)
         self.assertIn(room_text(room), text)
         self.assertIn("Cap 27.0 GiB", text)
         with index.read_only() as connection:

@@ -1,7 +1,7 @@
 """The fixed queue stays one row per step and explains waits once."""
 from __future__ import annotations
 
-from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.lint.memory_test_support import write_pressure_reading, admission_policy_fixture
 
 from collections.abc import Iterator
 from dataclasses import replace
@@ -59,7 +59,7 @@ class QueueViewTests(QueueFixtureTests):
             (token_path, {**token, "token_left_at": NOW - 10}),
             (head_path, {**head, "priority_since": NOW - 42}),
         ])
-        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(3 * gate.GIB), policy=admission_policy_fixture())
+        reading = gate.queue_read_from(inputs, policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         self.assertEqual([step.pid for step in reading.view.waiting], [token["pid"], head["pid"]])
         self.assertIsInstance(queue_view.step_checks(model, 1), gate.LineWaiter)
@@ -87,19 +87,18 @@ class QueueViewTests(QueueFixtureTests):
         base = inputs.reservations[0]
         rows = (dict(base, need=2 * gate.GIB, reservation_id="z-parent"),
                 dict(base, need=6 * gate.GIB, reservation_id="a-child"))
-        reading = gate.queue_read_from(replace(inputs, running=(parent, child), reservations=rows),
-                                       gate.AdmissionLimits(3 * gate.GIB), admission_policy_fixture())
+        reading = gate.queue_read_from(replace(inputs, running=(parent, child), reservations=rows), admission_policy_fixture())
         room = reading.explanation.room
         assert isinstance(room, gate.MemoryRoom)
-        holds = {hold.owner: hold for hold in room.runs}
-        self.assertEqual(holds["a-child"].use, gate.AnonymousRunUse(4 * gate.GIB))
+        holds = {hold.memory.owner: hold for hold in room.runs}
+        self.assertEqual(holds["a-child"].memory.use, gate.AnonymousRunUse(4 * gate.GIB))
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_view.render_view(model, 200))
         for name, owner in (("parent-holder", "z-parent"), ("child-holder", "a-child")):
             row, = [line for line in text.splitlines() if name in line]
             hold = holds[owner]
-            assert isinstance(hold.use, gate.AnonymousRunUse)
-            self.assertIn(f"{hold.bytes / gate.GIB:.1f} / {hold.use.bytes / gate.GIB:.1f}", row)
+            assert isinstance(hold.memory.use, gate.AnonymousRunUse)
+            self.assertIn(f"{hold.bytes / gate.GIB:.1f} / {hold.memory.use.bytes / gate.GIB:.1f}", row)
 
     def service_model(self, fixture: AdmissionFixture) -> queue_view.QueueModel:
         reply, = fixture.server.handle_request(wire.ViewRequest())
@@ -142,7 +141,7 @@ class QueueViewTests(QueueFixtureTests):
                     self.assertFalse(fixture.server.reservations)
                     room = model.reading.explanation.room
                     assert isinstance(room, gate.MemoryRoom)
-                    self.assertGreater(sum(hold.held for hold in room.runs), 0)
+                    self.assertGreater(sum(hold.memory.held for hold in room.runs), 0)
 
     def test_service_without_a_recorded_process_shows_pid_absence(self) -> None:
         model = self.fixture.model()
@@ -489,7 +488,7 @@ class QueueViewTests(QueueFixtureTests):
                 self.assertEqual(queue_evidence.step_labels(model.reading.view.waiting[1], labels).unit, "other-unit")
                 self.assertEqual(queue_evidence.step_labels(model.reading.view.waiting[0], {}).unit, "queue-unit")
                 fixture.free(60 * gate.GIB)
-                _ = (fixture.root / "pressure").write_text("full avg10=0\nsome avg10=0\n")
+                write_pressure_reading(fixture.root / "pressure")
                 _ = fixture.server.run_pass()
                 _ = fixture.server.run_pass()
                 model = self.service_model(fixture)
@@ -683,7 +682,7 @@ class QueueViewTests(QueueFixtureTests):
             host=gate.HostMemory(60 * gate.GIB, 60 * gate.GIB),
             ordered=[(path, {**row, "need": gate.GIB, "estimated_at": NOW - 600,
                             "priority_since": NOW - 42}), inputs.ordered[1]])
-        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(3 * gate.GIB), policy=admission_policy_fixture())
+        reading = gate.queue_read_from(inputs, policy=admission_policy_fixture())
         head = reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
         self.assertTrue(head.room.passes)
@@ -904,7 +903,7 @@ class QueueViewTests(QueueFixtureTests):
         model = self.fixture.model()
         checks = queue_view.step_checks(model, 1)
         assert isinstance(checks, gate.HeadExplanation)
-        with mock.patch.object(gate, "decide", side_effect=AssertionError("admission decides once")),              mock.patch.object(gate, "memory_room", side_effect=AssertionError("recorded room")):
+        with mock.patch.object(gate, "admission_pass", side_effect=AssertionError("admission decides once")),              mock.patch.object(gate, "memory_room", side_effect=AssertionError("recorded room")):
             text = plain(queue_view.check_lines(checks, model))
         self.assertEqual(checks.room.need, int(7.6 * gate.GIB))
         self.assertIn(queue_evidence.room_check_text(checks.room), text)
@@ -914,9 +913,7 @@ class QueueViewTests(QueueFixtureTests):
 class CapViewTests(QueueFixtureTests):
     def cap_model(self, *, available: int = 20, need: int = 10, used: int = 5) -> queue_view.QueueModel:
         model = self.fixture.cap_model()
-        room = gate.memory_room(gate.HostMemory(available * gate.GIB, 60 * gate.GIB),
-            [gate.RunMemory("run", need * gate.GIB, gate.AnonymousRunUse(used * gate.GIB))],
-            NOW, admission_policy_fixture())
+        room = gate.memory_room(gate.HostMemory(available * gate.GIB, 60 * gate.GIB), [gate.RunMemory("run", need * gate.GIB, gate.AnonymousRunUse(used * gate.GIB))], admission_policy_fixture())
         return replace(model, reading=replace(model.reading,
             explanation=replace(model.reading.explanation, room=room)))
 
@@ -988,8 +985,7 @@ class CapViewTests(QueueFixtureTests):
                     reservations=tuple({**row, "need": 6 * gate.GIB} for row in inputs.reservations),
                     running=(replace(inputs.running[0], promise=6 * gate.GIB,
                         measured=gate.MeasuredMemory(0, anonymous=gate.AnonymousRunUse(0))),))
-                reading = gate.queue_read_from(inputs, gate.AdmissionLimits(3 * gate.GIB),
-                                               policy=admission_policy_fixture())
+                reading = gate.queue_read_from(inputs, policy=admission_policy_fixture())
                 head = reading.explanation.head
                 assert isinstance(head, gate.HeadExplanation)
                 self.assertEqual(head.room.room, expected_room * gate.GIB)

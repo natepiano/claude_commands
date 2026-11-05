@@ -23,6 +23,7 @@ if __package__ in (None, ""):
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_service import SystemClock
+from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit as gate
 
@@ -102,17 +103,14 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest) -
     timeout = gate.read_memory_config().query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
     try:
-        for main_service in (False, True):
-            with _connect(_remaining_seconds(deadline)) as connection:
-                connection.settimeout(_remaining_seconds(deadline))
-                connection.sendall(wire.encode_request(request, main_service=main_service).encode())
-                line = _line(connection, bytearray(), deadline)
-                reply = wire.parse_reply(line, request)
-                if isinstance(reply, wire.Refused):
-                    if not main_service and reply.reason == "invalid snapshot record fields":
-                        continue
-                    raise wire.AdmissionUnavailable(reply.reason)
-                return reply
+        with _connect(_remaining_seconds(deadline)) as connection:
+            connection.settimeout(_remaining_seconds(deadline))
+            connection.sendall(wire.encode_request(request).encode())
+            line = _line(connection, bytearray(), deadline)
+            reply = wire.parse_reply(line, request)
+            if isinstance(reply, wire.Refused):
+                raise wire.AdmissionUnavailable(reply.reason)
+            return reply
     except FileNotFoundError as error:
         raise wire.AdmissionUnavailable("no socket") from error
     except ConnectionRefusedError as error:
@@ -132,7 +130,15 @@ class EstimateConnection:
 _ESTIMATE_CONNECTION: ContextVar[EstimateConnection | None] = ContextVar("estimate_connection", default=None)
 
 
-def build_history_generation(configuration: gate.MemoryConfig | None = None) -> gate.BuildHistoryGeneration:
+@dataclass(frozen=True)
+class ReadConfigurationAtUse:
+    """Read local admission configuration when a request needs it."""
+
+
+READ_CONFIGURATION_AT_USE = ReadConfigurationAtUse()
+
+
+def build_history_generation(configuration: gate.MemoryConfig | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> gate.BuildHistoryGeneration:
     """Read the generation before reading build history."""
     reply = _call(wire.BuildHistoryRequest(), lambda _wait: None, channel=_ESTIMATE_CONNECTION.get(),
                   configuration=configuration)
@@ -253,7 +259,7 @@ def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
-          configuration: gate.MemoryConfig | wire.CleanupTiming | None = None
+          configuration: gate.MemoryConfig | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
     acquisition = isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
@@ -265,7 +271,7 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                  launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
-        resolved = configuration if configuration is not None else gate.read_memory_config(report=False)
+        resolved = gate.read_memory_config(report=False) if isinstance(configuration, ReadConfigurationAtUse) else configuration
         request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
         reply = _acquire(request, on_wait, refresh, attempt=attempt, channel=channel, retry=retry,
                          configuration=resolved)
@@ -290,7 +296,6 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              configuration: gate.MemoryConfig | wire.CleanupTiming
              ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
     first = request
-    main_service = False
     leave_interval = (configuration.running_pass_seconds if isinstance(configuration, gate.MemoryConfig)
                       else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
@@ -327,7 +332,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 send_timeout = retry.bound(timeout)
                 if active_channel is not None or send_timeout < timeout:
                     connection.settimeout(send_timeout)
-                connection.sendall(wire.encode_request(request, main_service=main_service).encode())
+                connection.sendall(wire.encode_request(request).encode())
                 pending = active_channel.pending if active_channel is not None else bytearray()
                 while True:
                     deadline = max(last_valid, last_silence_notice) + configuration.silence_seconds
@@ -357,9 +362,6 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     if CLOCK.monotonic() > retry.deadline:
                         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
                     if isinstance(reply, wire.Refused):
-                        if not main_service and reply.reason == "invalid snapshot record fields":
-                            main_service = True
-                            break
                         if generation_query:
                             return reply
                         return _refused(reply.reason, checker=isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)))
@@ -495,7 +497,7 @@ def _silence_notice(last_valid: float) -> None:
 
 
 def _mutation(request: wire.ReleaseRequest | wire.WidthRequest | wire.AdmitHeadRequest | wire.PrioritySetRequest | wire.PriorityClearRequest | wire.TokenWaitRequest,
-              configuration: gate.MemoryConfig | wire.CleanupTiming | None = None) -> wire.Ok | wire.Refused:
+              configuration: gate.MemoryConfig | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> wire.Ok | wire.Refused:
     return cast(wire.Ok | wire.Refused, _call(request, lambda waiting: None, configuration=configuration))
 
 
@@ -526,23 +528,13 @@ def token_wait(reservation: str, configuration: gate.MemoryConfig | wire.Cleanup
 def wait_reasons(result: gate.AdmissionWaitSnapshot) -> tuple[str, ...]:
     """Describe why admission holds, without treating changing samples as a new reason."""
     cause = result.head_reason.cause if isinstance(result.head_reason, gate.HeadAdmissionStatus) else result.head_reason
-    if isinstance(cause, gate.MemoryPressure):
-        if cause.condition == "swap":
-            return ("swap memory pressure",)
-        return ("memory pressure",)
+    if isinstance(cause, gate.MemoryPressure) and cause.condition == "swap":
+        return ("swap memory pressure",)
     if isinstance(cause, gate.BehindHead):
         return (f"queue head {cause.head_name}",)
-    if isinstance(cause, (gate.PressureUnavailable, gate.ReadingUnavailable)):
-        return (cause.reason,)
-    if isinstance(cause, gate.StartSpacingWait):
-        return ("start spacing",)
-    if isinstance(cause, gate.NeedsMemory):
-        return ("free memory",)
-    if isinstance(cause, gate.EstimateExpired):
-        return ("estimate expired",)
-    if isinstance(cause, gate.TokenWaitingWaiter):
-        return ("waiting for the cargo token",)
-    return ("admission refresh",)
+    if isinstance(cause, gate.ReadyForAdmission):
+        return ("admission refresh",)
+    return (reason_phrase(cause, ()),)
 
 
 @dataclass
