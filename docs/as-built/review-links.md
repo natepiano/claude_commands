@@ -196,6 +196,15 @@ The page shows every row with its recorded kind or the missing-kind notice.
 The short URL ends in `/changes.html`.
 The page retains the plain, narrow layout and fits a phone.
 Each row shows its kind, description once, proof, and answer controls.
+How to check and Proof show text lines in preformatted blocks.
+Consecutive lines that start with `- ` form a bulleted list.
+Consecutive lines that start with a number, a dot, and a space form a numbered list.
+Text without list lines stays in one block with all whitespace unchanged.
+In text with list lines, blank lines separate blocks and leading spaces are dropped.
+The list file stores cell line breaks as `<br>` and reads them as line breaks.
+A typed `<br>` takes one more backslash in storage and reads back unchanged.
+Every line separator that Python's `splitlines` recognizes is a line break.
+Each row stays on one table line.
 The user can select Works, Not works, Validate yourself, Send feedback, or Ask a question.
 The feedback box is a textarea with `feedback_rows` rows.
 The setting starts at 5.
@@ -239,6 +248,9 @@ The same ID and answer text change nothing and exit 0 on a rerun.
 The same ID with different answer text is refused.
 The row returns to its tab's count and Next order after the answer saves.
 The page shows the question and answer below the change, with the usual answer buttons.
+Question and Answer show text lines in paragraphs and use the same list forms as How to check.
+The answer keeps its internal line breaks and strips only whitespace at its two ends.
+All text is escaped, including text in list items.
 The user can ask another question or save a verdict.
 
 Each answer uses a background `fetch` POST.
