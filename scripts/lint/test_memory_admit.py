@@ -21,6 +21,7 @@ from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 import contextlib
 from contextlib import closing
 from dataclasses import replace
+from functools import cached_property
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Literal, cast, override
@@ -401,7 +402,7 @@ class MemoryRoomRulesTests(unittest.TestCase):
                         "sidecar": "", "test_threads": gate.NoTestWidth(), "call_id": gate.NoCallRecord(),
                         "build_run": run})
                     steps.append(gate.RunningStep("run", "run", "nextest", "/tree", 6 * GIB,
-                        gate.MeasuredMemory(amount, anonymous=gate.AnonymousRunUse(amount), scope=scope), run=run, pid=index))
+                        gate.MeasuredMemory(amount, anonymous=gate.AnonymousRunUse(amount), anonymous_source=gate.ScopeSource(Path(scope), frozenset())), run=run, pid=index))
                 inputs = gate.QueueInputs([], tuple(steps), tuple(rows), gate.HostMemory(20 * GIB, 64 * GIB),
                     gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), NOW_EPOCH)
                 reading = gate.queue_read_from(inputs, gate.AdmissionLimits(3 * GIB), admission_policy_fixture())
@@ -1486,10 +1487,23 @@ class RepositoryHistoryTests(unittest.TestCase):
 
     def test_repository_identity_uses_the_recorders_remote_rule(self) -> None:
         directory = self.checkout("project", "git@example.org:owner/project.git")
-        with patch.object(gate.record, "remote_identity", return_value="https://example.org/owner/project") as normalize:
+        with patch.object(gate.repository, "remote_identity", return_value="https://example.org/owner/project") as normalize:
             identity = self.identity(directory)
         self.assertEqual(identity.key, "https://example.org/owner/project")
         normalize.assert_called_once_with("git@example.org:owner/project.git", str(directory))
+
+    def test_real_remote_forms_keep_the_repository_key_and_legacy_name(self) -> None:
+        for folder, remote in (("one/project", "git@Example.org:owner/project.git"),
+                               ("two/project", "https://example.org/owner/project.git")):
+            with self.subTest(remote=remote):
+                directory = self.checkout(folder, remote)
+                self.assertEqual(self.identity(directory),
+                                 gate.RepositoryIdentity("https://example.org/owner/project", "project", "project"))
+
+    def test_real_repository_without_origin_keeps_the_root_commit_key_and_checkout_name(self) -> None:
+        directory = self.checkout("project")
+        root_commit = subprocess.check_output(["git", "-C", str(directory), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(self.identity(directory), gate.RepositoryIdentity("git-root:" + root_commit, "project"))
 
     def test_same_repository_shares_peaks_across_folders_and_remote_forms(self) -> None:
         first = self.identity(self.checkout("one/repo", "git@example.org:nate/first.git"))
@@ -1688,12 +1702,7 @@ class MemoryQueueFixture(unittest.TestCase):
             result = self.readings.get(pid, gate.MeasuredMemory(0, anonymous=gate.AnonymousRunUse(0)))
             scope = self.root / f"fixture-anonymous-{pid}"
             if scope.is_dir() and isinstance(result, gate.MeasuredMemory):
-                use = result.anonymous
-                if isinstance(use, gate.AnonymousRunUse):
-                    stat = scope / "memory.stat"
-                    content = f"anon {use.bytes}\ninactive_file 0\n"
-                    if not stat.exists() or stat.read_text() != content:
-                        _ = stat.write_text(content)
+                return replace(result, anonymous_source=gate.ScopeSource(scope, frozenset()))
             return result
         _ = self.enterContext(patch.object(gate, "tree_memory", side_effect=reading))
 
@@ -3594,7 +3603,8 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                         captured = gate.reservation_memory(reservation, row, NOW, processes,
                                                            self.root / "proc", admission_policy_fixture())
                         assert isinstance(captured, gate.MeasuredMemory)
-                        self.assertEqual(captured.scope, str(scope))
+                        assert isinstance(captured.anonymous_source, gate.ScopeSource)
+                        self.assertEqual(str(captured.anonymous_source.directory), str(scope))
                         self.assertEqual(reading.promise, gate.LifetimePromise(12 * GIB))
                         self.assertIsInstance(reading.anonymous, gate.RunUseUnavailable)
                         tree.assert_not_called()
@@ -4079,9 +4089,9 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertEqual((view.promised, sum(step.promise for step in view.running)), (int(20.5 * GIB), int(23.5 * GIB)))
         self.assertCountEqual([step.measured for step in view.running],
                               [gate.MeasuredMemory(GIB, anonymous=gate.AnonymousRunUse(GIB), promise=gate.LifetimePromise(12 * GIB),
-                                  scope=str(self.root / "fixture-anonymous-100")),
+                                  anonymous_source=gate.ScopeSource(self.root / "fixture-anonymous-100", frozenset())),
                                gate.MeasuredMemory(2 * GIB, anonymous=gate.AnonymousRunUse(2 * GIB),
-                                  promise=gate.LifetimePromise(int(11.5 * GIB)), scope=str(self.root / "fixture-anonymous-200"))])
+                                  promise=gate.LifetimePromise(int(11.5 * GIB)), anonymous_source=gate.ScopeSource(self.root / "fixture-anonymous-200", frozenset()))])
         self.assertEqual(view.waiting[0].session_name, "clone88ci")
         self.assertIsInstance(view.waiting[0].reason, gate.HeadAdmissionStatus)
         self.assertEqual(cast(gate.HeadAdmissionStatus, view.waiting[0].reason).decision.state, "hold")
@@ -4180,6 +4190,277 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertIsInstance(head.admission, gate.ProposedAdmission)
 
 
+class ProcessRunUseTests(unittest.TestCase):
+    @cached_property
+    def fixture(self) -> AdmissionFixture:
+        return self.enterContext(AdmissionFixture())
+
+    @override
+    def setUp(self) -> None:
+        self.process(100, parent=1, resident=4 * GIB, anonymous=2 * GIB, swap=GIB)
+        self.process(101, parent=100, resident=2 * GIB, anonymous=GIB, swap=GIB // 2)
+        self.process(200, parent=1, resident=20 * GIB, anonymous=15 * GIB, swap=8 * GIB)
+
+    def process(self, pid: int, *, parent: int, resident: int, anonymous: int, swap: int) -> None:
+        write_process(self.fixture.proc.path, pid, resident, parent=parent,
+                      anonymous=anonymous, swap=swap)
+
+    def reservation(self, name: str, pid: int, *, scope: str = "", need: int = 6 * GIB) -> Path:
+        sidecar = ""
+        if scope:
+            path = self.fixture.root / f"{name}.cgroup"
+            _ = path.write_text(scope)
+            sidecar = str(path)
+        row: dict[str, object] = {
+            "pid": pid, "start_time": str(pid), "need": need, "repo": "test", "step": "merge-gate",
+            "worktree": "/tmp/fixture", "sidecar": sidecar,
+            "admitted_at": store.utc_iso(self.fixture.clock.now() - 180),
+            "test_threads": None, "call_id": None, "reservation_id": name,
+        }
+        path = self.fixture.state_dir / f"{name}.reservation"
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def captured(self) -> gate.QueueInputs:
+        return fixture_queue_inputs(self.fixture.state_dir, gate.process_table(self.fixture.proc.path),
+                                    self.fixture.clock.now(), admission_policy_fixture())
+
+    def room(self) -> gate.MemoryRoom:
+        inputs = self.captured()
+        room = gate.memory_room(inputs.host, gate.run_memories(inputs), inputs.now, admission_policy_fixture())
+        assert isinstance(room, gate.MemoryRoom)
+        return room
+
+    def scope(self) -> Path:
+        sidecar = self.fixture.scope(wire.Owner(100, "100"), folder="builds.slice/holder.scope",
+            members=(100, 101), current=10 * GIB, anonymous=5 * GIB, swap=3 * GIB)
+        return Path(sidecar.read_text())
+
+    def test_unscoped_run_uses_only_its_tree_anonymous_memory_for_the_cap_and_keep_aside(self) -> None:
+        _ = self.reservation("holder", 100)
+        inputs = self.captured()
+        reading = inputs.running[0].measured
+        assert isinstance(reading, gate.MeasuredMemory)
+        self.assertEqual((reading.bytes, reading.swap_bytes), (6 * GIB, 3 * GIB // 2))
+        self.assertEqual(reading.anonymous, gate.AnonymousRunUse(3 * GIB))
+        self.assertEqual(reading.anonymous_source, gate.ProcessSource((
+            gate.ProcessAnonymousUse(100, gate.AnonymousRunUse(2 * GIB)),
+            gate.ProcessAnonymousUse(101, gate.AnonymousRunUse(GIB)))))
+        room = self.room()
+        self.assertEqual(room.used, 3 * GIB)
+        self.assertEqual(room.kept, 3 * GIB)
+        self.assertEqual(room.cap, room.available + 3 * GIB - room.safety)
+        self.assertEqual(room.room, room.available - room.safety - 3 * GIB)
+
+    def test_scoped_run_uses_memory_stat_instead_of_process_anonymous_memory(self) -> None:
+        scope = self.scope()
+        _ = (self.fixture.proc.path / "100/status").write_text("VmRSS: 4194304 kB\nVmSwap: 1048576 kB\n")
+        _ = self.reservation("scoped", 100, scope=str(scope))
+        reading = self.captured().running[0].measured
+        assert isinstance(reading, gate.MeasuredMemory)
+        self.assertEqual(reading.anonymous_source, gate.ScopeSource(scope, frozenset({100, 101})))
+        room = self.room()
+        self.assertEqual(room.used, 5 * GIB)
+        self.assertEqual(room.kept, GIB)
+        self.assertEqual(room.cap, room.available + 5 * GIB - room.safety)
+
+    def test_missing_or_invalid_process_anonymous_memory_keeps_the_run_unavailable(self) -> None:
+        _ = self.reservation("holder", 100)
+        status = self.fixture.proc.path / "101/status"
+        for content in ("VmRSS: 2097152 kB\nVmSwap: 524288 kB\n",
+                        "VmRSS: 2097152 kB\nRssAnon: invalid kB\n", "VmRSS: 2097152 kB\nRssAnon: -1 kB\n"):
+            with self.subTest(status=content):
+                status.unlink(missing_ok=True)
+                _ = status.write_text(content)
+                room = self.room()
+                self.assertIsInstance(room.cap, gate.CapUnavailable)
+                hold, = room.runs
+                self.assertIsInstance(hold.use, gate.RunUseUnavailable)
+                assert isinstance(hold.use, gate.RunUseUnavailable)
+                self.assertIn(str(status), hold.use.reason)
+                self.assertEqual(hold.bytes, 6 * GIB)
+
+    def test_a_missing_or_zombie_child_adds_no_use_and_keeps_the_cap_available(self) -> None:
+        _ = self.reservation("holder", 100)
+        status = self.fixture.proc.path / "101/status"
+        for content in (None, "Name: fixture\nState: Z (zombie)\n"):
+            with self.subTest(status=content):
+                status.unlink(missing_ok=True)
+                if content is not None:
+                    _ = status.write_text(content)
+                room = self.room()
+                self.assertEqual(room.used, 2 * GIB)
+                self.assertEqual(room.kept, 4 * GIB)
+                self.assertEqual(room.cap, room.available + 2 * GIB - room.safety)
+
+    def test_a_denied_status_keeps_the_run_unavailable_and_names_its_file(self) -> None:
+        _ = self.reservation("holder", 100)
+        denied = self.fixture.proc.path / "101/status"
+        read_text = Path.read_text
+
+        def read_private(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == denied:
+                raise PermissionError(13, "Permission denied", str(path))
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with patch.object(Path, "read_text", read_private):
+            room = self.room()
+        self.assertIsInstance(room.cap, gate.CapUnavailable)
+        hold, = room.runs
+        assert isinstance(hold.use, gate.RunUseUnavailable)
+        self.assertIn(str(denied), hold.use.reason)
+        self.assertIn("holder", queue_evidence.room_text(room))
+
+    def test_a_scope_child_removed_during_the_walk_does_not_hide_live_use(self) -> None:
+        scope = self.scope()
+        child = scope / "ended.scope"
+        child.mkdir()
+        _ = (child / "cgroup.procs").write_text("200\n")
+        read_text = Path.read_text
+
+        def remove_child(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == child / "cgroup.procs":
+                path.unlink()
+                child.rmdir()
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with patch.object(Path, "read_text", remove_child):
+            reading = gate.process_memory(gate.PopulatedStepScope(scope), self.fixture.proc.path)
+        self.assertEqual(reading.anonymous, gate.AnonymousRunUse(5 * GIB))
+        self.assertEqual(reading.anonymous_source, gate.ScopeSource(scope, frozenset({100, 101})))
+
+    def test_two_reservations_over_one_tree_count_anonymous_use_once(self) -> None:
+        _ = self.reservation("first", 100)
+        for pid in (100, 101):
+            with self.subTest(second_root=pid):
+                _ = self.reservation("second", pid)
+                room = self.room()
+                self.assertEqual(room.used, 3 * GIB)
+                self.assertEqual(sum(run.need for run in room.runs), 12 * GIB)
+                self.assertEqual(room.kept, 9 * GIB)
+                self.assertEqual(room.cap, room.available + 3 * GIB - room.safety)
+
+    def test_tree_inside_a_read_scope_counts_anonymous_use_once_in_either_order(self) -> None:
+        scope = self.scope()
+        for scoped_first in (True, False):
+            with self.subTest(scoped_first=scoped_first):
+                for path in self.fixture.state_dir.glob("*.reservation"):
+                    path.unlink()
+                _ = self.reservation("a" if scoped_first else "b", 100, scope=str(scope))
+                _ = self.reservation("b" if scoped_first else "a", 101)
+                room = self.room()
+                self.assertEqual(room.used, 5 * GIB)
+                self.assertEqual(room.kept, 7 * GIB)
+                self.assertEqual(room.cap, room.available + 5 * GIB - room.safety)
+
+    def test_nested_and_equal_readings_assign_shared_use_to_the_child_in_both_orders(self) -> None:
+        self.process(100, parent=1, resident=4 * GIB, anonymous=0, swap=0)
+        self.process(101, parent=100, resident=4 * GIB, anonymous=4 * GIB, swap=0)
+        for kind in ("process tree", "scope tree", "same scope", "same process set"):
+            with self.subTest(kind=kind):
+                for path in self.fixture.state_dir.glob("*.reservation"):
+                    path.unlink()
+                parent_scope = child_scope = ""
+                child_pid = 101
+                if kind in ("scope tree", "same scope"):
+                    parent_sidecar = self.fixture.scope(wire.Owner(100, "100"), folder="shared.scope",
+                        members=(100, 101), current=4 * GIB, anonymous=4 * GIB)
+                    parent_scope = parent_sidecar.read_text()
+                    if kind == "scope tree":
+                        child_sidecar = self.fixture.scope(wire.Owner(101, "101"), folder="shared.scope/child.scope",
+                            members=(101,), current=4 * GIB, anonymous=4 * GIB)
+                        child_scope = child_sidecar.read_text()
+                    else:
+                        child_scope = parent_scope
+                elif kind == "same process set":
+                    child_pid = 100
+                _ = self.reservation("z-parent", 100, scope=parent_scope, need=2 * GIB)
+                _ = self.reservation("a-child", child_pid, scope=child_scope, need=6 * GIB)
+                inputs = self.captured()
+                head: gate.Waiter = {"pid": 300, "start_time": "300", "since": inputs.now,
+                    "need": GIB, "step": "check", "folder": "/tmp/waiter"}
+                decisions: list[gate.AdmissionDecision] = []
+                for reverse in (False, True):
+                    ordered_inputs = replace(inputs, host=gate.HostMemory(8 * GIB, 60 * GIB),
+                        reservations=tuple(reversed(inputs.reservations)) if reverse else inputs.reservations,
+                        running=tuple(reversed(inputs.running)) if reverse else inputs.running,
+                        ordered=[(Path("waiter.waiting"), gate.rank_waiter(head, gate.NormalOrder()))])
+                    result = gate.admission_pass(ordered_inputs, inputs.now, gate.AdmissionLimits(3 * GIB),
+                                                 admission_policy_fixture())
+                    room = result.policy.room
+                    assert isinstance(room, gate.MemoryRoom)
+                    holds = {hold.owner: hold for hold in room.runs}
+                    self.assertEqual(holds["a-child"].use, gate.AnonymousRunUse(4 * GIB))
+                    self.assertEqual(holds["z-parent"].use, gate.AnonymousRunUse(0))
+                    self.assertEqual({owner: hold.bytes for owner, hold in holds.items()},
+                                     {"a-child": 2 * GIB, "z-parent": 2 * GIB})
+                    self.assertEqual(room.used, 4 * GIB)
+                    self.assertEqual(room.kept, 4 * GIB)
+                    self.assertEqual(result.rows[0].decision.state, "admit")
+                    decisions.append(result.rows[0].decision)
+                self.assertEqual(decisions[0], decisions[1])
+
+    def test_unowned_scope_subtracts_tree_resident_bytes_and_swap_separately(self) -> None:
+        _ = self.scope()
+        path = self.reservation("holder", 100)
+        readings = gate.unowned_slice_memory([gate.read_reservation(path)],
+            gate.process_table(self.fixture.proc.path), self.fixture.proc.path)
+        reading, = readings
+        self.assertEqual(reading.bytes, 4 * GIB)
+        self.assertEqual(reading.swap_bytes, 3 * GIB // 2)
+
+    def test_queue_place_sampler_keeps_resident_bytes_separate_from_anonymous_use_and_swap(self) -> None:
+        import threading
+        from scripts.build_queue import queue_place as queue
+
+        sidecar = self.fixture.root / "sample.cgroup"
+        _ = sidecar.write_text("")
+        path = self.fixture.root / "sample"
+
+        class SingleSampleQueuePlace(queue.QueuePlace):
+            def sample_once(self) -> None:
+                stopped = threading.Event()
+                stopped.set()
+                self._sample(queue.ProgramTree(100), stopped)
+
+        place = SingleSampleQueuePlace(path, sidecar, configuration=admission_configuration_fixture())
+        with patch.object(queue, "program_members", return_value={100: "100", 101: "101"}):
+            place.sample_once()
+        self.assertEqual(place.peak_bytes, 6 * GIB)
+        self.assertEqual(int(path.with_suffix(".max").read_text()), 6 * GIB)
+
+    def test_merge_gate_context_holder_without_a_scope_gets_a_cap_value(self) -> None:
+        from scripts.build_queue.queue_place import queue_place
+
+        self.fixture.configure(**{"program_first_peak_gib.merge-gate": 6})
+        pid = os.getpid()
+        owner = self.fixture.fixture_owner(pid, str(pid))
+        self.process(pid, parent=1, resident=4 * GIB, anonymous=2 * GIB, swap=GIB)
+        with patch.object(gate, "process_start_time", return_value=owner.start_time), self.fixture.serving():
+            with queue_place("merge-gate", self.fixture.root):
+                with self.fixture.loop_turn():
+                    _ = self.fixture.run_pass()
+                    records = list(self.fixture.server.reservations.values())
+                    self.assertEqual(len(records), 1)
+                    record = records[0]
+                    path, row = Path(record.path), service.reservation_row(record)
+                    self.assertEqual(row["pid"], pid)
+                    self.assertEqual(row["step"], "merge-gate")
+                    self.assertEqual(Path(row["sidecar"]).read_text(), "")
+                    reading = gate.reservation_memory(path, row,
+                        datetime.fromtimestamp(self.fixture.clock.now(), UTC),
+                        gate.process_table(self.fixture.proc.path), self.fixture.proc.path, admission_policy_fixture())
+                    assert isinstance(reading, gate.MeasuredMemory)
+                    self.assertEqual(reading.anonymous, gate.AnonymousRunUse(2 * GIB))
+                    reply, = self.fixture.server.handle_request(wire.ExplainRequest())
+                    assert isinstance(reply, wire.ExplainReply)
+                    room = reply.explanation.room
+                    assert isinstance(room, gate.MemoryRoom)
+                    self.assertEqual(room.cap, room.available + 2 * GIB - room.safety)
+                    self.assertEqual(room.kept, max(0, row["need"] - 2 * GIB))
+
+
 class ProcessMemoryTests(unittest.TestCase):
 
     def test_tree_counts_resident_bytes_and_records_swap_separately(self) -> None:
@@ -4194,10 +4475,15 @@ class ProcessMemoryTests(unittest.TestCase):
                 path.mkdir()
                 fields = [state, str(parent), *(["0"] * 17), start]
                 _ = (path / "stat").write_text(f"{pid} (test process) " + " ".join(fields))
-                _ = (path / "status").write_text(f"VmRSS: {resident} kB\nVmSwap: {swap} kB\n")
+                _ = (path / "status").write_text(
+                    f"VmRSS: {resident} kB\nRssAnon: {resident // 2} kB\nVmSwap: {swap} kB\n")
             processes = gate.process_table(proc)
             self.assertEqual(gate.tree_memory(100, "start", processes, proc),
-                             gate.MeasuredMemory(60 * 1024, swap_bytes=9 * 1024))
+                             gate.MeasuredMemory(60 * 1024, swap_bytes=9 * 1024,
+                                 anonymous=gate.AnonymousRunUse(30 * 1024), anonymous_source=gate.ProcessSource((
+                                     gate.ProcessAnonymousUse(100, gate.AnonymousRunUse(5 * 1024)),
+                                     gate.ProcessAnonymousUse(101, gate.AnonymousRunUse(10 * 1024)),
+                                     gate.ProcessAnonymousUse(102, gate.AnonymousRunUse(15 * 1024))))))
             self.assertEqual(gate.tree_memory(100, "reused", processes, proc), gate.GoneMemory())
             self.assertEqual(gate.tree_memory(999, "gone", processes, proc), gate.GoneMemory())
 

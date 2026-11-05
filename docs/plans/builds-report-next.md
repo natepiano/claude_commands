@@ -21,14 +21,6 @@
 - **Completion:** a bevy_brp launch on natedev shows its absolute target folder in the build log index.
 - **Source phase:** 11 (simplify item 24).
 
-## Mac offload reads the repository key without loading memory_admit
-- **Starts when:** queue 10z merges to builds. Four units edit `memory_admit.py` now. Showrunner disposition 2026-11-04: next, report-unit owns it as one phase.
-- **Target:** `offload.repository_identity` (`scripts/mac_test/offload.py:902`).
-- **Need:** `offload.repository_identity` imports all of memory_admit and runs 2-3 git processes to read one key. The recorder no longer loads memory_admit (Phases 16 and 18).
-- **Constraints:** reuse `record.recorded_repository_key` or `record.remote_identity`. Keep repository keys unchanged.
-- **Completion:** Mac offload does not load memory_admit. A test pins the keys for remote and root identities. The phase notice gives the CPU per call before and after.
-- **Source phase:** 16 (simplify items 10 and 13).
-
 ## The recorder takes the build folders from verify.sh
 - **Starts when:** verify-unit's remake of `verify.sh` merges (ETA 2026-11-05 01:30 EST). Tell verify-unit at the start. Showrunner disposition 2026-11-04: next, report-unit owns both sides.
 - **Target:** `scripts/buildlog/record.py` (`record.step`), `scripts/direct/verify.sh` (`GATE_METADATA`).
