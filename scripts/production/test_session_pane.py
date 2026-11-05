@@ -203,12 +203,19 @@ class SessionPaneTests(unittest.TestCase):
             '{"result":{"agents":[{"pane_id":"w1:p1","agent":"claude","agent_status":"blocked"}]}}', "")
         with (mock.patch.object(time, "monotonic", return_value=100.0),
               mock.patch("herdr.run_program", return_value=reply) as program):
-            for deadline, expected in ((100.5, 0.5), (99.0, 0.0), (float("inf"), 10.0)):
+            for deadline, expected in ((100.5, 0.5), (float("inf"), 10.0)):
                 with self.subTest(deadline=deadline):
                     self.assertEqual(session_pane.read_place(place, deadline=deadline), reply.stdout)
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
                     self.assertEqual(session_pane.agent_status(place, deadline=deadline), "blocked")
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+            with self.subTest(deadline=99.0):
+                program.reset_mock()
+                with self.assertRaises(herdr.HerdrFailure):
+                    _ = session_pane.read_place(place, deadline=99.0)
+                with self.assertRaises(herdr.HerdrFailure):
+                    _ = session_pane.agent_status(place, deadline=99.0)
+                program.assert_not_called()
 
     def test_every_verb_targets_the_units_herdr_pane(self) -> None:
         target = ("unit", "show", "herdr-unit")

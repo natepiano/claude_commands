@@ -104,6 +104,18 @@ class EnsureTests(NixFixture):
         self.assertEqual(result.env, self.env)
         self.assertEqual(self.direnv_calls(), [])
 
+    def test_passed_deadline_refuses_before_direnv_runs(self) -> None:
+        import time
+        from scripts.lib import operation_deadline
+
+        _ = self.envrc(self.work)
+        with (operation_deadline.within(time.monotonic() - 1),
+              patch.object(subprocess, "run") as run):
+            result = nix_env.ensure(self.work, self.env)
+        self.assertEqual(result, nix_env.Refused(f"nix_env: {self.work}: deadline passed"))
+        run.assert_not_called()
+        self.assertEqual(self.direnv_calls(), [])
+
     def cli(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(HELPER), *arguments], cwd=self.work,
                               env={**self.env, **(extra or {})}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
