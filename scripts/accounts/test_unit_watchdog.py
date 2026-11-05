@@ -107,6 +107,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.refused = set()
         self.pending = []
         self.finish_jobs = True
+        _ = self.enterContext(patch.object(staff, "local_snapshot", side_effect=self.current_staff))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "panes"))
         _ = self.enterContext(patch.object(hook_pane_record, "RECORD_DIR", self.home / "panes"))
         _ = self.enterContext(patch.object(stop_resume, "resume", side_effect=self.resume))
@@ -1129,7 +1130,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def current_staff(self) -> staff.StaffSnapshot:
-        record = staff.local_snapshot()
+        record = self.fixture.membership()
         return replace(record, rows=tuple(
             replace(row, current_session=staff.StaffId(self.units[row.name]["session_id"]))
             if row.kind == "unit" and row.name in self.units else row for row in record.rows))
