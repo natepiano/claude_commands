@@ -1,23 +1,25 @@
 """Exercise guarded deployment with a private AWS executable and no network."""
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from contextlib import redirect_stdout
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import redirect_stderr, redirect_stdout
 import base64
 from datetime import UTC, datetime
 from decimal import Decimal
-from functools import partial
+from functools import lru_cache, partial
 import gzip
 from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+from types import CodeType, SimpleNamespace
 from typing import ClassVar, cast, override
 from unittest import mock
 from urllib.request import Request
@@ -43,7 +45,10 @@ service_index = args.index('--region') + 2
 service = args[service_index]
 operation = args[service_index + 1]
 if service == 'ssm' and os.environ.get('BOX_FIXTURE'):
-    os.execv(sys.executable, [sys.executable, str(root / 'box-aws'), *args])
+    import runpy
+    sys.argv = [str(root / 'box-aws'), *args]
+    runpy.run_path(sys.argv[0], run_name='__main__')
+    sys.exit(0)
 if (root / ('fail-down-' + operation)).exists():
     print('fixture removal failure: ' + operation, file=sys.stderr)
     sys.exit(1)
@@ -257,6 +262,56 @@ else:
 '''
 
 
+@lru_cache(maxsize=None)
+def compile_fake(source: str) -> CodeType:
+    return compile(source, '<deployment fake>', 'exec')
+
+
+def run_fake(path: str, *, run_name: str = '__main__') -> dict[str, object]:
+    namespace: dict[str, object] = {'__name__': run_name, '__file__': path}
+    exec(compile_fake(Path(path).read_text()), namespace)
+    return namespace
+
+
+class FixtureExecutor:
+    """Run Python fixture commands without starting another interpreter."""
+
+    def __init__(self, root: Path) -> None:
+        self.root: Path = root
+
+    def run(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
+            timeout: float, check: bool, env: dict[str, str] | None = None,
+            input: str | None = None) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ) if env is None else env
+        found = shutil.which(arguments[0], path=environment.get('PATH'))
+        path = Path(found) if found else Path(arguments[0])
+        if (path.parent != self.root / 'bin' or not path.read_text().startswith(f'#!{sys.executable}\n')
+                or input is not None):
+            return subprocess.run(arguments, capture_output=capture_output, text=text, timeout=timeout,
+                                  check=check, env=env, input=input)
+        assert capture_output and text
+        stdout, stderr = StringIO(), StringIO()
+        status = 0
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(sys, 'argv', [str(path), *arguments[1:]]),
+              mock.patch.object(runpy, 'run_path', side_effect=run_fake),
+              redirect_stdout(stdout), redirect_stderr(stderr)):
+            try:
+                _ = run_fake(str(path))
+            except SystemExit as exit:
+                if exit.code is None:
+                    status = 0
+                elif isinstance(exit.code, int):
+                    status = exit.code
+                else:
+                    print(exit.code, file=sys.stderr)
+                    status = 1
+        result = subprocess.CompletedProcess(arguments, status, stdout.getvalue(), stderr.getvalue())
+        if check:
+            result.check_returncode()
+        return result
+
+
 class DeploymentTests(CostFixture):
     now: int = 0
     bundle: Path = Path()
@@ -337,6 +392,87 @@ class DeploymentTests(CostFixture):
         })))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         self.set_clock(self.now)
+        if self._testMethodName not in self.process_tests:
+            process = SimpleNamespace(**{**cast(Mapping[str, object], vars(subprocess)), 'run': FixtureExecutor(self.root).run})
+            _ = self.enterContext(mock.patch.object(aws_target, 'subprocess', process))
+
+    # These tests retain child processes for environment, timeout, exit, and redaction checks.
+    process_tests: ClassVar[frozenset[str]] = frozenset({
+        'test_price_command_writes_private_state_for_the_selected_zone_and_admin_environment',
+        'test_compute_timeout_keeps_exact_instance_costs_until_preparation_recovers',
+        'test_terminal_update_failure_reconciles_compute_but_uncertain_failure_keeps_it_pending',
+        'test_failure_redacts_the_prepared_address_after_the_private_file_changes',
+        'test_update_failure_reports_current_events_and_rollback_without_the_address',
+        'test_create_reservation_failures_report_events_reason_status_and_redact',
+        'test_unconfirmed_scaler_key_is_deleted_and_never_printed',
+        'test_admin_child_receives_only_the_environment_credentials',
+        'test_admin_child_timeout_and_error_redact_secrets',
+    })
+
+    def test_admin_child_receives_only_the_environment_credentials(self) -> None:
+        source = '''import json, os, sys
+print(json.dumps({'key': os.environ.get('AWS_ACCESS_KEY_ID') == 'fixture-admin-id',
+                  'secret': os.environ.get('AWS_SECRET_ACCESS_KEY') == 'fixture-admin-secret',
+                  'config': os.environ.get('AWS_CONFIG_FILE'), 'profile': '--profile' in sys.argv,
+                  'inherited_profile': 'AWS_PROFILE' in os.environ}))
+'''
+        self.fake_commands(f'#!{sys.executable}\n' + source, 'aws')
+        execute = admin_secrets.AdminSecretSession(self.settings).executor(aws_target.execute_command)
+        with mock.patch.dict(os.environ, {'AWS_PROFILE': 'unrelated'}):
+            result = execute(['aws', '--profile', 'build-admin'], capture_output=True, text=True,
+                             timeout=TEST_HANG_GUARD_SECS, check=True)
+        self.assertEqual(json.loads(result.stdout), {'key': True, 'secret': True, 'config': '/dev/null',
+                                                    'profile': False, 'inherited_profile': False})
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, '')
+
+    def test_admin_child_timeout_and_error_redact_secrets(self) -> None:
+        session = admin_secrets.AdminSecretSession(self.settings)
+        session.credentials = session.get()
+        execute = session.executor(aws_target.execute_command)
+        self.fake_commands(f'#!{sys.executable}\nimport time\ntime.sleep(5)\n', 'aws')
+        with self.assertRaises(subprocess.TimeoutExpired) as timeout:
+            _ = execute(['aws'], capture_output=True, text=True, timeout=0.02, check=False)
+        self.assertEqual(cast(object, timeout.exception.cmd), 'administrator AWS command')
+        self.assertIsNone(cast(object, timeout.exception.output))
+        source = '''import os, sys
+print(os.environ['AWS_ACCESS_KEY_ID'])
+print('child refused ' + os.environ['AWS_SECRET_ACCESS_KEY'], file=sys.stderr)
+sys.exit(7)
+'''
+        self.fake_commands(f'#!{sys.executable}\n' + source, 'aws')
+        result = execute(['aws'], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (7, '', 'child refused [redacted]\n'))
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            _ = execute(['aws'], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=True)
+        self.assertEqual(failure.exception.returncode, 7)
+        self.assertEqual(cast(object, failure.exception.stderr), 'child refused [redacted]\n')
+        self.assertIsNone(cast(object, failure.exception.output))
+
+    def test_fixture_executor_preserves_command_records_output_and_environment(self) -> None:
+        runner = FixtureExecutor(self.root)
+        environment = dict(os.environ, FIXTURE_CHILD_ONLY='present')
+        arguments = ['aws', '--region', 'us-east-1', 'sts', 'get-caller-identity']
+        real = subprocess.run(arguments, capture_output=True, text=True, env=environment,
+                              check=False, timeout=TEST_HANG_GUARD_SECS)
+        record = (self.root / 'commands.jsonl').read_bytes()
+        (self.root / 'commands.jsonl').unlink()
+        argv = sys.argv
+        before = dict(os.environ)
+        result = runner.run(arguments, capture_output=True, text=True, env=environment,
+                            check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (real.returncode, real.stdout, real.stderr))
+        self.assertEqual((self.root / 'commands.jsonl').read_bytes(), record)
+        self.assertEqual(dict(os.environ), before)
+        self.assertIs(sys.argv, argv)
+        self.fake_commands(f'#!{sys.executable}\nimport sys\nprint("failure", file=sys.stderr)\nsys.exit(3)\n', 'aws')
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            _ = runner.run(['aws'], capture_output=True, text=True, env=environment,
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(failure.exception.returncode, 3)
+        self.assertEqual(cast(object, failure.exception.stderr), 'failure\n')
+        self.assertEqual(dict(os.environ), before)
+        self.assertIs(sys.argv, argv)
 
     @override
     def replace(self, key: str, value: str) -> None:
