@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
+from scripts.message import session_send
 from scripts.aws_target.config import (
     LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, offload_enabled, read_settings,
 )
@@ -574,13 +575,12 @@ def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, cos
 
 def send_limit_event(event: LimitEvent) -> bool:
     """Use the existing message interface after persisting the event identity."""
-    script = Path(__file__).resolve().parents[1] / "message" / "send.py"
     # Keep the key active across every date that the message interface can represent.
     repeat_minutes = (datetime.max - datetime.min) // timedelta(minutes=1) + 1
-    result = subprocess.run([sys.executable, str(script), "--to", event.recipient, "--from", "aws-spending-guard",
+    result = subprocess.run(session_send.send_argv("--to", event.recipient, "--from", "aws-spending-guard",
                              "--key", f"aws-limit:{event.event_id}", "--repeat-minutes", str(repeat_minutes), "--text",
                              f"AWS spending guard: {event.period} limit refuses new work; drain the target. "
-                             + f"Estimate ${event.estimate_usd}; limit ${event.limit_usd}."],
+                             + f"Estimate ${event.estimate_usd}; limit ${event.limit_usd}."),
                             capture_output=True, text=True, timeout=event.timeout_s, check=False)
     return result.returncode == 0 and result.stdout.startswith(("SENT:", "SKIPPED:"))
 

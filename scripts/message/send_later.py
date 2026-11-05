@@ -20,12 +20,12 @@ from datetime import datetime, timezone
 from typing import cast
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone
+from scripts.message import session_send
 
 Runner = Callable[[Sequence[str]], int]
-SEND = Path.home() / ".claude/scripts/message/send.py"
-SCRIPTS = {"send": SEND, "silence": Path.home() / ".claude/scripts/notify/silence.py"}
+SCRIPTS = {"send": session_send.SEND_SCRIPT, "silence": Path.home() / ".claude/scripts/notify/silence.py"}
 PY = Path.home() / ".claude/scripts/lib/py"
 
 

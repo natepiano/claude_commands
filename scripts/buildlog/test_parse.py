@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -19,13 +21,16 @@ from unittest import mock
 
 import index
 import parse
+import repository
 import test_record as record_tests
 from store import UNKNOWN_IDENTITY
 from test_index import use_test_log
 
 if TYPE_CHECKING:
+    from ..lib import test_hang_guard
     from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
 else:
+    from scripts.lib import test_hang_guard
     from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
 
 use_test_log()
@@ -263,15 +268,18 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
 
     def test_repository_identity_uses_origin_or_the_root_commit(self) -> None:
         root_commit = self.fixture.git("rev-list", "--max-parents=0", "HEAD", cwd=self.fixture.repo)
+        self.assertEqual(repository.repository_key(str(self.fixture.repo)), "git-root:" + root_commit)
         row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST)
         self.assertEqual(row["repo_identity"], "git-root:" + root_commit)
         self.assertEqual(self.fixture.git("remote", "add", "origin", "git@GitHub.com:example/hana.git", cwd=self.fixture.repo), "")
+        self.assertEqual(repository.repository_key(str(self.fixture.repo)), "https://github.com/example/hana")
         row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST)
         self.assertEqual(row["repo_identity"], "https://github.com/example/hana")
 
     def test_step_outside_a_repository_records_unknown_identity(self) -> None:
         directory = self.fixture.base / "not-a-repository"
         directory.mkdir()
+        self.assertEqual(repository.repository_key(str(directory)), UNKNOWN_IDENTITY)
         result = self.fixture.record(
             "step", "0", str(record_tests.START), str(record_tests.START + 12.5),
             "0", "", "", *record_tests.NEXTEST, cwd=directory,
@@ -301,6 +309,46 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         self.assertEqual(row["test_scope"], "filtered")
         self.assertEqual(row["filters"], ["one"])
         self.assertEqual(row["test_phase_peak_bytes"], 1700)
+
+    def test_step_loads_one_configuration_module_in_script_and_package_forms(self) -> None:
+        source = """\
+import json
+from pathlib import Path
+import runpy
+import sys
+
+mode, script, arguments = sys.argv[1:]
+path = Path(script)
+sys.path.insert(0, str(path.parents[2]))
+sys.path.insert(0, str(path.parent))
+arguments = json.loads(arguments)
+if mode == "script":
+    sys.argv = [script, *arguments]
+    try:
+        runpy.run_path(script, run_name="__main__")
+    except SystemExit as result:
+        assert result.code == 0, result.code
+else:
+    from scripts.buildlog import record
+    assert record.main(arguments) == 0
+conf_path = path.parents[1] / "lib/conf.py"
+modules = {name: module for name, module in sys.modules.copy().items()
+           if getattr(module, "__file__", None)
+           and Path(module.__file__).resolve() == conf_path}
+assert len({id(module) for module in modules.values()}) == 1, list(modules)
+"""
+        for mode in ("script", "package"):
+            with self.subTest(mode=mode):
+                handoff = self.fixture.handoff().rename(self.fixture.base / f"handoff-{mode}.log")
+                arguments = ["step", "0", str(record_tests.START), str(record_tests.START + 1),
+                             "0", str(handoff), "", *record_tests.NEXTEST]
+                result = subprocess.run(
+                    [sys.executable, "-c", source, mode, str(record_tests.SCRIPT), json.dumps(arguments)],
+                    cwd=self.fixture.repo, env=self.fixture.environment(), capture_output=True, text=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.fixture.records()[-1]["step"], "nextest")
 
     def test_step_rows_keep_compiled_names_and_tty_rows_keep_them_unknown(self) -> None:
         for tty, expected in (("0", ["alpha", "beta"]), ("1", None)):

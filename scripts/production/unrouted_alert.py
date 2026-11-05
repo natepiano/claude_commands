@@ -23,6 +23,8 @@ def send_message(recipient: str, sender: str, message: str) -> None:
         match outcome.header.outcome:
             case "sent" | "queued" | "kept":
                 return
+            case "retry":
+                raise RuntimeError(f"RETRY: {outcome.header.detail}")
             case "skipped" | "replaced" | "failed" | "refused" | "held" | "pending":
                 pass
     raise RuntimeError((result.stderr or result.stdout).strip() or "message delivery failed")

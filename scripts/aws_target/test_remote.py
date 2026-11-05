@@ -1,6 +1,14 @@
 """Remote permission, interruption, and stop evidence protect AWS work."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    from scripts.lib import process_start as process_identity
+
+
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext, redirect_stdout
 import io
@@ -450,7 +458,7 @@ class RunnerPermissionTests(ControlFixture):
         arguments.pid, arguments.what, arguments.remote = 700, "check hana", "aws-build"
         scope = mac_test.RepositoryScope("hana", "https://example.invalid/team/hana", 1)
         with mock.patch.object(mac_test, "target_claim_scope", return_value=scope), \
-             mock.patch.object(mac_test, "process_start_time", return_value="fixture-process"), \
+             mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fixture-process")), \
              redirect_stdout(io.StringIO()):
             self.assertEqual(mac_test.command_claim(arguments, paths, watch_claim=False), 0)
         claim = mac_test.claim_path(paths, scope)

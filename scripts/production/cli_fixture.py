@@ -63,6 +63,7 @@ def production_paths(environment: Mapping[str, str]) -> Generator[None]:
     """Bind source readers to the same fixture paths for direct and CLI calls."""
     import dailies_render
     from scripts.production import showrunners
+    from scripts.message import session_send
     from scripts.whoami import note_file
 
     home = Path(environment.get("HOME", str(Path.home())))
@@ -81,7 +82,7 @@ def production_paths(environment: Mapping[str, str]) -> Generator[None]:
             "SESSIONS": Path(environment.get("SHOWRUNNERS_SESSIONS") or
                              str(Path(showrunners.__file__).parents[1] / "message/sessions.py")),
             "SEND": Path(environment.get("SHOWRUNNERS_SEND") or
-                         str(Path(showrunners.__file__).parents[1] / "message/send.py")),
+                         str(session_send.SEND_SCRIPT)),
         }.items():
             _ = scope.enter_context(patch.object(showrunners, name, value))
         yield

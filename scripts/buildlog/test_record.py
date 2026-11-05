@@ -27,10 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory
-    from ..lib.shell_test_support import shell_function
+    from ..lib.shell_test_support import shell_function, shell_functions
 else:
     from scripts.lib.socket_test_support import short_socket_directory
-    from scripts.lib.shell_test_support import shell_function
+    from scripts.lib.shell_test_support import shell_function, shell_functions
 
 import record as recorder
 import step_context
@@ -126,6 +126,9 @@ class RecordTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(mock.patch.dict(os.environ))
+        if "BUILDLOG_REPO_IDENTITY" in os.environ:
+            del os.environ["BUILDLOG_REPO_IDENTITY"]
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.base)))
         tools = rust_tool_path(self.base / "tools")
         self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
@@ -196,13 +199,52 @@ class RecordTests(unittest.TestCase):
             "step", str(status), str(START), str(START + 12.5), tty, handoff, peak, *argv, extra=extra, cwd=cwd
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        return self.records()[-1]
+        return [row for row in self.records() if row.get("kind") == "step"][-1]
 
     def records(self) -> list[Record]:
         found: list[Record] = []
         for path in sorted(self.root.glob("*/*.jsonl")):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
+
+    def test_reserved_test_phase_row_keeps_the_sampler_reservation_with_or_without_charge(self) -> None:
+        reservation = "sampled-reservation"
+        charge: recorder.TestPhaseChargeUse = {
+            "bytes": 8192, "selected_at": START, "reservation_id": reservation, "need": {},
+        }
+        history = self.root / "admission/anon_peaks.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        for has_charge in (False, True):
+            with self.subTest(has_charge=has_charge):
+                _ = history.write_text(json.dumps({
+                    "reservation_id": reservation,
+                    "test_phase_charge_use": charge if has_charge else None,
+                }) + "\n")
+                result = self.record("test-phase-context", json.dumps({"reservation_id": reservation}), *NEXTEST)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                context = cast(Record, json.loads(result.stdout))
+                phase = self.base / f"reserved-phase-{has_charge}.json"
+                _ = phase.write_text(json.dumps({
+                    **context, "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+                }))
+                row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TEST_PHASE_FILE": str(phase)})
+                self.assertEqual(row["test_phase_charge"], charge if has_charge else None)
+                self.assertEqual(row["reservation_id"], reservation)
+
+    def test_test_phase_without_a_text_reservation_omits_the_sidecar_and_row_key(self) -> None:
+        contexts: tuple[Record, ...] = ({}, {"reservation_id": ""}, {"reservation_id": None}, {"reservation_id": 7})
+        for case, sampling_context in enumerate(contexts):
+            with self.subTest(sampling_context=sampling_context):
+                result = self.record("test-phase-context", json.dumps(sampling_context), *NEXTEST)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                context = cast(Record, json.loads(result.stdout))
+                phase = self.base / f"unreserved-phase-{case}.json"
+                _ = phase.write_text(json.dumps({
+                    **context, "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+                }))
+                row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TEST_PHASE_FILE": str(phase)})
+                self.assertNotIn("reservation_id", row)
+                self.assertNotIn("reservation_id", context)
 
     def test_step_records_resolved_target_and_build_directories(self) -> None:
         cargo = self.base / "tools" / "cargo"
@@ -211,18 +253,15 @@ class RecordTests(unittest.TestCase):
                               "build_directory": str(build)})
         _ = cargo.write_text("#!/bin/sh\nif [ \"$1\" = metadata ]; then\n  printf '%s\\n' '" + payload + "'\nelse\n  exit 99\nfi\n")
         cargo.chmod(0o755)
-        captured = str(self.repo / "captured-output")
-        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TARGET_FOLDER": captured})
-        self.assertEqual(row["target_directory"], str(target))
+        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TARGET_FOLDER": str(target)})
+        self.assertTrue(row["target_dir"] == row["target_directory"] == str(target))
         self.assertEqual(row["build_directory"], str(build))
-        self.assertIn("target_dir", row)
-        self.assertEqual(row["target_dir"], captured)
         _ = index.update()
         with closing(index.read_only()) as connection:
             indexed = connection.execute(
                 "SELECT target_folder, build_history_group, target_directory, build_directory FROM steps"
             ).fetchall()
-        self.assertEqual(indexed, [(captured, "folder:" + captured, str(target), str(build))])
+        self.assertEqual(indexed, [(str(target), "folder:" + str(target), str(target), str(build))])
 
     def test_floor_scan_records_filesystem_identity_without_changing_old_rows(self) -> None:
         recorder.floor_scan(1, 2, [], START, filesystem="8-1:/outputs")
@@ -417,6 +456,25 @@ class RecordTests(unittest.TestCase):
         _ = self.assert_folder_record(NEXTEST, "unresolved")
         self.assertIn("target folder:", (self.root / "errors.log").read_text())
 
+    def test_invalid_cli_config_records_unresolved_and_an_error(self) -> None:
+        _ = (self.repo / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
+        malformed = self.base / "malformed.toml"
+        _ = malformed.write_text('[build\n')
+        unreadable = self.base / "config-directory"
+        unreadable.mkdir()
+        for setting in ('build.target-dir="broken', str(malformed), str(unreadable), str(self.base / "missing.toml")):
+            with self.subTest(setting=setting):
+                self.assertEqual(self.resolved_folder(["cargo", "check", "--config", setting]), "unresolved")
+                self.assertIn("target folder:", (self.root / "errors.log").read_text())
+
+    def test_target_environment_overrides_cli_config_in_capture(self) -> None:
+        argv = ["cargo", "check", "--config", 'build.target-dir="configured-output"']
+        for variable, expected in (("CARGO_TARGET_DIR", "environment-output"),
+                                   ("CARGO_BUILD_TARGET_DIR", "configured-output")):
+            with self.subTest(variable=variable):
+                self.assertEqual(self.resolved_folder(argv, extra={variable: "environment-output"}),
+                                 str(self.repo / expected))
+
     def test_captured_folder_survives_config_change_and_pending_retry(self) -> None:
         config = self.repo / ".cargo"
         config.mkdir()
@@ -443,7 +501,7 @@ class RecordTests(unittest.TestCase):
 
         shell = "\n".join(shell_function(invoke.read_text(), name) for name in
                           ("buildlog_read_context", "buildlog_now", "buildlog_begin", "buildlog_write_step", "buildlog_end"))
-        shell += "\n" + shell_function(verify.read_text(), "refresh_test_build_inputs") + "\n"
+        shell += "\n" + shell_functions(verify, "set_verdict_keys", "refresh_test_build_inputs")
         shell += 'tree_key() { printf key; }\n'
         home = self.base / "shell-home"
         launcher = home / ".claude/scripts/lib/py"
@@ -684,6 +742,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(record["duration_s"], 12.5)
 
     def test_piped_run_records_memory_wait_outside_step_duration(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
         runtime = Path(self.enterContext(short_socket_directory())) / "systemd"
@@ -745,6 +805,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(duration, 7)
 
     def test_launch_memory_wait_limit_refuses_once(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11010048 kB\n")
         command = ('source "$1"; sleep() { SECONDS=$((SECONDS + 1)); }; '
@@ -780,6 +842,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         _ = cases["above floor"].write_text("MemAvailable: 13631488 kB\n")
         for name, meminfo in cases.items():
             with self.subTest(name=name):
+                self.admission.allow_next_start()
                 result = subprocess.run(
                     ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
                     env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
@@ -883,6 +946,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(self.records()[-1]["mem_wait_s"], 0)
 
     def test_unscoped_step_waits_for_memory(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
         marker = self.base / "step-started"
@@ -1043,6 +1108,80 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual((unknown["tree_key"], unknown["tree_changed"]), (None, None))
         _ = (self.repo / "new.rs").write_text("\n")
         self.assertNotEqual(self.key(*NEXTEST), key)
+
+    def test_step_without_a_command_keeps_unknown_repository_identity(self) -> None:
+        _ = self.git("remote", "add", "origin", "https://example.org/local.git", cwd=self.repo)
+        row = self.step(0, "0", "", "", [])
+        self.assertEqual(row["repo_identity"], store.UNKNOWN_IDENTITY)
+
+    def test_mirror_steps_record_the_sent_repository_identity_without_derivation(self) -> None:
+        mirror = self.base / "mirror"
+        mirror.mkdir()
+        _ = self.git("init", "-q", "--template=", cwd=mirror)
+        identity = "https://example.org/source"
+        for caller in ("verify-mac", "verify-linux"):
+            with self.subTest(caller=caller), mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": identity}):
+                row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller}, cwd=mirror)
+                self.assertEqual(row["repo_identity"], identity)
+                _ = index.update()
+                with closing(index.read_only()) as connection:
+                    indexed = cast(tuple[str, int], connection.execute(
+                        "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
+                    ).fetchone())
+                self.assertEqual(indexed, (identity, 0))
+
+    def test_ordinary_steps_ignore_the_sent_repository_identity(self) -> None:
+        directory = self.base / "ordinary"
+        directory.mkdir()
+        with mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": "https://example.org/source"}):
+            row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": "verify"}, cwd=directory)
+        self.assertEqual(row["repo_identity"], store.UNKNOWN_IDENTITY)
+
+    def test_mirror_steps_without_a_sent_identity_keep_unknown_identity(self) -> None:
+        directory = self.base / "mirror"
+        directory.mkdir()
+        for caller in ("verify-mac", "verify-linux"):
+            for sent in (None, "", " \t\n"):
+                with self.subTest(caller=caller, sent=sent), mock.patch.dict(os.environ):
+                    if sent is None:
+                        if "BUILDLOG_REPO_IDENTITY" in os.environ:
+                            del os.environ["BUILDLOG_REPO_IDENTITY"]
+                    else:
+                        os.environ["BUILDLOG_REPO_IDENTITY"] = sent
+                    self.assertIsInstance(recorder.sent_repository_identity(), recorder.NoSentRepositoryIdentity)
+                    call_id = f"{caller}-{sent!r}"
+                    row = self.step(0, "0", "", "", NEXTEST, {
+                        "BUILDLOG_CALLER": caller, "BUILDLOG_CALL_ID": call_id,
+                    }, cwd=directory)
+                    self.assertEqual(row["repo_identity"], store.UNKNOWN_IDENTITY)
+                    recorder.ssh_attempt({
+                        "call_id": call_id, "target": "mac" if caller == "verify-mac" else "aws",
+                        "repo_identity": "https://example.org/source", "queued_at": START,
+                        "departed_at": START + 1, "slot": 1, "outcome": "passed",
+                        "completion": "confirmed", "cleanup": "confirmed", "unresolved_count": 0,
+                        "evidence_at": START + 2,
+                    })
+                    _ = index.update()
+                    with closing(index.read_only()) as connection:
+                        indexed = cast(tuple[str, int], connection.execute(
+                            "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
+                        ).fetchone())
+                    self.assertEqual(indexed, ("https://example.org/source", 1))
+
+    def test_known_local_repository_identity_wins_over_the_sent_identity(self) -> None:
+        identity = "https://example.org/local"
+        _ = self.git("remote", "add", "origin", identity + ".git", cwd=self.repo)
+        for caller in ("verify-mac", "verify-linux"):
+            with self.subTest(caller=caller), mock.patch.dict(
+                os.environ, {"BUILDLOG_REPO_IDENTITY": "https://example.org/source"},
+            ):
+                row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller})
+                self.assertEqual(row["repo_identity"], identity)
+
+    def test_sent_repository_identity_strips_surrounding_space(self) -> None:
+        with mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": "  https://example.org/source\n"}):
+            self.assertEqual(recorder.sent_repository_identity(),
+                             recorder.SentRepositoryIdentity("https://example.org/source"))
 
     def test_verify_mac_step_without_git_records_the_sent_tree_key_and_call_id(self) -> None:
         mirror = self.base / "mirror"

@@ -92,6 +92,8 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             match outcome.header.outcome:
                 case "sent" | "skipped" | "kept" | "replaced":
                     return
+                case "retry":
+                    raise Refusal(f"send.py: needs a retry: {outcome.header.detail}")
                 case "queued" | "failed" | "refused" | "held" | "pending":
                     pass
         raise Refusal(f"send.py: {failure_detail(sent)}")

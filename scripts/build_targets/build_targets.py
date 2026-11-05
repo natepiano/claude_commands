@@ -61,11 +61,15 @@ import build_hold
 import override_guard
 from user_zone import user_zone
 if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
     from ..direct.step_record import Pinned, ROUTED, TargetSelection
+    from ..buildlog import mac_idle_alert
     from ..message import roster
     from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
 else:
+    from scripts.lib import process_start as process_identity
     from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
+    from scripts.buildlog import mac_idle_alert
     from scripts.message import roster
     from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
 
@@ -102,8 +106,7 @@ def local_time(instant: datetime) -> str:
     return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def display_field(value: str) -> str:
-    return " ".join(value.split())
+display_field = mac_idle_alert.display_field
 
 
 def unit_label_suffix(state: RunningJob | Held, labels: Mapping[RunningJob | Held, roster.UnitLabels]) -> str:
@@ -216,6 +219,9 @@ def command_status(probe: bool = False) -> int:
     except Exception:
         identities = {}
     labels = {state: identities[session_id] for state, session_id in holders.items() if session_id in identities}
+    alert = mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone())
+    if alert is not None:
+        print(f"\033[1;31m{alert}\033[0m" if sys.stdout.isatty() else alert)
     for name, state in states:
         print(format_state(name, state, labels))
     return 0
@@ -373,14 +379,14 @@ def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
 
 def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> bool:
     """Find the same process's reservation, including retained cleanup ownership."""
-    start = mac_test.process_start_time(pid)
-    if start is None:
+    start = process_identity.process_start(pid)
+    if not isinstance(start, process_identity.Started):
         return False
     scope = mac_test.target_claim_scope(paths, repo_root)
     with mac_test.locked(paths.lock):
         block = mac_test.blocking_claim_block(paths)
         return any(mac_test.scopes_overlap(claim.scope, scope)
-                   and claim.record["pid"] == pid and claim.record["proc_start"] == start
+                   and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                    and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
                    and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)
                    for claim in mac_test.read_claims(paths))
@@ -392,15 +398,15 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
     scope = mac_test.target_claim_scope(paths, args.repo_root)
     if not isinstance(scope, mac_test.RepositoryScope):
         return
-    start = mac_test.process_start_time(args.pid)
-    if start is None:
+    start = process_identity.process_start(args.pid)
+    if not isinstance(start, process_identity.Started):
         return
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
                        if mac_test.scopes_overlap(claim.scope, scope) and "remote_host" in claim.record
                        and (mac_test.run_is_kept(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
-                                and claim.record["proc_start"] == start)))
+                                and claim.record["proc_start"] == start.start)))
     if not claims:
         return
     try:
@@ -501,8 +507,8 @@ def command_reserve(args: CliArguments) -> int:
 
 def command_release_wait(pid: int) -> int:
     """Release only process-bound reservations; remote claims retain ownership."""
-    start = mac_test.process_start_time(pid)
-    if start is None:
+    start = process_identity.process_start(pid)
+    if not isinstance(start, process_identity.Started):
         return 0
     for target in read_targets():
         if not isinstance(target, SshTarget):
@@ -512,7 +518,7 @@ def command_release_wait(pid: int) -> int:
             continue
         with mac_test.locked(paths.lock):
             for claim in mac_test.read_claims(paths):
-                if (claim.record["pid"] == pid and claim.record["proc_start"] == start
+                if (claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                         and "remote_host" not in claim.record):
                     claim.path.unlink(missing_ok=True)
     return 0
