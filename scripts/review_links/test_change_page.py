@@ -127,6 +127,35 @@ class BrowserForms(HTMLParser):
 SEND_MESSAGE = change_page.send_message
 
 
+class ReviewTextTests(unittest.TestCase):
+    def test_text_without_list_lines_keeps_all_whitespace_in_one_block(self) -> None:
+        text = '\n First <line> \r\n\r Second & line\u2028Third\n'
+        for block in ("p", "pre"):
+            with self.subTest(block=block):
+                self.assertEqual(change_page.review_text_html(text, block),
+                    f'<{block}>\n First &lt;line&gt; \r\n\r Second &amp; line\u2028Third\n</{block}>')
+
+    def test_question_and_answer_show_list_runs_and_text_blocks(self) -> None:
+        question = change_page.AnsweredQuestion("q1", "\n  Steps\n continue\n\n  - First\n- Second\n1. Third\n2. Fourth\n\n Done\n", "- Yes\n- No")
+        self.assertEqual(change_page.question_html(question),
+            '<h2>Question</h2><p>Steps\ncontinue</p><ul><li>First</li><li>Second</li></ul>'
+            + '<ol><li>Third</li><li>Fourth</li></ol><p>Done</p><h2>Answer</h2><ul><li>Yes</li><li>No</li></ul>')
+
+    def test_review_text_escapes_text_blocks_and_each_list_item(self) -> None:
+        text = '<script>& "text"\n\n- <a href="x"> & **bold**\n1. `code` | <img>'
+        for block in ("p", "pre"):
+            with self.subTest(block=block):
+                self.assertEqual(change_page.review_text_html(text, block),
+                    f'<{block}>&lt;script&gt;&amp; &quot;text&quot;</{block}>'
+                    + '<ul><li>&lt;a href=&quot;x&quot;&gt; &amp; **bold**</li></ul>'
+                    + '<ol><li>`code` | &lt;img&gt;</li></ol>')
+
+    def test_each_numbered_run_starts_at_its_first_number(self) -> None:
+        self.assertEqual(change_page.review_text_html('3. Third\n4. Fourth\n\n1. First\n- Bullet\n8. Eighth'),
+            '<ol start="3"><li>Third</li><li>Fourth</li></ol><ol><li>First</li></ol>'
+            + '<ul><li>Bullet</li></ul><ol start="8"><li>Eighth</li></ol>')
+
+
 class ChangePageTests(unittest.TestCase):
     temporary: Path = Path()
     root: Path = Path()
@@ -145,6 +174,45 @@ class ChangePageTests(unittest.TestCase):
         super().__init__(methodName)
         self.raw_messages = []
         self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""))
+
+    def test_both_pages_show_lists_in_the_question_answer_and_check(self) -> None:
+        item = change_review.Visible('Numbered moves', 'Steps\n- Click <one>\n- Click two\n\nFinish', 'Result')
+        _ = change_review.edit_row(self.review_list, 'C1', item, date(2026, 11, 5), self.production)
+        status = change_page.DeliveryStatus(self.root)
+        question = status.ask(self.page, 'C1', 'Which steps?\n1. First\n2. Second')
+        assert isinstance(question, change_page.QuestionDelivery)
+        self.assertTrue(status.answer_question(self.page, 'C1', question.question_id, 'Use these:\n- One\n- Two'))
+        for content in (change_page.render(self.page, status).decode(),
+                        change_browser.render(change_page.ReviewBrowser('token'), status).decode()):
+            with self.subTest(page=content[:80]):
+                self.assertIn('<pre>Steps</pre><ul><li>Click &lt;one&gt;</li><li>Click two</li></ul>'
+                              + '<pre>Finish. You see: Result</pre>', content)
+                self.assertIn('<h2>Question</h2><p>Which steps?</p><ol><li>First</li><li>Second</li></ol>', content)
+                self.assertIn('<h2>Answer</h2><p>Use these:</p><ul><li>One</li><li>Two</li></ul>', content)
+
+    def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        question = status.ask(self.page, 'C1', 'Which steps?')
+        assert isinstance(question, change_page.QuestionDelivery)
+        answer = '  \n1. First\n\n2.  Second | <result>\n  '
+        arguments = ['answer-question', '--production', str(self.production), '--list', str(self.review_list),
+                     '--row', 'C1', '--question', question.question_id, '--text', answer]
+        self.assertEqual(change_page.main(arguments), 0)
+        saved = status.slots(self.page, 'C1').question
+        self.assertEqual(saved, change_page.AnsweredQuestion(question.question_id, question.text, answer.strip()))
+        record = status.path(self.page, 'C1')
+        before, modified = record.read_bytes(), record.stat().st_mtime_ns
+        self.assertEqual(change_page.main(arguments), 0)
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), (before, modified))
+        self.assertIn('<h2>Answer</h2><ol><li>First</li></ol><ol start="2"><li> Second | &lt;result&gt;</li></ol>',
+                      change_page.render(self.page, status).decode())
+
+    def test_a_row_without_a_production_document_shows_proof_lists(self) -> None:
+        row = change_page.answer_row(self.page, 'C1') | {change_review.CHECK: 'Read\n- First\n- Second'}
+        change = change_browser.WaitingChange('orphan/C1', 'orphan',
+            change_routing.UnavailableProduction(self.review_list), row)
+        self.assertIn('<h2>Proof</h2><pre>Read</pre><ul><li>First</li><li>Second</li></ul>',
+                      change_browser.section(change, 5))
 
     def test_publications_keep_the_html_and_manifest_under_one_configured_root(self) -> None:
         from scripts.review_links import review_link
