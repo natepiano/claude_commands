@@ -63,6 +63,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
@@ -93,13 +94,9 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/merge_gate.py` | read | staff.json path |
 | `scripts/production/migrate_middle_stores.py` | read | operation, snapshot |
 | `scripts/production/migrate_next_pins.py` | read | operation, snapshot |
-| `scripts/production/migrate_proposals.py` | read | snapshot, StaffId |
-| `scripts/production/migrate_showrunner_settings.py` | read | snapshot, StaffId |
 | `scripts/production/migrate_showrunner_state.py` | read | operation, snapshot |
-| `scripts/production/migrate_showrunner_timers.py` | read | snapshot, StaffId |
 | `scripts/production/migrate_staff_ids.py` | read | _file, is_owner, native_id, operation, publish_native_ids, runtime_id, snapshot |
 | `scripts/production/next_item.py` | read | snapshot |
-| `scripts/production/owns_fill.py` | read | snapshot, PresentWorktree, RemovedWorktree |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
@@ -172,7 +169,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-157 accessors: 27 write, 129 read, 1 owner.
+154 accessors: 27 write, 126 read, 1 owner.
 
 ## Approved copies
 
