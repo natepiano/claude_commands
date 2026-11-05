@@ -1738,35 +1738,18 @@ Each estimate decodes `admission/anon_peaks.jsonl` once and asks the index once,
 **Ruled out:** a byte-offset start of the history read (the file is only close to append order); moving `program_peak_estimate` onto the shared read (it raises on an unreadable file); the fresh zero-compile rule inside the shared join (it changes fresh estimates).
 
 ### Phase 70 — Memory and sweep find the enclosing Cargo target with one function  · status: done
-**Depends on:** report-unit Phase 25 (`9ae49ff1f`) on `origin/builds`. Start only when `git merge-base --is-ancestor 9ae49ff1f origin/builds` succeeds.
-
-**Approved:** showrunner 2026-11-05 03:45 EST, with report's held F013 test case added.
-
-#### Work Order
-
-**Goal:** one function finds the Cargo target folder that encloses a path. Memory kill classification and sweep's delete record both use it.
-
-**Spec:**
-1. Add `sweep.enclosing_cargo_target(path, *, lint_settings) -> EnclosingCargoTarget | NoEnclosingCargoTarget` beside `is_cargo_target` (`scripts/lint/sweep.py` :934).
-   It walks the path and its parents. It returns `EnclosingCargoTarget(folder)` for the first Cargo target folder, or `NoEnclosingCargoTarget()` when no folder matches.
-2. Switch both parent-folder walks to it: `scripts/buildlog/memory.py` `build_output_program` (added by report Phase 25) and `sweep.py` `record_target_deletes` (:2783).
-3. Move report's held F013 cache-tag test case from `scripts/buildlog/test_memory_window.py` to `scripts/lint/test_sweep.py`; it tests sweep code.
-
-**Constraints from prior phases:**
-- Phase 66: keep both guards in `_recorded_mapping_rows()` (`sweep.py` :385). A folder mismatch is never evidence.
-  An override row counts only when the fixed recorder wrote it (after `TARGET_OVERRIDE_RECORDER_CUT`). Keep the cut, unknown-start and mismatch tests unchanged.
-- Phase 67: keep every build coordination import in `sweep.py` inside a function. `memory.py` keeps its run-time import form for `sweep`.
-- Keep one copy of each module in a process.
+#### As-built
+One function finds the Cargo target folder that holds a path, and both parent walks use it.
+- `sweep.enclosing_cargo_target(path: str, *, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> EnclosingCargoTarget | NoEnclosingCargoTarget` resolves the path and returns the nearest folder, the path itself included, that `is_cargo_target` accepts. `EnclosingCargoTarget.folder` is a `str`, as the other sweep target paths are.
+- `record_target_deletes` skips a path whose real path is a known target and records the enclosing target of each other path; a path outside every target adds nothing.
+- `memory.build_output_program` passes the resolved program's parent folder, so a target folder itself is not a build program. It reads lint settings only through `is_cargo_target`, so only a cache-tag folder reads `lint.conf`.
 
 **Files:**
-- `scripts/lint/sweep.py`, `scripts/buildlog/memory.py` — the function and its two callers.
-- `scripts/lint/test_sweep.py`, `scripts/buildlog/test_memory_window.py` — tests.
+- `scripts/lint/sweep.py` — the function, its two result types and `record_target_deletes`.
+- `scripts/buildlog/memory.py` — `build_output_program` calls the function.
+- `scripts/lint/test_sweep.py` — the cache-tagged target, the path itself, the nearest delete record and the outside delete.
+- `scripts/buildlog/test_memory_window.py` — a target folder is not a build program.
 
-**Workers:** `1 writer + 1 tester`
+**Gotchas:** the function includes the path itself; a caller that classifies a file passes its parent folder.
 
-**Acceptance gate:**
-- `git grep -n "\.parents" -- scripts/buildlog/memory.py` shows no Cargo target walk; `record_target_deletes` has no own walk.
-- Tests through both callers pin the nearest matching target and the `NoEnclosingCargoTarget` result.
-- `test_sweep.py`, `test_memory_window.py` and `scripts/mac_test/test_offload.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
-- Also touches: `memory.py`, `test_memory_window.py` (report-unit); tested against report's tip.
-- Change-Review line: none — the same targets, found by one function.
+**Ruled out:** moving the memory cache-tag and symlink tests to `test_sweep.py` (they pin memory's classification).
