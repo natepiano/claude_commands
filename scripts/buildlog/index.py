@@ -42,7 +42,7 @@ else:
     from scripts.lib import conf
     from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 33
 
 
 # These indexes support repeated queries over the current schema.
@@ -138,6 +138,7 @@ STEP_COLUMNS: list[Column] = [
     ("status", "INTEGER", "exit status; 128+n for signal n"),
     ("rustc", "TEXT", "rustc -V for the step's toolchain"),
     ("peak_mem_bytes", "INTEGER", "cgroup memory.peak of the step (page cache included); natedev only"),
+    ("test_phase_charge_bytes", "INTEGER", "charge admission used for the test phase; NULL when no charge was recorded"),
     ("mem_stall_some_s", "REAL", "seconds at least one task waited on memory; natedev only"),
     ("mem_stall_full_s", "REAL", "seconds every task waited on memory; natedev only"),
     ("finished_s", "REAL", "cargo's own 'Finished ... in' build time (mend: its check time)"),
@@ -393,6 +394,7 @@ SAMPLE_COLUMNS: list[Column] = [
     ("slices", "TEXT", "JSON raw builds and CI slice readings; memory.current is the whole held charge"),
     ("filesystem", "TEXT", "JSON filesystem free/used/total and top-layer device identity"),
     ("jobserver", "TEXT", "JSON free pool tokens, not CPUs in use; measured or unavailable"),
+    ("zram", "TEXT", "JSON zram storage at the sample time"),
 ]
 
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
@@ -826,6 +828,9 @@ def build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild:
 
 def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     argv = record.get("argv")
+    charge = record.get("test_phase_charge")
+    charge_bytes = cast(dict[str, object], charge).get("bytes") if isinstance(charge, dict) else None
+    charge_bytes = charge_bytes if type(charge_bytes) is int else None
     target_dir = record.get("target_dir") or store.UNKNOWN_IDENTITY
     folder = target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute() else None
     target_directory = record.get("target_directory") or folder or store.UNKNOWN_IDENTITY
@@ -836,6 +841,7 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
     record = {
         **record,
         "src": src,
+        "test_phase_charge_bytes": charge_bytes,
         "started_at_us": epoch_microseconds(record.get("started_at")),
         "repo": folder_name(record.get("repo_path")),
         "worktree_name": folder_name(record.get("worktree")),

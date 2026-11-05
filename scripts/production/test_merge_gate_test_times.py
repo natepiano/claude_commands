@@ -152,7 +152,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
                              if (job.suite, job.module, job.returncode) == (row["suite"], row["module"], row["status"]))
             self.assertEqual((row["wall_s"], row["cpu_s"]), (execution.seconds, execution.cpu_seconds))
             self.assertGreaterEqual(row["peak_mib"], 12.5)
-        runner = str(merge_gate.RUNNER)
+        runner = str(self.checkout / "scripts/test_times/module_run.py")
         self.assertEqual(len(launches), 4)
         for argv, root, environment in launches:
             self.assertEqual(argv[1], runner)

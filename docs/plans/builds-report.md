@@ -200,6 +200,13 @@ The build report is too long for the user and is not used for analysis. Retire i
 
 The result goes to the showrunner. No repository code changes.
 
+Method (side A and side B 1 already ran this way; keep it):
+1. Use one shared clone of hana origin/main 72d2c08da9bdbc295f7a36af216e01941b582371. The source checkout stays unchanged.
+2. Side A keeps `[workspace.metadata.dev] features = ["hana/dynamic_linking"]` in the root manifest. Side B removes only that activation.
+3. Side A builds into `dylib_ab/target-a`, side B into `dylib_ab/target-b`, through `CARGO_TARGET_DIR`. Cold means an empty target folder; compiler and download caches stay.
+4. Run each verify.sh call with `--local`, `--no-cache` and the measurement reason, on natedev only.
+5. Record wall, build, test, wait and load per run. Exclude an interrupted run.
+
 Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
 
 ### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
@@ -225,7 +232,7 @@ The user, 2026-11-03: tables do not work for them. Lower priority. Design a char
 #### As-built
 
 - Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
-- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html` and opens it. The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.py` and prints the tailnet link (Phase 22). The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
 - Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
 - `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
 - `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
@@ -299,7 +306,7 @@ Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHON
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
 
 ### Phase 15 — The build page ranks the top costs with the action that cuts each  · status: todo
-**Depends on:** Phase 14; the builds showrunner names the build page
+**Depends on:** Phase 14; queue-unit's Phase 10m (it moves the Build Memory page and its feed into the repo)
 
 The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to builds to review - i'm not sure about this". The builds showrunner ran it. The data is useful: memory wait is 236 step-hours a day, eight times the next cost. The output does not tell the user what to do. Ruling:
 
@@ -308,7 +315,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to build
 3. Show hours in the user's zone. No seconds, no UTC, no microseconds.
 4. Move the Definitions block into the as-built doc.
 5. Check the memory-wait number first. 236 h a day means about 10 steps wait at all times. queue-unit's 10l bug (on main now) made a waiting step with the AWS hook hold its grant and never start. Say how many of the 236 h came from that bug.
-6. The build history charts (C950) go on the same page. No second page.
+6. The build history charts (C950) go on the same page. No second page. Phase 22 made `buildlog charts` publish its own page and print its tailnet link. After this phase, `buildlog charts` publishes no page of its own: it prints the tailnet link of the shared build page. With no link available, it prints the reason and exits non-zero.
 
 The page is queue-unit's Build Memory page (`memory_live.html`, fed by `memory_feed.py`); queue's 10m moves it into the repo. Agreed with queue-unit 2026-11-04: report-unit gives typed data, no HTML, from `charts.page_section(days)` and `costs.top_costs(n=3)`. queue's feed calls them and its page draws them. A 7-day read stays under 1 s. Send queue-unit the signatures and types when they land.
 
@@ -316,13 +323,13 @@ Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder):
 
 Each fix returns as a new Change-Review row.
 
-Acceptance: one page request through queue's feed calls both providers for 7 days in under 1 s total. Interface tests pass `NoDataYet`, `CostUnavailable` and `MacIdleUpperBound` through to the feed unchanged. Phase 16's `test_machine_aliases_read_sync_configuration_once` stays green.
+Acceptance: one page request through queue's feed calls both providers for 7 days in under 1 s total. Interface tests pass `NoDataYet`, `CostUnavailable` and `MacIdleUpperBound` through to the feed unchanged. Phase 16's `test_machine_aliases_read_sync_configuration_once` stays green. A test proves `buildlog charts` prints the shared page's tailnet link and writes no page; a test proves a missing link prints the reason and exits non-zero.
 
 **Constraints from prior phases:** `costs.machine_name` reads `sync_config()` once and calls `record._target_hosts` (Phase 16).
 
 **Workers:** 1 writer (report-unit's providers and their interface tests). queue-unit owns the page and the feed integration test.
 
-**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).
+**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `config/buildlog.conf` (action text and ranking window) and the test that reads it, `docs/as-built/` (Definitions).
 
 ### Phase 16 — Each build step spends less CPU to write its build-log row  · status: done
 **Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
@@ -354,19 +361,125 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 
 **Ruled out:** a join on equal `at` text between the two writers (a miss showed the slice as absent).
 
-### Phase 18 — Each test step's row records the memory charge admission gave its test phase  · status: todo
+### Phase 18 — Each test step's row records the memory charge admission gave its test phase  · status: done
 **Depends on:** none (from next items; showrunner 2026-11-04: natest P10 is on builds, the index.py freeze has ended, start now)
 
-Admission now saves the charge it gave a test phase: `memory_admit.read_test_phase_charge_use` returns `TestPhaseChargeUse` (`bytes`, `selected_at`, `reservation_id`, `need`) or `NoTestPhaseChargeUse`, and finalization copies it into the admission history row as `test_phase_charge_use`. The step row still writes `test_phase_charge: null` (`record.py` `test_phase_context`), and the index has no column for it.
+#### As-built
 
-1. Find where the recorder can read the charge for its own step: the sampling context that `invoke.sh` passes to `record.py test-phase-context`, the reservation's saved file, or the admission history row by `reservation_id`. Quote the code that proves the charge exists at that moment.
-2. Copy the charge into the step row's `test_phase_charge`. Compute nothing. No charge records null.
-3. Add an index column for the charge bytes, so `buildlog query` can rank steps by it.
+- Admission selects the charge after the grant and publishes it in its history row (`admission/anon_peaks.jsonl`, `test_phase_charge_use`) at release, before the recorder runs. The grant never carries it; `test-phase-context` writes `test_phase_charge: null` and keeps the sidecar's `reservation_id`.
+- At step end and on pending-record retry, `record.completed_test_phase_charge(reservation_id)` searches the history from the end (mmap, shared flock, whole rows only), only when the sidecar's window is `ObservedTestPhase`. A match builds `ChargedTestPhaseRecord`; the row copies the evidence unchanged.
+- Bad or unreadable evidence records null and writes one `errors.log` line; the row is always published. A step whose admission published no history row (no sampled peak, or unscoped) records null.
+- The index has `steps.test_phase_charge_bytes` (`SCHEMA_VERSION` 32); older rows read null.
+- `TestPhaseChargeUse`, `NoTestPhaseChargeUse`, `CallRecord`, `NoCallRecord` and `parse_test_phase_charge_use` live in `scripts/lib/test_phase.py`; `memory_admit` re-exports the names. `record.py` loads no `memory_admit`.
+- CPU ms per call, bevy_brp: terminal 118.5 (charged with the real 11 MB history 117.0, no row 113.6), tee 112.1 (120.2, 117.0), call 56.3, step-context 50.5, test-phase-context 51.0. Drivers: `cpu_driver.py` and `cpu_driver_charged.py` in the phase 18 folder.
 
-Acceptance: a step with a charge records it for terminal and tee steps; a step without one records null. The index column holds the bytes or null. CPU per `record.py` call stays at or below the Phase 16 values (terminal 150.3 ms, tee 151.4 ms, test-phase-context 80.9 ms).
+**Files:** `scripts/buildlog/record.py`, `index.py`, `test_step_row.py`, `test_index.py`, `scripts/lib/test_phase.py`, `scripts/lint/memory_admit.py`, `test_memory_admit.py`, `docs/as-built/buildlog-memory-stalls.md`.
 
-**Constraints from prior phases:** `record.py` keeps its imports lazy (Phase 16). Do not import `memory_admit` on the step path. An edit to `memory_admit.py` or `invoke.sh` needs a notice to queue-unit.
+**Ruled out:** reading the charge from the grant's sampling context (the charge is chosen later); a history offset in the sidecar (a search with no match costs about 1 ms).
 
-**Workers:** 1 writer (rowcpu).
+### Phase 19 — Each step row names the output folders its own command built  · status: done
+**Depends on:** none
 
-**Files:** `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, their tests, `docs/as-built/buildlog-memory-stalls.md`; `scripts/lint/invoke.sh` and `scripts/lint/memory_admit.py` only if step 1 shows the charge must pass through them.
+#### As-built
+
+- At step end, `step_context.step_output_roots(argv, cwd)` runs `cargo metadata` with the step's own Cargo inputs: the program (with `+toolchain`), the env wrapper's environment and folder, `--manifest-path`, `--config`, and the first `--target-dir` passed as `--config build.target-dir="<absolute>"`. `step_context.cargo_command_context` gives this split to both start capture and end read.
+- When `target_dir` is an absolute folder and the read `target_directory` differs from it, the row has no pair and `errors.log` gets one line. With `target_dir` `unresolved` or `none`, a successful read still writes the pair. Old rows are unchanged.
+- `cargo_target_config.cargo_folder_settings` applies Cargo's order under both policies, lowest first: config files, `CARGO_BUILD_TARGET_DIR`/`CARGO_BUILD_BUILD_DIR`, CLI `--config` (inline and file), `CARGO_TARGET_DIR`, `--target-dir`. Strict capture now reads `--config` (it ignored it since Phase 11); bad TOML or an unreadable file records `unresolved`. sweep.py gets the same order.
+- `read_cargo_output_roots(checkout, *, cargo, options, environment)` builds `[*cargo, "metadata", "--format-version", "1", "--no-deps", *options]`; its six other callers keep the default call.
+- CPU ms per call, bevy_brp, interleaved A/B against Phase 18 (f88894adc) on one loaded machine: terminal 150.5 → 152.3 (1.012x), tee 157.9 → 159.6 (1.010x). Driver: `cpu_ab.py` in the phase 19 folder.
+
+**Files:** `scripts/buildlog/record.py`, `step_context.py`, `test_record.py`, `test_step_row.py`, `scripts/lib/cargo_output.py`, `cargo_output_test_support.py`, `cargo_target_config.py`, `test_cargo_output.py`, `docs/as-built/build-targets.md`.
+
+**Gotchas:** Cargo reads `CARGO_TARGET_DIR` before all build config, CLI `--config` included; `CARGO_BUILD_TARGET_DIR` is ordinary config and loses to `--config`. A CPU baseline from an earlier phase is not valid under a different load: measure A/B in one run.
+
+### Phase 20 — memory.py reads recorded output folders through one reader  · status: done
+**Depends on:** resources' `build_shape.recorded_output_roots` on builds.
+
+#### As-built
+
+- `memory.build_output_roots(index_file, current_checkout, host)` reads recorded Cargo pairs through `build_shape.recorded_output_roots(index_file, host)`, the reader the floor sweep uses. One reader of the steps output pairs remains. The signature, `@lru_cache(maxsize=1)` and `build_output_program` are unchanged.
+- Each `AbsoluteRecordedRoot` side of a pair adds its resolved path; each distinct path resolves once. Each `AbsoluteRecordedRoot` workspace key adds a checkout beside the current checkout. `RecordedRootsUnavailable` leaves only the current checkout. Rows from another host and rows with a `--target-dir` override add nothing (the reader's rule).
+- The `cargo metadata` fallback is unchanged: each checkout with a `Cargo.toml` gets `read_cargo_output_roots`; only a `CargoOutputRoots` result adds roots.
+- The import of `build_shape` is lazy, inside the function, with a `TYPE_CHECKING` split (`from ..lint import build_shape` for basedpyright, `from scripts.lint import build_shape` at run time), so `buildlog snapshot` does not load it.
+- On the live natedev index the root set is 157 (was 166): 6 lost roots lie under kept roots and 3 come from old `unknown`-pair vendor/bevy_render rows whose folders do not exist, so the kill classification is the same.
+- First-call own CPU is about 420-450 ms (was about 120 ms), with `cargo metadata` stubbed; accepted for one reader. Wall time stays about 10 s from 116 sequential `cargo metadata` probes.
+
+**Files:**
+- `scripts/buildlog/memory.py` — `build_output_roots` calls the shared reader.
+- `scripts/buildlog/test_memory_window.py` — `BuildOutputRootsTests`: six outcome tests with a `build_roots(outputs, index_file)` helper; fixtures use `create_step_index` and `record_root_attempt` from `scripts/lint/test_build_shape.py`.
+
+**Binds later work:** the parallel probe change keeps the reader call, the lazy import and the `build_roots` test helper. Resources' later reader change (dedupe pairs, row facts, move into buildlog) edits `memory.py` after this unit's merges.
+
+**Gotchas:**
+- The shared reader returns duplicate pairs because its `SELECT DISTINCT` includes argv: 15,838 pairs, 1,120 distinct on natedev.
+- The tree's own index path can name a schema file that does not exist live; a timing run must pass the live index path.
+
+**Ruled out:** an equal-root-set gate — a lost root is acceptable when a kept root covers it or its folder does not exist.
+
+### Phase 21 — Each memory tick writes one row  · status: done
+
+#### As-built
+
+- Each `buildlog sample` tick writes one sample row, and that row carries `zram`. The tick writes no `memory_snapshot` row, and `cli.py` `sample` has no second writer.
+- `memory.read_zram() -> ZramPresent | ZramAbsent` reads `BUILDLOG_ZRAM` (default `/sys/block/zram0`). `sample.sample()` (lazy import) and `memory.snapshot()` call it. `zram_state` reads an unreadable path as absent, so the sample is kept.
+- `MemorySnapshot` is one TypedDict (`kind`, `at`, `host`, `zram`, `slices`): the standalone `buildlog snapshot` row.
+- `index.py`: `samples.zram` TEXT column; `SCHEMA_VERSION = 33`.
+- `memory.nearest_snapshot` uses one local `nearest_value(column)` over `samples` UNION ALL `memory_snapshots`, key (distance, snapshot row first, `at`). It takes the nearest slices, then the nearest zram. No slices in range reads as unavailable.
+- CPU per tick 313.0 → 297.1 ms (interleaved A/B against c5d618d86); log size 4,808,160 → 4,698,720 bytes/day.
+
+**Files:**
+- `scripts/buildlog/sample.py` — zram in the sample record.
+- `scripts/buildlog/index.py` — the `zram` column and schema 33.
+- `scripts/buildlog/memory.py` — `read_zram`, `MemorySnapshot`, `nearest_snapshot`.
+- `scripts/buildlog/cli.py` — the `sample` command writes one row.
+- `scripts/buildlog/cgroup_test_support.py` — `write_zram` and `ZRAM_READING`.
+- `scripts/buildlog/test_sample.py`, `test_memory_window.py`, `test_index.py`, `test_mac_idle.py` — tests.
+- `docs/as-built/build-memory-admission.md` — owns "Slice snapshots" and the schema number; `docs/as-built/buildlog-memory-stalls.md` points to it.
+
+**Gotchas:**
+- Old logs keep zram and old slices in `memory_snapshots`, so the reader reads both tables.
+- An equal-distance test needs different `at` text forms (`…00.000Z` sorts before `…00Z`), or text order alone picks the winner.
+
+**Ruled out:** moving the zram reader to `cgroup_capture.py` — it removes no copy and gives no CPU gain.
+
+### Phase 22 — buildlog charts prints a tailnet link  · status: done
+
+#### As-built
+
+- `buildlog charts` writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.snapshot`, and prints only the bare tailnet link. It prints no file path. Two runs print the same link.
+- `charts.present_page(series, path, no_open) -> int` puts the page write and the snapshot under one handler of `review_link.SNAPSHOT_ERRORS`. A failure prints one stderr line (`buildlog charts: publication failed: <reason>`) and returns 1.
+- `charts.local_display(environ, platform) -> bool`: false in any ssh session (`SSH_CONNECTION` set); otherwise true on darwin, or with `DISPLAY` or `WAYLAND_DISPLAY`. Only then does `webbrowser.open(link)` run, under `suppress(OSError, webbrowser.Error)`. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` skip the open.
+- `review_link.SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)`; `review_link.main` and charts catch it.
+
+**Files:**
+- `scripts/buildlog/charts.py` — `present_page`, `local_display`.
+- `scripts/buildlog/test_charts.py` — link, display table, browser failure, cache and review-root failure, stable-link tests; `check_publication` fixes the platform.
+- `scripts/review_links/review_link.py` — `SNAPSHOT_ERRORS`.
+- `scripts/buildlog/cli.py` — the charts help line.
+
+**Gotchas:**
+- `review_link.snapshot` costs about 141 ms CPU per call, mostly its `change_routing` import (natedev-efficiency owns that cost).
+- Tests that reach `present_page` must fix `charts.sys.platform`: darwin with no environment is a local display.
+
+**Ruled out:** opening the page on the Mac over ssh with a target config read — the user's rule is "it should always be a tailscale link".
+
+### Phase 23 — The first kill lookup runs its cargo metadata probes in parallel  · status: done
+
+#### As-built
+
+- `memory.build_output_roots` runs `read_cargo_output_roots` for each checkout with a `Cargo.toml` through `ThreadPoolExecutor(max_workers=workers)` and `executor.map`. The root set does not depend on probe order, and a probe exception reaches the caller.
+- `config/buildlog.conf` `METADATA_PROBE_WORKERS=8` (`# whole: 1..`) sets `workers`, read at use with `conf.read("buildlog").whole(...)`.
+- On the live natedev index (157 roots, same set), the first kill lookup takes 1.08 s wall instead of 4.98 s. Total CPU is 5.54 s instead of 4.85 s, because parallel `cargo metadata` runs contend. The cost is paid once per report process that classifies a kill.
+
+**Files:**
+- `scripts/buildlog/memory.py` — the pooled probe loop; `concurrent.futures` is a top-level import, and `build_shape` stays a lazy import (import cycle).
+- `config/buildlog.conf` — `METADATA_PROBE_WORKERS`.
+- `scripts/buildlog/test_memory_window.py` — `probe`, `configure_workers` (`write_config_fixture`, so the committed limits stay) and `probes_meet` (one `threading.Barrier(2)`) helpers; tests for overlapping probes, one worker in sequence and exception propagation.
+
+**Gotchas:** `METADATA_PROBE_WORKERS=1` restores the sequence and the lower CPU.
+
+**Ruled out:**
+- Checking recorded roots before the probes — a second cached reader for a path that runs about once a month.
+- Pooling the `disk.py` timer probes — background wall time only; CPU stays the same.
+- Probing fewer checkouts from recorded pairs or saved roots — the roots go wrong after a Cargo config change.
+- A test that a fractional worker count is refused — it tests only the conf library, which `scripts/lib/test_conf.py` covers.
