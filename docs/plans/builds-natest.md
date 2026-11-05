@@ -66,7 +66,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   1. Baseline: before the edit, run the module three times with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` and keep the median `wall_s` and `cpu_s`. These runs find the cost (step 2); they are not the before number of the gain (step 5). Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
   2. Find the cost from the JSON: the slowest tests, and `wall_s - tests_s` (import and module or class fixtures). Name the expensive operations before any edit; do not apply a cut the module already has.
   3. Cut it, in this order:
-     - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s).
+     - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s). A server fixture that runs `serve_forever` pays its 0.5 s poll interval on each stop; stop it on an event (Phase 20: 62 to 21 s).
      - Remove trivial tests (Invariants above) only when step 2 shows tests that read as repeats: tests with the same setup and the same assertion target. Then run `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` and compare each candidate's assertions with its covering tests; a candidate whose result a covering test also checks is a trivial test. Skip the sweep in a module whose time is in process starts: Phase 13 found no repeat in five such modules.
      - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does.
      - Call code in-process in place of a subprocess when the test does not check the process boundary; keep one process test for each boundary.
@@ -519,28 +519,48 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 20 — The hana_shot test module stops its fixture servers at once  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/hana_shot/test_hana_shot.py` runs faster in same-load pairs, with every test and assertion kept.
-
-**Spec:** The builds showrunner approved this on 2026-11-04 from the Phase 13 proposals. Edit only the fixtures of `test_hana_shot.py` (the hana_shot owner's file). Gate median 66 s; 74 s in the Phase 15 gate.
-
-1. Fixture stop: `HanaShotTest.setUp` (about line 350) and `restart_fake_listener` (about line 981) run `server.serve_forever` with the default poll interval of 0.5 s. `server.shutdown()` can wait up to that interval. 95 tests use the fixture, so the upper bound is 47.5 s. Make the stop return at once: pass a short `poll_interval` to `serve_forever`, or stop the loop on an event. Measure both and keep the faster; a short interval must not add measurable CPU.
-2. Resend deadline: `test_screenshot_busy_past_the_resend_limit_fails` (about line 1896) waits for the production `resend_seconds` (2.0 s, read through `hana_shot_settings` in `hana_shot.py` about line 1353). Give this test a private, shorter `resend_seconds` through the fixture config, with no change to `hana_shot.py`. Keep `test_busy_screenshot_is_resent_once`, which checks the successful resend.
-3. Measure the module in same-load pairs before and after, and report the medians.
+- `FixtureServer` (a `ThreadingHTTPServer`) serves until a `stopping` event is set. `shutdown` sets the event, opens one wake connection, and waits for the loop to finish, with `TEST_HANG_GUARD_SECS` as the limit. `HanaShotTest.setUp` and `restart_fake_listener` use `FixtureServer.serve` in place of `serve_forever`, so no stop waits for the 0.5 s poll interval.
+- `test_screenshot_busy_past_the_resend_limit_fails` gets `resend_seconds=0.05` through the `BuildLogIsolatedTest` fixture config. `hana_shot.py` is unchanged.
+- All 113 tests and their assertions stay. Same-load pair medians (3 rounds, load 28-37): wall 62.3 s to 20.9 s, CPU 17.3 s to 19.3 s. In single runs the event stop (30.5 s) beat a short poll interval (32.8 s).
 
 **Files:**
 - `scripts/hana_shot/test_hana_shot.py` — the fixture stop and the private resend deadline (the hana_shot owner's file; fixtures only)
 
-**Workers:** 1 writer
-- `impl` — `test_hana_shot.py`; one file, so no second writer
+**Gotchas:**
+- `serve_forever` pays its poll interval on each `shutdown()`. A fixture that starts a server for each test pays it for each test.
+
+### Phase 21 — The merge gate fails a test module that starts the real `send.py`  · status: todo
+**Depends on:** none
+**Blocked by:** builds-queue Phase 10z on builds — the audit-hook guard and its patch point in `scripts/message/session_send.py`
+
+#### Work Order
+
+**Goal:** In the merge gate, a test module that starts the real `scripts/message/send.py` fails with one line that names the module, and the gate time cost is measured in same-load pairs.
+
+**Spec:** The builds showrunner asked for this on 2026-11-05. That night a builds-queue 10z test reached the real `send.py` and sent natedev two live messages. builds-queue Phase 10z adds an audit-hook guard for the sender modules (sweep, admission service, disk) through one patch point in `scripts/message/session_send.py`.
+
+1. The gate runs each module through `scripts/test_times/module_run.py` (`RUNNER` in `merge_gate.py`, about line 110). Install the 10z guard in `module_run.py` `main()` before discovery, through 10z's patch point. Make no copy of its hook. Read the hook and the patch point from builds after 10z lands, and name them in this Spec before dispatch.
+2. A module that starts the real `send.py` fails. The gate prints one line for it: `<module>: started the real scripts/message/send.py`. Other modules run as before.
+3. A test that needs `send.py` uses the fake sender that 10z names. Do not add an allow list.
+4. Measure the gate time cost: run a group of modules with and without the guard in same-load pairs (`pairs.sh`), and report the medians.
+
+**Files:**
+- `scripts/test_times/module_run.py` — install the guard through the patch point
+- `scripts/test_times/test_module_run.py` — a fixture module that starts the real `send.py` fails with the one line; a module that does not passes
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `module_run.py`
+- `test` — `test_module_run.py`: the failing fixture module and its one line; a clean module stays green
 
 **Constraints from prior phases:**
-- Phase 13: no test in this module is a proved repeat; keep all 113 tests and their assertions.
-- Name `test_hana_shot.py` in the notice's also-touches line, tested against its owner's tip (showrunner, 2026-11-04).
+- Phase 1: `module_run.py` matches the import path of `python -m unittest` and writes each test's time to `TEST_TIMES_OUT`. Keep both.
+- Phase 15: `line_collector.py` uses an audit hook in coverage runs. The guard must not change what the collector records.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/hana_shot -p 'test_hana_shot.py'` green, 113 tests
-- same-load pair medians before and after, in the checkpoint notice
-- `basedpyright scripts/hana_shot/test_hana_shot.py` prints `0 errors, 0 warnings, 0 notes`
+- `python3 -m unittest discover -s scripts/test_times -p 'test_module_run.py'` green
+- a fixture module that starts the real `send.py` fails in a gate run with the one line; no message is sent
+- same-load pair medians with and without the guard, in the checkpoint notice
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
