@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import cast
 from unittest.mock import patch
 from scripts.direct.implement_launcher_claude_test_support import ClaudeLauncherFixture
-from scripts.production import staff
+from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, fixture_worker, isolated_staff_file, transcript_fixture, stopped_worker_module
 
 
@@ -34,7 +34,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         rows = cast(list[dict[str, object]], json.loads((self.root / "staff-at-work.json").read_text()))
         self.assertIn(current.to_json(), rows)
         prompt = (self.root / "opening-message.txt").read_text()
-        extract = run / f"{old.id}.handoff.md"
+        extract = worker_admission.handoff_path(run, old)
         self.assertLess(prompt.index(str(extract)), prompt.index(str(source)))
         self.assertIn(evidence[0][0], extract.read_text())
         stored = cast(dict[str, object], json.loads(reference.read_text()))

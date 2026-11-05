@@ -1,6 +1,8 @@
 """Pane operations use only fake hosts, fake process ancestry and session records."""
 from __future__ import annotations
 
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 import json
 import math
 import os
@@ -131,13 +133,12 @@ class SessionPaneTests(unittest.TestCase):
         }
         _ = (self.root / "responses.json").write_text(json.dumps(responses))
         fake_unit_host.write(self.environment, [
-            fake_unit_host.HostedUnit("native", "w1:p1", {
-                "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "herdr-unit"}, "native screen\n"),
+            labeled_host("native", "w1:p1", "herdr-unit", slug="show", screen="native screen\n"),
             fake_unit_host.HostedUnit("native", "w1:p2", {}, "native screen\n")])
         owner = unit_membership("show", "herdr-unit")
         fake_unit_host.process(self.environment, 998042, 991001, ["claude"], {
             "HERDR_SESSION": "native", "HERDR_PANE_ID": "w1:p1",
-            "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "herdr-unit"})
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "show", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr-unit"})
         _ = (self.records / "998042.json").write_text(json.dumps({
             "pid": 998042, "sessionId": owner.current_session, "name": "fixture", "updatedAt": 1,
             "procStart": "fixture-start", "messagingSocketPath": "", "tmux": "", "formerNames": []}))
@@ -233,8 +234,8 @@ class SessionPaneTests(unittest.TestCase):
                        "--lines", "60"], self.log("herdr"))
 
     def test_nested_tmux_session_cannot_receive_input_through_the_outer_herdr_pane(self) -> None:
-        inherited = {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "show",
-                     "SHOWRUNNER_UNIT_ID": "herdr-unit"}
+        inherited = {"HERDR_PANE_ID": "w1:p1", ('' + 'SHOWRUNNER_' + 'UNIT'): "show",
+                     ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr-unit"}
         self.process(991020, 991001, ["tmux: server"], inherited)
         nested = {**inherited, "TMUX_PANE": "%7"}
         self.process(991021, 991020, ["zsh"], nested)

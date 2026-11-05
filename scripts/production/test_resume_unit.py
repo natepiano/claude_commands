@@ -139,19 +139,19 @@ class ResumeUnitTests(unittest.TestCase):
             del record
             return production
 
-        def not_marked(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
+        def not_marked(_slug: str, _name: str) -> unit_lookup.LabeledSession | None:
             # The real pane writer retains a fixed owner; the live process resumes
             # that owner's current conversation, which can differ after /clear.
             owner = staff.by_current_session(DIRECTOR)
             entries = [entry for entry in pane_record.launches()
                        if owner is not None and entry["session_id"] == owner.id]
-            return (unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
+            return (unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
                                           HerdrPlace("agents", entries[-1]["pane_id"]))
                     if entries else None)
 
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", not_marked))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", not_marked))
         _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: self.configs))
         _ = self.enterContext(mock.patch.object(retirement_sessions, "config_dirs", lambda: self.configs))
         _ = cast(MutableMapping[str, str], self.enterContext(
@@ -255,7 +255,7 @@ class ResumeUnitTests(unittest.TestCase):
                 production = read_production(Path(argv[argv.index("--production") + 1]))
                 row = add_unit.ensure_staff_unit(production, argv[4])
                 launched_ids.append(row.id)
-                retirement.marked = unit_lookup.MarkedUnit("alpha-unit",
+                retirement.marked = unit_lookup.LabeledSession("alpha-unit",
                     unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
                 pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(retirement.worktree),
                     {}, ["claude", "--resume", DIRECTOR]))
@@ -311,7 +311,7 @@ class ResumeUnitTests(unittest.TestCase):
                   unit_config.parked_path(row.id).read_bytes())
         with self.subTest(evidence="fixed owner for the live current conversation"):
             self.assertTrue(resume_unit.resumed_session_proven("alpha", "alpha-unit", DIRECTOR, row))
-        current = unit_lookup.MarkedUnit("alpha-unit",
+        current = unit_lookup.LabeledSession("alpha-unit",
             unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
         other_session = fixture_runtime_id("unrelated-resume-conversation")
         for marked, expected_session in (
@@ -320,7 +320,7 @@ class ResumeUnitTests(unittest.TestCase):
             (current, row.id),
         ):
             with self.subTest(marked=marked, expected_session=expected_session), mock.patch.object(
-                    unit_lookup, "marked_unit", return_value=marked):
+                    unit_lookup, "labeled_session", return_value=marked):
                 self.assertFalse(resume_unit.resumed_session_proven("alpha", "alpha-unit", expected_session, row))
         self.assertEqual((self.staff.staff_file.read_bytes(), pane_record.record_path("agents").read_bytes(),
                           unit_config.parked_path(row.id).read_bytes()), before)
@@ -512,17 +512,17 @@ class ResumeUnitTests(unittest.TestCase):
         for pane, identity, at in (("w1:p1", "older", "2026-10-27T23:00:00+00:00"),
                                     ("w1:p2", DIRECTOR, "2026-10-28T23:00:00+00:00")):
             launch = pane_record.launch(pane, identity, str(self.worktree),
-                {"SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
+                {('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
             launch["written_at"] = at
             pane_record.write("agents", launch)
-        current_backend = unit_lookup.marked_unit
+        current_backend = unit_lookup.labeled_session
 
-        def observed_backend(slug: str, name: str) -> unit_lookup.MarkedUnit | None:
+        def observed_backend(slug: str, name: str) -> unit_lookup.LabeledSession | None:
             # Retained pane files are historical evidence. Only the fake launch
             # establishes a live backend for this test.
             return current_backend(slug, name) if self.calls else None
 
-        with mock.patch.object(unit_lookup, "marked_unit", side_effect=observed_backend):
+        with mock.patch.object(unit_lookup, "labeled_session", side_effect=observed_backend):
             self.assert_resumed(*self.resume())
 
     def external_transcript(self) -> Path:

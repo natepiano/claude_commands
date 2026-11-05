@@ -2,16 +2,269 @@
 """Share the location and state of one live verify call."""
 from __future__ import annotations
 
-import argparse
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import Enum
 import json
 import os
 from pathlib import Path
 import socket
+import sys
 import tempfile
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start as process_identity
+
+
+KINDS = ("check", "lint", "doc", "test", "build", "example", "final")
+STATES = ("waiting_hold", "waiting_mac", "waiting_ssh", "on_ssh", "on_mac", "on_natedev", "local_noncompiling")
+# Each rule holds the argument name, requirement, default and choices.
+COMMAND_ARGUMENTS: dict[str, tuple[tuple[str, bool, str, tuple[str, ...]], ...]] = {
+    "start": (("pid", True, "", ()),),
+    "write": tuple(("--" + name, True, "", ()) for name in ("call-id", "pid", "kind", "runs-on", "state"))
+        + (("--repo", False, os.getcwd(), ()),)
+        + tuple(("--" + name, False, "", ()) for name in
+                ("package", "reason", "eligible-targets", "mac-targets", "pinned-target")),
+    "state": (("--call-id", True, "", ()), ("--target", False, "", ()), ("state", True, "", STATES)),
+    "remove": (("--call-id", True, "", ()),),
+    "stopped": (("--call-id", True, "", ()), ("--consumed", True, "", ())),
+}
+
+
+class UseArgumentParser:
+    """Help or unsupported syntax requires the full argument parser."""
+
+
+def parse_light_cli(arguments: list[str]) -> dict[str, str] | UseArgumentParser:
+    if not arguments or arguments[0] not in ("write", "state", "remove", "stopped"):
+        return UseArgumentParser()
+    verb = arguments[0]
+    rules = COMMAND_ARGUMENTS[verb]
+    flags = {name: (required, default, choices) for name, required, default, choices in rules if name.startswith("--")}
+    positional = [name for name, _, _, _ in rules if not name.startswith("--")]
+    values = {name.removeprefix("--").replace("-", "_"): default
+              for name, required, default, _ in rules if not required}
+    values["command"] = verb
+    index = 1
+    while index < len(arguments):
+        token = arguments[index]
+        if token.startswith("--"):
+            name, separator, value = token.partition("=")
+            if name not in flags:
+                return UseArgumentParser()
+            if not separator:
+                index += 1
+                if index == len(arguments) or arguments[index].startswith("-"):
+                    return UseArgumentParser()
+                value = arguments[index]
+            values[name[2:].replace("-", "_")] = value
+        elif token.startswith("-") or not positional:
+            return UseArgumentParser()
+        else:
+            values[positional.pop(0)] = token
+        index += 1
+    for name, required, _, choices in rules:
+        key = name.removeprefix("--").replace("-", "_")
+        if (required and key not in values) or (choices and values.get(key) not in choices):
+            return UseArgumentParser()
+    return values
+
+
+def execute_cli(args: dict[str, str]) -> int:
+    try:
+        command = args["command"]
+        if command == "start":
+            print(process_start(int(args["pid"])))
+            return 0
+        call_id = args["call_id"]
+        if command == "remove":
+            remove(call_id)
+        elif command == "stopped":
+            return 0 if consume_stopped_build(call_id, Path(args["consumed"])) else 1
+        elif command == "state":
+            state_fields(call_id, args["state"], args["target"])
+        else:
+            pid, kind, location = int(args["pid"]), args["kind"], args["runs_on"]
+            if kind not in KINDS or location not in ("mac_allowed", "natedev_only", "ssh_allowed"):
+                raise ValueError("invalid step kind or run location")
+            if location == "natedev_only" and not args["reason"]:
+                raise ValueError("natedev-only step needs a reason")
+            if args["state"] not in STATES:
+                raise ValueError("invalid step state")
+            runs_on: dict[str, object] = {"kind": location}
+            eligible = ["mac", "natedev"] if location == "mac_allowed" else ["natedev"]
+            if location == "ssh_allowed":
+                eligible = list(filter(None, args["eligible_targets"].split(",")))
+                runs_on["mac_targets"] = list(filter(None, args["mac_targets"].split(",")))
+            elif location == "natedev_only":
+                runs_on["reason"] = args["reason"]
+            row: dict[str, object] = dict(v=1, call_id=call_id, pid=pid, proc_start=process_start(pid),
+                repo=str(Path(args["repo"]).resolve()), kind=kind, package=args["package"] or None,
+                eligible_targets=eligible, selected_target="", runs_on=runs_on, state=args["state"],
+                updated=datetime.now(timezone.utc).isoformat())
+            if args["pinned_target"]:
+                row["pinned_target"] = args["pinned_target"]
+            write_fields(call_id, row)
+    except (OSError, ValueError, IndexError) as error:
+        print(f"step record: {error}; step refused", file=sys.stderr)
+        return 2
+    return 0
+
+
+def record_directory() -> Path:
+    return Path(os.environ.get("VERIFY_STEPS_DIR", str(Path.home() / ".local/state/verify-steps")))
+
+
+def record_path(call_id: str) -> Path:
+    if not call_id or Path(call_id).name != call_id or call_id in (".", ".."):
+        raise ValueError("invalid call id")
+    return record_directory() / f"{call_id}.json"
+
+
+def process_start(pid: int) -> str:
+    result = process_identity.process_start(pid)
+    if isinstance(result, process_identity.Started):
+        return result.start
+    if isinstance(result, (process_identity.Gone, process_identity.Zombie)):
+        raise ProcessLookupError("process has ended")
+    raise OSError(result.reason)
+
+
+def _text(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("record needs nonempty text")
+    return value
+
+
+def validated_fields(value: object, call_id: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("record must be an object")
+    row = cast(dict[str, object], value)
+    if row.get("v") != 1 or row.get("call_id") != call_id:
+        raise ValueError("record version or call id differs")
+    pid = row.get("pid")
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("invalid process id")
+    if _text(row.get("kind")) not in KINDS:
+        raise ValueError("invalid step kind")
+    package = row.get("package")
+    if package is not None and not isinstance(package, str):
+        raise ValueError("invalid package")
+    target = row.get("runs_on")
+    if not isinstance(target, dict):
+        raise ValueError("invalid run location")
+    location = cast(dict[str, object], target)
+    if location.get("kind") == "mac_allowed":
+        eligible = ["mac", "natedev"]
+    elif location.get("kind") == "ssh_allowed":
+        targets, macs = row.get("eligible_targets"), location.get("mac_targets", [])
+        if (not isinstance(targets, list) or not isinstance(macs, list)
+                or not all(isinstance(item, str) and item for item in cast(list[object], targets))
+                or not all(isinstance(item, str) and item for item in cast(list[object], macs))):
+            raise ValueError("invalid eligible targets")
+        eligible = cast(list[str], targets)
+    elif location.get("kind") == "natedev_only":
+        _ = _text(location.get("reason"))
+        eligible = ["natedev"]
+    else:
+        raise ValueError("invalid run location")
+    selected, pinned = row.get("selected_target", ""), row.get("pinned_target", "")
+    if not isinstance(selected, str):
+        raise ValueError("invalid selected target")
+    if not isinstance(pinned, str):
+        raise ValueError("invalid pinned target")
+    if pinned and pinned not in (eligible if location["kind"] == "ssh_allowed" else ["mac"]):
+        raise ValueError("pinned target is not eligible")
+    for field in ("proc_start", "repo", "updated"):
+        _ = _text(row.get(field))
+    if _text(row.get("state")) not in STATES:
+        raise ValueError("invalid step state")
+    return {**row, "eligible_targets": eligible, "selected_target": selected, "package": package or None}
+
+
+def read_fields(call_id: str) -> dict[str, object]:
+    return validated_fields(cast(object, json.loads(record_path(call_id).read_text())), call_id)
+
+
+def write_fields(call_id: str, row: Mapping[str, object]) -> None:
+    path = record_path(call_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".step-", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump(row, output)
+            output.flush()
+            os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        _ = temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def state_fields(call_id: str, next_state: str, target: str = "") -> None:
+    try:
+        row = read_fields(call_id)
+        if process_start(cast(int, row["pid"])) != row["proc_start"]:
+            raise ValueError("stale step record")
+    except (OSError, ValueError, IndexError) as error:
+        raise ValueError(f"cannot update step record: {error}") from error
+    selected = target or ("mac" if next_state == "on_mac" else "natedev" if next_state == "on_natedev" else "")
+    write_fields(call_id, {**row, "state": next_state, "selected_target": selected,
+                           "updated": datetime.now(timezone.utc).isoformat()})
+
+
+def remove(call_id: str) -> None:
+    record_path(call_id).unlink(missing_ok=True)
+
+
+def consume_stopped_build(call_id: str, consumed: Path) -> bool:
+    """Read this call's new enforcer stops, including stops before a release."""
+    root = Path(os.environ.get("BUILDLOG_DIR", str(Path.home() / ".local/state/buildlog")))
+    host = socket.gethostname().split(".")[0]
+    proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+    if sys.platform == "darwin":
+        return False  # The Linux build enforcer does not run on Darwin.
+    boot_id = (proc / "sys/kernel/random/boot_id").read_text().strip()
+    seen: set[str]
+    try:
+        seen = set(consumed.read_text().splitlines())
+    except FileNotFoundError:
+        seen = set()
+    found: set[str] = set()
+    for path in sorted((root / host).glob("hold-builds-*.jsonl")):
+        for line in path.read_text().splitlines():
+            value = cast(object, json.loads(line))
+            if not isinstance(value, dict):
+                continue
+            row = cast(dict[str, object], value)
+            if (row.get("kind") != "hold_build" or row.get("action") != "stopped"
+                    or row.get("call_id") != call_id or row.get("boot_id") != boot_id):
+                continue
+            pid, start = row.get("pid"), row.get("proc_start")
+            if type(pid) is not int or pid <= 0 or not isinstance(start, str) or not start:
+                raise ValueError("stopped build has no process identity")
+            identity = _text(row.get("id"))
+            if identity not in seen:
+                found.add(identity)
+    if found:
+        _ = consumed.write_text("\n".join(sorted(seen | found)) + "\n")
+    return bool(found)
+
+
+if __name__ == "__main__":
+    parsed = parse_light_cli(sys.argv[1:])
+    if isinstance(parsed, dict):
+        raise SystemExit(execute_cli(parsed))
+
+
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -132,77 +385,23 @@ class UnreadableRecord:
 
 
 ReadResult = StepRecord | MissingRecord | StaleRecord | UnreadableRecord
-KINDS = ("check", "lint", "doc", "test", "build", "example", "final")
-
-
-def record_directory() -> Path:
-    return Path(os.environ.get("VERIFY_STEPS_DIR", str(Path.home() / ".local/state/verify-steps")))
-
-
-def record_path(call_id: str) -> Path:
-    if not call_id or Path(call_id).name != call_id or call_id in (".", ".."):
-        raise ValueError("invalid call id")
-    return record_directory() / f"{call_id}.json"
-
-
-def process_start(pid: int) -> str:
-    root = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
-    fields = (root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
-    if fields[0] == "Z":
-        raise ProcessLookupError("process has ended")
-    return fields[19]
-
-
-def _text(value: object) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError("record needs nonempty text")
-    return value
 
 
 def _decode(value: object, call_id: str) -> StepRecord:
-    if not isinstance(value, dict):
-        raise ValueError("record must be an object")
-    row = cast(dict[str, object], value)
-    if row.get("v") != 1 or row.get("call_id") != call_id:
-        raise ValueError("record version or call id differs")
-    pid = row.get("pid")
-    if type(pid) is not int or pid <= 0:
-        raise ValueError("invalid process id")
-    kind = _text(row.get("kind"))
-    if kind not in KINDS:
-        raise ValueError("invalid step kind")
-    package = row.get("package")
-    if package is not None and not isinstance(package, str):
-        raise ValueError("invalid package")
-    target = row.get("runs_on")
-    if not isinstance(target, dict):
-        raise ValueError("invalid run location")
-    location = cast(dict[str, object], target)
-    if location.get("kind") == "mac_allowed":
+    row = validated_fields(value, call_id)
+    location = cast(dict[str, object], row["runs_on"])
+    if location["kind"] == "mac_allowed":
         runs_on: RunsOn = MacAllowed()
-    elif location.get("kind") == "ssh_allowed":
-        targets = row.get("eligible_targets")
-        macs = location.get("mac_targets", [])
-        if (not isinstance(targets, list) or not isinstance(macs, list)
-                or not all(isinstance(item, str) and item for item in cast(list[object], targets))
-                or not all(isinstance(item, str) and item for item in cast(list[object], macs))):
-            raise ValueError("invalid eligible targets")
-        runs_on = SshAllowed(tuple(cast(list[str], targets)), tuple(cast(list[str], macs)))
-    elif location.get("kind") == "natedev_only":
-        runs_on = NatedevOnly(_text(location.get("reason")))
+    elif location["kind"] == "ssh_allowed":
+        runs_on = SshAllowed(tuple(cast(list[str], row["eligible_targets"])),
+                            tuple(cast(list[str], location.get("mac_targets", []))))
     else:
-        raise ValueError("invalid run location")
-    selected = row.get("selected_target", "")
-    if not isinstance(selected, str):
-        raise ValueError("invalid selected target")
-    pinned = row.get("pinned_target", "")
-    if not isinstance(pinned, str):
-        raise ValueError("invalid pinned target")
-    if pinned and pinned not in (runs_on.targets if isinstance(runs_on, SshAllowed) else ("mac",)):
-        raise ValueError("pinned target is not eligible")
-    return StepRecord(call_id, pid, _text(row.get("proc_start")), Path(_text(row.get("repo"))),
-                      kind, package, runs_on, StepState(_text(row.get("state"))), _text(row.get("updated")),
-                      selected_target=selected, selection=Pinned(pinned) if pinned else Routed())
+        runs_on = NatedevOnly(_text(location["reason"]))
+    pinned = cast(str, row.get("pinned_target", ""))
+    return StepRecord(call_id, cast(int, row["pid"]), _text(row["proc_start"]), Path(_text(row["repo"])),
+                      _text(row["kind"]), cast(str | None, row["package"]), runs_on,
+                      StepState(_text(row["state"])), _text(row["updated"]),
+                      selected_target=cast(str, row["selected_target"]), selection=Pinned(pinned) if pinned else ROUTED)
 
 
 def read(call_id: str) -> ReadResult:
@@ -232,8 +431,6 @@ def live_records() -> list[StepRecord]:
 
 
 def write(record: StepRecord) -> None:
-    path = record_path(record.call_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
     location = ({"kind": "mac_allowed"} if isinstance(record.runs_on, MacAllowed)
                 else {"kind": "ssh_allowed", "mac_targets": list(record.runs_on.mac_targets)}
                 if isinstance(record.runs_on, SshAllowed)
@@ -244,122 +441,27 @@ def write(record: StepRecord) -> None:
                runs_on=location, state=record.state.value, updated=record.updated)
     if isinstance(record.selection, Pinned):
         row["pinned_target"] = record.selection.target
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".step-", delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            json.dump(row, output)
-            output.flush()
-            os.fsync(output.fileno())
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
-        _ = temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_fields(record.call_id, row)
 
 
 def state(call_id: str, next_state: StepState, target: str = "") -> None:
-    record = read(call_id)
-    if not isinstance(record, StepRecord):
-        raise ValueError(f"cannot update step record: {record}")
-    selected = target or ("mac" if next_state == StepState.ON_MAC else "natedev" if next_state == StepState.ON_NATEDEV else "")
-    write(replace(record, state=next_state, selected_target=selected,
-                  updated=datetime.now(timezone.utc).isoformat()))
-
-
-def remove(call_id: str) -> None:
-    record_path(call_id).unlink(missing_ok=True)
-
-
-def consume_stopped_build(call_id: str, consumed: Path) -> bool:
-    """Read this call's new enforcer stops, including stops before a release."""
-    root = Path(os.environ.get("BUILDLOG_DIR", str(Path.home() / ".local/state/buildlog")))
-    host = socket.gethostname().split(".")[0]
-    proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
-    boot_id = (proc / "sys/kernel/random/boot_id").read_text().strip()
-    seen: set[str]
-    try:
-        seen = set(consumed.read_text().splitlines())
-    except FileNotFoundError:
-        seen = set()
-    found: set[str] = set()
-    for path in sorted((root / host).glob("hold-builds-*.jsonl")):
-        for line in path.read_text().splitlines():
-            value = cast(object, json.loads(line))
-            if not isinstance(value, dict):
-                continue
-            row = cast(dict[str, object], value)
-            if (row.get("kind") != "hold_build" or row.get("action") != "stopped"
-                    or row.get("call_id") != call_id or row.get("boot_id") != boot_id):
-                continue
-            pid, start = row.get("pid"), row.get("proc_start")
-            if type(pid) is not int or pid <= 0 or not isinstance(start, str) or not start:
-                raise ValueError("stopped build has no process identity")
-            identity = _text(row.get("id"))
-            if identity not in seen:
-                found.add(identity)
-    if found:
-        _ = consumed.write_text("\n".join(sorted(seen | found)) + "\n")
-    return bool(found)
+    state_fields(call_id, next_state.value, target)
 
 
 def main() -> int:
+    import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    start = commands.add_parser("start")
-    _ = start.add_argument("pid", type=int)
-    create = commands.add_parser("write")
-    for flag in ("call-id", "pid", "kind", "runs-on", "state"):
-        _ = create.add_argument("--" + flag, required=True)
-    _ = create.add_argument("--repo", default=os.getcwd())
-    _ = create.add_argument("--package")
-    _ = create.add_argument("--reason", default="")
-    _ = create.add_argument("--eligible-targets", default="")
-    _ = create.add_argument("--mac-targets", default="")
-    _ = create.add_argument("--pinned-target", default="")
-    update = commands.add_parser("state")
-    _ = update.add_argument("--call-id", required=True)
-    _ = update.add_argument("--target", default="")
-    _ = update.add_argument("state", choices=[item.value for item in StepState])
-    delete = commands.add_parser("remove")
-    _ = delete.add_argument("--call-id", required=True)
-    stopped = commands.add_parser("stopped")
-    _ = stopped.add_argument("--call-id", required=True)
-    _ = stopped.add_argument("--consumed", required=True)
-    args = parser.parse_args()
-    try:
-        command = cast(str, args.command)
-        if command == "start":
-            print(process_start(cast(int, args.pid)))
-            return 0
-        call_id = cast(str, args.call_id)
-        if command == "remove":
-            remove(call_id)
-        elif command == "stopped":
-            return 0 if consume_stopped_build(call_id, Path(cast(str, args.consumed))) else 1
-        elif command == "state":
-            state(call_id, StepState(cast(str, args.state)), cast(str, args.target))
-        else:
-            pid = int(cast(str, args.pid))
-            kind = cast(str, args.kind)
-            location = cast(str, args.runs_on)
-            reason = cast(str, args.reason)
-            pinned_target = cast(str, args.pinned_target)
-            if kind not in KINDS or location not in ("mac_allowed", "natedev_only", "ssh_allowed"):
-                raise ValueError("invalid step kind or run location")
-            if location == "natedev_only" and not reason:
-                raise ValueError("natedev-only step needs a reason")
-            write(StepRecord(call_id, pid, process_start(pid), Path(cast(str, args.repo)).resolve(), kind,
-                             cast(str | None, args.package), MacAllowed() if location == "mac_allowed" else
-                             SshAllowed(tuple(filter(None, cast(str, args.eligible_targets).split(","))),
-                                        tuple(filter(None, cast(str, args.mac_targets).split(","))))
-                             if location == "ssh_allowed" else NatedevOnly(reason),
-                             StepState(cast(str, args.state)), datetime.now(timezone.utc).isoformat(),
-                             selection=Pinned(pinned_target) if pinned_target else ROUTED))
-    except (OSError, ValueError, IndexError) as error:
-        parser.exit(2, f"step record: {error}; step refused\n")
-    return 0
+    for verb, rules in COMMAND_ARGUMENTS.items():
+        command = commands.add_parser(verb)
+        for name, required, default, choices in rules:
+            if name.startswith("--"):
+                _ = command.add_argument(name, required=required, default=default, choices=choices or None)
+            else:
+                _ = command.add_argument(name, choices=choices or None)
+    arguments = vars(parser.parse_args())
+    return execute_cli(cast(dict[str, str], arguments))
 
 
 if __name__ == "__main__":

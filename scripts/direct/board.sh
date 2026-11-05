@@ -205,6 +205,39 @@ pid_is_gone() {
   fi
 }
 
+owned_group_matches() {
+  local dir="$1"
+  [[ -f "$dir/owned" ]] || return 1
+  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
+from scripts.lib.process_start import Gone, Started, Unreadable, process_start, process_start_format
+try:
+    record = json.loads(Path(sys.argv[1]).read_text())
+    group, start = record["group"], record["start"]
+    if type(group) is not int or group <= 1 or not isinstance(start, str) or not start:
+        raise ValueError("invalid owner record")
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+result = process_start(group)
+if record.get("start_format") != process_start_format():
+    # Retain a group with an unknown format unless the group is gone.
+    if not isinstance(result, Gone):
+        sys.exit(0)
+    from scripts.lib.process_group import send_process_group
+    try:
+        send_process_group(group, 0)
+    except ProcessLookupError:
+        sys.exit(1)
+    except PermissionError:
+        pass
+    sys.exit(0)
+sys.exit(0 if isinstance(result, Unreadable) or result == Started(start) else 1)
+PYTHON
+}
+
 lock_stale_reason() {
   local holder_pid
   holder_pid="$(cat "$1/holder_pid" 2>/dev/null || true)"
@@ -213,6 +246,7 @@ lock_stale_reason() {
     return 0
   fi
   if lock_is_expired "$1"; then
+    if owned_group_matches "$1"; then return 1; fi
     printf 'expired'
     return 0
   fi
@@ -242,18 +276,12 @@ import time
 
 record = Path(sys.argv[1])
 
+sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
+from scripts.lib.process_start import Started, Zombie, process_start
+
 def identity(pid: int) -> str | None:
-    try:
-        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
-        # A zombie leader still owns its PID, so its start time is safe to
-        # check while live children remain in the group.
-        return fields[19]
-    except (OSError, IndexError):
-        try:
-            return subprocess.check_output(['ps', '-p', str(pid), '-o', 'lstart='],
-                                           text=True, stderr=subprocess.DEVNULL).strip()
-        except subprocess.CalledProcessError:
-            return None
+    result = process_start(pid)
+    return result.start if isinstance(result, (Started, Zombie)) else None
 
 def live_group(group: int) -> bool:
     try:

@@ -21,16 +21,46 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NO
 
 
 class ProtocolTests(unittest.TestCase):
+
+
+    def test_room_cap_and_unavailable_pressure_survive_the_service_reply(self) -> None:
+        from scripts.build_queue.queue_fixture import QueueFixture
+        with QueueFixture() as fixture:
+            inputs = fixture.inputs(policy=admission_policy_fixture())
+            running = replace(inputs.running[0], promise=6 * GIB,
+                measured=gate.MeasuredMemory(2 * GIB, swap_bytes=4 * GIB,
+                                            anonymous=gate.AnonymousRunUse(2 * GIB)))
+            reservation = inputs.reservations[0].copy()
+            reservation["need"] = 6 * GIB
+            inputs = replace(inputs, running=(running,), reservations=(reservation,),
+                host=gate.HostMemory(10 * GIB, 60 * GIB),
+                pressure=gate.PressureUnavailable("PSI unreadable"))
+            reading = gate.queue_read_from(inputs, gate.AdmissionLimits(3 * GIB),
+                                           admission_policy_fixture())
+            reply = wire.ViewReply(reading)
+            parsed = wire.parse_reply(wire.encode_reply(reply))
+            self.assertEqual(parsed, reply)
+            assert isinstance(parsed, wire.ViewReply)
+            room = parsed.reading.explanation.room
+            assert isinstance(room, gate.MemoryRoom)
+            self.assertEqual((room.room, room.kept, room.used, room.cap),
+                             (3 * GIB, 4 * GIB, 2 * GIB, 9 * GIB))
+            self.assertEqual(parsed.reading.view.running[0].measured, running.measured)
+            self.assertIsInstance(parsed.reading.explanation.host, gate.HostAvailable)
+            assert isinstance(parsed.reading.explanation.host, gate.HostAvailable)
+            self.assertEqual(parsed.reading.explanation.host.pressure,
+                             gate.PressureUnavailable("PSI unreadable"))
+
     def test_unowned_scope_activity_round_trips_and_old_records_remain_readable(self) -> None:
         from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun
 
         activity = ScopeProcesses(2, "session", "worker", "/tree", "python3", NOW, False, NoLiveBuildRun())
-        current = gate.UnownedSliceMemory(GIB, owner="scope", activity=activity)
+        current = gate.UnownedSliceMemory(GIB, owner="scope", activity=activity, pid=gate.PidNotRecorded())
         self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(current), gate.UnownedSliceMemory), current)
         old = cast(dict[str, object], gate.snapshot_value(current))
         del old["activity"]
         self.assertEqual(gate.parse_snapshot_value(old, gate.UnownedSliceMemory),
-                         gate.UnownedSliceMemory(GIB, owner="scope"))
+                         gate.UnownedSliceMemory(GIB, owner="scope", pid=gate.PidNotRecorded()))
 
     def test_service_job_state_and_separate_swap_survive_the_view_reply(self) -> None:
         from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
@@ -39,8 +69,8 @@ class ProtocolTests(unittest.TestCase):
         for state in (IdleService(), RunningServiceJob(NOW - 120)):
             with self.subTest(state=state):
                 memory = gate.UnownedSliceMemory(GIB // 10, swap_bytes=2 * GIB,
-                    owner="hana-ci.slice", job_state=state)
-                step = gate.RunningStep("", "", "unowned", "ci.slice", 0, memory)
+                    owner="hana-ci.slice", job_state=state, pid=gate.PidNotRecorded())
+                step = gate.RunningStep("", "", "unowned", "ci.slice", 0, memory, pid=gate.PidNotRecorded())
                 view = gate.QueueView((), (step,), 20 * GIB, 0, 3 * GIB, NOW)
                 reading = queue_read_fixture(view, policy=admission_policy_fixture())
                 reply = wire.ViewReply(reading)
@@ -64,13 +94,13 @@ class ProtocolTests(unittest.TestCase):
         parsed = gate.parse_snapshot_value(current, gate.QueueRead)
         self.assertEqual(parsed, replace(reading, diagnostics=(gate.ConfigurationDiagnostic("service warning"),)))
         step = gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0),
-                                run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30)
+                                run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
         self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(step), gate.RunningStep), step)
         old = cast(dict[str, object], gate.snapshot_value(step))
         for name in ("unit", "run", "started_at"):
             del old[name]
         self.assertEqual(gate.parse_snapshot_value(old, gate.RunningStep),
-                         gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0)))
+                         gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0), pid=123))
 
     def test_unit_override_round_trips_and_main_encoder_omits_it(self) -> None:
         with AdmissionFixture() as fixture:
@@ -228,7 +258,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             assert isinstance(limits, gate.AdmissionLimits)
             reading = gate.queue_read_from(inputs, limits, policy=admission_policy_fixture())
             replies: tuple[wire.Reply, ...] = (
-                wait_reply(gate.EstimateExpired(NOW - admission_policy_fixture().timing.head_seconds), 1, "head", "estimate expired"),
+                wait_reply(gate.EstimateExpired(NOW - admission_policy_fixture().timing.estimate_refresh_seconds), 1, "head", "estimate expired"),
                 admitted_reply("stem", GIB, "future-source", "stem.max", "stem.wave"),
                 wire.LaunchAdmitted(GIB, "future-source"), wire.Refused("no"), wire.Ok(),
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
@@ -279,11 +309,11 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
     def test_expired_explanation_keeps_release_advice_and_decided_from_over_wire(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            _ = fixture.server.handle_request(fixture.request(age=admission_policy_fixture().timing.head_seconds))
+            _ = fixture.server.handle_request(fixture.request(age=admission_policy_fixture().timing.estimate_refresh_seconds))
             inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
             assert isinstance(inputs, gate.QueueInputs)
             assert isinstance(limits, gate.AdmissionLimits)
-            inputs = replace(inputs, recovery=gate.RecoveryStarts(NOW + 120, NOW + 30))
+            inputs = replace(inputs, recovery=gate.NextStartAt(NOW + 30))
             local = gate.queue_read_from(inputs, limits, policy=admission_policy_fixture()).explanation
             parsed = wire.parse_reply(wire.encode_reply(wire.ExplainReply(local)))
             assert isinstance(parsed, wire.ExplainReply)
@@ -295,8 +325,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                              queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone))
             self.assertTrue(queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone).startswith("the estimate expired at"))
             assert isinstance(local.head, gate.HeadExplanation)
-            assert isinstance(local.head.waiter.reason, gate.EstimateExpired)
+            assert isinstance(local.head.cause, gate.EstimateExpired)
             assert isinstance(parsed.explanation.head, gate.HeadExplanation)
-            assert isinstance(parsed.explanation.head.waiter.reason, gate.EstimateExpired)
-            self.assertEqual(queue_evidence.estimate_refresh_text(parsed.explanation.head.waiter.reason, zone),
-                             queue_evidence.estimate_refresh_text(local.head.waiter.reason, zone))
+            assert isinstance(parsed.explanation.head.cause, gate.EstimateExpired)
+            self.assertEqual(queue_evidence.estimate_refresh_text(parsed.explanation.head.cause, zone),
+                             queue_evidence.estimate_refresh_text(local.head.cause, zone))
