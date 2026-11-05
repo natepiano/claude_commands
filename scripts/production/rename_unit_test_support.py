@@ -10,7 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import AbstractContextManager, closing, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
@@ -423,11 +423,10 @@ class FolderSessionFixture:
     def installed(self) -> Generator[None]:
         from scripts.shutdown import restart, pane_record
 
-        def live_rows(record: staff.StaffSnapshot, _client: object) -> list[staff.StaffRow]:
-            row = record.by_id(self.owner.id)
-            return [row] if self.live and row is not None else []
+        def live_members(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+            return [row for row in rows if self.live and row.id == self.owner.id]
 
-        with (mock.patch.object(restart, "live_rows", side_effect=live_rows),
+        with (mock.patch.object(restart, "live_members", side_effect=live_members),
               mock.patch.object(restart, "stop_row", side_effect=self.stop),
               mock.patch.object(restart, "start_row", side_effect=self.start),
               mock.patch.object(pane_record, "launch_for_session", return_value=None),
