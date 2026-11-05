@@ -199,7 +199,8 @@ GATE_RUN_COLUMNS: list[Column] = [
     ("aborted", "INTEGER", "1 when the run was aborted"),
     ("dirty", "INTEGER", "1 when the checkout had changes"),
     ("modules_run", "INTEGER", "distinct test modules; excludes the type job"),
-    ("tests_run", "INTEGER", "tests run in the last attempt of each test module"),
+    ("tests_run", "INTEGER", "recorded sum of tests across module attempts"),
+    ("slow_test_s", "REAL", "threshold used to retain passing test times"),
 ]
 
 GATE_SUITE_COLUMNS: list[Column] = [
@@ -846,36 +847,24 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
         )
 
 
-@dataclass(frozen=True)
-class LatestGateModuleAttempt:
-    attempt: int
-    tests_run: int
-
-
 def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     """Replace a gate run and all its suite, module, and test rows."""
     run_id = record.get("id")
     for table in GATE_TABLES[1:]:
         _ = connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
     module_rows = entries(record, "modules")
-    latest_attempts: dict[tuple[str, str], LatestGateModuleAttempt] = {}
+    module_keys: set[tuple[str, str]] = set()
     for module in module_rows:
-        suite = module.get("suite")
-        name = module.get("module")
-        attempt = module.get("attempt")
-        tests_run = module.get("tests_run")
-        if (not isinstance(suite, str) or not isinstance(name, str)
-                or (suite, name) == TYPE_CHECK_JOB
-                or not isinstance(attempt, int) or not isinstance(tests_run, int)):
+        suite, name = module.get("suite"), module.get("module")
+        if not isinstance(suite, str) or not isinstance(name, str):
             continue
         key = (suite, name)
-        if key not in latest_attempts or attempt >= latest_attempts[key].attempt:
-            latest_attempts[key] = LatestGateModuleAttempt(attempt, tests_run)
+        if key != TYPE_CHECK_JOB:
+            module_keys.add(key)
     insert(connection, "gate_runs", pick({
         **record,
         "src": src,
-        "modules_run": len(latest_attempts),
-        "tests_run": sum(last.tests_run for last in latest_attempts.values()),
+        "modules_run": len(module_keys),
     }, GATE_RUN_COLUMNS))
     parent: GateChildContext = {
         "run_id": run_id,

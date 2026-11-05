@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
 import json
 import subprocess
 import sys
@@ -24,6 +26,8 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    # Keep the unit CLI process boundary.
+    @process_boundary
     def test_checkpoint_receipt_names_pushed_merge_and_source_once_on_retry(self) -> None:
         checkpoint = self.checkpoint()
         first = self.run_checkpoint(checkpoint)
