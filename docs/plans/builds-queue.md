@@ -149,15 +149,52 @@ only I can bump
 
 **Ruled out:** a budget that follows measured use (10t); time windows that let younger runs pass the first in line (10y); slot fields in state.json; a cancel command.
 
-### Phase 10ab — One sweep process loads store.py once  · status: todo
+### Phase 10q — One sweep process loads store.py once  · status: todo
 
 **Depends on:** 10z. A small checkpoint before 10x. Source: resources Phase 64 review, sent by builds 2026-11-05.
 
-1. **Defect.** `scripts/build_queue/head_facts.py:17` imports `from scripts.buildlog import store`. The lint graph imports the bare `store`. So `import sweep` loads `store` and `scripts.buildlog.store`: two module objects, two copies of its state (proved on resources 1a7ce52ce).
-2. **Fix.** One runtime module identity for store in each process. Copying record.py's `__package__` check does not do it: head_facts keeps a set `__package__` when sweep imports it, so it keeps the package import beside the bare `store` (architect review, 2026-11-05). Pick the one name every importer uses, and check the other build_queue modules for the same import.
-3. **Proof.** Tests for both import orders (`import sweep` first, and the package import first): each leaves exactly one store module in `sys.modules`. Queue and memory suites green; basedpyright 0/0/0.
+#### Work Order
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `head_facts.py` and any importer it changes; `test` owns the import-order tests.
+**Goal:** Every process holds one `store` module object, whichever name imports it first.
+
+**Spec:**
+1. **Defect (confirmed on b2d0be2ea).** `scripts/build_queue/head_facts.py:17` imports `from scripts.buildlog import store`; the buildlog and lint modules import the bare `store`. After `import sweep`, `sys.modules` holds `store` and `scripts.buildlog.store` as two objects, so store's module state exists twice.
+2. **Fix.** `scripts/buildlog/store.py` registers its one module object under both names when it first loads: `store` and `scripts.buildlog.store`. A later import under the other name gets the same object. Copying record.py's `__package__` check does not fix it: head_facts keeps a set `__package__` under sweep (architect review, 2026-11-05). Importers do not change.
+3. **Proof.** Tests in fresh interpreters, one per import order: bare `store` first, then `from scripts.buildlog import store`; and the reverse; and `import sweep`. Each leaves one object, `sys.modules["store"] is sys.modules["scripts.buildlog.store"]`.
+
+**Files:**
+- `scripts/buildlog/store.py` — registers itself under both names (also touches: report-unit and natest own buildlog work; name them in the notice).
+- `scripts/buildlog/test_store_identity.py` — new: the import-order tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the store.py change.
+- `test` — `scripts/buildlog/test_store_identity.py`, from the Spec alone.
+
+**Acceptance gate:** the new test, the buildlog, lint (sweep, memory admit) and build_queue suites pass; basedpyright 0 errors, 0 warnings, 0 notes on the changed files.
+
+### Phase 10s — A run with no scope reads its anonymous use from its processes  · status: todo
+
+**Depends on:** 10q. Runs before 10x. Source: builds live check of main 66a34ca16, 2026-11-05 02:05 EST.
+
+#### Work Order
+
+**Goal:** The cap shows a value while a merge gate runs, and a merge gate keeps aside only its need less its use.
+
+**Spec:**
+1. **Cause (live, 02:05 EST).** The service runs the 10z code (started 01:55:30, after the 01:55:26 files). The devtools merge gate (pid 2678865) holds a reservation with no `sidecar`: `merge_gate.py:343` takes `queue_place("merge-gate")` in its own process and makes no scope. `reservation_memory` then sets `RunUseUnavailable("step has no scope")`, so `memory_room` sets the cap to `CapUnavailable`, and the run keeps aside its full 6 GiB need for its life. Room and starts are correct; the cap text and the keep-aside are not as 10z intends.
+2. **Fix, use (builds approval, 02:3x EST).** One reading per step kind, in one function in `process_memory` that picks by what the step has. A step with a scope reads its scope's `memory.stat` anon. An in-process holder with no scope (`queue_place` used as a context manager, as `merge_gate.py:343` does) reads `RssAnon` summed over its process tree. Both give `AnonymousRunUse`. One process table read per pass, as today. No second copy in `queue_evidence.py`.
+3. **Fix, text.** When the cap is unavailable, `room_text` names the runs whose use is unavailable and prints no use sum: today it prints "anonymous use 0.0 GiB" beside "unavailable".
+4. **Proof.** Tests: a step with no scope gets its anonymous use from a fixture process tree, the cap is a value and its keep-aside is need less use; a merge gate holder (`queue_place("merge-gate")` as a context manager) gets a cap value; a step with a scope still reads `memory.stat`; an unreadable status file leaves that run unavailable and the text names it with no sum.
+5. **Out of scope.** The merge gate's 6 GiB need against its 4.6 GiB peak stays with 10e (grant from the recorded peak).
+
+**Files:**
+- `scripts/lint/memory_admit.py` — `process_memory`, `reservation_memory`.
+- `scripts/build_queue/queue_evidence.py` — `room_text`.
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py` — the tests.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns `memory_admit.py` and `queue_evidence.py`; `test` owns the two test files.
+
+**Acceptance gate:** memory, queue and caller suites pass; basedpyright 0/0/0 on the changed files. Change-Review: during a merge gate, `/build:queue` shows a cap value and the gate keeps aside its need less its use.
 
 ### Phase 10x — The admission code keeps one way to do each thing  · status: todo
 
@@ -716,7 +753,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - Service estimate request: `AdmitRequest` requires an estimated profile (`admission_protocol.py:67`), and build admission refuses a missing or stale generation (`admission_service.py:762`). Add a named request variant for a service-made estimate, not an optional profile. State its refresh, generation, replay and `NoRun` behavior. `impl` owns `admission_protocol.py`; `test` owns protocol compatibility tests, including a client from the pinned store package.
 - Deployment order: the socket exists already, so "after the socket" is no gate. The runner group gets socket access, and the slice cap rises, only after the service with authorization and a compatible protocol is on main and live. natedev owns the NixOS activation and the account-level acceptance.
 
-**Pending decision:** the `hana-ci.slice` cap. 10z deleted the admission budget, so "raise `MemoryMax` to the admission budget (24G)" (nixos item 3) has no value to copy. State a slice policy, and how registered CI reservations replace the CI keep-aside (`ci_memory_margin_gib=7`) with no double charge. Sent to builds, 2026-11-05.
+**Slice cap (builds ruling, 2026-11-05).** 10z deleted the admission budget, so nixos item 3 has no 24G value to copy. The `hana-ci.slice` cap is host RAM less the 3 GiB safety, and admission alone decides. Registered CI reservations replace the CI keep-aside, so CI is not charged twice. Order: 10d runs after 10q and 10x. **Last step, held for the user's go (builds filed the question):** delete `ci_memory_margin_gib` and send natedev the slice note with the new `MemoryMax`. If the user says keep, that step keeps `MemoryMax=34G` and the keep-aside.
 
 **Workers:** `1 writer + 1 tester` (natedev owns the NixOS activation)
 - `impl` — the CI cargo front, the service authorization and estimate path, the client package entry; hub: `scripts/build_queue/admission_service.py`
