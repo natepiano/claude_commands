@@ -273,8 +273,11 @@ State:
   reply: file it with `/showrunner:question` for that unit, and say nothing of
   it to the user. A unit can also file its own with `/unit:question`. The count
   and `/next question` show it, and its answer goes back to the unit through
-  `update_registration.py answer` (`/next` → question). A filed item stays on
-  the list when `open_for_user` leaves it out; it leaves only through `answer`.
+  `update_registration.py answer` (`/next` → question).
+  A filed item stays on the list when `open_for_user` omits it.
+  It leaves only through `answer` or `withdraw`.
+  Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
+  It records no answer and relays nothing.
   User, 2026-10-28: "i asked it to add it to your question list not to bring
   it directly to my attention".
   A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone.

@@ -134,7 +134,16 @@ The showrunner still judges, before the call: the other units' overlap notice, n
 
 - `ask --text "<one line>" --question "<full>" [--unit <unit>] [--urgency <level> [--due <date>]]` (`/unit:question`, `/showrunner:question`, 2026-10-28) adds one item to `OUTSTANDING` without a reply to the user. It refuses a `--unit` that is not a Units row, an item text that fails the plumbing check, and a text already open. It runs the question review before it takes the lock, then writes the item with `asked_by` (the unit, else `showrunner`) and its review result, records it in the history, and prints `filed question: <text>` and `ask: ok`. A held review exits 2 with `question held for review: …` and writes nothing.
 - `answer --item <words>` removes the one item whose text is `<words>`, or holds them, from this production's list or one below it (`showrunners.user_facing(slug, below=True)`, as `mark-important`). It prints `relay: to <unit>`, `relay: to the showrunner of <slug>, for <unit>` (an item below this production), or `relay: none; …`, then `answer: ok — <slug>: <text>`. More or fewer than one match exits 2.
-- **Filed items stay.** `questions` keeps a stored item with `asked_by` that the new `open_for_user` leaves out, and prints `questions: kept — <text>: asked by <unit>; …`: such an item leaves only through `answer`. `open` and `next` show `asked by <unit>` after the item's time. `ask`, `answer`, `questions` and `mark-important` each read and write `OUTSTANDING` under an exclusive `flock` on `<slug>.lock` beside it, taken once per process.
+- `withdraw --item <text>` removes one open item whose text matches exactly, from this production or a production below it.
+  Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
+  It records no answer and relays nothing.
+  It prints `withdraw: ok — <slug>: <text>`.
+- **Filed items stay.** `questions` keeps a stored item with `asked_by` when the new `open_for_user` omits it.
+  It prints `questions: kept — <text>: asked by <unit>; …`.
+  The item leaves only through `answer` or `withdraw`.
+  `open` and `next` show `asked by <unit>` after the item's time.
+  `ask`, `answer`, `withdraw`, `questions` and `mark-important` read and write `OUTSTANDING` under an exclusive `flock`.
+  Each process takes the lock once on `<slug>.lock` beside `OUTSTANDING`.
 - `--state` is `SHOWRUNNER_STATE` (`<SCRATCH>/showrunner_state.json`): optional `units` (`{unit, phase, wait}`), `merges_held` (text list) and `open_for_user` (a one-line reminder string, or `{text, after?: YYYY-MM-DDTHH:MM, question?}`). An unknown key or wrong type fails the step, and every item is validated before anything is written. A new object item must carry `question`; `questions --state` reviews it with `review.review_question`, prints `reviewed question: <text>`, and a failed review refuses the whole registration with nothing written. The Stop hook then blocks a reply that lacks the reviewed text, until one reply carries it, or that asks the user anything unregistered. The question review is in `docs/as-built/message-clarity.md`.
 
 ### Dailies: `dailies_input.py` and `dailies_render.py`
