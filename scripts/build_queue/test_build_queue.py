@@ -102,8 +102,12 @@ class QueueTests(unittest.TestCase):
     def test_cli_keeps_running_grants_above_numbered_waiters(self) -> None:
         with QueueFixture() as fixture:
             reading = fixture.read()
+            measured = reading.view.running[0].measured
+            assert isinstance(measured, memory_admit.MeasuredMemory)
             grants = tuple(replace(reading.view.running[0], session_id=f"gate-{index}",
-                step="merge-gate", promise=6 * GIB, unit="queue-unit") for index in range(3))
+                step="merge-gate", promise=6 * GIB, unit="queue-unit", pid=900 + index,
+                measured=replace(measured, anonymous_source=memory_admit.ScopeSource(
+                    fixture.root / f"gate-{index}.scope", frozenset({900 + index})))) for index in range(3))
             reading = queue_read_fixture(replace(reading.view, running=grants), policy=admission_policy_fixture())
             self.labels_read.return_value = {**fixture.labels,
                 **{step.session_id: UnitLabels("gate", "builds", "wrong-unit") for step in grants}}

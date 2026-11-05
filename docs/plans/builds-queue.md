@@ -168,7 +168,7 @@ only I can bump
 
 **Ruled out:** record.py's `__package__` check (head_facts keeps a set `__package__` under sweep); a `find_spec` search or package import from store.py (it shadows modules through `sys.path` and runs an unrelated `scripts/__init__.py` from the cwd).
 
-### Phase 10s — A run with no scope reads its anonymous use from its processes  · status: todo
+### Phase 10s — A run with no scope reads its anonymous use from its processes  · status: done
 
 **Depends on:** 10q. Runs before 10x. Source: builds live check of main 66a34ca16, 2026-11-05 02:05 EST.
 
@@ -241,20 +241,20 @@ only I can bump
 
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 
-**Depends on:** 10z (the page reads the room evidence 10z publishes).
+**Depends on:** 10z (the page reads the room evidence 10z publishes) and report-unit Phase 15 on builds (builds ruling, 2026-11-05). report Phase 15 builds one typed provider, `charts.page_data(days, n=3) -> PageData | IndexUnavailable`, and starts at once. report-unit waits for 10m only in its Phase 26.
 
 1. **The ask (user, 2026-11-04, change reviews C959 and C969, through builds).** C959: "we are moving to the new build html page - we will use /build:queue for reference until we can retire it". C969: leftover-process ages on the queue board, "this should be the case on the new html page too".
 2. **The page.** The Build Memory page (memory_live.html, fed by memory_feed.py) is today a prototype in the queue unit's session folder, served by review link h7uj5c. It moves into the repository with its feed and one command to open it. The command name needs the user's approval. New board features go on this page. report-unit's cost and chart views land on this page too, not on a second one.
-3. **report-unit's sections (report-unit, 2026-11-04; C950 and C948).** The page gets two sections: the build history charts and a top-3 cost list. report-unit owns the data: one function per section in `scripts/buildlog` returns typed data, no HTML (for example `charts.page_section(days)` and `costs.top_costs(n=3)`), read in under 1 s for 7 days. The feed calls the functions and the page draws them. There is no JSON file between them.
+3. **report-unit's sections (report-unit, 2026-11-04; C950 and C948).** The page gets two sections: the build history charts and a top-3 cost list. report-unit owns the data: one function in `scripts/buildlog`, `charts.page_data(days, n=3)`, returns typed data for both sections, no HTML, read in under 1 s for 7 days (builds ruling, 2026-11-05). The feed calls the function and the page draws its data. There is no JSON file between them.
 4. **Leftover-process ages.** The page shows each leftover process with the same readable age as the queue board ("45 min", "19 h", "2 d"), from the same formatter.
 5. **/build:queue.** It gets no new work. It stays for reference until the page covers it; 10n retires it.
 6. **Wait states.** The page shows the three wait states the service records: unreadable pressure (with its path), start spacing, and head protection. 10z keeps the pressure text and `ReadingAlertTests`; 10h owns holder names.
 7. **Proof.** The feed's tests pass, with feed and page tests for each of the three wait states. A pixel check of the page shows the cap, the room, the leftover ages and report-unit's sections. Each item returns as its own Change-Review row.
 
 8. **Partial readings (architect review of 10q, 2026-11-05).** The feed reads each part of the page on its own. When one part is unavailable (the cap, pressure, a run's use), the page keeps the other parts and names the missing one. Use named availability states, not a bare `None` (today `memory_feed.py:109` stores missing pressure as `None`). Acceptance tests: with the cap alone unavailable, the page keeps its rows, the room and the reason text.
-9. **Sources.** The prototype is in `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/` (`memory_live.html`, `memory_feed.py`). It moves to `scripts/build_page/` (page, feed and tests). report-unit's sections reuse the typed collectors `charts.collect_charts` (`scripts/buildlog/charts.py:133`) and `costs.collect_costs` (`scripts/buildlog/costs.py:389`).
+9. **Sources.** The prototype is in `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/` (`memory_live.html`, `memory_feed.py`). It moves to `scripts/build_page/` (page, feed and tests). The feed makes one call to report Phase 15's `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` (report e913e5fa2; types in `charts.py`; 0.42-0.48 s for 7 days on the live index). `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`; `start` and `end` bound the recent window in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`; `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`; `CostAction(action, owner)`. The feed checks that one result: on `IndexUnavailable(reason)` the page shows the reason in place of both sections, and `NoDataYet` shows an empty top list with its window. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable`: the feed passes `days` of at least `TOP_COST_RECENT_DAYS` and shows a config error as the page reason. 10m starts only after report Phase 15 is on builds (it lands with report 24-25, after a user answer); builds says when. The item 7 pixel check uses their data.
 
-**Workers:** `impl` owns `scripts/build_page/` (the page and the feed); `test` owns `scripts/build_page/test_*.py`. report-unit owns, as a separate lane, its section adapters over `collect_charts` and `collect_costs` in `scripts/buildlog` and their tests.
+**Workers:** `impl` owns `scripts/build_page/` (the page and the feed); `test` owns `scripts/build_page/test_*.py`. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
 
 ### Phase 10n — /build:queue retires when the build page covers it  · status: todo
 
