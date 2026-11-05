@@ -64,7 +64,7 @@ from scripts.accounts.role_map import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
-    from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
+    from scripts.shutdown.inventory import ListedSession, Session
 
 
 MoveAlerts = Literal["user", "none"]
@@ -2261,23 +2261,23 @@ def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["un
     return "ungrouped"
 
 
-def live_group_members(*, registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> dict[ClaudeGroup, list[ListedSession]]:
-    """Classify local live owners without their restart resources or worktrees."""
-    sys.path.insert(0, str(SCRIPTS / "shutdown"))
-    if TYPE_CHECKING:
-        from scripts.shutdown import inventory
-    else:
-        inventory = import_module("inventory")
-    members: dict[ClaudeGroup, list[ListedSession]] = {"units": [], "showrunners": []}
-    for session in inventory.listing(registrations=registrations):
-        group = session_group(session)
-        if group != "ungrouped":
-            members[group].append(session)
-    return members
+@dataclass(frozen=True)
+class LiveGroupMember:
+    """A current staff member and the account of its live process."""
+
+    session_id: str
+    name: str
+    group: ClaudeGroup
+    config_dir: Path
 
 
-def session_account_label(session: ListedSession) -> str:
-    return account.label_for("Claude", session.login)
+def live_group_members() -> dict[ClaudeGroup, list[LiveGroupMember]]:
+    """Share the board's staff membership and live process accounts."""
+    return _read_local_role_sessions(GroupAccounts(), include_workers=False).members
+
+
+def session_account_label(session: ListedSession | LiveGroupMember) -> str:
+    return claude_config_label(session.config_dir)
 
 
 def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
@@ -2885,7 +2885,7 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
     return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
 
 
-def move_preview_line(member: ListedSession, target: str) -> str:
+def move_preview_line(member: ListedSession | LiveGroupMember, target: str) -> str:
     return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
 
 
@@ -2913,21 +2913,21 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
     if isinstance(checked, MoveRefused):
         return checked
-    if TYPE_CHECKING:
-        from scripts.shutdown import inventory
-    else:
-        inventory = import_module("inventory")
-    registrations = inventory.showrunner_registrations()
-    members = live_group_members(registrations=registrations)[group]
+    members = live_group_members()[group]
     selected = [session for session in members if not session_on_account(session, target)]
     ids = tuple(session.session_id for session in selected)
     reason = why or f"{group} moved by hand"
     notices = (f"{group}: no live session moves",) if not ids else ()
     if group == "showrunners":
+        if TYPE_CHECKING:
+            from scripts.shutdown import inventory
+        else:
+            inventory = import_module("inventory")
+        live_ids = {member.session_id for member in members}
         notices += tuple(
-            f"{runner['slug']}: no session runs under the id its update timer names; "
-            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner['doc'])}"
-            for runner in inventory.unregistered_showrunners(members, registrations=registrations))
+            f"{runner.slug}: no session runs under the id its update timer names; "
+            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.doc)}"
+            for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
             *(move_preview_line(item, target) for item in selected), *notices))
@@ -2938,12 +2938,8 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     return outcome(ids, target, stdout, stderr, code)
 
 
-def session_on_account(session: ListedSession, label: str) -> bool:
-    if not _label_is(label, "claude"):
-        return False
-    destination = account_identity(claude_account_dir(label))
-    return (isinstance(destination, agent_accounts.NumberedAccount)
-            and session.login.casefold() == destination.login.casefold())
+def session_on_account(session: ListedSession | LiveGroupMember, label: str) -> bool:
+    return _label_is(label, "claude") and session.config_dir == claude_account_dir(label)
 
 
 @overload
@@ -4709,6 +4705,7 @@ class LocalRoleSessions:
     """One local observation supplies counts and detail output."""
 
     counts: dict[tuple[Path, str], dict[str, str]]
+    members: dict[ClaudeGroup, list[LiveGroupMember]]
     inputs: tuple[str, ...]
     session_lines: tuple[str, ...]
     continuation_lines: tuple[str, ...]
@@ -4739,14 +4736,14 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
     return ""
 
 
-def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
+def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
     """Read local registries without account checks or host discovery."""
+    sys.path.insert(0, str(SCRIPTS / "herdr"))
     from scripts.message import sessions
-    from scripts.shutdown import inventory
     from scripts.herdr import pane_launch
-    from scripts.production import showrunners, session_staff, staff
+    from scripts.production import session_staff, staff
 
-    inputs = {sessions.sessions_dir(), pane_launch.record_directory(), showrunners.NOTIFIER_STATE_DIR}
+    inputs = {sessions.sessions_dir(), pane_launch.record_directory()}
     counts: dict[tuple[Path, str], dict[str, str]] = {}
     launches: dict[str, pane_launch.PaneLaunch] = {}
     for path in pane_launch.record_directory().glob("*.json"):
@@ -4766,32 +4763,28 @@ def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
             print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
     inputs.update(Path(path) for path in membership.inputs)
-    runners = inventory.showrunner_registrations()
-    runner_ids = {runner.session_id for runner in runners.entries}
-    for path in showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*/conf"):
-        inputs.add(path)
     for path in sessions.sessions_dir().glob("*.json"):
         inputs.add(path)
     live = {session["sessionId"]: session for session in sessions.running_sessions()}
     session_lines: list[str] = []
+    members: dict[ClaudeGroup, list[LiveGroupMember]] = {"units": [], "showrunners": []}
     for identity, session in live.items():
         owner = membership.by_current_session(identity)
         candidates = [launch for reference, launch in launches.items()
                       if owner is not None and reference in (owner.id, owner.current_session)]
         launch = max(candidates, key=lambda launch: launch["written_at"]) if candidates else launches.get(identity)
-        role = "showrunners" if identity in runner_ids else ""
-        if not role:
-            try:
+        role = ""
+        try:
+            member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
+                                             session_staff.LiveSession(identity))
+            if isinstance(member, session_staff.NoSuchMember) and launch is not None:
                 member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                 session_staff.LiveSession(identity))
-                if isinstance(member, session_staff.NoSuchMember) and launch is not None:
-                    member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                     session_staff.StoredReference(launch["session_id"]))
-            except (staff.StaffUnreadable, ValueError) as error:
-                print(f"accounts: unit {identity}: {error}", file=sys.stderr)
-                continue
-            if isinstance(member, session_staff.MemberFound):
-                role = "units"
+                                                 session_staff.StoredReference(launch["session_id"]))
+        except (staff.StaffUnreadable, ValueError) as error:
+            print(f"accounts: unit {identity}: {error}", file=sys.stderr)
+            continue
+        if isinstance(member, session_staff.MemberFound):
+            role = "units"
         if owner is not None and owner.kind in ("showrunner", "worker"):
             role = "showrunners" if owner.kind == "showrunner" else "workers"
         setting = _session_config_dir(session["pid"])
@@ -4799,6 +4792,9 @@ def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
         label = claude_config_label(directory) if directory is not None else "account unreadable"
         suffix = _moving_role_suffix(role, label, groups)
         session_lines.append(f"session {identity} ({session['name']}): {label}{suffix}")
+        if role in CLAUDE_GROUPS and directory is not None:
+            group = role
+            members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             counts.setdefault((directory, role), {})[identity] = "busy" if session.get("status") == "busy" else "idle"
     # A stopped member stays on its last observed account, never the requested account.
@@ -4821,7 +4817,7 @@ def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
     from scripts.message.unit_labels import MeshWorker, listed_mesh_worker
 
     continuation_lines: list[str] = []
-    for run, name, entry, home in _worker_status_records(inputs):
+    for run, name, entry, home in (_worker_status_records(inputs) if include_workers else ()):
         if home and listed_mesh_worker(cast(MeshWorker, cast(object, entry))):
             counts.setdefault((Path(home), "workers"), {})[str(run / name)] = (
                 "busy" if entry.get("status") in ("running", "starting") else "idle")
@@ -4831,7 +4827,7 @@ def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
                 reason = ("waiting for capacity on the selected account" if entry.get("status") == "waiting_capacity"
                           else "quota refusal; waiting for account recovery or a confirmed move")
             continuation_lines.append(f"worker {run.name}/{name}: continuation owed — {reason}")
-    return LocalRoleSessions(counts, tuple(str(path) for path in sorted(inputs)),
+    return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), tuple(continuation_lines))
 
 
