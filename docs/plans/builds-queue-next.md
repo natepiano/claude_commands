@@ -14,3 +14,21 @@
   - Completion condition: the service import moves into `admitted_processes()`, or the state read gets a home that needs no service import; no test patches `build_hold.admission_service`. Then tell natest the builds commit; natest measures `test_verify_ssh_targets_routing.py` and `test_verify_lint_judgment.py` again. This item adds no import assertion: natest withdrew that proposed check on 2026-11-05 (a new check goes to the user first) and adds it after this item lands only if the user approves.
   - Waits for: the builds `build_hold.py` freeze (natedev's send.py cleanup) to end; builds sends natedev's main hash.
   - Revealed by: natest proposal, 2026-11-05 (sent with Phase 10o).
+
+- [ ] **The admission service reads each fact once per pass**
+  - Target: `scripts/lint/memory_admit.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/scope_activity.py`.
+  - Why needed: each scoped reservation's step lifetime is read about four extra times per pass. Priority labels, `ScopeActivityReader.run()` and the build run of a reservation with no `RunIdentity` also repeat, and `observed_test_phase(row)` runs before `test_phase_history` accepts the step.
+  - Completion condition: one read of each per pass, or once per reservation for a stored run; decisions stay the same. A stored run does not see later changes, so check the slot effect in `_end`.
+  - Revealed by: 10x simplify review, items 39-43, 2026-11-05.
+
+- [ ] **queue_fixture.head_reading stops changing the reading after the pass**
+  - Target: `scripts/build_queue/queue_fixture.py` and its about 60 tests.
+  - Why needed: `head_reading` changes `reading.ordered` after the pass, so a test can show a state the pass did not produce.
+  - Completion condition: the fields are in the waiter row before the pass; the tests keep their assertions.
+  - Revealed by: 10x simplify review, item 46, 2026-11-05.
+
+- [ ] **One reader for CI slice member programs**
+  - Target: `member_programs` (reads `comm` for CI classification) and `ScopeActivityReader` (reads the cmdline base name).
+  - Why needed: two readers answer one question with different sources.
+  - Completion condition: one reader, with proof that CI classification and each caller's error behavior stay the same.
+  - Revealed by: 10x simplify review, item 18, ledger F014, 2026-11-05.

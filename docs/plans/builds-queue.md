@@ -339,6 +339,71 @@ only I can bump
 
 **Acceptance gate:** queue and caller suites pass; basedpyright 0/0/0. Change-Review: none (the fault needs a failing service; the tests show it).
 
+### Phase 15 — A queue priority change stops blocking other queue requests while it reads the roster  · status: todo
+
+**Depends on:** 14. Source: the 10x architect review; builds ruling, 2026-11-05: one small phase after 14.
+
+#### Work Order
+
+**Goal:** Queue queries and releases stay responsive while a priority change reads the roster.
+
+**Spec:**
+1. **Cause.** `handle_request` builds a whole priority roster inside the service loop for each `PrioritySetRequest`. That read took 3.9 s after the roster fix and 28 s at the 2026-11-05 outage.
+2. **Fix.** The roster read does not hold the service loop. One loop thread still changes service state (Phase 10k item 9). Validation and replies stay the same.
+3. **Proof.** A test delays the roster read. A queue query and a release get their replies during the delay, and the priority change then gets today's reply.
+
+**Files:**
+- `scripts/build_queue/admission_service.py` — the priority request path.
+- `scripts/lint/memory_admit.py` — the roster caller, when the change reaches it.
+- `scripts/build_queue/test_admission_service.py` — the tests.
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** queue and caller suites pass; basedpyright 0/0/0. Change-Review: none (the tests show it).
+
+### Phase 16 — The copy guard refuses only what makes a repository tree  · status: todo
+
+**Depends on:** verify P35 on GitHub builds, which hands `scripts/copies/` to queue-unit and edits `copy_guard.py`. First of the copies items (builds ruling, 2026-11-05: "A broken guard is fixed at once").
+
+#### Work Order
+
+**Goal:** A command that makes no repository tree passes the copy guard, and a refusal says what the guard could not read.
+
+**Spec:**
+1. **Refused today.** `python3 - <<'EOF'` for a program that only rewrites a showrunner state file ("cannot parse Python program"). `python3 /dev/stdin`, `sed` loops and `bash -n` from the builds showrunner's commands. `python3 - <<EOF` with an expansion ("cannot resolve expanded interpreter stdin").
+2. **Fix.** Parse valid Python whose string holds nested quotes. A form with no tree-making operation passes. An input the guard cannot read gets a message that names what it cannot read, and the message names `copies.py` only for a tree-making operation.
+3. **Keep.** Each tree-making form in `test_copy_guard.py` stays refused. Change an assertion only for a form item 1 names, and state why in the summary.
+4. **Proof.** One regression test for each form in item 1, with the real hook command text.
+
+**Files:**
+- `scripts/copies/copy_guard.py`, `scripts/copies/shell_syntax.py` — the parser and the messages.
+- `scripts/copies/test_copy_guard.py` — the tests.
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** copies and hook suites pass; basedpyright 0/0/0. Change-Review: a command that the guard refused now runs.
+
+### Phase 17 — copies.py list shows remote mirrors, and copies.py starts without an object scan  · status: todo
+
+**Depends on:** 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items.
+
+#### Work Order
+
+**Goal:** `copies.py list` answers who holds a mirror, and a copy start does no full object scan.
+
+**Spec:**
+1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
+2. **Start.** Remove the initial `git rev-list --objects --all` scan (0.39 s per `verify.sh doc`). Rebuild `.git` once when fetch or checkout reports object damage. Preserve the exclusive checkout lease and the damaged-index recovery tests.
+3. **Proof.** List tests for remote-only records and mixed local and remote records. Measure the documentation-run cost before and after, and state both numbers in the summary.
+
+**Files:**
+- `scripts/copies/copies.py` — the list and the start.
+- `scripts/copies/test_copies.py` — the tests.
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** copies and verify documentation suites pass; basedpyright 0/0/0. Change-Review: `copies.py list` output.
+
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 
 **Depends on:** 10z (the page reads the room evidence 10z publishes) and report-unit Phase 15 on builds (builds ruling, 2026-11-05). report Phase 15 builds one typed provider, `charts.page_data(days, n=3) -> PageData | IndexUnavailable`, and starts at once. report-unit waits for 10m only in its Phase 26.
@@ -867,7 +932,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 1. A running CI job with a registered reservation is charged only through its reservation.
 2. The CI keep-aside applies only while a running CI job has no registered reservation.
 3. Tests: registered jobs only (no keep-aside), unregistered jobs only (keep-aside as today), and a mix (the keep-aside once, plus each registered reservation).
-4. **Order of the deletion (director call, one-line revert).** 10d keeps `ci_memory_margin_gib` and this mixed rule until natedev confirms the runner activation, because a CI job has no reservation before that. The key deletion the user approved is 10d's last change, after that confirmation. A job the front cannot cover then has no keep-aside, and `MemoryMax=34G` is its limit.
+4. **Order of the deletion (director call, one-line revert).** 10d keeps `ci_memory_margin_gib` and this mixed rule until natedev confirms the runner activation, because a CI job has no reservation before that. The key deletion is 10d's last change, after that confirmation. Name it in the 10d notice: builds asks the user before the merge, because a config key deletion needs the user's approval (builds, 2026-11-05). A job the front cannot cover then has no keep-aside, and `MemoryMax=34G` is its limit.
 
 **Current references (architect review of 10q).** `CleanupTiming` exists (`admission_protocol.py:177`), and `admission_client.py:502` accepts it for release with no config read. Authorization targets today: `_run_place()` (`admission_service.py:847`), replay lookup (`admission_service.py:1311`) and peer credentials (`admission_service.py:1519`, where the UID is read and then discarded). These replace the older line numbers in the constraints above. Keep the tests that deny every local config and history read through the whole runner acquisition.
 
