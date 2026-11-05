@@ -1628,7 +1628,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:** named availability states for `StepEvidence.arguments` — `history_selection` reads an empty argv and a missing one the same way.
 
 ### Phase 61 — Workspace and temporary-sweep failures reach natedev once, and the Phase 58 floor code has one copy of each rule  · status: todo
-**Depends on:** Phase 62 (both change `scripts/lint/sweep.py`; builds ruling 2026-11-04: Phase 62 runs first). Runs beside Phase 59.
+**Depends on:** Phase 62 (both change `scripts/lint/sweep.py`; builds ruling 2026-11-04: Phase 62 runs first).
 
 #### Work Order
 
@@ -1689,8 +1689,8 @@ Full detail: `findings.py status --phase 58` in the resources run folder.
 - Time one real floor pass on natedev before and after Spec 12. Put both times in the checkpoint notice.
 - Change-Review line: a failed workspace sweep reaches natedev once | read the natedev session after a workspace sweep failure | one alert arrives, with the failure status.
 
-### Phase 62 — The floor sweep takes its target folders from recorded step rows  · status: todo
-**Depends on:** Phase 58 (its checkpoint). Runs beside Phase 59. Runs before Phase 61 (builds ruling 2026-11-04).
+### Phase 62 — The floor sweep takes its target folders from recorded step rows  · status: done
+**Depends on:** Phase 58 (its checkpoint). Runs before Phase 61 (builds ruling 2026-11-04).
 
 #### Work Order
 
