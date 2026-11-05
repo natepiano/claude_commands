@@ -29,27 +29,6 @@
 
 **Order:** after Phases 24 and 27. Track this producer repair separately from the completed Phase 20 work. `mac_test.py` (near lines 1525 and 2491) already requests END events; find why they do not reach the recorded history, and add no second emission path.
 
-## Copy guard refuses a program that makes no tree
-
-**Source:** builds (showrunner), 2026-11-04. Not urgent.
-
-**Owner:** queue-unit, because it owns `scripts/copies/` once Phase 35 is on GitHub builds.
-
-**Today:** `copy_guard.py` and `shell_syntax.py` refused `python3 - <<'EOF'` for a program that only rewrote a showrunner state file. The message was `unresolved relevant operation: cannot parse Python program: Repository trees must be made by copies.py run`.
-
-**Needed:**
-1. Parse valid Python whose string holds nested quotes.
-2. Stop naming copies.py for a program that makes no repository tree.
-3. Add a regression test of that program shape.
-
-## Label the columns of copies.py list
-
-**Source:** builds (showrunner), 2026-11-04.
-
-**Owner:** queue-unit, for the reason above.
-
-**Needed:** print a header row, and give the number column a name.
-
 ## Check mend against the active rustc before lint
 
 **Source:** builds (showrunner), 2026-11-04.
@@ -88,14 +67,6 @@
 
 **Needed:** `verify.sh` reads the platform from the `eligible` answer. Change the answer format and every reader together. Keep selection, refusal, fallback and reservation behavior. The estimate is 6.5 s on the routing module and one interpreter start fewer per SSH-target run. Before start, trial-merge origin/builds-resources and take natest Phase 24. On landing, send natest the builds commit.
 
-## Remove the full object scan from copies.py initialization
-
-**Source:** Phase 35 review, approved by builds 2026-11-05.
-
-**Owner:** queue-unit, for the reason above.
-
-**Needed:** remove the initial `git rev-list --objects --all` scan. Rebuild `.git` once when fetch or checkout reports object damage. Preserve the exclusive checkout lease and damaged-index recovery tests. Measure the documentation-run cost before and after.
-
 ## Report Phase 28 metadata items
 
 **Source:** builds (showrunner), 2026-11-05. Build on report Phase 28 (`eb4210b92`) once it lands on builds. Its ledger is `/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/findings_state.json`.
@@ -112,3 +83,11 @@
 **Today:** natest's survey saw the module raise FixtureHang once (659 s, load 55).
 
 **Needed:** find the cause. If it is the same as the retry-clock hang (`988b6690b`, `3c86b5424`), fix it the same way. Send builds the cause when known.
+
+## One busy-mirror loop in sweep.py
+
+**Source:** Phase 35 review, sent to next items by builds 2026-11-05.
+
+**Owner:** whoever holds `scripts/lint/sweep.py` when the builds file freeze lifts. Queue-unit owns the `sweep.py` callers of the floor interfaces once Phase 35 is on GitHub builds.
+
+**Needed:** `lint/sweep.py` (near lines 3298, 3321 and 3678-3682) has one busy-mirror `LockHeld` loop in `_hold_floor_pass`. Rename `leased_mirrors` to `busy_mirrors`. Then close its route from the Phase 35 ledger (F031).

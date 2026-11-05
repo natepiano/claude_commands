@@ -851,7 +851,7 @@ Checkpoints `f81a7ba55` and `3aea5698d` on `verify-remake-1-24`, landed with the
 
 **Goal:** the remote mirror code has one lease path, one record writer and reader, one visible lock order and no unused flags, and a Mac offload run spends less time scanning its mirror.
 
-**Acceptance observation:** the time of one `mirror-use` on the hana mirror, before and after, on natedev's real path to the Mac. Put both times in the notice.
+**Acceptance observation:** the time of one `mirror_has_process` call on the hana mirror on the Mac, and one `mirror_sweep_leases` pass on natedev's real target folder. The `mirror_has_process` time before is 5.2 s. Put each before and after time in the notice.
 
 **Spec:**
 
@@ -884,7 +884,7 @@ Checkpoints `f81a7ba55` and `3aea5698d` on `verify-remake-1-24`, landed with the
 **Not in this phase.**
 - F030 (`mac_run.sh` shell lease to the `hold` coproc): no change. `flock` waits and `remote_lease` refuses at once, so the change adds a refusal. Close its route with this reason.
 - F032 (`.remote-mirrors` out of the pool): no change. The move splits lease exclusion for a process that holds the old inode, and the dot-name skip costs one line. Close its route with this reason.
-- F031 (`sweep.py` busy-mirror loop and the `busy_mirrors` name): waits until builds lifts the `sweep.py` freeze. If the freeze still stands at this checkpoint, the route stays open and the item goes to `docs/plans/natedev-verify-next.md`.
+- F031 (`sweep.py` busy-mirror loop and the `busy_mirrors` name): `sweep.py` is under the builds file freeze, so the item is in `docs/plans/natedev-verify-next.md` and its route stays open.
 
 **Files:**
 - `scripts/copies/copies.py`
