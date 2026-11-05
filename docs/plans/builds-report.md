@@ -305,67 +305,28 @@ Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHON
 
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
 
-### Phase 15 — The build page gets its chart and top-cost data from two typed functions  · status: done
+### Phase 15 — The build page gets its chart and top-cost data from one typed function  · status: done
 **Depends on:** Phase 14
 
-The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to builds to review - i'm not sure about this". The builds showrunner ran it. The data is useful, but the output does not tell the user what to do. Ruling: the top 3 costs move onto the one build page, each with the action that cuts it and its owner; the build history charts (C950) go on the same page. The page is queue-unit's Build Memory page; queue Phase 10m moves it into the repo, calls this phase's function in its feed and draws them. Agreed with queue-unit 2026-11-04: report-unit gives typed data, no HTML. From the builds showrunner (not the user), 2026-11-05: this phase builds only the data function and starts at once; Phase 26 (after 10m) deletes `buildlog costs` and points `buildlog charts` at the shared page.
+The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the top 3 costs move onto the one build page, each with the action that cuts it and its owner, beside the build history charts (C950). queue-unit's Phase 10m draws the page; this phase gives it typed data, no HTML. The top 3 rank the last 2 days, so a fixed cost does not stay on top.
 
-Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder): the 236 h/day is a 7-day average that old days drive. Oct 29-31 had 347-533 h/day; Nov 1-3 had 7-90 h/day. The 10l bug adds at most 125 h in total (Nov 2-4). `costs.py` counts each wait correctly. builds ruling: the top 3 rank the last 2 days, so a fixed cost does not stay on top.
+#### As-built
 
-#### Work Order
-
-**Goal:** One function gives queue's feed typed data for the build page in under 1 s for 7 days: `charts.page_data(days, n=3)` returns the history charts and the top costs of the recent window, each cost with its action and owner from config. No HTML and no JSON file between it and the feed.
-
-**Director amendment 2026-11-05, fix round 1:** the first build had two functions, `page_section(days)` and `top_costs(n)`. Each read the same week of costs, and together they took 0.98 s CPU and 1.0-1.05 s wall on the live index. From the builds showrunner (not the user), 2026-11-05: "A. One function, charts.page_data(days, n=3) -> PageData | IndexUnavailable, one read over the page window. TOP_COST_WEEK_DAYS is not on builds yet, so dropping it needs no user go."
-
-**Spec:**
-- `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable`: opens `index.read_only()` once, takes one snapshot transaction and makes one `costs.read_costs` call for the `days` ending now. From that one reading it builds the `ChartSet` exactly as `collect_charts` does, and the top costs. `sqlite3.Error` becomes `IndexUnavailable(reason)`.
-- `collect_charts` and `page_data` share one helper for the snapshot read (`BEGIN`, `read_costs`, `ROLLBACK`). `main` (`buildlog charts`) and `page_data` share one helper that opens and closes the index and maps `sqlite3.Error` to `IndexUnavailable`. `buildlog charts` output stays the same.
-- Top costs use two buckets from the one reading: the recent window (`TOP_COST_RECENT_DAYS`, 2) and the page window (`days`). Build each bucket the way `build_series` builds a day bucket, through one shared helper with no copy.
-- Rank the `(machine, cause)` pairs by the recent bucket's `RankedCost.seconds` (`costs.aggregate_costs`), largest first; keep the first `n`. Map each value with `cost_value` for both buckets, so `MeasuredCost`, `MacIdleUpperBound`, `CostUnavailable` and `NoDataYet` reach the feed unchanged.
-- `TOP_COST_RECENT_DAYS` greater than `days` is an error that names the key and the page days (`conf.Unusable`); a recent window must never lose costs silently.
-- Types, all frozen dataclasses in `charts.py`:
-  - `PageData(charts: ChartSet, top: TopCosts)`.
-  - `CostAction(text: str, owner: str)`.
-  - `WindowValue = WindowMatchesRecent | WindowDiffers`. `WindowDiffers(value: ChartCost)` holds the page-window value per day.
-    - When both values are measured or upper bounds: `WindowDiffers` only when `abs(window - recent) > 0.5 * recent` (per-day seconds; the upper bound's known part), else `WindowMatchesRecent`.
-    - When the recent value is measured or an upper bound and the window value is `CostUnavailable` or `NoDataYet`: `WindowDiffers` with that value unchanged. The page must not claim a match it did not measure.
-    - When the recent value is `CostUnavailable` or `NoDataYet`: `WindowMatchesRecent`; the recent value already carries the state.
-  - `TopCost(machine: str, cause: costs.Cause, recent: ChartCost, window: WindowValue, action: CostAction)`. `recent` holds seconds for the recent window; the page divides by `recent_days`.
-  - `TopCosts(start: datetime, end: datetime, recent_days: int, rows: tuple[TopCost, ...] | NoDataYet)`. `start` and `end` bound the recent window, in the user's zone (`user_zone()`). With no ranked pair, `rows` is `NoDataYet.VALUE`.
-  - `IndexUnavailable(reason: str)`.
-- Config, read at use from `config/buildlog.conf`, with a comment, a `# Basis:` line and a kind line for each key, in the file's existing style:
-  - `TOP_COST_RECENT_DAYS=2` (`# whole: 1..`). No `TOP_COST_WEEK_DAYS`: the page window is the comparison window.
-  - One action key and one owner key per cause (a `# text:` kind line that `scripts.lib.test_conf` accepts; values unquoted). Texts confirmed by the builds showrunner 2026-11-05:
-    - `COST_ACTION_MEMORY_WAIT=Lower the memory peaks of the steps that wait most.`, `COST_OWNER_MEMORY_WAIT=queue-unit`
-    - `COST_ACTION_COLD_REBUILDS=Keep warm build folders for the checkouts that rebuild most.`, `COST_OWNER_COLD_REBUILDS=resources-unit`
-    - `COST_ACTION_RERUNS_AFTER_A_PASS=Do not run tests again on a tree that already passed.`, `COST_OWNER_RERUNS_AFTER_A_PASS=sdlc`
-    - `COST_ACTION_FAILED_RUNS=Fix each visible failure before the next run.`, `COST_OWNER_FAILED_RUNS=the unit that ran the step`
-    - `COST_ACTION_CANCELLED_CI=Push once a checkpoint is ready, so a later push does not cancel CI.`, `COST_OWNER_CANCELLED_CI=builds`
-    - `COST_ACTION_MAC_IDLE_WHILE_NATEDEV_WAITS=Send waiting tests to the free Mac.`, `COST_OWNER_MAC_IDLE_WHILE_NATEDEV_WAITS=builds`
-  - Map `costs.Cause` to the key suffix in one table in `charts.py`; `CAUSES` comes from that table. Read the keys with `conf.read("buildlog").text(...)`. A missing or empty key goes through the repository's standard `conf` recovery (a committed value, with a warning that names the key), else `conf.Unusable` with the key name. No action or owner text in code.
-- `buildlog costs`, the FOOTER definitions and the chart HTML stay unchanged in this phase (Phase 26 changes them).
-- No change to `scripts/buildlog/store.py` (frozen until queue 10q merges) or `scripts/buildlog/costs.py`.
+- `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` gives queue's build page feed its data. It opens the index once (`read_index`), reads costs once over the page window in one snapshot (`read_snapshot`), and builds the charts and the top costs from that one reading. `page_data(7)` takes 0.42-0.48 s wall on the live index.
+- `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`: `start` and `end` bound the recent window, in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`. `CostAction(action, owner)`.
+- `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
+- Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
+- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
+- `buildlog charts` output is unchanged; `main` and `page_data` share `read_index`, and `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
 
 **Files:**
-- `scripts/buildlog/charts.py` — `page_data`, the types above, the shared bucket, snapshot and index helpers.
-- `scripts/buildlog/test_charts.py` — interface tests.
-- `config/buildlog.conf` — the new keys. Do not touch `METADATA_PROBE_WORKERS`; its deletion waits on the user.
+- `scripts/buildlog/charts.py` — `page_data`, its types, the snapshot and index helpers.
+- `scripts/buildlog/test_charts.py` — `PageDataTests`.
+- `config/buildlog.conf` — recent days, actions and owners.
 
-**Workers:** 1 writer — `rowcpu` owns all three files; nothing splits.
+**Binds later work:** queue's build page feed calls `charts.page_data`; it stays when `buildlog charts` moves to the shared page.
 
-**State:** none.
-
-**Constraints from prior phases:** `costs.machine_name` reads `sync_config()` once and calls `record._target_hosts` (Phase 16). `collect_charts` keeps one transaction and one `read_costs` call (Phase 14). `cost_value` returns `NoDataYet` before a machine's first indexed event, and `CostUnavailable` for missing coverage or missing waits (Phase 14).
-
-**Acceptance gate:**
-- Interface tests on a fixture index: top costs hold at most `n` rows ranked by the recent window; `NoDataYet`, `CostUnavailable` and `MacIdleUpperBound` pass through unchanged; the three `WindowValue` rules above, with the 0.5 boundary below, at and above; an empty recent window gives `rows == NoDataYet.VALUE`; `start`/`end` carry the user's zone; each row's action and owner come from a fixture config; a missing key with no committed value fails with its name; `TOP_COST_RECENT_DAYS` above `days` fails with the key name; an unreadable index gives `IndexUnavailable`.
-- A test proves one `page_data` call makes one `costs.read_costs` call.
-- `page_data(7).charts` equals `collect_charts` for the same window on a fixture index.
-- CPU and wall on the live index (`~/.local/state/buildlog/index-*.sqlite`, not a test index), a fresh process per run, 5 runs: `page_data(7)` under 1 s wall. Report CPU and wall medians, the index path, the load average, and the row count of the result.
-- `scripts.buildlog.test_charts`, `test_costs`, `test_report`, `test_moments`, `test_target_report` and `scripts.lib.test_conf` green, from the worktree root with and without `PYTHONPATH`. Phase 16's `test_machine_aliases_read_sync_configuration_once` stays green.
-- `basedpyright scripts/buildlog/charts.py scripts/buildlog/test_charts.py`: 0 errors, 0 warnings, 0 notes.
-- Send queue-unit the signature and types when they land (director, through builds).
+**Ruled out:** a `read_costs` keyword that skips phase rows (one read makes it unnecessary); a snapshot inside `read_costs` for every reader (`buildlog costs` is its only unsnapshotted reader and goes away with the shared page).
 
 ### Phase 16 — Each build step spends less CPU to write its build-log row  · status: done
 **Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
@@ -568,7 +529,7 @@ Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder):
 **Ruled out:** a per-kill `cached_property` (under 1 ms per report).
 
 ### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
-**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's sections)
+**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`)
 
 From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
 
