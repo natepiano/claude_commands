@@ -25,6 +25,33 @@ SCRIPT = Path(__file__).with_name("live_units.py")
 
 
 class RowDocumentLiveUnitsTests(StaffTestCase):
+    def test_read_units_collects_the_supplied_scan_with_the_same_staff_snapshot(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+        from scripts.production import live_units, session_staff
+        import unit_lookup
+
+        fixture = self.row_production()
+        sources = unit_lookup.member_sources()
+        every = unit_lookup.LabeledProductions({}, {fixture.slug: ("member",)})
+        errors = io.StringIO()
+
+        def scan(record: staff.StaffSnapshot, observed: unit_lookup.MemberSources) -> None:
+            self.assertEqual(record.by_id(fixture.unit.id), fixture.unit)
+            self.assertIs(observed, sources)
+            session_staff.report_anomaly("codex pid 123: no current staff row")
+
+        with (mock.patch.object(unit_lookup, "member_sources", return_value=sources),
+              mock.patch.object(unit_lookup, "every_labeled_session", return_value=every),
+              redirect_stderr(errors)):
+            listing = live_units.read_units(fixture.doc, scan)
+            legacy = live_units.units_of_doc(fixture.doc)
+
+        self.assertEqual([item.unit for item in listing.units], ["member-unit"])
+        self.assertEqual(listing.anomalies, ("anomaly: codex pid 123: no current staff row",))
+        self.assertEqual(legacy, listing.units)
+        self.assertEqual(errors.getvalue(), "")
+
     def test_incomplete_facts_keep_the_live_unit_and_one_named_problem(self) -> None:
         import io
         from contextlib import redirect_stderr

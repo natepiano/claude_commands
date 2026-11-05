@@ -5,13 +5,15 @@ import contextlib
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
-from unittest.mock import patch
+from types import SimpleNamespace
+from typing import cast, override
+from unittest.mock import Mock, patch
 
 
 import sys
@@ -64,6 +66,11 @@ class UnitPhasesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        from scripts.message import process_table
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(sessions)}))
+        _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
 
     def run_file(self, *events: str) -> Path:
         path = self.root / "run.jsonl"
@@ -141,11 +148,152 @@ class UnitPhasesTests(unittest.TestCase):
     def test_table_has_one_row_per_unit_and_escapes_pipes(self) -> None:
         records: dict[str, object] = {"one-unit": {"current": None, "phases": phase_rows("todo")}}
         self.assertEqual(unit_phases.table([unit("one-unit", live("a|b")), unit("two-unit", None)], records), "\n".join([
-            "| Unit | Phase | Task |",
-            "| --- | --- | --- |",
-            "| a\\|b | not started | — |",
-            "| gone | — | — |",
+            "| Unit | Status | Phase | Task |",
+            "| --- | --- | --- | --- |",
+            "| a\\|b | active | not started | — |",
+            "| gone | active | — | — |",
         ]))
+
+    def test_plain_table_reads_active_and_paused_status_from_staff_even_when_gone(self) -> None:
+        owner = fixture_member("showrunner", name="table-owner")
+        first = fixture_member("unit", name="first", parent=owner.id)
+        second = fixture_member("unit", name="second", parent=owner.id)
+        doc = self.root / "status-production.md"
+        _ = doc.write_text("# Production\n")
+        owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        from scripts.production import session_staff
+
+        first_session = unit("first-unit", live("first")).session
+        assert first_session is not None
+        every = unit_lookup.LabeledProductions({owner.name: {"first": first_session}},
+                                              {owner.name: ("first", "second")})
+
+        def render() -> str:
+            with patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources({}, ())):
+                return unit_phases.table(live_units.units_in(doc, every), {})
+
+        initial = render()
+        self.assertIn("| Unit | Status | Phase | Task |", initial)
+        self.assertIn("| first | active | — | — |", initial)
+        _ = staff.pause(second.id, "review the change")
+        paused = render()
+        self.assertIn("| first | active | — | — |", paused)
+        self.assertIn("| gone | paused | — | — |", paused)
+        _ = staff.resume(second.id)
+        resumed = render()
+        self.assertIn("| gone | active | — | — |", resumed)
+        self.assertEqual(staff.by_id(first.id), first)
+
+    def test_unplaced_processes_print_below_the_table_and_send_one_configured_message(self) -> None:
+        self.assert_anomaly_delivery(send_code=0)
+
+    def test_failed_anomaly_send_keeps_the_table_and_exit_code_and_adds_one_line(self) -> None:
+        self.assert_anomaly_delivery(send_code=1)
+
+    def assert_anomaly_delivery(self, *, send_code: int) -> None:
+        from scripts.production import session_staff
+
+        doc = self.root / "production.md"
+        _ = doc.write_text("# Production\n")
+        owner = fixture_member("showrunner", name="anomaly-owner", doc=staff.LiveDoc("natedev", doc))
+        member = fixture_member("unit", name="member", parent=owner.id)
+        config = self.root / "config"
+        config.mkdir()
+        config_source = Path(__file__).resolve().parents[2] / "config/production.conf"
+        _ = (config / "production.conf").write_text(re.sub(r"(?m)^UNIT_ANOMALIES_TO=.*$", "UNIT_ANOMALIES_TO=fixture-director", config_source.read_text()))
+        observed = [session_staff.LabeledSession("", session_staff.ClaudeUnknown("no registered session"),
+                    HerdrPlace("agents", f"w{index}:p1"), session_staff.ObservedProcess(920000 + index, command),
+                    session_staff.LiveSession(identity))
+                    for index, (command, identity) in enumerate((("codex", "unplaced-codex"),
+                                                               ("claude", "unplaced-claude")))]
+        output, errors = io.StringIO(), io.StringIO()
+        sender = Mock(return_value=subprocess.CompletedProcess(
+            ["send.py"], send_code, "", "fixture send failed" if send_code else ""))
+        with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              patch.object(unit_lookup, "observed_session_labels", return_value=tuple(observed)),
+              patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              patch.object(phase_table, "show_production", return_value="{}"),
+              patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)),
+              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):
+            result = unit_phases.main(["--production", str(doc)])
+        self.assertEqual(result, 0, errors.getvalue())
+        lines = output.getvalue().splitlines()
+        table_end = next(index for index, line in enumerate(lines) if line.startswith("| gone |"))
+        anomalies = [line for line in lines if line.startswith("anomaly:")
+                     and ("unplaced-codex" in line or "unplaced-claude" in line)]
+        self.assertEqual(len(anomalies), 2, output.getvalue())
+        for identity in ("unplaced-codex", "unplaced-claude"):
+            matching = [line for line in anomalies if identity in line]
+            self.assertEqual(len(matching), 1, output.getvalue())
+            self.assertGreater(lines.index(matching[0]), table_end)
+        self.assertNotIn("anomaly:", errors.getvalue())
+        sender.assert_called_once()
+        call = sender.call_args
+        assert call is not None
+        command = cast(list[str], call.args[0])
+        self.assertEqual(command[command.index("--to") + 1], "fixture-director")
+        message = command[command.index("--text") + 1]
+        for line in anomalies:
+            self.assertIn(line, message)
+        extra = [line for line in lines[table_end + 1:] if line.strip() and line not in anomalies]
+        self.assertEqual(len(extra), 1 if send_code else 0, output.getvalue())
+        self.assertEqual(staff.by_id(member.id), member)
+
+    def test_table_without_anomalies_sends_no_message(self) -> None:
+        doc = self.root / "production.md"
+        _ = doc.write_text("# Production\n")
+        owner = fixture_member("showrunner", name="quiet-owner", doc=staff.LiveDoc("natedev", doc))
+        member = fixture_member("unit", name="member", parent=owner.id)
+        from scripts.production import session_staff
+
+        output = io.StringIO()
+        sender = Mock()
+        with (patch.object(unit_lookup, "observed_session_labels", return_value=()),
+              patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              patch.object(phase_table, "show_production", return_value="{}"),
+              patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
+            result = unit_phases.main(["--production", str(doc)])
+        self.assertEqual(result, 0)
+        self.assertIn("| gone | active |", output.getvalue())
+        self.assertNotIn("anomaly:", output.getvalue())
+        sender.assert_not_called()
+        self.assertEqual(staff.by_id(member.id), member)
+
+    def test_scanner_only_anomaly_prints_below_the_table_and_reaches_the_message(self) -> None:
+        from scripts.production import session_staff, staff_sources
+        from scripts.production.staff_test_support import recorded_unit
+
+        doc = self.root / "scan-production.md"
+        _ = doc.write_text("# Production\n")
+        owner = fixture_member("showrunner", name="scan-owner", doc=staff.LiveDoc("natedev", doc))
+        member = recorded_unit(owner.name, "member", self.root / "member", doc)
+        sources = session_staff.MemberSources({}, ())
+        output, errors = io.StringIO(), io.StringIO()
+        line = "anomaly: codex pid 123: no process identity"
+        sender = Mock(return_value=subprocess.CompletedProcess(["send.py"], 0, "", ""))
+
+        def scan(record: staff.StaffSnapshot, observed: unit_lookup.MemberSources) -> None:
+            self.assertEqual(record.by_id(member.id), member)
+            self.assertIs(observed, sources)
+            session_staff.report_anomaly("codex pid 123: no process identity")
+
+        with (patch.object(unit_lookup, "observed_session_labels", return_value=()),
+              patch.object(unit_lookup, "member_sources", return_value=sources),
+              patch.object(staff_sources, "unplaced_processes", side_effect=scan) as scanner,
+              patch.object(phase_table, "show_production", return_value="{}"),
+              patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)),
+              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):
+            result = unit_phases.main(["--production", str(doc)])
+
+        self.assertEqual(result, 0, errors.getvalue())
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(output.getvalue().splitlines()[-2:], ["| gone | active | — | — |", line])
+        scanner.assert_called_once()
+        sender.assert_called_once()
+        call = sender.call_args
+        assert call is not None
+        command = cast(list[str], call.args[0])
+        self.assertEqual(command[command.index("--text") + 1], line)
 
     def test_main_keeps_plan_history_functions_intact_while_it_reads_and_renders(self) -> None:
         doc = self.root / "production.md"
@@ -170,7 +318,7 @@ class UnitPhasesTests(unittest.TestCase):
             return "phase table"
 
         output = io.StringIO()
-        with (patch.object(live_units, "units_of_doc", return_value=[unit("one-unit", live("one"))]),
+        with (patch.object(live_units, "read_units", return_value=live_units.UnitListing([unit("one-unit", live("one"))], ())),
               patch.object(phase_table, "show_production", side_effect=records),
               patch.object(unit_phases, "table", side_effect=render),
               contextlib.redirect_stdout(output)):
@@ -187,12 +335,12 @@ class UnitPhasesTests(unittest.TestCase):
         out = io.StringIO()
         with (patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "caller"}),
               patch.object(showrunners, "production_of", return_value=doc) as found,
-              patch.object(live_units, "units_of_doc", return_value=[unit("a-unit", live("a"))]),
+              patch.object(live_units, "read_units", return_value=live_units.UnitListing([unit("a-unit", live("a"))], ())),
               patch.object(phase_table, "show_production", return_value="{}"),
               contextlib.redirect_stdout(out)):
             self.assertEqual(unit_phases.main([]), 0)
         found.assert_called_once_with("caller")
-        self.assertIn("| a | — | — |", out.getvalue())
+        self.assertIn("| a | active | — | — |", out.getvalue())
 
     def test_a_session_that_is_no_showrunner_is_told_to_name_the_production(self) -> None:
         err = io.StringIO()
@@ -212,7 +360,7 @@ class UnitPhasesTests(unittest.TestCase):
         units = [unit("names-unit", live("names"))]
         records: dict[str, object] = {"names-unit": {"plan": "/tmp/claude/names.md"}}
         output = io.StringIO()
-        with (patch.object(live_units, "units_of_doc", return_value=units),
+        with (patch.object(live_units, "read_units", return_value=live_units.UnitListing(units, ())),
               patch.object(phase_table, "show_production", return_value=json.dumps(records)),
               patch.object(style_units, "table", return_value="ticket table") as tickets,
               patch.object(style_ledger, "ledger_location", return_value=style_ledger.LedgerLocation(
@@ -232,12 +380,12 @@ class UnitPhasesTests(unittest.TestCase):
                 _ = doc.write_text("# Production\n" + kind, encoding="utf-8")
                 units = [unit("a-unit", live("a"))]
                 output = io.StringIO()
-                with (patch.object(live_units, "units_of_doc", return_value=units),
+                with (patch.object(live_units, "read_units", return_value=live_units.UnitListing(units, ())),
                       patch.object(phase_table, "show_production", return_value="{}"),
                       patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
                     self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
                 tickets.assert_not_called()
-                self.assertEqual(output.getvalue(), "| Unit | Phase | Task |\n| --- | --- | --- |\n| a | — | — |\n")
+                self.assertEqual(output.getvalue(), "| Unit | Status | Phase | Task |\n| --- | --- | --- | --- |\n| a | active | — | — |\n")
 
     def test_a_missing_plan_folder_keeps_ledger_data_and_an_unresolved_worktree_keeps_its_row(self) -> None:
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
@@ -265,15 +413,15 @@ class UnitPhasesTests(unittest.TestCase):
                 + "'global:rust/read.md','alpha','[]','[]','[]','[\"one\"]','assigned','2026-10-01')", (str(names.id),))
             _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','12','')", (str(decision),))
         output = io.StringIO()
-        with (patch.object(live_units, "units_of_doc", return_value=[unit("names-unit", live("names")),
-                                                                        unit("types-unit", live("types"))]),
+        with (patch.object(live_units, "read_units", return_value=live_units.UnitListing([unit("names-unit", live("names")),
+                                                                        unit("types-unit", live("types"))], ())),
               patch.object(phase_table, "show_production", return_value=json.dumps({
                   "names-unit": {"unavailable": "plan cannot be read"},
                   "types-unit": {"unavailable": "worktree cannot be read"}})),
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
-        self.assertIn("| names | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
-        self.assertIn("| types | idle | idle | — | 0 | 0 | 0 |", output.getvalue())
+        self.assertIn("| names | active | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
+        self.assertIn("| types | active | idle | idle | — | 0 | 0 | 0 |", output.getvalue())
 
     def test_production_of_reads_the_timer_addressed_to_the_session(self) -> None:
         doc = self.root / "show-production.md"

@@ -248,3 +248,34 @@ The user, 2026-11-02 19:4x EST, relayed by the sdlc showrunner, on `/module_revi
 - `scripts/agents/agent_exec.sh` and the phase review path did not change.
 
 **Files:** the three commands; `commands/agent.md`; `config/agents.conf`; `docs/as-built/agent-registry.md`; `docs/direct_footprint_review.md`; `scripts/agents/agent_admin.sh`; `scripts/direct/test_phase_process.py`; `scripts/lib/test_agents_registry.conf`, `scripts/lib/test_agents_registry_fixture.py`; `scripts/whoami/quota_alert_test_support.py` and ten `scripts/whoami/test_*` files.
+
+### Phase 9 — `/showrunner:units` shows only units, with a status column and anomaly lines  · status: done
+
+The user, 2026-11-05, relayed by hana and the sdlc showrunner: "we should show the units for a producer - we shouldn't show anything else but the anomalies sould show because they are not accounted for either in the script (like morty - which should be accounted for and not shown) or if there ar orphan units they are indicators of a bug or an actual orphan and need to be addressed" (allow-banned: user quote). And: "you need to show a status column for a unit as to whether it is paused or active - that should be added to the command also".
+
+#### Work Order
+
+Design from the sdlc showrunner:
+
+1. The table shows only the production's staff units. Every process that `unit_phases.py` cannot place is an anomaly line under the table, on stdout. Today these lines go to stderr from `scripts/production/session_staff.py:665`, above the table. When a run has anomaly lines, the script sends one message per run with those lines through `send.py --to <target>`. The target is `sdlc`, read from a key in `config/production.conf`.
+2. Morty is placed and is not an anomaly. Match its Codex thread with `MORTY_NATIVE_ID` in `config/send.conf`, the value that `send.py` uses for `Authority: morty`. Read the value from that config. Do not copy it. A Codex process that is not Morty stays an anomaly.
+3. The tables get a Status column, `paused` or `active`, in the plain table and the style table. The pause record is one field on the staff row: `paused = {since, by, why}`. No field means active. There is no new store.
+4. One command sets and clears the field, in the existing staff command:
+   - `staff.py pause <unit> --why "<why>"`
+   - `staff.py pause --production <slug> [--except <unit>...] --why "<why>"`
+   - `staff.py resume <unit>`
+   - `staff.py resume --production <slug>`
+5. A pause is a record only. It stops nothing. A rerun of pause or resume succeeds.
+6. Add no other check.
+
+**Files:** `scripts/production/unit_phases.py`, `live_units.py`, `session_staff.py`, `staff_sources.py`, `unit_lookup.py`, `display_cells.py`, `style_units.py`, `staff.py`; `config/production.conf`; `commands/showrunner/units.md`; `docs/as-built/staff-accessors.md`, `docs/as-built/showrunner-automation.md`; and their test files.
+
+**Workers:** `2 writers`
+- `impl` — the source, config and doc files.
+- `test` — the test files, written at the same time, with the callers' existing tests in each edit round.
+
+**Acceptance gate:** on the live sdlc production, `unit_phases.py --production docs/plans/sdlc-production.md` prints a table with a Status column; no Morty line; each other unplaced process as an `anomaly:` line under the table; and one message reaches sdlc with those lines. `staff.py pause` then `resume` on a live unit changes its Status cell and back. Named tests pass for: Morty placed, another Codex process unplaced, one send per run, no send with no lines, a send failure leaves the table and exit code unchanged, and each pause and resume form.
+
+### Phase 9r — Two refusals without proof of a live target are deleted  · status: todo
+
+From the sdlc showrunner, 2026-11-05. A Codex process with no native thread identity (Morty, and an unrelated interactive Codex) must not make `staff.retire` raise. `codex_mesh._release_source_servers` must not refuse with "source server endpoint is unknown" for a recorded pid, because a reused pid can be an unrelated process. User rule 2026-11-02: only proof that the target is live refuses. Add no new check. Separate hash, on branch `sdlc-fix-rounds-retire`.

@@ -508,6 +508,87 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_pause_and_resume_one_unit_preserve_membership_and_allow_reruns(self) -> None:
+        from scripts.production.fake_showrunner import write_session
+
+        owner, unit, worker = self.tree()
+        before = unit.to_json()
+        caller = fixture_member("showrunner", name="fixture-director")
+        listener = write_session(sessions.sessions_dir(), "registry-name", caller.current_session)
+        self.addCleanup(listener.close)
+        self.enterContext(mock.patch.dict(os.environ, {"CODEX_THREAD_ID": ""}))
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.cli("pause", f"{owner.name}/{unit.name}", "--why", "review the change")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                current = staff.by_id(unit.id)
+                assert current is not None
+                paused = cast(dict[str, object], current.to_json()["paused"])
+                self.assertIsInstance(paused, dict)
+                self.assertEqual(paused["why"], "review the change")
+                self.assertTrue(paused["since"])
+                self.assertEqual(paused["by"], "fixture-director")
+                self.assertEqual({key: value for key, value in current.to_json().items() if key != "paused"}, before)
+                self.assertEqual(staff.by_id(worker.id), worker)
+        for attempt in range(2):
+            with self.subTest(resume=attempt):
+                result = self.cli("resume", f"{owner.name}/{unit.name}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(staff.by_id(unit.id), unit)
+
+    def test_pause_records_the_codex_callers_staff_name(self) -> None:
+        owner, unit, worker = self.tree()
+        caller = fixture_worker("codex-director", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": caller.current_session}):
+            result = self.cli("pause", f"{owner.name}/{unit.name}", "--why", "review the change")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        current = staff.by_id(unit.id)
+        assert current is not None
+        self.assertEqual(cast(dict[str, object], current.to_json()["paused"])["by"], caller.name)
+        self.assertEqual(staff.by_id(worker.id), worker)
+
+    def test_production_pause_and_resume_change_only_its_units(self) -> None:
+        owner, first, worker = self.tree()
+        second = fixture_member("unit", name="registry", parent=owner.id)
+        other_owner = fixture_member("showrunner", name="hana")
+        other = fixture_member("unit", name="other", parent=other_owner.id)
+        _ = self.cli("pause", "--production", owner.name, "--why", "review the production")
+        for original in (first, second):
+            current = staff.by_id(original.id)
+            assert current is not None
+            self.assertEqual(cast(dict[str, object], current.to_json()["paused"])["why"], "review the production")
+        self.assertEqual(staff.by_id(other.id), other)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        _ = self.cli("resume", "--production", owner.name)
+        self.assertEqual(staff.by_id(first.id), first)
+        self.assertEqual(staff.by_id(second.id), second)
+
+    def test_production_pause_except_keeps_each_named_unit_active(self) -> None:
+        owner, selected, worker = self.tree()
+        first = fixture_member("unit", name="registry", parent=owner.id)
+        second = fixture_member("unit", name="builds", parent=owner.id)
+        _ = self.cli("pause", "--production", owner.name, "--except", first.name, "--except", second.name,
+                 "--why", "review the selected unit")
+        current = staff.by_id(selected.id)
+        assert current is not None
+        self.assertEqual(cast(dict[str, object], current.to_json()["paused"])["why"], "review the selected unit")
+        for original in (first, second, worker):
+            self.assertEqual(staff.by_id(original.id), original)
+        _ = self.cli("resume", "--production", owner.name)
+        self.assertEqual(staff.by_id(selected.id), selected)
+
+    def test_rename_and_move_preserve_the_pause_record(self) -> None:
+        owner, unit, worker = self.tree()
+        destination = fixture_member("showrunner", name="hana")
+        _ = self.cli("pause", f"{owner.name}/{unit.name}", "--why", "review before moving")
+        paused = staff.by_id(unit.id)
+        assert paused is not None
+        changed = staff.rename(unit.id, "registry")
+        self.assertEqual(changed.to_json()["paused"], paused.to_json()["paused"])
+        moved = staff.move(changed.id, staff.ReportsTo(destination.id))
+        self.assertEqual(moved.to_json()["paused"], paused.to_json()["paused"])
+        self.assertEqual(staff.by_id(worker.id), worker)
+
     def test_snapshots_keep_their_production_record_source(self) -> None:
         value: dict[str, object] = {"schema": 2, "rows": []}
         _ = self.write_document(value)

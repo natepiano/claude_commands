@@ -399,7 +399,7 @@ def source_environment(source: Path) -> dict[str, str]:
 
 OWNER_CLI = """import os, runpy, sys
 sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
-from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
+from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_readers, observe_operation_lock
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
 from scripts.production import staff_sources
@@ -412,6 +412,9 @@ sys.argv[0] = script
 with isolated_source_readers(), mock.patch.object(
     remote, 'local_machine', return_value='mac' if sys.platform == 'darwin' else 'natedev',
 ):
+    if script == str(STAFF_SCRIPT):
+        from scripts.production import staff
+        raise SystemExit(staff.main())
     runpy.run_path(script, run_name='__main__')
 """
 

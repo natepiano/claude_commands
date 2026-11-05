@@ -8,12 +8,19 @@ The check in `scripts/production/test_staff_accessors.py` fails when this table 
 Made from the code on 2026-11-04. Tests are left out. `staff.py` is the one owner of reads and writes;
 on natedev each Python accessor reads `staff.json` in its own process, and on the Mac `staff.py` asks natedev over ssh.
 
-Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, retire_pending, set_doc, set_worktree, update_current_session.
+Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, retire_pending, set_doc, set_worktree, update_current_session, pause, resume.
+
+`StaffRow.paused` is `Paused(since, by, why)` or `Active()`. JSON stores `paused: {since, by, why}` only for a paused row.
+`pause(reference, why)` records the time in the user zone and the caller's session name. `resume(reference)` removes the field.
+The commands accept a unit or `--production <slug>`. Production pause accepts repeated `--except <unit>` options.
+Both commands are safe to repeat. They stop no process. Rename, move, retire and restore retain the pause field.
 
 | File | Access | `staff` calls |
 |---|---|---|
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
+| `commands/showrunner/units.md` | write | staff.py pause, resume (shell) |
 | `docs/associate-producer/operations.md` | read | staff.json (shell) |
+| `docs/as-built/showrunner-automation.md` | write | staff.py pause, resume (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |

@@ -6,6 +6,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 import io
 import json
 import os
+import re
 import unittest
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
@@ -663,6 +664,56 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(errors.getvalue().splitlines(), [
             "staff sources: Codex process scan: pid 42401: No closing quotation"])
 
+    def test_codex_scan_continues_after_a_process_environment_disappears(self) -> None:
+        from scripts.message import process_table
+
+        doc = self.fill_production("environment-demo")
+        owner = staff.by_path("environment-demo")
+        assert owner is not None
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        table = {pid: process_table.Process(pid, 1, "codex", "codex") for pid in (42401, 42402)}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", side_effect=[
+                  FileNotFoundError("process disappeared"), {"CODEX_THREAD_ID": owner.current_session}]),
+              redirect_stderr(io.StringIO()) as errors):
+            document = staff_sources.live()
+        members = cast(list[dict[str, object]], document["members"])
+        found = next(member for member in members if member["id"] == owner.id)
+        self.assertEqual(found["identity"], {"codex": owner.current_session})
+        self.assertFalse(document["complete"])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "staff sources: Codex process 42401: process disappeared"])
+
+    def test_scanner_places_morty_and_reports_another_codex_from_terminal_names_without_thread_environment(self) -> None:
+        from scripts.message import codex_daemon, process_table
+
+        self.write_json(self.staff_file, {"schema": 2, "rows": []})
+        morty = fixture_runtime_id("scanner-morty")
+        other = fixture_runtime_id("scanner-other")
+        config = self.root / "config"
+        config.mkdir()
+        original = (Path(__file__).resolve().parents[2] / "config/send.conf").read_text()
+        write_text_atomic(config / "send.conf",
+            re.sub(r"(?m)^MORTY_NATIVE_ID=.*$", f"MORTY_NATIVE_ID=codex:{morty}", original))
+        table = {pid: process_table.Process(pid, 1, "codex", "codex") for pid in (42401, 42402)}
+        sessions = [codex_daemon.DaemonSession(identity, name, str(self.root), "idle")
+                    for identity, name in ((morty, "morty"), (other, "other"))]
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"CODEX_HOME": str(self.root / "codex")}),
+              mock.patch.object(herdr, "herdr_place_of", side_effect=[herdr.HerdrPlace("agents", "w1:p1"),
+                                                                    herdr.HerdrPlace("agents", "w2:p1")]),
+              mock.patch.object(herdr.Herdr, "result", side_effect=[
+                  {"pane": {"terminal_title_stripped": "morty | idle"}},
+                  {"pane": {"terminal_title_stripped": "other | idle"}}]),
+              mock.patch.object(codex_daemon, "loaded_sessions", return_value=sessions),
+              session_staff.anomalies(staff_sources.CodexProcessThreads().check) as lines):
+            staff_sources.unplaced_processes(staff.snapshot(), MemberSources({}, ()))
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("pid 42402 (codex)", lines[0])
+        self.assertIn(other, lines[0])
+        self.assertNotIn(morty, "\n".join(lines))
+
     def test_missing_codex_thread_reports_one_codex_problem(self) -> None:
         from scripts.message import process_table
 
@@ -675,8 +726,10 @@ class StaffSourcesTests(StaffTestCase):
         record = staff.snapshot()
         sources = MemberSources({}, (launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
-              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
+              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"}),
+              mock.patch.object(staff_sources.CodexProcessThreads, "thread") as recover):
             evidence = staff_sources.observe_workers(record, sources)
+        recover.assert_not_called()
         expected = "staff sources: Codex process 42401: native thread identity is unavailable"
         self.assertEqual(evidence.diagnostics, (expected,))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
