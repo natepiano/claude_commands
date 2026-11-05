@@ -34,8 +34,8 @@ folder = pathlib.Path(__file__).parent
 args = sys.argv[1:]
 with (folder / "attempts.jsonl").open("a") as stream:
     stream.write(json.dumps(args) + "\\n")
-status = int((folder / "question_exit").read_text())
-if status == 0:
+status = int((folder / ("withdraw_exit" if args[0] == "withdraw" else "question_exit")).read_text())
+if status == 0 and args[0] == "ask":
     with (folder / "questions.jsonl").open("a") as stream:
         stream.write(json.dumps(args) + "\\n")
 raise SystemExit(status)
@@ -131,6 +131,7 @@ class VaultPullTests(unittest.TestCase):
         script = self.folder / "update_registration.py"
         _ = script.write_text(QUESTION_STAND_IN)
         _ = (self.folder / "question_exit").write_text("0")
+        _ = (self.folder / "withdraw_exit").write_text("0")
         shim = self.folder / "bin"
         shim.mkdir()
         _ = (shim / "git").write_text(GIT_STAND_IN)
@@ -333,12 +334,107 @@ class VaultPullTests(unittest.TestCase):
         _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
         self.assertEqual(self.hour()[0], 0)
         self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+        withdrawals = [args for args in self.questions("attempts.jsonl") if args[0] == "withdraw"]
+        self.assertEqual(len(withdrawals), 1)
+        self.assertEqual(withdrawals[0], [
+            "withdraw", "--production", first[first.index("--production") + 1],
+            "--item", first[first.index("--text") + 1],
+        ])
         _ = self.git(self.mac, "switch", "-c", "feature")
         self.now += 3600
         self.assertEqual(self.hour()[0], 0)
         self.assertEqual(len(self.questions()), 2)
         self.assertNotEqual(self.questions()[1], first)
-        self.assertFalse(any("withdraw" in args for args in self.commands))
+        second = self.questions()[1]
+        self.assertNotEqual(second[second.index("--text") + 1], first[first.index("--text") + 1])
+        _ = self.git(self.mac, "switch", "main")
+        self.assertEqual(self.hour()[0], 0)
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+        withdrawals = [args for args in self.questions("attempts.jsonl") if args[0] == "withdraw"]
+        self.assertEqual(len(withdrawals), 2)
+        self.assertEqual(withdrawals[1][withdrawals[1].index("--item") + 1], second[second.index("--text") + 1])
+
+    def test_a_changed_cause_withdraws_the_original_question_text(self) -> None:
+        _ = self.conflict()
+        _ = self.git(self.mac, "switch", "-c", "feature")
+        self.assertEqual(self.hour()[0], 0)
+        first = self.questions()[0]
+        _ = self.git(self.mac, "switch", "main")
+        self.now += 3600
+        self.assertEqual(self.hour()[0], 0)
+        outage = vault_pull.read_state().outage
+        assert isinstance(outage, vault_pull.OpenOutage)
+        self.assertEqual(outage.cause, "conflict")
+        self.assertEqual(len(self.questions()), 1)
+        _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
+        self.assertEqual(self.hour()[0], 0)
+        withdrawals = [args for args in self.questions("attempts.jsonl") if args[0] == "withdraw"]
+        self.assertEqual(len(withdrawals), 1)
+        self.assertEqual(withdrawals[0][withdrawals[0].index("--item") + 1], first[first.index("--text") + 1])
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+
+    def test_a_good_run_inside_the_unreachable_grace_withdraws_no_question(self) -> None:
+        self.unreachable = True
+        self.assertEqual(self.hour()[0], 0)
+        outage = vault_pull.read_state().outage
+        assert isinstance(outage, vault_pull.OpenOutage)
+        self.assertFalse(outage.asked)
+        self.unreachable = False
+        self.now += 3600
+        self.assertEqual(self.hour()[0], 0)
+        self.assertEqual(self.questions("attempts.jsonl"), [])
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+
+    def test_a_failed_withdraw_keeps_the_good_result_and_does_not_retry(self) -> None:
+        _ = self.git(self.mac, "switch", "-c", "feature")
+        self.assertEqual(self.hour()[0], 0)
+        _ = self.git(self.mac, "switch", "main")
+        _ = (self.folder / "withdraw_exit").write_text("2")
+        self.assertEqual(self.hour(), (0, "buildlog vault: current; the question was not withdrawn"))
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+        attempts = self.questions("attempts.jsonl")
+        self.assertEqual(len([args for args in attempts if args[0] == "withdraw"]), 1)
+        self.assertEqual(len(self.questions()), 1)
+        self.assertEqual(self.hour(), (0, "buildlog vault: current"))
+        self.assertEqual(self.questions("attempts.jsonl"), attempts)
+
+    def test_a_timed_out_withdraw_keeps_the_good_result_and_does_not_retry(self) -> None:
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
+        _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
+
+        def timed_out_withdraw(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+            result = self.run_transport(args, timeout)
+            if "withdraw" in args:
+                self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+                return None
+            return result
+
+        with mock.patch.object(vault_pull, "run", new=timed_out_withdraw):
+            self.assertEqual(self.hour(), (0, "buildlog vault: synced 0 incoming commits; the question was not withdrawn"))
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
+        attempts = self.questions("attempts.jsonl")
+        self.assertEqual(len([args for args in attempts if args[0] == "withdraw"]), 1)
+        self.assertEqual(self.hour(), (0, "buildlog vault: current"))
+        self.assertEqual(self.questions("attempts.jsonl"), attempts)
+
+    def test_a_deferral_keeps_the_question_until_the_first_good_sync(self) -> None:
+        _ = self.conflict()
+        self.assertEqual(self.hour()[0], 0)
+        outage = vault_pull.read_state().outage
+        attempts = self.questions("attempts.jsonl")
+        _ = self.git(self.mac, "merge", "-s", "ours", "--no-edit", "origin/main")
+        self.warm = False
+        self.assertEqual(self.hour(), (0, "buildlog vault: GitHub credentials are cold; the next hour retries"))
+        self.assertEqual(vault_pull.read_state().outage, outage)
+        self.assertEqual(self.questions("attempts.jsonl"), attempts)
+        self.warm = True
+        self.assertEqual(self.hour()[0], 0)
+        withdrawals = [args for args in self.questions("attempts.jsonl") if args[0] == "withdraw"]
+        self.assertEqual(len(withdrawals), 1)
+        first = self.questions()[0]
+        self.assertEqual(withdrawals[0][withdrawals[0].index("--item") + 1], first[first.index("--text") + 1])
+        self.assertIsInstance(vault_pull.read_state().outage, vault_pull.NoOutage)
 
     def test_not_on_main_files_one_question_without_committing_edits(self) -> None:
         _ = self.git(self.mac, "switch", "-c", "feature")
@@ -394,7 +490,7 @@ class VaultPullTests(unittest.TestCase):
         args = self.questions()[0]
         self.assertEqual(args[0], "ask")
         self.assertEqual(args[args.index("--production") + 1], str(vault_pull.PRODUCTION))
-        self.assertIn("conflict", args[args.index("--text") + 1])
+        self.assertIn("conflict", args[args.index("--question") + 1])
         self.assertIn("2027-01-15", args[args.index("--text") + 1])
         self.assertNotIn("\n", args[args.index("--text") + 1])
         self.assertEqual(args[args.index("--urgency") + 1], "soon")

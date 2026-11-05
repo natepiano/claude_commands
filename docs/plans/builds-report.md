@@ -670,3 +670,50 @@ One idle episode sends one showrunner message and at most one phone push. A chan
 **Ruled out:**
 - Saving the episode's claim path: it missed work in a blocked episode and took another repository's claim.
 - A cause-and-holder message key: it did not send when a cause came back.
+
+### Phase 31 — A vault sync that works again closes its open question by itself  · status: done
+**Depends on:** none (the public `withdraw` command is on `~/.claude` main at 1f0104fdd)
+
+From the natedev showrunner (not the user), 2026-11-05: "Your hanadocs sync can now clear its conflict question on a good run. Add that as a small follow-up through builds." From the builds showrunner (not the user), 2026-11-05: start the top item in the next-items doc that waits on nothing.
+
+Director decisions, each a one-line revert:
+- The question's `--text` drops the cause, because a cause can change inside one outage and `withdraw` needs the exact text. No new state is saved. Risk: the short line no longer names the cause; the question body still does.
+- A failed `withdraw` does not change the result and has no retry, because a user who already answered gives the same exit 2 as a real failure, so a retry would never end. Risk: a rare failure leaves a stale question for natedev to clear by hand.
+- A deferral does not withdraw, because a deferral is not a good sync.
+- No old-record reader and no migration: the live state has `"outage": null`, and natedev's list holds no open hanadocs question at this date.
+
+#### Work Order
+
+**Goal:** A good vault sync closes the question that its outage filed, through the public `withdraw` command. natedev no longer clears it by hand.
+
+**Spec:**
+- Add `question_text(since: float) -> str` to `scripts/buildlog/vault_pull.py`. It returns `Hanadocs vault sync stopped, <opened iso>`, with the same `opened` value that `ask_question` computes today. It is the one place that makes this text.
+- `ask_question` files `question_text(since)` as `--text`. The `--question` body, `--urgency` and `--due` do not change. `ask_question` drops its `cause` parameter when nothing else reads it.
+- Add one function that runs `python3 <REGISTRATION> withdraw --production <PRODUCTION> --item <question_text(since)>` through `run(..., COMMAND_TIMEOUT_S)`. It returns whether the command exited 0.
+- In `_vault_locked`, a `Pulled` or `Current` outcome writes `VaultState(LastGoodPull(now), NoOutage())` first. Then, when the earlier outage is an `OpenOutage` with `asked=True`, it runs the withdraw once.
+- A failed or timed-out withdraw still exits 0. The state stays `NoOutage`. The run prints one line: the normal sync line, then `; the question was not withdrawn`. Nothing retries it.
+- A `DeferredSync` outcome keeps the outage and runs no withdraw. The first good sync after it withdraws.
+- A good sync after an outage with `asked=False` runs no withdraw.
+- `VaultState` and the state file do not change.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — `question_text`, the withdraw function, `ask_question`, `_vault_locked`.
+- `scripts/buildlog/test_vault_pull.py` — `QUESTION_STAND_IN` keeps withdraw calls apart from ask calls; the acceptance tests below.
+
+**Workers:** 1 writer — `vault` owns both files; nothing splits.
+
+**State:** none new. `vault_pull.json` keeps its form.
+
+**Approved assertion change:** `test_a_good_run_closes_the_outage_and_a_later_stop_files_a_new_question` ends with `self.assertFalse(any("withdraw" in args for args in self.commands))`. This phase's Goal replaces that line: the good run now runs exactly one withdraw for the filed question.
+`test_question_command_names_the_cause_date_production_and_urgency` asserts `"conflict"` in `--text`. The Spec moves the cause out of `--text`, so that assertion reads `--question`.
+
+**Acceptance gate:** each is a test in `scripts/buildlog/test_vault_pull.py` that runs `vault` against temporary repositories and the question stand-in. The observation is the argument list the stand-in records and the state file.
+- A conflict, then a good run: exactly one withdraw, and its `--item` equals the `--text` of the ask.
+- A cause change in one outage (not on main, then a conflict), then a good run: one ask, and the withdraw `--item` equals the filed text.
+- A later outage files a new text, and its good run withdraws only that text.
+- A good run after an unreachable outage inside the grace (`asked=False`): no withdraw.
+- A withdraw that exits non-zero: `vault` returns 0, the state holds `NoOutage`, one printed line says the question was not withdrawn, and the next good run runs no second withdraw.
+- A deferral after a filed question: no withdraw, and the first good run after it withdraws once.
+- `test_vault_pull`, `test_target_sync`, `test_sync` green in the discover form.
+- `basedpyright scripts/buildlog/vault_pull.py scripts/buildlog/test_vault_pull.py`: 0 errors, 0 warnings, 0 notes.
+- Live check: deferred to the next real outage on natedev. A forced outage would file a real question on the user's list.

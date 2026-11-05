@@ -360,13 +360,26 @@ def stop_details(outcome: PullStop) -> tuple[StopCause, str, str]:
                     + "2. Leave the error unresolved. The vault sync remains stopped. I recommend choice 1.")
 
 
-def ask_question(cause: StopCause, reason: str, choices: str, since: float) -> bool:
+def question_text(since: float) -> str:
+    opened = datetime.fromtimestamp(since, UTC)
+    return f"Hanadocs vault sync stopped, {opened.isoformat()}"
+
+
+def ask_question(reason: str, choices: str, since: float) -> bool:
     opened = datetime.fromtimestamp(since, UTC)
     result = run([
         "python3", str(REGISTRATION), "ask", "--production", str(PRODUCTION),
-        "--text", f"Hanadocs vault sync: {cause}, {opened.isoformat()}",
+        "--text", question_text(since),
         "--question", reason + " " + choices, "--urgency", "soon",
         "--due", (opened + timedelta(days=1)).date().isoformat(),
+    ], COMMAND_TIMEOUT_S)
+    return result is not None and result.returncode == 0
+
+
+def withdraw_question(since: float) -> bool:
+    result = run([
+        "python3", str(REGISTRATION), "withdraw", "--production", str(PRODUCTION),
+        "--item", question_text(since),
     ], COMMAND_TIMEOUT_S)
     return result is not None and result.returncode == 0
 
@@ -393,7 +406,11 @@ def _vault_locked() -> int:
             return 0
         if isinstance(outcome, (Pulled, Current)):
             write_state(VaultState(LastGoodPull(now), NoOutage()))
-            print(f"buildlog vault: synced {outcome.commits} incoming commits" if isinstance(outcome, Pulled) else "buildlog vault: current")
+            description = f"buildlog vault: synced {outcome.commits} incoming commits" if isinstance(outcome, Pulled) else "buildlog vault: current"
+            if isinstance(state.outage, OpenOutage) and state.outage.asked:
+                if not withdraw_question(state.outage.since):
+                    description += "; the question was not withdrawn"
+            print(description)
             return 0
         cause, reason, choices = stop_details(outcome)
         previous = state.outage
@@ -403,7 +420,7 @@ def _vault_locked() -> int:
         if not outage.asked and not sleeping:
             outage = replace(outage, asked=True)
             write_state(replace(state, outage=outage))
-            if not ask_question(cause, reason, choices, outage.since):
+            if not ask_question(reason, choices, outage.since):
                 outage = replace(outage, asked=False)
                 write_state(replace(state, outage=outage))
         else:
