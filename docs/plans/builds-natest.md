@@ -308,8 +308,10 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - Cost indexes outside the hash: a changed cost index is a schema change and gets its own file.
 
-### Phase 11 — Shared test fixtures skip repeated setup  · status: todo
+### Phase 11 — Shared test fixtures skip repeated setup  · status: done
 **Depends on:** Phase 6
+
+**Result:** no change shipped. Same-load pairs (3 rounds) showed no gain: `test_simplify_lens` 93.2 to 92.7 s wall, `test_nix_env` 3.0 to 2.8 s, `test_nix_env_launches` 4.7 to 4.7 s, `test_review_launcher` 32.2 to 32.5 s. The director reverted both edits: the gain is noise, and a hand-kept config file list breaks future callers.
 
 #### Work Order
 
