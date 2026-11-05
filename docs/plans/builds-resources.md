@@ -1338,60 +1338,33 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 **Ruled out:** caller-side `store` imports in six files, replaced by the one re-export.
 
 ### Phase 57 — The gate comparison shows Cargo waits with and without running gates  · status: done
-**Depends on:** Phase 20 on `origin/main` for 24 hours. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its measurement files are in the run folder.
 
-#### Work Order
+#### As-built
 
-**Goal:** report Cargo memory waits with and without overlapping merge gates from the recorded queue lifetimes.
+A measurement script in the unit run folder splits Cargo memory waits by recorded merge-gate overlap for the first 24 hours after Phase 20 was installed. It changes no repository file.
 
-**Measured:**
-1. Phase 20 supplies `read_queue_lifetimes()` in `scripts/lint/memory_admit.py`.
-2. A `QueueStepLifetime` groups reservation intervals, token gaps and the logical step's end.
-3. The lifecycle file has an age limit and a size limit. Its retained coverage can be shorter than fourteen days.
-4. The buildlog sampler records cumulative memory stalls. It does not record the required memory PSI avg10 series.
-
-**Spec:**
-1. Start after Phase 20 has been on `origin/main` for 24 hours.
-   Record its deployment time and the comparison's due time in the phase report.
-   Compare the first 24 hours after deployment with the preceding 24 hours where usable evidence exists.
-   Report missing earlier evidence explicitly. Do not reconstruct gate intervals from unrelated Cargo step rows.
-2. Import `read_queue_lifetimes()` from the checkout. Add no second lifecycle parser or interval reader.
-   Use each gate's reservation intervals to identify overlapping running gates.
-   Unite overlapping gate intervals before classifying Cargo wait periods. Do not count overlapping gates twice.
-   Report Cargo memory-wait minutes with and without gate overlap. Keep token-gap minutes separate.
-   Count each logical step's memory wait once. Report `MemoryWaitIncomplete` separately.
-3. Preserve cancellation and incomplete evidence in the comparison.
-   A `TokenReturn` ends an interval, not the logical step. A `NoPositiveSample` value is not a measured zero peak.
-   Report open intervals and cancelled gates separately. State how the comparison treats each incomplete interval.
-4. Report the actual retained time range, missing intervals and the usable comparison period.
-   Report pressure comparisons as unavailable until the recorded PSI series supports them.
-   Do not infer avg10 hold durations from cumulative stall counters.
-5. Test overlapping gates, cancellation, token returns and incomplete intervals in private fixtures.
-   Test one logical step with multiple reservation intervals. Verify that token gaps do not become memory waits.
-   Keep the measurement script and its tests in the phase run folder. This phase changes no shared implementation file.
-6. Publish the comparison in a follow-up notice to builds.
-   Include coverage limits, Cargo wait totals and the unavailable pressure comparison, when applicable.
-
-**Constraints from prior phases:**
-- Phase 20 owns lifecycle recording and the one reader. This phase owns the deferred Phase 16 gate comparison.
-- Use saved lifecycle identities and interval times. Missing identity evidence does not prove that a step ended.
-- This phase does not calibrate a queue model or adopt another head policy.
+- `compare_lifetimes(lifetimes, *, window_start, window_end) -> WindowComparison` reads only through `read_queue_lifetimes()`. It unites overlapping gate intervals and counts each logical wait once. It keeps token gaps, incomplete waits, open intervals, cancelled gates and missing peak samples separate.
+- Phase 20 reached the installed natedev copy at 2026-11-04 15:45:21 EST and origin/main at 15:45:22 EST, in `7e5c326df`. The comparison was due at 2026-11-05 15:45:21 EST.
+- The report has an After window only: 23.996 usable hours, with gates running 23.298 of them. It shows 241 Cargo steps, 240 complete waits and 1 incomplete wait. Cargo waits are 4313.325 minutes with gates, 12.495 minutes without gates and 2.230 minutes unknown.
+- 229 gates ran and 8 were cancelled. Two gate endings have no admission record. Token gaps are 0 minutes, because no token return is recorded. Four peak samples are missing.
+- Pressure comparison is unavailable, because the memory PSI avg10 series is not recorded.
+- The result does not show that gates cause Cargo waits.
 
 **Files:**
-- `phases/57/gate_comparison.py` — new measurement script, in the unit run folder.
-- `phases/57/test_gate_comparison.py` — in the unit run folder, new private measurement fixtures and tests.
-- `phases/57/gate_comparison_report.md` — in the unit run folder: deployment time, due time, totals and coverage limits.
+- `phases/57/gate_comparison.py`, in the unit run folder — the measurement script.
+- `phases/57/test_gate_comparison.py`, in the unit run folder — private fixtures and tests.
+- `phases/57/gate_comparison_report.md` and `phases/57/evidence/`, in the unit run folder — the report and the copied evidence.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns the measurement script, report and follow-up notice.
-- `test` owns the measurement tests and private fixtures.
+**Gotchas:**
+- A commit time does not prove arrival on main. `4298a9aaf` at 16:30:03 EST was never an origin/main tip; the origin/main reflog gives the arrival.
+- Lifecycle recording began 13 seconds after the install, at 15:45:34 EST. `read_queue_lifetimes()` drops 110 older `token_gap` rows that have no `since`.
+- `read_queue_lifetimes()` discards an unmatched ending that is a `TokenReturn` or that has other intervals in its step. This evidence has neither case.
+- The no-gate rate rests on about 0.67 hours. A window 45 minutes later changes it from 19 to 362 wait minutes per hour.
 
-**Acceptance gate:**
-- The measurement tests pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the script and its tests.
-- The report compares Cargo waits with and without overlapping gate intervals, with one memory wait per logical step.
-- The report names the actual retained coverage, cancelled gates, incomplete waits, open intervals and missing peak samples.
-- Pressure comparisons remain unavailable until the PSI record supports them.
-- The follow-up notice records the Phase 20 deployment time and the due time 24 hours later.
+**Ruled out:**
+- A before and after comparison: recording began at the deployment.
+- Comparing the with-gate and no-gate rates: the no-gate period is too short.
+- A second lifecycle parser or gate intervals rebuilt from Cargo step rows.
 
 ### Phase 58 — The disk floor alert stays silent during a live sweep, and the floor pass finishes quickly  · status: done
 
