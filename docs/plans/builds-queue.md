@@ -170,46 +170,66 @@ only I can bump
 
 ### Phase 10s — A run with no scope reads its anonymous use from its processes  · status: done
 
-**Depends on:** 10q. Runs before 10x. Source: builds live check of main 66a34ca16, 2026-11-05 02:05 EST.
+#### As-built
 
-#### Work Order
-
-**Goal:** The cap shows a value while a merge gate runs, and a merge gate keeps aside only its need less its use.
-
-**Spec:**
-1. **Cause (live, 02:05 EST).** The service runs the 10z code (started 01:55:30, after the 01:55:26 files). The devtools merge gate (pid 2678865) holds a reservation with no `sidecar`: `merge_gate.py:343` takes `queue_place("merge-gate")` in its own process and makes no scope. `reservation_memory` then sets `RunUseUnavailable("step has no scope")`, so `memory_room` sets the cap to `CapUnavailable`, and the run keeps aside its full 6 GiB need for its life. Room and starts are correct; the cap text and the keep-aside are not as 10z intends.
-2. **Fix, use (builds approval, 02:3x EST).** One reading per step kind, in one function in `process_memory` that picks by what the step has. A step with a scope reads its scope's `memory.stat` anon. An in-process holder with no scope (`queue_place` used as a context manager, as `merge_gate.py:343` does) reads `RssAnon` summed over its process tree. Both give `AnonymousRunUse`. One process table read per pass, as today. No second copy in `queue_evidence.py`.
-3. **Fix, text.** When the cap is unavailable, `room_text` names the runs whose use is unavailable and prints no use sum: today it prints "anonymous use 0.0 GiB" beside "unavailable".
-4. **Keep the resident reading (architect review, 2026-11-05).** `process_memory` (`memory_admit.py:2827`) returns resident bytes today; `queue_place.py:352` and `unowned_slice_memory` (`memory_admit.py:4612`) read them. Keep resident bytes and swap as separate values, and add the anonymous reading beside them. A missing or invalid `RssAnon` line makes that run's use `RunUseUnavailable`; today the reader skips status errors with no trace.
-5. **One count per process (architect review).** `run_memories` (`memory_admit.py:3688`) removes duplicate scope readings; process trees have no such rule. Two reservations that cover the same process tree count its use once, and a tree inside a scope that another reservation reads counts once. `memory_admit.py` owns that rule.
-6. **The memory page.** The page feed (`/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/memory_feed.py:291`) rejects the whole reading when the cap alone is unavailable, so the page goes blank. Keep the rows, the room and the cap text, and draw no cap line. 10m adds the named page types.
-7. **Proof.** Tests: a step with no scope gets its anonymous use from a fixture process tree, the cap is a value and its keep-aside is need less use; a merge gate holder (`queue_place("merge-gate")` as a context manager) gets a cap value; a step with a scope still reads `memory.stat`; an unreadable status file or a missing `RssAnon` line leaves that run unavailable and the text names it with no sum; two reservations over one tree, and a tree inside a read scope, count its use once; `queue_place.py` and `unowned_slice_memory` still get resident bytes and swap.
-8. **Out of scope.** The merge gate's 6 GiB need against its 4.6 GiB peak stays with 10e (grant from the recorded peak).
+- `process_memory(source, proc)` reads one anonymous use per step kind: a step with a scope reads its scope's `memory.stat` anon (`ScopeSource`); an in-process holder with no scope, such as the merge gate's `queue_place("merge-gate")`, sums `RssAnon` over its process tree (`ProcessSource`); otherwise `NoSource`. `MeasuredMemory.anonymous_source` holds the source, and resident bytes and swap stay separate values beside it. A gone pid or a zombie counts 0.
+- A missing or invalid `RssAnon` line, or a denied status read, makes that run's use `RunUseUnavailable`.
+- `run_memories` counts a shared process once, independent of order: the smallest process set takes it (reservation key breaks a tie); scopes count by depth, and an outer scope subtracts nested scopes.
+- `CapUnavailable(runs)` names the runs whose use is unavailable; `room_text` prints them and no use sum. An old reason-only `CapUnavailable` record reads as `runs=()` and prints `Cap unavailable; free …`.
+- `queue_place.py` samples a scope through `slice_working_set`, the one reader; `queue_view.py` rows use `hold.use`.
+- The admission service has no lock: one loop thread owns its state. The test fixture refuses an off-thread `handle_request`, `persist` or `run_pass`; tests call the server through `fixture.loop_turn()`.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — `process_memory`, `tree_memory`, `reservation_memory`, `run_memories`.
-- `scripts/build_queue/queue_evidence.py` — `room_text`.
-- `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/memory_feed.py` — the page feed (outside the repository).
-- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py` — the tests.
+- `scripts/lint/memory_admit.py` — the anonymous-use readers, shared-process attribution, the cap record decoder.
+- `scripts/build_queue/queue_evidence.py`, `queue_place.py`, `queue_view.py` — cap text, scope sampler, rows.
+- `scripts/build_queue/admission_test_support.py` — the loop-thread guard.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `memory_admit.py`, `queue_evidence.py` and `memory_feed.py`; `test` owns the two test files.
+**Binds later work:** every new admission service test calls the server through `fixture.loop_turn()` and holds no fixture turn across a client call that needs the service loop. The holder pick for a memory wait uses the counted use from `run_memories`. A `RunUseUnavailable` run keeps its full keep-aside.
 
-**Acceptance gate:** memory, queue and caller suites pass; basedpyright 0/0/0 on the changed files. Change-Review: during a merge gate, `/build:queue` shows a cap value and the gate keeps aside its need less its use.
+**Gotchas:** a feed or client process started before an install keeps the old decoder; restart it after the install.
+
+**Ruled out:** a service lock (tests use the loop thread instead).
 
 ### Phase 10x — The admission code keeps one way to do each thing  · status: todo
 
 **Depends on:** 10z and 10s. Runs before 10d, 10h, 10k and 10v, which change the same admission files. **Order after 10x (architect review, 2026-11-05):** 10d, 10h, 10k, 10v, then 10e, one at a time; 10e runs after 10v because both change the merge gate caller and its history identity.
 
-1. **Source.** The 10z simplify review, items 1-8, 10, 11, 14, 16, 19-34 and 40 (saved in the 10z phase folder as `simplify_result_1.md`). 10z fixed the items that change behavior or shown numbers. This phase deletes and merges code; behavior does not change.
-2. **Dead code.** Delete `AdmissionServer.launches`, the unused charge and peak code with `peak_hold_seconds`, `AdmissionLimits`, `decide`, `HeadPriority`, `HeadPolicy.recovery`, `MemoryRoom.now`, `countdown`, `Span.until` and the dead `BUILDLOG_BUILD_BUDGET_GIB` setters in outside test support (one owner switches all callers).
-3. **One copy.** One room helper, one run-owner key, one slot rule and expiry check, one `memory.stat` read per scope, one pressure reader name, one pid text helper, one live-run helper, one member-program helper, one epoch parse, one scope-file writer.
-4. **Walk.** `admission_walk` walks the given order once, with per-pass values computed once.
-5. **Names.** `recovery` fields become `spacing`, with a reader for old state records.
-6. **Keep (architect review, 2026-11-05).** Keep the restored test-phase path: `reservation_memory` uses `test_phase_history` (`memory_admit.py:2934`), so its need, margin, observations and tests stay; simplify item 2 is wrong there. Keep `session_send_argv` in `scripts/message/session_send.py`, the asynchronous alert, the `SEND_SCRIPT` patch point and the sender guards: importing sweep from admission makes the import cycle again.
-7. **Config absence.** `admission_client.py:135`, `:256` and `:498` use config unions with `None`, where `None` means "read config at use". Give that state a name, and keep cleanup timing apart from it, so 10d's runner path never reads a local config it cannot open.
-8. **Proof.** Both suites green with no lost assertion. The diff deletes more than it adds. Every caller suite runs before the full gate.
+#### Work Order
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `memory_admit.py`, `admission_*.py` and outside test support setters; `test` owns the suites and the caller suites.
+**Goal:** The admission code keeps one way to do each thing. The code deletes and merges; admission decisions and shown numbers do not change.
+
+**Spec:**
+1. **Source.** The 10z simplify review, `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/10z/simplify_result_1.md`, items 1-8, 10, 11, 14, 19-34 and 40. Its line numbers are from before 10z round 2 and 10s: find each symbol by name. 10z fixed items 9, 12, 13, 15, 17, 18, 35-39 and 41. 10s did item 16. Item 27(b) is ruled out: keep the member pid lines.
+2. **Dead code.** Before each deletion, prove with `git grep` that no production code reads the symbol. Delete:
+   - `AdmissionServer.launches` and its uses (item 1);
+   - `charge_basis`, `build_charge`, `queue_evidence.charge_text` and `free_text`, and `ExplainedRunningStep.basis` with a snapshot reader that drops the old field (item 2, narrowed below);
+   - `AdmissionLimits`, `resolve_admission_limits`, `ReadHostAdmissionLimits`, `READ_HOST_ADMISSION_LIMITS` and the type switch in `memory_room`; pass `AdmissionPolicy` alone and switch every caller, `scripts/buildlog/memory.py` and `scripts/mac_test/loopback_proof.py` included (item 4);
+   - `decide`; move its tests to `admission_pass` with built `QueueInputs` (item 5);
+   - `HeadPriority`, `NoHeadPriority`, `HeadPolicy.head` and `HeadPolicy.recovery` (item 7);
+   - `MemoryRoom.now` and the `now` parameter of `memory_room`, with a snapshot reader drop (item 22);
+   - `queue_view.countdown` and `Span.until` in `queue_lines.py` (item 34);
+   - every `BUILDLOG_BUILD_BUDGET_GIB` setter, in this unit's files and in `scripts/direct/verify_*_test_support.py`, `scripts/production/merge_gate_test_support.py` and `scripts/mac_test/test_linux_runner.py` (item 33; one owner switches all callers).
+3. **Keep.** Keep `PeakHold`, both `peak_hold_seconds` keys (builds restored `peak_hold_seconds.merge-gate=180` in 8ff1fb0da), `release_build` and the peak reads `reservation_memory` uses for the hold. Keep the test-phase path: `reservation_memory` uses `test_phase_history` (`memory_admit.py:2985`), so its need, margin, observations and tests stay. Keep `session_send_argv` in `scripts/message/session_send.py`, the asynchronous alert, the `SEND_SCRIPT` patch point and the sender guards: importing sweep from admission makes the import cycle again. Keep the 10s readers: `slice_working_set`, `scope_members`, `kib_fields`, `sum_anonymous_use`.
+4. **One copy.** One `inputs_room` helper (item 6). One `run_owner` key and one `reservation_run` lookup; `RunKeepAside` holds a typed run, with a snapshot reader conversion (item 10). An `owner` field on `ExplainedRunningStep`, filled once (item 11). One `ended_step_slot` and one `slot_in_force` (item 14). `ContinuationSlot(slot, owner)` (item 21). One pressure reader name, `Pressure` (item 23). One `step_pid_text` (item 24). One `_live_run` and one `_run_alive` (item 25). One `member_programs` helper (item 26). `scope_activity.py` builds members once (item 27a). `reason_phrase` for the client's two copied branches and for the card's `BehindHead` (items 28, 30). A public `_epoch` (item 29). One `write_scope` fixture helper; `test_admission_service.py` uses `AdmissionFixture` helpers in place of its local `pressure()` and `release()` (item 32).
+5. **Walk.** `admission_walk` walks the given order once, with per-pass values computed once (item 8). `queue_fixture.py` builds `QueueInputs` that make `admission_pass` give each wanted reason, with no hand-set head decision (item 31).
+6. **Service work per pass.** Find each waiter's build run once, or skip the ancestor walk when the row has `build_run` (item 19). Read the step lifetime only in the `OwnerExited | NotEnding` branch (item 20).
+7. **Names.** `recovery` fields become `spacing` on `QueueInputs`, `QueueExplanation`, `ProposedAdmission`, `ServiceState` and `AdmissionServer`, with a reader for old state records (item 40).
+8. **Config absence.** `admission_client.py` uses config unions with `None` where `None` means "read config at use" (today near `:135`, `:256` and `:498`). Give that state a name, and keep cleanup timing apart from it, so 10d's runner path never reads a local config it cannot open.
+9. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:407` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
+10. **Proof.** Every suite green with no lost assertion; a moved test keeps its assertions. The diff deletes more than it adds. Every caller suite runs before the full gate.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — dead code, room helper, run owner, slots, walk, names.
+- `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_client.py`, `scripts/build_queue/admission_protocol.py` — launches, slots, live-run helpers, epoch, spacing names, config absence.
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_lines.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/scope_activity.py` — text helpers.
+- `scripts/buildlog/memory.py`, `scripts/mac_test/loopback_proof.py` — `memory_room` callers.
+- `scripts/build_queue/queue_fixture.py`, `scripts/build_queue/admission_test_support.py` — shared fixtures.
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_editor_scope.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_queue_view.py` — the tests.
+- `scripts/direct/verify_examples_test_support.py`, `scripts/direct/verify_hold_wait_test_support.py`, `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/verify_token_wait_test_support.py`, `scripts/production/merge_gate_test_support.py`, `scripts/mac_test/test_linux_runner.py`, `scripts/hooks/test_brp_launch_gate.py`, `scripts/production/test_merge_gate_suites_admission.py` — outside setters and pressure-name callers.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns `memory_admit.py`, `admission_service.py`, `admission_client.py`, `admission_protocol.py`, `queue_evidence.py`, `queue_view.py`, `queue_lines.py`, `queue_card.py`, `scope_activity.py`, `scripts/buildlog/memory.py` and `scripts/mac_test/loopback_proof.py`; `test` owns the shared fixtures `admission_test_support.py` and `queue_fixture.py`, every test file, and the outside test support setters.
+
+**Acceptance gate:** memory, queue, buildlog, hooks, direct `test_verify_*` and merge-gate admission suites pass; basedpyright 0/0/0 on each slot's files; the diff deletes more lines than it adds. Change-Review: none — the queue view, card and waits show the same text and numbers as before.
 
 ### Phase 10h — A memory wait names what holds it  · status: todo
 
@@ -222,6 +242,8 @@ only I can bump
 5. **Causes that name no holder.** Pressure, an unreadable reading, start spacing and estimate refresh name `{"kind":"none"}`, never an unrelated running run.
 6. **Recorded holder.** The pass picks a tagged holder and records it. `AdmissionWaitSnapshot` holds only running steps today, so the holder is a new tagged field; an older snapshot without it reads as an explicit absence default.
 7. **Proof.** Client and service tests for each kind, for grouped reservations and held slots, for each no-holder cause and for no repeat on an unchanged holder. verify-unit builds the reader in verify.sh.
+8. **Holder from the counted use (architect review of 10s, 2026-11-05).** Pick the holder from the recorded `MemoryRoom.runs`, which carry the use `run_memories` attributes (`memory_admit.py:3726`: a shared process counts once), never from raw reservation readings. A run whose `RunKeepAside.use` is unavailable is charged its full keep-aside, the same rule the room uses; never count it as zero use. That state is not an unreadable host or pressure reading, which names `{"kind":"none"}`. Tests: overlapping process trees in both reservation orders give the same holder; a run with unavailable use and the largest full keep-aside is the holder.
+9. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:407` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `admission_client.py`, `admission_service.py`, the pass record in `memory_admit.py`; `test` owns their tests.
 
@@ -234,10 +256,12 @@ only I can bump
 3. **The profile.** Each group 1 run records its highest use in each 5% of each phase, under the key history already uses for the step's need, with the same retention. Failed runs and the existing margins keep their current treatment.
 4. **The keep-aside.** While a run runs, keep aside max(0, the highest recorded use from its phase and percent now to the end of its last phase − its use now). With no counter, or no matching profile, the run keeps its full 10z keep-aside.
 5. **Shown.** Hovering a running run shows its phase, its percent done, what it keeps aside and why.
-6. **Test phase contract (architect reviews, 2026-11-05).** A nextest test phase keeps 10z's rule: need = max(test peak, N) × `test_phase_margin`. Freeze the baseline N and the margin when the test phase starts. Do not freeze the test peak: `test_phase_charge` (`memory_admit.py:3666`) reads the current test peak at each pass, and that stays. Progress data may lower the remaining need only from measured anonymous use, never from an estimate. A phase reset, a missing counter or an unmatched profile falls back to the frozen N and margin.
+6. **Test phase contract (architect reviews, 2026-11-05).** A nextest test phase keeps 10z's rule: need = max(test peak, N) × `test_phase_margin`. Freeze the baseline N and the margin when the test phase starts. Do not freeze the test peak: `test_phase_charge` (`memory_admit.py:3713`) reads the current test peak at each pass, and that stays. Progress data may lower the remaining need only from measured anonymous use, never from an estimate. A phase reset, a missing counter or an unmatched profile falls back to the frozen N and margin.
 7. **Proof.** Unit tests for the profile, each counter parser, each transition in item 6 and the fallback. One test grows the observed test peak past N after the test phase starts; the need follows the peak with the frozen margin. Measured runs after landing show lower keep-aside late in a build and no OOM kill.
+8. **Measured use (architect review of 10s, 2026-11-05).** Profiles and the use-now subtraction read the anonymous use that `run_memories` attributes, never resident bytes or swap. A run with `RunUseUnavailable` keeps its full keep-aside: it writes no profile sample and does not lower the remaining need. Name the no-counter and no-profile states as types, not `None`, and test them beside the phase-reset and growing-peak cases.
+9. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:407` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns the counter parsers, the profile writer and `memory_admit.py`; `test` owns the parser fixtures, the transition tests and the caller suites.
+**Workers:** `1 writer + 1 tester` — `impl` owns the counter parsers, the profile writer, `memory_admit.py` and the caller files that set the cargo progress variables (`scripts/build_hold/cargo` and each nextest or clippy launch path the design finds; name outside owners in the notice); `test` owns the parser fixtures, the transition tests and the caller suites, with production caller fixtures that use `loop_turn()`.
 
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 
@@ -251,8 +275,9 @@ only I can bump
 6. **Wait states.** The page shows the three wait states the service records: unreadable pressure (with its path), start spacing, and head protection. 10z keeps the pressure text and `ReadingAlertTests`; 10h owns holder names.
 7. **Proof.** The feed's tests pass, with feed and page tests for each of the three wait states. A pixel check of the page shows the cap, the room, the leftover ages and report-unit's sections. Each item returns as its own Change-Review row.
 
-8. **Partial readings (architect review of 10q, 2026-11-05).** The feed reads each part of the page on its own. When one part is unavailable (the cap, pressure, a run's use), the page keeps the other parts and names the missing one. Use named availability states, not a bare `None` (today `memory_feed.py:109` stores missing pressure as `None`). Acceptance tests: with the cap alone unavailable, the page keeps its rows, the room and the reason text.
+8. **Partial readings (architect review of 10q, 2026-11-05).** The feed reads each part of the page on its own. When one part is unavailable (the cap, pressure, a run's use), the page keeps the other parts and names the missing one. Use named availability states, not a bare `None` (today `memory_feed.py:109` stores missing pressure as `None`, and `MemoryPage.cap` uses `None`). 10s already keeps the rows with no cap line (`memory_feed.py:295`, `memory_live.html:354`); this item replaces the `None` fields. Acceptance tests: with the cap alone unavailable, the page keeps its rows, the room and the reason text, for both `CapUnavailable(runs=())` (an old record) and named unavailable runs.
 9. **Sources.** The prototype is in `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/design/memory-view/` (`memory_live.html`, `memory_feed.py`). It moves to `scripts/build_page/` (page, feed and tests). The feed makes one call to report Phase 15's `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` (report e913e5fa2; types in `charts.py`; 0.42-0.48 s for 7 days on the live index). `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`; `start` and `end` bound the recent window in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`; `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`; `CostAction(action, owner)`. The feed checks that one result: on `IndexUnavailable(reason)` the page shows the reason in place of both sections, and `NoDataYet` shows an empty top list with its window. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable`: the feed passes `days` of at least `TOP_COST_RECENT_DAYS` and shows a config error as the page reason. 10m starts only after report Phase 15 is on builds (it lands with report 24-25, after a user answer); builds says when. The item 7 pixel check uses their data.
+10. **Feed restart at install (architect review of 10s, 2026-11-05).** A running feed keeps the decoder it loaded, so a schema change breaks it until it restarts. The page command restarts the feed when the installed admission code changes. Test: a feed that started before a schema update reads the new record after the restart.
 
 **Workers:** `impl` owns `scripts/build_page/` (the page and the feed); `test` owns `scripts/build_page/test_*.py`. report-unit owns `charts.page_data` in `scripts/buildlog` and its tests (report Phase 15).
 
@@ -278,7 +303,9 @@ only I can bump
 6. **Nested calls.** Some callers are wrappers around programs that already ask the queue. A nested call reuses the reservation of the call around it: one run gets one charge and never waits on its own request.
 7. **Proof.** Tests: with another admitted run or a held slot present, a run with no room waits in line and shows on the queue (on an empty host an oversized run starts alone, so that case proves nothing); a small run with room starts at once; a nested call gets no second charge and does not block itself; no caller starts a `builds.slice` scope outside the entry point. Live check: the memory page shows no "worker background runs" row that skipped the line.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns the entry point and `memory_admit.py`; outside callers by owner: sdlc devtools-unit (`merge_gate.py`), verify-unit (`verify.sh` paths), aws-unit (target paths); `test` owns the tests.
+8. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:407` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns the entry point, `memory_admit.py`, `scripts/agents/mesh_runs.py` and the shared `scripts/build_queue/queue_place.py` entry path; outside callers by owner: sdlc devtools-unit (`merge_gate.py`), verify-unit (`verify.sh` paths), aws-unit (target paths); `test` owns the tests.
 
 ### Phase 1 — /build:queue answers in under a second, one line per step, and says why each step waits  · status: done
 
@@ -766,6 +793,8 @@ This rule holds under both answers to the held last step; the answer changes onl
 
 **Current references (architect review of 10q).** `CleanupTiming` exists (`admission_protocol.py:177`), and `admission_client.py:502` accepts it for release with no config read. Authorization targets today: `_run_place()` (`admission_service.py:847`), replay lookup (`admission_service.py:1311`) and peer credentials (`admission_service.py:1519`, where the UID is read and then discarded). These replace the older line numbers in the constraints above. Keep the tests that deny every local config and history read through the whole runner acquisition.
 
+**Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:407` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
+
 **Workers:** `1 writer + 1 tester` (natedev owns the NixOS activation)
 - `impl` — the CI cargo front, the service authorization and estimate path, the client package entry; hub: `scripts/build_queue/admission_service.py`
 - `test` — the runner-account fixtures, the authorization denial tests, the estimate-without-home test and the two-job ordering test
@@ -779,9 +808,9 @@ This rule holds under both answers to the held last step; the answer changes onl
 1. F014: `_read_need_record` in `scripts/lint/memory_admit.py` keeps three identical rejection returns. Make one.
 2. F044: move the `struct` import in `admission_service.py` `_record_caller_version` to the module imports.
 
-**Existing path (architect review, 2026-11-05).** `HistoryPeakSizing`, `program_peak_estimate` and the program refresh path exist; `merge_gate.py:343` still picks `FixedCapSizing`. The change is the caller switch and its evidence. Agree history handling with 10v's `full-tests` split. 10e runs after 10v (see 10x's order line).
+**Existing path (architect review, 2026-11-05).** `HistoryPeakSizing`, `program_peak_estimate` and the program refresh path exist; `merge_gate.py:342` still picks `FixedCapSizing`. The change is the caller switch and its evidence. Agree history handling with 10v's `full-tests` split. 10e runs after 10v (see 10x's order line).
 
-**Anonymous peak evidence (architect review of 10q, 2026-11-05).** `merge_gate.py:485` measures resident memory plus swap, and `merge_gate.py:1028` sends that peak to the reservation sampler. `program_peak_estimate` (`memory_admit.py:1736`) reads those records as `anon_peak_bytes`. Before the caller switch:
+**Anonymous peak evidence (architect review of 10q, 2026-11-05).** `merge_gate.py:484` measures resident memory plus swap, and `merge_gate.py:1036` sends that peak to the reservation sampler. `program_peak_estimate` (`memory_admit.py:1741`) reads those records as `anon_peak_bytes`. Before the caller switch:
 1. Define valid anonymous peak evidence for a merge gate: the 10s anonymous reading of the gate's process tree.
 2. Mark records written before the change as legacy. A legacy record does not size a grant. With no valid record, the gate keeps today's fixed grant.
 3. Keep the gate's own internal memory limit apart from its grant.
