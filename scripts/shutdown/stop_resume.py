@@ -67,10 +67,17 @@ STAY_SECONDS = 10.0
 
 def _tab_of(session: str) -> herdr.TabSession | SessionNotFound:
     """Find the pane through the current conversation or its fixed row id."""
+    from scripts.production import staff
+
     client = herdr.Herdr(herdr.shared_session())
     entries = pane_record.read(client.session)
-    row = LaunchNames.read().tab_record.by_current_session(session)
-    references = {session, row.id if row is not None else session}
+    references = {session}
+    try:
+        row = staff.initial_snapshot().by_current_session(session)
+        if row is not None:
+            references.add(row.id)
+    except (OSError, ValueError) as error:
+        print(f"{session}: staff anomaly: {error}", file=sys.stderr)
     tabs: list[herdr.TabSession] = []
     for pane in client.panes():
         identity = pane["session_id"]
