@@ -38,6 +38,7 @@
 #
 # Use config/lint.conf to select lint stages. Taplo always checks the workspace.
 # Check, test, and checkpoint rustdoc always run. Clippy judges before repairs.
+# Only status 101 without a kill or a hold permits Clippy repairs.
 #
 # A worker session remembers passes. With UNIT_RUN_DIR or
 # UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
@@ -63,7 +64,7 @@
 # unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
 # usage error, the sandbox or a kill. A lint failure is not recorded when the
-# third clippy fix and format pass still changed the tree. The judged tree is
+# last allowed clippy fix and format pass still changed the tree. The judged tree is
 # the tree when the run starts, or for `lint` the tree invoke_clippy_fix and formatting leave
 # for clippy judgment. A run that ends on any other tree (for `test`,
 # any other part of it the package is built from) records nothing: an edit
@@ -107,8 +108,9 @@
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
 #                                          workspace taplo fmt --check,
-#                                          workspace clippy fix, fmt, then clippy
-#                                          judgment on all targets with all features
+#                                          workspace clippy judgment; on status 101
+#                                          without a kill, fix + fmt, then judgment
+#                                          on all targets with all features
 #                                          (warnings denied)
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
@@ -467,7 +469,7 @@ run_step() {
                 # The pipeline shell owns tokens taken during memory admission.
                 trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
                 run_once "$@"
-            ) 2>&1 | tee "$step_log"; then
+            ) 2>&1 | tee "$step_log" ${CLIPPY_LOG:+"$CLIPPY_LOG"}; then
                 exit 0
             else
                 exit "${PIPESTATUS[0]}"
@@ -3684,26 +3686,54 @@ case "$CMD" in
         fi
         if lint_config_enabled clippy; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
-            for clippy_judgment in 1 2; do
-                start_tree_watch
-                clippy_status=0
-                invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
-                finish_tree_watch
-                (( clippy_status != 0 && clippy_judgment == 1 )) || break
+            start_tree_watch
+            # Store diagnostics in the watch directory for cancellation cleanup.
+            # Keep admission and the step record in run().
+            CLIPPY_LOG="$(mktemp "${TREE_WATCH_DIR:-${TMPDIR:-/tmp}}/clippy.XXXXXX")"
+            clippy_status=0
+            # Use the existing tee to record diagnostics.
+            # Keep wait and cancellation messages visible.
+            if invoke_clippy --workspace --all-targets --all-features --keep-going; then
+                :
+            else
+                clippy_status=$?
+            fi
+            # Status 101 permits repairs for lint findings and compile errors.
+            # A kill or a lint hold prevents repairs.
+            clippy_repair=0
+            if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
+            if [[ "$HOLD_LINT" == 0 && "$clippy_status" == 101 && "${RUN_LAST_ATTEMPT_KILLED:-0}" == 0 ]] && ! grep -qE "process didn.t exit successfully:.*signal:" "$CLIPPY_LOG"; then
+                clippy_repair=1
+            fi
+            rm -f "$CLIPPY_LOG"
+            unset CLIPPY_LOG
+            finish_tree_watch
+            if (( clippy_repair )); then
+                # Read at use so a changed policy applies to this repair round.
+                clippy_fix_limit="$(_lint_config_raw clippy_fix_pass_limit)"
+                if [[ ! "$clippy_fix_limit" =~ ^[1-9][0-9]{0,3}$ ]]; then
+                    [[ -z "$clippy_fix_limit" ]] || echo "verify.sh: invalid clippy_fix_pass_limit=$clippy_fix_limit; using 3." >&2
+                    clippy_fix_limit=3
+                fi
                 clippy_tree_before="$(tree_key --tree-content)"
-                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
+                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=clippy_fix_limit; clippy_fix_pass++)); do
                     invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
                     fmt_cargo "${FMT_SCOPE[@]}"
                     clippy_tree_after="$(tree_key --tree-content)"
                     if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
                         break
                     fi
-                    if (( clippy_fix_pass == 3 )); then
+                    # An empty key cannot prove that the tree stopped changing.
+                    if (( clippy_fix_pass == clippy_fix_limit )); then
                         CLIPPY_FIX_LIMIT_REACHED=1
                     fi
                     clippy_tree_before="$clippy_tree_after"
                 done
-            done
+                start_tree_watch
+                clippy_status=0
+                invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
+                finish_tree_watch
+            fi
             (( clippy_status == 0 )) || exit "$clippy_status"
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else

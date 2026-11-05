@@ -3221,6 +3221,9 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                                  + "repeat_minutes=bad\nsend_timeout_s=inf\n")
         with mock.patch.object(conf, "_committed_files", return_value=(committed,)), conf.diagnostics(report=False):
             self.assertEqual(mac_test.read_config().idle, shipped)
+        with mock.patch.object(conf, "_committed_files", return_value=iter(())), \
+             self.assertRaises(conf.Unusable):
+            _ = mac_test.read_config()
 
     def test_claim_idle_settings_read_configured_values(self) -> None:
         path = self.root / "mac_test.conf"

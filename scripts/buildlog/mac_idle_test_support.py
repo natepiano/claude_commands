@@ -12,6 +12,18 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import write_config_fixture
+else:
+    from scripts.lint.memory_test_support import write_config_fixture
+
+
+def write_idle_config(directory: Path, overrides: str = "") -> Path:
+    """Write a complete private configuration with the shared value limits."""
+    path = directory / "mac_test.conf"
+    _ = write_config_fixture(path, overrides)
+    return path
+
 
 def write_idle_alert(directory: Path, now: float, *, written_age: float = 0) -> Path:
     """One saved blocked-Mac fixture for both queue and target view tests."""

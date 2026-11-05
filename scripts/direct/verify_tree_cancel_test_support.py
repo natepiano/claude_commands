@@ -62,7 +62,7 @@ if stage == "clippy" and os.environ.get("TEST_FAIL_FIRST_JUDGMENT") == "1":
     judgment = root / "first-judgment"
     if not judgment.exists():
         judgment.touch()
-        raise SystemExit(1)
+        raise SystemExit(101)
 if stage in os.environ.get("TEST_REWRITE_STAGES", "").split(","):
     marker = root / (stage + ".rewritten")
     if not marker.exists():
@@ -120,6 +120,10 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
     @override
     def build_fixture(self) -> None:
         super().build_fixture()
+        # This fixture's config reader enables tools but supplies no numeric
+        # policies. An absent fix limit exercises verify's default budget.
+        with (self.root / "lint-config.sh").open("a") as reader:
+            _ = reader.write('_lint_config_raw() { :; }\n')
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         metadata = write_workspace(self.workspace)
