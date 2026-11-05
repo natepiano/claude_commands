@@ -357,16 +357,15 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 ### Phase 18 — Each test step's row records the memory charge admission gave its test phase  · status: done
 **Depends on:** none (from next items; showrunner 2026-11-04: natest P10 is on builds, the index.py freeze has ended, start now)
 
-Admission now saves the charge it gave a test phase: `memory_admit.read_test_phase_charge_use` returns `TestPhaseChargeUse` (`bytes`, `selected_at`, `reservation_id`, `need`) or `NoTestPhaseChargeUse`, and finalization copies it into the admission history row as `test_phase_charge_use`. The step row still writes `test_phase_charge: null` (`record.py` `test_phase_context`), and the index has no column for it.
+#### As-built
 
-1. Find where the recorder can read the charge for its own step: the sampling context that `invoke.sh` passes to `record.py test-phase-context`, the reservation's saved file, or the admission history row by `reservation_id`. Quote the code that proves the charge exists at that moment.
-2. Copy the charge into the step row's `test_phase_charge`. Compute nothing. No charge records null.
-3. Add an index column for the charge bytes, so `buildlog query` can rank steps by it.
+- Admission selects the charge after the grant and publishes it in its history row (`admission/anon_peaks.jsonl`, `test_phase_charge_use`) at release, before the recorder runs. The grant never carries it; `test-phase-context` writes `test_phase_charge: null` and keeps the sidecar's `reservation_id`.
+- At step end and on pending-record retry, `record.completed_test_phase_charge(reservation_id)` searches the history from the end (mmap, shared flock, whole rows only), only when the sidecar's window is `ObservedTestPhase`. A match builds `ChargedTestPhaseRecord`; the row copies the evidence unchanged.
+- Bad or unreadable evidence records null and writes one `errors.log` line; the row is always published. A step whose admission published no history row (no sampled peak, or unscoped) records null.
+- The index has `steps.test_phase_charge_bytes` (`SCHEMA_VERSION` 32); older rows read null.
+- `TestPhaseChargeUse`, `NoTestPhaseChargeUse`, `CallRecord`, `NoCallRecord` and `parse_test_phase_charge_use` live in `scripts/lib/test_phase.py`; `memory_admit` re-exports the names. `record.py` loads no `memory_admit`.
+- CPU ms per call, bevy_brp: terminal 118.5 (charged with the real 11 MB history 117.0, no row 113.6), tee 112.1 (120.2, 117.0), call 56.3, step-context 50.5, test-phase-context 51.0. Drivers: `cpu_driver.py` and `cpu_driver_charged.py` in the phase 18 folder.
 
-Acceptance: a step with a charge records it for terminal and tee steps; a step without one records null. The index column holds the bytes or null. CPU per `record.py` call stays at or below the Phase 16 values (terminal 150.3 ms, tee 151.4 ms, test-phase-context 80.9 ms).
+**Files:** `scripts/buildlog/record.py`, `index.py`, `test_step_row.py`, `test_index.py`, `scripts/lib/test_phase.py`, `scripts/lint/memory_admit.py`, `test_memory_admit.py`, `docs/as-built/buildlog-memory-stalls.md`.
 
-**Constraints from prior phases:** `record.py` keeps its imports lazy (Phase 16). Do not import `memory_admit` on the step path. An edit to `memory_admit.py` or `invoke.sh` needs a notice to queue-unit.
-
-**Workers:** 1 writer (rowcpu).
-
-**Files:** `scripts/buildlog/record.py`, `scripts/buildlog/index.py`, their tests, `docs/as-built/buildlog-memory-stalls.md`; `scripts/lint/invoke.sh` and `scripts/lint/memory_admit.py` only if step 1 shows the charge must pass through them.
+**Ruled out:** reading the charge from the grant's sampling context (the charge is chosen later); a history offset in the sidecar (a search with no match costs about 1 ms).
