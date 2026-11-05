@@ -315,7 +315,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to build
 3. Show hours in the user's zone. No seconds, no UTC, no microseconds.
 4. Move the Definitions block into the as-built doc.
 5. Check the memory-wait number first. 236 h a day means about 10 steps wait at all times. queue-unit's 10l bug (on main now) made a waiting step with the AWS hook hold its grant and never start. Say how many of the 236 h came from that bug.
-6. The build history charts (C950) go on the same page. No second page.
+6. The build history charts (C950) go on the same page. No second page. Phase 22 made `buildlog charts` publish its own page and print its tailnet link. After this phase, `buildlog charts` publishes no page of its own: it prints the tailnet link of the shared build page. With no link available, it prints the reason and exits non-zero.
 
 The page is queue-unit's Build Memory page (`memory_live.html`, fed by `memory_feed.py`); queue's 10m moves it into the repo. Agreed with queue-unit 2026-11-04: report-unit gives typed data, no HTML, from `charts.page_section(days)` and `costs.top_costs(n=3)`. queue's feed calls them and its page draws them. A 7-day read stays under 1 s. Send queue-unit the signatures and types when they land.
 
@@ -323,7 +323,7 @@ Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder):
 
 Each fix returns as a new Change-Review row.
 
-Acceptance: one page request through queue's feed calls both providers for 7 days in under 1 s total. Interface tests pass `NoDataYet`, `CostUnavailable` and `MacIdleUpperBound` through to the feed unchanged. Phase 16's `test_machine_aliases_read_sync_configuration_once` stays green.
+Acceptance: one page request through queue's feed calls both providers for 7 days in under 1 s total. Interface tests pass `NoDataYet`, `CostUnavailable` and `MacIdleUpperBound` through to the feed unchanged. Phase 16's `test_machine_aliases_read_sync_configuration_once` stays green. A test proves `buildlog charts` prints the shared page's tailnet link and writes no page; a test proves a missing link prints the reason and exits non-zero.
 
 **Constraints from prior phases:** `costs.machine_name` reads `sync_config()` once and calls `record._target_hosts` (Phase 16).
 
@@ -393,54 +393,28 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 **Gotchas:** Cargo reads `CARGO_TARGET_DIR` before all build config, CLI `--config` included; `CARGO_BUILD_TARGET_DIR` is ordinary config and loses to `--config`. A CPU baseline from an earlier phase is not valid under a different load: measure A/B in one run.
 
 ### Phase 20 — memory.py reads recorded output folders through one reader  · status: done
-**Depends on:** resources' Phase 62 lands on builds (it adds `build_shape.recorded_output_roots`). Landed: fb0d3eb9b, merged into builds-report at 10f003f3a.
+**Depends on:** resources' `build_shape.recorded_output_roots` on builds.
 
-Routed from resources' Phase 62 review (F021), through the builds showrunner (2026-11-04).
+#### As-built
 
-#### Work Order
-
-**Goal:** `memory.build_output_roots` reads the recorded output pairs through `build_shape.recorded_output_roots`, so one reader of the steps output pairs remains, and the kill classification stays the same.
-
-**Spec:**
-`scripts/buildlog/memory.py` `build_output_roots(index_file, current_checkout, host) -> frozenset[Path]` (line 84) reads `SELECT DISTINCT target_directory, build_directory, worktree, cwd FROM steps WHERE host = ?` with its own SQL. Replace that SQL with one call to `build_shape.recorded_output_roots(index_file, host)` (`scripts/lint/build_shape.py:268`). Keep the signature, the `@lru_cache(maxsize=1)` and `build_output_program` as they are.
-
-Reader types (`scripts/lint/build_shape.py:202-240`): `RecordedOutputRoots.workspaces: dict[RecordedRoot, tuple[RecordedOutputPair, ...]]`; `RecordedOutputPair(target_directory, build_directory)`; `RecordedRoot = AbsoluteRecordedRoot(path) | UnknownRecordedRoot() | RelativeRecordedRoot()`; `RecordedRootsUnavailable(reason)`.
-
-Outcomes, each with a test in `scripts/buildlog/test_memory_window.py`:
-1. **Recorded pair.** Each `AbsoluteRecordedRoot` in a pair adds `path.resolve()` to the roots. Each `AbsoluteRecordedRoot` workspace key adds its path to the checkouts.
-2. **Missing pair.** An `UnknownRecordedRoot` or `RelativeRecordedRoot` side adds no root; the other side of the same pair still adds its root. A row with no worktree and no cwd still adds its pair.
-3. **`RecordedRootsUnavailable`** (no index file, or no `steps` table): the roots come from the current checkout's `cargo metadata` only, as now on an `sqlite3.Error`.
-4. **Host filter.** Rows from another host add no root and no checkout.
-5. **Process cache.** A second call in the same process reads the index once and runs `cargo metadata` once per checkout (count the calls).
-6. **`cargo metadata` fallback (unchanged).** The current checkout and each recorded checkout that holds a `Cargo.toml` get `read_cargo_output_roots`; a `CargoOutputRoots` result adds its target and build directories; a `CargoOutputUnavailable` result adds nothing; a checkout with no `Cargo.toml` is not probed.
-7. **Target folder override.** A row whose argv sets `--target-dir` adds no pair and no checkout, because the shared reader skips it. resources owns that rule. The live index on 2026-11-04 holds 0 such rows on every host (natedev 95,943 rows), so the kill classification does not change.
-
-Import the reader inside `build_output_roots` (a lazy import), the same way `sample.py` imports `read_zram`, so the `buildlog sample` tick does not load `build_shape`. `build_shape` uses package imports (`from scripts.buildlog import store`); follow the `TYPE_CHECKING` pattern in `scripts/buildlog/mac_idle.py:29-36` for the import, so basedpyright resolves it.
-
-A checkout now comes from the workspace key (`worktree`, else `cwd`), not from both columns. On natedev, 4 of 1,138 distinct `cwd` values lie outside their `worktree`; their pairs still count.
-
-Measured before the phase, first call in a fresh process on the live natedev index: 166 roots (77 from recorded pairs, the rest from `cargo metadata` on 116 live checkouts); wall 10.0 s, own CPU 338 ms, child CPU 6.7 s. The shared reader costs about 410 ms of own CPU against 84 ms for the old SQL (it reads `argv` and `target_folder` too). This one-time cost per report process is accepted for one reader.
+- `memory.build_output_roots(index_file, current_checkout, host)` reads recorded Cargo pairs through `build_shape.recorded_output_roots(index_file, host)`, the reader the floor sweep uses. One reader of the steps output pairs remains. The signature, `@lru_cache(maxsize=1)` and `build_output_program` are unchanged.
+- Each `AbsoluteRecordedRoot` side of a pair adds its resolved path; each distinct path resolves once. Each `AbsoluteRecordedRoot` workspace key adds a checkout beside the current checkout. `RecordedRootsUnavailable` leaves only the current checkout. Rows from another host and rows with a `--target-dir` override add nothing (the reader's rule).
+- The `cargo metadata` fallback is unchanged: each checkout with a `Cargo.toml` gets `read_cargo_output_roots`; only a `CargoOutputRoots` result adds roots.
+- The import of `build_shape` is lazy, inside the function, with a `TYPE_CHECKING` split (`from ..lint import build_shape` for basedpyright, `from scripts.lint import build_shape` at run time), so `buildlog snapshot` does not load it.
+- On the live natedev index the root set is 157 (was 166): 6 lost roots lie under kept roots and 3 come from old `unknown`-pair vendor/bevy_render rows whose folders do not exist, so the kill classification is the same.
+- First-call own CPU is about 420-450 ms (was about 120 ms), with `cargo metadata` stubbed; accepted for one reader. Wall time stays about 10 s from 116 sequential `cargo metadata` probes.
 
 **Files:**
-- `scripts/buildlog/memory.py` — `build_output_roots` calls `build_shape.recorded_output_roots`.
-- `scripts/buildlog/test_memory_window.py` — one test per outcome above.
+- `scripts/buildlog/memory.py` — `build_output_roots` calls the shared reader.
+- `scripts/buildlog/test_memory_window.py` — `BuildOutputRootsTests`: six outcome tests with a `build_roots(outputs, index_file)` helper; fixtures use `create_step_index` and `record_root_attempt` from `scripts/lint/test_build_shape.py`.
 
-**Workers:** 1 writer (rowcpu): two files, one function; nothing splits.
+**Binds later work:** the parallel probe change keeps the reader call, the lazy import and the `build_roots` test helper. Resources' later reader change (dedupe pairs, row facts, move into buildlog) edits `memory.py` after this unit's merges.
 
-**State:** none.
+**Gotchas:**
+- The shared reader returns duplicate pairs because its `SELECT DISTINCT` includes argv: 15,838 pairs, 1,120 distinct on natedev.
+- The tree's own index path can name a schema file that does not exist live; a timing run must pass the live index path.
 
-**Constraints from prior phases:**
-- Phase 19 put the measured pair on new rows with a target folder override: such a row's pair equals its `target_dir`. The shared reader still skips these rows by argv. resources owns that rule; the change was sent to resources and builds on 2026-11-04.
-- Phase 19: measure CPU only as an interleaved A/B against the prior commit, in one run. The machine load is high and changes.
-- Phase 21 (one row per memory tick) is done. It did not change `build_output_roots`.
-- Do not change `scripts/lint/build_shape.py`; resources owns it.
-
-**Acceptance gate:**
-- Each outcome test fails on the pre-phase tree or pins unchanged behavior that the change reaches (outcomes 3, 4, 6).
-- `test_memory_records.test_build_program_matches_resolved_roots_not_target_name` stays green.
-- On the live natedev index, with real `cargo metadata`, every root the base tree returns and the changed tree does not is covered by a kept root or names a folder that does not exist. Measured 2026-11-04: base 166, changed 157; 6 of the 9 lost roots lie under a kept target root, and 3 come from old `vendor/bevy_render` rows with `unknown` pairs whose folders do not exist. New rows record the pair of the step's own `cwd`, so no kill can change class.
-- Interleaved CPU A/B of `build_output_roots` own CPU (with `read_cargo_output_roots` patched to `CargoOutputUnavailable`), 10 runs per tree; report both means. No percent gate: the cost above is accepted.
-- basedpyright on both files: 0 errors, 0 warnings, 0 notes.
+**Ruled out:** an equal-root-set gate — a lost root is acceptable when a kept root covers it or its folder does not exist.
 
 ### Phase 21 — Each memory tick writes one row  · status: done
 
@@ -501,7 +475,7 @@ The builds showrunner asked for this on 2026-11-04 (Phase 20 simplify item 9).
 **Spec:**
 `scripts/buildlog/memory.py` `build_output_roots` runs `read_cargo_output_roots(checkout)` once for each checkout with a `Cargo.toml`, one at a time. On the live natedev index that is 116 probes: wall 10.0 s, child CPU 6.7 s.
 1. Run those probes through `concurrent.futures.ThreadPoolExecutor(max_workers=<workers>)` with `executor.map`. Each probe is a `cargo metadata` subprocess, so threads give real parallel work.
-2. Read the worker count at use from `config/buildlog.conf` key `METADATA_PROBE_WORKERS` (default 8, range 1..), with `conf.read("buildlog").number(...)`, the same way `index.py:1070` reads `INDEX_UNUSED_DAYS`. Add the key with a `# Basis:` line and a `# range:` line.
+2. Read the worker count at use from `config/buildlog.conf` key `METADATA_PROBE_WORKERS` (default 8, whole number 1..), with `conf.read("buildlog").whole(...)`, which returns an `int` for `ThreadPoolExecutor(max_workers=...)`. `.number(...)` returns a float and is wrong here. Add the key with a `# Basis:` line and a `# whole: 1..` line, the same form as `config/build_folders.conf`.
 3. Keep the result the same: a `CargoOutputRoots` result adds its target and build directories; a `CargoOutputUnavailable` result adds nothing; a checkout with no `Cargo.toml` is not probed; the set does not depend on probe order. An exception that a probe raises still reaches the caller, as now.
 4. Keep the signature, the `@lru_cache(maxsize=1)`, the lazy `build_shape` import and the Phase 20 recorded-root code.
 
@@ -517,10 +491,12 @@ The builds showrunner asked for this on 2026-11-04 (Phase 20 simplify item 9).
 **Constraints from prior phases:**
 - Phase 20: `build_output_roots` reads recorded pairs through `build_shape.recorded_output_roots`; checkouts come from absolute workspace keys plus the current checkout. Tests use a `build_roots` helper in `BuildOutputRootsTests`.
 - Phase 19: measure CPU only as an interleaved A/B against the prior commit, in one run.
+- Order with resources: resources plans one phase after its Phase 63 that changes the reader boundary in `memory.py` (Phase 20 findings F008, F010, F011, F012). Phase 23 lands first; resources merges it before that change.
 
 **Acceptance gate:**
 - A test proves two probes run at the same time (for example, a probe that waits on a `threading.Barrier(2)` with a short timeout fails when the probes run one at a time).
 - A test proves the worker count comes from `METADATA_PROBE_WORKERS` (a value of 1 runs the probes one at a time).
+- A test proves a fractional `METADATA_PROBE_WORKERS` (for example `1.5`) is refused by the config read.
 - The Phase 20 outcome tests and `test_kill_classification_reads_index_and_metadata_once_for_the_process` stay green unchanged.
 - Interleaved A/B on the live natedev index with real `cargo metadata`, 5 fresh processes per tree, base = the Phase 20 checkpoint: wall time, own CPU and child CPU means, and the same root set.
 - basedpyright on the changed Python files: 0 errors, 0 warnings, 0 notes.
