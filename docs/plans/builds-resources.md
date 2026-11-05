@@ -192,7 +192,9 @@ Own what a build may use and when it starts: memory admission and the memory que
 ### Phase 8 — Shared build state is written only by the installed copy  · status: todo
 **Depends on:** Phases 2, 10, 12 and 19. Merge `origin/builds` first. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8.
 
-**Held (2026-11-05):** the send.py freeze covers `build_hold.py`, so this phase starts after messaging's main hash. Its guards and refusals also need the user's yes (user rule 2026-11-05: a new check goes to the user first).
+**Held (2026-11-05):** the send.py freeze covers `build_hold.py`, so this phase starts after messaging's main hash.
+
+**User decision (2026-11-05, via the builds showrunner):** "A. Build Phase 8 with the refusals." The question was whether to add the installed-copy write guards; the user's 2026-11-05 rule sends a new check to the user first.
 
 **Approved:** showrunner 2026-10-29. The edit to `docs/plans/builds-production.md` is approved.
 
@@ -1464,7 +1466,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 - `FloorOutcome.assessment` holds a `tmp_sweep.SweepAssessment`. `notify_floor_problem` accepts `FloorOutcome | tmp_sweep.SweepAssessment`.
 - `send_floor_alert` returns `FloorAlertDelivery(natedev, phone)`, with one `FloorChannelOutcome` per channel (not attempted, delivered, queued or failed). `send_holder_message` is the natedev leg; it returns `FloorChannelOutcome` and logs "message to natedev ...".
 - The lock alert has one pure transition, `next_lock_alert(previous, holder, process, now)`, also used at lock acquisition. The record is written only when the state changes. An unreadable hold is `ObservedUnreadableFloorHold` or `ReportedUnreadableFloorHold`; an old `alert_delivered` true decodes as reported, false as observed. A pass that sees no holder keeps `DeliveredFloorLockAlert`, so the same holder does not alert again.
-- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, `page_paths(measurement)`, and one `roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
+- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, and one `roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
 - `config/lint.conf` sets `sweep_scan_workers.natedev=1` and `sweep_discovery_workers=4` (the directory-search pool). The code no longer forces one scan worker.
 - A real floor pass walks each idle target once, and walks again only the targets that had deletions to compute `after_caches`.
 
@@ -1658,7 +1660,7 @@ One function finds the Cargo target folder that holds a path, and both parent wa
 
 **Ruled out:** moving the memory cache-tag and symlink tests to `test_sweep.py` (they pin memory's classification).
 
-### Phase 71 — The phone low-disk push carries only the free space, the alert line and one folder  · status: todo
+### Phase 71 — The phone low-disk push carries only the free space, the alert line and one folder  · status: done
 **Depends on:** none. Phase 63 built the push. Phase 70's held hash carries it; this phase lands before the user reviews the text.
 
 **Approved:** builds showrunner 2026-11-05 09:20 EST, relaying the user: "the body will be too long."
@@ -1680,10 +1682,10 @@ One function finds the Cargo target folder that holds a path, and both parent wa
    - available, protected, scratch or other: `Review <folder> first (recommended): deleting it frees <size>, which covers the <shortfall> shortfall.`
    - insufficient: `The largest folder is <folder> at <size>. Deleting it frees only part of the <shortfall> shortfall; the natedev session lists every folder.`
    - unavailable: `Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low.` The action line names both choices, so the body says what each does.
-4. On a crossing, the natedev session message has, in order: the alert line, the cleanup line, each folder line with its effect, the recommendation sentence, the closing line (`Delete nothing…` or `Keep it…`), and `natedev checks your choice before it deletes anything.` These lines replace `page_paths` and `protected_folder_lines` in that message. The unavailable state keeps its measure-first lines.
-5. One function writes the recommendation sentence. The push and the session message both use it. `folder_choices` runs once per crossing, and both channels use its result.
+4. On a crossing, the natedev session message has, in order: the alert line, the cleanup line, each folder line with its effect, the folder fact, the closing line (`Delete nothing: builds can fail when the disk is full.`), and `natedev checks your choice before it deletes anything.` These lines replace `page_paths` and `protected_folder_lines` in that message. The unavailable state keeps its measure-first lines.
+5. One function writes the folder fact: the folder, its size and the shortfall, or `Folder sizes are unknown.` The push adds its choice words to it; the session message uses it with its own lines. `folder_choices` runs once per crossing, both channels use its result, and the session message lists every measured folder (review F001-F003, 2026-11-05).
 6. `fit_disk_floor_push` renders the push. When the text is at or over the limit, it renders the unavailable form. When that is also over the limit, it sends no push. The folder-trim loop goes.
-7. Delete `page_paths` and its test. `protected_folder_lines` keeps its other caller (the out-of-reach report).
+7. Delete `page_paths` and its test. `protected_folder_lines` keeps its other caller (the out-of-reach report). `sweep_page_paths` loses its last reader: delete it from `config/lint.conf` and `config/README.md`.
 8. Update the four catalog examples (available, unavailable, insufficient, protected) to the new fields.
 9. Add no guard, refusal or check this Work Order does not ask for.
 
@@ -1695,6 +1697,8 @@ One function finds the Cargo target folder that holds a path, and both parent wa
 - `scripts/lint/sweep.py` — the recommendation sentence, the session message lines, `fit_disk_floor_push`, `page_paths` removed.
 - `scripts/notify/push_catalog.py` — the `sweep.disk_floor` template and its four examples.
 - `scripts/lint/test_sweep.py` — the push text, the session message, the fit fallback and the removed `page_paths` test.
+- `config/lint.conf`, `config/README.md` — `sweep_page_paths` removed.
+- `docs/as-built/build-memory-admission.md` — the out-of-reach paragraph no longer names `page_paths` or a phone page.
 
 **Workers:** `1 writer + 1 tester`
 

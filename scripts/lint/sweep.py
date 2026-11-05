@@ -3195,14 +3195,6 @@ def leaf_directories(measurement: AvailableDiskMeasurement) -> list[OutsideCache
             if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
 
 
-def page_paths(measurement: DiskMeasurement) -> list[str]:
-    """List measured folders without duplicate parent folders."""
-    if not isinstance(measurement, AvailableDiskMeasurement):
-        return []
-    return [f"{item.path}: holds {gib(item.bytes)}."
-            for item in sorted(leaf_directories(measurement), key=lambda item: item.bytes, reverse=True)]
-
-
 def measure_protected_folders(roots: frozenset[str], excluded: frozenset[str]) -> tuple[tuple[str, int], ...]:
     """Measure protected folders once, excluding nested targets and shared inodes."""
     seen: set[InodeKey] = set()
@@ -3232,14 +3224,6 @@ def folder_choice(path: str, size: int) -> FolderChoice:
     return FolderChoice(label, size, FolderChoiceKind.OTHER)
 
 
-def classified_folder_choices(choices: tuple[FolderChoice, ...], shortfall: int) -> FolderChoices:
-    """Use the largest measured choice to select the text state."""
-    if not choices:
-        return UNAVAILABLE_FOLDER_CHOICES
-    return (AvailableFolderChoices(choices) if choices[0].bytes >= shortfall
-            else InsufficientFolderChoices(choices))
-
-
 def folder_choices(measurement: DiskMeasurement, protected: Sequence[tuple[str, int]], shortfall: int, *,
                    now: float, lint_settings: conf.ConfigRead) -> FolderChoices:
     """Use current measurements and keep protected folders distinct from holders."""
@@ -3252,7 +3236,10 @@ def folder_choices(measurement: DiskMeasurement, protected: Sequence[tuple[str, 
             choices.extend(folder_choice(item.path, item.bytes) for item in leaf_directories(measurement)
                            if item.bytes > 0 and item.path not in protected_paths)
     choices.sort(key=lambda item: (-item.bytes, item.label))
-    return classified_folder_choices(tuple(choices[:lint_settings.whole("sweep_page_paths")]), shortfall)
+    if not choices:
+        return UNAVAILABLE_FOLDER_CHOICES
+    return (AvailableFolderChoices(tuple(choices)) if choices[0].bytes >= shortfall
+            else InsufficientFolderChoices(tuple(choices)))
 
 
 @cache
@@ -3261,55 +3248,64 @@ def prepare_push_texts() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 
 
-def disk_floor_push(free: int, floor: int, removed: int, choices: FolderChoices) -> RenderedPush:
-    """Render folder choices with the action for their measurement state."""
+def folder_recommendation(choices: FolderChoices, shortfall: int) -> str:
+    """Describe the largest measured folder for both alert channels."""
+    if isinstance(choices, UnavailableFolderChoices):
+        return "Folder sizes are unknown."
+    largest = choices.choices[0]
+    if isinstance(choices, InsufficientFolderChoices):
+        return (f"The largest folder is {largest.label} at {gib(largest.bytes)}. "
+                f"Deleting it frees only part of the {gib(shortfall)} shortfall.")
+    if largest.kind is FolderChoiceKind.TRASH:
+        action = f"Delete {largest.label}"
+        effect = "this frees"
+    else:
+        action = f"Review {largest.label} first"
+        effect = "deleting it frees"
+    return f"{action} (recommended): {effect} {gib(largest.bytes)}, which covers the {gib(shortfall)} shortfall."
+
+
+def folder_choice_lines(choices: FolderChoices, shortfall: int, *, path_limit: int) -> list[str]:
+    """Render the session choices with shortened folder labels and their effects."""
+    if isinstance(choices, UnavailableFolderChoices):
+        lines = [folder_recommendation(choices, shortfall), "",
+                 "Measure first (recommended): natedev lists folder sizes, then you choose what to delete.", "",
+                 "Delete nothing: the disk stays low and builds can fail."]
+    else:
+        choices = replace(choices, choices=tuple(replace(item, label=alert_path(item.label, path_limit))
+                                                 for item in choices.choices))
+        effects = {
+            FolderChoiceKind.TRASH: "Deleting it removes discarded files.",
+            FolderChoiceKind.SCRATCH: "Deleting it removes temporary work; check for work you still need.",
+            FolderChoiceKind.OTHER: "Deleting it removes its contents; their use is unknown.",
+            FolderChoiceKind.PROTECTED: ("It is protected: no build record shows what made it. "
+                                         "Cleanup never deletes it. Deleting it removes its files."),
+        }
+        lines = [f"{item.label}: holds {gib(item.bytes)}. {effects[item.kind]}" for item in choices.choices]
+        lines.append(folder_recommendation(choices, shortfall))
+        lines.append("Delete nothing: builds can fail when the disk is full.")
+    lines.append("natedev checks your choice before it deletes anything.")
+    return lines
+
+
+def disk_floor_push(free: int, floor: int, choices: FolderChoices) -> RenderedPush:
+    """Render free space, the alert line, and one folder recommendation."""
     if TYPE_CHECKING:
         from ..notify.push_texts import render
     else:
         prepare_push_texts()
         from push_texts import render
-    lines: list[str] = []
-    folder_action = "In the natedev Claude session, say which folders to delete."
-    shortfall = gib(max(0, floor - free))
+    folder_action = ("In the natedev Claude session, reply measure or delete nothing."
+                     if isinstance(choices, UnavailableFolderChoices)
+                     else "In the natedev Claude session, say which folders to delete.")
+    recommendation = folder_recommendation(choices, max(0, floor - free))
     if isinstance(choices, UnavailableFolderChoices):
-        folder_action = "In the natedev Claude session, reply measure or delete nothing."
-        lines = ["Folder sizes are unknown or out of date, so no folder is recommended yet.", "",
-                 "Measure first (recommended): natedev lists folder sizes, then you choose what to delete.", "",
-                 "Delete nothing: the disk stays low and builds can fail."]
-    else:
-        contents = {FolderChoiceKind.TRASH: "discarded files", FolderChoiceKind.SCRATCH: "scratch files"}
-        for item in choices.choices:
-            if item.kind is FolderChoiceKind.PROTECTED:
-                lines.append(f"{item.label} holds {gib(item.bytes)}. It is protected: no build record shows what made it. Cleanup never deletes it.")
-            elif isinstance(choices, InsufficientFolderChoices) and item.kind in contents:
-                lines.append(f"{item.label}: holds {gib(item.bytes)} of {contents[item.kind]}.")
-            else:
-                effect = {
-                    FolderChoiceKind.TRASH: "Deleting it removes discarded files.",
-                    FolderChoiceKind.SCRATCH: "Deleting it removes temporary work; check for work you still need.",
-                    FolderChoiceKind.OTHER: "Deleting it removes its contents; their use is unknown.",
-                }[item.kind]
-                lines.append(f"{item.label}: holds {gib(item.bytes)}. {effect}")
-        closing = "Delete nothing: builds can fail when the disk is full."
-        if isinstance(choices, AvailableFolderChoices):
-            recommendation = choices.choices[0]
-            if recommendation.kind is FolderChoiceKind.PROTECTED:
-                deletion = "Delete it" if len(choices.choices) == 1 else f"Delete {recommendation.label}"
-                lines.append(f"{deletion} (recommended): frees {gib(recommendation.bytes)} against the {shortfall} shortfall.")
-                closing = "Keep it: free space stays low, and builds can fail."
-            elif recommendation.kind in (FolderChoiceKind.SCRATCH, FolderChoiceKind.OTHER):
-                lines.append(f"Recommended: review {recommendation.label} first; its size covers the {shortfall} shortfall.")
-            else:
-                lines.append(f"Recommended: {recommendation.label} covers the {shortfall} shortfall.")
-        else:
-            total = gib(sum(item.bytes for item in choices.choices))
-            deletion = "Delete it" if len(choices.choices) == 1 else f"Delete these {len(choices.choices)}"
-            lines.append(f"{deletion} (recommended): frees {total}, so builds get some room. That is only part of the {shortfall} shortfall, so builds can still fail.")
-        lines.append(closing)
-    return render("sweep.disk_floor", free=gib(free), floor=gib(floor),
-                  folder_action=folder_action,
-                  cleanup=f"Cleanup removed {gib(removed)}." if removed else "The cleanup run freed nothing.",
-                  choices="\n".join(lines))
+        recommendation += (" Measure (recommended): natedev lists folder sizes, then you choose. "
+                           "Delete nothing: free space stays low.")
+    elif isinstance(choices, InsufficientFolderChoices):
+        recommendation = recommendation.removesuffix(".") + "; the natedev session lists every folder."
+    return render("sweep.disk_floor", free=gib(free), floor=gib(floor), folder_action=folder_action,
+                  recommendation=recommendation)
 
 
 @dataclass(frozen=True)
@@ -3320,19 +3316,16 @@ class NoPhoneAlert:
 NO_PHONE_ALERT = NoPhoneAlert()
 
 
-def fit_disk_floor_push(free: int, floor: int, removed: int, choices: FolderChoices, *,
+def fit_disk_floor_push(free: int, floor: int, choices: FolderChoices, *,
                         lint_settings: conf.ConfigRead) -> RenderedPush | NoPhoneAlert:
-    """Fit actual values by trimming choices, then use the unavailable surface."""
+    """Use the unavailable text when the recommendation reaches the limit."""
     limit = lint_settings.whole("sweep_push_text_limit")
-    while True:
-        rendered = disk_floor_push(free, floor, removed, choices)
+    for candidate in (choices, UNAVAILABLE_FOLDER_CHOICES):
+        rendered = disk_floor_push(free, floor, candidate)
         if len(rendered.message) < limit:
             return rendered
-        if not isinstance(choices, UnavailableFolderChoices):
-            choices = classified_folder_choices(choices.choices[:-1], max(0, floor - free))
-        else:
-            print("lint sweep: phone text exceeds sweep_push_text_limit", file=sys.stderr)
-            return NO_PHONE_ALERT
+    print("lint sweep: phone text exceeds sweep_push_text_limit", file=sys.stderr)
+    return NO_PHONE_ALERT
 
 
 def crossing_send_argv(repeat: CrossingSendKey | NoCrossingSend) -> list[str]:
@@ -3814,19 +3807,23 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
         pending_failure = isinstance(failure, FailurePending)
         if not crossing_pending and not pending_failure:
             return current
-        problems: list[str] = []
+        shortfall = max(0, phone_floor - free)
+        choices: FolderChoices = UNAVAILABLE_FOLDER_CHOICES
         if crossing_pending:
-            problems.append(f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains.")
-            measurement = read_disk_measurement()
-            problems.extend(page_paths(measurement))
-        else:
-            measurement = UnavailableDiskMeasurement("missing")
-        if isinstance(failure, FailurePending):
-            problems.append(f"The {scope.label} failed with status {failure.event.status}. {failure.event.detail}")
+            choices = folder_choices(read_disk_measurement(), protected, shortfall,
+                                     now=time.time(), lint_settings=lint_settings)
+
         def render(path_limit: int) -> str:
-            protected_lines = (protected_folder_lines(protected, path_limit, lint_settings=lint_settings)
-                               if crossing_pending else [])
-            return "\n".join([*problems, *protected_lines])
+            lines: list[str] = []
+            if crossing_pending:
+                lines.extend([
+                    f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains.",
+                    f"Cleanup removed {gib(removed)}." if removed else "The cleanup run freed nothing.",
+                    *folder_choice_lines(choices, shortfall, path_limit=path_limit),
+                ])
+            if isinstance(failure, FailurePending):
+                lines.append(f"The {scope.label} failed with status {failure.event.status}. {failure.event.detail}")
+            return "\n".join(lines)
         message = fit_alert_text(render, lint_settings=lint_settings)
 
         def save_delivery(delivery: FloorAlertDelivery) -> None:
@@ -3853,9 +3850,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
             delivery = send_floor_alert(message, repeat=repeat, lint_settings=lint_settings)
             save_delivery(FloorAlertDelivery(delivery, FloorChannelOutcome.NOT_ATTEMPTED))
         if phone_pending and identity_saved and isinstance(crossing, OpenPhoneCrossing):
-            choices = folder_choices(measurement, protected, max(0, phone_floor - free),
-                                     now=time.time(), lint_settings=lint_settings)
-            phone = fit_disk_floor_push(free, phone_floor, removed, choices, lint_settings=lint_settings)
+            phone = fit_disk_floor_push(free, phone_floor, choices, lint_settings=lint_settings)
             if not isinstance(phone, NoPhoneAlert):
                 result = send_phone_push(phone,
                                         repeat=CrossingSendKey(f"phone:{crossing.identity}",

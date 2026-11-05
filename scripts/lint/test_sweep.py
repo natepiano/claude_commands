@@ -3718,10 +3718,10 @@ class FloorTests(SweepCase):
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             yield delivery
 
-    def finalize_crossing(self, free_gib: int, *, protected: tuple[tuple[str, int], ...] = ()) -> None:
+    def finalize_crossing(self, free_gib: int, *, protected: tuple[tuple[str, int], ...] = (), removed: int = 0) -> None:
         with mock.patch.object(sweep, "free_bytes", return_value=free_gib * GIB):
             sweep.notify_floor_problem(sweep.FloorOutcome(
-                sweep.tmp_sweep.CompletedSweepAssessment(0), after=free_gib * GIB, protected=protected),
+                sweep.tmp_sweep.CompletedSweepAssessment(0), after=free_gib * GIB, protected=protected, removed=removed),
                 lint_settings=conf.read("lint"))
 
     def test_crossing_sends_both_channels_once_and_rearms_only_above_the_line(self) -> None:
@@ -3845,6 +3845,63 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
             self.assertNotIn("private failed pass", delivery.attempts[1].text)
 
+    def test_disk_floor_push_body_has_one_recommendation_without_folder_lines(self) -> None:
+        kind = sweep.FolderChoiceKind
+        for state, choices, expected in (
+            ("trash", sweep.AvailableFolderChoices((
+                sweep.FolderChoice("~/.local/share/Trash", 26 * GIB, kind.TRASH),
+                sweep.FolderChoice("/private/second", 12 * GIB, kind.OTHER),
+            )), "Delete ~/.local/share/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+            ("protected", sweep.AvailableFolderChoices((
+                sweep.FolderChoice("/private/protected", 27 * GIB, kind.PROTECTED),
+            )), "Review /private/protected first (recommended): deleting it frees 27.0 GiB, which covers the 10.0 GiB shortfall."),
+            ("scratch", sweep.AvailableFolderChoices((
+                sweep.FolderChoice("/private/scratch", 26 * GIB, kind.SCRATCH),
+            )), "Review /private/scratch first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+            ("other", sweep.AvailableFolderChoices((
+                sweep.FolderChoice("/private/other", 26 * GIB, kind.OTHER),
+            )), "Review /private/other first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+            ("insufficient", sweep.InsufficientFolderChoices((
+                sweep.FolderChoice("/private/largest", 6 * GIB, kind.OTHER),
+                sweep.FolderChoice("/private/second", 2 * GIB, kind.OTHER),
+            )), "The largest folder is /private/largest at 6.0 GiB. Deleting it frees only part of the 10.0 GiB shortfall; the natedev session lists every folder."),
+            ("unavailable", sweep.UNAVAILABLE_FOLDER_CHOICES,
+             "Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low."),
+        ):
+            with self.subTest(state=state):
+                push = sweep.disk_floor_push(140 * GIB, 150 * GIB, choices)
+                self.assertEqual(push.title, "natedev disk is low; builds can fail")
+                self.assertEqual(push.body, "natedev has 140.0 GiB free, below the 150.0 GiB alert line, so builds can fail. " + expected)
+                assert isinstance(push.action, ActionRequired)
+                self.assertEqual(push.action.text,
+                    "In the natedev Claude session, reply measure or delete nothing." if state == "unavailable"
+                    else "In the natedev Claude session, say which folders to delete.")
+
+    def test_crossing_session_keeps_trash_and_scratch_effects(self) -> None:
+        for folder, effect, recommendation in (
+            ("/private/Trash", "Deleting it removes discarded files.",
+             "Delete /private/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+            ("/private/scratch/work", "Deleting it removes temporary work; check for work you still need.",
+             "Review /private/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+        ):
+            with self.subTest(folder=folder), self.crossing_delivery({}) as delivery:
+                measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
+                    sweep.OutsideCacheDirectory(folder, 26 * GIB, 0, sweep.NoLargestGrowingChild()),
+                ], 0)
+                with mock.patch.object(sweep, "read_disk_measurement", return_value=measurement):
+                    self.finalize_crossing(140)
+                message = delivery.attempts[0].text
+                lines = [
+                    "Free disk space fell below the 150.0 GiB alert line. 140.0 GiB remains.",
+                    "The cleanup run freed nothing.",
+                    f"{folder}: holds 26.0 GiB. {effect}",
+                    recommendation,
+                    "Delete nothing: builds can fail when the disk is full.",
+                    "natedev checks your choice before it deletes anything.",
+                ]
+                self.assertEqual(message.splitlines(), lines)
+                self.assertIn(recommendation, phone_text(delivery.attempts))
+
     def test_unavailable_crossing_measurement_names_no_folder(self) -> None:
         stale = sweep.AvailableDiskMeasurement(
             datetime.fromtimestamp(time.time() - 600, UTC), sweep.NoEarlierDiskMeasurement(), [
@@ -3857,13 +3914,23 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 with mock.patch.object(sweep, "read_disk_measurement", return_value=measurement):
                     self.finalize_crossing(140)
                 text = phone_text(delivery.attempts)
-                self.assertIn("The cleanup run freed nothing.", text)
-                self.assertNotIn("If the disk fills, builds fail.", text)
                 self.assertIn("In the natedev Claude session, reply measure or delete nothing.", text)
-                self.assertIn("Folder sizes are unknown or out of date, so no folder is recommended yet.", text)
+                self.assertIn("Folder sizes are unknown. Measure (recommended): natedev lists folder sizes, then you choose. Delete nothing: free space stays low.", text)
                 self.assertNotIn("/", text)
-                self.assertIn("Measure first (recommended): natedev lists folder sizes, then you choose what to delete.", text)
-                self.assertIn("Delete nothing: the disk stays low and builds can fail.", text)
+                message = delivery.attempts[0].text
+                self.assertNotIn("/private/stale-choice", message)
+                self.assertNotIn("If the disk fills, builds fail.", message)
+                lines = [
+                    "Free disk space fell below the 150.0 GiB alert line. 140.0 GiB remains.",
+                    "The cleanup run freed nothing.",
+                    "Folder sizes are unknown.",
+                    "",
+                    "Measure first (recommended): natedev lists folder sizes, then you choose what to delete.",
+                    "",
+                    "Delete nothing: the disk stays low and builds can fail.",
+                    "natedev checks your choice before it deletes anything.",
+                ]
+                self.assertEqual(message.splitlines(), lines)
 
     def test_crossing_recommends_one_measured_choice_that_frees_the_shortfall(self) -> None:
         with self.crossing_delivery({}) as delivery:
@@ -3871,91 +3938,129 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 sweep.OutsideCacheDirectory("/tmp/claude/large/target", 180 * GIB, 0, sweep.NoLargestGrowingChild()),
                 sweep.OutsideCacheDirectory("/tmp/claude/small/target", 20 * GIB, 0, sweep.NoLargestGrowingChild()),
             ], 0)
-            with mock.patch.object(sweep, "read_disk_measurement", return_value=measurement):
-                self.finalize_crossing(140)
+            with (mock.patch.object(sweep, "read_disk_measurement", return_value=measurement),
+                  mock.patch.object(sweep, "folder_choices", wraps=sweep.folder_choices) as choices):
+                self.finalize_crossing(140, removed=2 * GIB)
+            choices.assert_called_once()
+            recommendation = ("Review /tmp/claude/large/target first (recommended): deleting it frees 180.0 GiB, "
+                              "which covers the 10.0 GiB shortfall.")
             text = phone_text(delivery.attempts)
-            self.assertIn("The cleanup run freed nothing.", text)
-            self.assertIn("/tmp/claude/large/target", text)
-            self.assertIn("180.0 GiB", text)
-            self.assertIn("recommend", text.lower())
-            self.assertRegex(text, r"Delete nothing:.*builds can fail")
+            self.assertIn(recommendation, text)
+            self.assertNotIn("/tmp/claude/small/target", text)
             self.assertIn("In the natedev Claude session, say which folders to delete.", text)
-            self.assertTrue(text.endswith("natedev checks your choice before it deletes anything."))
+            message = delivery.attempts[0].text
+            lines = [
+                "Free disk space fell below the 150.0 GiB alert line. 140.0 GiB remains.",
+                "Cleanup removed 2.0 GiB.",
+                "/tmp/claude/large/target: holds 180.0 GiB. Deleting it removes its contents; their use is unknown.",
+                "/tmp/claude/small/target: holds 20.0 GiB. Deleting it removes its contents; their use is unknown.",
+                recommendation,
+                "Delete nothing: builds can fail when the disk is full.",
+                "natedev checks your choice before it deletes anything.",
+            ]
+            self.assertEqual(message.splitlines(), lines)
 
     def test_crossing_names_the_largest_choice_when_no_choice_frees_enough(self) -> None:
         with self.crossing_delivery({}) as delivery:
-            _ = write_config_fixture(conf.path("lint"), "sweep_page_paths=2\nsweep_push_text_limit=2000\n")
             measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
                 sweep.OutsideCacheDirectory("/tmp/claude/largest", 60 * GIB, 0, sweep.NoLargestGrowingChild()),
                 sweep.OutsideCacheDirectory("/tmp/claude/small/target", 20 * GIB, 0, sweep.NoLargestGrowingChild()),
-                sweep.OutsideCacheDirectory("/tmp/claude/unlisted", 10 * GIB, 0, sweep.NoLargestGrowingChild()),
+                sweep.OutsideCacheDirectory("/tmp/claude/fifth", 5 * GIB, 0, sweep.NoLargestGrowingChild()),
+                sweep.OutsideCacheDirectory("/tmp/claude/third", 10 * GIB, 0, sweep.NoLargestGrowingChild()),
+                sweep.OutsideCacheDirectory("/tmp/claude/fourth", 8 * GIB, 0, sweep.NoLargestGrowingChild()),
             ], 0)
             with mock.patch.object(sweep, "read_disk_measurement", return_value=measurement):
                 self.finalize_crossing(0)
+            recommendation = ("The largest folder is /tmp/claude/largest at 60.0 GiB. "
+                              "Deleting it frees only part of the 150.0 GiB shortfall; the natedev session lists every folder.")
             text = phone_text(delivery.attempts)
-            self.assertIn("The cleanup run freed nothing.", text)
+            self.assertIn(recommendation, text)
             self.assertIn("In the natedev Claude session, say which folders to delete.", text)
-            self.assertIn("/tmp/claude/largest: holds 60.0 GiB", text)
-            self.assertIn("/tmp/claude/small/target: holds 20.0 GiB", text)
-            self.assertLess(text.index("/tmp/claude/largest"), text.index("/tmp/claude/small/target"))
-            self.assertIn("Delete these 2 (recommended): frees 80.0 GiB, so builds get some room. " +
-                          "That is only part of the 150.0 GiB shortfall, so builds can still fail.", text)
-            self.assertLess(text.index("Delete these 2 (recommended)"), text.index("Delete nothing:"))
-            self.assertRegex(text, r"Delete nothing:.*builds can fail")
-            self.assertNotIn("/tmp/claude/unlisted", text)
+            self.assertNotIn("/tmp/claude/small/target", text)
+            message = delivery.attempts[0].text
+            session_fact = ("The largest folder is /tmp/claude/largest at 60.0 GiB. "
+                            "Deleting it frees only part of the 150.0 GiB shortfall.")
+            self.assertIn("The cleanup run freed nothing.", message)
+            self.assertIn("/tmp/claude/largest: holds 60.0 GiB", message)
+            self.assertIn("/tmp/claude/small/target: holds 20.0 GiB", message)
+            self.assertLess(message.index("/tmp/claude/largest"), message.index("/tmp/claude/small/target"))
+            lines = [
+                "Free disk space fell below the 150.0 GiB alert line. 0.0 GiB remains.",
+                "The cleanup run freed nothing.",
+                "/tmp/claude/largest: holds 60.0 GiB. Deleting it removes its contents; their use is unknown.",
+                "/tmp/claude/small/target: holds 20.0 GiB. Deleting it removes its contents; their use is unknown.",
+                "/tmp/claude/third: holds 10.0 GiB. Deleting it removes its contents; their use is unknown.",
+                "/tmp/claude/fourth: holds 8.0 GiB. Deleting it removes its contents; their use is unknown.",
+                "/tmp/claude/fifth: holds 5.0 GiB. Deleting it removes its contents; their use is unknown.",
+                session_fact,
+                "Delete nothing: builds can fail when the disk is full.",
+                "natedev checks your choice before it deletes anything.",
+            ]
+            self.assertEqual(message.splitlines(), lines)
+            self.assertNotIn("the natedev session lists every folder", message)
 
     def test_crossing_recommends_one_insufficient_folder_with_its_remaining_risk(self) -> None:
         with self.crossing_delivery({}) as delivery:
-            _ = write_config_fixture(conf.path("lint"), "sweep_push_text_limit=2000\n")
             measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
                 sweep.OutsideCacheDirectory("/tmp/claude/only/target", 60 * GIB, 0, sweep.NoLargestGrowingChild()),
             ], 0)
             with mock.patch.object(sweep, "read_disk_measurement", return_value=measurement):
                 self.finalize_crossing(0)
-            text = phone_text(delivery.attempts)
-            self.assertIn("/tmp/claude/only/target: holds 60.0 GiB", text)
-            self.assertIn("Delete it (recommended): frees 60.0 GiB, so builds get some room. " +
-                          "That is only part of the 150.0 GiB shortfall, so builds can still fail.", text)
-            self.assertRegex(text, r"Delete nothing:.*builds can fail")
-            self.assertLess(text.index("Delete it (recommended)"), text.index("Delete nothing:"))
+            recommendation = ("The largest folder is /tmp/claude/only/target at 60.0 GiB. "
+                              "Deleting it frees only part of the 150.0 GiB shortfall; the natedev session lists every folder.")
+            self.assertIn(recommendation, phone_text(delivery.attempts))
+            message = delivery.attempts[0].text
+            self.assertIn("/tmp/claude/only/target: holds 60.0 GiB", message)
+            session_fact = ("The largest folder is /tmp/claude/only/target at 60.0 GiB. "
+                            "Deleting it frees only part of the 150.0 GiB shortfall.")
+            self.assertIn(session_fact, message)
+            self.assertRegex(message, r"Delete nothing:.*builds can fail")
+            self.assertLess(message.index(session_fact), message.index("Delete nothing:"))
+            self.assertNotIn("the natedev session lists every folder", message)
 
-    def test_crossing_labels_protected_sizes_on_both_channels_without_a_holder(self) -> None:
+    def test_crossing_labels_protected_sizes_without_a_holder(self) -> None:
         with self.crossing_delivery({}) as delivery:
             protected = (("/private/protected", 27 * GIB),)
             self.finalize_crossing(140, protected=protected)
             self.assertEqual(len(delivery.attempts), 2)
             for attempt in delivery.attempts:
-                self.assertIn("protected", attempt.text.lower())
                 self.assertIn("/private/protected", attempt.text)
-                self.assertIn("holds 27.0 GiB", attempt.text)
+                self.assertIn("27.0 GiB", attempt.text)
                 self.assertNotIn("in use", attempt.text)
                 self.assertNotIn("pid ", attempt.text)
-            text = phone_text(delivery.attempts)
-            self.assertIn("The cleanup run freed nothing.", text)
-            self.assertIn("In the natedev Claude session, say which folders to delete.", text)
-            self.assertRegex(text, r"(?i)(no build record|no recorded evidence)")
-            self.assertRegex(text, r"Delete it \(recommended\):.*27.0 GiB")
-            self.assertRegex(text, r"Keep it:.*(no space|0.0 GiB|builds can fail)")
-            self.assertNotIn("Review ", text)
+            recommendation = ("Review /private/protected first (recommended): deleting it frees 27.0 GiB, "
+                              "which covers the 10.0 GiB shortfall.")
+            self.assertIn(recommendation, phone_text(delivery.attempts))
+            self.assertIn("In the natedev Claude session, say which folders to delete.", phone_text(delivery.attempts))
+            message = delivery.attempts[0].text
+            self.assertIn("It is protected", message)
+            self.assertIn("The cleanup run freed nothing.", message)
+            self.assertIn("holds 27.0 GiB", message)
+            self.assertRegex(message, r"(?i)(no build record|no recorded evidence)")
+            self.assertIn(recommendation, message)
+            self.assertIn("Delete nothing: builds can fail when the disk is full.", message)
+            self.assertLess(message.index(recommendation), message.index("Delete nothing:"))
+            self.assertNotIn("Keep it", message)
+            self.assertEqual(message.count("Review "), 1)
             self.assertEqual(sweep.floor_holders({"/private/protected": sweep.NoRecordedEvidence("/private/protected")},
                                                 {"/private/protected": 27 * GIB}), [])
 
     def test_measured_target_folder_has_no_cargo_or_rebuild_claim(self) -> None:
         with self.crossing_delivery({}) as delivery:
-            _ = write_config_fixture(conf.path("lint"), "sweep_push_text_limit=2000\n")
             folder = str(delivery.base / "unknown" / "target")
             measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
                 sweep.OutsideCacheDirectory(folder, 26 * GIB, 0, sweep.NoLargestGrowingChild()),
             ], 0)
             with mock.patch.object(sweep, "read_disk_measurement", return_value=measurement):
                 self.finalize_crossing(140)
-            text = phone_text(delivery.attempts)
-            self.assertIn(folder, text)
-            self.assertIn("holds 26.0 GiB", text)
-            self.assertNotIn("Cargo", text)
-            self.assertNotIn("compiled", text)
-            self.assertNotIn("rebuild", text)
-            self.assertIn("their use is unknown", text)
+            for attempt in delivery.attempts:
+                self.assertIn(folder, attempt.text)
+                self.assertNotIn("Cargo", attempt.text)
+                self.assertNotIn("compiled", attempt.text)
+                self.assertNotIn("rebuild", attempt.text)
+            message = delivery.attempts[0].text
+            self.assertIn("holds 26.0 GiB", message)
+            self.assertIn("their use is unknown", message)
 
     def test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key(self) -> None:
         replies: dict[str, list[int]] = {}
@@ -3996,33 +4101,37 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             for attempt in delivery.attempts:
                 self.assertEqual(float(attempt.command[attempt.command.index("--repeat-minutes") + 1]), interval)
 
-    def test_real_crossing_values_trim_one_choice_instead_of_discarding_the_list(self) -> None:
-        with self.crossing_delivery({}) as delivery:
-            _ = write_config_fixture(conf.path("lint"), "sweep_push_text_limit=526\nsweep_page_paths=2\n")
-            measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
-                sweep.OutsideCacheDirectory("/private/first", 180 * GIB, 0, sweep.NoLargestGrowingChild()),
-                sweep.OutsideCacheDirectory("/private/second", 20 * GIB, 0, sweep.NoLargestGrowingChild()),
-            ], 0)
-            with (mock.patch.object(sweep, "read_disk_measurement", return_value=measurement),
-                  mock.patch.object(sweep, "free_bytes", return_value=140 * GIB)):
-                sweep.notify_floor_problem(sweep.FloorOutcome(sweep.tmp_sweep.CompletedSweepAssessment(0),
-                    removed=123456 * GIB, after=140 * GIB), lint_settings=conf.read("lint"))
-            text = phone_text(delivery.attempts)
-            self.assertIn("/private/first", text)
-            self.assertNotIn("/private/second", text)
-            self.assertIn("Cleanup removed 123456.0 GiB.", text)
-            self.assertNotIn("Folder sizes are unknown", text)
-            self.assertLess(len(text.split("\n", 1)[1]), 526)
+    def test_disk_floor_push_fit_falls_back_at_each_limit(self) -> None:
+        _ = self.base()
+        choices = sweep.AvailableFolderChoices((
+            sweep.FolderChoice("/private/" + "large" * 60, 180 * GIB, sweep.FolderChoiceKind.OTHER),
+            sweep.FolderChoice("/private/small", 20 * GIB, sweep.FolderChoiceKind.OTHER),
+        ))
+        named = sweep.disk_floor_push(140 * GIB, 150 * GIB, choices)
+        unavailable = sweep.disk_floor_push(140 * GIB, 150 * GIB, sweep.UNAVAILABLE_FOLDER_CHOICES)
+        for state, selected, rendered, fallback in (
+            ("measured", choices, named, unavailable),
+            ("unavailable", sweep.UNAVAILABLE_FOLDER_CHOICES, unavailable, sweep.NO_PHONE_ALERT),
+        ):
+            for offset in (-1, 0, 1):
+                with self.subTest(state=state, offset=offset), redirect_stderr(io.StringIO()):
+                    _ = write_config_fixture(conf.path("lint"), f"sweep_push_text_limit={len(rendered.message) + offset}\n")
+                    push = sweep.fit_disk_floor_push(140 * GIB, 150 * GIB, selected, lint_settings=conf.read("lint"))
+                    self.assertEqual(push, rendered if offset == 1 else fallback)
 
     def test_protected_recommendation_names_its_folder_among_several_choices(self) -> None:
         with self.crossing_delivery({}) as delivery:
-            _ = write_config_fixture(conf.path("lint"), "sweep_push_text_limit=2000\nsweep_page_paths=2\n")
             self.finalize_crossing(140, protected=(("/private/larger", 27 * GIB), ("/private/smaller", 20 * GIB)))
+            recommendation = ("Review /private/larger first (recommended): deleting it frees 27.0 GiB, "
+                              "which covers the 10.0 GiB shortfall.")
             text = phone_text(delivery.attempts)
-            self.assertIn("/private/larger holds 27.0 GiB", text)
-            self.assertIn("/private/smaller holds 20.0 GiB", text)
-            self.assertIn("Delete /private/larger (recommended): frees 27.0 GiB", text)
-            self.assertNotIn("Delete it (recommended)", text)
+            self.assertIn(recommendation, text)
+            self.assertNotIn("/private/smaller", text)
+            message = delivery.attempts[0].text
+            self.assertIn("/private/larger: holds 27.0 GiB", message)
+            self.assertIn("/private/smaller: holds 20.0 GiB", message)
+            self.assertIn(recommendation, message)
+            self.assertNotIn("Delete it (recommended)", message)
             self.assertEqual(sweep.floor_holders({path: sweep.NoRecordedEvidence(path) for path in
                 ("/private/larger", "/private/smaller")}, {"/private/larger": 27 * GIB, "/private/smaller": 20 * GIB}), [])
 
@@ -4619,15 +4728,6 @@ raise SystemExit(int(os.environ[variable]))
         self.assertIn("140.0 GiB", message)
         self.assertIn("150.0 GiB", message)
         self.assertIn(f"{folder.path}: holds 26.0 GiB.", message)
-
-    def test_page_lists_busy_targets_then_the_deepest_measured_folders_by_size(self) -> None:
-        def folder(path: str, size: int) -> sweep.OutsideCacheDirectory:
-            return sweep.OutsideCacheDirectory(path, size * GIB, 0, sweep.NoLargestGrowingChild())
-        measurement = sweep.AvailableDiskMeasurement(
-            datetime.now(PACIFIC), sweep.NoEarlierDiskMeasurement(),
-            [folder("/tmp/claude-1000", 90), folder("/tmp/claude-1000/scratch", 86), folder("/home/n/.cache/uv", 12)], 0)
-        self.assertEqual(sweep.page_paths(measurement), [
-            "/tmp/claude-1000/scratch: holds 86.0 GiB.", "/home/n/.cache/uv: holds 12.0 GiB."])
 
     def test_nixos_disk_action_states_the_space_needed_to_restore_the_build_floor(self) -> None:
         for free in (149, 0, 290):
