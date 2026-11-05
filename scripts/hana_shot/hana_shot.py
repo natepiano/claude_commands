@@ -2221,13 +2221,29 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             + f"so this Hana runs that code: {build_paths_label(uncommitted_paths, hana_shot_settings=hana_shot_settings)}",
             file=sys.stderr,
         )
+    owner = owner.strip()
+    if not owner:
+        if not __package__:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from scripts.production import staff
+        try:
+            current = staff.runtime_id()
+            if current:
+                record = staff.local_snapshot()
+                row = record.by_current_session(current)
+                if row is not None and row.kind == "worker":
+                    row = record.parent_of(row)
+                if row is not None:
+                    owner = row.name
+        except staff.StaffUnreadable:
+            pass
     scratch = Path(tempfile.mkdtemp(prefix=f"hana-shot-{port}-"))
     config = scratch / "config"
     config.mkdir()
     log = scratch / "hana.log"
     command = [
         "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
-        f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner.strip() or os.environ.get('SHOWRUNNER_UNIT_ID', '')}",
+        f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner}",
         f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
     ]
     direnv = shutil.which("direnv")
@@ -2955,7 +2971,7 @@ def add_run_flags(parser: argparse.ArgumentParser, port_required: bool = True) -
     _ = parser.add_argument("--worktree")
     _ = parser.add_argument("--binary")
     _ = parser.add_argument("--purpose", default="", help="feature under test; required when launching Hana")
-    _ = parser.add_argument("--owner", default="", help="unit director; defaults to SHOWRUNNER_UNIT_ID")
+    _ = parser.add_argument("--owner", default="", help="unit director; defaults to the caller's unit name in staff")
 
 
 class ArgumentExit(SystemExit):
@@ -3015,7 +3031,7 @@ def arguments(argv: list[str], *,
     _ = launch_parser.add_argument("--worktree")
     _ = launch_parser.add_argument("--binary")
     _ = launch_parser.add_argument("--purpose", default="", help="feature under test (required)")
-    _ = launch_parser.add_argument("--owner", default="", help="unit director; defaults to SHOWRUNNER_UNIT_ID")
+    _ = launch_parser.add_argument("--owner", default="", help="unit director; defaults to the caller's unit name in staff")
 
     shutdown_parser = commands.add_parser("shutdown", help="stop a launched Hana and remove its scratch")
     _ = shutdown_parser.add_argument("--port", type=int, required=True)

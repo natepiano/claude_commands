@@ -1628,69 +1628,34 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** named availability states for `StepEvidence.arguments` — `history_selection` reads an empty argv and a missing one the same way.
 
-### Phase 61 — Workspace and temporary-sweep failures reach natedev once, and the Phase 58 floor code has one copy of each rule  · status: todo
-**Depends on:** Phase 62 (both change `scripts/lint/sweep.py`; builds ruling 2026-11-04: Phase 62 runs first).
+### Phase 61 — Workspace and temporary-sweep failures reach natedev once, and the Phase 58 floor code has one copy of each rule  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a workspace or temporary-sweep failure sends one natedev alert per failure episode through the Phase 58 failure-episode states, and the floor code that Phase 58 added has one copy of each rule and named states for each record.
-
-**Measured (Phase 58 review pass 1, repair round 8, landing rule):** these findings moved here from Phase 58. None is a regression, and none fails a test or gate. F003 was there before Phase 58 (`2925d6453^` has the same status aggregation); this deferral is an exception to the Phase 58 rule that a failed sweep sends a push.
-- F003: `main()` returns status 1 for a workspace or temporary-sweep failure and sends no notification (`main()`, `scripts/lint/sweep.py` :4181).
-- F010: `scan_floor_roots` forces one scan worker in code; one config key has two meanings.
-- F011: `ObservedUnreadableFloorHold.alert_delivered` is a bare flag.
-- F012: `send_floor_alert` returns a different fact for each channel.
-- F013: `alert_floor_lock` writes the record at up to five sites; the reset block has four copies.
-- F014: the `phone_crossing` strings are written in two places, in two forms.
-- F015: the default `FloorRecord` fallback is copied.
-- F016: `read_floor_record` copies the pid check.
-- F017: the cmdline decode is copied.
-- F018: the `holders` parameter of `page_paths` is dead; `closing` is a one-item list.
-- F019: the natedev closing line states a policy, not this event's phone result.
-- F020: two comments repeat other text.
-- F021: `target_dirs` pushes branches back only for `visit` to pop them.
-- F022: satisfied by Phase 62; `discover_cargo_outputs` (`sweep.py` :419) has no executors and no `refreshed` state.
-- F023: build trees and `roots_for` are computed more than once per target.
-- F024: the new tests copy their setup and add patches inside `subTest` loops.
-Full detail: `findings.py status --phase 58` in the resources run folder.
-
-**Spec:**
-1. Route workspace and temporary-sweep failures through the Phase 58 failure-episode finalizer, each with its own failure scope. Send one natedev alert for each failure episode (builds ruling 2026-11-04 18:32 EST: sweep failures go to natedev only).
-   - Give each scope a named identity, one per workspace and one for the temporary sweep, so unrelated workspaces never share an episode.
-   - Return named assessment outcomes: `tmp_sweep.run_if_due()` (`scripts/lint/tmp_sweep.py:1377`) returns 0 when the sweep is not due, and workspace lock contention returns 0 with no assessment. A skip is not a recovery: it never clears a pending failure.
-2. Add `sweep_scan_workers.natedev=1` to `config/lint.conf` and a separate `sweep_discovery_workers` key for the `target_dirs` directory-search pool (`sweep.py` :2389). Delete the code override in `scan_floor_roots` (`sweep.py` :2216-2219) and the unused `map` branch.
-3. Replace `alert_delivered` with two states: `ObservedUnreadableFloorHold` and `ReportedUnreadableFloorHold`. Decode old records: `alert_delivered` true reads as reported, false as observed.
-4. Return `FloorAlertDelivery(natedev, phone)` from `send_floor_alert`. Each field is a named channel outcome: not attempted, delivered, queued or failed.
-5. Add one pure transition `next_lock_alert(previous, holder, process, now)`, where `process` is a named observation (live sweep, other process, unreadable), never a bool. Write once, only when the state changed. Use it at lock acquisition too.
-6. Use `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, and one `_command_text(bytes)` helper.
-7. Change `page_paths` to `page_paths(measurement)`. Put the closing string in the `render` list. State the phone result of the event in the natedev closing line.
-8. Remove the two repeated comments.
-9. Simplify `target_dirs` (one loop over a named 3-level constant, `visit(search, directory, depth)`, no `len < 2` case; `sweep.py` :2323). Phase 62 removed the metadata refresh from `discover_cargo_outputs`; do not change that function here.
-10. Compute `roots_for` once per distinct root. Pass found markers to `is_cargo_target`. Fill `known_trees` from discovery.
-11. Add `phone_calls(send)`, `record=` on `locked_floor` and `saved_lock_alert()` test helpers. Move patches above loops. Keep one status-1 channel assert.
-12. A real floor pass walks each idle target only once (Phase 58 simplify item 33; builds 2026-11-04: current). To compute `after_caches` (`scripts/lint/sweep.py` ~:3699), walk again only the targets that had deletions. Do not compute it from blocks minus freed inodes: hard links make that number wrong.
-
-**Constraints from prior phases:**
-- Phase 62 (`01bf65845`) maps floor targets from recorded step pairs, then the saved cache. Keep its recorded-root mapping, its speed and these protections: a target with no recorded evidence is `NoRecordedEvidence` and is never deleted or a floor holder; an unrecorded target nested under a recorded or cached output root outside the configured roots is found and protected; a real pass saves merged pairs (an internal cache for `folder_audit` and `disk.py`); an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>` to stderr. Keep these `scripts/lint/test_sweep.py` tests unchanged: `test_unrecorded_and_unknown_root_targets_stay_protected`, `test_unrecorded_nested_targets_outside_search_roots_stay_protected`, `test_a_dry_floor_pass_reports_an_unreadable_recorded_root_index`, `test_unavailable_index_uses_saved_roots_after_the_checkout_is_gone`, `test_recorded_pairs_precede_saved_pairs_and_dry_discovery_keeps_the_cache`.
-- Keep the Phase 58 alert rule (natedev only), its notification finalizer, the failure-episode and crossing states, and the dry-run result. Phase 50 and 53 own the floor rules, Mac claims and outside caches.
-- Keep the warm floor-only dry run on natedev under 30 s.
+- Workspace and temporary-sweep failures go through the floor failure-episode finalizer, and each failure episode sends one natedev alert. A sweep failure sends no phone push. A clean pass ends the episode.
+- Each scope has its own record beside `floor.json`: `workspace-<sha256 of the sorted output roots>.json` for each workspace, and `temporary-sweep.json`. A run from the workspace root and a run from a member folder share one record. A clean workspace sweep with no saved record writes no state file.
+- `tmp_sweep.SweepAssessment = CompletedSweepAssessment | SkippedSweepAssessment`. `run_if_due` returns a skip when the sweep is not due. A workspace pass with lock contention or with no output root is also a skip. A skip changes no state, so it keeps an open episode. `report_assessment(run, scope, ...)` runs a sweep and reports its assessment.
+- `FloorOutcome.assessment` holds a `tmp_sweep.SweepAssessment`. `notify_floor_problem` accepts `FloorOutcome | tmp_sweep.SweepAssessment`.
+- `send_floor_alert` returns `FloorAlertDelivery(natedev, phone)`, with one `FloorChannelOutcome` per channel (not attempted, delivered, queued or failed). `send_holder_message` is the natedev leg; it returns `FloorChannelOutcome` and logs "message to natedev ...".
+- The lock alert has one pure transition, `next_lock_alert(previous, holder, process, now)`, also used at lock acquisition. The record is written only when the state changes. An unreadable hold is `ObservedUnreadableFloorHold` or `ReportedUnreadableFloorHold`; an old `alert_delivered` true decodes as reported, false as observed. A pass that sees no holder keeps `DeliveredFloorLockAlert`, so the same holder does not alert again.
+- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, `page_paths(measurement)`, and one `roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
+- `config/lint.conf` sets `sweep_scan_workers.natedev=1` and `sweep_discovery_workers=4` (the directory-search pool). The code no longer forces one scan worker.
+- A real floor pass walks each idle target once, and walks again only the targets that had deletions to compute `after_caches`.
 
 **Files:**
-- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` — floor code, failure scopes and their tests.
-- `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py` — temporary-sweep assessment outcomes and their tests.
-- `config/lint.conf` — any changed key.
+- `scripts/lint/sweep.py` — failure scopes, `report_assessment`, the lock-alert transition, the channel outcomes and the floor code.
+- `scripts/lint/tmp_sweep.py` — the `SweepAssessment` types used by both sweeps.
+- `config/lint.conf` — the scan and directory-search worker counts.
+- `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py` — tests.
+- `docs/as-built/build-targets.md` — the failure records and the lock-alert rules.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `sweep.py`, `tmp_sweep.py` and `config/lint.conf`.
-- `test` owns `test_sweep.py` and `test_tmp_sweep.py`, and runs `scripts/notify/test_push_texts.py`.
+**Binds later work:** The phone low-space push keeps the natedev leg `send_holder_message` and the phone leg of `send_floor_alert` apart, and keeps `notify_floor_problem` accepting `FloorOutcome | tmp_sweep.SweepAssessment`. A no-holder pass keeps `DeliveredFloorLockAlert`; `test_missing_lock_observation_preserves_the_delivered_holder_receipt` stays unchanged. Workspace and temporary-sweep failures keep their own records and never send a phone push.
 
-**Acceptance gate:**
-- Tests prove, for each scope (one workspace, a second workspace, the temporary sweep): failure sends one natedev alert; a skip (not due, or lock contention) keeps the episode; a second failure sends nothing; a clean pass ends the episode; a failure in one workspace never ends or merges with another's. Old records with `alert_delivered` decode to the new states.
-- `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py` and `scripts/notify/test_push_texts.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
-- `sweep.py --floor-only --dry-run` on natedev exits 0 in under 30 s on three warm runs in a row at natedev's normal build load (load 45-70). Every baseline target that still exists is mapped as before the phase. Record each run's load and time in the checkpoint notice. (No cold run: `disk-floor.timer` runs the floor every 120 s, so no run follows 30 minutes without a sweep.)
-- Tests prove: a real pass walks again only the targets that had deletions, and `after_caches` equals a full walk on a fixture with hard links.
-- Time one real floor pass on natedev before and after Spec 12. Put both times in the checkpoint notice.
-- Change-Review line: a failed workspace sweep reaches natedev once | read the natedev session after a workspace sweep failure | one alert arrives, with the failure status.
+**Gotchas:**
+- A test that calls `sweep_workspace` with `dry_run` false writes the real `~/.local/state/lint-sweep` folder unless it sets `tmp_sweep.STATE_ENV` to a temporary folder.
+- `after_caches` is never computed from blocks minus freed inodes: hard links make that number wrong.
+
+**Ruled out:** a scope keyed by the calling folder (a member folder and its workspace root must share one episode); the stand-in arguments to `next_lock_alert` at acquisition and the phone branch of `send_floor_alert` stay, because the phone push uses that branch.
 
 ### Phase 62 — The floor sweep takes its target folders from recorded step rows  · status: done
 
@@ -1737,8 +1702,15 @@ The rejected texts and the reviewer's suggested rewrites are in the resources ru
 3. Send the push with the natedev alert on a crossing (`FloorAlertChannels.NATEDEV_AND_PHONE`). Keep one push per crossing.
 4. Use `sweep_push_text_limit` and `sweep_page_paths` in `config/lint.conf`, or remove them and their `config/README.md` rows. Phase 58 left them with no reader.
 5. Give the alert text a surface for each folder-choice state: measurements available (recommend one choice), measurement unavailable or stale (say so and name no folder), and no single choice frees enough (say what the largest choice frees). Never invent a deletion recommendation. Each state has a catalog example that passes the review.
-   - Protected folders (`NoRecordedEvidence`): since Phase 62 the natedev alert lists the largest of them with sizes (`protected_folder_lines`, from `FloorOutcome.protected`; `notify_floor_problem`, `sweep.py` :3418). The phone text uses the same measurement, labels these folders as protected (the floor never deletes them; only a person can), and says each one "holds" its size. They are never floor holders.
-6. Records from Phase 58 hold `UnderPhoneFloorPushed` after natedev delivery alone, so they prove no phone delivery. Keep the natedev and phone receipts as separate states for each crossing. An open episode in an old record gets its first phone push once, with no second natedev alert.
+   - Protected folders (`NoRecordedEvidence`): since Phase 62 the natedev alert lists the largest of them with sizes (`protected_folder_lines`, from `FloorOutcome.protected`; `notify_floor_problem`, `sweep.py` :3525). The phone text uses the same measurement, labels these folders as protected (the floor never deletes them; only a person can), and says each one "holds" its size. They are never floor holders.
+6. Records from Phase 58 hold `PhoneCrossing.UNDER_PUSHED` after natedev delivery alone, so they prove no phone delivery. Keep the natedev and phone receipts as separate states for each crossing. An open episode in an old record gets its first phone push once, with no second natedev alert.
+   - Each crossing has a durable identity saved in the record before the first send (for example the time the pass first measured free space under the line). Each channel's send passes `send.py --key <channel>:<crossing identity>` with a `--repeat-minutes` window that covers a restart, so a send repeated after a crash between delivery and the saved receipt is skipped by `send.py`. The receipt is still saved after each accepted send.
+
+**Constraints from prior phases (Phase 61):**
+- `FloorOutcome` carries `assessment: tmp_sweep.SweepAssessment`; `notify_floor_problem` (`sweep.py` :3525) accepts `FloorOutcome | tmp_sweep.SweepAssessment`, and a skipped assessment changes no state.
+- `send_holder_message` is the natedev leg of `send_floor_alert` and returns `FloorChannelOutcome`; the phone leg is separate. Its log line reads "message to natedev ...".
+- A pass that sees no lock holder keeps a `DeliveredFloorLockAlert` receipt (`next_lock_alert`, `sweep.py` :1182). Keep `test_missing_lock_observation_preserves_the_delivered_holder_receipt` green and unchanged.
+- Workspace and temporary-sweep failures keep their own records (`workspace-<sha256>.json`, `temporary-sweep.json`) and never send a phone push.
 7. The `sweep_phone_floor_gib` comment ("Send one phone alert") and the `Phone` state names must be true at the checkpoint (builds 2026-11-04). If this phase cannot bring back the phone push, file the key rename with `/unit:question`: a rename deletes a key.
 8. If the text still fails the review, keep the alert natedev only and ask the builds showrunner.
 
@@ -1752,6 +1724,6 @@ The rejected texts and the reviewer's suggested rewrites are in the resources ru
 - `test` owns `test_sweep.py` and the channel-retry and folder-choice cases, and runs `scripts/notify/test_push_texts.py` and `scripts/lint/test_tmp_sweep.py`.
 
 **Acceptance gate:**
-- Tests prove: a fall under the alert line sends one push and one natedev alert; a second pass under the line sends none; free space exactly at the line keeps the episode; a rise above the line and a new fall sends one more; a failed phone delivery with a sent natedev alert retries only the phone, and the reverse retries only natedev; a restart mid-episode sends nothing twice; an old record's open episode gets one phone push; a sweep-failure alert sends no phone push; the unavailable-measurement text names no folder; protected folders appear labelled as protected, with the same sizes on both channels, and are never floor holders.
+- Tests prove: a fall under the alert line sends one push and one natedev alert; a second pass under the line sends none; free space exactly at the line keeps the episode; a rise above the line and a new fall sends one more; a failed phone delivery with a sent natedev alert retries only the phone, and the reverse retries only natedev; a restart mid-episode sends nothing twice, also when the pass stops after a send and before its receipt is saved; an old record's open episode gets one phone push; a sweep-failure alert sends no phone push; the unavailable-measurement text names no folder; protected folders appear labelled as protected, with the same sizes on both channels, and are never floor holders.
 - `scripts/notify/test_push_texts.py` passes with a normal approval record. `scripts/lint/test_sweep.py` and `scripts/lint/test_tmp_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
 - Change-Review line: the phone gets one low-disk push | read the phone pushes after natedev free space falls under 150 GiB | one push arrives that says which folders to delete and what each one holds.

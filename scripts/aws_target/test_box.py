@@ -82,8 +82,8 @@ elif name == 'bash':
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open('a') as handle: handle.write(json.dumps({'kind': 'step', 'id': 'proof-step', 'target': 'aws', 'host': 'aws-build', 'package': 'aws-routing-proof', 'status': 0, 'pinned': True}) + '\n')
 elif name == 'tailscale':
-    output({'Self': {'HostName': 'natedev', 'TailscaleIPs': ['100.64.0.1']},
-            'Peer': {'mac': {'HostName': 'MacBook-Pro', 'TailscaleIPs': ['100.64.0.2']}}})
+    output({'Self': {'HostName': 'natedev', 'DNSName': 'natedev.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.1']},
+            'Peer': {'mac': {'HostName': "Nate's MacBook Pro 2023", 'DNSName': 'nates-macbook-pro-2023.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.2']}}})
 elif name == 'git':
     if 'branch' in args: print('main')
     elif s.get('dirty'): print(' M hosts/aws-build.nix')
@@ -266,6 +266,31 @@ class BoxTests(unittest.TestCase):
             results = box.json_record((self.directory / 'up.json').read_text())
             self.assertEqual(len(results), 11)
             self.assertTrue(all(mapping(result)['status'] == 'present' for result in results.values()))
+
+    def test_policy_devices_match_machine_names_instead_of_hostnames(self) -> None:
+        status: dict[str, object] = {
+            'Self': {'HostName': 'natedev', 'DNSName': 'natedev.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.1']},
+            'Peer': {'mac': {'HostName': "Nate's MacBook Pro 2023", 'DNSName': 'nates-macbook-pro-2023.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.2']}},
+        }
+        self.assertEqual(box.policy_device_bindings(box.policy_source(), status),
+                         {'$natedev': '100.64.0.1', '$mac': '100.64.0.2'})
+        with self.assertRaisesRegex(box.BoxRefused, "Nate's MacBook Pro 2023: no match"):
+            _ = box.policy_device_bindings({'devices': {'$mac': "Nate's MacBook Pro 2023"}}, status)
+
+    def test_policy_devices_report_every_bad_name_and_the_present_names(self) -> None:
+        source: dict[str, object] = {'devices': {'$missing': 'missing', '$duplicate': 'duplicate', '$empty': 'empty'}}
+        status: dict[str, object] = {
+            'Self': {'HostName': 'duplicate', 'DNSName': 'duplicate.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.1']},
+            'Peer': {'duplicate': {'HostName': 'duplicate', 'DNSName': 'duplicate.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.2']},
+                     'empty': {'HostName': 'empty', 'DNSName': 'empty.tail21e383.ts.net.'},
+                     'other': {'HostName': 'other', 'DNSName': 'other'},
+                     'missing': {'HostName': 'missing', 'TailscaleIPs': ['100.64.0.3']}},
+        }
+        with self.assertRaises(box.BoxRefused) as failure:
+            _ = box.policy_device_bindings(source, status)
+        self.assertEqual(str(failure.exception),
+                         'Tailscale policy devices: missing: no match; duplicate: more than one match; '
+                         + 'empty: no address; machine names present: duplicate, empty, other')
 
     def test_policy_changes_only_box_rules_and_then_reports_present(self) -> None:
         unrelated = mapping(cast(list[object], self.tailnet.policy['acls'])[0])

@@ -38,12 +38,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import herdr  # noqa: E402
 import pane_launch
+from scripts.lib import legacy_identity
 import sessions
 from pane_launch import PaneLaunch as PaneLaunch
 from pane_launch import (
     CLAUDE_VALUE_FLAGS as CLAUDE_VALUE_FLAGS,
     KEPT_NAMES as KEPT_NAMES,
-    KEPT_PREFIXES as KEPT_PREFIXES,
     MODEL_FLAGS as MODEL_FLAGS,
     NAME_FLAGS as NAME_FLAGS,
     RESUME_FLAGS as RESUME_FLAGS,
@@ -122,7 +122,7 @@ def resume_launch(entry: PaneLaunch) -> PaneLaunch:
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
            arguments: Sequence[str], *, kind: Literal["claude", "codex"] = "claude") -> PaneLaunch:
     """Retain plugin paths only in the shutdown restore record."""
-    entry = pane_launch.launch(pane_id, session_id, cwd, environment, arguments, kind=kind)
+    entry = pane_launch.launch(pane_id, session_id, cwd, legacy_identity.without_legacy_identity(environment), arguments, kind=kind)
     if kind == "claude":
         plugins = parse_claude_arguments(arguments).plugin_directories
         if plugins:
@@ -155,9 +155,9 @@ def locked(session: str) -> AbstractContextManager[None]:
 
 
 def without_legacy_identity(entry: PaneLaunch) -> PaneLaunch:
-    """Remove the retired identity variable from a retained launch."""
+    """Remove copied staff identity from a retained launch."""
     current = entry.copy()
-    current["environment"] = {key: value for key, value in entry["environment"].items() if key != "STAFF_ID"}
+    current["environment"] = legacy_identity.without_legacy_identity(entry["environment"])
     return current
 
 
@@ -171,14 +171,16 @@ def write(session: str, launch: PaneLaunch) -> None:
 
 
 def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> dict[str, str]:
-    """Keep a conversation's identity when its terminal command lost the environment."""
+    """Keep native runtime labels and account settings from retained launches."""
     environment: dict[str, str] = {}
     for previous in sorted(history, key=lambda item: item["written_at"]):
         if previous["session_id"] == launch["session_id"]:
             environment.update({key: value for key, value in previous["environment"].items()
-                                if key in herdr.MEMBER_MARKS or key.startswith(KEPT_PREFIXES)})
-    environment.update({key: value for key, value in launch["environment"].items() if key != "STAFF_ID"})
-    return environment
+                                if key in herdr.NATIVE_ID_MARKS or _needed(key)})
+    environment.update(launch["environment"])
+    current = launch.copy()
+    current["environment"] = environment
+    return without_legacy_identity(current)["environment"]
 
 
 def matching_launch(place: herdr.HerdrPlace, session_id: str) -> PaneLaunch | None:
@@ -229,10 +231,17 @@ def _set_ended(session: str, pane_id: str, session_id: str, ended: bool,
 
 def forget_unit(unit_id: str) -> list[str]:
     """Drop every entry of a unit's director, in each session's record; a rename relaunches it in a new pane."""
+    from scripts.production import staff
+
+    record = staff.snapshot()
+    owner = record.by_member_reference(unit_id)
+    if owner is None or owner.kind != "unit":
+        print(f"{unit_id}: no unit staff row; launch records retained", file=sys.stderr)
+        return []
     dropped: list[str] = []
     for path in sorted(record_directory().glob("*.json")):
         for pane, entry in pane_launch.read_strict(path).items():
-            if entry["environment"].get("SHOWRUNNER_UNIT_ID") == unit_id:
+            if record.by_member_reference(entry["session_id"]) == owner:
                 pane_launch.retire_launch(path, pane, entry)
                 dropped.append(f"{path.stem}:{pane}")
     return dropped
@@ -240,7 +249,7 @@ def forget_unit(unit_id: str) -> list[str]:
 
 def _needed(name: str) -> bool:
     """An environment name a record reads; the value of any other name is dropped as it is read."""
-    return name == "CLAUDE_CONFIG_DIR" or name in KEPT_NAMES or name.startswith(KEPT_PREFIXES)
+    return name == "CLAUDE_CONFIG_DIR" or name in KEPT_NAMES
 
 
 def _environment(parts: Sequence[bytes]) -> dict[str, str]:

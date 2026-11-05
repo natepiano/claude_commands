@@ -83,6 +83,7 @@ class GateRun(TypedDict):
     dirty: bool
     suites: list[SuiteRun]
     modules: list[ModuleRun]
+    slow_test_s: float
 
 
 class GateRunRecord(GateRun):
@@ -90,6 +91,7 @@ class GateRunRecord(GateRun):
     v: int
     id: str
     host: str
+    tests_run: int
 
 
 @dataclass(frozen=True)
@@ -182,12 +184,10 @@ def slow_test_s() -> float:
     return conf.read("test_times").number("SLOW_TEST_S")
 
 
-def module_runs(executions: Sequence[Execution]) -> list[ModuleRun]:
+def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[ModuleRun]:
     """Keep each attempt and select its test times with one threshold."""
     attempts: dict[tuple[str, str], int] = {}
     modules: list[ModuleRun] = []
-    threshold_read = False
-    threshold = 0.0
     for job in executions:
         key = (job.suite, job.module)
         attempts[key] = attempts.get(key, 0) + 1
@@ -199,13 +199,10 @@ def module_runs(executions: Sequence[Execution]) -> list[ModuleRun]:
             "times_missing": job.times.reason if isinstance(job.times, NoModuleTimes) else "",
         }
         if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
-            if not threshold_read:
-                threshold = slow_test_s()
-                threshold_read = True
             times = job.times
             module.update(tests_run=times["tests_run"], failures=times["failures"],
                           errors=times["errors"], skipped=times["skipped"], tests_s=times["tests_s"],
-                          tests=kept_tests(times, threshold))
+                          tests=kept_tests(times, slow_test_s))
         modules.append(module)
     return modules
 
@@ -225,7 +222,8 @@ def write_gate_run(run: GateRun) -> None:
         epoch = time.time()
         host = store.host_name()
         entry: GateRunRecord = {"kind": "gate_run", "v": record.RECORD_VERSION,
-                                "id": record.new_id(host, epoch), "host": host, **run}
+                                "id": record.new_id(host, epoch), "host": host, **run,
+                                "tests_run": sum(module["tests_run"] for module in run["modules"])}
         store.append_line(store.host_file(host, epoch), entry)
     except Exception as error:
         report_not_written(error)

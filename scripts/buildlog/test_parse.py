@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import index
@@ -21,6 +22,11 @@ import parse
 import test_record as record_tests
 from store import UNKNOWN_IDENTITY
 from test_index import use_test_log
+
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
+else:
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
 
 use_test_log()
 
@@ -51,6 +57,12 @@ def fixture(name: str) -> str:
 
 def facts(step: str, name: str) -> parse.LogFacts:
     return parse.log_facts(step, fixture(name))
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
+    _ = write_config_fixture(root / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
 
 
 class ArgvTests(unittest.TestCase):
@@ -315,6 +327,17 @@ class SweepTests(unittest.TestCase):
 
 
 class NextestFormTests(unittest.TestCase):
+    def test_logs_without_test_results_do_not_require_the_nextest_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary)
+            _ = write_config_fixture(config / "test_times.conf")
+            _ = write_config_fault(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=unusable")
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                rows, summaries = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
+                self.assertEqual((rows, summaries), ([], []))
+                with self.assertRaises(ValueError):
+                    _ = parse.test_results(["        PASS [ 2.000s] hana tests::slow"])
+
     def test_slow_and_timeout(self) -> None:
         result = parse.log_facts("nextest", NEXTEST_TIMEOUT)
         self.assertEqual(result["tests_run"], 3)

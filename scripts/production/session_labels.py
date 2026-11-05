@@ -4,7 +4,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from scripts.production import staff, showrunners, unit_names
+from scripts.production import staff, showrunners
+from scripts.lib import legacy_identity
 
 
 def showrunner_owner(record: staff.StaffSnapshot, slug: str, document: str) -> staff.StaffRow | None:
@@ -41,25 +42,9 @@ class StaffLabels:
 
     def environment(self, environment: Mapping[str, str], session_id: str) -> dict[str, str]:
         """Join the current native runtime identity without inferring a member."""
-        result = {key: value for key, value in environment.items() if key != "STAFF_ID"}
+        result = legacy_identity.without_legacy_identity(environment)
         row = self.record.by_current_session(session_id) if session_id else None
         if row is None:
             return result
         result["CLAUDE_CODE_SESSION_ID"] = row.current_session
-        if row.kind in ("showrunner", "agent"):
-            _ = result.pop("SHOWRUNNER_UNIT", None)
-            _ = result.pop("SHOWRUNNER_UNIT_ID", None)
-        elif row.kind == "unit":
-            parent = self.record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
-            if parent is None or parent.kind != "showrunner":
-                return result
-            slugs = [slug for slug, owner in self.showrunners.items() if owner.id == parent.id]
-            slug = slugs[0] if len(slugs) == 1 else parent.name
-            result["SHOWRUNNER_UNIT"] = slug
-            retained_id = result.get("SHOWRUNNER_UNIT_ID", "")
-            try:
-                retained_owner = unit_names.name(retained_id) if retained_id else ""
-            except unit_names.BadName:
-                retained_owner = ""
-            result["SHOWRUNNER_UNIT_ID"] = retained_id if retained_owner == row.name else unit_names.unit_id(row.name)
         return result

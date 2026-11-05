@@ -448,6 +448,8 @@ def _clock(epoch: float) -> str:
 def report(since: float, until: float, host: str = "natedev", root: Path | None = None) -> str:
     root = root if root is not None else store.root()
     index = buildlog_index.index_path_in(root)
+    if not index.exists():
+        _ = buildlog_index.update_in(root)
     steps = load_steps(index, since, until, host)
     arms: dict[int | None, list[Step]] = defaultdict(list)
     for step in steps:
@@ -489,8 +491,7 @@ def report(since: float, until: float, host: str = "natedev", root: Path | None 
     configuration = read_memory_config()
     r_values: dict[int | None, float | None] = {
         width: expected_peak(repository, "nextest", host, datetime.fromtimestamp(until, UTC), root, width,
-                             first_peak_bytes=configuration.program_first_peaks["cargo"],
-                             budget=configuration.build_budget_bytes).bytes / GIB
+                             first_peak_bytes=configuration.program_first_peaks["cargo"]).bytes / GIB
         for width in widths
     }
 

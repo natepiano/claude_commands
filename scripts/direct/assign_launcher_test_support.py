@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
@@ -26,15 +27,32 @@ ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
 
 
+@dataclass(frozen=True)
+class InProcessAssignment:
+    """Call the assignment entry point in this process."""
+
+
+@dataclass(frozen=True)
+class LauncherScript:
+    """Run an assignment shell script in a separate process."""
+
+    path: Path
+
+
+AssignmentExecution = InProcessAssignment | LauncherScript
+DEFAULT_ASSIGNMENT_EXECUTION = InProcessAssignment()
+
+
 def read_object(path: Path) -> dict[str, object]:
     with path.open() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
         records = cast(dict[str, object], json.load(handle))
     if path.name == codex_mesh.ROSTER_FILE:
         records = fixture_worker_records(records, staff.local_snapshot())
+        assignments = codex_mesh.task_assignments()
         for raw in records.values():
             entry = cast(dict[str, object], raw)
-            role = codex_mesh.task_role(str(entry.get("thread_id", "")))
+            role = codex_mesh.task_role(str(entry.get("thread_id", "")), assignments)
             if isinstance(role, codex_mesh.AssignedWorkerRole):
                 entry["role"] = role.role
     return records
@@ -136,7 +154,7 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
 
     def launch(self, role: str = "implement", *options: str,
                paths: bool = True, session: bool = True,
-               script: Path | None = None) -> subprocess.CompletedProcess[str]:
+               execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
         arguments = ["--role", role, "--cwd", str(self.project),
                      "--phase", "7", "--prompt", str(self.prompt)]
         if session:
@@ -144,9 +162,9 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         if paths and role in {"implement", "test", "fix"}:
             arguments.extend(["--paths", str(self.paths)])
         arguments.extend(options)
-        if script is None:
+        if isinstance(execution, InProcessAssignment):
             return invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
-        return self.run_launcher(["bash", str(script), *arguments])
+        return self.run_launcher(["bash", str(execution.path), *arguments])
 
     def run_launcher(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         with subprocess.Popen(arguments, env=os.environ.copy(), cwd=ROOT, text=True,
@@ -156,8 +174,8 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
 
     def successful(self, role: str = "implement", *options: str,
-                   script: Path | None = None) -> subprocess.CompletedProcess[str]:
-        result = self.launch(role, *options, script=script)
+                   execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
+        result = self.launch(role, *options, execution=execution)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 

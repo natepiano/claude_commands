@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Show gate, module and kept test times for the current host."""
+"""Show repository test times and gate module times for the current host."""
 from __future__ import annotations
 
 import argparse
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sqlite3
@@ -16,14 +16,19 @@ from typing import TYPE_CHECKING, Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 if TYPE_CHECKING:
-    from ..buildlog import index as index, store
+    from ..buildlog import index as index, parse, store, treekey
+    from ..buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 else:
     import index
+    import parse
     import store
+    import treekey
+    from mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+TOOL_REPOSITORY = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(TOOL_REPOSITORY))
 from scripts.lib import conf
-from scripts.lib.terminal_cells import pad_right, terminal_width
+from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
 from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
@@ -48,6 +53,11 @@ def query_rows(connection: sqlite3.Connection, sql: str,
 
 
 @dataclass(frozen=True)
+class ThresholdNotRecorded:
+    """The legacy run does not record its test threshold."""
+
+
+@dataclass(frozen=True)
 class ModuleAttempt:
     run_id: str
     started_at: str
@@ -63,14 +73,17 @@ class ModuleAttempt:
     tests_run: int
     tests_s: float
     aborted: bool
+    slow_test_s: float | ThresholdNotRecorded
 
     @classmethod
     def from_row(cls, row: dict[str, object]) -> ModuleAttempt:
+        threshold = row["slow_test_s"]
         return cls(str(row["run_id"]), str(row["started_at"]), str(row["suite"]), str(row["module"]),
                    int(str(row["attempt"])), str(row["restart"]), str(row["times_missing"]),
                    float(str(row["wall_s"])), float(str(row["cpu_s"])), float(str(row["peak_mib"])),
                    int(str(row["status"])), int(str(row["tests_run"])), float(str(row["tests_s"])),
-                   bool(row["aborted"]))
+                   bool(row["aborted"]),
+                   ThresholdNotRecorded() if threshold is None else float(str(threshold)))
 
     @property
     def key(self) -> tuple[str, str]:
@@ -79,6 +92,11 @@ class ModuleAttempt:
     @property
     def name(self) -> str:
         return f"{self.suite}/{self.module}"
+
+
+MODULE_ATTEMPTS_QUERY = """
+    SELECT m.*, r.aborted, r.slow_test_s FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+"""
 
 
 @dataclass(frozen=True)
@@ -100,10 +118,6 @@ def local_time(value: str) -> str:
     return datetime.fromisoformat(value).astimezone(user_zone()).strftime("%m-%d %H:%M")
 
 
-def seconds(value: float) -> str:
-    return f"{value:.3f}"
-
-
 def verdict(status: int) -> str:
     return "PASS" if status == 0 else "RED"
 
@@ -116,32 +130,27 @@ def mebibytes(value: float) -> str:
     return f"{value:.3f}"
 
 
-def print_table(headers: Sequence[str], rows: Sequence[Sequence[str]],
-                empty_message: str = "no gate runs recorded yet") -> None:
-    if not rows:
-        print(empty_message)
-        return
-    widths = [max(terminal_width(header), *(terminal_width(row[column]) for row in rows))
-              for column, header in enumerate(headers)]
-    for row in [headers, *rows]:
-        print("  ".join(pad_right(value, width)
-                        for value, width in zip(row, widths, strict=True)).rstrip())
-
-
 def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> None:
-    live = {(suite, test_module_name(repo, suite, path))
-            for suite, path in discover_test_modules(repo)}
-    live.add(TYPE_CHECK_JOB)
-    count = conf.read("test_times").whole("TOP_RUNS")
+    modules = {(suite, test_module_name(repo, suite, path))
+               for suite, path in discover_test_modules(repo)}
+    config = conf.read("test_times")
+    count = config.whole("TOP_RUNS")
+    checkout = Path(config.text("TOP_CHECKOUT")).expanduser().resolve()
+    checkouts = [str(row["checkout"]) for row in query(connection,
+                 "SELECT DISTINCT checkout FROM gate_runs WHERE host = ?", (host,))
+                 if Path(str(row["checkout"])).expanduser().resolve() == checkout]
+    checkout_parameters = ", ".join(["?"] * len(checkouts))
+    oldest = cutoff(config.whole("TOP_MAX_AGE_DAYS"))
     histories: list[list[ModuleAttempt]] = []
-    for folder, filename in sorted(live):
+    for folder, filename in sorted(modules | {TYPE_CHECK_JOB}):
         history: list[ModuleAttempt] = []
         seen: set[str] = set()
-        for row in query_rows(connection, """
-            SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+        for row in query_rows(connection, MODULE_ATTEMPTS_QUERY + f"""
             WHERE m.suite = ? AND m.module = ? AND m.host = ? AND m.restart = ''
+              AND m.status = 0 AND r.aborted = 0 AND r.checkout IN ({checkout_parameters})
+              AND m.started_at >= ?
             ORDER BY m.started_at DESC, m.run_id DESC, m.attempt ASC
-        """, (folder, filename, host)):
+        """, (folder, filename, host, *checkouts, oldest)):
             attempt = ModuleAttempt.from_row(row)
             if attempt.run_id in seen:
                 continue
@@ -151,6 +160,8 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
                 break
         if history:
             histories.append(history)
+    unmeasured = [f"{folder}/{filename}"
+                  for folder, filename in sorted(modules - {history[0].key for history in histories})]
     ranked = sorted(((statistics.median(attempt.wall_s for attempt in history), history)
                      for history in histories), key=lambda item: (-item[0], item[1][0].name))[:limit]
     output: list[list[str]] = []
@@ -173,10 +184,67 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
                  "slowest kept test", "runs counted"], output, "no modules recorded yet")
     if output:
         print(f"{len(output)} modules; sum of medians {seconds(sum(item[0] for item in ranked))} s")
+    if unmeasured:
+        print(f"unmeasured: {len(unmeasured)} live modules: {', '.join(unmeasured)}")
 
 
 def cutoff(days: int) -> str:
     return store.utc_iso((datetime.now(UTC) - timedelta(days=days)).timestamp())
+
+
+@dataclass
+class NextestHistory:
+    binary: str
+    test: str
+    passed_seconds: list[float] = field(default_factory=list)
+    runs_kept: int = 0
+    failures: int = 0
+    last_seconds: float | DurationNotRecorded = DURATION_NOT_RECORDED
+
+    @property
+    def median_seconds(self) -> float | DurationNotRecorded:
+        return statistics.median(self.passed_seconds) if self.passed_seconds else DURATION_NOT_RECORDED
+
+    @property
+    def rank(self) -> tuple[bool, float, str, str]:
+        duration = self.median_seconds if self.passed_seconds else self.last_seconds
+        value = duration if isinstance(duration, float) else 0.0
+        return not self.passed_seconds, -value, self.binary, self.test
+
+
+def nextest_top(connection: sqlite3.Connection, host: str, limit: int, repo: Path, identity: str) -> None:
+    """Rank retained nextest results within one repository, host and age limit."""
+    config = conf.read("test_times")
+    threshold = parse.nextest_slow_test_s()
+    histories: dict[tuple[str, str], NextestHistory] = {}
+    for row in query_rows(connection, """
+        SELECT t.binary, t.test, t.status, t.duration_s FROM steps s INDEXED BY steps_host_started
+        JOIN tests t ON t.step_id = s.id
+        WHERE s.repo_identity = ? AND s.host = ? AND s.started_at >= ?
+        ORDER BY s.started_at
+    """, (identity, host, cutoff(config.whole("TOP_MAX_AGE_DAYS")))):
+        binary, name = str(row["binary"]), str(row["test"])
+        key = binary, name
+        if key not in histories:
+            histories[key] = NextestHistory(binary, name)
+        history = histories[key]
+        history.runs_kept += 1
+        status = str(row["status"])
+        recorded_duration = row["duration_s"]
+        duration = recorded_duration if isinstance(recorded_duration, float) else DURATION_NOT_RECORDED
+        if status in ("passed", "flaky") and isinstance(duration, float):
+            history.passed_seconds.append(duration)
+        if status in ("failed", "timed_out"):
+            history.failures += 1
+        history.last_seconds = duration
+    ranked = sorted(histories.values(), key=lambda history: history.rank)[:limit]
+    print(f"repository: {repo.name} ({identity}); host: {host}; recorded threshold: > {seconds(threshold)} s")
+    print_table(["rank", "binary", "test", "median s", "runs kept", "failed / timed out", "last s"], [
+        [str(rank), history.binary, history.test,
+         seconds(median) if isinstance(median := history.median_seconds, float) else "",
+         str(history.runs_kept), str(history.failures),
+         seconds(history.last_seconds) if isinstance(history.last_seconds, float) else ""]
+        for rank, history in enumerate(ranked, 1)], "no nextest tests recorded yet")
 
 
 def suites(connection: sqlite3.Connection, host: str, days: int) -> None:
@@ -187,9 +255,10 @@ def suites(connection: sqlite3.Connection, host: str, days: int) -> None:
         ) AS slowest FROM gate_runs r
         WHERE r.host = ? AND r.started_at >= ? ORDER BY r.started_at DESC, r.id DESC
     """, (host, cutoff(days)))
-    print_table(["start", "host", "selection", "modules run", "wall s", "status", "slowest module", "run"], [
+    print_table(["start", "host", "selection", "modules run", "tests run", "wall s", "status", "slowest module", "run"], [
         [local_time(str(row["started_at"])), str(row["host"]), str(row["selection"]),
-         str(row["modules_run"]), seconds(float(str(row["wall_s"]))), verdict(int(str(row["status"]))),
+         str(row["modules_run"]), "" if row["tests_run"] is None else str(row["tests_run"]),
+         seconds(float(str(row["wall_s"]))), verdict(int(str(row["status"]))),
          str(row["slowest"] or ""), run_mark(bool(row["aborted"]))] for row in rows])
 
 
@@ -207,8 +276,7 @@ def suite(connection: sqlite3.Connection, host: str, folder: str, days: int) -> 
 
 def module(connection: sqlite3.Connection, host: str, name: str, runs: int) -> None:
     folder, filename = name.split("/", 1)
-    attempts = [ModuleAttempt.from_row(row) for row in query(connection, """
-        SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+    attempts = [ModuleAttempt.from_row(row) for row in query(connection, MODULE_ATTEMPTS_QUERY + """
         WHERE m.host = ? AND m.suite = ? AND m.module = ?
         ORDER BY m.started_at DESC, m.run_id DESC, m.attempt DESC LIMIT ?
     """, (host, folder, filename, runs))]
@@ -245,8 +313,7 @@ def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> Non
     candidates: list[ModuleAttempt] = []
     for (folder, filename), names in identities.items():
         seen: set[str] = set()
-        for row in query_rows(connection, """
-            SELECT m.*, r.aborted FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+        for row in query_rows(connection, MODULE_ATTEMPTS_QUERY + """
             WHERE m.suite = ? AND m.module = ? AND m.host = ? AND m.started_at >= ?
             ORDER BY m.started_at DESC, m.run_id DESC, m.attempt DESC
         """, (folder, filename, host, min(names.values()))):
@@ -270,12 +337,15 @@ def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> Non
             if attempt.started_at < first_at:
                 continue
             duration = ""
-            status = "not kept"
             if attempt.times_missing:
                 status = "times missing"
             elif name in kept:
                 row = kept[name]
                 duration, status = seconds(float(str(row["duration_s"]))), str(row["status"])
+            elif isinstance(attempt.slow_test_s, ThresholdNotRecorded):
+                status = "not kept (slow_test_s unknown)"
+            else:
+                status = f"not kept (faster than {seconds(attempt.slow_test_s)} s or did not run)"
             output.append([local_time(attempt.started_at), attempt.name, name, duration, status,
                            run_mark(attempt.aborted)])
     print_table(["start", "suite/module", "test", "duration s", "status", "run"],
@@ -297,6 +367,7 @@ class ReportRequestArguments(argparse.Namespace):
     command: ReportCommand
     limit: int
     repo: Path
+    host: str
     days: int
     runs: int
     subject: str
@@ -305,9 +376,10 @@ class ReportRequestArguments(argparse.Namespace):
 def arguments(argv: list[str]) -> ReportRequestArguments:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    top_parser = subcommands.add_parser("top", help="rank live modules by their median wall time")
+    top_parser = subcommands.add_parser("top", help="rank repository tests or gate modules by median time")
     _ = top_parser.add_argument("--limit", type=positive, default=20)
-    _ = top_parser.add_argument("--repo", type=Path, default=Path("~/.claude"))
+    _ = top_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    _ = top_parser.add_argument("--host", default=store.host_name())
     suites_parser = subcommands.add_parser("suites", help="show gate runs")
     _ = suites_parser.add_argument("--days", type=positive, default=7)
     suite_parser = subcommands.add_parser("suite", help="show one folder suite")
@@ -352,7 +424,21 @@ def main(argv: list[str] | None = None) -> int:
         host = store.host_name()
         match request.command:
             case "top":
-                top(connection, host, request.limit, request.repo.expanduser().resolve())
+                if TYPE_CHECKING:
+                    from ..buildlog import record
+                else:
+                    import record
+
+                repo = request.repo.expanduser().resolve()
+                repo = Path(treekey.worktree(str(repo)) or str(repo))
+                identity = record.recorded_repository_key(["git"], str(repo))
+                if identity == store.UNKNOWN_IDENTITY:
+                    print(f"repository identity unavailable for {repo}", file=sys.stderr)
+                    return 1
+                if identity == record.recorded_repository_key(["git"], str(TOOL_REPOSITORY)):
+                    top(connection, request.host, request.limit, repo)
+                else:
+                    nextest_top(connection, request.host, request.limit, repo, identity)
             case "suites":
                 suites(connection, host, request.days)
             case "suite":

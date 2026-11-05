@@ -4,23 +4,39 @@ from __future__ import annotations
 import io
 import json
 import os
-import sys
-import subprocess
 from pathlib import Path
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from scripts.production import staff, worker_admission
-from scripts.production.staff_test_support import CHECKOUT, fixture_runtime_id, StaffTestCase, production_membership, unit_membership, showrunner_relationship, transcript_fixture
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff, worker_admission, worker_fill
+from scripts.production.staff_test_support import CHECKOUT, fixture_runtime_id, StaffTestCase, production_membership, unit_membership, recorded_showrunner, transcript_fixture
 
 
 class WorkerFillTests(StaffTestCase):
+    def test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch(self) -> None:
+        _, unit, row = self.tree()
+        run = self.root / "retry"
+        run.mkdir()
+        prompt = run / "prompt.md"
+        _ = prompt.write_text("Complete the retry assignment.")
+        source = transcript_fixture(row, staff.ClaudeBackend())[0]
+        _ = worker_admission.handoff_path(run, row).write_text(f"{worker_admission.HANDOFF_SOURCE_PREFIX}{source}\n")
+        _ = (run / "mesh_roster.json").write_text(json.dumps({row.name: {
+            "staff_id": row.id, "assignment_id": worker_admission.assignment_id(prompt), "dispatch_state": "invalid"}}))
+        result = self.script(CHECKOUT / "scripts/production/worker_fill.py", "coordinate-claude",
+                             "--name", row.name, "--run", str(run), "--prompt", str(prompt),
+                             "--staff-id", row.id, input="attached\ndispatched\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.splitlines(),
+                         [f"anomaly: {row.name}: unknown dispatch_state 'invalid'; using NO_RECORD"])
+        self.assertEqual(result.stdout.splitlines(),
+                         ["attach", str(run / f"{row.id}.opening.md"), f"published {row.current_session}"])
+        allowed = worker_admission.WorkerStartAllowed(row.name, unit.id, run, worker_admission.ExistingWorkerSlot(row))
+        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
     def test_uncertain_claude_dispatch_requires_readable_evidence_before_resending(self) -> None:
         _, unit, row = self.tree()
-        for case, torn, matching, resend in (("matched", True, True, False),
-                                             ("unknown", True, False, False),
-                                             ("absent", False, False, True)):
+        for case, torn, matching in (("matched", True, True), ("unknown", True, False), ("absent", False, False)):
             with self.subTest(case=case):
                 run = self.root / case
                 run.mkdir()
@@ -30,29 +46,35 @@ class WorkerFillTests(StaffTestCase):
                 text = prompt.read_text() if matching else "An unrelated assignment."
                 _ = source.write_text(('{"torn":\n' if torn else "") + json.dumps({
                     "type": "user", "message": {"role": "user", "content": text}}) + "\n")
-                _ = (run / f"{row.id}.handoff.md").write_text(f"Full source transcript: {source}\n")
+                _ = worker_admission.handoff_path(run, row).write_text(f"{worker_admission.HANDOFF_SOURCE_PREFIX}{source}\n")
                 allowed = worker_admission.WorkerStartAllowed(row.name, unit.id, run,
                     worker_admission.ExistingWorkerSlot(row))
-                worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.DISPATCH_DEFERRED)
+                worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
                 before = self.staff_file.read_bytes(), source.read_bytes()
-                result = subprocess.run([sys.executable, str(CHECKOUT / "scripts/production/worker_fill.py"),
-                    "coordinate-claude", "--name", row.name, "--run", str(run), "--role", "impl",
-                    "--prompt", str(prompt), "--staff-id", row.id],
-                    input=row.current_session + "\ndispatched\n", capture_output=True, text=True,
-                    timeout=TEST_HANG_GUARD_SECS, check=False)
-                self.assertEqual(result.returncode, 2 if torn and not matching else 0, result.stderr)
-                if torn and not matching:
-                    self.assertIn("delivery is unknown", result.stderr)
-                self.assertEqual(result.stdout.splitlines(),
-                                 ["attach", str(run / f"{row.id}.opening.md"), "published"]
-                                 if resend else [] if torn and not matching else ["unchanged"])
-                if resend:
+                refused = case == "unknown"
+                arguments = ("coordinate-claude", "--name", row.name, "--run", str(run),
+                             "--prompt", str(prompt), "--staff-id", row.id)
+                if case == "absent":
+                    result = self.script(CHECKOUT / "scripts/production/worker_fill.py", *arguments,
+                                         input="attached\ndispatched\n")
+                    output, errors = result.stdout, result.stderr
+                else:
+                    with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                        code = worker_fill.main(list(arguments))
+                    output, errors = out.getvalue(), err.getvalue()
+                    self.assertEqual(code, 2 if refused else 0, errors)
+                if refused:
+                    self.assertIn("delivery is unknown", errors)
+                self.assertEqual(output.splitlines(),
+                                 ["attach", str(run / f"{row.id}.opening.md"), f"published {row.current_session}"]
+                                 if case == "absent" else [] if refused else ["unchanged"])
+                if case == "absent":
                     opening = (run / f"{row.id}.opening.md").read_text()
                     self.assertIn(prompt.read_text(), opening)
-                    self.assertLess(opening.index(str(run / f"{row.id}.handoff.md")), opening.index(str(source)))
+                    self.assertLess(opening.index(str(worker_admission.handoff_path(run, row))), opening.index(str(source)))
                 self.assertEqual((self.staff_file.read_bytes(), source.read_bytes()), before)
                 self.assertEqual(worker_admission.dispatch_record(allowed).state,
-                                 worker_admission.SwitchState.DISPATCH_DEFERRED if torn and not matching
+                                 worker_admission.SwitchState.DISPATCH_IN_FLIGHT if refused
                                  else worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
 
     def test_staff_id_admits_without_reading_unrelated_malformed_evidence(self) -> None:
@@ -77,7 +99,7 @@ class WorkerFillTests(StaffTestCase):
 
     def test_retired_unit_cannot_admit_a_worker(self) -> None:
         doc = self.production("demo", "models-unit")
-        _ = staff.set_doc(showrunner_relationship("demo").id, staff.LiveDoc("natedev", doc))
+        _ = recorded_showrunner("demo", doc)
         production_membership("demo", "models-unit")
         parent = unit_membership("demo", "models-unit")
         _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=parent.worktree)

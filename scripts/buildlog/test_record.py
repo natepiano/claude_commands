@@ -700,6 +700,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(record["duration_s"], 12.5)
 
     def test_piped_run_records_memory_wait_outside_step_duration(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
         runtime = Path(self.enterContext(short_socket_directory())) / "systemd"
@@ -761,6 +763,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(duration, 7)
 
     def test_launch_memory_wait_limit_refuses_once(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11010048 kB\n")
         command = ('source "$1"; sleep() { SECONDS=$((SECONDS + 1)); }; '
@@ -796,6 +800,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         _ = cases["above floor"].write_text("MemAvailable: 13631488 kB\n")
         for name, meminfo in cases.items():
             with self.subTest(name=name):
+                self.admission.allow_next_start()
                 result = subprocess.run(
                     ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
                     env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
@@ -899,6 +904,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(self.records()[-1]["mem_wait_s"], 0)
 
     def test_unscoped_step_waits_for_memory(self) -> None:
+        self.admission.configure(**{"program_first_peak_gib.cargo": 9})
+        _ = self.admission.occupy_host()
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
         marker = self.base / "step-started"

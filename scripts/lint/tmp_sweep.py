@@ -1374,24 +1374,42 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
     return 1 if result.failed else 0
 
 
+@dataclass(frozen=True)
+class CompletedSweepAssessment:
+    """The sweep assessed its scope and returned this status."""
+
+    status: int
+
+
+@dataclass(frozen=True)
+class SkippedSweepAssessment:
+    """The sweep did not assess its scope."""
+
+    @property
+    def status(self) -> int:
+        return 0
+
+
+SweepAssessment = CompletedSweepAssessment | SkippedSweepAssessment
+
+
 def run_if_due(dry_run: bool, now: float | None = None, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> int:
-    """Run the sweep when the last run started RUN_INTERVAL_SECONDS or more ago. The stamp moves
-    before the run, so a run that fails waits an hour like any other."""
+) -> SweepAssessment:
+    """Assess only a due sweep. Move the stamp before the attempt."""
     moment = time.time() if now is None else now
     stamp = state_dir() / STAMP_NAME
     try:
         if stamp.stat().st_mtime > moment - RUN_INTERVAL_SECONDS:
-            return 0
+            return SkippedSweepAssessment()
     except FileNotFoundError:
         pass
     if not dry_run:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.touch()
         os.utime(stamp, (moment, moment))
-    return run(dry_run, moment, lint_settings=lint_settings, scratch_settings=scratch_settings)
+    return CompletedSweepAssessment(run(dry_run, moment, lint_settings=lint_settings, scratch_settings=scratch_settings))
 
 
 def main(argv: list[str]) -> int:

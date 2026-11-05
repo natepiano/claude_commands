@@ -181,6 +181,14 @@ The root filesystem keeps `floor.json`, `floor.lock`, and `floor-alert.lock`.
 Other filesystems use `floor-<major>-<minor>` with the same suffixes.
 Each filesystem keeps its own growth measurements and alert receipts.
 Old root floor records remain readable.
+Each other sweep keeps its failure record in the same folder, with its own `-alert.lock`.
+Target discovery uses `floor-discovery.json`.
+A workspace sweep uses `workspace-<sha256>.json`, named from its sorted output roots.
+A run from the workspace root and a run from a member folder share that record.
+The temporary sweep uses `temporary-sweep.json`.
+A failure tells natedev once per failure episode, and a clean pass ends the episode.
+A workspace pass that finds no output root is skipped, so it keeps the episode open.
+A clean workspace sweep with no saved record writes no state file.
 Each new `floor_scan` row names its filesystem and probe path.
 CI paths come from `sweep_ci_targets`; missing paths are skipped, and the sweep never takes CI output.
 
@@ -239,8 +247,10 @@ in the lock file. If a known holder keeps a real pass below the floor from
 running longer than `floor_lock_alert_minutes=15` in `[sweep]`, the waiting pass
 tells natedev its pid, command and the free space. The start time, rather than
 the file's mtime, sets the age. A successful send is saved in the floor record
-once per pid and start time; failed sends are tried on the next pass. A hold
-with no readable identity sends no alert. Waiting passes serialize the receipt
+once per pid and start time; failed sends are tried on the next pass. A pass
+that sees no holder keeps that receipt, so the same holder does not alert again.
+A hold whose start time is unreadable alerts once per pid, from the time a pass
+first saw it. Waiting passes serialize the receipt
 check, send and success record under a separate stable `floor-alert.lock`.
 The active pass updates its measurement under that same lock, reading the
 latest receipts before it writes, so neither pass can restore an older record.

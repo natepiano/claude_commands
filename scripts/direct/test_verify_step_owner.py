@@ -24,6 +24,7 @@ WAIT = VERIFY.with_name("wait_for_test_state.py")
 
 
 class StepOwnership(TypedDict):
+    start_format: str
     group: int
     start: str
 
@@ -155,6 +156,7 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
         self.wait_for("both-started", process)
         record = cast(StepOwnership, json.loads(
             (self.root / "board" / "locks" / "cargo.d" / "owned").read_text()))
+        self.assertEqual(record["start_format"], "darwin-lstart-utc-c-v1" if sys.platform == "darwin" else "linux-proc-stat22-v1")
         self.assertEqual(record["group"], self.step_process("real")["group"])
         self.assertNotEqual(record["group"], self.step_process("sweep")["group"])
         self.assertFalse((self.root / "real.finished").exists())

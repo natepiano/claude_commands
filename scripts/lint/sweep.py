@@ -180,7 +180,8 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.message import send_budget
+from scripts.message import send_budget, send_result
+from scripts.message.session_send import session_send_argv
 from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 import conf
@@ -292,6 +293,7 @@ class CargoOutputIndex:
     workspaces: tuple[CargoOutputRoots, ...] = ()
     history: tuple[CargoOutputRoots, ...] = ()
     no_recorded_evidence: tuple[NoRecordedEvidence, ...] = ()
+    known_trees: dict[str, list[str]] = field(default_factory=dict)
 
     @cached_property
     def linked_roots(self) -> dict[str, tuple[str, ...]]:
@@ -419,7 +421,8 @@ def save_cargo_output_roots(index: CargoOutputIndex) -> None:
 def discover_cargo_outputs(roots: Sequence[str], *,
                            lint_settings: conf.ConfigRead) -> tuple[list[str], CargoOutputIndex]:
     """Map recorded step pairs first, then saved pairs. Protect every other target."""
-    discovered = target_dirs(roots, lint_settings=lint_settings)
+    known_trees: dict[str, list[str]] = {}
+    discovered = target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees)
     recorded = recorded_output_roots(build_index.index_path(), store.host_name())
     cached = saved_cargo_output_roots()
     mappings: list[CargoOutputRoots] = []
@@ -441,9 +444,9 @@ def discover_cargo_outputs(roots: Sequence[str], *,
               for path in (item.target_directory, item.build_directory) if path.is_dir()}
     added = sorted(mapped - set(discovered))
     if added:
-        discovered = sorted(set(discovered) | set(target_dirs(added, lint_settings=lint_settings)))
+        discovered = sorted(set(discovered) | set(target_dirs(added, lint_settings=lint_settings, known_trees=known_trees)))
     protected = tuple(NoRecordedEvidence(path) for path in discovered if path not in mapped)
-    index = CargoOutputIndex(combined, no_recorded_evidence=protected)
+    index = CargoOutputIndex(combined, no_recorded_evidence=protected, known_trees=known_trees)
     return sorted(set(discovered) | mapped), index
 
 
@@ -540,6 +543,7 @@ class Scan:
     target_links: dict[str, dict[InodeKey, int]] = field(default_factory=dict)
     whole_targets: list[WholeTargetTake] = field(default_factory=list)
     observations: ScanDirectoryObservations = field(default_factory=ScanDirectoryObservations)
+    changed_targets: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -559,7 +563,6 @@ UNKNOWN_HELD_ROOTS = UnknownHeldRoots()
 class KnownFloorLockHolder:
     pid: int
     started_at: float
-    command: str
 
 
 @dataclass(frozen=True)
@@ -585,26 +588,62 @@ class NoFloorLockAlert:
 
 @dataclass(frozen=True)
 class ObservedUnreadableFloorHold:
-    """An unreadable hold timed from its first observation."""
+    """An unreadable hold awaits a successful alert."""
 
     pid: int
     first_observed_at: float
-    alert_delivered: bool = False
 
 
 @dataclass(frozen=True)
-class AbovePhoneFloor:
-    """Free space has not crossed the phone line since the last reset."""
+class ReportedUnreadableFloorHold:
+    """Natedev received the alert for this unreadable hold."""
+
+    pid: int
+    first_observed_at: float
+
+
+FloorLockAlertState = (DeliveredFloorLockAlert | NoFloorLockAlert
+                       | ObservedUnreadableFloorHold | ReportedUnreadableFloorHold)
 
 
 @dataclass(frozen=True)
-class UnderPhoneFloorPending:
-    """Free space crossed the phone line, but phone delivery has not succeeded."""
+class LiveSweepProcess:
+    """The holder is a live sweep."""
 
 
 @dataclass(frozen=True)
-class UnderPhoneFloorPushed:
-    """The current low disk crossing has a delivered phone alert."""
+class OtherFloorProcess:
+    command: str
+
+
+@dataclass(frozen=True)
+class UnreadableFloorProcess:
+    """The holder command cannot be read."""
+
+
+@dataclass(frozen=True)
+class NoLockAlertNeeded:
+    """This observation needs no delivery."""
+
+
+@dataclass(frozen=True)
+class FloorLockAlertCandidate:
+    pid: int
+    started_at: float
+    command: str
+    receipt: DeliveredFloorLockAlert | ReportedUnreadableFloorHold
+
+
+@dataclass(frozen=True)
+class LockAlertTransition:
+    lock_alert: FloorLockAlertState
+    alert: NoLockAlertNeeded | FloorLockAlertCandidate
+
+
+class PhoneCrossing(Enum):
+    ABOVE = "above"
+    UNDER_PENDING = "under_pending"
+    UNDER_PUSHED = "under_pushed"
 
 
 @dataclass(frozen=True)
@@ -625,7 +664,7 @@ class FailurePending:
 
 @dataclass(frozen=True)
 class FailureReported:
-    """The phone received this failure episode, which still needs recovery."""
+    """Natedev received this failure episode, which still needs recovery."""
 
 
 @dataclass(frozen=True)
@@ -636,10 +675,10 @@ class FloorRecord:
     alert_history: NoDeliveredAlert | DeliveredAlert
     push_history: NoDeliveredAlert | DeliveredAlert
     held_roots: UnknownHeldRoots | KnownHeldRoots = UNKNOWN_HELD_ROOTS
-    lock_alert: DeliveredFloorLockAlert | NoFloorLockAlert | ObservedUnreadableFloorHold = NoFloorLockAlert()
+    lock_alert: FloorLockAlertState = NoFloorLockAlert()
     filesystem: str = ""
     measured_roots: tuple[str, ...] = ()
-    phone_crossing: AbovePhoneFloor | UnderPhoneFloorPending | UnderPhoneFloorPushed = AbovePhoneFloor()
+    phone_crossing: PhoneCrossing = PhoneCrossing.ABOVE
     failure: NoFailure | FailurePending | FailureReported = NoFailure()
 
 
@@ -709,6 +748,23 @@ DiskMeasurement = AvailableDiskMeasurement | UnavailableDiskMeasurement
 class FloorAlertChannels(Enum):
     NATEDEV = "natedev"
     NATEDEV_AND_PHONE = "natedev_and_phone"
+
+
+class FloorChannelOutcome(Enum):
+    NOT_ATTEMPTED = "not_attempted"
+    DELIVERED = "delivered"
+    QUEUED = "queued"
+    FAILED = "failed"
+
+    @property
+    def accepted(self) -> bool:
+        return self in (FloorChannelOutcome.DELIVERED, FloorChannelOutcome.QUEUED)
+
+
+@dataclass(frozen=True)
+class FloorAlertDelivery:
+    natedev: FloorChannelOutcome
+    phone: FloorChannelOutcome
 
 
 @dataclass(frozen=True)
@@ -784,23 +840,22 @@ def _build_trees(root: str, depth: int, *,
     return trees
 
 
+def has_cargo_tag(directory: str) -> bool:
+    """Check whether the cache tag identifies Cargo output."""
+    try:
+        with open(os.path.join(directory, CACHE_TAG), "rb") as handle:
+            return CARGO_TAG_LINE in handle.read(512).decode("utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def is_cargo_target(directory: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> bool:
-    """Whether cargo built into directory."""
-    if os.path.isfile(os.path.join(directory, RUSTC_INFO)):
-        return True
-    # Cost: one more stat per directory without rustc info; reads and tree
-    # searches happen only where that stat finds a tag.
-    tag = os.path.join(directory, CACHE_TAG)
-    if not os.path.isfile(tag):
-        return False
-    try:
-        with open(tag, "rb") as handle:
-            lines = handle.read(512).decode("utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return False
-    return CARGO_TAG_LINE in lines and bool(build_trees(directory, lint_settings=lint_settings))
+    """Check whether Cargo built output in this directory."""
+    return (os.path.isfile(os.path.join(directory, RUSTC_INFO))
+            or (os.path.isfile(os.path.join(directory, CACHE_TAG)) and has_cargo_tag(directory)
+                and bool(build_trees(directory, lint_settings=lint_settings))))
 
 
 @dataclass(frozen=True)
@@ -1073,25 +1128,20 @@ def lock_holder(lock: str, locks: str = PROC_LOCKS, *,
     return file_lock.lock_holder(lock, locks, reads=lint_settings.whole("sweep_proc_locks_reads"))
 
 
-def floor_lock_holder(path: str, *,
+def floor_lock_holder(path: str, pid: int, command: bytes, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder:
     """Match the durable hold identity to the pid that currently owns the flock."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    pid = lock_holder(path, lint_settings=lint_settings)
-    if pid is None:
-        return NoFloorLockHolder()
     try:
         raw = cast(object, json.loads(Path(path).read_text()))
         if isinstance(raw, dict):
             data = cast(dict[str, object], raw)
             started = data.get("started_at")
             if data.get("pid") == pid and _finite_number(started) and started >= 0:
-                command = (Path(PROC_DIR) / str(pid) / "cmdline").read_bytes()
-                text = command.replace(b"\0", b" ").decode(errors="replace").strip()
-                if text and lock_holder(path, lint_settings=lint_settings) == pid:
-                    return KnownFloorLockHolder(pid, float(started), text)
+                if command.rstrip(b"\0") and lock_holder(path, lint_settings=lint_settings) == pid:
+                    return KnownFloorLockHolder(pid, float(started))
     except (OSError, ValueError):
         pass
     return UnreadableFloorLockHolder(pid)
@@ -1120,57 +1170,73 @@ def _runs_sweep(command: bytes) -> bool:
     return False
 
 
+def _command_text(command: bytes) -> str:
+    """Decode a process command for a report."""
+    return command.replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+def next_lock_alert(previous: FloorLockAlertState,
+                    holder: KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder,
+                    process: LiveSweepProcess | OtherFloorProcess | UnreadableFloorProcess,
+                    now: float) -> LockAlertTransition:
+    """Compute the observation and delivery candidate without reading or writing state."""
+    if (isinstance(holder, NoFloorLockHolder) or isinstance(process, LiveSweepProcess)) and isinstance(previous, DeliveredFloorLockAlert):
+        return LockAlertTransition(previous, NoLockAlertNeeded())
+    if isinstance(holder, NoFloorLockHolder) or isinstance(process, LiveSweepProcess):
+        return LockAlertTransition(NoFloorLockAlert(), NoLockAlertNeeded())
+    if isinstance(holder, KnownFloorLockHolder):
+        receipt = DeliveredFloorLockAlert(holder.pid, holder.started_at)
+        if previous == receipt:
+            return LockAlertTransition(previous, NoLockAlertNeeded())
+        return LockAlertTransition(NoFloorLockAlert(),
+                                   FloorLockAlertCandidate(holder.pid, holder.started_at,
+                                                           process.command if isinstance(process, OtherFloorProcess)
+                                                           else "command is unreadable", receipt))
+    if isinstance(previous, (ObservedUnreadableFloorHold, ReportedUnreadableFloorHold)) and previous.pid == holder.pid:
+        observed = previous
+    else:
+        observed = ObservedUnreadableFloorHold(holder.pid, now)
+    command = process.command if isinstance(process, OtherFloorProcess) else "command is unreadable"
+    alert = (NoLockAlertNeeded() if isinstance(observed, ReportedUnreadableFloorHold)
+             else FloorLockAlertCandidate(holder.pid, observed.first_observed_at, command,
+                                          ReportedUnreadableFloorHold(holder.pid, observed.first_observed_at)))
+    return LockAlertTransition(observed, alert)
+
+
 def alert_floor_lock(path: str, free: int, floor: int, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
-    """Tell natedev once per overdue hold, retrying failed sends on later passes."""
+    """Report an overdue hold once, then save its observation or delivery receipt."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     record_path = floor_record_path()
     with locked_floor_record(record_path) as previous:
-        holder = floor_lock_holder(path, lint_settings=lint_settings)
-        current = previous if isinstance(previous, FloorRecord) else FloorRecord(
-            time.time(), free, 0, NoDeliveredAlert(), NoDeliveredAlert())
-        if isinstance(holder, NoFloorLockHolder):
-            if isinstance(current.lock_alert, ObservedUnreadableFloorHold):
-                write_floor_record(record_path, replace(current, lock_alert=NoFloorLockAlert()))
-            return
-        command_text = "command is unreadable"
-        try:
-            command = (Path(PROC_DIR) / str(holder.pid) / "cmdline").read_bytes()
-            command_text = command.replace(b"\0", b" ").decode(errors="replace").strip() or command_text
-            if _runs_sweep(command):
-                if isinstance(current.lock_alert, ObservedUnreadableFloorHold):
-                    write_floor_record(record_path, replace(current, lock_alert=NoFloorLockAlert()))
-                return
-        except OSError:
-            pass
-        seconds = int(lint_settings.number(FLOOR_LOCK_ALERT_KEY) * 60)
         now = time.time()
-        if isinstance(holder, UnreadableFloorLockHolder):
-            observed = current.lock_alert
-            if not isinstance(observed, ObservedUnreadableFloorHold) or observed.pid != holder.pid:
-                observed = ObservedUnreadableFloorHold(holder.pid, now)
-                current = replace(current, lock_alert=observed)
-                write_floor_record(record_path, current)
-            started_at = observed.first_observed_at
-            identity = replace(observed, alert_delivered=True)
-        else:
-            started_at = holder.started_at
-            command_text = holder.command
-            identity = DeliveredFloorLockAlert(holder.pid, started_at)
-            if isinstance(current.lock_alert, ObservedUnreadableFloorHold):
-                current = replace(current, lock_alert=NoFloorLockAlert())
-                write_floor_record(record_path, current)
-        if now - started_at < seconds:
-            return
-        if current.lock_alert == identity:
-            return
-        message = (f"natedev has {gib(free)} free, under the {gib(floor)} floor. "
-                   f"The disk floor sweep cannot run: pid {holder.pid} ({command_text}) "
-                   f"has held floor.lock since {when(started_at)}.")
-        if send_floor_alert(message, FloorAlertChannels.NATEDEV, lint_settings=lint_settings):
-            write_floor_record(record_path, replace(current, lock_alert=identity))
+        current = floor_record_or_new(previous, free)
+        process: LiveSweepProcess | OtherFloorProcess | UnreadableFloorProcess = UnreadableFloorProcess()
+        holder: KnownFloorLockHolder | UnreadableFloorLockHolder | NoFloorLockHolder = NoFloorLockHolder()
+        pid = lock_holder(path, lint_settings=lint_settings)
+        if pid is not None:
+            try:
+                command = (Path(PROC_DIR) / str(pid) / "cmdline").read_bytes()
+            except OSError:
+                command = b""
+            if command:
+                process = LiveSweepProcess() if _runs_sweep(command) else OtherFloorProcess(_command_text(command))
+            holder = floor_lock_holder(path, pid, command, lint_settings=lint_settings)
+        transition = next_lock_alert(current.lock_alert, holder, process, now)
+        state = transition.lock_alert
+        candidate = transition.alert
+        seconds = int(lint_settings.number(FLOOR_LOCK_ALERT_KEY) * 60)
+        if isinstance(candidate, FloorLockAlertCandidate) and now - candidate.started_at >= seconds:
+            message = (f"natedev has {gib(free)} free, under the {gib(floor)} floor. "
+                       f"The disk floor sweep cannot run: pid {candidate.pid} ({candidate.command}) "
+                       f"has held floor.lock since {when(candidate.started_at)}.")
+            delivery = send_floor_alert(message, FloorAlertChannels.NATEDEV, lint_settings=lint_settings)
+            if delivery.natedev.accepted:
+                state = candidate.receipt
+        if state != current.lock_alert:
+            write_floor_record(record_path, replace(current, lock_alert=state))
 
 
 def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
@@ -2201,11 +2267,12 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
             scan.target_bytes[root] = sum(scan.blocks[key] for key in scan.target_links.get(root, {}))
         return scan
 
+    paired_roots = output_index.roots_for
     clusters: list[tuple[str, ...]] = []
     assigned: set[str] = set()
     for root in roots:
         if root not in assigned:
-            cluster = tuple(path for path in OUTPUT_ROOTS.get().roots_for(root) if path in roots)
+            cluster = tuple(path for path in paired_roots(root) if path in roots)
             clusters.append(cluster)
             assigned.update(cluster)
     if not clusters:
@@ -2213,13 +2280,8 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
     if len(clusters) == 1:
         return scan_target(clusters[0])
     combined = Scan(discovered_targets=discovered)
-    scan_workers = lint_settings.whole("sweep_scan_workers")
-    if isinstance(FLOOR_FILESYSTEM.get(), FilesystemFloor):
-        # Natedev scans finish faster without contention between Python scan threads.
-        scan_workers = 1
-    with ThreadPoolExecutor(max_workers=scan_workers) as workers:
-        scans = map(scan_target, clusters) if scan_workers == 1 else workers.map(scan_target, clusters)
-        for scan in scans:
+    with ThreadPoolExecutor(max_workers=lint_settings.whole("sweep_scan_workers")) as workers:
+        for scan in workers.map(scan_target, clusters):
             combined.blocks.update(scan.blocks)
             combined.links.update(scan.links)
             combined.groups.extend(scan.groups)
@@ -2318,11 +2380,16 @@ class TargetRootSearch:
     owned_trees: set[str] = field(default_factory=set)
     targets: set[str] = field(default_factory=set)
     checkouts: list[str] = field(default_factory=list)
+    known_trees: dict[str, list[str]] = field(default_factory=dict)
+
+
+DISCOVERY_BRANCH_LEVELS = 3
 
 
 def target_dirs(roots: Sequence[str], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     checkouts: list[str] | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    known_trees: dict[str, list[str]] | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[str]:
     """Every cargo target directory under roots."""
     if isinstance(lint_settings, UseConfiguredValue):
@@ -2334,8 +2401,7 @@ def target_dirs(roots: Sequence[str], *,
     skipped = frozenset(lint_settings.words("sweep_floor_skip"))
     marker_names = frozenset(("Cargo.toml", RUSTC_INFO, CACHE_TAG))
 
-    def visit(search: TargetRootSearch) -> None:
-        directory, depth = search.frontier.pop()
+    def visit(search: TargetRootSearch, directory: str, depth: int) -> None:
         if directory in search.owned_trees:
             return
         children: list[os.DirEntry[str]] = []
@@ -2359,13 +2425,17 @@ def target_dirs(roots: Sequence[str], *,
                 markers.add(GIT_DIR)
         if "Cargo.toml" in markers:
             search.checkouts.append(directory)
-        if (RUSTC_INFO in markers or CACHE_TAG in markers) and is_cargo_target(directory, lint_settings=lint_settings):
-            search.targets.add(os.path.realpath(directory))
-            # Search residue for nested targets, but exclude Cargo's own build trees.
-            depth = 0
-            search.owned_trees.update(_build_trees(directory, tree_depth, lint_settings=lint_settings))
-            if directory in search.owned_trees:
-                return
+        if RUSTC_INFO in markers or (CACHE_TAG in markers and has_cargo_tag(directory)):
+            trees = _build_trees(directory, tree_depth, lint_settings=lint_settings)
+            if RUSTC_INFO in markers or trees:
+                target = os.path.realpath(directory)
+                search.targets.add(target)
+                search.known_trees[target] = trees
+                # Exclude Cargo build trees when searching for nested targets.
+                depth = 0
+                search.owned_trees.update(trees)
+                if directory in search.owned_trees:
+                    return
         if depth < search_depth:
             # Style keeps its cache under .git. Do not search Git objects.
             retained = os.path.join(directory, GIT_DIR, scratch.STYLE_TARGET_NAME)
@@ -2376,29 +2446,26 @@ def target_dirs(roots: Sequence[str], *,
 
     def search_branch(search: TargetRootSearch) -> TargetRootSearch:
         while search.frontier:
-            visit(search)
+            directory, depth = search.frontier.pop()
+            visit(search, directory, depth)
         return search
 
     def collect(search: TargetRootSearch) -> None:
         found.update(search.targets)
         owned_trees.update(search.owned_trees)
+        if isinstance(known_trees, dict):
+            known_trees.update(search.known_trees)
         if isinstance(checkouts, list):
             checkouts.extend(search.checkouts)
 
     # Branches share no directory traversal state. Preserve the depth from each configured root.
-    with ThreadPoolExecutor(max_workers=lint_settings.whole("sweep_scan_workers")) as workers:
+    with ThreadPoolExecutor(max_workers=lint_settings.whole("sweep_discovery_workers")) as workers:
         for root in roots:
             search = TargetRootSearch([(os.path.expanduser(root), 0)], set(owned_trees))
-            visit(search)
-            # Separate large scratch trees through three directory levels before concurrent searches.
-            for _ in range(2):
+            for _ in range(DISCOVERY_BRANCH_LEVELS):
                 frontier, search.frontier = search.frontier, []
-                for branch in frontier:
-                    search.frontier.append(branch)
-                    visit(search)
-            if len(search.frontier) < 2:
-                collect(search_branch(search))
-                continue
+                for directory, depth in frontier:
+                    visit(search, directory, depth)
             collect(search)
             branches = (TargetRootSearch([branch], set(search.owned_trees)) for branch in search.frontier)
             for result in workers.map(search_branch, branches):
@@ -2541,6 +2608,9 @@ def shrink_floor(
                             continue
                         attempted.append(group)
                         account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
+                        if isinstance(account, ConfirmedDeletion) and account.removed:
+                            scan.changed_targets.add(root)
+                            scan.changed_targets.update(OUTPUT_ROOTS.get().roots_for(root))
                         filesystem = FLOOR_FILESYSTEM.get()
                         credited = (account.device_bytes.get(filesystem.device, 0)
                                     if isinstance(account, ConfirmedDeletion) and isinstance(filesystem, FilesystemFloor)
@@ -2667,6 +2737,16 @@ def record_before_delete(paths: Sequence[str], *, known_targets: Sequence[str] =
     return True
 
 
+def floor_record_or_new(previous: NoFloorRecord | FloorRecord, free: int) -> FloorRecord:
+    """Use the saved record, or start a record with this free-space reading."""
+    return previous if isinstance(previous, FloorRecord) else FloorRecord(
+        time.time(), free, 0, NoDeliveredAlert(), NoDeliveredAlert())
+
+
+def _valid_pid(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
     try:
         value = cast(object, json.loads(path.read_text()))
@@ -2692,25 +2772,25 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
     held_roots: UnknownHeldRoots | KnownHeldRoots = UNKNOWN_HELD_ROOTS
     if isinstance(roots, list) and all(isinstance(root, str) for root in cast(list[object], roots)):
         held_roots = KnownHeldRoots(frozenset(cast(list[str], roots)))
-    lock_alert: DeliveredFloorLockAlert | NoFloorLockAlert | ObservedUnreadableFloorHold = NoFloorLockAlert()
+    lock_alert: FloorLockAlertState = NoFloorLockAlert()
     saved_alert = data.get("lock_alert")
     if isinstance(saved_alert, dict):
         saved = cast(dict[str, object], saved_alert)
         pid, started = saved.get("pid"), saved.get("started_at")
-        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _finite_number(started):
-            lock_alert = DeliveredFloorLockAlert(pid, float(started))
-        observed = saved.get("first_observed_at")
-        delivered = saved.get("alert_delivered")
-        if (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-                and _finite_number(observed) and observed >= 0 and isinstance(delivered, bool)):
-            lock_alert = ObservedUnreadableFloorHold(pid, float(observed), delivered)
+        if _valid_pid(pid):
+            if _finite_number(started):
+                lock_alert = DeliveredFloorLockAlert(pid, float(started))
+            observed = saved.get("first_observed_at")
+            delivered = saved.get("alert_delivered")
+            if _finite_number(observed) and observed >= 0 and isinstance(delivered, bool):
+                lock_alert = (ReportedUnreadableFloorHold(pid, float(observed)) if delivered
+                              else ObservedUnreadableFloorHold(pid, float(observed)))
     filesystem = data.get("filesystem", "")
     measured_roots = data.get("measured_roots", [])
-    crossing: AbovePhoneFloor | UnderPhoneFloorPending | UnderPhoneFloorPushed = AbovePhoneFloor()
-    if data.get("phone_crossing") == "under_pushed":
-        crossing = UnderPhoneFloorPushed()
-    elif data.get("phone_crossing") == "under_pending":
-        crossing = UnderPhoneFloorPending()
+    try:
+        crossing = PhoneCrossing(data.get("phone_crossing", PhoneCrossing.ABOVE.value))
+    except ValueError:
+        crossing = PhoneCrossing.ABOVE
     failure: NoFailure | FailurePending | FailureReported = NoFailure()
     saved_failure = data.get("failure")
     if saved_failure == "reported":
@@ -2746,8 +2826,7 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         "build_cache_bytes": record.build_cache_bytes,
         "last_alert_at": alert_at,
         "last_push_at": push_at,
-        "phone_crossing": ("under_pushed" if isinstance(record.phone_crossing, UnderPhoneFloorPushed)
-                           else "under_pending" if isinstance(record.phone_crossing, UnderPhoneFloorPending) else "above"),
+        "phone_crossing": record.phone_crossing.value,
     }
     if isinstance(record.failure, FailurePending):
         data["failure"] = {"status": record.failure.event.status, "detail": record.failure.event.detail}
@@ -2758,8 +2837,12 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
     if record.filesystem:
         data["filesystem"] = record.filesystem
         data["measured_roots"] = list(record.measured_roots)
-    if isinstance(record.lock_alert, (DeliveredFloorLockAlert, ObservedUnreadableFloorHold)):
+    if isinstance(record.lock_alert, DeliveredFloorLockAlert):
         data["lock_alert"] = asdict(record.lock_alert)
+    elif isinstance(record.lock_alert, (ObservedUnreadableFloorHold, ReportedUnreadableFloorHold)):
+        data["lock_alert"] = {"pid": record.lock_alert.pid,
+                              "first_observed_at": record.lock_alert.first_observed_at,
+                              "alert_delivered": isinstance(record.lock_alert, ReportedUnreadableFloorHold)}
     if isinstance(record.held_roots, KnownHeldRoots):
         data["held_roots"] = sorted(record.held_roots.roots)
     _ = partial.write_text(json.dumps(data) + "\n")
@@ -2957,7 +3040,6 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
             outcome = "no session found"
         return f"- {holder_text(holder, path_limit)}; {outcome}"
 
-    closing = ["The disk sweep sends alerts only to natedev."]
     def render(path_limit: int) -> str:
         return "\n".join([
             f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No idle build cache is left to remove.",
@@ -2966,7 +3048,7 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
             f"Not swept: CI's targets ({gib(ci_bytes)}).",
             *([f"Could not remove {failures} {'path' if failures == 1 else 'paths'} this sweep; the next sweep tries again."] if failures else []),
             *protected_folder_lines(protected, path_limit, lint_settings=lint_settings),
-            *closing,
+            "No phone alert was attempted for this event.",
             *disk_measurement_lines(measurement, 0, 0, now, False, path_limit, lint_settings=lint_settings),
         ])
     return fit_alert_text(render, lint_settings=lint_settings)
@@ -2986,18 +3068,15 @@ def holder_message_text(holder: FloorHolder, free: int, floor: int, *,
     ])
 
 
-def page_paths(holders: Sequence[FloorHolder], measurement: DiskMeasurement) -> list[str]:
-    """What holds the space, for the page: each busy target, then the largest measured folders
-    outside build caches. A folder that holds another listed folder is left out, so each path is exact."""
-    paths = [f"{holder.path}: frees {gib(holder.bytes)}. Process {holder.pid} uses it now and can fail." if holder.pid is not None
-             else f"{holder.path}: frees {gib(holder.bytes)}. A build uses it now and can fail." for holder in holders]
-    if isinstance(measurement, AvailableDiskMeasurement):
-        names = [item.path for item in measurement.directories]
-        leaves = [item for item in measurement.directories
-                  if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
-        paths.extend(f"{item.path}: holds {gib(item.bytes)}."
-                     for item in sorted(leaves, key=lambda item: item.bytes, reverse=True))
-    return paths
+def page_paths(measurement: DiskMeasurement) -> list[str]:
+    """List measured folders without duplicate parent folders."""
+    if not isinstance(measurement, AvailableDiskMeasurement):
+        return []
+    names = [item.path for item in measurement.directories]
+    leaves = [item for item in measurement.directories
+              if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
+    return [f"{item.path}: holds {gib(item.bytes)}."
+            for item in sorted(leaves, key=lambda item: item.bytes, reverse=True)]
 
 
 def measure_protected_folders(roots: frozenset[str], excluded: frozenset[str]) -> tuple[tuple[str, int], ...]:
@@ -3025,79 +3104,66 @@ class NoPhoneAlert:
 NO_PHONE_ALERT = NoPhoneAlert()
 
 
-def session_send_argv(to: str, *,
-    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> list[str]:
-    """send.py's argv for a disk floor message to the session named to; the text goes on stdin."""
-    if isinstance(lint_settings, UseConfiguredValue):
-        lint_settings = conf.read("lint")
-    return [sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
-            "--to", to, "--from", "disk_floor", "--timeout", f"{lint_settings.number("sweep_sender_timeout_seconds"):g}"]
-
-
 def send_holder_message(session: str, message: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> bool:
-    """Tell a session that its process holds a target the floor needs; True when send.py delivered
-    the message or queued it (exit 1)."""
+) -> FloorChannelOutcome:
+    """Send a session message and distinguish delivery, queuing, and failure."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     try:
-        result = subprocess.run(session_send_argv(session, lint_settings=lint_settings), input=message, text=True, capture_output=True, timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
+        result = subprocess.run(session_send_argv(session, lint_settings=lint_settings), input=message,
+                                text=True, capture_output=True,
+                                timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
-        return False
-    if result.returncode in (0, 1):
-        print(f"lint sweep: message to {session} {'queued' if result.returncode == 1 else 'delivered'}")
-        return True
-    print(f"lint sweep: message to {session} failed ({result.returncode}): {failure_detail(result)}",
-          file=sys.stderr)
-    return False
+        return FloorChannelOutcome.FAILED
+    outcome = {send_result.EXIT["sent"]: FloorChannelOutcome.DELIVERED,
+               send_result.EXIT["queued"]: FloorChannelOutcome.QUEUED}.get(result.returncode, FloorChannelOutcome.FAILED)
+    if outcome.accepted:
+        print(f"lint sweep: message to {session} {outcome.value}")
+    else:
+        print(f"lint sweep: message to {session} failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
+    return outcome
 
 
 def send_floor_alert(message: str, channels: FloorAlertChannels, *,
                      phone: RenderedPush | NoPhoneAlert = NO_PHONE_ALERT,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> bool:
+) -> FloorAlertDelivery:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     scripts = Path(__file__).resolve().parents[1]
-    if not TYPE_CHECKING:
-        # Imported here, so modules that only read sweep's config never load the reviewer.
-        sys.path.insert(0, str(scripts / "notify"))
-        import review
-    filesystem = FLOOR_FILESYSTEM.get()
-    if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
-        message = f"Filesystem {filesystem.key} at {filesystem.probe_path}:\n{message}"
-    commands = [("message", session_send_argv("natedev", lint_settings=lint_settings))]
+    command: list[str] = []
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
         if TYPE_CHECKING:
             from ..notify.push_texts import RenderedPush, user_send_argv
         else:
+            sys.path.insert(0, str(scripts / "notify"))
             from push_texts import RenderedPush, user_send_argv
 
         if not isinstance(phone, RenderedPush):
             raise ValueError("phone channel requires a rendered disk alert")
         command = user_send_argv(phone)
         command[1] = str(scripts / "message/send.py")
-        commands.append(("phone", command))
-    delivered = False
-    phone_delivered = False
-    for channel, command in commands:
-        try:
-            timeout = send_budget.user_seconds(review.user_send_seconds()) if channel == "phone" else send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds"))
-            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
-            if result.returncode == 0 or (channel == "message" and result.returncode == 1):
-                delivered = True
-                if channel == "phone":
-                    phone_delivered = True
-                state = "queued" if result.returncode == 1 else "delivered"
-                print(f"lint sweep: {channel} alert {state}")
-            else:
-                print(f"lint sweep: {channel} alert failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            print(f"lint sweep: {channel} alert failed: {error}", file=sys.stderr)
-    return phone_delivered if channels is FloorAlertChannels.NATEDEV_AND_PHONE else delivered
+    filesystem = FLOOR_FILESYSTEM.get()
+    if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
+        message = f"Filesystem {filesystem.key} at {filesystem.probe_path}:\n{message}"
+    natedev = send_holder_message("natedev", message, lint_settings=lint_settings)
+    if not command:
+        return FloorAlertDelivery(natedev, FloorChannelOutcome.NOT_ATTEMPTED)
+    if not TYPE_CHECKING:
+        import review
+    try:
+        result = subprocess.run(command, input=None, text=True, capture_output=True,
+                                timeout=send_budget.user_seconds(review.user_send_seconds()))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"lint sweep: phone alert failed: {error}", file=sys.stderr)
+        return FloorAlertDelivery(natedev, FloorChannelOutcome.FAILED)
+    if result.returncode == send_result.EXIT["sent"]:
+        print("lint sweep: phone alert delivered")
+        return FloorAlertDelivery(natedev, FloorChannelOutcome.DELIVERED)
+    print(f"lint sweep: phone alert failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
+    return FloorAlertDelivery(natedev, FloorChannelOutcome.FAILED)
 
 
 if TYPE_CHECKING:
@@ -3265,30 +3331,61 @@ class NatedevFloor(Enum):
     CURRENT = "natedev"
 
 
-@dataclass(frozen=True)
-class CompletedFloorAssessment:
-    """The pass assessed this scope, including a failed assessment."""
-
-
-@dataclass(frozen=True)
-class SkippedFloorAssessment:
-    """Lock contention or interruption prevents this pass from assessing the scope."""
-
-
 class FloorFailureScope(Enum):
     FILESYSTEM = "filesystem"
     DISCOVERY = "discovery"
 
+    @property
+    def record_name(self) -> str:
+        return floor_record_path().name if self is FloorFailureScope.FILESYSTEM else "floor-discovery.json"
+
+    @property
+    def label(self) -> str:
+        return "disk floor sweep"
+
+
+@dataclass(frozen=True)
+class WorkspaceFailureScope:
+    roots: tuple[str, ...]
+
+    @property
+    def record_name(self) -> str:
+        identity = hashlib.sha256(json.dumps(self.roots).encode()).hexdigest()
+        return f"workspace-{identity}.json"
+
+    @property
+    def label(self) -> str:
+        return f"workspace sweep for {', '.join(self.roots)}"
+
+
+@dataclass(frozen=True)
+class TemporarySweepFailureScope:
+    """The temporary sweep has an independent failure episode."""
+
+    @property
+    def record_name(self) -> str:
+        return "temporary-sweep.json"
+
+    @property
+    def label(self) -> str:
+        return "temporary sweep"
+
+
+SweepFailureScope = FloorFailureScope | WorkspaceFailureScope | TemporarySweepFailureScope
+
 
 @dataclass(frozen=True)
 class FloorOutcome:
-    status: int
-    removed: int
-    before: int
-    after: int
-    busy: int
-    assessment: CompletedFloorAssessment | SkippedFloorAssessment = CompletedFloorAssessment()
+    assessment: tmp_sweep.SweepAssessment
+    removed: int = 0
+    before: int = 0
+    after: int = 0
+    busy: int = 0
     protected: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def status(self) -> int:
+        return self.assessment.status
 
 
 def mac_floor_settings(settings: conf.ConfigRead) -> tuple[int, tuple[str, ...]]:
@@ -3383,7 +3480,7 @@ def _hold_floor(floor: int, dry_run: bool, *,
                                                       for excluded in excluded_roots)]
         filesystems = filesystem_floors(floor, targets, lint_settings=lint_settings)
         if not dry_run:
-            notify_floor_problem(FloorOutcome(0, 0, 0, 0, 0), lint_settings=lint_settings,
+            notify_floor_problem(tmp_sweep.CompletedSweepAssessment(0), lint_settings=lint_settings,
                                  scope=FloorFailureScope.DISCOVERY)
         results: list[FloorOutcome] = []
         for filesystem in filesystems:
@@ -3395,52 +3492,55 @@ def _hold_floor(floor: int, dry_run: bool, *,
             except OSError as error:
                 print(f"lint sweep: filesystem {filesystem.probe_path}: {error}", file=sys.stderr)
                 if not dry_run:
-                    notify_floor_problem(FloorOutcome(1, 0, 0, 0, 0),
+                    notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1),
                                          lint_settings=lint_settings, detail=str(error))
-                results.append(FloorOutcome(1, 0, 0, 0, 0))
+                results.append(FloorOutcome(tmp_sweep.CompletedSweepAssessment(1)))
             finally:
                 FLOOR_FILESYSTEM.reset(scope)
         if not dry_run and mappings.workspaces:
             save_cargo_output_roots(mappings)
-        return FloorOutcome(max(result.status for result in results), sum(result.removed for result in results),
+        return FloorOutcome(tmp_sweep.CompletedSweepAssessment(max(result.status for result in results)),
+                            sum(result.removed for result in results),
                             sum(result.before for result in results), sum(result.after for result in results),
                             sum(result.busy for result in results))
     except (conf.Unusable, OSError) as error:
         print(f"lint sweep: {error}", file=sys.stderr)
         if not dry_run:
-            notify_floor_problem(FloorOutcome(2, 0, 0, 0, 0), lint_settings=lint_settings,
+            notify_floor_problem(tmp_sweep.CompletedSweepAssessment(2), lint_settings=lint_settings,
                                  detail=str(error), scope=FloorFailureScope.DISCOVERY)
-        return FloorOutcome(2, 0, 0, 0, 0)
+        return FloorOutcome(tmp_sweep.CompletedSweepAssessment(2))
     finally:
         OUTPUT_ROOTS.reset(token)
 
 
-def notify_floor_problem(outcome: FloorOutcome, *, lint_settings: conf.ConfigRead, detail: str = "",
-                         scope: FloorFailureScope = FloorFailureScope.FILESYSTEM) -> None:
+def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, lint_settings: conf.ConfigRead, detail: str = "",
+                         scope: SweepFailureScope = FloorFailureScope.FILESYSTEM) -> None:
     """Finalize delivery and state before an acquired floor lock closes."""
-    if isinstance(outcome.assessment, SkippedFloorAssessment):
+    assessment = outcome.assessment if isinstance(outcome, FloorOutcome) else outcome
+    if isinstance(assessment, tmp_sweep.SkippedSweepAssessment):
         return
+    after = outcome.after if isinstance(outcome, FloorOutcome) else 0
+    protected = outcome.protected if isinstance(outcome, FloorOutcome) else ()
     filesystem = FLOOR_FILESYSTEM.get()
     root_scope = scope is FloorFailureScope.FILESYSTEM and (
         not isinstance(filesystem, FilesystemFloor) or filesystem.root_device)
-    path = floor_record_path()
-    if scope is FloorFailureScope.DISCOVERY:
-        path = path.with_name("floor-discovery.json")
+    path = floor_record_path().with_name(scope.record_name)
+    if not root_scope and not assessment.status and not path.exists():
+        return
     phone_floor = int(lint_settings.number("sweep_phone_floor_gib") * GIB)
 
     def finalize(previous: NoFloorRecord | FloorRecord) -> FloorRecord:
-        current = previous if isinstance(previous, FloorRecord) else FloorRecord(
-            time.time(), outcome.after, 0, NoDeliveredAlert(), NoDeliveredAlert())
-        free = outcome.after
+        current = floor_record_or_new(previous, after)
+        free = after
         if root_scope:
             try:
                 # Measure inside the record lock. Older callers cannot reset a newer crossing.
                 free = free_bytes(filesystem.probe_path if isinstance(filesystem, FilesystemFloor)
                                   else os.path.expanduser("~"))
                 if free > phone_floor:
-                    current = replace(current, phone_crossing=AbovePhoneFloor())
-                elif free < phone_floor and isinstance(current.phone_crossing, AbovePhoneFloor):
-                    current = replace(current, phone_crossing=UnderPhoneFloorPending())
+                    current = replace(current, phone_crossing=PhoneCrossing.ABOVE)
+                elif free < phone_floor and current.phone_crossing is PhoneCrossing.ABOVE:
+                    current = replace(current, phone_crossing=PhoneCrossing.UNDER_PENDING)
             except OSError as error:
                 print(f"lint sweep: cannot measure the phone floor: {error}", file=sys.stderr)
         failure = current.failure
@@ -3450,24 +3550,24 @@ def notify_floor_problem(outcome: FloorOutcome, *, lint_settings: conf.ConfigRea
         else:
             failure = NoFailure()
         current = replace(current, failure=failure)
-        crossing_pending = root_scope and isinstance(current.phone_crossing, UnderPhoneFloorPending)
+        crossing_pending = root_scope and current.phone_crossing is PhoneCrossing.UNDER_PENDING
         if not crossing_pending and not isinstance(failure, FailurePending):
             return current
         problems: list[str] = []
         if crossing_pending:
             problems.append(f"Free disk space fell below the {gib(phone_floor)} alert line. {gib(free)} remains.")
-            problems.extend(page_paths([], read_disk_measurement()))
+            problems.extend(page_paths(read_disk_measurement()))
         if isinstance(failure, FailurePending):
-            problems.append(f"The disk floor sweep failed with status {failure.event.status}. {failure.event.detail}")
+            problems.append(f"The {scope.label} failed with status {failure.event.status}. {failure.event.detail}")
         def render(path_limit: int) -> str:
-            protected = (protected_folder_lines(outcome.protected, path_limit, lint_settings=lint_settings)
-                         if crossing_pending else [])
-            return "\n".join([*problems, *protected])
-        # Crossings and sweep failures go only to natedev (builds ruling 2026-11-04).
+            protected_lines = (protected_folder_lines(protected, path_limit, lint_settings=lint_settings)
+                               if crossing_pending else [])
+            return "\n".join([*problems, *protected_lines])
+        # Crossings and sweep failures go only to natedev.
         if send_floor_alert(fit_alert_text(render, lint_settings=lint_settings), FloorAlertChannels.NATEDEV,
-                           lint_settings=lint_settings):
+                            lint_settings=lint_settings).natedev.accepted:
             if crossing_pending:
-                current = replace(current, phone_crossing=UnderPhoneFloorPushed())
+                current = replace(current, phone_crossing=PhoneCrossing.UNDER_PUSHED)
             if isinstance(failure, FailurePending):
                 current = replace(current, failure=FailureReported())
         return current
@@ -3483,7 +3583,7 @@ def notify_floor_problem(outcome: FloorOutcome, *, lint_settings: conf.ConfigRea
             return
         current = finalize(previous)
         if current == previous or (isinstance(previous, NoFloorRecord) and isinstance(current.failure, NoFailure)
-                                   and isinstance(current.phone_crossing, AbovePhoneFloor)):
+                                   and current.phone_crossing is PhoneCrossing.ABOVE):
             return
         try:
             # Delivery comes first. A failed save can repeat a delivered alert on the next pass.
@@ -3504,7 +3604,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
 ) -> FloorOutcome:
     """Below the floor, take the shortfall from the least used idle targets."""
     guard: int | None = None
-    outcome = FloorOutcome(0, 0, 0, 0, 0, SkippedFloorAssessment())
+    outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
     protected: tuple[tuple[str, int], ...] = ()
     detail = ""
     try:
@@ -3520,7 +3620,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         if free >= floor:
             if dry_run:
                 print(f"lint sweep: {home}: {gib(free)} free, at or above the {gib(floor)} floor; nothing to remove")
-            outcome = FloorOutcome(0, 0, free, free, 0)
+            outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(0), before=free, after=free)
             return outcome
         if not dry_run:
             lock_path = str(lock)
@@ -3533,7 +3633,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         alert_floor_lock(lock_path, free, floor, lint_settings=lint_settings)
                     except OSError as error:
                         print(f"lint sweep: cannot report the floor lock: {error}", file=sys.stderr)
-                outcome = FloorOutcome(0, 0, free, free, 0, SkippedFloorAssessment())
+                outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment(), before=free, after=free)
                 return outcome
         if guard is not None:
             record_floor_lock(str(lock), guard, time.time())
@@ -3541,32 +3641,37 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         try:
             if guard is not None:
                 with locked_floor_record(record_path) as previous:
-                    if isinstance(previous, FloorRecord) and isinstance(previous.lock_alert, ObservedUnreadableFloorHold):
-                        write_floor_record(record_path, replace(previous, lock_alert=NoFloorLockAlert()))
+                    current = floor_record_or_new(previous, free)
+                    transition = next_lock_alert(current.lock_alert, NoFloorLockHolder(), LiveSweepProcess(), time.time())
+                    if transition.lock_alert != current.lock_alert:
+                        write_floor_record(record_path, replace(current, lock_alert=transition.lock_alert))
         except OSError as error:
             print(f"lint sweep: cannot clear the lock observation: {error}", file=sys.stderr)
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
         busy: dict[str, TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence] = {}
-        targets = (sorted({paired for root in filesystem.targets for paired in OUTPUT_ROOTS.get().roots_for(root)})
-                   if isinstance(filesystem, FilesystemFloor) else target_dirs(roots, lint_settings=lint_settings))
+        paired_roots = OUTPUT_ROOTS.get().roots_for
+        known_trees = {} if isinstance(policy, MacFloor) else dict(OUTPUT_ROOTS.get().known_trees)
+        targets = (sorted({paired for root in filesystem.targets for paired in paired_roots(root)})
+                   if isinstance(filesystem, FilesystemFloor) else
+                   target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees))
         all_discovered = sorted(set(targets) | {str(Path(path).expanduser().resolve())
                                  for path in lint_settings.words("sweep_ci_targets") if os.path.isdir(os.path.expanduser(path))})
+        excluded_targets = frozenset(all_discovered)
         if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
             print(f"lint sweep: filesystem {filesystem.key} at {filesystem.probe_path}")
         if isinstance(policy, MacFloor):
             targets = [target for target in targets if policy.allows(target)]
         owners = TargetOwnerIndex(targets)
-        known_trees: dict[str, list[str]] = {}
         hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
                         if isinstance(policy, NatedevFloor) else {})
         uses: dict[str, TargetUse | LockHeld] = dict(policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners))
         for root in tuple(hold_targets):
-            for paired in OUTPUT_ROOTS.get().roots_for(root):
+            for paired in paired_roots(root):
                 if paired in targets:
                     hold_targets[paired] = hold_targets[root]
         for root in tuple(uses):
-            for paired in OUTPUT_ROOTS.get().roots_for(root):
+            for paired in paired_roots(root):
                 if paired in targets:
                     uses[paired] = uses[root]
         locked_files = held_cargo_lock_files(lint_settings=lint_settings)
@@ -3608,19 +3713,16 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             idle.append(root)
             tree_targets.update({tree: root for tree in root_trees if owners.owner(tree) == TargetOwner(root)})
         for root in tuple(idle):
-            pair = OUTPUT_ROOTS.get().roots_for(root)
+            pair = paired_roots(root)
             blocked_pair = next((paired for paired in pair if paired in busy), "")
             if blocked_pair:
                 busy[root] = busy[blocked_pair]
                 idle.remove(root)
         scan = scan_floor_roots(DiscoveredTargetRoots(idle, all_discovered), known_trees, lint_settings=lint_settings)
         target_groups: dict[str, list[Group]] = {root: [] for root in idle}
-        grouped_roots: dict[str, tuple[str, ...]] = {}
+        grouped_roots = {root: paired_roots(root) for root in set(tree_targets.values())}
         for group in scan.groups:
-            target = tree_targets[group.build_tree]
-            if target not in grouped_roots:
-                grouped_roots[target] = OUTPUT_ROOTS.get().roots_for(target)
-            for root in grouped_roots[target]:
+            for root in grouped_roots[tree_targets[group.build_tree]]:
                 if root in target_groups:
                     target_groups[root].append(group)
         target_uses = {root: target_last_use(root, groups, targets) for root, groups in target_groups.items()}
@@ -3636,7 +3738,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             measured = measure_protected_folders(frozenset(
                 path for path, use in busy.items()
                 if not isinstance(policy, MacFloor) and not isinstance(use, BuildHoldTarget)),
-                frozenset(all_discovered))
+                excluded_targets)
             busy_bytes.update(measured)
             protected = tuple((path, size) for path, size in measured if isinstance(busy[path], NoRecordedEvidence))
             held_bytes = sum(busy_bytes.values())
@@ -3659,8 +3761,6 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
             + f" target dirs ({gib(total)}), {len(busy)} left alone {protection_reason}"
         )
-        # The shortfall comes from the read after the scan too: on 2026-10-25 the read from before it
-        # took 6.5 GiB of cache while another process had lifted free from 293.5 to 416 GiB.
         budget = total - max(0, floor - scanned_free)
         left, failures = total, 0
         chosen: list[tuple[FloorTake, int]] = []
@@ -3693,17 +3793,17 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         print(f"lint sweep: {gib(after_free)} free")
         if not dry_run and isinstance(policy, NatedevFloor):
             now = time.time()
-            # The record's free is read before its caches and the next sweep's free after its scan,
-            # so a deletion during either walk can only make the computed fall smaller.
-            seen: set[InodeKey] = set()
-            after_caches = sum(directory_blocks(path, seen, all_discovered) if any(
-                other != path and other.startswith(path + os.sep) for other in targets)
-                else directory_blocks(path, seen) for path in idle if on_floor_filesystem(path)) + unchanged_caches
+            unchanged = {key for path in idle if path not in scan.changed_targets and on_floor_filesystem(path)
+                         for key in scan.target_links.get(path, {})}
+            after_caches = sum(scan.blocks[key] for key in unchanged) + unchanged_caches
+            after_caches += sum(directory_blocks(path, unchanged, excluded_targets)
+                                for path in idle if path in scan.changed_targets and on_floor_filesystem(path))
             removed = max(0, before_caches - after_caches)
             try:
                 with locked_floor_record(record_path) as previous:
-                    history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
-                    push_history = previous.push_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
+                    base = floor_record_or_new(previous, after_free)
+                    history = base.alert_history
+                    push_history = base.push_history
                     alert_interval = lint_settings.number("sweep_alert_interval_seconds")
                     push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= alert_interval
                     if left > budget and after_free < floor and push_due:
@@ -3711,14 +3811,14 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
                                        for root, use in busy.items() if isinstance(use, BuildHoldTarget))
                         told = frozenset(holder.path for holder in holders if holder.session is not None
-                                         and send_holder_message(holder.session, holder_message_text(holder, after_free, floor, lint_settings=lint_settings), lint_settings=lint_settings))
+                                         and send_holder_message(holder.session, holder_message_text(holder, after_free, floor, lint_settings=lint_settings), lint_settings=lint_settings).accepted)
                         measurement = (read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
                                        or filesystem.root_device else UnavailableDiskMeasurement("missing"))
                         message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
                                                           ci_bytes, measurement, failures, protected=protected,
                                                           lint_settings=lint_settings)
                         delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV, lint_settings=lint_settings)
-                        if delivered or told:
+                        if delivered.natedev.accepted or told:
                             push_history = DeliveredAlert(time.time())
                     elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= alert_interval):
                         free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
@@ -3746,27 +3846,24 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                                                        reasons, read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
                                                        or filesystem.root_device else UnavailableDiskMeasurement("missing"),
                                                        lint_settings=lint_settings)
-                            if send_floor_alert(message, FloorAlertChannels.NATEDEV, lint_settings=lint_settings):
+                            if send_floor_alert(message, FloorAlertChannels.NATEDEV, lint_settings=lint_settings).natedev.accepted:
                                 history = DeliveredAlert(time.time())
-                    write_floor_record(record_path, FloorRecord(now, after_free, after_caches, history, push_history,
-                                                               KnownHeldRoots(frozenset(hold_targets)),
-                                                               previous.lock_alert if isinstance(previous, FloorRecord)
-                                                               else NoFloorLockAlert(),
-                                                               filesystem.key if isinstance(filesystem, FilesystemFloor) else "",
-                                                               tuple(sorted(idle)),
-                                                               previous.phone_crossing if isinstance(previous, FloorRecord)
-                                                               else AbovePhoneFloor(),
-                                                               previous.failure if isinstance(previous, FloorRecord) else NoFailure()))
+                    write_floor_record(record_path, replace(
+                        base, measured_at=now, free_bytes=after_free, build_cache_bytes=after_caches,
+                        alert_history=history, push_history=push_history,
+                        held_roots=KnownHeldRoots(frozenset(hold_targets)),
+                        filesystem=filesystem.key if isinstance(filesystem, FilesystemFloor) else "",
+                        measured_roots=tuple(sorted(idle))))
             except OSError as error:
                 print(f"lint sweep: cannot save floor accounting: {error}", file=sys.stderr)
-        outcome = FloorOutcome(0 if isinstance(policy, MacFloor) else (1 if failures else 0),
+        outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(0 if isinstance(policy, MacFloor) else (1 if failures else 0)),
                                0 if dry_run else max(0, total - left), free, after_free, len(busy), protected=protected)
         return outcome
     except (conf.Unusable, OSError) as error:
         if isinstance(policy, MacFloor):
             raise
         detail = str(error)
-        outcome = FloorOutcome(1, 0, 0, 0, 0)
+        outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(1))
         print(f"lint sweep: {error}", file=sys.stderr)
         return outcome
     finally:
@@ -4236,65 +4333,82 @@ def main(argv: list[str]) -> int:
     status = 0 if floor_only else sweep_workspace(target_dir, settings_read, dry_run, recent_minutes,
                                                  lint_settings=settings_read)
     if floor_only:
-        status = tmp_sweep.run_if_due(dry_run, lint_settings=settings_read) or status
+        status = report_assessment(lambda: tmp_sweep.run_if_due(dry_run, lint_settings=settings_read),
+                                   TemporarySweepFailureScope(), dry_run, settings_read) or status
     if floor is not None:
         status = hold_floor(floor, dry_run, lint_settings=settings_read) or status
     return status
 
 
+def report_assessment(run: Callable[[], tmp_sweep.SweepAssessment], scope: SweepFailureScope,
+                      dry_run: bool, lint_settings: conf.ConfigRead) -> int:
+    """Assess one scope and report its failure episode."""
+    detail = ""
+    try:
+        assessment = run()
+    except (conf.Unusable, OSError) as error:
+        detail = str(error)
+        print(f"lint sweep: {scope.label}: {error}", file=sys.stderr)
+        assessment = tmp_sweep.CompletedSweepAssessment(1)
+    if not dry_run:
+        notify_floor_problem(assessment, lint_settings=lint_settings, detail=detail, scope=scope)
+    return assessment.status
+
+
 def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_run: bool,
                     recent_minutes: float, *,
                     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+    if isinstance(lint_settings, UseConfiguredValue):
+        lint_settings = conf.read("lint")
     token = OUTPUT_ROOTS.set(CargoOutputIndex())
     try:
-        return _sweep_workspace(target_dir, budget_config, dry_run, recent_minutes, lint_settings=lint_settings)
+        roots = (cargo_roots() if target_dir is None else
+                 [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else [])
+        def assess() -> tmp_sweep.SweepAssessment:
+            if not dry_run and target_dir is None:
+                if OUTPUT_ROOTS.get().workspaces:
+                    save_cargo_output_roots(OUTPUT_ROOTS.get())
+                for root in roots:
+                    try:
+                        Path(root, USE_STAMP).touch()
+                    except OSError:
+                        pass
+            return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, lint_settings=lint_settings)
+        return report_assessment(assess, WorkspaceFailureScope(tuple(sorted(roots))), dry_run, lint_settings)
     finally:
         OUTPUT_ROOTS.reset(token)
 
 
-def _sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_run: bool,
+def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: bool,
                     recent_minutes: float, *,
-                    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
-    """Sweep target_dir, or the working directory's workspace, to its budget."""
+                    lint_settings: conf.ConfigRead) -> tmp_sweep.SweepAssessment:
+    """Sweep the resolved output roots to their budget."""
+    if not roots:
+        print("lint sweep: no target directory to sweep")
+        return tmp_sweep.SkippedSweepAssessment()
     budget, source = budget_bytes(dict(os.environ), budget_config, repo_name(os.getcwd()))
     if budget is None:
         print(f"lint sweep: {source} must be a non-negative number of GiB", file=sys.stderr)
-        return 2
-    if isinstance(lint_settings, UseConfiguredValue):
-        lint_settings = conf.read("lint")
+        return tmp_sweep.CompletedSweepAssessment(2)
     doc_budget = doc_index_bytes(lint_settings=lint_settings)
     if doc_budget is None:
         print(f"lint sweep: {DOC_INDEX_ENV} must be a non-negative number of MiB", file=sys.stderr)
-        return 2
-    if target_dir is None:
-        roots = cargo_roots()
-        if not dry_run:
-            if OUTPUT_ROOTS.get().workspaces:
-                save_cargo_output_roots(OUTPUT_ROOTS.get())
-            for root in roots:
-                try:
-                    Path(root, USE_STAMP).touch()
-                except OSError:
-                    pass
-    else:
-        roots = [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else []
-    if not roots:
-        print("lint sweep: no target directory to sweep")
-        return 0
+        return tmp_sweep.CompletedSweepAssessment(2)
     uses = process_uses(roots)
     if uses:
         root, use = next(iter(uses.items()))
         print(f"lint sweep: pid {use.pid} {use.how}; {root} skipped")
-        return 0
+        return tmp_sweep.SkippedSweepAssessment()
     tree_depth = lint_settings.whole("sweep_max_tree_depth")
     trees = [tree for root in roots for tree in _build_trees(root, tree_depth, lint_settings=lint_settings)]
     locks = lock_trees(output_lock_trees(roots, trees))
     if isinstance(locks, TargetLockBusy):
         print(f"lint sweep: a cargo build holds {locks.path}; skipped")
-        return 0
+        return tmp_sweep.SkippedSweepAssessment()
     try:
         doc_status = prune_doc_index(roots, doc_budget, dry_run, lint_settings=lint_settings)
-        return sweep(roots, trees, budget, source, dry_run, recent_minutes, lint_settings=lint_settings) or doc_status
+        return tmp_sweep.CompletedSweepAssessment(
+            sweep(roots, trees, budget, source, dry_run, recent_minutes, lint_settings=lint_settings) or doc_status)
     finally:
         release(locks.held)
 

@@ -84,10 +84,12 @@ class MacIdleTests(unittest.TestCase):
                      {"BUILDLOG_CALL_ID": self.call.call_id, "LINT_QUEUE_LEAVE_HOOK": "check Mac"})
         mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id), asdict(self.call))
         self.admission = caller_admission(self, self.root, dict(os.environ))
-        self.admission.free(0)
-        owner = self.admission.fixture_owner(124, "457")
-        request = self.admission.request(owner=owner, since=100)
-        _ = self.admission.server.handle_request(request)
+        _ = self.admission.occupy_host()
+        with self.admission.loop_turn():
+            self.admission.free(0)
+            owner = self.admission.fixture_owner(124, "457")
+            request = self.admission.request(owner=owner, since=100)
+            _ = self.admission.server.handle_request(request)
         mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000})
         self.step()
 

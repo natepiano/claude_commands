@@ -68,22 +68,14 @@ class HeadFactsTests(AdmissionLogTests):
             self.fail(f"complete fixture log must be readable: {result}")
         return result
 
-    def test_head_facts_use_recorded_limits_without_configuration_reads(self) -> None:
-        original = head_reading()
-        head = original.explanation.head
+    def test_head_facts_use_recorded_need_without_configuration_reads(self) -> None:
+        reading = head_reading()
+        head = reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
-        for budget in (9 * gate.GIB, 19 * gate.GIB):
-            with self.subTest(budget=budget):
-                reading = replace(original, explanation=replace(original.explanation,
-                    limits=replace(original.explanation.limits, budget=budget)))
-                with mock.patch("conf.read", side_effect=AssertionError("live configuration")), \
-                     mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("live policy")), \
-                     mock.patch.object(gate, "memory_config", side_effect=AssertionError("live policy")), \
-                     mock.patch.object(gate, "build_budget_bytes", side_effect=AssertionError("live budget")):
-                    facts = self.facts(reading)
-                self.assertEqual(facts.budget, budget)
-                self.assertEqual(facts.head_need, head.waiter.need)
-                self.assertEqual(facts.joined_at, head.waiter.since)
+        with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("live policy")):
+            facts = self.facts(reading)
+        self.assertEqual(facts.head_need, head.waiter.need)
+        self.assertEqual(facts.joined_at, head.waiter.since)
 
     def test_one_bump_uses_singular_text_and_plural_counts_stay_plural(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 1)])
@@ -230,10 +222,9 @@ class HeadFactsTests(AdmissionLogTests):
         write_bumps(NOW, [bump_line(NOW - 800), bump_line(NOW - 5)])
         with mock.patch.object(gate, "queue_read", side_effect=AssertionError("one service reading")), \
              mock.patch.object(admission_client, "view", side_effect=AssertionError("one service reading")), \
-             mock.patch.object(gate, "head_window", side_effect=AssertionError("admission owns windows")), \
-             mock.patch.object(gate, "head_priority", side_effect=AssertionError("admission owns priority")), \
+             mock.patch.object(gate, "memory_room", side_effect=AssertionError("admission owns room")), \
              mock.patch.object(gate, "waiter_order", side_effect=AssertionError("admission owns order")), \
-             mock.patch.object(gate, "build_budget_bytes", side_effect=AssertionError("snapshot budget")), \
+             mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("snapshot policy")), \
              mock.patch.object(gate, "read_meminfo", side_effect=AssertionError("snapshot free memory")):
             facts = self.facts(reading)
         self.assertEqual(facts.joined_at, NOW - 600)
@@ -249,7 +240,7 @@ class HeadFactsTests(AdmissionLogTests):
                 facts = self.facts(reading)
                 self.assertEqual(facts.joined_at, NOW - 158 * 60)
                 self.assertNotIn("head_since", repr(facts))
-                self.assertNotIn("Head for", head_facts.order_text(facts, ZONE))
+                self.assertNotIn("Head for", head_facts.order_text(facts))
 
     def test_follower_token_gap_never_becomes_the_same_sessions_head_gap(self) -> None:
         reading = head_reading()
@@ -273,43 +264,11 @@ class HeadFactsTests(AdmissionLogTests):
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         write_bumps(NOW, [bump_line(NOW - 5)])
         facts = self.facts(reading)
-        self.assertIn("queue priority: resources (user work)", head_facts.order_text(facts, ZONE))
+        self.assertIn("queue priority: resources (user work)", head_facts.order_text(facts))
         self.assertEqual(self.history(reading).total, 1)
         self.assertEqual(head_facts.bump_text(facts, ZONE), "Bumps since it joined at 06:50:00: 1")
 
-    def test_three_order_texts_use_recorded_priority_and_deadline(self) -> None:
-        reading = head_reading()
-        head = reading.explanation.head
-        if not isinstance(head, gate.HeadExplanation):
-            self.fail("fixture needs a head")
-        for order, priority, expected in (
-            (gate.StrictUntil(NOW + 125), True,
-             "younger steps may use 20.0 GiB of the budget until 07:02 (2 min 5 s left)"),
-            (gate.BackfillUntil(NOW + 65), True,
-             "younger steps may start until 07:01 (1 min 5 s left)"),
-            (gate.StrictUntil(NOW + 125), False,
-             "no head priority: younger steps that fit may start"),
-            (gate.BackfillUntil(NOW + 65), False,
-             "no head priority: younger steps that fit may start"),
-        ):
-            with self.subTest(order=order, priority=priority):
-                explanation = replace(reading.explanation, head=replace(head, order=order, has_priority=priority))
-                facts = self.facts(replace(reading, explanation=explanation))
-                self.assertEqual(head_facts.order_text(facts, ZONE), expected)
 
-    def test_strict_order_has_no_room_when_head_needs_the_whole_budget(self) -> None:
-        reading = head_reading()
-        head = reading.explanation.head
-        if not isinstance(head, gate.HeadExplanation):
-            self.fail("fixture needs a head")
-        for need in (21, 22):
-            with self.subTest(need=need):
-                waiting = replace(head.waiter, need=need * gate.GIB)
-                explanation = replace(reading.explanation, head=replace(
-                    head, waiter=waiting, order=gate.StrictUntil(NOW + 125), has_priority=True))
-                facts = self.facts(replace(reading, explanation=explanation))
-                self.assertEqual(head_facts.order_text(facts, ZONE),
-                    "younger steps wait until 07:02 (2 min 5 s left)")
 
     def test_token_wait_is_unknown_without_a_record(self) -> None:
         facts = self.facts(head_reading(fields={"priority_since": NOW - 154}))
@@ -457,7 +416,7 @@ class HeadFactsTests(AdmissionLogTests):
         younger = replace(reading.view.waiting[0], pid=456, session_id="younger-session", step="clippy",
                           since=NOW - 300)
         running = gate.RunningStep("running-session", "runner", "check", "/tmp/run", gate.GIB,
-                                   gate.MeasuredMemory(gate.GIB))
+                                   gate.MeasuredMemory(gate.GIB), pid=789)
         reading = with_waiting_process(reading, younger, "123")
         reading = replace(reading, view=replace(reading.view, running=(running,)))
         write_token_gaps([
@@ -576,7 +535,7 @@ class HeadFactsTests(AdmissionLogTests):
             bump_line(NOW - 25, session="runner", step="nextest", folder="/tmp/run", old_position=4),
             bump_line(NOW - 24, session="runner", step="nextest", folder="/tmp/run", old_position=2),
         ])
-        step = gate.RunningStep("runner", "runner", "nextest", "/tmp/run", gate.GIB, gate.MeasuredMemory(gate.GIB))
+        step = gate.RunningStep("runner", "runner", "nextest", "/tmp/run", gate.GIB, gate.MeasuredMemory(gate.GIB), pid=123)
         running = gate.ExplainedRunningStep(step, NOW - 25, gate.GIB, gate.GIB, gate.GIB, gate.UsingNow(gate.GIB))
         facts = self.facts(reading)
         self.assertEqual([record.old_position for record in head_facts.running_moves(facts, running)], [29, 4])
