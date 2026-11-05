@@ -511,6 +511,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 #### As-built
 
+- Phase 26 replaced the audit hook with a guard at the `send.py` entry. The hook bullets below are history.
 - `scripts/message/session_send_test_support.py` holds the audit hook `_forbid_sender`, `RealSenderForbidden(AssertionError)`, the state `sender_violation: NoSenderViolation | RealSenderRefused(test_id)` and `requesting_test()`. `forbid_real_sender()` installs the hook once.
 - The hook reads the process-start audit events `subprocess.Popen`, `os.posix_spawn`, `os.exec`, `os.spawn` and `os.system`. It checks each value whole and after `shlex.split`, resolves a relative path against the child `cwd`, and compares it with the real `send.py`. It records the first refusal, with the test that asked, before it raises. A test that catches the exception does not clear the state.
 - The only installs are the per-module `setUpModule` installs, which the scan test in `test_session_send.py` enforces.
@@ -548,17 +549,19 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 4. Split `repository_key(directory)` out of `record.recorded_repository_key`, then delete `recorded_repository_key`: its `argv` parameter exists only for an empty check. `step()` (`record.py` about line 1006) does the empty-argv check and calls `repository_key`. Every caller switches to `repository_key`; no `["git"]` dummy argument vector remains (`show.py` top, the test call sites). (showrunner, from report's simplify review, 2026-11-05.)
 5. Import `conf` under one module name in `parse.py` and `record.sync_config`. Today one step process loads `conf.py` twice (+1.8 ms).
 6. Move `repository_key` and `remote_identity` into one light module that does not import the rest of `record.py`. `show.py` imports it in place of `record` (importing `record` costs 49.7 ms cold; `show.py` imports `record` inside `main()`, about line 427). `record` keeps the two names as imports from the light module, so `scripts/lint/memory_admit.py` (about line 3229, `record.remote_identity`) needs no change. Measure the cold start of `show.py top` before and after, on a prepared index: the same logs, repository and host on both sides, with the index built outside the timed command. Report the index build time on its own line.
+7. Add `buildlog/repository.py` to `ADMISSION_CODE_PATHS` in `scripts/build_queue/admission_code.py`, after `buildlog/record.py`: `record.py` imports it, so it is admission code (showrunner, 2026-11-05).
 
 **Files:**
 - `scripts/buildlog/record.py` — record the sent key (report-unit's file)
 - `scripts/buildlog/parse.py` — one `conf` import name (report-unit's file)
 - `scripts/buildlog/repository.py` — the new light module for the repository key
 - `scripts/test_times/show.py` — import the light module
+- `scripts/build_queue/admission_code.py` — list the light module as admission code (queue-unit's file)
 - `scripts/buildlog/test_step_row.py` — its repository-key test patches `record.output`; move the patch target with the code
 - `scripts/buildlog/test_record.py`, `scripts/buildlog/test_parse.py`, `scripts/test_times/test_show.py` — the regression tests
 
 **Workers:** 1 writer + 1 tester
-- `impl` — `record.py`, `parse.py`, `repository.py`, `show.py`
+- `impl` — `record.py`, `parse.py`, `repository.py`, `show.py`, `admission_code.py`
 - `test` — `test_step_row.py` and the tests: a mirror step with no origin records the identity sent from natedev; a known local key wins over a sent key; `repository_key` of a directory with and without an origin; one step process loads `conf.py` once
 
 **Constraints from prior phases:**
@@ -667,34 +670,22 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 26 — The sender guard also stops `send.py` started from its own folder or as a module  · status: done
 **Depends on:** Phase 25
 
-#### Work Order
+#### As-built
 
-**Goal:** a test that starts the real `scripts/message/send.py` by any path fails the gate, including `cd <folder> && python send.py` and `python -m scripts.message.send`.
-
-**Spec:** The Phase 21 architect review found two paths that the audit hook does not match: a relative `send.py` after a `cd`, and `-m scripts.message.send`. Both reach the sender with `NoSenderViolation`. This is a defect in what Phase 21 shipped.
-
-**Ruling (builds showrunner, 2026-11-05):** guard at the `send.py` entry. One mechanism replaces the audit hook.
-1. `send.py` refuses at its entry when the guard environment variable is set. Before it exits, it writes a marker that `module_run.py` reads. This covers every start path, grandchildren included, which an audit hook does not see.
-2. The per-module installs in `session_send_test_support.py` set the variable for the test process and its children. Delete the audit hook.
-3. Before you delete the hook, look for a start path that the variable misses and the hook catches. If you find one, keep the hook for it and tell the showrunner which path.
-4. `module_run.py` reads the marker after `unittest.main`, and a module with a marker fails with the Phase 21 diagnostic line.
-5. `send.py` belongs to natedev messaging. The showrunner gave the go on 2026-11-05, with natedev's agreement. Put the guard at the top of `send.py` `main()` and change nothing else in the file. This unit owns the guard variable and the marker. Messaging's cleanup changes only the callers, so there is no overlap.
+- `scripts/message/send.py` `main()` starts with the guard: when `TEST_SENDER_GUARD` is set, it writes the marker file that the variable names, prints `REFUSED: real scripts/message/send.py is forbidden in tests` and returns 1. This covers every start path: a direct path, `cd scripts/message && python send.py`, `python -m scripts.message.send`, a shell, `os.system`, `os.posix_spawn` and grandchildren.
+- `scripts/message/session_send_test_support.py` `forbid_real_sender()` sets the variable in `os.environ` when it is not set (children inherit it), with a temporary marker path that `atexit` removes. It keeps the path once in `refusal_marker: SenderGuardNotInstalled | SenderRefusalMarker(path)`, so a test that clears `os.environ` does not lose it. The Phase 21 audit hook, `RealSenderForbidden` and `sender_violation` are deleted.
+- `scripts/test_times/module_run.py` reads `refusal_marker` after `unittest.main`. When the marker file exists, it prints `<pattern>: started the real scripts/message/send.py` to stderr and exits 1.
+- Known limit (showrunner, 2026-11-05): a wrapper that strips the variable on purpose (`env -i`, `env -u`, an explicit `env=`) is not guarded. The guard stops test accidents only.
+- Checks: the probes for each start path and the cleared-environment test are green; the gate on this phase plus builds was green (1395 s, full suite).
 
 **Files:**
-- `scripts/message/send.py` — refuse at entry under the guard variable and write the marker
-- `scripts/message/session_send_test_support.py` — set the guard variable; delete the audit hook
-- `scripts/message/test_session_send.py` — the `cd` and `-m` probes
-- `scripts/test_times/module_run.py` — read the marker
-- `scripts/test_times/test_module_run.py` — the marker fixture test
+- `scripts/message/send.py` — the guard at the top of `main()`
+- `scripts/message/session_send_test_support.py` — sets the variable and keeps the marker path
+- `scripts/message/test_session_send.py` — probes for each start path, the caught-refusal test and the install scan test
+- `scripts/test_times/module_run.py` — reads the marker after a module
+- `scripts/test_times/test_module_run.py` — fixture modules, the cleared-environment test
 
-**Workers:** 1 writer (one guard path; the files do not split)
-- `impl` — all files above
+**Binds later work:**
+- Only the modules that call `forbid_real_sender()` are guarded. The next-items backlog holds the proposal that the runner guards every module.
+- A change to `send.py` keeps the guard as the first statement of `main()`.
 
-**Constraints from prior phases:**
-- Phase 21: `session_send_test_support.py` holds the audit hook, `RealSenderRefused` and `sender_violation`; `module_run.py` reads them after `unittest.main`.
-- Phase 25: the gate runs the tested tree's own `module_run.py`.
-
-**Acceptance gate:**
-- probes for `cd <folder> && python send.py --help` and `python -m scripts.message.send --help` fail the module with one diagnostic, and start no sender
-- `scripts/message/test_session_send.py` and `scripts/test_times/test_module_run.py` green
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
