@@ -406,7 +406,7 @@ class StopResumeTests(unittest.TestCase):
                                          Path(self.enterContext(tempfile.TemporaryDirectory()))))
         _ = self.enterContext(patch.object(sessions, "session_liveness", self.observe))
         _ = self.enterContext(patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness))
-        _ = self.enterContext(patch.object(herdr, "_codex_conversations", return_value=({}, [])))
+        _ = self.enterContext(patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
         _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
             herdr.RolloutThread("019b3a40-4250-7000-8000-000000000102"), "generation-1", {})))
@@ -1167,7 +1167,7 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "pane_activity", side_effect=pane_activity),
               patch.object(self.client, "result", side_effect=self.client_result),
-              patch.object(herdr, "_codex_conversations", return_value=({identity: (123,)}, [])),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (123,)}, ())),
               patch.object(herdr, "native_process", side_effect=native_process) as native):
             self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
@@ -1184,7 +1184,7 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))),
               patch.object(self.client, "result", side_effect=self.client_result),
-              patch.object(herdr, "_codex_conversations", return_value=({identity: (123,)}, []))):
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (123,)}, ()))):
             self.assertEqual(stop_resume.stop("stable-row"), stop_resume.Stopped(identity, 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
 
@@ -1198,7 +1198,7 @@ class StopResumeTests(unittest.TestCase):
         for observed in observations:
             with (self.subTest(observed=observed),
                   patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-                  patch.object(herdr, "_codex_conversations", return_value=observed)):
+                  patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(observed[0], tuple(observed[1])))):
                 result = stop_resume.stop("stable-row")
                 self.assertIsInstance(result, stop_resume.StopFailed if observed[1] else stop_resume.NotRunning)
                 self.kill.assert_not_called()
@@ -1349,7 +1349,10 @@ class StopResumeTests(unittest.TestCase):
     def test_absent_and_unknown_sessions_are_distinct_and_unsignalled(self) -> None:
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
         self.live.return_value = sessions.SessionLivenessUnknown("registry unreadable")
-        self.assertEqual(stop_resume.stop("alpha"), stop_resume.StopFailed("019b3a40-4250-7000-8000-000000000102", "019b3a40-4250-7000-8000-000000000102 (Claude session unknown: registry unreadable)"))
+        identity = "019b3a40-4250-7000-8000-000000000102"
+        reason = f"{identity} is not proved live or stopped: 1 processes unknown, first: "\
+            + f"{identity} (Claude session unknown: registry unreadable)"
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.StopFailed(identity, reason))
         self.assertEqual(stop_resume.stop("elsewhere"), stop_resume.SessionNotFound("elsewhere"))
         self.assertEqual(stop_resume.resume("elsewhere", why="maintenance"), stop_resume.ResumeFailed("elsewhere", "unknown name"))
         self.kill.assert_not_called()
@@ -1662,7 +1665,10 @@ class StopResumeTests(unittest.TestCase):
         self.start.reset_mock()
         self.launched.clear()
         self.live.return_value = sessions.SessionLivenessUnknown("identity unreadable")
-        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.StopFailed("019b3a40-4250-7000-8000-000000000102", "019b3a40-4250-7000-8000-000000000102 (Claude session unknown: identity unreadable)"))
+        identity = "019b3a40-4250-7000-8000-000000000102"
+        reason = f"{identity} is not proved live or stopped: 1 processes unknown, first: "\
+            + f"{identity} (Claude session unknown: identity unreadable)"
+        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.StopFailed(identity, reason))
         self.start.assert_not_called()
         self.kill.assert_not_called()
 

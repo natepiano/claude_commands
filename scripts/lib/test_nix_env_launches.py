@@ -248,7 +248,9 @@ class ShellLaunchTests(NixFixture):
     def setUp(self) -> None:
         super().setUp()
         self.scripts = self.home / ".claude/scripts"
-        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh", "lib/nix_env.py", "lib/conf.py"):
+        _ = shutil.copytree(ROOT / "scripts/lib", self.scripts / "lib", dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "test_*"))
+        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh"):
             destination = self.scripts / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
