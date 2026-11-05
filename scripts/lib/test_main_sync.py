@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import override
 
 from scripts.lib import main_sync
+from scripts.message import session_send
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -116,7 +117,7 @@ class MainSyncTests(unittest.TestCase):
                 _ = (self.root / "config/send.conf").write_text(f"# range: 0.001..\nmain_sync_repeat_minutes={minutes}\n")
                 self.assertEqual(main_sync.main(["--checkout", str(self.checkout), "--notify", "natedev"]), 1)
                 send.assert_called_with(
-                    [sys.executable, str(main_sync.SEND), "--to", "natedev", "--from", "main-sync",
+                    [sys.executable, str(session_send.SEND_SCRIPT), "--to", "natedev", "--from", "main-sync",
                      "--text", "main sync on fixture-host: local edit. Commands there stay old until this is "
                      + "cleared; the job retries every 15 minutes.", "--key", "main-sync-fixture-host-dirty",
                      "--repeat-minutes", str(minutes)], check=False, capture_output=True)
