@@ -217,6 +217,7 @@ from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.mac_test import floor_claims
+from scripts.mac_test.mirror_root import MacMirrorRoot
 from build_shape import AbsoluteRecordedRoot, RecordedOutputRoots, recorded_output_roots
 
 GIB = 1 << 30
@@ -3388,17 +3389,21 @@ class FloorOutcome:
         return self.assessment.status
 
 
-def mac_floor_settings(settings: conf.ConfigRead) -> tuple[int, tuple[str, ...]]:
+def mac_floor_settings(
+    settings: conf.ConfigRead, *, mirror_root: MacMirrorRoot | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> tuple[int, tuple[str, ...]]:
     """Refuse a missing live floor or a floor below the admission minimum."""
+    if isinstance(mirror_root, UseConfiguredValue):
+        mirror_root = MacMirrorRoot.read(settings)
     if "sweep_floor_gib" not in settings.values():
         raise conf.Unusable("mac_test.conf: sweep_floor_gib is missing")
     floor = settings.number("sweep_floor_gib")
     if floor < settings.number("free_floor_gib"):
         raise conf.Unusable("mac_test.conf: sweep_floor_gib must be at least free_floor_gib")
     roots = settings.words("sweep_floor_roots")
-    approved = (Path("/tmp").resolve(), Path.home() / "rust", Path.home() / ".local/state/mac-test/mirror")
+    approved = (Path("/tmp").resolve(), Path.home() / "rust", mirror_root.local_path())
     if len(roots) != 3 or {Path(root).expanduser().resolve() for root in roots} != {root.resolve() for root in approved}:
-        raise conf.Unusable("mac_test.conf: sweep_floor_roots must name /tmp, ~/rust and ~/.local/state/mac-test/mirror")
+        raise conf.Unusable(f"mac_test.conf: sweep_floor_roots must name /tmp, ~/rust and ~/{mirror_root.relative}")
     return int(floor * GIB), roots
 
 
@@ -4308,12 +4313,13 @@ def main(argv: list[str]) -> int:
         try:
             with conf.diagnostics(report=False):
                 mac_settings = conf.read("mac_test")
-                mac_floor, mac_roots = mac_floor_settings(mac_settings)
+                mirror_root = MacMirrorRoot.read(mac_settings)
+                mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
             with floor_claims.locked_claims(timeout) as claims:
                 return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
-                                  policy=MacFloor(mac_roots, claims, Path.home() / ".local/state/mac-test/mirror"))
+                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path()))
         except conf.Unusable as error:
             print(f"lint sweep: {error}", file=sys.stderr)
             return 2

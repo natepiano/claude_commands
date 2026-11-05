@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable, Generator, Iterable, Sequence, Set
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
 from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, cast, final, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -44,6 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pane_launch
+from scripts.agents import worker_lifecycle
+from scripts.lib import operation_deadline
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -950,7 +952,7 @@ PROGRAM_TIMEOUT_SECONDS = 10.0
 def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
+        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=operation_deadline.remaining(timeout),
                               env=unmarked_environment() if environment is None else child_environment(environment))
     except OSError as error:
         raise HerdrFailure(f"{argv[0]}: {error}") from error
@@ -1160,11 +1162,15 @@ class _LayoutLock:
         self.handle: int = -1
 
     def __enter__(self) -> None:
-        import fcntl
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.handle = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-            fcntl.flock(self.handle, fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(self.handle)
+        except TimeoutError:
+            if self.handle >= 0:
+                os.close(self.handle)
+                self.handle = -1
+            raise
         except OSError as error:
             print(f"herdr: layout lock is unavailable: {self.path}: {error}", file=sys.stderr)
 
@@ -1184,6 +1190,9 @@ class Herdr:
 
     def run(self, *arguments: str, deadline: float = math.inf) -> str:
         """Run within the caller's monotonic deadline, retaining the usual 10 s cap."""
+        deadline = worker_lifecycle.effective_deadline(deadline)
+        if deadline <= time.monotonic():
+            raise HerdrFailure("deadline passed")
         context = f"herdr {' '.join(arguments[:2])}"
         try:
             result = run_program(self.argv(*arguments), timeout=min(PROGRAM_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic())))
@@ -1198,7 +1207,7 @@ class Herdr:
 
     def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
         """Run a command only when the selected pane contains its empty shell."""
-        deadline = time.monotonic() + PROGRAM_TIMEOUT_SECONDS
+        deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
         while True:
             try:
                 if check_target("", action="keys", place=HerdrPlace(self.session, pane), terminal=terminal,
@@ -1836,7 +1845,7 @@ class Herdr:
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
         launched_at = datetime.now(timezone.utc)
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         attempt_timeout_ms = min(timeout_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
         try:
             while True:
@@ -1851,7 +1860,7 @@ class Herdr:
                     if (error.code != "agent_pane_busy"
                             or deadline <= time.monotonic()):
                         raise
-                    time.sleep(0.1)
+                    time.sleep(operation_deadline.remaining(min(0.1, deadline - time.monotonic())))
                     attempt_timeout_ms = min(int((deadline - time.monotonic()) * 1000),
                                              _AGENT_START_TIMEOUT_MAXIMUM_MS)
                     continue
@@ -1899,7 +1908,7 @@ class Herdr:
     def start_command(self, argv: list[str], kind: str, pane: str,
                       timeout: float) -> subprocess.CompletedProcess[str]:
         """Observe a submitted agent while its CLI waits for interactive readiness."""
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + operation_deadline.remaining(timeout)
         shell: PaneShell | PaneShellUnknown = PaneShellUnknown()
         agent_seen = False
         tracked: set[AgentProcessIdentity] = set()
@@ -1910,6 +1919,7 @@ class Herdr:
         except (HerdrFailure, subprocess.TimeoutExpired):
             pass
         next_observation = time.monotonic() + 0.5
+        operation_deadline.check()
         try:
             process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                        env=unmarked_environment())
@@ -2056,7 +2066,7 @@ class Herdr:
                               ) -> PromptInputReady | PromptInputTimedOut:
         if isinstance(cursor, UnspecifiedPromptTranscript) and isinstance(transcript, SessionTranscript):
             cursor = TranscriptCursor(transcript, launched_at)
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         while time.monotonic() < deadline:
             state = self.prompt_input_state(pane, transcript, launched_at, cursor=cursor)
@@ -2097,7 +2107,7 @@ class Herdr:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
         opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt)
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         cursor = (TranscriptCursor(opening.transcript, launched_at)
                   if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
@@ -2767,7 +2777,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
 def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
     from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
-    deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
+    deadline = time.monotonic() + operation_deadline.remaining(min(10.0, timeout_ms / 1000))
     try:
         if server_answering(run_program(client.argv("status", "server"),
                                         timeout=max(0.001, deadline - time.monotonic()))):
@@ -2799,6 +2809,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: Securi
             pass
         return False
 
+    operation_deadline.check()
     try:
         pid = start_detached(client.argv("server"), ready=ready, within=deadline - time.monotonic(),
                              output=DiscardOutput(), environment=ExplicitEnvironment(unmarked_environment()))
@@ -2812,6 +2823,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: Securi
         try:
             identity = _startup_process_reader(PROGRAM_TIMEOUT_SECONDS).identity(pid)
             if check_target(identity, action="signal"):
+                operation_deadline.check()
                 os.kill(pid, signal.SIGTERM)
         except (_StartupProcessGone, ProcessLookupError, FileNotFoundError):
             pass
@@ -2828,7 +2840,7 @@ def start_server(name: str, timeout_ms: int, *,
     if _platform() == "darwin":
         return _start_darwin_server(herdr, timeout_ms,
             session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
-    deadline = time.monotonic() + timeout_ms / 1000
+    deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
     try:
         if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
             return ServerAdopted()
@@ -3267,11 +3279,15 @@ def _process_display_name(pid: int) -> str:
 
 
 def codex_managed_daemon(arguments: list[str]) -> bool:
-    """Identify the shared daemon that does not hold a thread live."""
+    """Identify the shared daemon and its helpers, which hold no thread."""
     if not is_codex_process(arguments):
         return False
     index = 2 if Path(arguments[0]).name in {"node", "nodejs"} else 1
-    return arguments[index:index + 1] == ["app-server"] and "--managed-daemon" in arguments
+    commands = arguments[index:]
+    if "app-server" not in commands:
+        return False
+    server = commands.index("app-server")
+    return "--managed-daemon" in commands or commands[server + 1:server + 2] == ["daemon"]
 
 
 @dataclass(frozen=True)
@@ -3292,14 +3308,24 @@ class UnknownConversation:
     """Incomplete evidence cannot prove that the target conversation stopped."""
 
     reason: str
+    shared_codex: bool = False
 
 
 def conversation_note(observed: UnknownConversation) -> None:
     print(f"anomaly: {' '.join(observed.reason.splitlines())}; not blocking", file=sys.stderr)
 
 
-def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
+@dataclass(frozen=True)
+class CodexConversations:
+    """One pass shares these live Codex threads and incomplete process reads."""
+
+    live: Mapping[str, tuple[int, ...]]
+    unknown: tuple[str, ...]
+
+
+def codex_conversations() -> CodexConversations:
     from scripts.lib import unit_runs
+    from scripts.message import codex_daemon
 
     # A static import would close the cycle codex_mesh -> session_staff -> herdr -> codex_mesh.
     loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
@@ -3327,14 +3353,23 @@ def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
     except (HerdrFailure, OSError, ValueError) as error:
         unknown.append(f"Codex process list unknown: {error}")
     live: dict[str, tuple[int, ...]] = {}
+    daemon_reads = {read.owner.home: read.sessions for read in codex_daemon.read_daemons(os.environ)}
+    for home, observed in daemon_reads.items():
+        if isinstance(observed, codex_daemon.DaemonUnreadable):
+            unknown.append(f"{home} (Codex daemon unknown: {observed.reason})")
+        else:
+            for session in observed:
+                _ = live.setdefault(session.thread_id, ())
     runs: set[Path] = set()
     for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
         runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
+        environment: dict[str, str] | None = None
         try:
-            if run := process_environment(pid).get("UNIT_RUN_DIR"):
+            environment = process_environment(pid)
+            if run := environment.get("UNIT_RUN_DIR"):
                 runs.add(Path(run))
             observed = native_process(pid, "codex")
             if isinstance(observed.identity, LaunchArgument):
@@ -3346,26 +3381,41 @@ def _codex_conversations() -> tuple[dict[str, tuple[int, ...]], list[str]]:
             continue
         except (HerdrFailure, OSError, ValueError):
             # A server can hold several threads; each open rollout proves its thread.
+            no_rollout = False
             try:
                 for identity in codex_rollout_threads(pid):
                     live[identity] = (*live.get(identity, ()), pid)
                 continue
+            except NoOpenCodexRollout:
+                no_rollout = True
             except (HerdrFailure, OSError, ValueError):
                 pass
+            if environment is not None:
+                if "app-server" in arguments:
+                    if environment.get("UNIT_RUN_DIR"):
+                        # The run read below resolves a server with no open rollout.
+                        continue
+                elif no_rollout and "--no-daemon" not in arguments:
+                    home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+                    if home in daemon_reads:
+                        # A failed daemon read already has one note for its account.
+                        continue
             unknown.append(f"{_process_display_name(pid)} (Codex thread unknown)")
-    deadline = time.monotonic() + PROGRAM_TIMEOUT_SECONDS
+    deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
     for run in sorted(runs):
         try:
             for identity in loaded_threads(run, deadline):
                 _ = live.setdefault(identity, ())
         except (OSError, ValueError) as error:
             unknown.append(f"{run.name} (Codex hosted threads unknown: {error})")
-    return live, unknown
+    return CodexConversations(live, tuple(unknown))
 
 
-def read_conversation(identity: str, kind: str = "") -> LiveConversation | StoppedConversation | UnknownConversation:
+def read_conversation(identity: str, kind: str = "", *,
+                      codex: CodexConversations | None = None) -> LiveConversation | StoppedConversation | UnknownConversation:
     """Read one current conversation across the native runtimes and hosted threads."""
     unknown: list[str] = []
+    shared_codex = False
     if kind != "codex":
         try:
             observed = runtime_sessions.session_liveness(identity)
@@ -3378,23 +3428,32 @@ def read_conversation(identity: str, kind: str = "") -> LiveConversation | Stopp
         except (HerdrFailure, OSError, ValueError) as error:
             unknown.append(f"{identity} (Claude session unknown: {error})")
     if kind != "claude":
-        live, incomplete = _codex_conversations()
-        if identity in live:
-            return LiveConversation("codex", live[identity])
-        unknown.extend(incomplete)
+        codex = codex_conversations() if codex is None else codex
+        if identity in codex.live:
+            return LiveConversation("codex", codex.live[identity])
+        shared_codex = not unknown and bool(codex.unknown)
+        unknown.extend(codex.unknown)
     if unknown:
-        return UnknownConversation(unknown[0])
+        first = " ".join(unknown[0].splitlines())
+        return UnknownConversation(f"{identity} is not proved live or stopped: {len(unknown)} processes unknown, first: {first}",
+                                   shared_codex=shared_codex)
     return StoppedConversation()
 
 
-def running_codex_threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
+def codex_notes(codex: CodexConversations) -> None:
+    """Print each shared reason from the snapshot once."""
+    for reason in dict.fromkeys(codex.unknown):
+        conversation_note(UnknownConversation(reason))
+
+
+def running_codex_threads(*, thread_host: Callable[[list[str]], bool],
+                          codex: CodexConversations | None = None) -> set[str]:
     """Read proved current threads, including app-server threads and excluding the shared daemon."""
     # Keep the keyword for external callers; host processes no longer exclude their threads.
     _ = thread_host
-    live, unknown = _codex_conversations()
-    for reason in dict.fromkeys(unknown):
-        conversation_note(UnknownConversation(reason))
-    return set(live)
+    codex = codex_conversations() if codex is None else codex
+    codex_notes(codex)
+    return set(codex.live)
 
 
 def process_environment(pid: int) -> dict[str, str]:

@@ -281,6 +281,9 @@ def running_builds(model: QueueModel) -> list[RunningBuild]:
         measured = (isinstance(memory, gate.MeasuredMemory) and isinstance(memory.anonymous, gate.AnonymousRunUse)
                     or isinstance(memory, gate.UnownedSliceMemory))
         hold = holds.get(owners_by_step.get(id(step), ""))
+        if hold is not None and not isinstance(step.run, LiveBuildRun):
+            used = hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else 0
+            measured = isinstance(hold.use, gate.AnonymousRunUse)
         kept = hold.bytes if hold is not None and not isinstance(step.run, LiveBuildRun) else 0
         if previous is None:
             rows[key] = RunningBuild(step, used, kept, started, measured,
@@ -297,7 +300,7 @@ def running_builds(model: QueueModel) -> list[RunningBuild]:
             hold = holds.get(f"{row.step.run.pid}-{row.step.run.start_time}")
             if hold is not None:
                 rows[key] = RunningBuild(row.step,
-                    hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else row.used,
+                    hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else 0,
                     hold.bytes, row.started_at, isinstance(hold.use, gate.AnonymousRunUse), row.swap_bytes)
         owners = {f"{row.step.run.pid}-{row.step.run.start_time}" for row in rows.values()
                   if isinstance(row.step.run, LiveBuildRun)}

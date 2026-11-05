@@ -38,6 +38,7 @@
 #
 # Use config/lint.conf to select lint stages. Taplo always checks the workspace.
 # Check, test, and checkpoint rustdoc always run. Clippy judges before repairs.
+# Only status 101 without a kill or a hold permits Clippy repairs.
 #
 # A worker session remembers passes. With UNIT_RUN_DIR or
 # UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
@@ -63,7 +64,7 @@
 # unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
 # usage error, the sandbox or a kill. A lint failure is not recorded when the
-# third clippy fix and format pass still changed the tree. The judged tree is
+# last allowed clippy fix and format pass still changed the tree. The judged tree is
 # the tree when the run starts, or for `lint` the tree invoke_clippy_fix and formatting leave
 # for clippy judgment. A run that ends on any other tree (for `test`,
 # any other part of it the package is built from) records nothing: an edit
@@ -107,8 +108,9 @@
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
 #                                          workspace taplo fmt --check,
-#                                          workspace clippy fix, fmt, then clippy
-#                                          judgment on all targets with all features
+#                                          workspace clippy judgment; on status 101
+#                                          without a kill, fix + fmt, then judgment
+#                                          on all targets with all features
 #                                          (warnings denied)
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
@@ -134,6 +136,9 @@
 #                                          the result replaces the record
 #   … --target <name>                      pin test, check, or doc to a configured SSH target;
 #                                          keep admission and version checks; never run locally
+#   verify.sh test <package> --mac "<why>" [--env NAME …] [--fetch <folder>]
+#                                          Mac only; wait when busy, never fall back;
+#                                          forward named variables and fetch one ignored folder
 #   verify.sh test <package> --local "<why>"   run on natedev; only for a test that cannot pass on macOS.
 #                                          Before CI either machine answers a test,
 #                                          merge gates included; CI is the protection
@@ -169,17 +174,90 @@
 # on top. Shell aliases, validate_ci and release checks use the lint CLI in that
 # directory instead of this script.
 #
-# Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
+# Exit codes: 2 = usage error, missing tooling or a Mac-only refusal; 3 = sandbox failure, re-run
 # the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
+# Save exported values before script variables replace caller names.
+# The --env rule refuses the VERIFY_ prefix. env -0 works in every bash build;
+# a bash built without programmable completion has no compgen.
+VERIFY_CALL_ENVIRONMENT=()
+while IFS= read -r -d '' VERIFY_ENV_ENTRY; do
+    case "$VERIFY_ENV_ENTRY" in VERIFY_*) continue ;; esac
+    VERIFY_CALL_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
+done < <(env -0)
+# Trace the helper in its interpreter. CPU time excludes child processes.
+# The normal path starts no extra interpreter.
+VERIFY_START_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$VERIFY_START_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_START_DIR=.
+VERIFY_START_DIR="$(cd -- "$VERIFY_START_DIR" && pwd -P)"
+PY="$VERIFY_START_DIR/../lib/py"
+if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
+    if [[ "$VERIFY_PY_TRACE" != /* ]]; then export VERIFY_PY_TRACE="$PWD/$VERIFY_PY_TRACE"; fi
+    export VERIFY_TRACE_REAL_PY="$PY"
+    PY="${VERIFY_PY_TRACE}.$$.runner"
+    cat > "$PY" <<'VERIFY_TRACE_RUNNER'
+#!/usr/bin/env bash
+options=()
+while [[ "${1:-}" == -S || "${1:-}" == -u ]]; do
+    options+=("$1"); shift
+done
+exec "$VERIFY_TRACE_REAL_PY" "${options[@]}" -c '
+import atexit, os, signal, sys, time, types
+started = float(sys.argv[1])
+arguments = sys.argv[2:]
+helper = os.environ.get("VERIFY_PY_HELPER", "") or os.path.basename(arguments[0])
+if helper == "-c": helper = "INLINE_PY"
+if helper == "-": helper = "STDIN_PY"
+process = os.getpid()
+recorded = False
+
+def record_trace():
+    global recorded
+    if recorded or os.getpid() != process:
+        return
+    recorded = True
+    with open(os.environ["VERIFY_PY_TRACE"], "a") as trace:
+        trace.write(f"{helper}\t{round((time.time() - started) * 1000)}\t{round(time.process_time() * 1000)}\n")
+
+def terminate_trace(signum, _frame):
+    record_trace()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+signal.signal(signal.SIGTERM, terminate_trace)
+atexit.register(record_trace)
+sys.addaudithook(lambda event, _arguments: record_trace() if event == "os.exec" else None)
+if arguments[0] == "-c":
+    helper = helper or "INLINE_PY"
+    source, filename = arguments[1], "<string>"
+    sys.argv = ["-c", *arguments[2:]]
+elif arguments[0] == "-":
+    helper = helper or "STDIN_PY"
+    source, filename = sys.stdin.read(), "<stdin>"
+    sys.argv = arguments
+else:
+    filename = arguments[0]
+    helper = os.path.basename(filename)
+    with open(filename, "rb") as script:
+        source = script.read()
+    sys.argv = arguments
+    sys.path[0] = os.path.dirname(os.path.abspath(filename))
+module = types.ModuleType("__main__")
+module.__file__ = filename
+sys.modules["__main__"] = module
+exec(compile(source, filename, "exec"), module.__dict__)
+' "${EPOCHREALTIME:-$(date +%s)}" "$@"
+VERIFY_TRACE_RUNNER
+    chmod +x "$PY"
+fi
 # Read-only queries run before environment setup and build admission.
 if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final-pass ) ]]; then
     if [[ "$1" == --session-dir ]]; then shift 2; fi
     shift
     VERIFY_QUERY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
-    exec "$VERIFY_QUERY_DIR/../lib/py" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
+    exec "$PY" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
 fi
 # Create the inherited temporary parent before environment commands use it.
 VERIFY_INVOKE_DIR="${BASH_SOURCE[0]%/*}"
@@ -198,7 +276,7 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
     export VERIFY_NIX_ENV_REEXEC=1
-    exec "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/py" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
+    exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
         exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
@@ -213,7 +291,42 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.12.
-PY="${HOME}/.claude/scripts/lib/py"
+if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
+    export VERIFY_TRACE_REAL_PY="${HOME}/.claude/scripts/lib/py"
+else
+    PY="${HOME}/.claude/scripts/lib/py"
+fi
+
+hash_stream() {
+    local hash
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash="$(sha256sum)" || return 1
+    else
+        hash="$(shasum -a 256)" || return 1
+    fi
+    printf '%s\n' "${hash%% *}"
+}
+
+lint_code_key() {
+    local file hash
+    hash="$(
+        set -o pipefail
+        {
+            for file in "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
+                "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"; do
+                if [[ -f "$file" ]]; then
+                    printf 'present\0'
+                    cat -- "$file" || exit 1
+                else
+                    printf 'absent\0'
+                fi
+                printf '\0'
+            done
+        } | hash_stream
+    )" || hash=""
+    printf '%s\n' "$hash"
+}
+LINT_LOADED_CODE_KEY="$(lint_code_key)"
 
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
@@ -226,6 +339,7 @@ BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
 STEP_RECORD_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/step_record.py"
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
+VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
 FINAL_PASS_START=""
 final_pass_finish() {
     [[ -n "$FINAL_PASS_START" ]] || return 0
@@ -252,20 +366,15 @@ remove_step_record() {
     fi
 }
 
-# A failed step may be a process killed by earlyoom or the kernel. Keep the
-# journal query here so tests can put a journalctl stub first on PATH.
+# One classifier preserves signal retries and checks the failed crate for silent exits.
 memory_kill_in_journal() {
-    local started=$1 ended=$2
-    journalctl -u earlyoom --since "$started" --until "$ended" --no-pager 2>/dev/null \
-        | grep -E 'sending SIG(TERM|KILL) to process' >/dev/null && return 0
-    journalctl -k --since "$started" --until "$ended" --no-pager 2>/dev/null \
-        | grep -E 'Memory cgroup out of memory|Out of memory: Killed' >/dev/null
+    local started=$1 ended=$2 log=$3
+    "$PY" "$VERIFY_START_DIR/memory_kill.py" "$started" "$ended" "$log"
 }
 
 step_was_killed_for_memory() {
     local log=$1 started=$2 ended=$3
-    grep -qaE 'SIGKILL|SIGTERM|signal: (9|15)' "$log" || return 1
-    memory_kill_in_journal "$started" "$ended"
+    memory_kill_in_journal "$started" "$ended" "$log"
 }
 
 step_writes_tree() {
@@ -343,9 +452,7 @@ run_step() {
             step_state on_natedev
         else
             acquire_token local || { status=$?; rm -f "$step_log"; return "$status"; }
-            if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-                printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
-            fi
+            record_token_wait
             step_state local_noncompiling
         fi
         export BUILDLOG_TARGET=natedev
@@ -363,7 +470,7 @@ run_step() {
                 # The pipeline shell owns tokens taken during memory admission.
                 trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
                 run_once "$@"
-            ) 2>&1 | tee "$step_log"; then
+            ) 2>&1 | tee "$step_log" ${CLIPPY_LOG:+"$CLIPPY_LOG"} ${MEND_LOG:+"$MEND_LOG"}; then
                 exit 0
             else
                 exit "${PIPESTATUS[0]}"
@@ -466,164 +573,6 @@ except (OSError, ValueError):
 print(",".join(features))
 '
 
-MEMBER_PY='
-import json
-import sys
-
-package_name = sys.argv[1]
-meta = json.load(sys.stdin)
-if any(package["name"] == package_name for package in meta["packages"]):
-    sys.exit(0)
-print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
-sys.exit(2)
-'
-
-EXAMPLE_FEATURES_PY='
-import json
-import sys
-
-package_name = sys.argv[1]
-example_name = sys.argv[2]
-meta = json.load(sys.stdin)
-for package in meta["packages"]:
-    if package["name"] != package_name:
-        continue
-    for target in package["targets"]:
-        if target["name"] == example_name and "example" in target["kind"]:
-            print(",".join(target.get("required-features", [])))
-            sys.exit(0)
-    print(
-        "verify.sh: example " + example_name + " not found in package " + package_name,
-        file=sys.stderr,
-    )
-    sys.exit(2)
-print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
-sys.exit(2)
-'
-
-# The cargo words that select what `build` builds, then the binaries it makes:
-# `select <word>` lines, `features <list>` for an example's required features,
-# and `binary <path under the profile folder>` lines. Bin and example names
-# are unique across the workspace, so --workspace --bin builds the one target
-# under the workspace's feature set, the set `test` already compiled.
-BUILD_TARGETS_PY='
-import json
-import sys
-
-package_name, kind, name = sys.argv[1], sys.argv[2], sys.argv[3]
-meta = json.load(sys.stdin)
-package = next(package for package in meta["packages"] if package["name"] == package_name)
-wanted = [target for target in package["targets"] if (kind or "bin") in target["kind"] and name in ("", target["name"])]
-if not wanted:
-    what = f"{kind} {name}" if name else "binary"
-    advice = "" if name else "; name an example with --example <name>"
-    print(f"verify.sh: package {package_name} has no {what}{advice}", file=sys.stderr)
-    sys.exit(2)
-for target in wanted:
-    print("select --" + (kind or "bin"))
-    print("select " + target["name"])
-    if kind == "example" and target.get("required-features"):
-        print("features " + ",".join(target["required-features"]))
-    print(("binary examples/" if kind == "example" else "binary ") + target["name"])
-print("target " + meta["target_directory"])
-'
-
-# Select the named package's test targets. Named targets with unavailable
-# required features would error instead of being skipped by --tests, and names
-# shared across members would select both; either case uses the broad flags.
-TEST_TARGETS_PY='
-import json
-import sys
-
-package_name = sys.argv[1]
-meta = json.load(sys.stdin)
-package = next(package for package in meta["packages"] if package["name"] == package_name)
-features = package["features"]
-enabled = set()
-pending = features.get("default", []) + [
-    name[len(package_name) + 1 :] for name in sys.argv[2].split(",") if name.startswith(package_name + "/")
-]
-while pending:
-    name = pending.pop()
-    if name in features and name not in enabled:
-        enabled.add(name)
-        pending += features[name]
-flags = {"bin": "--bin", "test": "--test", "bench": "--bench"}
-shared = {
-    (target["kind"][0], target["name"])
-    for other in meta["packages"]
-    if other["name"] != package_name
-    for target in other["targets"]
-}
-has_lib = any(target["kind"][0] in {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"} for target in package["targets"])
-selection = ["--lib"] if has_lib else []
-for target in package["targets"]:
-    kind = target["kind"][0]
-    if kind not in flags or (kind != "bin" and not target["test"]):
-        continue
-    if not set(target.get("required-features", [])) <= enabled or (kind, target["name"]) in shared:
-        selection = (["--lib"] if has_lib else []) + ["--bins", "--tests"]
-        break
-    selection += [flags[kind], target["name"]]
-print("\n".join(selection or ["--bins", "--tests"]))
-'
-
-UNTESTED_EXAMPLES_PY='
-import json
-from pathlib import Path
-import re
-import sys
-
-meta = json.load(sys.stdin)
-members = set(meta["workspace_members"])
-packages = [package for package in meta["packages"] if package["id"] in members]
-package_name = sys.argv[1]
-if package_name != "--workspace":
-    packages = [package for package in packages if package["name"] == package_name]
-    if not packages:
-        print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
-        sys.exit(2)
-
-test_marker = re.compile(r"^\s*(#\[(?:cfg\(test\)|(?:\w+::)*test)\])")
-offenders = []
-for package in packages:
-    for target in package["targets"]:
-        if "example" not in target["kind"]:
-            continue
-        example_name = target["name"]
-        owner_package = package["name"]
-        manifest_path = package["manifest_path"]
-        source = Path(target["src_path"])
-        if source.name == "main.rs" and source.parent.parent.name == "examples":
-            sources = sorted(source.parent.rglob("*.rs"))
-        else:
-            sources = [source]
-        for path in sources:
-            for line_number, line in enumerate(path.read_text().splitlines(), 1):
-                if match := test_marker.match(line):
-                    offenders.append((
-                        f"example {example_name} holds a test: {path}:{line_number} has {match.group(1)}, and examples carry no tests.",
-                        f"move it into {owner_package}\x27s src/ or tests/, or delete it.",
-                    ))
-                    break
-            else:
-                continue
-            break
-        if target.get("test", False):
-            offenders.append((
-                f"example {example_name} sets test = true in {manifest_path}, and examples carry no tests.",
-                "remove test = true from its [[example]] entry.",
-            ))
-
-for index, (reason, fix) in enumerate(offenders):
-    if index:
-        print(file=sys.stderr)
-    print(reason, file=sys.stderr)
-    print(fix, file=sys.stderr)
-if offenders:
-    sys.exit(2)
-'
-
 # Workspace members with a file that differs from HEAD: staged, unstaged,
 # deleted, or new and not ignored. A phase commits nothing before its
 # checkpoint, so HEAD is where the phase started and this is the whole phase's
@@ -697,10 +646,68 @@ read_metadata() {
     fi
 }
 
-require_member() {
-    if ! read_metadata | "$PY" -c "$MEMBER_PY" "$1"; then
-        exit 2
+# Read the metadata once. Later requests use the shell values.
+# Validate dev features before Cargo. Find changed members after mend.
+METADATA_READY=0
+load_metadata() {
+    [[ "$METADATA_READY" == 0 ]] || return 0
+    local values features="" kind="" name="" valid=1
+    local requests=() words=("${ARGS[@]:1}")
+    local package="${ARGS[0]:-}" index word
+    if [[ "${CHECK_UNTESTED_EXAMPLES:-0}" == 1 ]]; then
+        requests+=("untested-examples:$EXAMPLE_SCOPE")
     fi
+    case "$CMD" in
+        check|build|test) requests+=("member:$package") ;;
+        lint)
+            if [[ "$package" != --workspace ]]; then requests+=("member:$package"); fi
+            requests+=(workspace-root)
+            ;;
+        example) requests+=("example-features:$package:${ARGS[1]:-}") ;;
+        doc) requests+=(target-directory) ;;
+    esac
+    case "$CMD" in
+        test)
+            for ((index=0; index<${#words[@]}; index++)); do
+                if [[ "${words[index]}" == --features ]]; then
+                    features="${words[index+1]:-}"
+                fi
+            done
+            features="$(merge_dev_features "$features")"
+            features="$(qualify_features "$package" "$features")"
+            requests+=("test-targets:$package:$features")
+            ;;
+        build)
+            # Match take_build_args without emitting its usage error early:
+            # the existing member check still wins over malformed arguments.
+            while [[ ${#words[@]} -gt 0 ]]; do
+                word=${words[0]}
+                case "$word" in
+                    --bin|--example)
+                        if [[ -n "$kind" || -z "${words[1]:-}" || "${words[1]:-}" == --* ]]; then
+                            valid=0; break
+                        fi
+                        kind=${word#--}; name=${words[1]}; words=("${words[@]:2}")
+                        ;;
+                    --release) words=("${words[@]:1}") ;;
+                    --features)
+                        if [[ -z "${words[1]:-}" ]]; then valid=0; break; fi
+                        words=("${words[@]:2}")
+                        ;;
+                    *) valid=0; break ;;
+                esac
+            done
+            if [[ "$valid" == 1 ]]; then requests+=("build-targets:$package:$kind:$name"); fi
+            ;;
+    esac
+    GATE_METADATA="$(read_metadata)" || exit 2
+    values="$("$PY" "$VERIFY_METADATA_SCRIPT" "${requests[@]}" <<< "$GATE_METADATA")" || exit 2
+    eval "$values"
+    METADATA_READY=1
+}
+
+require_member() {
+    load_metadata
 }
 
 require_taplo() {
@@ -744,20 +751,19 @@ workspace_taplo() (
 )
 
 example_features() {
-    cargo metadata --no-deps --format-version 1 \
-        | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
+    load_metadata
+    printf '%s\n' "$EXAMPLE_FEATURES"
 }
 
 TEST_SELECTION=()
 take_test_targets() {
-    local words word
-    words="$(read_metadata \
-        | "$PY" -c "$TEST_TARGETS_PY" "$PKG" "${FEATURE_FLAGS[1]:-}")"
+    local word
+    load_metadata
     while IFS= read -r word; do
         if [[ -n "$word" ]]; then
             TEST_SELECTION+=("$word")
         fi
-    done <<< "$words"
+    done <<< "$TEST_TARGETS"
 }
 
 # Qualify each feature name in a comma list with the package, leaving names
@@ -850,7 +856,7 @@ take_build_args() {
                 ;;
         esac
     done
-    words="$(read_metadata | "$PY" -c "$BUILD_TARGETS_PY" "$PKG" "$kind" "$name")" || exit 2
+    words="$BUILD_TARGETS"
     while IFS= read -r line; do
         case "$line" in
             "select "*) BUILD_ARGS+=("${line#select }") ;;
@@ -935,7 +941,7 @@ compose_nextest_args() {
         TEST_FILTER="package($PKG)"
     fi
     # Build only the targets this package's tests live in
-    # (TEST_TARGETS_PY): --lib, which cannot be narrowed to one member
+    # (verify_metadata.py): --lib, which cannot be narrowed to one member
     # under --workspace and is left out for a package without a lib,
     # and the package's own bins and test-enabled targets. --bins
     # --tests linked every member's test executables, 78 in hana, to
@@ -1011,11 +1017,16 @@ if [[ "$CMD" == example-test ]]; then
     exit 2
 fi
 
-# --no-cache and --local may sit anywhere after the subcommand; nothing below
-# sees them.
+# Remove routing flags before constructing command words and records.
 NO_CACHE=0
 LOCAL_ONLY=0
 LOCAL_REASON=""
+MAC_ONLY=0
+MAC_REASON=""
+MAC_ENV_NAMES=()
+VERIFY_MAC_ENVIRONMENT=()
+MAC_FETCH=""
+MAC_FETCH_GIVEN=0
 PINNED_TARGET=""
 ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -1031,6 +1042,35 @@ while [[ $# -gt 0 ]]; do
         --no-cache)
             NO_CACHE=1
             shift
+            ;;
+        --mac)
+            if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
+                echo 'verify.sh: --mac needs a reason: --mac "<why this test must run on macOS>".' >&2
+                exit 2
+            fi
+            MAC_ONLY=1 MAC_REASON=$2
+            shift 2
+            ;;
+        --env)
+            name=${2:-}
+            if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                printf 'verify.sh: --env %s: not a variable name.\n' "$name" >&2
+                exit 2
+            fi
+            MAC_ENV_NAMES+=("$name")
+            shift 2
+            ;;
+        --fetch)
+            if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then
+                echo 'verify.sh: --fetch is given twice; name one folder.' >&2
+                exit 2
+            fi
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+                echo 'verify.sh: --fetch needs a folder relative to the repository root, such as target/shots.' >&2
+                exit 2
+            fi
+            MAC_FETCH_GIVEN=1 MAC_FETCH=${2%/}
+            shift 2
             ;;
         --local)
             if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
@@ -1055,6 +1095,48 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 set -- "${ARGS[@]}"
+if [[ "$MAC_ONLY" == 1 && "$CMD" != test ]]; then
+    echo 'verify.sh: --mac applies only to test.' >&2
+    exit 2
+fi
+if [[ "$MAC_ONLY" == 1 && "$LOCAL_ONLY" == 1 ]]; then
+    echo 'verify.sh: --mac and --local cannot be used together.' >&2
+    exit 2
+fi
+if [[ "$MAC_ONLY" == 0 && ( ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ) ]]; then
+    echo 'verify.sh: --env and --fetch need --mac "<why>".' >&2
+    exit 2
+fi
+for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do
+    case "$name" in
+        PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
+            printf 'verify.sh: --env %s: the runner sets it, or it changes what Cargo builds; it is not forwarded.\n' "$name" >&2
+            exit 2 ;;
+    esac
+    VERIFY_ENV_FOUND=0
+    for VERIFY_ENV_ENTRY in ${VERIFY_CALL_ENVIRONMENT[@]+"${VERIFY_CALL_ENVIRONMENT[@]}"}; do
+        if [[ "${VERIFY_ENV_ENTRY%%=*}" == "$name" ]]; then
+            VERIFY_MAC_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
+            VERIFY_ENV_FOUND=1
+            break
+        fi
+    done
+    if [[ "$VERIFY_ENV_FOUND" == 0 ]]; then
+        printf 'verify.sh: --env %s: not set here; set it on the call (NAME=value verify.sh …).\n' "$name" >&2
+        exit 2
+    fi
+done
+if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then
+    if [[ ! "$MAC_FETCH" =~ ^[A-Za-z0-9._/-]+$ || "$MAC_FETCH" == /* || "$MAC_FETCH" == -* \
+          || "/$MAC_FETCH/" == *//* || "/$MAC_FETCH/" == */./* || "/$MAC_FETCH/" == */../* ]]; then
+        printf 'verify.sh: --fetch %s: not a plain relative folder.\n' "$MAC_FETCH" >&2
+        exit 2
+    fi
+    if ! git -C "$(git rev-parse --show-toplevel)" check-ignore -q -- "$MAC_FETCH/"; then
+        printf 'verify.sh: --fetch %s: git does not ignore it; name a folder the tests write, such as one under target/.\n' "$MAC_FETCH" >&2
+        exit 2
+    fi
+fi
 if [[ -n "$PINNED_TARGET" ]]; then
     if [[ "$LOCAL_ONLY" == 1 || ! "$CMD" =~ ^(test|check|doc)$ ]]; then
         echo 'verify.sh: --target supports test, check, and doc without --local.' >&2
@@ -1063,7 +1145,7 @@ if [[ -n "$PINNED_TARGET" ]]; then
     NO_CACHE=1
 fi
 export BUILDLOG_PINNED_TARGET="$PINNED_TARGET"
-DEV_FEATURES="$("$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml")" || exit 2
+DEV_FEATURES="$(VERIFY_PY_HELPER=DEV_FEATURES_PY "$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml")" || exit 2
 if [[ "$LOCAL_ONLY" -eq 1 ]]; then
     export BUILDLOG_LOCAL_REASON="$LOCAL_REASON"
 else
@@ -1141,10 +1223,10 @@ buildlog_memory_event() {
 collect_routing_wait() {
     phase_wait_finish hold
     if [[ -n "$ROUTING_WAIT_STARTED" ]]; then
-        "$PY" -c 'import sys, time
-with open(sys.argv[2], "a") as output:
-    output.write("%.6f\n" % max(0, time.monotonic() - float(sys.argv[1])))' \
-            "$ROUTING_WAIT_STARTED" "$BUILDLOG_HOLD_WAIT_FILE"
+        local now=$EPOCHREALTIME elapsed
+        elapsed=$(( 10#${now/./} - 10#${ROUTING_WAIT_STARTED/./} ))
+        (( elapsed >= 0 )) || elapsed=0
+        printf '%d.%06d\n' "$(( elapsed / 1000000 ))" "$(( elapsed % 1000000 ))" >> "$BUILDLOG_HOLD_WAIT_FILE"
         ROUTING_WAIT_STARTED=""
     fi
 }
@@ -1159,7 +1241,7 @@ collect_hold_wait() {
 
 interrupt_hold_wait() {
     if [[ -n "${BUILDLOG_HOLD_WAITER_FILE:-}" && -f "$BUILDLOG_HOLD_WAITER_FILE" ]]; then
-        python3 "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
+        "$PY" "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
     fi
 }
 
@@ -1184,8 +1266,11 @@ CACHE_DIR=""
 if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
 fi
+if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then CACHE_DIR=""; fi
 RUN_LOG=""
+RUN_LOG_PIDS=()
 VERDICT_KEY=""
+VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
 RUN_STARTED=0
 CALL_NOTED=0
@@ -1216,7 +1301,15 @@ if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
 fi
 
 tree_key() {
-    local words=("$CMD" "${ARGS[@]}") names=() name scope=() key_options=("$@")
+    local words=("$CMD" "${ARGS[@]}") names=() name scope=() key_options=() scripts=()
+    local option content=0
+    for option in "$@"; do
+        if [[ "$option" == --tree-content ]]; then content=1; else key_options+=("$option"); fi
+    done
+    if [[ "$content" == 0 ]]; then
+        scripts=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh"
+            "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
+    fi
     if [[ "$CMD" == lint ]]; then
         if [[ ${#ARGS[@]} -eq 1 ]]; then words=(lint); fi
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
@@ -1244,9 +1337,18 @@ tree_key() {
         key_options+=(--without-lint-versions)
     fi
     VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
-    "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
-        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
+    "$PY" "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
         <<< "${GATE_METADATA}" 2>/dev/null || true
+}
+
+set_verdict_keys() {
+    local keys
+    keys="$(tree_key --with-tree-content "$@")"
+    VERDICT_KEY="${keys%%$'\n'*}"
+    VERDICT_TREE_KEY=""
+    if [[ "$keys" == *$'\n'* ]]; then
+        VERDICT_TREE_KEY="${keys#*$'\n'}"
+    fi
 }
 
 TREE_CHANGED_STATUS=77
@@ -1259,8 +1361,10 @@ after_tree_change() {
 
 stop_tree_watch() {
     if [[ -n "$TREE_WATCH_PID" ]]; then
-        kill "$TREE_WATCH_PID" 2>/dev/null || true
-        wait "$TREE_WATCH_PID" 2>/dev/null || true
+        # A group signal can reap the watcher before this cleanup starts.
+        if kill "$TREE_WATCH_PID" 2>/dev/null; then
+            wait "$TREE_WATCH_PID" 2>/dev/null || true
+        fi
         TREE_WATCH_PID=""
     fi
 }
@@ -1301,7 +1405,7 @@ cancel_tree_run() {
 start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-tree --owner "$$")"
-    VERDICT_KEY="$(tree_key --watch-start "$TREE_WATCH_DIR/start")"
+    set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
     [[ -s "$TREE_WATCH_DIR/start" ]] || { rm -rf "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
     local scope=()
     if [[ "$CMD" == test ]]; then scope=(--package "${ARGS[0]}"); fi
@@ -1321,7 +1425,7 @@ finish_tree_watch() {
 # Git's staged tree identity. A private copy avoids updating the real index's
 # cache-tree extension when write-tree runs.
 doc_tree() {
-    "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
 import os
 from pathlib import Path
 import subprocess
@@ -1346,7 +1450,7 @@ PYDOC
 # The caller holds DOC_CHECKOUT/lock until rustdoc and its record are complete.
 # The private index and persistent path preserve unchanged source mtimes.
 doc_checkout() {
-    "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$DOC_CHECKOUT" <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_CHECKOUT_PY "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$DOC_CHECKOUT" <<'PYDOC'
 import os
 from pathlib import Path
 import shutil
@@ -1390,7 +1494,7 @@ doc_record() {
         echo 'verify.sh: the staged tree changed while doc ran; no doc pass record was written.'
         return 0
     fi
-    "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_RECORD_PY "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
 from datetime import datetime, timezone
 import json
 import os
@@ -1552,7 +1656,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
     local runner_status result_text="" result_word="" result_reason="" mac_owns_watch=0
-    local result_seconds="" result_holder="" mac_words=0 line
+    local result_seconds="" result_holder="" result_fetch=failed mac_words=0 line name
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
     runner_args+=(--target "$selected_target")
@@ -1570,6 +1674,8 @@ try_mac_test() {
     if [[ "${2:-}" == busy || "${2:-}" == blocked ]]; then
         runner_args+=(--last-decline "$2")
     fi
+    for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do runner_args+=(--env "$name"); done
+    if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then runner_args+=(--fetch "$MAC_FETCH"); fi
     MAC_RESULT_FILE="$(mktemp)"
     runner_args+=(--result "$MAC_RESULT_FILE")
     if [[ "$FILTER_RUN" -eq 1 ]]; then
@@ -1588,14 +1694,36 @@ try_mac_test() {
         start_tree_watch
         mac_owns_watch=1
     elif [[ -n "${CACHE_DIR}" && -z "$TREE_WATCH_PID" ]]; then
-        VERDICT_KEY="$(tree_key)"
+        set_verdict_keys
     fi
     MAC_LOG_FILE="$(mktemp)"
     if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
         env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" state --call-id "$BUILDLOG_CALL_ID" \
             --target "$selected_target" on_ssh || exit 2
     fi
-    "$PY" "$MAC_RUNNER" "${runner_args[@]}" > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
+    # Apply forwarded values in Python. Bash can make these names readonly or arrays.
+    # The pipe preserves bytes and keeps values outside argv.
+    local VERIFY_MAC_ENV_PY='
+import os
+import runpy
+import sys
+
+with open(3, "rb") as handoff:
+    for entry in handoff.read().split(b"\0"):
+        if entry:
+            name, value = entry.split(b"=", 1)
+            os.environb[name] = value
+sys.argv = sys.argv[1:]
+sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))
+runpy.run_path(sys.argv[0], run_name="__main__")
+'
+    (
+        if [[ -z ${VERIFY_MAC_ENVIRONMENT[0]+set} ]]; then
+            exec "$PY" "$MAC_RUNNER" "${runner_args[@]}"
+        fi
+        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$MAC_RUNNER" "${runner_args[@]}" \
+            3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
+    ) > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
     MAC_RUNNER_PID=$!
     if wait "$MAC_RUNNER_PID"; then
         runner_status=0
@@ -1625,6 +1753,7 @@ try_mac_test() {
                 reason=*) result_reason="${line#reason=}" ;;
                 seconds=*) result_seconds="${line#seconds=}" ;;
                 holder=*) result_holder="${line#holder=}" ;;
+                fetch=*) result_fetch="${line#fetch=}" ;;
             esac
         done <<< "$result_text"
     fi
@@ -1681,6 +1810,14 @@ try_mac_test() {
             exit "$runner_status"
             ;;
         passed)
+            if [[ "$MAC_FETCH_GIVEN" == 1 && "$result_fetch" != fetched ]]; then
+                if [[ "$FILTER_RUN" == 1 ]]; then BUILDLOG_MAC=passed_filter; else BUILDLOG_MAC=passed_full; fi
+                printf 'verify.sh: FAIL: the tests passed on the Mac, but --fetch %s brought nothing back (%s).\n' "$MAC_FETCH" "$result_fetch" >&2
+                rm -f "$MAC_LOG_FILE"
+                MAC_LOG_FILE=""
+                note_event failed "$SECONDS" 0 "" 0 2
+                exit 2
+            fi
             MAC_PASSED=1
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then
                 rm -f "$MAC_LOG_FILE"
@@ -1717,7 +1854,7 @@ finish_mac_pass() {
 check_routing_hold() {
     local admission=0
     if build_hold_nothing_held; then return 0; fi
-    python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
+    "$PY" "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
         2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
     if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
         cat "$HOLD_WAIT_DIR/routing-diagnostic" >&2
@@ -1735,7 +1872,7 @@ initialize_step_record() {
     if [[ "$CMD" == test ]]; then arguments+=(--package "$PKG"); fi
     if [[ "$LOCAL_ONLY" == 1 ]]; then arguments+=(--local "$LOCAL_REASON"); fi
     if [[ -n "$PINNED_TARGET" ]]; then arguments+=(--target "$PINNED_TARGET"); fi
-    answer=$(python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
+    answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
     if (( status != 0 )); then
         printf 'verify.sh: target eligibility check failed (exit %s); step refused\n' "$status" >&2
         exit "$status"
@@ -1794,7 +1931,8 @@ initialize_step_record() {
     fi
     if [[ -n "$PINNED_TARGET" ]]; then STEP_RECORD_ARGS+=(--pinned-target "$PINNED_TARGET"); fi
     if [[ "$CMD" == test ]]; then STEP_RECORD_ARGS+=(--package "$PKG"); fi
-    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" || exit 2
+    VERIFY_MONOTONIC_OFFSET_US="$(env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" \
+        "${STEP_RECORD_ARGS[@]}" --clock-offset)" || exit 2
     STEP_RECORD_ACTIVE=1
     export BUILDLOG_MEM_WAIT_FIRST_FILE="${BUILDLOG_MEM_WAIT_FIRST_FILE:-$HOLD_WAIT_DIR/first-queued-at}"
     if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
@@ -1802,6 +1940,22 @@ initialize_step_record() {
     fi
     export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
     export BUILDLOG_CALL_ID
+    if [[ "$MAC_ONLY" == 1 ]]; then
+        printf 'verify.sh: Mac only (%s): route this test to the Mac.\n' "$MAC_REASON" >&2
+        local mac_eligible=0 refusal=state
+        while IFS=$'\t' read -r name eligibility reason settings; do
+            [[ "$settings" != - && "$(target_platform "$name")" == macos ]] || continue
+            if [[ "$eligibility" == eligible || "$reason" == busy ]]; then
+                mac_eligible=1
+            else
+                refusal=$reason
+            fi
+        done <<< "$STEP_TARGET_TABLE"
+        if [[ "$mac_eligible" == 0 ]]; then
+            BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=$refusal BUILDLOG_MAC_S=0
+            mac_only_refuse "$refusal"
+        fi
+    fi
     if step_can_retry; then
         while IFS=$'\t' read -r name eligibility reason settings; do
             if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON )
@@ -1927,7 +2081,9 @@ remember_mac_retry() {
         return 0
     fi
     if [[ "${LAST_TARGET_OUTCOME:-$BUILDLOG_MAC}" != declined || ! "$MAC_LEAVE_REASON" =~ ^(busy|blocked|disk)$ ]]; then
-        MAC_RETRY_AFTER="$("$PY" -c 'import time; print(time.monotonic() + 180)')"
+        local now=$EPOCHREALTIME deadline
+        deadline=$(( 10#${now/./} - VERIFY_MONOTONIC_OFFSET_US + 180000000 ))
+        printf -v MAC_RETRY_AFTER '%d.%06d' "$(( deadline / 1000000 ))" "$(( deadline % 1000000 ))"
         if [[ "$MAC_RETRY_NOTICE_SHOWN" == 0 ]]; then
             echo "verify.sh: Mac attempt ended ($BUILDLOG_MAC${BUILDLOG_MAC_REASON:+: $BUILDLOG_MAC_REASON}); waiting 180 s before each retry while natedev waits." >&2
             MAC_RETRY_NOTICE_SHOWN=1
@@ -1974,7 +2130,10 @@ ssh_reserve_hook() {
     done
     if [[ "$MAC_LEAVE_SETTINGS" == "$settings" ]]; then deadline=$MAC_RETRY_AFTER; fi
     if [[ "$deadline" != 0 && "$STEP_RUNS_ON" != mac_allowed ]]; then
-        printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$deadline"
+        # The retry hook expands the clock when it runs.
+        # shellcheck disable=SC2016
+        printf 'test "$(( ${EPOCHREALTIME/./} - %q ))" -ge %q' \
+            "$VERIFY_MONOTONIC_OFFSET_US" "${deadline/./}"
         printf ' && '
     fi
     printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
@@ -2024,6 +2183,7 @@ try_reserved_target() {
     fi
     SSH_RETRY_AFTER_SETTINGS=$settings
     try_mac_test "$settings" "$MAC_LEAVE_REASON" || return $?
+    if [[ "$MAC_PASSED" != 1 ]]; then check_mac_only_result; fi
     remember_mac_retry "$settings" || true
 }
 
@@ -2033,7 +2193,11 @@ mac_retry_hook() {
     if [[ "$2" != 0 ]]; then
         printf '{ '
         if [[ -n "$MAC_IDLE_MARKER" ]]; then printf 'test -f %q || ' "$MAC_IDLE_MARKER"; fi
-        printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$2"
+        local deadline=$2
+        # The retry hook expands the clock when it runs.
+        # shellcheck disable=SC2016
+        printf 'test "$(( ${EPOCHREALTIME/./} - %q ))" -ge %q' \
+            "$VERIFY_MONOTONIC_OFFSET_US" "${deadline/./}"
         printf '; } && '
     fi
     if [[ "${3:-}" == reserve ]]; then printf '{ if SSH_RETRY_AVAILABILITY="$('; fi
@@ -2047,13 +2211,44 @@ mac_retry_hook() {
     fi
 }
 
+mac_only_refuse() {
+    local reason=$1 text
+    case "$reason" in
+        blocked) text="the Mac is blocked (/build:status names the holder and when it lifts)" ;;
+        unreachable) text="the Mac cannot be reached (/build:status --probe)" ;;
+        backoff) text="the Mac was unreachable a short time ago (retry backoff)" ;;
+        disk) text="the Mac is below its free-space floor" ;;
+        off) text="Mac offload is off" ;;
+        repo) text="this repository has no Mac setting" ;;
+        linux_only) text="$PKG is Linux only on the Mac" ;;
+        state) text="the Mac claim state cannot be read" ;;
+        copy) text="the tree copy to the Mac failed" ;;
+        no_tests) text="no test matched on the Mac" ;;
+        lost) text="the link to the Mac dropped during the run" ;;
+        runner) text="the Mac runner gave no usable result" ;;
+        *) text=$reason ;;
+    esac
+    export BUILDLOG_TARGET=""
+    printf 'verify.sh: test --mac refused: %s; nothing ran on natedev.\n' "$text" >&2
+    note_event failed "$SECONDS" 0 "" 0 2
+    exit 2
+}
+
+# Only a busy claim can wait on a Mac-only call; every other answer ends it.
+check_mac_only_result() {
+    [[ "$MAC_ONLY" == 1 ]] || return 0
+    if [[ "$BUILDLOG_MAC:$BUILDLOG_MAC_REASON" == declined:busy ]]; then return 0; fi
+    if [[ "$BUILDLOG_MAC" == lost ]]; then mac_only_refuse lost; fi
+    mac_only_refuse "${BUILDLOG_MAC_REASON:-runner}"
+}
+
 route_test() {
     local name eligibility reason settings admission remote_candidates=0 reservation_status
     local announced_reason="" retry=0 retry_ready
     while IFS=$'\t' read -r name eligibility reason settings; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$(target_platform "$name")" == macos ]]; then
             BUILDLOG_MAC=declined
-            if [[ "$LOCAL_ONLY" == 0 ]]; then
+            if [[ "$LOCAL_ONLY" == 0 && "$MAC_ONLY" == 0 ]]; then
                 BUILDLOG_MAC_REASON=$reason
                 export BUILDLOG_LOCAL_REASON="$reason"
             fi
@@ -2067,7 +2262,7 @@ route_test() {
             STEP_TARGET_TABLE=${pinned_answer#*$'\n'}
             step_state waiting_ssh
         fi
-        if [[ "$retry" == 1 && "$STEP_RUNS_ON" != mac_allowed && -z "$PINNED_TARGET" ]]; then
+        if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$STEP_RUNS_ON" != mac_allowed && -z "$PINNED_TARGET" ]]; then
             admission=0
             check_routing_hold || admission=$?
             case "$admission" in
@@ -2078,6 +2273,9 @@ route_test() {
         fi
         remote_candidates=0
         while IFS=$'\t' read -r name eligibility reason settings; do
+            if [[ "$MAC_ONLY" == 1 ]]; then
+                [[ "$settings" != - && "$(target_platform "$name")" == macos ]] || continue
+            fi
             if [[ "$settings" == - ]]; then
                 [[ "$retry" == 0 && "$eligibility" == eligible && "$STEP_FORCE_MAC" == 0 ]] || continue
                 admission=0
@@ -2097,7 +2295,7 @@ route_test() {
             [[ -f "$MAC_RUNNER" ]] || continue
             if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
             remote_candidates=1
-            if [[ "$retry" == 1 && "$STEP_RUNS_ON" == mac_allowed ]]; then
+            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$STEP_RUNS_ON" == mac_allowed ]]; then
                 retry_ready=0
                 eval "$(mac_retry_hook "$settings" "$MAC_RETRY_AFTER" reserve)" >/dev/null 2>&1 || retry_ready=$?
                 if [[ "$retry_ready" != 0 ]]; then
@@ -2117,10 +2315,10 @@ route_test() {
                 echo "verify.sh: target $PINNED_TARGET refused: admission changed." >&2
                 return 2
             fi
-            if [[ "$retry" == 1 && "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ]]; then
+            if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ]]; then
                 continue
             fi
-            if [[ "$reservation_status" == 0 || ( "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ) ]]; then
+            if [[ "$reservation_status" == 0 || "$MAC_ONLY" == 1 || ( "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ) ]]; then
                 if [[ "$retry" == 1 ]]; then collect_routing_wait; fi
                 MAC_LEAVE_SETTINGS=$settings
                 try_reserved_target || return $?
@@ -2147,14 +2345,21 @@ route_test() {
             retry=1
             continue
         fi
-        admission=0
-        check_routing_hold || admission=$?
-        case "$admission" in
-            0) collect_routing_wait; return 0 ;;
-            10) ;;
-            *) return "$admission" ;;
-        esac
-        if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
+        if [[ "$MAC_ONLY" == 0 ]]; then
+            admission=0
+            check_routing_hold || admission=$?
+            case "$admission" in
+                0) collect_routing_wait; return 0 ;;
+                10) ;;
+                *) return "$admission" ;;
+            esac
+        fi
+        if [[ "$MAC_ONLY" == 1 ]]; then
+            if [[ -z "$announced_reason" ]]; then
+                echo 'verify.sh: waiting for the Mac (busy); natedev runs nothing for this call.' >&2
+                announced_reason=busy
+            fi
+        elif [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
             if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
                 echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
                 announced_reason=$BUILDLOG_MAC_REASON
@@ -2163,11 +2368,15 @@ route_test() {
             echo 'verify.sh: waiting for eligible SSH capacity or the local hold release.' >&2
             announced_reason=ssh
         fi
-        phase_wait_start hold "build hold"
+        if [[ "$MAC_ONLY" == 1 ]]; then phase_wait_start hold "Mac busy"; else phase_wait_start hold "build hold"; fi
         if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
-            ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
+            ROUTING_WAIT_STARTED=$EPOCHREALTIME
         fi
-        "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
+        if [[ "$MAC_ONLY" == 1 ]]; then
+            sleep "${BUILD_TARGETS_POLL_S:-15}" &
+        else
+            "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
+        fi
         HOLD_WAITER_PID=$!
         admission=0
         wait "$HOLD_WAITER_PID" || admission=$?
@@ -2186,6 +2395,8 @@ route_test() {
 # the run's hold folder, so the EXIT trap removes both, and both names carry
 # the run's pid for tmp_sweep.py when a kill skips the trap.
 start_copy_watch() {
+    # BASHPID identifies this shell inside a subshell. Bash 3.2 needs the child shell's PPID.
+    local parent_pid="${BASHPID:-$(exec sh -c 'printf "%s\n" "$PPID"')}"
     local copy_parent=()
     [[ -z "${HOLD_WAIT_DIR:-}" ]] || copy_parent=(--parent "$HOLD_WAIT_DIR")
     COPY_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-copy --owner "$$" "${copy_parent[@]}")"
@@ -2193,7 +2404,8 @@ start_copy_watch() {
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
         --repo-root "$(git rev-parse --show-toplevel)" --package "$PKG"
-        --call-id "$BUILDLOG_CALL_ID" --call-started "$VERIFY_CALL_STARTED")
+        --call-id "$BUILDLOG_CALL_ID" --call-started "$VERIFY_CALL_STARTED"
+        --parent-pid "$parent_pid")
     if [[ "$FILTER_RUN" -eq 1 ]]; then
         watch_args+=(--filter-run)
     fi
@@ -2315,8 +2527,10 @@ cache_lookup() {
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && "${NO_CACHE}" -eq 0 ]] || return 1
     record="${CACHE_DIR}/${LOOKUP_KEY}"
-    # --local asks for Linux: a pass the Mac ran does not answer it.
-    if [[ -f "${record}.pass" && ! ( "${LOCAL_ONLY}" -eq 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) ]]; then
+    # --local needs a natedev pass; --mac needs a Mac pass.
+    if [[ -f "${record}.pass" \
+          && ! ( "$LOCAL_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) \
+          && ! ( "$MAC_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" != mac ) ]]; then
         record+=.pass outcome=reused word=PASS
     elif [[ -f "${record}.fail" ]]; then
         record+=.fail outcome=replayed word=FAIL
@@ -2364,17 +2578,22 @@ build_seconds() {
 # or when the tree has changed since that verdict.
 # The time in the user's zone setting, with its label; UTC (labeled) when the setting cannot be read.
 user_clock() {
-    TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
+    TZ="$("$PY" -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
 }
 
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
     # A lost token gives no verdict about the tree.
     (( EXIT_STATUS != 125 )) || return 1
+    if [[ "$CMD" == lint ]]; then
+        [[ -n "$LINT_LOADED_CODE_KEY" && "$(lint_code_key)" == "$LINT_LOADED_CODE_KEY" ]] || return 1
+    fi
     key="$(tree_key)"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
-        echo "verify.sh: the tree changed while ${CMD} ran, so this result was not recorded; the next ${CMD} runs again."
+        if [[ -z "$VERDICT_TREE_KEY" || "$(tree_key --tree-content)" != "$VERDICT_TREE_KEY" ]]; then
+            echo "verify.sh: the tree changed while ${CMD} ran, so this result was not recorded; the next ${CMD} runs again."
+        fi
         return 1
     fi
     if [[ "${kind}" == fail ]]; then
@@ -2455,17 +2674,16 @@ finish_run() {
 # Checked before the cache lookup and any build, so a recorded pass never
 # stands in for the rule that examples carry no tests.
 GATE_METADATA=""
+CHECK_UNTESTED_EXAMPLES=0
 if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
     || ( ${#ARGS[@]} -eq 3 && "${ARGS[1]}" == --features ) ) ) ]]; then
-    GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
+    CHECK_UNTESTED_EXAMPLES=1
     if [[ "$CMD" == final ]]; then
         EXAMPLE_SCOPE=--workspace
     else
         EXAMPLE_SCOPE="${ARGS[0]}"
     fi
-    if ! "$PY" -c "$UNTESTED_EXAMPLES_PY" "$EXAMPLE_SCOPE" <<< "$GATE_METADATA"; then
-        exit 2
-    fi
+    load_metadata
 fi
 # A test record's key reads the package's dependencies from it (tree_key).
 if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
@@ -2484,8 +2702,12 @@ export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
 trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; release_wait_claim; remove_step_record; final_pass_finish "$hold_status"; exit "$hold_status"' EXIT
 hold_interrupted() {
     local signal_name=$1 code=$2
-    trap - INT TERM HUP
+    # Ignore repeated signals while cleanup closes the hold record.
+    trap '' INT TERM HUP
     if [[ -n "$HOLD_WAITER_PID" ]]; then
+        # A background Bash sleep inherits ignored INT. End that waiter with
+        # TERM for every caller signal; keep the caller's status in the record.
+        if [[ "$MAC_ONLY" == 1 ]]; then signal_name=TERM; fi
         kill -s "$signal_name" "$HOLD_WAITER_PID" 2>/dev/null || true
         wait "$HOLD_WAITER_PID" 2>/dev/null || true
     fi
@@ -2503,6 +2725,10 @@ fi
 if [[ "$CMD" == test ]]; then
     compose_nextest_args
     route_test || exit $?
+    if [[ "$MAC_ONLY" == 1 ]]; then
+        BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=runner
+        mac_only_refuse runner
+    fi
 fi
 while [[ -z "$PINNED_TARGET" ]] && ! build_hold_nothing_held; do
     step_state waiting_hold
@@ -2523,7 +2749,7 @@ while [[ -z "$PINNED_TARGET" ]] && ! build_hold_nothing_held; do
     if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]]; then
         HOLD_WAIT_ARGS+=(--leave-hook "$(ssh_retry_hook)")
     fi
-    python3 "$BUILD_TARGETS_SCRIPT" "${HOLD_WAIT_ARGS[@]}" &
+    "$PY" "$BUILD_TARGETS_SCRIPT" "${HOLD_WAIT_ARGS[@]}" &
     HOLD_WAITER_PID=$!
     HOLD_WAIT_STATUS=0
     wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
@@ -2574,6 +2800,12 @@ TOKEN_HELD=0
 # A step routed to the Mac skips its first token acquisition.
 TOKEN_WAITED=0
 TOKEN_WAITER_PID=""
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
+TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)" || exit 2
+TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)" || exit 2
+TOKEN_RENEW_S=$(awk -v interval="$TOKEN_RENEW_S" -v hold="$TOKEN_HOLD_S" \
+    'BEGIN { if (interval > hold / 3) interval = hold / 3; print interval }')
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on
     # the real board. Normal calls retain Bash's elapsed-seconds clock.
@@ -2632,8 +2864,9 @@ token_waiters_key() {
     if [[ "$CMD" == lint && ${#key_args[@]} -gt 0 && "${key_args[0]}" != --* ]]; then
         key_args=("${key_args[@]:1}")
     fi
-    "$PY" -c 'import hashlib, sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:16])' \
-        "$(pwd -P)" "$CMD" ${key_args[@]+"${key_args[@]}"}
+    local hash
+    hash="$( { printf '%s' "$(pwd -P)"; printf '\0%s' "$CMD" ${key_args[@]+"${key_args[@]}"}; } | hash_stream)"
+    printf '%s\n' "${hash:0:16}"
 }
 supersede_older_waiters() {
     local file name pid stamp own=${TOKEN_WAITER_FILE%.*}
@@ -2705,7 +2938,7 @@ token_wait_note() {
     fi
     case "$kind" in
         first) printf 'waiting for the cargo token since %s: %s; calls ahead of this one: %d\n' \
-            "$(TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%H:%M %Z')" \
+            "$(TZ="$("$PY" -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%H:%M %Z')" \
             "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
         still) printf 'still waiting for the cargo token (%d min): %s; calls ahead of this one: %d\n' \
             "$waited_min" "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
@@ -2744,11 +2977,15 @@ token_acquired() {
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
 }
 
-# Waits until this run holds the token, with no time limit: the pid reclaim and
-# the 3600 s hold already free a dead or stuck holder, and the queue above
-# drops a waiter whose verify.sh ended. Sets TOKEN_WAITED to the seconds it
-# waited.
+# Dead holders release the token. The queue removes waiters whose verify.sh ended.
+# TOKEN_WAITED records the elapsed wait in seconds.
 # The local argument disables remote routing for a local formatter.
+record_token_wait() {
+    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    fi
+}
+
 acquire_token() {
     sync_token_state
     TOKEN_WAITED=0
@@ -2792,7 +3029,7 @@ acquire_token() {
             # Two tries 3 s apart, then the queue is read again.
             pause=1
             bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-                --pid $$ --hold 3600 --wait 3 >/dev/null 2>&1 &
+                --pid $$ --hold "$TOKEN_HOLD_S" --wait 3 >/dev/null 2>&1 &
             TOKEN_WAITER_PID=$!
             status=0
             wait "$TOKEN_WAITER_PID" || status=$?
@@ -2920,8 +3157,10 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     except OSError:
         recorded = ""
     if recorded != holder:
-        print("verify.sh: this run lost the cargo token before its step started; run it again.",
-              file=sys.stderr)
+        lost_file = os.environ.get("VERIFY_TOKEN_LOST_FILE")
+        if lost_file:
+            Path(lost_file).write_text("lost")
+        print("verify.sh: lost the cargo token before its step started", file=sys.stderr)
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
@@ -2934,16 +3173,99 @@ sys.exit(shell_status(subprocess.call(command)))
 # Preserve the shared invocation policy (including systemd scopes and its
 # fallback), changing only the command it launches while this token is held.
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
+renew_token() {
+    local status=0
+    bash "${BOARD_HELPER}" renew "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+        --pid $$ --hold "$TOKEN_HOLD_S" >/dev/null 2>&1 || status=$?
+    # Status 2 means the guard cannot confirm ownership. Continue renewal.
+    (( status == 0 || status == 2 ))
+}
+
+# Each span owns one renewer. Nested spans use the same renewer.
+# Release stops the renewer before ownership changes.
+start_token_renewer() {
+    [[ "${TOKEN_HELD:-0}" -eq 1 ]] || return 0
+    renew_token || return 1
+    local renew_parent=${BASHPID:-$$}
+    (
+        delay_pid=""
+        trap 'if [[ -n "$delay_pid" ]]; then
+            kill "$delay_pid" 2>/dev/null || true
+            wait "$delay_pid" 2>/dev/null || true
+        fi; exit 0' INT TERM HUP
+        while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
+            sleep "$TOKEN_RENEW_S" &
+            delay_pid=$!
+            wait "$delay_pid" || break
+            delay_pid=""
+            renew_token || break
+        done
+    ) &
+    TOKEN_RENEWER_PID=$!
+}
+
+stop_token_renewer() {
+    [[ -n "${TOKEN_RENEWER_PID:-}" ]] || return 0
+    kill "$TOKEN_RENEWER_PID" 2>/dev/null || true
+    wait "$TOKEN_RENEWER_PID" 2>/dev/null || true
+    TOKEN_RENEWER_PID=""
+}
+
+with_token_renewal() {
+    # A nested call must keep its caller's renewer.
+    if [[ -n "${TOKEN_RENEWER_PID:-}" ]] && kill -0 "$TOKEN_RENEWER_PID" 2>/dev/null; then
+        "$@"
+        return $?
+    fi
+    local TOKEN_RENEWER_PID="" status=0
+    # Admission or the command guard handles confirmed ownership loss.
+    start_token_renewer || true
+    "$@" || status=$?
+    stop_token_renewer
+    return "$status"
+}
+
+# Routing can retain the token during remote waits. Renew it during those waits.
+eval "$(declare -f route_test | sed '1s/route_test/route_test_without_renewal/')"
+route_test() {
+    with_token_renewal route_test_without_renewal
+}
+
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" python3 -c "$STEP_OWNER_PY" \
-            "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
+        local TOKEN_RENEWER_PID="" step_status=0
+        if ! start_token_renewer; then
+            printf lost > "${HOLD_WAIT_DIR:?}/token-lost"
+            printf 'verify.sh: lost the cargo token before its step started\n' >&2
+            return 125
+        fi
+        VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
+            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
+                "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
+        stop_token_renewer
+        return "$step_status"
     else
         buildlog_exec_unowned "$@"
     fi
 }
 
+# Retry only when the ownership guard started no command.
+# run_once releases the reservation and sampler before this call.
+buildlog_retry_unstarted_step() {
+    BUILDLOG_RETRY_STEP=0
+    [[ -s "$HOLD_WAIT_DIR/token-lost" ]] || return 0
+    rm -f "$HOLD_WAIT_DIR/token-lost"
+    # shellcheck disable=SC2034 # invoke.sh reads this callback result.
+    BUILDLOG_RETRY_STEP=1
+    TOKEN_HELD=0
+    if ! buildlog_step_compiles "$@"; then
+        acquire_token local || return $?
+        record_token_wait
+    fi
+}
+
 release_token() {
+    stop_token_renewer
     # A subshell records its release for the parent shell.
     # A killed acquisition can still hold the token, so release that token too.
     if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
@@ -2956,8 +3278,7 @@ release_token() {
     local release_status=0
     bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null \
         || release_status=$?
-    # An expired hold may be reclaimed while this step is still running. The
-    # new holder owns the token; the old step's result remains authoritative.
+    # An ownership identity change permits reclaim. Preserve the original step result.
     (( release_status == 0 || release_status == 3 )) || return "$release_status"
     TOKEN_HELD=0
     if [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
@@ -2987,7 +3308,7 @@ buildlog_wait_for_memory() {
     fi
     local LINT_QUEUE_LEAVE_HOOK="$leave_hook"
     export LINT_QUEUE_LEAVE_HOOK
-    buildlog_wait_for_memory_only "$@" || status=$?
+    with_token_renewal buildlog_wait_for_memory_only "$@" || status=$?
     if (( status != 0 )) || [[ "$BUILDLOG_MEM_OUTCOME" != Granted ]]; then
         release_token || cleanup_status=$?
         (( status != 0 )) || status=$cleanup_status
@@ -3005,7 +3326,7 @@ refresh_test_build_inputs() {
     # Admission and the recorder must see the inputs after a hold, just as
     # buildlog_begin takes its source key after that wait.
     rm -f "$HOLD_WAIT_DIR/test-build-inputs"
-    VERDICT_KEY="$(VERIFY_COMPUTE_TEST_BUILD=1 tree_key)"
+    VERIFY_COMPUTE_TEST_BUILD=1 set_verdict_keys
     export BUILDLOG_TEST_BUILD_KEY="" BUILDLOG_TEST_TARGET_DIR="" BUILDLOG_TEST_BUILD_DIR=""
     if [[ -f "$HOLD_WAIT_DIR/test-build-inputs" ]]; then
         { IFS= read -r BUILDLOG_TEST_BUILD_KEY; IFS= read -r BUILDLOG_TEST_TARGET_DIR;
@@ -3041,9 +3362,7 @@ build_hold_wait_local() {
     phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
     acquire_token || return $?
-    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
-    fi
+    record_token_wait
     if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
     return "$status"
 }
@@ -3063,13 +3382,38 @@ if [[ "$CMD" == test ]]; then
     # The common path calculates once; a later hold refreshes after its wait.
     refresh_test_build_inputs
 fi
+run_log_tee() {
+    # Keep readers alive while verify_interrupted stops the step and records its result.
+    # An early reader exit can cause SIGPIPE during cleanup.
+    trap '' INT TERM HUP
+    exec tee -i -a "$RUN_LOG"
+}
+
+start_run_log() {
+    exec > >(run_log_tee)
+    RUN_LOG_PIDS+=("$!")
+    exec 2> >(run_log_tee >&2)
+    RUN_LOG_PIDS+=("$!")
+}
+
+stop_interrupted_run_log() {
+    # Stop blocked readers after cleanup. They can ignore EOF while their output pipe is full.
+    [[ ${#RUN_LOG_PIDS[@]} -gt 0 ]] || return 0
+    set +x
+    exec >/dev/null 2>&1
+    local pid
+    for pid in "${RUN_LOG_PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+    for pid in "${RUN_LOG_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    RUN_LOG_PIDS=()
+}
+
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
-    if [[ "$CMD" != test ]]; then VERDICT_KEY="$(tree_key)"; fi
+    if [[ "$CMD" != test ]]; then set_verdict_keys; fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
-    exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
+    start_run_log
 fi
 
 ACTIVITY_ACTIVE=0
@@ -3142,7 +3486,10 @@ verify_cleanup() {
 # status the trap receives; a lint failure record keeps it.
 trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; final_pass_finish "$EXIT_STATUS"; exit "${EXIT_STATUS}"' EXIT
 verify_interrupted() {
-    trap - EXIT INT TERM HUP
+    trap - EXIT
+    # The supervisor can forward a signal that this group already received.
+    # Ignore later signals until cleanup removes this call's records.
+    trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
     interrupt_hold_wait
     if [[ -n "$RUN_STEP_PID" ]]; then
@@ -3153,6 +3500,7 @@ verify_interrupted() {
     fi
     verify_cleanup interrupted
     final_pass_finish "$EXIT_STATUS"
+    stop_interrupted_run_log
     exit "$EXIT_STATUS"
 }
 trap 'verify_interrupted 2' INT
@@ -3211,8 +3559,7 @@ case "$CMD" in
         if [[ "$HOLD_LINT" == 1 ]]; then
             # Format locally; the Mac judges the resulting tree without fixes.
             fmt_cargo --all
-            GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
-            WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
+            load_metadata
             workspace_taplo
             lint_status=0
             if lint_config_enabled mend; then
@@ -3249,8 +3596,7 @@ case "$CMD" in
             else
                 lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
             fi
-            GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
-            WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
+            load_metadata
             if ! workspace_taplo --check; then
                 lint_status=1
             fi
@@ -3277,15 +3623,15 @@ case "$CMD" in
         if lint_config_enabled mend; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: mend start'
             MEND_LOG="$(mktemp)"
-            # pipefail is set, so a failing mend fails the pipeline; the log
-            # only decides which message names the failure.
-            if invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" 2>&1 | tee "$MEND_LOG"; then
+            # run_step() records diagnostics through its tee.
+            # Keep this call in the parent so cleanup can stop the step.
+            if invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then
                 :
             else
-                mend_status=${PIPESTATUS[0]}
-                if (( mend_status == 137 )); then
+                mend_status=$?
+                if (( mend_status == 137 || mend_status == 125 )); then
                     rm -f "$MEND_LOG"
-                    exit 137
+                    exit "$mend_status"
                 fi
                 if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
                     echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
@@ -3296,6 +3642,7 @@ case "$CMD" in
                 exit 1
             fi
             rm -f "$MEND_LOG"
+            MEND_LOG=""
             [[ "$PKG" != --workspace ]] || echo 'style-lint: mend passed'
         else
             lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
@@ -3308,8 +3655,8 @@ case "$CMD" in
             FMT_SCOPE=(--all)
         else
             FMT_SCOPE=(-p "$PKG")
-            FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
-            | "$PY" -c "$CHANGED_MEMBERS_PY")"
+            FMT_MEMBERS="$(read_metadata \
+            | VERIFY_PY_HELPER=CHANGED_MEMBERS_PY "$PY" -c "$CHANGED_MEMBERS_PY")"
             while IFS= read -r member; do
                 if [[ -n "$member" && "$member" != "$PKG" ]]; then
                     FMT_SCOPE+=(-p "$member")
@@ -3325,12 +3672,11 @@ case "$CMD" in
         fi
         # Record the tree Taplo reads; clippy fix and fmt update the key below.
         if [[ -n "${RUN_LOG}" ]]; then
-            VERDICT_KEY="$(tree_key)"
+            set_verdict_keys
         fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
-        GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
-        WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
+        load_metadata
         TAPLO_ARGS=(--check)
         if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(); fi
         if workspace_taplo ${TAPLO_ARGS[@]+"${TAPLO_ARGS[@]}"}; then
@@ -3349,26 +3695,54 @@ case "$CMD" in
         fi
         if lint_config_enabled clippy; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
-            for clippy_judgment in 1 2; do
-                start_tree_watch
-                clippy_status=0
-                invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
-                finish_tree_watch
-                (( clippy_status != 0 && clippy_judgment == 1 )) || break
-                clippy_tree_before="$(tree_key)"
-                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
+            start_tree_watch
+            # Store diagnostics in the watch directory for cancellation cleanup.
+            # Keep admission and the step record in run().
+            CLIPPY_LOG="$(mktemp "${TREE_WATCH_DIR:-${TMPDIR:-/tmp}}/clippy.XXXXXX")"
+            clippy_status=0
+            # Use the existing tee to record diagnostics.
+            # Keep wait and cancellation messages visible.
+            if invoke_clippy --workspace --all-targets --all-features --keep-going; then
+                :
+            else
+                clippy_status=$?
+            fi
+            # Status 101 permits repairs for lint findings and compile errors.
+            # A kill or a lint hold prevents repairs.
+            clippy_repair=0
+            if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
+            if [[ "$HOLD_LINT" == 0 && "$clippy_status" == 101 && "${RUN_LAST_ATTEMPT_KILLED:-0}" == 0 ]] && ! grep -qE "process didn.t exit successfully:.*signal:" "$CLIPPY_LOG"; then
+                clippy_repair=1
+            fi
+            rm -f "$CLIPPY_LOG"
+            unset CLIPPY_LOG
+            finish_tree_watch
+            if (( clippy_repair )); then
+                # Read at use so a changed policy applies to this repair round.
+                clippy_fix_limit="$(_lint_config_raw clippy_fix_pass_limit)"
+                if [[ ! "$clippy_fix_limit" =~ ^[1-9][0-9]{0,3}$ ]]; then
+                    [[ -z "$clippy_fix_limit" ]] || echo "verify.sh: invalid clippy_fix_pass_limit=$clippy_fix_limit; using 3." >&2
+                    clippy_fix_limit=3
+                fi
+                clippy_tree_before="$(tree_key --tree-content)"
+                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=clippy_fix_limit; clippy_fix_pass++)); do
                     invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
                     fmt_cargo "${FMT_SCOPE[@]}"
-                    clippy_tree_after="$(tree_key)"
+                    clippy_tree_after="$(tree_key --tree-content)"
                     if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
                         break
                     fi
-                    if (( clippy_fix_pass == 3 )); then
+                    # An empty key cannot prove that the tree stopped changing.
+                    if (( clippy_fix_pass == clippy_fix_limit )); then
                         CLIPPY_FIX_LIMIT_REACHED=1
                     fi
                     clippy_tree_before="$clippy_tree_after"
                 done
-            done
+                start_tree_watch
+                clippy_status=0
+                invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
+                finish_tree_watch
+            fi
             (( clippy_status == 0 )) || exit "$clippy_status"
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else
@@ -3392,12 +3766,12 @@ case "$CMD" in
         # Cargo resolves its configured target at the original repo, never at
         # the isolated source checkout. Relative env overrides use that top.
         if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
-            CARGO_TARGET_DIR="$(cd "$DOC_REPO_TOP" && cargo metadata --no-deps --format-version 1 \
-                | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+            load_metadata
+            CARGO_TARGET_DIR="$TARGET_DIRECTORY"
         fi
-        CARGO_TARGET_DIR="$("$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
+        CARGO_TARGET_DIR="$(VERIFY_PY_HELPER=DOC_TARGET_PATH_PY "$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
         export CARGO_TARGET_DIR
-        DOC_CHECKOUT="$CARGO_TARGET_DIR/verify-doc/$("$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:24])' "$DOC_REPO_TOP")"
+        DOC_CHECKOUT="$CARGO_TARGET_DIR/verify-doc/$(VERIFY_PY_HELPER=DOC_CHECKOUT_HASH_PY "$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:24])' "$DOC_REPO_TOP")"
         mkdir -p "$DOC_CHECKOUT"
         # fd 8 holds the doc checkout lock; fd 9 belongs to nextest sharing.
         exec 8>"$DOC_CHECKOUT/lock"

@@ -27,10 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory
-    from ..lib.shell_test_support import shell_function
+    from ..lib.shell_test_support import shell_function, shell_functions
 else:
     from scripts.lib.socket_test_support import short_socket_directory
-    from scripts.lib.shell_test_support import shell_function
+    from scripts.lib.shell_test_support import shell_function, shell_functions
 
 import record as recorder
 import step_context
@@ -126,6 +126,9 @@ class RecordTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(mock.patch.dict(os.environ))
+        if "BUILDLOG_REPO_IDENTITY" in os.environ:
+            del os.environ["BUILDLOG_REPO_IDENTITY"]
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.base)))
         tools = rust_tool_path(self.base / "tools")
         self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
@@ -196,7 +199,7 @@ class RecordTests(unittest.TestCase):
             "step", str(status), str(START), str(START + 12.5), tty, handoff, peak, *argv, extra=extra, cwd=cwd
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        return self.records()[-1]
+        return [row for row in self.records() if row.get("kind") == "step"][-1]
 
     def records(self) -> list[Record]:
         found: list[Record] = []
@@ -498,7 +501,7 @@ class RecordTests(unittest.TestCase):
 
         shell = "\n".join(shell_function(invoke.read_text(), name) for name in
                           ("buildlog_read_context", "buildlog_now", "buildlog_begin", "buildlog_write_step", "buildlog_end"))
-        shell += "\n" + shell_function(verify.read_text(), "refresh_test_build_inputs") + "\n"
+        shell += "\n" + shell_functions(verify, "set_verdict_keys", "refresh_test_build_inputs")
         shell += 'tree_key() { printf key; }\n'
         home = self.base / "shell-home"
         launcher = home / ".claude/scripts/lib/py"
@@ -1105,6 +1108,80 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual((unknown["tree_key"], unknown["tree_changed"]), (None, None))
         _ = (self.repo / "new.rs").write_text("\n")
         self.assertNotEqual(self.key(*NEXTEST), key)
+
+    def test_step_without_a_command_keeps_unknown_repository_identity(self) -> None:
+        _ = self.git("remote", "add", "origin", "https://example.org/local.git", cwd=self.repo)
+        row = self.step(0, "0", "", "", [])
+        self.assertEqual(row["repo_identity"], store.UNKNOWN_IDENTITY)
+
+    def test_mirror_steps_record_the_sent_repository_identity_without_derivation(self) -> None:
+        mirror = self.base / "mirror"
+        mirror.mkdir()
+        _ = self.git("init", "-q", "--template=", cwd=mirror)
+        identity = "https://example.org/source"
+        for caller in ("verify-mac", "verify-linux"):
+            with self.subTest(caller=caller), mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": identity}):
+                row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller}, cwd=mirror)
+                self.assertEqual(row["repo_identity"], identity)
+                _ = index.update()
+                with closing(index.read_only()) as connection:
+                    indexed = cast(tuple[str, int], connection.execute(
+                        "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
+                    ).fetchone())
+                self.assertEqual(indexed, (identity, 0))
+
+    def test_ordinary_steps_ignore_the_sent_repository_identity(self) -> None:
+        directory = self.base / "ordinary"
+        directory.mkdir()
+        with mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": "https://example.org/source"}):
+            row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": "verify"}, cwd=directory)
+        self.assertEqual(row["repo_identity"], store.UNKNOWN_IDENTITY)
+
+    def test_mirror_steps_without_a_sent_identity_keep_unknown_identity(self) -> None:
+        directory = self.base / "mirror"
+        directory.mkdir()
+        for caller in ("verify-mac", "verify-linux"):
+            for sent in (None, "", " \t\n"):
+                with self.subTest(caller=caller, sent=sent), mock.patch.dict(os.environ):
+                    if sent is None:
+                        if "BUILDLOG_REPO_IDENTITY" in os.environ:
+                            del os.environ["BUILDLOG_REPO_IDENTITY"]
+                    else:
+                        os.environ["BUILDLOG_REPO_IDENTITY"] = sent
+                    self.assertIsInstance(recorder.sent_repository_identity(), recorder.NoSentRepositoryIdentity)
+                    call_id = f"{caller}-{sent!r}"
+                    row = self.step(0, "0", "", "", NEXTEST, {
+                        "BUILDLOG_CALLER": caller, "BUILDLOG_CALL_ID": call_id,
+                    }, cwd=directory)
+                    self.assertEqual(row["repo_identity"], store.UNKNOWN_IDENTITY)
+                    recorder.ssh_attempt({
+                        "call_id": call_id, "target": "mac" if caller == "verify-mac" else "aws",
+                        "repo_identity": "https://example.org/source", "queued_at": START,
+                        "departed_at": START + 1, "slot": 1, "outcome": "passed",
+                        "completion": "confirmed", "cleanup": "confirmed", "unresolved_count": 0,
+                        "evidence_at": START + 2,
+                    })
+                    _ = index.update()
+                    with closing(index.read_only()) as connection:
+                        indexed = cast(tuple[str, int], connection.execute(
+                            "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
+                        ).fetchone())
+                    self.assertEqual(indexed, ("https://example.org/source", 1))
+
+    def test_known_local_repository_identity_wins_over_the_sent_identity(self) -> None:
+        identity = "https://example.org/local"
+        _ = self.git("remote", "add", "origin", identity + ".git", cwd=self.repo)
+        for caller in ("verify-mac", "verify-linux"):
+            with self.subTest(caller=caller), mock.patch.dict(
+                os.environ, {"BUILDLOG_REPO_IDENTITY": "https://example.org/source"},
+            ):
+                row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller})
+                self.assertEqual(row["repo_identity"], identity)
+
+    def test_sent_repository_identity_strips_surrounding_space(self) -> None:
+        with mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": "  https://example.org/source\n"}):
+            self.assertEqual(recorder.sent_repository_identity(),
+                             recorder.SentRepositoryIdentity("https://example.org/source"))
 
     def test_verify_mac_step_without_git_records_the_sent_tree_key_and_call_id(self) -> None:
         mirror = self.base / "mirror"

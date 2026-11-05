@@ -91,20 +91,23 @@ class SharedGateAdmissionTests(ServiceGateFixture):
     def test_gate_waits_for_the_protected_head_and_prints_its_need(self) -> None:
         fixture = self.admission
         with fixture.loop_turn():
-            busy = only_admitted(fixture.server.handle_request(fixture.request()))
+            busy = only_admitted(fixture.server.handle_request(fixture.request(owner=fixture.proc.spawn(used=0))))
             fixture.allow_next_start()
-        older = fixture.request(need=400 * (1 << 20), since=fixture.clock.now() - 60)
-        older = replace(older, identity=replace(older.identity, name="older-step"))
-        fixture.free(0)
-        reply, = fixture.server.handle_request(older)
+        with fixture.loop_turn():
+            older = fixture.request(need=400 * (1 << 20), since=fixture.clock.now() - 60)
+            older = replace(older, identity=replace(older.identity, name="older-step"))
+            fixture.free(0)
+            reply, = fixture.server.handle_request(older)
         self.assertIsInstance(reply, wire.Wait)
         handle_request = fixture.server.handle_request
 
         def fit_older(request: wire.Request,
                       connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            if isinstance(request, wire.AdmitRequest) and request.owner != older.owner:
-                fixture.free(23 * memory_admit.GIB // 2)
-            return handle_request(request, connection)
+            with fixture.loop_turn():
+                if isinstance(request, wire.AdmitRequest) and request.owner != older.owner:
+                    self.assertIn(older.episode, fixture.server.waiters)
+                    fixture.free(23 * memory_admit.GIB // 2)
+                return handle_request(request, connection)
 
         admit = client.admit
         output = io.StringIO()

@@ -8,6 +8,12 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 # typical cases use existing test facts or the Nix thresholds, never invented log citations.
 
 
+def mac_idle_reservation(holder: str, detail: str) -> str:
+    """The optional reservation sentence used as a catalog value."""
+    return (f'The Mac reservation lists holder "{holder}" and label "{detail}".'
+            if holder not in ("", "none") else "")
+
+
 ENTRIES = (
     PushText("decision.choices", "{sender}", "decision", "{title}",
         ActionTemplate("On {machine}, reply in the {session} terminal: {choice_labels}."),
@@ -42,6 +48,27 @@ ENTRIES = (
          PushExample("unreachable", {"reason": "natedev could not reach the Mac for more than 24 hours.", "action": "Wake the Mac and connect it to the network."}),
          PushExample("command", {"reason": "The update failed with an error the job does not know.", "action": "In the Claude session named natedev, ask it to read the vault update error in the hourly log."})),
         purpose="The Mac vault cannot update. One alert is sent until a pull succeeds."),
+    PushText("mac_idle.blocked", "Mac idle watch", "blocked", "{holder} blocks waiting Mac tests",
+        ActionTemplate("On natedev, in the {holder} session, ask it to finish its Mac work and run /build:mac unblock"),
+        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
+        + "{waiting} steps wait behind the {holder} session's block. It labeled the reservation \"{detail}\". "
+        + "Waiting work can use the Mac after {clears}.",
+        (PushExample("research_block", {"minutes": "10", "waiting": "7", "holder": "research",
+            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"}),
+         PushExample("three_waiting", {"minutes": "12", "waiting": "3", "holder": "research",
+            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"})),
+        purpose="A Mac block holds up eligible steps past the configured threshold."),
+    PushText("mac_idle.stuck", "Mac idle watch", "decision", "Waiting tests are not using the Mac",
+        ActionTemplate("On natedev, ask the builds showrunner to get the waiting steps onto the Mac"),
+        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
+        + "{waiting} steps wait. {reservation} "
+        + "To restore Mac work: {clears}.",
+        (PushExample("idle_research_claim", {"minutes": "10", "waiting": "3",
+            "reservation": mac_idle_reservation("research", "P15 F11 L0 run"), "since": "07:50 EDT", "clears": "release of the idle claim P15 F11 L0 run"}),
+         PushExample("free_mac", {"minutes": "10", "waiting": "7",
+            "reservation": mac_idle_reservation("none", ""), "since": "07:47 EDT",
+            "clears": "the builds showrunner checks why the waiting steps do not take the Mac"})),
+        purpose="Eligible steps wait while the Mac has no build or test."),
     PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
         ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
         "The nix shell for {session}'s worktree did not load, so its builds will fail. "

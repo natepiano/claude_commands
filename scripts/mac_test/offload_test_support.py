@@ -31,6 +31,7 @@ else:
     from memory_test_support import write_config_fixture, config_environment
 
 import offload
+import conf
 import mac_test
 import treekey
 from offload_test_commands import COMMAND_STUB, write_shell
@@ -117,9 +118,11 @@ class RemoteClaimRecord(TypedDict):
 
 HANA = offload.KnownRepository("hana")
 
-HANA_COMMAND_PATTERN = "[.]local/state/mac-test/mirror/hana([/'\"[:space:]]|$)"
+FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
 
-HANA_CWD_PATTERN = "^n.*/[.]local/state/mac-test/mirror/hana(/|$)"
+HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
+
+HANA_CWD_PATTERN = "^n.*/" + offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana(/|$)"
 
 CLAIM_STUB = r'''
 from __future__ import annotations
@@ -348,6 +351,8 @@ class OffloadCommandFixture(unittest.TestCase):
         verb: offload.MacVerb = "nextest",
         package: str = "hana",
         source: offload.MacSource = WORKING_TREE_SOURCE,
+        runner_options: tuple[str, ...] = (),
+        call_id: str = "call-17",
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -357,7 +362,7 @@ class OffloadCommandFixture(unittest.TestCase):
             "--repo-root",
             str(self.repository if repository is None else repository),
             "--call-id",
-            "call-17",
+            call_id,
         ]
         if isinstance(source, offload.StagedDocSnapshot):
             arguments.extend(["--source-root", str(source.root)])
@@ -372,7 +377,7 @@ class OffloadCommandFixture(unittest.TestCase):
             arguments.extend(["--settings", str(settings)])
         if last_decline:
             arguments.extend(["--last-decline", last_decline])
-        arguments.extend(["--result", str(self.result_path), "--"])
+        arguments.extend(["--result", str(self.result_path), *runner_options, "--"])
         arguments.extend(nextest_arguments)
         if subprocess_cli:
             return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
@@ -448,6 +453,8 @@ raise SystemExit(offload.main())
         extra: dict[str, str] | None = None,
         ignore_interrupt: bool = False,
         start_new_session: bool = False,
+        runner_options: tuple[str, ...] = (),
+        call_id: str = "call-signal",
     ) -> subprocess.Popen[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -459,9 +466,10 @@ raise SystemExit(offload.main())
             "--package",
             "hana",
             "--call-id",
-            "call-signal",
+            call_id,
             "--result",
             str(self.result_path),
+            *runner_options,
             "--",
             *nextest_arguments,
         ]
@@ -571,7 +579,7 @@ raise SystemExit(offload.main())
         self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
         self.assertNotIn("pkill", remote)
         self.assertNotIn("PIPESTATUS", remote)
-        self.assertNotIn(".local/state/mac-test/mirror/", remote.replace("[.]local/state/mac-test/mirror/", ""))
+        self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/", ""))
 
     def remote_claim(self) -> RemoteClaimRecord:
         return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))

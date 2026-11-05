@@ -90,7 +90,6 @@ class UnitStatusFixture(unittest.TestCase):
         script = root / "scripts/production/unit_status.sh"
         script.parent.mkdir(parents=True)
         _ = shutil.copy2(SCRIPT, script)
-        _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
         message = root / "scripts/message"
         copy_session_modules(message)
         _ = shutil.copy2(SCRIPT.parents[1] / "message/process_table.py", message / "process_table.py")
@@ -111,8 +110,9 @@ class UnitStatusFixture(unittest.TestCase):
         (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
-        for name in ("agent_scope.py", "legacy_identity.py", "script_envelope.py", "atomic_file.py", "conf.py", "git_exclude.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py"):
-            _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
+        _ = shutil.copytree(SCRIPT.parents[1] / "lib", root / "scripts/lib", dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "test_*"))
+        _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
         for name in ("active", "sessions"):
             (root / name).mkdir()
         _ = (root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
@@ -143,7 +143,6 @@ class UnitStatusFixture(unittest.TestCase):
         stopped_units: tuple[str, ...] = (),
         missing_units: tuple[str, ...] = (),
         unreadable_units: tuple[str, ...] = (),
-        duplicate_units: tuple[str, ...] = (),
     ) -> tuple[tuple[str, ...], str | None, str]:
         with self.case_directory() as root, isolated_staff_file(root / "staff.json", environment := dict(os.environ)):
             script = root / "scripts/production/unit_status.sh"
@@ -228,22 +227,16 @@ class UnitStatusFixture(unittest.TestCase):
                 for unit in hosted:
                     if unit.session in stopped_units:
                         unit.marks["CLAUDE_CODE_SESSION_ID"] = unit.marks.pop("CODEX_THREAD_ID")
-                hosted.extend(HostedUnit(unit.session, f"copy-{unit.pane}", dict(unit.marks))
-                              for unit in tuple(hosted) if unit.session in duplicate_units)
                 publish_host(environment, hosted)
                 for unit in hosted:
-                    if unit.session in pids and not unit.pane.startswith("copy-"):
+                    if unit.session in pids:
                         fake_unit_host.place_process(environment, pids[unit.session], unit.pane, exec_shell=True)
                 result = subprocess.run(
                     [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
                     check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                if duplicate_units:
-                    self.assertEqual(len(result.stderr.splitlines()), len(duplicate_units))
-                    self.assertIn("anomaly:", result.stderr)
-                else:
-                    self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stderr, "")
                 outputs.append(result.stdout)
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None
             seen_path = root / "status" / "decisions_seen"

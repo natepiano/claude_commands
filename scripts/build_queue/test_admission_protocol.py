@@ -22,6 +22,33 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NO
 
 class ProtocolTests(unittest.TestCase):
 
+    def test_old_unavailable_cap_reply_keeps_the_room_without_an_empty_run_list(self) -> None:
+        from scripts.build_queue.queue_fixture import QueueFixture
+
+        with QueueFixture() as fixture:
+            reading = gate.queue_read_from(fixture.inputs(policy=admission_policy_fixture()),
+                                          gate.AdmissionLimits(3 * GIB), admission_policy_fixture())
+            original_room = reading.explanation.room
+            assert isinstance(original_room, gate.MemoryRoom)
+            envelope = cast(dict[str, object], json.loads(wire.encode_reply(wire.ViewReply(reading))))
+            data = cast(dict[str, object], envelope["data"])
+            recorded = cast(dict[str, object], data["reading"])
+            explanation = cast(dict[str, object], recorded["explanation"])
+            room = cast(dict[str, object], explanation["room"])
+            room["cap"] = {"kind": "CapUnavailable", "reason": "anonymous use unavailable"}
+
+            reply = wire.parse_reply(json.dumps(envelope))
+            assert isinstance(reply, wire.ViewReply)
+            decoded_room = reply.reading.explanation.room
+            assert isinstance(decoded_room, gate.MemoryRoom)
+            self.assertIsInstance(decoded_room.cap, gate.CapUnavailable)
+            self.assertEqual((decoded_room.available, decoded_room.room, decoded_room.kept),
+                             (original_room.available, original_room.room, original_room.kept))
+            shown = queue_evidence.room_text(decoded_room)
+            self.assertTrue(shown.startswith(f"Cap unavailable; free {queue_evidence.gib(original_room.available)}"), shown)
+            self.assertNotIn("anonymous use", shown)
+            self.assertNotIn("unavailable for", shown)
+
 
     def test_room_cap_and_unavailable_pressure_survive_the_service_reply(self) -> None:
         from scripts.build_queue.queue_fixture import QueueFixture

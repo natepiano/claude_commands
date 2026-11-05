@@ -8,11 +8,13 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from importlib import import_module
+import fcntl
 import math
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -34,10 +36,18 @@ import sweep
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import conf
 import treekey
+if TYPE_CHECKING:
+    from .mirror_root import MacMirrorRoot
+else:
+    from scripts.mac_test.mirror_root import MacMirrorRoot
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
 if TYPE_CHECKING:
+    from ..buildlog import record, repository, store
     from ..build_targets import target_config
 else:
+    import record
+    import repository
+    import store
     import target_config
 
 
@@ -140,10 +150,56 @@ def read_tree_key(directory: Path) -> TreeKey:
 
 
 @dataclass(frozen=True)
+class FetchFolder:
+    """A plain repository-relative folder requested from this run."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class NoFetch:
+    """The caller requested no files from the Mac."""
+
+
+NO_FETCH = NoFetch()
+
+
+@dataclass(frozen=True)
+class Fetched:
+    path: Path
+    kib: int
+
+
+@dataclass(frozen=True)
+class FetchMissing:
+    pass
+
+
+@dataclass(frozen=True)
+class FetchTooLarge:
+    kib: int
+    limit_mib: float
+
+
+@dataclass(frozen=True)
+class FetchFailed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class FetchNotRun:
+    pass
+
+
+FetchResult = Fetched | FetchMissing | FetchTooLarge | FetchFailed | FetchNotRun
+
+
+@dataclass(frozen=True)
 class PassedOnMac:
     """A completed Mac run with a successful test status."""
 
     seconds: float
+    fetch: FetchResult = FetchNotRun()
 
 
 @dataclass(frozen=True)
@@ -152,6 +208,7 @@ class FailedOnMac:
 
     status: int
     seconds: float
+    fetch: FetchResult = FetchNotRun()
 
 
 @dataclass(frozen=True)
@@ -159,6 +216,7 @@ class NoTestMatchedOnMac:
     """A completed Mac run whose filter selected no test."""
 
     seconds: float
+    fetch: FetchResult = FetchNotRun()
 
 
 @dataclass(frozen=True)
@@ -338,6 +396,14 @@ class OffloadConfig:
     def leftover_timeout_s(self) -> float:
         return self.connection.leftover_timeout_s
 
+    @property
+    def fetch_limit_mib(self) -> float:
+        return float(self.values["fetch_limit_mib"])
+
+    @property
+    def fetch_retention_days(self) -> float:
+        return float(self.values["fetch_retention_days"])
+
 
 @dataclass(frozen=True)
 class RepositoryWorkingTree:
@@ -371,6 +437,8 @@ class OffloadRequest:
     target: str = ""
     slot: int = 1
     admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
+    environment: tuple[tuple[str, str], ...] = ()
+    fetch: FetchFolder | NoFetch = NO_FETCH
 
     @property
     def source_root(self) -> Path:
@@ -641,6 +709,8 @@ class CliArguments(argparse.Namespace):
         self.nextest_words: list[str] = []
         self.verb: MacVerb = "nextest"
         self.claim_owner_pid: int = 0
+        self.environment: list[str] = []
+        self.fetch: str | None = None
 
 
 class ProcessController:
@@ -848,12 +918,7 @@ def config_path() -> Path:
 
 def configured_ssh_target(target: str) -> target_config.SshTarget:
     """Resolve an SSH target before access to its coordination state."""
-    for configured in target_config.read_targets():
-        if configured.name == target and isinstance(configured, target_config.SshTarget):
-            if target in (".", "..") or Path(target).name != target:
-                raise target_config.ConfigError(f"invalid target name: {target}")
-            return configured
-    raise target_config.ConfigError(f"unknown SSH target: {target}")
+    return target_config.configured_ssh_target(target)
 
 
 def ssh_target_state_directory(target: str) -> Path:
@@ -903,15 +968,8 @@ def repository_identity(repo_root: Path) -> RepositoryIdentity:
     source = Path(sweep.source_git_dir(common))
     if not (source / "config").is_file():
         return KnownRepository(name)
-    # Load admission after module initialization to preserve its recorder boundary.
-    if TYPE_CHECKING:
-        from ..lint import memory_admit
-    else:
-        import memory_admit
-    identity = memory_admit.git_identity(["git"], str(source.parent))[0]
-    if isinstance(identity, memory_admit.RepositoryIdentity):
-        return KnownRepository(name, identity.key)
-    return KnownRepository(name)
+    key = repository.repository_key(str(source.parent))
+    return KnownRepository(name) if key == store.UNKNOWN_IDENTITY else KnownRepository(name, key)
 
 
 def comma_values(value: str) -> set[str]:
@@ -941,6 +999,7 @@ def write_result(
     verb: MacVerb = "nextest",
     target: str = "",
     evidence: AttemptEvidence | None = None,
+    fetch: FetchFolder | NoFetch = NO_FETCH,
 ) -> int:
     """Write the wire form and return the exit status for one outcome."""
     label = target or "Mac"
@@ -977,8 +1036,13 @@ def write_result(
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
         status = 75
+        description = reason
+        if isinstance(result, DeclinedMacRun) and result.reason == "disk":
+            reason = "disk"
+            description = f"disk: {result.detail}" if result.detail else reason
         if not decline_already_shown(result.reason, last_decline):
-            print(f"mac_test: not running on the {label} ({reason})")
+            print(f"mac_test: not running on the {label} ({description})")
+    fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
     if isinstance(destination, ResultFile):
         holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
         linux = bool(target) and not target_config.uses_legacy_mac_layout(configured_ssh_target(target).platform)
@@ -992,9 +1056,12 @@ def write_result(
         if isinstance(result, InterruptedTargetRun):
             details += f'interruption_generation={result.generation}\n'
         _ = destination.path.write_text(
-            f"{prefix}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line + details,
+            f"{prefix}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line + details
+            + (f"fetch={fetch_word(fetched)}\n" if isinstance(fetch, FetchFolder) else ""),
             encoding="utf-8",
         )
+    if isinstance(fetch, FetchFolder):
+        report_fetch(fetch, fetched)
     return status
 
 
@@ -1058,9 +1125,14 @@ def linux_mirror_root() -> Path:
     return Path('.local/state/build-target/mirror')
 
 
+def mac_mirror_root() -> MacMirrorRoot:
+    """Read the remote mirror root without expanding the local home folder."""
+    return MacMirrorRoot.read(conf.read("mac_test"))
+
+
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     if target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
-        return f".local/state/mac-test/mirror/{repository.legacy_mirror_name}"
+        return f"{mac_mirror_root().relative}/{repository.legacy_mirror_name}"
     if slot < 1:
         raise ValueError("slot must be positive")
     return f"{linux_mirror_root()}/{repository.path_key}/{slot}"
@@ -1337,6 +1409,83 @@ def probe_mac(
     return UNAVAILABLE_PROBE
 
 
+@dataclass(frozen=True)
+class MacDiskReady:
+    """The Mac meets the disk minimum."""
+
+    free_gib: float
+
+
+@dataclass(frozen=True)
+class SweepShort:
+    """The Mac remains below the disk minimum after the sweep."""
+
+    free_gib: float
+
+
+@dataclass(frozen=True)
+class SweepFailed:
+    """The sweep or its final disk reading failed."""
+
+    cause: str
+
+
+def ensure_mac_disk_floor(
+    controller: ProcessController, config: OffloadConfig, repository: KnownRepository,
+    probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
+) -> MacDiskReady | SweepShort | SweepFailed:
+    """Run one shared floor sweep, then read the Mac disk space again."""
+    if probe.free_gib >= config.free_floor_gib:
+        return MacDiskReady(probe.free_gib)
+    try:
+        directory = state_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        # Keep the inode stable so every waiter uses the same lock.
+        path = directory / f"floor-sweep-{quote(config.host, safe='')}.lock"
+        with path.open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            else:
+                _ = lock.seek(0)
+                _ = lock.truncate()
+                _ = lock.write("floor sweep was interrupted")
+                lock.flush()
+                settings = config_path() if isinstance(config.source, DefaultMacSettings) else config.source
+                timeout = conf.read(settings).number("floor_sweep_timeout_s")
+                result = controller.capture(
+                    [*ssh_prefix(config),
+                     "~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac"],
+                    CommandTimeLimit(timeout),
+                )
+                if isinstance(result, CommandTimedOut):
+                    cause = f"floor sweep timed out after {timeout:g} s"
+                elif isinstance(result, CommandCouldNotStart):
+                    cause = "floor sweep could not start"
+                elif result.status != 0:
+                    detail = " ".join(result.stderr.split())
+                    cause = f"floor sweep exited with status {result.status}" + (f": {detail}" if detail else "")
+                else:
+                    cause = "ok"
+                _ = lock.seek(0)
+                _ = lock.truncate()
+                _ = lock.write(cause)
+                lock.flush()
+            _ = lock.seek(0)
+            cause = lock.read()
+            after = probe_mac(controller, config, repository, target, slot)
+            if cause != "ok":
+                return SweepFailed(cause or "floor sweep result missing")
+            if not isinstance(after, ProbeSnapshot):
+                return SweepFailed("Mac disk reading failed after the floor sweep")
+            if after.free_gib < config.free_floor_gib:
+                return SweepShort(after.free_gib)
+            return MacDiskReady(after.free_gib)
+    except (OSError, ValueError) as error:
+        return SweepFailed(f"floor sweep unavailable: {error}")
+
+
 def ignored_paths(
     controller: ProcessController, repo_root: Path
 ) -> IgnoredPathListingResult:
@@ -1481,7 +1630,9 @@ def remote_test_command(
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
     repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
-    if any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
+    if isinstance(request.fetch, FetchFolder):
+        cleanup_command = "echo mac_cleanup=kept"
+    elif any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
         cleanup_command = "echo mac_cleanup=skipped"
     else:
         target = shlex.quote(f"{remote_mirror(repository, request.target, request.slot)}/target")
@@ -1496,8 +1647,11 @@ def remote_test_command(
             + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
         )
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
+    remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
+    environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+        f"{remove_folder}{environment}"
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
@@ -1511,6 +1665,110 @@ def remote_test_command(
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
         f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
     )
+
+
+def plain_fetch_folder(value: str) -> bool:
+    folder = value.removesuffix("/")
+    return (
+        re.fullmatch(r"[A-Za-z0-9_./-]+", folder) is not None
+        and not folder.startswith(("/", "-"))
+        and all(part not in ("", ".", "..") for part in folder.split("/"))
+    )
+
+
+def fetch_word(result: FetchResult) -> str:
+    if isinstance(result, Fetched):
+        return "fetched"
+    if isinstance(result, FetchMissing):
+        return "missing"
+    if isinstance(result, FetchTooLarge):
+        return "too_large"
+    if isinstance(result, FetchFailed):
+        return "failed"
+    return "not_run"
+
+
+def report_fetch(folder: FetchFolder, result: FetchResult) -> None:
+    if isinstance(result, Fetched):
+        print(f"mac_test: fetched {folder.value} from the Mac to {result.path} ({result.kib} KiB)")
+        return
+    if isinstance(result, FetchMissing):
+        reason = f"{folder.value} is missing on the Mac"
+    elif isinstance(result, FetchTooLarge):
+        reason = f"{folder.value} is {result.kib} KiB, over the {result.limit_mib:g} MiB limit"
+    elif isinstance(result, FetchFailed):
+        reason = result.reason
+    else:
+        reason = "the Mac run did not report a test status"
+    print(f"mac_test: nothing fetched: {reason}")
+
+
+def fetch_folder(
+    controller: ProcessController,
+    config: OffloadConfig,
+    request: OffloadRequest,
+    repository: KnownRepository,
+) -> FetchResult:
+    """Fetch under the run's claim, publishing only a complete per-call folder."""
+    folder = request.fetch
+    if not isinstance(folder, FetchFolder):
+        return FetchNotRun()
+    # The call ID becomes a local directory component, never a path supplied to SSH.
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", request.call_id) is None or request.call_id in (".", ".."):
+        return FetchFailed("the call ID is not a directory name")
+    fetched = state_directory(request.target) / "fetched"
+    destination = fetched / request.call_id
+    partial = fetched / f"{request.call_id}.partial"
+    owns_partial = False
+    try:
+        fetched.mkdir(parents=True, exist_ok=True)
+        oldest = time.time() - config.fetch_retention_days * 24 * 60 * 60
+        for entry in fetched.iterdir():
+            if entry.lstat().st_mtime < oldest:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+        if destination.exists() or destination.is_symlink() or partial.exists() or partial.is_symlink():
+            return FetchFailed("the fetched destination already exists")
+        quoted = shlex.quote(folder.value)
+        size_command = (
+            f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+            + f"if [ -d {quoted} ]; then "
+            + f"if size=$(du -sk {quoted}); then "
+            + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
+            + "else printf 'fetch=missing\\nrc=0\\n'; fi"
+        )
+        size = controller.capture([*ssh_prefix(config), size_command], CommandTimeLimit(config.probe_timeout_s))
+        if not isinstance(size, CommandOutput) or size.status != 0:
+            return FetchFailed("the Mac folder size could not be read")
+        if size.stdout.strip() == "fetch=missing\nrc=0":
+            return FetchMissing()
+        measured = re.fullmatch(r"fetch_kib=([0-9]+)\nrc=0\n?", size.stdout)
+        if measured is None:
+            return FetchFailed("the Mac folder size was not usable")
+        kib = int(measured.group(1))
+        if kib > config.fetch_limit_mib * 1024:
+            return FetchTooLarge(kib, config.fetch_limit_mib)
+        partial.mkdir()
+        owns_partial = True
+        landing = partial / folder.value
+        landing.mkdir(parents=True)
+        copied = controller.capture([
+            "rsync", "-rlp", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
+            f"{config.host}:{remote_mirror(repository, request.target, request.slot)}/{folder.value}/", f"{landing}/",
+        ])
+        if not isinstance(copied, CommandOutput) or copied.status != 0:
+            return FetchFailed("the folder copy from the Mac failed")
+        if destination.exists() or destination.is_symlink():
+            return FetchFailed("the fetched destination already exists")
+        os.replace(partial, destination)
+        return Fetched(destination / folder.value, kib)
+    except OSError as error:
+        return FetchFailed(str(error))
+    finally:
+        if owns_partial and partial.exists():
+            shutil.rmtree(partial)
 
 
 def extended_regex_literal(text: str) -> str:
@@ -1530,9 +1788,7 @@ def extended_regex_literal(text: str) -> str:
 def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1) -> str:
     """Define select_leftovers: the user's processes running from the scoped mirrors.
 
-    A repository's scope stops at its own mirror, so its leftover check never
-    reaches another repository's run. The `[.]` keeps each pattern from
-    matching this script's own text.
+    A repository's scope stops at its own mirror. Brackets around the first character prevent the pattern from matching its assignment.
     """
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         if not isinstance(scope, KnownRepository):
@@ -1543,13 +1799,15 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
             import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
                                                    require_boot_identity=target_config.is_aws_target(configured_ssh_target(target)))
+    root = mac_mirror_root().relative
+    mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
     if isinstance(scope, KnownRepository):
-        mirror = extended_regex_literal(remote_mirror(scope, target, slot))
+        mirror += "/" + extended_regex_literal(scope.legacy_mirror_name)
         command_pattern = f"{mirror}([/'\"[:space:]]|$)"
         cwd_pattern = f"^n.*/{mirror}(/|$)"
     else:
-        command_pattern = "[.]local/state/mac-test/mirror/"
-        cwd_pattern = "^n.*/[.]local/state/mac-test/mirror(/|$)"
+        command_pattern = f"{mirror}/"
+        cwd_pattern = f"^n.*/{mirror}(/|$)"
     return (
         f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
         + f"mirror_cwd_pattern={shlex.quote(cwd_pattern)}\n"
@@ -1759,7 +2017,10 @@ def claimed_run(
             if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup, InterruptedTargetStatus)):
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
-            if probe.free_gib < config.free_floor_gib:
+            disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot)
+            if isinstance(disk, SweepFailed):
+                return DeclinedMacRun("disk", elapsed_seconds(started), disk.cause)
+            if isinstance(disk, SweepShort):
                 return declined("disk", started)
             copy_started = time.monotonic()
             copied = copy_tree_with_key(controller, config, request, repository)
@@ -1781,7 +2042,6 @@ def claimed_run(
                 remote_test_command(config, request, repository, copied.tree_key),
             ]
         )
-        seconds = elapsed_seconds(started)
         if isinstance(remote_status, InterruptedTargetStatus) and (not generation or remote_status.generation != generation):
             remote_status = MISSING_MAC_STATUS
         if not isinstance(remote_status, ReportedMacStatus):
@@ -1798,6 +2058,8 @@ def claimed_run(
             detail = (remote_status.detail if isinstance(remote_status, MissingMacStatus)
                       else "runner sent no final status")
             return LostMacRun(elapsed_seconds(started), detail)
+        fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
+        seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
@@ -1811,10 +2073,10 @@ def claimed_run(
         if linux and remote_status.status == 75:
             return declined("state", started)
         if remote_status.status == 0:
-            return PassedOnMac(seconds)
+            return PassedOnMac(seconds, fetched)
         if remote_status.status == 4 and request.verb == "nextest":
-            return NoTestMatchedOnMac(seconds)
-        return FailedOnMac(remote_status.status, seconds)
+            return NoTestMatchedOnMac(seconds, fetched)
+        return FailedOnMac(remote_status.status, seconds, fetched)
     except OffloadInterrupted:
         if not release_allowed:
             checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
@@ -2031,6 +2293,8 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--copy", action="store_true")
     _ = run.add_argument("--claim-owner-pid", type=int, default=0)
     _ = run.add_argument("--result")
+    _ = run.add_argument("--env", dest="environment", action="append", default=[])
+    _ = run.add_argument("--fetch")
     _ = run.add_argument("nextest_words", nargs=argparse.REMAINDER)
     return root
 
@@ -2055,6 +2319,8 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         copy=arguments.copy,
         verb=arguments.verb,
         target=arguments.target,
+        environment=tuple((name, os.environ[name]) for name in arguments.environment),
+        fetch=FetchFolder(arguments.fetch.removesuffix("/")) if arguments.fetch is not None else NO_FETCH,
         admission=MacClaimFromWait(arguments.claim_owner_pid) if arguments.claim_owner_pid else UnclaimedMacRun(),
     )
 
@@ -2072,10 +2338,6 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     """Append each attempt independently of the final verify call target."""
     if not request.target:
         return
-    if TYPE_CHECKING:
-        from ..buildlog import record
-    else:
-        import record
     repository = repository_identity(request.repo_root)
     queued = os.environ.get("BUILDLOG_MEM_WAIT_SINCE", "")
     first = os.environ.get("BUILDLOG_MEM_WAIT_FIRST_FILE", "")
@@ -2087,7 +2349,8 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
                if isinstance(result, NoTestMatchedOnMac) else "declined")
     attempt: record.SshAttempt = {
         "call_id": request.call_id, "target": request.target,
-        "repo_identity": repository.key if isinstance(repository, KnownRepository) else "unknown",
+        "repo_identity": (repository.key if isinstance(repository, KnownRepository) and repository.key
+                          else store.UNKNOWN_IDENTITY),
         "queued_at": float(queued) if queued else time.time() - elapsed_seconds(started),
         "departed_at": time.time() - elapsed_seconds(started), "slot": evidence.slot,
         "outcome": outcome, "completion": evidence.completion, "cleanup": evidence.cleanup,
@@ -2105,6 +2368,15 @@ def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
     cli = parser()
     arguments = cli.parse_args(namespace=CliArguments())
+    if (arguments.environment or arguments.fetch is not None) and (arguments.verb != "nextest" or arguments.copy):
+        cli.error("--env and --fetch apply only to non-copy nextest runs")
+    for name in arguments.environment:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            cli.error(f"--env {name}: not a variable name")
+        if name not in os.environ:
+            cli.error(f"--env {name}: not set here")
+    if arguments.fetch is not None and not plain_fetch_folder(arguments.fetch):
+        cli.error("--fetch: not a plain relative folder")
     if arguments.verb != "nextest" and (arguments.copy or arguments.filter_run):
         cli.error("--copy and --filter-run apply only to nextest")
     if arguments.source_root and arguments.verb != "doc":
@@ -2121,7 +2393,7 @@ def main() -> int:
         with interrupt_handlers(controller):
             result = run_offload(controller, config, request, started)
         status = write_result(result, request.result, request.last_decline, request.verb, request.target,
-                              controller.attempt_evidence)
+                              controller.attempt_evidence, request.fetch)
         try:
             persist_attempt(request, result, controller.attempt_evidence, started)
         except (OSError, ValueError) as error:
