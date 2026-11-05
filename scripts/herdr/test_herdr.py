@@ -111,6 +111,8 @@ def codex_launch_evidence(root: Path, argv: list[str]) -> Generator[dict[str, ob
                                       "HERDR_PANE_RECORD_DIR": str(root / "codex-launch-records")}),
           isolated_staff_file(root / "codex-staff.json", {}),
           native_process_commands(pid),
+          patch.object(herdr.Herdr, "panes", return_value=[
+              {"pane_id": "w1:p1", "session_id": "fixture-agent", "workspace_id": "w1"}]),
           patch.object(herdr, "process_environment", side_effect=environment)):
         yield {"process_info": {"foreground_processes": [
             {"pid": pid, "argv": argv, "cwd": str(root)}]}}
@@ -184,6 +186,21 @@ class NativePaneSessionTests(StaffTestCase):
             with self.assertRaisesRegex(ValueError, "native process start changed"):
                 _ = client.codex_launch("w1:p1", arguments)
 
+    def test_bare_codex_launch_uses_the_tabs_current_staff_thread(self) -> None:
+        owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "agent", "bare-client",
+                              staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("bare-client-thread")))
+        client = herdr.Herdr("agents")
+        with (codex_launch_evidence(self.root, ["codex"]) as info,
+              patch.object(client, "panes", return_value=[
+                  {"pane_id": "w1:p1", "session_id": None, "workspace_id": "w1"}]),
+              patch.object(client, "pane_tab", return_value=("workspace", 1, {"name": owner.id})),
+              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,))),
+              patch.object(client, "result", return_value=info)):
+            entry = client.codex_launch("w1:p1")
+        self.assertEqual(entry["session_id"], owner.current_session)
+        self.assertEqual(entry["cwd"], str(self.root))
+        self.assertEqual(entry.get("pid"), 998070)
+
     def test_codex_launch_removes_retired_identity_before_retaining_the_launch(self) -> None:
         identity = fixture_runtime_id("clean-codex-launch")
         observation = herdr.NativeAgentProcess(herdr.RolloutThread(identity), "same-start", {"SHOWRUNNER_UNIT": "old"})
@@ -205,6 +222,8 @@ class NativePaneSessionTests(StaffTestCase):
         with (patch.object(herdr, "run_program", return_value=completed),
               patch.object(herdr, "native_process", return_value=observation) as native,
               native_process_commands(998075),
+              patch.object(client, "panes", return_value=[
+                  {"pane_id": "w1:p1", "session_id": identity, "workspace_id": "w1"}]),
               patch.object(client, "result", return_value={"process_info": info})):
             self.assertEqual(client.native_pane_process("w1:p1", "codex", 1), observation)
             startup = client.startup_processes("w1:p1", "codex", 1)
@@ -3811,7 +3830,9 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(self.commands()[-1], ["--session", "fixture", "agent", "prompt", "pane-1", script_prompt("continue")])
 
     def test_start_sends_exactly_one_multiline_prompt(self) -> None:
-        with codex_launch_evidence(self.root, ["codex", "-m", "fixture-model"]) as process_info:
+        with (codex_launch_evidence(self.root, ["codex", "-m", "fixture-model"]) as process_info,
+              patch.object(herdr.Herdr, "panes", return_value=[
+                  {"pane_id": "pane-1", "session_id": "fixture-agent", "workspace_id": "w1"}])):
             self.configure_herdr(["pane", "process-info", "--pane", "pane-1"],
                                  json.dumps({"result": process_info}))
             _ = self.herdr.start_agent("worker", "pane-1", "codex", ["-m", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 10_000)

@@ -1137,7 +1137,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("FAIL (exit 9)", self.notices[0][1])
         self.assertEqual(mesh_runs.reap_orphans(str(self.run_dir)), [])
 
-    def test_delayed_transcript_publication_keeps_two_deliveries_to_one_input(self) -> None:
+    def test_delayed_transcript_publication_retypes_without_a_receipt(self) -> None:
         row = self.fixture.worker(family="codex")
         self.fixture.world.add(row, "w1:p1", family="codex")
         record = self.record(row)
@@ -1154,10 +1154,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
         with patch.object(worker_admission, "transcript_entries", delayed_entries), ThreadPoolExecutor(max_workers=2) as pool:
             futures = (pool.submit(mesh_runs.deliver, record, 0), pool.submit(mesh_runs.deliver, record, 0))
             results = [future.result() for future in futures]
-        self.assertEqual(len(self.inputs), 1)
-        self.assertEqual(sum("already delivered" in result for result in results), 1)
+        self.assertEqual(len(self.inputs), 2)
+        self.assertEqual(sum("already delivered" in result for result in results), 0)
 
-    def test_receipt_timeout_recovery_does_not_repeat_pane_input(self) -> None:
+    def test_receipt_timeout_recovery_retypes_without_a_receipt(self) -> None:
         row = self.fixture.worker(family="codex")
         self.fixture.world.add(row, "w1:p1", family="codex")
         record = self.record(row)
@@ -1170,11 +1170,11 @@ class PaneRunDeliveryTests(unittest.TestCase):
             _ = mesh_runs.deliver(record, 0)
         recovered = mesh_runs.reap_orphans(str(self.run_dir))
 
-        self.assertEqual(len(self.inputs), 1)
+        self.assertEqual(len(self.inputs), 2)
         self.assertEqual(recovered, [record["run_id"]])
         finished = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
         self.assertEqual(finished["status"], "finished")
-        self.assertEqual(len(self.pending_transcripts), 1)
+        self.assertEqual(len(self.pending_transcripts), 2)
 
     def test_result_queued_during_a_turn_finishes_without_a_transcript_receipt(self) -> None:
         row = self.fixture.worker(family="claude")
@@ -1189,9 +1189,38 @@ class PaneRunDeliveryTests(unittest.TestCase):
         result = mesh_runs.deliver(finished, 0)
 
         self.assertEqual(finished["status"], "finished")
-        self.assertIn("already delivered", result)
+        self.assertIn("sent", result)
+        self.assertEqual(len(self.inputs), 2)
+        self.assertEqual(len(self.pending_transcripts), 2)
+        self.assertEqual(self.notices, [])
+
+    def test_interrupted_result_record_retypes_without_a_transcript_receipt_and_finishes(self) -> None:
+        row = self.fixture.worker(family="claude")
+        self.fixture.world.add(row, "w1:p1")
+        record = self.record(row)
+        record["pid"] = DEAD_PID
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        self.defer_transcript = True
+
+        def interrupt_finish(target: Path, text: str) -> None:
+            if target == path:
+                saved = cast(mesh_runs.RunRecord, json.loads(text))
+                if saved["status"] == "finished":
+                    raise SystemExit("interrupted before the finished record")
+            write_text_atomic(target, text)
+
+        with patch("scripts.agents.mesh_runs.write_text_atomic", interrupt_finish):
+            with self.assertRaisesRegex(SystemExit, "interrupted before the finished record"):
+                _ = mesh_runs.main(["supervise", str(path)])
+
         self.assertEqual(len(self.inputs), 1)
-        self.assertEqual(len(self.pending_transcripts), 1)
+        self.assertEqual(mesh_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
+        self.assertEqual(len(self.inputs), 2)
+        self.assertEqual(self.inputs[0], self.inputs[1])
+        finished = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual(finished["status"], "finished")
+        self.assertEqual(mesh_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(self.notices, [])
 
     def test_pane_result_arrives_after_the_launcher_exits(self) -> None:

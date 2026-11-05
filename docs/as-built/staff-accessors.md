@@ -180,3 +180,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/command_inputs.rs`) | the user, 2026-11-04 |
 
 No other copy of the staff facts is allowed without the user's approval. Remake this list before any staff migration.
+
+`Herdr.codex_client_session` reads the current thread for a bare Codex pane from its tab's staff row.
+Both `Herdr._codex_launch` and `pane_record.seed` use this method.
+`pane_record.py` still reads staff for saved launch references and resume operations.

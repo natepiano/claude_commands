@@ -121,7 +121,6 @@ class RunRecord(TypedDict):
     exit_code: NotRequired[int]
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
-    pane_result_typed: NotRequired[Literal[True]]
     # Set when the run ended without its supervisor: "supervisor gone".
     ended: NotRequired[str]
 
@@ -561,18 +560,11 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
                     return f"already delivered: {record['run_id']}"
             except (OSError, ValueError) as error:
                 reason = f"worker transcript is unavailable: {error}"
-            record_path = runs / f"{record['run_id']}.json"
-            record = _read_record(record_path)
-            if record.get("pane_result_typed"):
-                return f"already delivered: {record['run_id']}"
             timeout = send_budget.seconds()
             result = send.deliver_worker_text(member, membership, marker + "\n" + text,
                                               sender="mesh-runs", timeout=timeout, reason=reason)
             if result.outcome in ("failed", "refused"):
                 raise RunDeliveryFailed(f"{result.outcome}: {result.detail}")
-            if isinstance(result, send.PaneTextDelivered):
-                record["pane_result_typed"] = True
-                _write_record(record_path, record)
             return f"{result.outcome}: {result.detail}"
     thread_id = member.current_session
     roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)

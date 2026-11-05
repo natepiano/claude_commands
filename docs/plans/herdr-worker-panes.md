@@ -2159,7 +2159,7 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
 
 **Ruled out:** a stored mark as the delivery rule (a worker that sees one result twice loses nothing); a second classifier; a check that the Work Order does not name.
 
-### Phase 9a — Delivery after an interrupted pane input  · status: todo
+### Phase 9a — Delivery after an interrupted pane input  · status: done
 
 **Depends on:** Phase 9
 

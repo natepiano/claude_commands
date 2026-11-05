@@ -1819,6 +1819,16 @@ class Herdr:
                 except HerdrFailure as error:
                     print(f"herdr {self.session}: workspace {candidate.workspace_id} retained: {error}", file=sys.stderr)
 
+    def codex_client_session(self, pane: str) -> str:
+        """Read the current thread from the staff row named by the client's tab."""
+        try:
+            reference = self.pane_tab(pane)[2]["name"]
+            record = staff.initial_snapshot()
+        except (OSError, ValueError, HerdrFailure):
+            return ""
+        owner = record.by_member_reference(reference) or record.by_path(reference)
+        return owner.current_session if owner is not None else ""
+
     def codex_launch(self, pane: str, arguments: Sequence[str] = ()) -> pane_launch.PaneLaunch:
         """Read one Codex launch from its exact foreground process."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
@@ -1827,6 +1837,7 @@ class Herdr:
 
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str]) -> pane_launch.PaneLaunch:
+        thread = "" if any(item["session_id"] for item in self.panes() if item["pane_id"] == pane) else self.codex_client_session(pane)
         matches: list[pane_launch.PaneLaunch] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
@@ -1836,13 +1847,17 @@ class Herdr:
             pid = process.get("pid")
             if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
                 raise ValueError("Codex launch has no process id")
-            observed = native_process(pid, "codex")
+            if thread:
+                session_id, started, environment = thread, _process_birth(pid), process_environment(pid)
+            else:
+                observed = native_process(pid, "codex")
+                session_id, started, environment = observed.identity.id, observed.started, observed.environment
             cwd = json_text(process.get("cwd"), "Codex launch cwd")
             if not Path(cwd).is_absolute():
                 raise ValueError("Codex launch working folder is unavailable")
-            entry = pane_launch.launch(pane, observed.identity.id, cwd, legacy_identity.without_legacy_identity(observed.environment),
+            entry = pane_launch.launch(pane, session_id, cwd, legacy_identity.without_legacy_identity(environment),
                                        ["codex", *arguments], kind="codex")
-            entry["pid"], entry["proc_start"] = pid, observed.started
+            entry["pid"], entry["proc_start"] = pid, started
             matches.append(entry)
         if len(matches) != 1:
             raise ValueError("Codex launch has no unique foreground process")
