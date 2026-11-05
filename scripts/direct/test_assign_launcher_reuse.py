@@ -150,7 +150,8 @@ class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
             "'codex_mesh: compacted, but the roster changed during compaction (status=paused)\\n')\n" +
             "    return real_call(dispatch, verb, *options, **kwargs)\n" +
             "assign.Dispatch.mesh_call = mesh_call\n")
-        result = self.launch("implement", "--to", name)
+        result = self.launch("implement", "--to", name,
+                             execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("roster changed during compaction", result.stderr)
         self.assertIn("reopen --to " + name, result.stderr)

@@ -8,7 +8,7 @@ import os
 import subprocess
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack, redirect_stderr
 from dataclasses import replace
 from pathlib import Path
@@ -24,7 +24,7 @@ from scripts.production.add_unit_test_support import AddUnitTestCase
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture
 from scripts.production.rename_rerun_test_support import file_versions, saved_fixture
-from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
 from scripts.shutdown import pane_record, restart, shutdown_record
 import herdr
 
@@ -277,12 +277,20 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual(file_versions(self.root), before)
         self.assertEqual((backend.starts, backend.stops), ([], []))
 
-    def test_worker_resume_uses_its_current_session_and_the_parent_folder(self) -> None:
+    def test_move_reads_only_members_and_resumes_their_current_sessions(self) -> None:
+        import herdr
+        import sessions
+
         worker = fixture_worker("impl1", self.owner.id)
-        running = {self.owner.id, worker.id}
+        other = fixture_member("unit", name="other-unit", parent=self.owner.parent,
+            worktree=staff.PresentWorktree("natedev", self.root / "other-worktree"))
+        other_worker = fixture_worker("other-worker", other.id)
+        rows = (self.owner, worker, other, other_worker)
+        running = {row.id for row in rows}
         events: list[tuple[str, staff.StaffRow]] = []
-        def live_rows(record: staff.StaffSnapshot, _client: object) -> list[staff.StaffRow]:
-            return [row for row in record.rows if row.id in running]
+        def read_conversation(identity: str) -> herdr.LiveConversation | herdr.StoppedConversation:
+            row = next(row for row in rows if row.current_session == identity)
+            return herdr.LiveConversation("claude", (998041,)) if row.id in running else herdr.StoppedConversation()
         def stop(row: staff.StaffRow, _client: object) -> bool:
             events.append(("stop", row))
             running.remove(row.id)
@@ -295,7 +303,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
             events.append(("start", row))
             running.add(row.id)
             return "w1:p1" if row.id == self.owner.id else "w1:p2"
-        with (mock.patch.object(restart, "live_rows", side_effect=live_rows),
+        with (mock.patch.object(herdr, "read_conversation", side_effect=read_conversation) as read,
+              mock.patch.object(sessions, "running_sessions") as registry,
+              mock.patch.object(herdr, "running_codex_threads") as codex,
               mock.patch.object(restart, "stop_row", side_effect=stop),
               mock.patch.object(restart, "start_row", side_effect=start),
               mock.patch.object(os, "kill", side_effect=AssertionError("No real signal is allowed"))):
@@ -304,7 +314,13 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual([(action, row.id) for action, row in events],
             [("stop", self.owner.id), ("stop", worker.id), ("start", self.owner.id), ("start", worker.id)])
         self.assertEqual(staff.by_id(worker.id), worker)
-        self.assertEqual(running, {self.owner.id, worker.id})
+        self.assertEqual(running, {row.id for row in rows})
+        registry.assert_not_called()
+        codex.assert_not_called()
+        self.assertEqual({call.args[0] for call in read.call_args_list},
+                         {self.owner.current_session, worker.current_session})
+        self.assertFalse(self.source.exists())
+        self.assertTrue(self.destination.is_dir())
 
     def test_unsafe_stop_moves_no_folder_and_sends_no_signal(self) -> None:
         backend = FolderSessionFixture(self.owner, live=True)
@@ -360,7 +376,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
 
 
     def test_running_unit_stops_pauses_moves_and_resumes_with_its_worker_command(self) -> None:
-        self.test_worker_resume_uses_its_current_session_and_the_parent_folder()
+        self.test_move_reads_only_members_and_resumes_their_current_sessions()
 
     def test_held_move_lock_refuses_without_stopping_or_moving(self) -> None:
         import fcntl
@@ -529,7 +545,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
             _ = path.write_text('{"queued_message": "Keep this task"}\n')
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
         with mock.patch.object(codex_mesh, "command_stop") as pause:
-            self.test_worker_resume_uses_its_current_session_and_the_parent_folder()
+            self.test_move_reads_only_members_and_resumes_their_current_sessions()
         pause.assert_not_called()
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
 
@@ -598,7 +614,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual(file_versions(self.records), before)
 
     def test_folder_move_resumes_the_same_worker_thread_with_the_staff_folder(self) -> None:
-        self.test_worker_resume_uses_its_current_session_and_the_parent_folder()
+        self.test_move_reads_only_members_and_resumes_their_current_sessions()
 
 
     def test_next_worker_dispatch_uses_the_moved_run_folder(self) -> None:
@@ -994,8 +1010,8 @@ class FolderMoveReviewTests(FolderRenameFixture):
         running = {self.owner.id, worker.id}
         clock = [100.0]
         calls: list[tuple[str, staff.StaffId, float]] = []
-        def observe(record: staff.StaffSnapshot, _client: object) -> list[staff.StaffRow]:
-            return [row for row in record.rows if row.id in running]
+        def observe(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+            return [row for row in rows if row.id in running]
         def stop(row: staff.StaffRow, _client: object, **_options: object) -> bool:
             calls.append(("stop", row.id, clock[0]))
             running.remove(row.id)
@@ -1007,7 +1023,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
             return "fixture-pane"
         with (mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
               worker_lifecycle.operation_deadline(deadline=100.25),
-              mock.patch.object(restart, "live_rows", side_effect=observe),
+              mock.patch.object(restart, "live_members", side_effect=observe),
               mock.patch.object(restart, "stop_row", side_effect=stop),
               mock.patch.object(restart, "start_row", side_effect=start),
               mock.patch.object(os, "kill", side_effect=AssertionError("No real signal is allowed"))):

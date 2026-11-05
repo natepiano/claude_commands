@@ -30,7 +30,7 @@ import merge_checkpoint
 import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
@@ -767,11 +767,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         return rows[0]
 
     def invoke(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        # Keep real executable coverage for both the unit and child entry paths.
-        if self._testMethodName in (
-            "test_checkpoint_receipt_names_pushed_merge_and_source_once_on_retry",
-            "test_attached_child_handoff_merges_without_a_units_row_and_acknowledges_after_push",
-        ):
+        if process_boundary_for_case(self):
             return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
                                   env=self.env, capture_output=True, text=True, check=False,
                                   timeout=TEST_HANG_GUARD_SECS)

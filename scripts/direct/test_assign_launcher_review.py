@@ -72,7 +72,8 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready))
+                                           "--early-ready", str(ready),
+                                           execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
                 try:
                     while not settled.exists():
                         self.assertFalse(launched.done(), "Stage 1 completed the entire review")
@@ -124,7 +125,8 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         self.server.respond = final_diff
         with ThreadPoolExecutor(max_workers=1) as executor:
             launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                       "--early-ready", str(ready))
+                                       "--early-ready", str(ready),
+                                       execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
             try:
                 self.hang_guard.event(self.server.held_turn_ready)
                 self.assertEqual(deliveries, [])
@@ -199,7 +201,8 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready))
+                                           "--early-ready", str(ready),
+                                           execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
                 try:
                     while not settled.exists():
                         self.assertFalse(launched.done(), "review exited before its final diff existed")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.cli_fixture import process_boundary
+
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 import json
@@ -233,6 +235,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertIn("push origin new", result.stdout)
         self.assertEqual(self.snapshot(), before)
 
+    # Keep the rename CLI process boundary.
+    @process_boundary
     def test_apply_moves_state_and_commits_documents_on_the_new_merge_branch(self) -> None:
         self.assert_success(self.run_rename("apply"))
         self.assert_applied()

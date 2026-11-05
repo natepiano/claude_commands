@@ -39,7 +39,7 @@ import tidy_wrapped
 import unit_move
 import unit_names
 import unit_lookup
-from cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
@@ -735,7 +735,7 @@ class ProductionRenameFixture(StaffTestCase):
 
     def run_rename(self, action: str, destination: str = NEW, *, fail_state: bool = False,
                    source: str = OLD) -> subprocess.CompletedProcess[str]:
-        if self._testMethodName == "test_apply_moves_state_and_commits_documents_on_the_new_merge_branch":
+        if process_boundary_for_case(self):
             return subprocess.run([sys.executable, str(SCRIPT), action, source, destination],
                                   cwd=self.checkout, env=self.env, capture_output=True,
                                   text=True, check=False, timeout=TEST_HANG_GUARD_SECS)

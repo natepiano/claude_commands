@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ledger_test_support import ticket_owner_id
+from scripts.production.cli_fixture import process_boundary
 
 import io
 import os
@@ -525,6 +526,8 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(code, 1, output)
         self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
 
+    # Keep one gate case in a child interpreter with the shared queue fake.
+    @process_boundary
     def test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         second = self.rule("structure-other", "tier: D\nfamily: modules\n")

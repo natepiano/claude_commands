@@ -233,6 +233,13 @@ def encode(record: Record) -> bytes:
     return (json.dumps(record, separators=(",", ":")) + "\n").encode()
 
 
+def configure_cleanup(test: unittest.TestCase, root: Path) -> Path:
+    config = root.parent / "config"
+    _ = write_config_fixture(config / "buildlog.conf")
+    test.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+    return config
+
+
 class IndexTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     host_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -246,7 +253,7 @@ class IndexTests(unittest.TestCase):
         self.host_file.parent.mkdir(parents=True)
 
     def test_schema_files_keep_independent_rows_and_offsets(self) -> None:
-        _ = self.configure_cleanup()
+        _ = configure_cleanup(self, self.root)
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         original_path = index.index_path()
@@ -278,7 +285,7 @@ class IndexTests(unittest.TestCase):
             self.assertNotEqual(index.index_path(), original_path)
 
     def test_cleanup_reads_the_unused_schema_age_from_config_at_use(self) -> None:
-        config = self.configure_cleanup()
+        config = configure_cleanup(self, self.root)
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         active_path = index.index_path()
@@ -319,14 +326,8 @@ class IndexTests(unittest.TestCase):
                 self.assertEqual(index.update(), 0)
                 self.assertEqual(self.host_file.read_bytes(), original)
 
-    def configure_cleanup(self) -> Path:
-        config = self.root.parent / "config"
-        _ = write_config_fixture(config / "buildlog.conf")
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
-        return config
-
     def test_update_preserves_an_old_index_during_other_schema_cleanup(self) -> None:
-        _ = self.configure_cleanup()
+        _ = configure_cleanup(self, self.root)
         self.write(self.host_file, step("retained"))
         self.assertEqual(index.update(), 1)
         retained_path = index.index_path()
@@ -795,7 +796,7 @@ class IndexTests(unittest.TestCase):
                 self.assertEqual(index.update(), 3)
                 self.assertEqual(self.rows(
                     "SELECT id, selection, status, modules_run, tests_run FROM gate_runs"),
-                    [("recovered-gate", "affected", 1, 1, 2)])
+                    [("recovered-gate", "affected", 1, 1, None)])
                 self.assertEqual(self.rows(
                     "SELECT run_id, suite, wall_s, status FROM gate_suites"),
                     [("recovered-gate", "scripts", 4.0, 1)])

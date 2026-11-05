@@ -14,12 +14,26 @@ import signal
 import shutil
 import subprocess
 import sys
+import unittest
 from types import ModuleType
 from typing import cast
 from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+def process_boundary[**P](test: Callable[P, None]) -> Callable[P, None]:
+    """Keep this test at the process boundary after a rename."""
+    setattr(test, "process_boundary", True)
+    return test
+
+
+def process_boundary_for_case(case: unittest.TestCase) -> bool:
+    """Read the process requirement from the current test method."""
+    method: object = getattr(type(case), case._testMethodName, None)
+    return getattr(method, "process_boundary", False) is True
+
 
 class _Parsed(Exception):
     """Stop a real CLI immediately after argument parsing."""

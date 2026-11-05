@@ -34,7 +34,7 @@ import rules
 import style_ledger
 import style_rules
 from scripts.production import staff, unit_config
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
@@ -160,8 +160,7 @@ class StylePlanFixture(unittest.TestCase):
         if command[0] == sys.executable and len(command) > 1:
             module = next((item for item in (style_plan, style_ledger, style_footprint, proposal_issue)
                            if Path(command[1]) == Path(item.__file__ or "")), None)
-        # Keep one gate case in a child interpreter with the shared queue fake.
-        if module is style_plan and self._testMethodName == "test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict":
+        if module is style_plan and process_boundary_for_case(self):
             command = style_cli_command(Path(command[1]), *arguments)
             module = None
         executable = Path(shutil.which(command[0], path=environment.get("PATH")) or command[0])
