@@ -67,7 +67,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   2. Find the cost from the JSON: the slowest tests, and `wall_s - tests_s` (import and module or class fixtures). Name the expensive operations before any edit; do not apply a cut the module already has.
   3. Cut it, in this order:
      - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s).
-     - Remove trivial tests (Invariants above).
+     - Remove trivial tests (Invariants above). Run `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` on the module. Compare each candidate's assertions with its covering tests; a candidate whose result a covering test also checks is a trivial test.
      - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does.
      - Call code in-process in place of a subprocess when the test does not check the process boundary; keep one process test for each boundary.
      - Split a module whose tests are independent into two or more files, so the gate runs them at the same time. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time. Every file of the group is in acceptance. Time the group with one `module_run.py` process per file, all started at once (as `pairs.sh` does), from the first start to the last end. The gate runs at most half the CPU count of modules at once (`DEFAULT_MAX_RUNNING_JOBS` in `merge_gate.py`); a group with more files than that gains less in the gate.
@@ -311,8 +311,10 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - Fixture micro-cuts (an interpreter cache seed, a per-class config copy): the gain is noise, and a trimmed config copy needs a hand-kept file list that breaks a future caller.
 
-### Phase 12 — A tool lists the tests that only repeat other tests  · status: todo
+### Phase 12 — A tool lists the tests that only repeat other tests  · status: done
 **Depends on:** none
+
+**Result:** `coverage_overlap.py` on `test_fast_track.py`: 25 of 55 tests known, 9 candidates, 191 s with the collector on (189 s module time). The 30 unknown tests name their cause (a git wrapper script on the test PATH, or Python children with no set). Thread attribution, setup-child liveness and a failed exec moved to Phase 15; Phase 13 waits for it.
 
 #### Work Order
 
@@ -363,7 +365,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 13 — The slowest modules lose the tests that only repeat other tests  · status: todo
-**Depends on:** Phase 12, Phase 7, Phase 14
+**Depends on:** Phase 12, Phase 7, Phase 14, Phase 15
 
 #### Work Order
 
@@ -415,11 +417,15 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Goal:** `coverage_overlap.py` gives no test the lines of a thread or child it does not own, and a failed `exec` keeps collection on.
 
-**Spec:** Phase 12 review round 3 found these attribution edges (F003, F004, F005, F008). The hard-landing rule moved them here.
+**Spec:** Phase 12 review round 3 found these attribution edges (F003, F004, F005, F008). The hard-landing rule moved them here. Phase 13 waits for this phase: an assertion check does not show which test owns a line. The Astra review of 2026-11-04 (`/tmp/claude/astra/20261105T013927Z-2009698/review.md`) adds the details under each item.
 
 1. Liveness: at each test start and stop, the collector polls each child it holds a `Popen` for. A child of a test alive at its stop makes that test unknown (cause `child outlived its test`), and also each later test that starts while the child is alive. A Python child from setup (`setUpClass`, module setup) alive at a test's start makes that test unknown (cause `shared child`), with or without a set. A child that exited before a test started has no effect on that test. A child with no `Popen` in the parent uses its set's exit time, or no exit time when it wrote no set. A leaf or unverified launch from setup has no effect (risk: a background process from setup that serves later tests).
+   - The audit hook keeps setup `Popen` references with their launch kind and owner; today it keeps only setup launch records. The missing-set check stays separate from liveness: a Python child that exited with no set still makes its test unknown.
+   - A launch with no `Popen` and no set is unknown for each test from its start to the end of the run.
+   - A launch whose `Popen` constructor raised after a fork is no launch. Phase 12 drops only a `Popen` with no pid; record constructor success explicitly, never from an exit code. Test a missing program with `cwd` set.
 2. Threads: a thread alive at a test's start that runs a measured line during the test makes the test unknown (cause `shared thread`). A thread that a test starts and that is alive at its stop makes the test unknown (cause `thread outlived its test`).
-3. The `os.exec` event writes the process set and keeps collection on; a later set of the same process replaces it.
+   - `line()` returns `DISABLE`, so a second thread on the same line gives no event. Keep LINE events on while thread attribution is needed. Exclude the runner thread. Compare thread objects, not reusable idents. Reject a shared thread's line before it goes into the set. Test a line that the runner runs before a shared thread runs it.
+3. Exec: separate the set write from the collector stop. A later snapshot replaces an earlier one only for the same collector instance and test. A successful exec keeps the pre-exec set as its own report. Mark a snapshot apart from a completed report. Keep the fork-exec test; add a failed exec and a case with no final report.
 
 **Files:**
 - `scripts/test_times/line_collector.py`, `scripts/test_times/coverage_overlap.py` — the liveness poll, the thread check, the exec report

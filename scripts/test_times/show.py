@@ -23,7 +23,7 @@ else:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
-from scripts.lib.terminal_cells import pad_right, terminal_width
+from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
 from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
@@ -113,10 +113,6 @@ def local_time(value: str) -> str:
     return datetime.fromisoformat(value).astimezone(user_zone()).strftime("%m-%d %H:%M")
 
 
-def seconds(value: float) -> str:
-    return f"{value:.3f}"
-
-
 def verdict(status: int) -> str:
     return "PASS" if status == 0 else "RED"
 
@@ -127,18 +123,6 @@ def run_mark(aborted: bool) -> str:
 
 def mebibytes(value: float) -> str:
     return f"{value:.3f}"
-
-
-def print_table(headers: Sequence[str], rows: Sequence[Sequence[str]],
-                empty_message: str = "no gate runs recorded yet") -> None:
-    if not rows:
-        print(empty_message)
-        return
-    widths = [max(terminal_width(header), *(terminal_width(row[column]) for row in rows))
-              for column, header in enumerate(headers)]
-    for row in [headers, *rows]:
-        print("  ".join(pad_right(value, width)
-                        for value, width in zip(row, widths, strict=True)).rstrip())
 
 
 def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> None:

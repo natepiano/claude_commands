@@ -141,17 +141,18 @@ class TimedResult(TimedResultBase):
         self.collectedDurations[-1] = (test.id(), elapsed)
 
 
-def test_times(result: TimedResult) -> list[TestTime]:
-    """Combine durations and outcomes under each parent test id."""
+def timed_outcomes(result: TimedResult) -> list[tuple[str, TestStatus, float]]:
+    """Combine each full test id with its outcome and duration."""
     durations = dict(result.collectedDurations)
-    return [
-        {
-            "test": test_id if test_id in result.fixtures else test_id.partition(".")[2] or test_id,
-            "s": 0.0 if status == "skip" else durations.get(test_id, 0.0),
-            "status": status,
-        }
-        for test_id, status in result.outcomes.items()
-    ]
+    return [(test_id, status, 0.0 if status == "skip" else durations.get(test_id, 0.0))
+            for test_id, status in result.outcomes.items()]
+
+
+def test_times(result: TimedResult) -> list[TestTime]:
+    """Use short test names for the timing output."""
+    return [{"test": test_id if test_id in result.fixtures else test_id.partition(".")[2] or test_id,
+             "s": seconds, "status": status}
+            for test_id, status, seconds in timed_outcomes(result)]
 
 
 def write_times(path: Path, result: TimedResult, wall_s: float) -> None:
