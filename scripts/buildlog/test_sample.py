@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import cli
 import index
 import sample
@@ -35,6 +37,7 @@ use_test_log()
 
 CLI = Path(__file__).with_name("cli.py")
 Record = dict[str, object]
+TICK_SNAPSHOT_FIELDS = {"kind", "at", "host", "zram"}
 
 
 class SampleTests(unittest.TestCase):
@@ -144,7 +147,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(row["jobserver"], {"builds": {"state": "measured", "free_pool_tokens": 7},
                                             "ci": {"state": "measured", "free_pool_tokens": 7}})
 
-    def test_cli_sample_reads_each_slice_file_once_for_both_sample_rows(self) -> None:
+    def test_cli_sample_reads_each_slice_file_once(self) -> None:
         import cgroup_capture
 
         builds, ci = self.root / "builds.slice", self.root / "ci.slice"
@@ -358,7 +361,8 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(len(lines), 2 if via_cli else 1)
         row = cast(Record, json.loads(lines[0]))
         if via_cli:
-            self.assertEqual(cast(Record, json.loads(lines[1]))["slices"], row["slices"])
+            self.assertEqual(set(cast(Record, json.loads(lines[1]))), TICK_SNAPSHOT_FIELDS)
+            self.assertIn("slices", row)
         return row
 
     def test_sample_writes_power_profile_and_utc_state_mtime(self) -> None:
@@ -477,7 +481,15 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(snapshot["kind"], "memory_snapshot")
         self.assertEqual(snapshot["at"], record["at"])
         self.assertEqual(snapshot["host"], host)
-        slices = cast(dict[str, Record], snapshot["slices"])
+        self.assertEqual(set(snapshot), TICK_SNAPSHOT_FIELDS)
+        self.assertEqual(set(record), {
+            "kind", "host", "at", "boot_id", "slices", "filesystem", "jobserver",
+            "mem_used_bytes", "swap_used_bytes", "builds_anon_bytes", "sccache_in_service", "ci_anon_bytes",
+            "stall_some_us", "stall_full_us", "cpu_stall_some_us", "cpu_stall_full_us",
+            "io_stall_some_us", "io_stall_full_us", "cpu_idle_ticks", "cpu_iowait_ticks", "cpu_total_ticks",
+            "power_profile", "power_profile_since",
+        })
+        slices = cast(dict[str, Record], record["slices"])
         self.assertEqual(slices["ci"]["stall_some_us"], 2_500_000)
 
     def test_snapshot_failure_still_keeps_minute_sample(self) -> None:

@@ -1,0 +1,6 @@
+{
+  "devices": {"$natedev": "natedev", "$mac": "MacBook-Pro"},
+  "tagOwners": {"tag:build-aws": ["autogroup:admin"]},
+  "acls": [{"action": "accept", "src": ["$natedev", "$mac"], "dst": ["tag:build-aws:22"]}],
+  "ssh": [{"action": "accept", "src": ["$natedev", "$mac"], "dst": ["tag:build-aws"], "users": ["natepiano"]}]
+}

@@ -266,7 +266,7 @@ def is_standing_plan(plan: Path) -> bool:
         return False
 
 
-def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> UnitTicketProgress:
+def unit_ticket_progress(worktree: Path, unit_id: staff.StaffId, sources: set[Path]) -> UnitTicketProgress:
     try:
         common = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -285,14 +285,14 @@ def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> 
                 """SELECT
                     (SELECT count(*) FROM tickets WHERE unit = ? AND state = 'merged'),
                     (SELECT id FROM tickets WHERE unit = ? AND state IN ('assigned', 'checkpointed')
-                     ORDER BY created_at DESC LIMIT 1)""", (unit_name, unit_name),
+                     ORDER BY created_at DESC LIMIT 1)""", (unit_id, unit_id),
             ).fetchone())
             return UnitTicketProgress(row[0], TicketInProgress(row[1]) if row[1] else NoTicketInProgress())
     except (OSError, UnicodeError, subprocess.TimeoutExpired, sqlite3.Error):
         return UnitTicketProgress()
 
 
-def unit(unit_name: str, worktree: Path, plan_text: str, clock: BoardClock, sources: set[Path],
+def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str, clock: BoardClock, sources: set[Path],
          *, resolver: session_staff.RowResolver | None = None) -> dict[str, object]:
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     worktree = worktree.expanduser().resolve()
@@ -328,7 +328,7 @@ def unit(unit_name: str, worktree: Path, plan_text: str, clock: BoardClock, sour
     current = record.current
     ledger_unit = unit_names.unit_id(unit_name)
     standing = is_standing_plan(record.plan)
-    tickets = unit_ticket_progress(worktree, ledger_unit, sources) if standing else UnitTicketProgress()
+    tickets = unit_ticket_progress(worktree, unit_id, sources) if standing else UnitTicketProgress()
     ticket = tickets.open_ticket
     if isinstance(ticket, TicketInProgress) and isinstance(current, phase_table.OpenPhase):
         current = next((row for row in phase_table.build_run(record.plan, events).phases if isinstance(row, phase_table.OpenPhase)
@@ -439,7 +439,7 @@ def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
             units.append({"key": row.name, "state": "unavailable", "problem": reason})
         elif isinstance(config, unit_config.UnitConfig) and isinstance(tree, staff.PresentWorktree):
             plan = str(tree.path / config.plan.path) if isinstance(config.plan, unit_config.PlanFile) else "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
-            units.append(unit(row.name, tree.path, plan, clock, sources, resolver=resolver))
+            units.append(unit(row.name, row.id, tree.path, plan, clock, sources, resolver=resolver))
     offset = datetime.fromtimestamp(clock.now, clock.zone).utcoffset()
     return {"production": runner["slug"], "as_of": clock.time(clock.now), "zone": runner["zone"],
             "utc_offset_minutes": int(offset.total_seconds() / 60) if offset else 0,

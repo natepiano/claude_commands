@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import io
 import re
 import signal
@@ -66,9 +68,9 @@ class StylePlanTests(StylePlanFixture):
             with closing(sqlite3.connect(ledger.database)) as connection, connection:
                 _ = connection.execute("UPDATE held_findings SET proposal=? WHERE finding_id=?",
                                        (str(decision), by_path[paths[name]].finding_id))
-        ledger.ticket_add("names-unit-2", "names-unit", "proposal", "names", "crates/alpha", [paths["ticketed"]],
+        ledger.ticket_add("2", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [paths["ticketed"]],
                           [rule], proposal=str(issue), finding_ids=(by_path[paths["ticketed"]].finding_id,))
-        ledger.ticket_assign("names-unit-2", "demo-style-names")
+        ledger.ticket_assign("2", "demo-style-names")
         for index, excluded in enumerate(("declined", "unanswered", "types", "waived", "unfiled", "built"), 2):
             decision = issue.with_name(excluded + ".md")
             text = issue.read_text()
@@ -115,7 +117,7 @@ class StylePlanTests(StylePlanFixture):
                                               definitions, style_ledger.GitReadCache(self.repo), measured_at)
         self.assertEqual(split, style_ledger.RecordedSplit(3, 2, 1, 6, measured_at))
         left = split.ready + split.changed + split.structure + split.other
-        output = style_units.table([live_units.LiveUnit("names-unit", None)], {}, now=datetime(2026, 10, 28, 12, tzinfo=UTC),
+        output = style_units.table([live_units.LiveUnit("names-unit", None)], {}, doc=self.doc, now=datetime(2026, 10, 28, 12, tzinfo=UTC),
                                    zone=UTC, ledger_paths={"names-unit": ledger.database})
         self.assertIn(f"| 1 | 0 | {left} approved of 14 filed |", output)
 
@@ -125,11 +127,11 @@ class StylePlanTests(StylePlanFixture):
         issue = self.approved_decision(rule, self.sources[:1], "type")
         ledger = self.ledger()
         finding, = ledger.proposal_findings(issue)
-        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [finding.path],
+        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [finding.path],
                           [rule], proposal=str(issue), finding_ids=(finding.finding_id,))
-        ledger.ticket_assign("names-unit-1", "demo-style-names")
-        ledger.ticket_checkpoint("names-unit-1", self.tip)
-        self.assertEqual(ledger.ticket_merge("names-unit-1"),
+        ledger.ticket_assign("1", "demo-style-names")
+        ledger.ticket_checkpoint("1", self.tip)
+        self.assertEqual(ledger.ticket_merge("1"),
                          (style_ledger.FindingNotBuilt(finding.finding_id, approved_renames.NoAppliedCheck("type")),))
         held, = ledger.proposal_findings(issue)
         self.assertIsInstance(held.state, style_ledger.Filed)
@@ -169,7 +171,7 @@ class StylePlanTests(StylePlanFixture):
             result = style_plan.classify_split(ledger, "names-unit", self.doc, self.base(), unit_plans.AllCrates(),
                                                style_plan.BusyFiles(self.board(), frozenset()), definitions,
                                                style_ledger.GitReadCache(self.repo), measured_at)
-            table = style_units.table([live_units.LiveUnit("names-unit", None)], {},
+            table = style_units.table([live_units.LiveUnit("names-unit", None)], {}, doc=self.doc,
                                       ledger_paths={"names-unit": ledger.database})
         self.assertEqual(result, style_ledger.RecordedSplit(1, 0, 0, 1, measured_at))
         self.assertIn("| 0 | 0 | 2 |", table)
@@ -185,13 +187,13 @@ class StylePlanTests(StylePlanFixture):
         # The helper files each finding after hold(); site evidence consumes the current ledger row.
         findings = ledger.proposal_findings(issue)
         definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == type_rule)
-        ledger.ticket_add("types-unit-1", "types-unit", "read", "types", "crates/alpha", [self.sources[1]], [type_rule])
-        ledger.ticket_assign("types-unit-1", "style/main")
-        _ = ledger.ticket_base("types-unit-1")
+        ledger.ticket_add("2001", ticket_owner_id("types-unit"), "read", "types", "crates/alpha", [self.sources[1]], [type_rule])
+        ledger.ticket_assign("2001", "style/main")
+        _ = ledger.ticket_base("2001")
         for index, path in enumerate(self.sources[:2]):
             _ = ledger.hold(type_rule, path, 1, "type work", "type", "before", "after", definition.blob,
-                            "outside" if index == 0 else "types-unit-1")
-        ledger.ticket_drop("types-unit-1")
+                            "outside" if index == 0 else "2001")
+        ledger.ticket_drop("2001")
         self.commit_files({self.sources[1]: "pub fn value() { changed(); }\n"})
         self.finish_judging()
         scopes: dict[rules.Family, unit_plans.PilotScope] = {"names": unit_plans.AllCrates(), "types": unit_plans.AllCrates()}
@@ -215,7 +217,7 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(ledger, "declaration_reading", return_value=reading), redirect_stdout(output)):
             split = style_plan.classify_split(ledger, "names-unit", self.doc, self.base(), unit_plans.AllCrates(),
                                               style_plan.BusyFiles(self.board(), frozenset()), definitions, cache, measured_at)
-            _ = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
+            _ = style_plan._select_phase(ledger, ticket_owner_id("names-unit"), "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
                                          self.doc, self.plan.read_text(), unit_plans.AllCrates(),
                                          style_plan.BusyFiles(self.board(), frozenset()), frozenset(), definitions, style_plan.MainChanges(self.tip), family="names")
         self.assertEqual(split, style_ledger.RecordedSplit(0, 1, 1, 0, measured_at))
@@ -261,7 +263,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertLessEqual(started, measured_at)
         self.assertLessEqual(measured_at, datetime.now(UTC))
         self.assertEqual((self.plan.read_bytes(), issue.read_bytes()), (before_plan, before_issue))
-        rendered = style_units.table([live_units.LiveUnit("names-unit", None)], {}, now=measured_at, zone=UTC,
+        rendered = style_units.table([live_units.LiveUnit("names-unit", None)], {}, doc=self.doc, now=measured_at, zone=UTC,
                                      ledger_paths={"names-unit": ledger.database})
         self.assertIn("| gone | idle | idle | — | 0 | 0 | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
 
@@ -418,11 +420,11 @@ class RefillRecordingTests(unittest.TestCase):
 
     def test_main_records_every_outcome_after_next_phase_returns(self) -> None:
         cases: tuple[tuple[object, str, int, str], ...] = (
-            (style_plan.PhaseWritten("names-unit-1"), "phase written", 0, "phase written: names-unit-1\n"),
-            (style_plan.Resumed("names-unit-1"), "resumed", 0, "resume names-unit-1\n"),
+            (style_plan.PhaseWritten("1"), "phase written", 0, "phase written: 1\n"),
+            (style_plan.Resumed("1"), "resumed", 0, "resume 1\n"),
             (style_plan.RepairFirst(), "repair first", 0, "repair first\n"),
-            (style_plan.WaitingForMerge("names-unit-1", "abcdef123"), "waiting for merge", 5,
-             "waiting for merge: names-unit-1 checkpointed at abcdef1\n"),
+            (style_plan.WaitingForMerge("1", "abcdef123"), "waiting for merge", 5,
+             "waiting for merge: 1 checkpointed at abcdef1\n"),
             (style_plan.WaitingForSync(0), "waiting for sync", 3, "waiting for sync\n"),
             (style_plan.WaitingForStructure(("alpha", "beta"), 0), "waiting for structure: alpha, beta", 3,
              "waiting for structure: alpha, beta\n"),

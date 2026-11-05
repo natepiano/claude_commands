@@ -6,6 +6,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from calendar import monthrange
+import json
+from typing import cast
 import time
 from typing import TYPE_CHECKING
 from pathlib import Path
@@ -172,6 +175,20 @@ class RepositorySlots:
 
 
 @dataclass(frozen=True)
+class RemovalComplete:
+    """No incomplete removal record remains."""
+
+
+@dataclass(frozen=True)
+class RemovalPending:
+    resources: tuple[str, ...]
+    storage_usd_per_day: Decimal
+
+
+REMOVAL_COMPLETE = RemovalComplete()
+
+
+@dataclass(frozen=True)
 class AwsStatusRow:
     target: str
     state: str
@@ -186,6 +203,7 @@ class AwsStatusRow:
     notices: tuple[cost_ledger.LimitEvent, ...]
     starting_at: int
     recovery: measurement.ControllerRecovery
+    removal: RemovalComplete | RemovalPending = REMOVAL_COMPLETE
 
 
 def read_aws_status(target: SshTarget) -> AwsStatusRow | StateUnreadable:
@@ -215,9 +233,22 @@ def read_aws_status(target: SshTarget) -> AwsStatusRow | StateUnreadable:
         reason = snapshot.controller.reason
         if not isinstance(permission, cost_ledger.PermissionAllowed):
             reason = '; '.join(filter(None, (reason, permission.reason)))
+        removal: RemovalComplete | RemovalPending = REMOVAL_COMPLETE
+        removal_path = paths.directory / 'down.json'
+        if removal_path.exists():
+            value = cast(object, json.loads(removal_path.read_text()))
+            if not isinstance(value, dict):
+                raise ValueError('down.json: expected a removal record')
+            saved = cast(dict[str, object], value)
+            resources = tuple(str(saved[key]) for key in ('volume', 'budget') if saved.get(key))
+            inventory = cost_ledger.CostLedger(paths.directory).read_snapshot().inventories
+            names = ('retained_storage_usd_per_month', 'gp3_iops_usd_per_month', 'gp3_throughput_usd_per_month')
+            monthly_storage = sum((r.usd_per_month for r in inventory[-1].resources if r.name in names), Decimal(0)) if inventory else Decimal(0)
+            now = datetime.fromtimestamp(time.time(), timezone.utc)
+            removal = RemovalPending(resources, monthly_storage / monthrange(now.year, now.month)[1])
         return AwsStatusRow(target.name, snapshot.controller.state, snapshot.controller.at, reason, spending,
                             permission.at, monthly, snapshot.monthly_limit_usd, tuple(slots),
-                            record.read_attempt_results(target.name), snapshot.events, snapshot.controller.starting_at, snapshot.controller.recovery)
+                            record.read_attempt_results(target.name), snapshot.events, snapshot.controller.starting_at, snapshot.controller.recovery, removal)
     except (OSError, ValueError, mac_test.StateReadError, ConfigError) as error:
         return StateUnreadable(str(error))
 

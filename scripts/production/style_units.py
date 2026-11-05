@@ -19,6 +19,7 @@ import live_units
 import rules
 import style_ledger
 import display_cells
+from scripts.production import staff, session_staff, unit_lookup, unit_names
 from issues import Issue, frontmatter
 from proposal_issue import ApprovedDecision, decision_answer, proposal_unit
 from scripts.direct import plan_history
@@ -279,7 +280,7 @@ def left_cell(approved: int, filed: int, split: style_ledger.RecordedSplit | sty
             + f"structure {split.structure:,} · other {split.other:,} ({age})")
 
 
-def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
+def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: Path,
           ledger_paths: Mapping[str, Path],
           now: datetime | None = None, zone: tzinfo | None = None,
           decision_folder: Path = DECISION_FOLDER) -> str:
@@ -287,6 +288,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     now = now if now is not None else datetime.now(UTC)
     zone = zone if zone is not None else user_zone()
     paths = ledger_paths
+    resolver = session_staff.RowResolver(staff.snapshot())
+    holders = {unit_names.unit_id(row.name): row for row in unit_lookup.doc_units(doc, resolver.record)}
     decisions: dict[Path, DecisionFamily | DecisionFileMissing] = {}
     snapshots: dict[Path, LedgerSnapshot] = {}
     with ThreadPoolExecutor(max_workers=1) as reads:
@@ -302,7 +305,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         snapshot = snapshots[paths[unit.unit].resolve()] if unit.unit in paths else LedgerSnapshot()
         family = rules.style_family(unit.unit)
         counts = snapshot.counts.get(family, FamilyCounts()) if isinstance(family, str) else FamilyCounts()
-        ticket = snapshot.tickets.get(unit.unit, NoTicket())
+        holder = holders.get(unit.unit)
+        if holder is None:
+            print(f"anomaly: {unit.unit}: staff ticket ownership is unavailable under {doc}", file=sys.stderr)
+        ticket = snapshot.tickets.get(str(holder.id), NoTicket()) if holder is not None else NoTicket()
         refill = snapshot.refills.get(unit.unit)
         idle = f"idle ({clock(refill.at, zone)})" if refill else "idle"
         idle_step = f"idle — {refill.outcome}" if refill else "idle"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import sys
 import unittest
 from pathlib import Path
@@ -33,7 +35,7 @@ class StylePlanTests(StylePlanFixture):
             for _ in expected:
                 code, _, errors = self.run_next()
                 self.assertEqual(code, 0, errors)
-                ticket = ledger.ticket_open("names-unit")[0]
+                ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
                 self.assertEqual(ticket["kind"], "proposal")
                 tickets.append(ticket["files"])
                 ledger.ticket_checkpoint(ticket["id"], self.tip)

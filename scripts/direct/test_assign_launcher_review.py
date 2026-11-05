@@ -41,7 +41,7 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         """Omit Stage 2 delivery after the first follow completes."""
         ready = self.session_dir.parent / "handoff.ready"
         settled = self.session_dir.parent / "stage-one-settled"
-        reply = self.session_dir / "phases/7/review_reply_contract_1.txt"
+        reply = self.session_dir / "phases/7/project-review_reply_contract_1.txt"
         # A successful transport acknowledgment alone must not complete a review.
         # Keep the recorder, follower, and server real. Omit the send.
         transport = self.session_dir.parent / "codex_mesh.py"
@@ -129,8 +129,8 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
                 self.hang_guard.event(self.server.held_turn_ready)
                 self.assertEqual(deliveries, [])
                 phase = self.session_dir / "phases/7"
-                self.assertEqual((phase / "review_status_contract").read_text().strip(), "reviewing")
-                launcher_pid = int((phase / "review_pid_contract").read_text())
+                self.assertEqual((phase / "project-review_status_contract").read_text().strip(), "reviewing")
+                launcher_pid = int((phase / "project-review_pid_contract").read_text())
                 os.kill(launcher_pid, 0)
                 address = next(iter(self.assignment_records()))
                 pending = session_staff.worker_inbox_path(self.session_dir, address)
@@ -155,15 +155,15 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
             finally:
                 self.server.release_held_turn.set()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.session_dir / "phases/7/review_status_contract").read_text().strip(), "reviewed")
+        self.assertEqual((self.session_dir / "phases/7/project-review_status_contract").read_text().strip(), "reviewed")
         self.assertEqual(len(deliveries), 1, deliveries)
         self.assertIn("Stage 2", deliveries[0])
         self.assertIn(str(ready.with_suffix(".diff")), deliveries[0])
 
     def test_an_early_review_that_finishes_stage_one_waits_for_stage_two_to_finish(self) -> None:
         ready = self.session_dir.parent / "final.ready"
-        reply = self.session_dir / "phases/7/review_reply_contract_1.txt"
-        status = reply.with_name("review_status_contract_1")
+        reply = self.session_dir / "phases/7/project-review_reply_contract_1.txt"
+        status = reply.with_name("project-review_status_contract_1")
         settled = self.session_dir.parent / "stage-one-settled"
         self.observe_follow_settlement(settled)
         original = self.server.respond
@@ -231,13 +231,13 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(len(finished), 1, self.events())
         self.assertEqual(finished[0]["status"], "completed")
         self.assertEqual(status.read_text().strip(), "done")
-        self.assertIn("Final review.", status.with_name("review_summary_contract_1.txt").read_text())
+        self.assertIn("Final review.", status.with_name("project-review_summary_contract_1.txt").read_text())
 
     def test_an_early_review_without_stage_two_delivery_records_error_instead_of_done(self) -> None:
         result = self.review_after_stage_one()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         folder = self.session_dir / "phases/7"
-        self.assertEqual((folder / "review_status_contract_1").read_text().strip(), "error")
+        self.assertEqual((folder / "project-review_status_contract_1").read_text().strip(), "error")
         self.assertEqual(self.turn_starts, 1)
         finished = [event for event in self.events() if event.get("event_type") == "pass_finished"]
         self.assertEqual(len(finished), 1, self.events())

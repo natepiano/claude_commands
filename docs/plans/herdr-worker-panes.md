@@ -613,7 +613,9 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 - The live fill starts at each existing staff row. A timer selects a showrunner's live merge checkout and doc. A unit takes its location from that doc's Units row or its proved live session folder when the row is stale. The fill refuses unequal existing fields, lists unfilled rows with reasons, continues complete rows, and resumes a stopped row-to-file publication. A finished rerun changes nothing. Failed timer evidence keeps its durable owner id, including nested showrunners.
 - The stored showrunner doc is the one retired source. Scratch copies, other worktrees and branch-tip copies cannot override it. Missing owners and historical facts stay listed. New retired rows belong to Phase 3h; this phase has no pending writer assignment.
 
-### Phase 3k — `.unit.toml` writers emit taplo-formatted text  · status: todo
+### Phase 3k — `.unit.toml` writers emit taplo-formatted text  · status: done (models-unit 3ed6b4e3c on sdlc; live proof by style-unit)
+
+**Evidence (style-unit, 2026-11-04):** `taplo fmt --check` passes on 49 of 49 `.unit.toml` files; a `staff_sources` dry-run prints unchanged on natedev and on the Mac.
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1060,7 +1062,7 @@ Make no unproved write and create no second row.
 **Shared rename files:** this writer owns the rename-file changes for 3x, 3z, and 4a, including their tests and fixtures.
 Each change lands inside its store's landing, with the migration and rewriter removal.
 
-### Phase 3z — Shutdown and style stores keyed by staff id  · status: todo
+### Phase 3z — Shutdown and style stores keyed by staff id  · status: done
 
 **Owner:** shutdown-unit and style-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1313,7 +1315,9 @@ Make no unproved write and create no second row.
 
 **Acceptance gate:** `grep -rnE '\*\*Production:\*\*|gate_names|## Gates' scripts commands docs/direct docs/production_format.md` finds nothing; a unit director in a real production finds its showrunner from the row; a real merge checkpoint runs with the staged-file, shrink and as-built checks; the suites pass; full gate green. No rerun test: a delete.
 
-### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: todo
+### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: done (models-unit 42a7ef32d on sdlc; live proof by style-unit)
+
+**Evidence (style-unit, 2026-11-04):** the audit reads 13 AppPort, 54 NoAppPort and 1 ConfigMissing rows and writes nothing. 4d deleted the audit after this run. Tables: /tmp/claude/scratch/style-unit-ports-evidence/.
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1683,6 +1687,21 @@ Fix the input readiness gate (accounts-unit finding, 2026-11-04).
 6. Add a regression test in scripts/herdr/test_herdr.py that fails without the fix: a transcript with only a `bridge_status` turn reads as ready.
 herdr.py is shared with 3v and 4e writers: post the function you take on the board before you edit it.
 Files: scripts/herdr/herdr.py (`prompt_input_state` and a small helper beside it) and scripts/herdr/test_herdr.py.
+
+### Phase 4y — Rename edges after Step B  · status: todo
+
+**Depends on:** 4g Step B (rename_unit.py on the row, journal in unit_move.py).
+
+**Work Order:**
+
+Close the Step B review edges routed at repair round 10 (4g review, 2026-11-04). The rename rule stays as sdlc set it.
+1. Recovery identity (F009): `unit_move._recoverable_folder` returns success only when the journal's source, destination and Git admin path all match. Keep the branch checks. A test puts another linked worktree of the same repository on the requested branch at the destination and expects no adoption.
+2. Same name (F017): a row already named `port` with request `port-unit → port` and no journal writes nothing and moves nothing (rule 1).
+3. Output (F018): the printed line follows the operation result. A finished pending move prints `done`; a rerun with nothing to do prints only `unchanged`.
+4. Pending kinds (F019): a folder-only move and a pending rename are distinct journal variants, not `FolderMove.name == ""`.
+5. Order (F020): set the displays before the folder and branch move (rule 2).
+Files: scripts/production/rename_unit.py, scripts/production/unit_move.py and their tests.
+The restart deadline (F007) moved to shutdown-unit Phase 4l.
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: todo
 

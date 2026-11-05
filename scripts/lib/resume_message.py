@@ -96,7 +96,7 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
             return _resume_task(seat, cwd, prompt)
         except ValueError:
             pass
-    # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
+    # Find the saved slot through staff_id, including identities from named fix workers.
     recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
     team_role = recorded_slot or seat["role"]
     phase_id = _resume_phase_id(seat)

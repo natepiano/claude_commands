@@ -221,7 +221,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(unit_phases, "table") as phases,
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
-        tickets.assert_called_once_with(units, records, ledger_paths={"names-unit": self.root / "ledger.sqlite"})
+        tickets.assert_called_once_with(units, records, doc=doc, ledger_paths={"names-unit": self.root / "ledger.sqlite"})
         locate.assert_called_once_with(self.root)
         phases.assert_not_called()
         self.assertEqual(output.getvalue(), "ticket table\n")
@@ -251,6 +251,7 @@ class UnitPhasesTests(unittest.TestCase):
                                worktree=staff.PresentWorktree("natedev", folder))
         decision = self.root / "decision.md"
         _ = decision.write_text("---\nstatus: open\nunit: names-unit\nplan: approved\n---\n")
+        names = next(row for row in staff.initial_snapshot().find(kind="unit", parent=owner.id) if row.name == "names")
         database = style_ledger.ledger_location(self.root).database
         database.parent.mkdir(parents=True)
         with contextlib.closing(sqlite3.connect(database)) as connection, connection:
@@ -261,10 +262,10 @@ class UnitPhasesTests(unittest.TestCase):
                 CREATE TABLE held_findings(proposal TEXT,state TEXT,build_ticket TEXT,built_at TEXT);
                 CREATE TABLE refill_results(unit TEXT,at TEXT,outcome TEXT,split_at TEXT,
                     ready INTEGER,changed INTEGER,structure INTEGER,other INTEGER);
-                INSERT INTO tickets VALUES ('names-unit-12','names-unit','proposal','names',
-                    'global:rust/read.md','alpha','[]','[]','[]','["one"]','assigned','2026-10-01');
             """)
-            _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','names-unit-12','')", (str(decision),))
+            _ = connection.execute("INSERT INTO tickets VALUES ('12',?,'proposal','names',"
+                + "'global:rust/read.md','alpha','[]','[]','[]','[\"one\"]','assigned','2026-10-01')", (str(names.id),))
+            _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','12','')", (str(decision),))
         output = io.StringIO()
         with (patch.object(live_units, "units_of_doc", return_value=[unit("names-unit", live("names")),
                                                                         unit("types-unit", live("types"))]),

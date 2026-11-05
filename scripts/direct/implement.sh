@@ -153,7 +153,7 @@ if action == "admit":
     raise SystemExit(0)
 
 with worker_claim_lock(root):
-    identity_file = worker_record_path(root, name, slot, role=pass_kind)
+    identity_file = worker_record_path(root, name, "fix" if pass_kind == "fix" else slot)
     roster = read(root / "mesh_roster.json")
     entry = roster.get(name, {}) if isinstance(roster, dict) else {}
     member = worker_admission.member(root, name)

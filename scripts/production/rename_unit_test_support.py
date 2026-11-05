@@ -9,10 +9,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
-from contextlib import closing
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, closing, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, cast, override
+from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,8 +21,8 @@ from scripts.herdr import fake_herdr
 from scripts.lint.memory_test_support import config_environment
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.production.staff_test_support import fixture_member, StaffTestCase
-from scripts.production import staff, unit_config
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase
+from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import rename_unit
@@ -243,7 +243,7 @@ class UnitRenameFixture(StaffTestCase):
         self.write(self.doc, self.production_doc().replace(
             "- **Log:**", f"- **Kind:** style\n- **Repository:** `{self.checkout}`\n- **Log:**"))
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
-        _ = fixture_member("unit", name="names", parent=parent.id,
+        unit = fixture_member("unit", name="names", parent=parent.id,
                            worktree=staff.PresentWorktree("natedev", worktree))
         _ = unit_config.write(worktree, unit_config.UnitConfig(
             unit_config.PlanFile(plan), unit_config.NoAppPort(), ()))
@@ -257,7 +257,7 @@ class UnitRenameFixture(StaffTestCase):
         database = self.root / "state/style" / self.checkout.name / "ledger.sqlite"
         with mock.patch.dict(os.environ, self.env):
             with style_ledger.Ledger(self.checkout, database) as ledger:
-                ledger.wait_for_sync("names-unit")
+                ledger.wait_for_sync(unit.id)
         with closing(sqlite3.connect(database)) as connection, connection:
             _ = connection.executemany(
                 "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,"
@@ -267,3 +267,163 @@ class UnitRenameFixture(StaffTestCase):
                  ("names-unit-3", "names-unit", "queued")],
             )
         return worktree, plan, database
+
+
+class FolderRenameFixture(StaffTestCase):
+    """Keep folder rename inputs in one private staff record and Git repository."""
+
+    old_name: str = "source"
+    new_name: str = "destination"
+    home: Path = Path()
+    checkout: Path = Path()
+    source: Path = Path()
+    destination: Path = Path()
+    records: Path = Path()
+    configuration: Path = Path()
+    env: dict[str, str] = {}
+
+    @property
+    def owner(self) -> staff.StaffRow:
+        """The original row remains the expected identity after each move."""
+        parent = staff.native_id(fixture_runtime_id("showrunner::folder-production"))
+        identity = staff.native_id(fixture_runtime_id(f"unit:{parent}:{self.old_name}"))
+        return staff.StaffRow(identity, "unit", self.old_name, staff.ReportsTo(parent),
+            current_session=staff.native_id(fixture_runtime_id("folder-current-after-clear")),
+            worktree=staff.PresentWorktree("natedev", self.source))
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = self.root / "home"
+        self.checkout = self.root / "repository"
+        self.source = self.home / "rust" / f"cargo-liner-{self.old_name}"
+        self.destination = self.source.with_name(f"cargo-liner-{self.new_name}")
+        self.records = self.root / "launches"
+        self.configuration = self.root / "production.conf"
+        self.env = {
+            **config_environment(self.root),
+            "HOME": str(self.home), "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_PROC": str(self.root / "proc"), "HERDR_PLATFORM": "linux",
+            "CODEX_HOME": str(self.home / ".codex"), "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+            "HERDR_PANE_RECORD_DIR": str(self.records),
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
+        }
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.env)))
+        self.home.mkdir(exist_ok=True)
+        (self.root / "proc").mkdir()
+        self.checkout.mkdir()
+        self.source.parent.mkdir(parents=True)
+        self.records.mkdir()
+        _ = self.git("init", "-b", "main")
+        _ = self.git("config", "user.name", "Folder Rename Test")
+        _ = self.git("config", "user.email", "rename@example.invalid")
+        _ = self.git("config", "gc.auto", "0")
+        _ = (self.checkout / "kept.txt").write_text("Keep this work.\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "fixture")
+        _ = self.git("worktree", "add", "-b", f"cargo-liner-{self.old_name}", str(self.source))
+        owner = fixture_member("showrunner", name="folder-production",
+            doc=staff.LiveDoc("natedev", self.checkout / "production.md"))
+        row = fixture_member("unit", name=self.old_name, parent=owner.id,
+            worktree=staff.PresentWorktree("natedev", self.source))
+        _ = staff.update_current_session(row.current_session,
+            staff.native_id(fixture_runtime_id("folder-current-after-clear")))
+        _ = self.configuration.write_text((Path(__file__).resolve().parents[2] / "config/production.conf").read_text())
+        self.transcript("claude")
+
+    def git(self, *arguments: str, cwd: Path | None = None) -> str:
+        result = subprocess.run(["git", "-C", str(cwd or self.checkout), *arguments],
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def command(self, *, new: str = "") -> subprocess.CompletedProcess[str]:
+        from scripts.production import rename_unit as folder_rename
+
+        arguments = ["apply", "folder-production", self.old_name, new or self.new_name]
+        return invoke_cli(folder_rename, lambda: folder_rename.main(arguments), arguments,
+                          dict(os.environ), self.checkout)
+
+    def publish_session_process(self, kind: Literal["claude", "codex"], *, live: bool, pid: int = 998041) -> None:
+        """Publish private process evidence for the current conversation."""
+        row = staff.by_id(self.owner.id)
+        if row is None or not isinstance(row.worktree, staff.PresentWorktree):
+            raise AssertionError("The fixture needs a present worktree")
+        folder = row.worktree
+        fake_unit_host.process(os.environ, 998040, 1, ["zsh"], {}, cwd=folder.path)
+        arguments = [kind, "resume", self.owner.current_session] if kind == "codex" else [kind]
+        environment = {"CODEX_HOME": str(self.home / ".codex")} if kind == "codex" else {
+            "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "CLAUDE_CODE_SESSION_ID": self.owner.current_session}
+        fake_unit_host.process(os.environ, pid, 998040 if live else 1, arguments if live else [],
+                               environment, cwd=folder.path)
+        descriptor = self.root / "proc" / str(pid) / "fd/4"
+        descriptor.parent.mkdir(exist_ok=True)
+        descriptor.unlink(missing_ok=True)
+        if live and kind == "codex":
+            record = self.root / "rollout-folder-current.jsonl"
+            _ = record.write_text(json.dumps({"type": "session_meta", "payload": {
+                "id": self.owner.current_session}}) + "\n")
+            descriptor.symlink_to(record)
+
+    def transcript(self, kind: Literal["claude", "codex"]) -> None:
+        for directory in (self.home / ".claude", self.home / ".codex"):
+            if directory.exists():
+                shutil.rmtree(directory)
+        if kind == "claude":
+            path = self.home / ".claude/projects/previous-folder" / f"{self.owner.current_session}.jsonl"
+        else:
+            path = self.home / ".codex/sessions/2026/11/04" / f"rollout-fixture-{self.owner.current_session}.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("{}\n")
+
+
+
+class FolderSessionFixture:
+    """Keep fake session state across an interrupted command and its retry."""
+
+    def __init__(self, owner: staff.StaffRow, *, live: bool) -> None:
+        self.owner: staff.StaffRow = owner
+        self.live: bool = live
+        self.stops: list[str] = []
+        self.starts: list[staff.StaffRow] = []
+        self.resumes: list[tuple[str, list[str]]] = []
+
+    def stop(self, row: staff.StaffRow, _client: object) -> bool:
+        if row.current_session != self.owner.current_session:
+            raise AssertionError("The move must stop current_session")
+        if self.live:
+            self.stops.append(row.current_session)
+        self.live = False
+        return True
+
+    def start(self, row: staff.StaffRow, _record: staff.StaffSnapshot, _client: object,
+              **_options: object) -> str:
+        if self.live:
+            raise AssertionError("The move must never start a second session")
+        if row.current_session != self.owner.current_session:
+            raise AssertionError("The move must resume current_session")
+        from scripts.shutdown import restart
+
+        kind, _environment, arguments = restart.session_launch(row.current_session)
+        self.resumes.append((kind, arguments))
+        if not isinstance(row.worktree, staff.PresentWorktree) or not row.worktree.path.is_dir():
+            raise OSError("The resume directory is absent")
+        self.starts.append(row)
+        self.live = True
+        return "w1:p1"
+
+    @contextmanager
+    def installed(self) -> Generator[None]:
+        from scripts.shutdown import restart, pane_record
+
+        def live_rows(record: staff.StaffSnapshot, _client: object) -> list[staff.StaffRow]:
+            row = record.by_id(self.owner.id)
+            return [row] if self.live and row is not None else []
+
+        with (mock.patch.object(restart, "live_rows", side_effect=live_rows),
+              mock.patch.object(restart, "stop_row", side_effect=self.stop),
+              mock.patch.object(restart, "start_row", side_effect=self.start),
+              mock.patch.object(pane_record, "launch_for_session", return_value=None),
+              mock.patch.object(os, "kill", side_effect=AssertionError("No real process may receive a signal"))):
+            yield

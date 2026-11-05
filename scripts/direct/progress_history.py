@@ -1800,6 +1800,7 @@ def _arm_review(args: argparse.Namespace) -> None:
     called_task = _arg_string(args, "called_task", "direct.review") or "direct.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
+    worker = _arg_string(args, "worker") or "review"
     # `review.sh --phase` writes its files in the phase's directory, so the marker names the same one.
     artifact_dir = phase_reservation.phase_directory(session_dir, phase_id) if phase_id else session_dir
     armed: dict[str, object] = {
@@ -1810,11 +1811,9 @@ def _arm_review(args: argparse.Namespace) -> None:
         "started_at": now,
         "called_task": called_task,
         "called_agent": _resolve_worker_agent(called_task),
-        # `review.sh` suffixes both files with its lens, so an armed reviewer
-        # must name the same pair the launcher it precedes will write. Empty is
-        # the single-reviewer layout and the unsuffixed names.
-        "status_file": str(artifact_dir / f"review_status{suffix}"),
-        "pid_file": str(artifact_dir / f"review_pid{suffix}"),
+        # Named reviewers use their worker prefix. Legacy reviewers use review.
+        "status_file": str(artifact_dir / f"{worker}_status{suffix}"),
+        "pid_file": str(artifact_dir / f"{worker}_pid{suffix}"),
         "status": "armed",
     }
     state[ARMED_REVIEW_KEY] = armed
@@ -6510,6 +6509,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = arm_review.add_argument("--activity", required=True)
     _ = arm_review.add_argument("--called-task", default="direct.review")
     _ = arm_review.add_argument("--lens", default="")
+    _ = arm_review.add_argument("--worker", default="", help="the named assign.sh reviewer; omit for review.sh")
     _ = arm_review.add_argument("--phase-id", default="", help="the open phase the review belongs to, as review.sh --phase names it")
     arm_review.set_defaults(handler=_arm_review)
 

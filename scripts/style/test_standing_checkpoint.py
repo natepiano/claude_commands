@@ -262,9 +262,9 @@ class StandingCheckpointTests(unittest.TestCase):
         result = self.refill()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"discarded {ticket['id']}: merged", result.stdout)
-        self.assertIn("phase written: names-unit-2", result.stdout)
+        self.assertIn("phase written: 2", result.stdout)
         self.assertNotIn(f"### Phase 1 — {ticket['id']}", self.plan.read_text())
-        self.assertIn("### Phase 2 — names-unit-2", self.plan.read_text())
+        self.assertIn("### Phase 2 — 2", self.plan.read_text())
         self.assertEqual(self.template.read_bytes(), self.template_before)
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), head)
 
