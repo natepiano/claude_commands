@@ -200,6 +200,13 @@ The build report is too long for the user and is not used for analysis. Retire i
 
 The result goes to the showrunner. No repository code changes.
 
+Method (side A and side B 1 already ran this way; keep it):
+1. Use one shared clone of hana origin/main 72d2c08da9bdbc295f7a36af216e01941b582371. The source checkout stays unchanged.
+2. Side A keeps `[workspace.metadata.dev] features = ["hana/dynamic_linking"]` in the root manifest. Side B removes only that activation.
+3. Side A builds into `dylib_ab/target-a`, side B into `dylib_ab/target-b`, through `CARGO_TARGET_DIR`. Cold means an empty target folder; compiler and download caches stay.
+4. Run each verify.sh call with `--local`, `--no-cache` and the measurement reason, on natedev only.
+5. Record wall, build, test, wait and load per run. Exclude an interrupted run.
+
 Completion gate: add one row to `docs/plans/builds-report-rounds.md` with the hana commit, the settings of each side, the measured times, the limits and the conclusion. Mark it as a controlled A/B result, not a phase-time measurement over ten hana phases. Record the `record.py` commit of each run: Phase 16 cut its CPU per step. If runs used different versions, say so; do not repeat completed runs for that reason.
 
 ### Phase 7 — The build improvement loop ranks costs and records each round  · status: done
@@ -299,7 +306,7 @@ Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHON
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
 
 ### Phase 15 — The build page ranks the top costs with the action that cuts each  · status: todo
-**Depends on:** Phase 14; the builds showrunner names the build page
+**Depends on:** Phase 14; queue-unit's Phase 10m (it moves the Build Memory page and its feed into the repo)
 
 The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to builds to review - i'm not sure about this". The builds showrunner ran it. The data is useful: memory wait is 236 step-hours a day, eight times the next cost. The output does not tell the user what to do. Ruling:
 
@@ -322,7 +329,7 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 
 **Workers:** 1 writer (report-unit's providers and their interface tests). queue-unit owns the page and the feed integration test.
 
-**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `docs/as-built/` (Definitions).
+**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `config/buildlog.conf` (action text and ranking window) and the test that reads it, `docs/as-built/` (Definitions).
 
 ### Phase 16 — Each build step spends less CPU to write its build-log row  · status: done
 **Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
@@ -373,34 +380,27 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 ### Phase 19 — Each step row names the output folders its own command built  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** A step row's `target_directory` and `build_directory` are the folders the step's own command used, or absent when the recorder cannot prove them.
+- At step end, `step_context.step_output_roots(argv, cwd)` runs `cargo metadata` with the step's own Cargo inputs: the program (with `+toolchain`), the env wrapper's environment and folder, `--manifest-path`, `--config`, and the first `--target-dir` passed as `--config build.target-dir="<absolute>"`. `step_context.cargo_command_context` gives this split to both start capture and end read.
+- When `target_dir` is an absolute folder and the read `target_directory` differs from it, the row has no pair and `errors.log` gets one line. With `target_dir` `unresolved` or `none`, a successful read still writes the pair. Old rows are unchanged.
+- `cargo_target_config.cargo_folder_settings` applies Cargo's order under both policies, lowest first: config files, `CARGO_BUILD_TARGET_DIR`/`CARGO_BUILD_BUILD_DIR`, CLI `--config` (inline and file), `CARGO_TARGET_DIR`, `--target-dir`. Strict capture now reads `--config` (it ignored it since Phase 11); bad TOML or an unreadable file records `unresolved`. sweep.py gets the same order.
+- `read_cargo_output_roots(checkout, *, cargo, options, environment)` builds `[*cargo, "metadata", "--format-version", "1", "--no-deps", *options]`; its six other callers keep the default call.
+- CPU ms per call, bevy_brp, interleaved A/B against Phase 18 (f88894adc) on one loaded machine: terminal 150.5 → 152.3 (1.012x), tee 157.9 → 159.6 (1.010x). Driver: `cpu_ab.py` in the phase 19 folder.
 
-**Spec:**
-Routed from resources' Phase 62 review, through the builds showrunner (2026-11-04). It fixes wrong results.
+**Files:** `scripts/buildlog/record.py`, `step_context.py`, `test_record.py`, `test_step_row.py`, `scripts/lib/cargo_output.py`, `cargo_output_test_support.py`, `cargo_target_config.py`, `test_cargo_output.py`, `docs/as-built/build-targets.md`.
 
-Fault: `record.step()` (`scripts/buildlog/record.py:1022`) calls `read_cargo_output_roots(Path(directory))`. That runs `cargo metadata` in the step's folder with the writer's environment. It does not apply the step command's `--target-dir`, `--config` values or `env` wrapper assignments. So a step that built `/x/t` can record `target_directory` `/checkout/target`. The step's `target_dir` field is already right: `step_context.resolve_target_folder` applies all of these at step start (Phase 11). resources' disk floor now reads a pair that differs from `target_dir` as no evidence, so nothing is deleted meanwhile.
-
-1. Read the pair with the step command's own Cargo inputs: its working folder and environment after its `env` wrapper (`parse.command_context(argv, cwd, environ)`), its `--manifest-path`, and its `--config` values. Pass `--target-dir <p>` as `--config build.target-dir="<absolute p>"`, because `cargo metadata` has no `--target-dir`. `scripts/lib/cargo_output.read_cargo_output_roots` may take these inputs as an optional keyword; its other callers (`tree_watch.py`, `linux_runner.py`, `memory.py`, `sample.py`, `folder_audit.py`, `sweep.py`) must not change.
-2. When `target_dir` is an absolute folder and the read `target_directory` differs from it, write no pair and one `errors.log` line. When `target_dir` is `unresolved` or `none`, keep today's rule: the pair is written only from a successful read.
-3. Rows already in the log stay as they are. Do not rewrite or reindex old rows.
-
-Acceptance: real-path tests in `test_step_row.py` with a real `cargo metadata` call (one small workspace fixture), one per input: `--target-dir` relative and absolute, `--config build.target-dir`, `env CARGO_TARGET_DIR=… cargo …`, `--manifest-path` from another folder, a `build.build-dir` setting, and a forced mismatch (no pair, one error line). Each pair equals the step's `target_dir`. CPU per `record.py` terminal and tee call stays within 10 % of the Phase 18 values (118.5 ms and 112.1 ms; `SD/phases/18/cpu_driver.py`).
-
-**Files:**
-- `scripts/buildlog/record.py` — the call at line 1022 and the mismatch rule.
-- `scripts/lib/cargo_output.py` — an optional keyword for the step's Cargo inputs, only if step 1 needs it.
-- `scripts/buildlog/test_step_row.py` — the acceptance tests.
-- `docs/as-built/build-targets.md` — one line near line 153: a step row's pair comes from the step command's own Cargo inputs.
-
-**Workers:** 1 writer (rowcpu): the change and its tests are one small file set.
-
-**State:** step rows in the build log (new rows only).
+**Gotchas:** Cargo reads `CARGO_TARGET_DIR` before all build config, CLI `--config` included; `CARGO_BUILD_TARGET_DIR` is ordinary config and loses to `--config`. A CPU baseline from an earlier phase is not valid under a different load: measure A/B in one run.
 
 ### Phase 20 — memory.py reads recorded output folders through one reader  · status: todo
 **Depends on:** resources' Phase 62 lands on builds (it adds `build_shape.recorded_output_roots`).
 
 Routed from resources' Phase 62 review (F021), through the builds showrunner (2026-11-04). `scripts/buildlog/memory.py` `build_output_roots` (line 87) reads the steps output pairs with its own SQL. Make it read them through `build_shape.recorded_output_roots`, so one reader remains. Write the Work Order when Phase 62 lands and the function's signature is known.
+
+**Constraints from prior phases:**
+- On origin/builds-resources, `recorded_output_roots(index_path, host) -> RecordedOutputRoots | RecordedRootsUnavailable` (scripts/lint/build_shape.py:268) skips every row whose argv sets `--target-dir` or a `--config` target-dir. It also skips rows whose absolute `target_folder` differs from `target_directory`. Since Phase 19 a new row with such an override has a pair that equals its `target_dir`. resources owns that rule; the change was sent to resources and builds on 2026-11-04.
+- The Work Order must name the outcomes: missing pair, `RecordedRootsUnavailable`, host filter, process cache, and the current `cargo metadata` fallback. Each gets a test. The kill classification stays the same.
+- Files: `scripts/buildlog/memory.py`, `scripts/buildlog/test_memory_window.py`.
+- The "Each memory tick writes one row" next item also changes `memory.py`; do not run the two at the same time.
 
 **Workers:** 1 writer (rowcpu).

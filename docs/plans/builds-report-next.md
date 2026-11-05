@@ -33,11 +33,12 @@
 - **Starts when:** verify-unit's remake of `verify.sh` merges (ETA 2026-11-04 20:30). Tell verify-unit at the start. Showrunner disposition 2026-11-04: next, report-unit owns both sides.
 - **Target:** `scripts/buildlog/record.py` (`record.step`), `scripts/direct/verify.sh` (`GATE_METADATA`).
 - **Need:** `record.step` runs `cargo metadata` (30-120 ms CPU) and `rustc -V` (10-17 ms) on every step. `verify.sh` already knows `target_directory` and `build_directory`.
-- **Completion:** verify.sh passes the folders; the recorder runs `cargo metadata` only when they are missing. The phase notice gives the CPU per step before and after.
+- **Completion:** verify.sh passes the folders with evidence of the Cargo inputs that produced them. The recorder checks that evidence through `step_context` before it uses the folders. Missing or stale evidence uses the Phase 19 reader (`step_context.step_output_roots`). Keep the mismatch diagnostic and the saved pairs of pending retries. Test env wrappers, manifests, CLI config, target overrides, and a config change between steps. The phase notice gives the CPU per step from an interleaved A/B run against the prior checkpoint.
+- **Target also:** `scripts/buildlog/step_context.py` (Phase 19 moved the output-folder read there).
 - **Source phase:** 16 (simplify item 11).
 
 ## Each memory tick writes one row
-- **Starts when:** natest P10 is on builds (the showrunner says when). Showrunner disposition 2026-11-04: next.
+- **Starts when:** ready now: natest P10 is on builds and the index.py freeze has ended (showrunner, 2026-11-04, Phase 18). Showrunner disposition 2026-11-04: next. Phase 20 also changes `memory.py`; do not run the two at the same time.
 - **Target:** `scripts/buildlog/index.py` (a `zram` column in `SAMPLE_COLUMNS`, schema version bump), `scripts/buildlog/sample.py`, `scripts/buildlog/memory.py`, `scripts/buildlog/cli.py`.
 - **Need:** each tick writes kind, at and host twice through two writers; the tick snapshot row holds only zram.
 - **Completion:** the sample row carries zram; the tick `memory_snapshot` row, `write_snapshot`, `tick_snapshot` and `TickMemorySnapshot` are gone; `memory_snapshot` stays only for `buildlog snapshot`. Old logs give the same report. About 105 KB/day less.
