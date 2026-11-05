@@ -559,12 +559,44 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         with (mock.patch.object(sys, "argv", ["build_targets.py", "eligible", "--repo-root", str(self.root),
                                                "--kind", kind, "--package", package]),
               mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(free_gib, "fake-mac")),
+              mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")),
               redirect_stdout(output)):
             self.assertEqual(build_targets.main(), 0)
         return output.getvalue()
 
     def kind_answer(self, kind: str, package: str = "", free_gib: float = 60) -> str:
         return self.kind_output(kind, package, free_gib).splitlines()[0] + "\n"
+
+    def floor_answer(self, after: float, result: offload.CapturedCommandResult) -> tuple[str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch.object(offload, "probe_mac", side_effect=[
+                  offload.ProbeSnapshot(59, "fake-mac"), offload.ProbeSnapshot(after, "fake-mac")]),
+              mock.patch.object(offload.ProcessController, "capture", return_value=result) as sweep,
+              redirect_stdout(output), redirect_stderr(errors)):
+            self.assertEqual(build_targets.command_kind_eligible(
+                self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET), 0)
+        self.assertEqual(sweep.call_count, 1)
+        return output.getvalue(), errors.getvalue()
+
+    def test_floor_sweep_admits_the_mac_after_a_disk_exclusion(self) -> None:
+        output, errors = self.floor_answer(60, offload.CommandOutput(0, "", ""))
+        self.assertEqual(output.splitlines()[0], "mac_allowed")
+        self.assertIn("mac\teligible\t-", output)
+        self.assertEqual(errors, "")
+
+    def test_floor_sweep_shortfall_keeps_the_disk_route(self) -> None:
+        output, _ = self.floor_answer(59, offload.CommandOutput(0, "", ""))
+        self.assertEqual(output.splitlines()[0], "natedev_only disk")
+        self.assertIn("mac\texcluded\tdisk", output)
+
+    def test_floor_sweep_failure_keeps_the_disk_route_and_names_the_cause(self) -> None:
+        for result, cause in ((offload.CommandOutput(7, "", "disk busy"), "status 7: disk busy"),
+                              (offload.COMMAND_TIMED_OUT, "timed out")):
+            with self.subTest(cause=cause):
+                output, errors = self.floor_answer(200, result)
+                self.assertEqual(output.splitlines()[0], "natedev_only disk")
+                self.assertIn("mac\texcluded\tdisk", output)
+                self.assertIn(cause, errors)
 
     def test_kind_table_keeps_target_order_settings_and_each_mac_decision(self) -> None:
         other_settings = self.settings.with_name("other.conf")
