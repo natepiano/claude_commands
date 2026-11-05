@@ -334,7 +334,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
         with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
               patch.object(herdr, "_PLATFORM", "linux"),
-              patch.object(herdr, "_codex_conversations", return_value=({}, [])),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
               patch.object(reader_sessions, "session_liveness", side_effect=reader_liveness),
               patch.object(herdr, "shared_session", return_value="shared"),
               patch.object(herdr, "native_process", side_effect=native_process),

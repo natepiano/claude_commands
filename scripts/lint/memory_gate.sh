@@ -10,6 +10,10 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_queue" && pwd)/admission_client.py"
 
+# Each new wait uses its own identity. Rejoining callers restore it after sourcing.
+BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE=""
+export -n BUILDLOG_MEM_WAIT_SINCE BUILDLOG_MEM_WAIT_FIRST_FILE
+
 buildlog_memory_python() {
     if [[ -x "$HOME/.claude/scripts/lib/py" ]]; then
         "$HOME/.claude/scripts/lib/py" "$@"

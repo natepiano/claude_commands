@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import unittest
-from scripts.direct import verify_lint_scope_test_support as support
+from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
 
 
-class VerifyLintScopeTests(support.VerifyLintScopeFixture):
+class VerifyLintScopeTests(VerifyLintJudgmentFixture):
     def test_failed_fix_still_formats_and_returns_judgment_status(self) -> None:
+        self.environment["TEST_CLIPPY_FIRST_STATUS"] = "101"
         self.environment["TEST_CLIPPY_FIX_STATUS"] = "41"
         for judgment_status in (0, 43):
             with self.subTest(judgment_status=judgment_status):

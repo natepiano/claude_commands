@@ -110,7 +110,6 @@ SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
-RUNNER = Path(__file__).resolve().parents[1] / "test_times" / "module_run.py"
 ROLLBACK_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 # Read the live roots before a module receives its private environment.
 LIVE_ROOTS = (str(Path.home().resolve()),
@@ -987,6 +986,14 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     gate_record.write_gate_run(run)
 
 
+def module_runner(repo: Path) -> Path:
+    """Use the test runner from the tested checkout."""
+    runner = repo / "scripts" / "test_times" / "module_run.py"
+    if not runner.is_file():
+        raise GateRefused(f"test runner not found: {runner}")
+    return runner
+
+
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1003,6 +1010,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     modules = discover_test_modules(repo)
     if not modules:
         raise GateRefused("the test list is empty")
+    runner = module_runner(repo)
     tmpfs = Path("/dev/shm")
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
@@ -1140,7 +1148,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
-                            [*scope_prefix, python, str(RUNNER), str(path.parent), path.name])
+                            [*scope_prefix, python, str(runner), str(path.parent), path.name])
                     with rollback_signals(defer=True):
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)

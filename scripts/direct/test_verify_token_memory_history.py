@@ -105,11 +105,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         os.kill(process.pid, signal.SIGTERM)
         self.assertNotEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
 
-        def released() -> bool:
-            with admission.loop_turn():
-                return not admission.server.waiters and not admission.server.reservations
-
-        wait_until(released, admission.state_dir)
+        wait_until(admission.callers_released, admission.state_dir)
         self.assertFalse((board / "locks/cargo.d").exists())
         self.assertEqual(self.live_group_processes(process.pid), [])
         self.assertFalse((self.root / "cargo-calls").exists())
@@ -219,22 +215,29 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             self.assertEqual(list((board / "token_waiters").glob(f"*.{process.pid}*")), [])
             self.assertFalse((self.root / "cargo-calls").exists())
 
-            def released() -> bool:
-                with admission.loop_turn():
-                    return not admission.server.waiters and not admission.server.reservations
-
-            wait_until(released, admission.state_dir)
+            wait_until(admission.callers_released, admission.state_dir)
         finally:
             if hidden.exists():
                 _ = hidden.rename(admission.socket_path)
 
-    def test_lost_token_refuses_execution_after_memory_admission(self) -> None:
+    def test_lost_token_refuses_execution_before_retry_after_memory_admission(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         board = self.root / "board"
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
         errors = self.root / "lost-token.err"
+        attempts = self.root / "attempt-statuses"
+        shell = self.root / "observe-attempts.sh"
+        _ = shell.write_text('''set -T
+observe_attempt_status() {
+    if [[ "${FUNCNAME[1]:-}" == run_step_attempt && "$BASH_COMMAND" == 'buildlog_retry_unstarted_step "$@"' ]]; then
+        printf '%s\n' "$status" >> "$TEST_ATTEMPT_STATUSES"
+    fi
+}
+trap observe_attempt_status DEBUG
+''')
         process = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(board),
-            "UNIT_TEAM_ROLE": "impl"}, errors)
+            "UNIT_TEAM_ROLE": "impl", "BASH_ENV": str(shell),
+            "TEST_ATTEMPT_STATUSES": str(attempts)}, errors)
         lock = board / "locks/cargo.d"
         released = subprocess.run(["bash", str(BOARD), "release", str(board), "impl", "cargo",
             "--pid", str(process.pid)], capture_output=True, text=True,
@@ -245,10 +248,26 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(peer.returncode, 0, peer.stdout + peer.stderr)
         admission.free(48 * 1024 ** 3)
-        self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 125, errors.read_text())
+        self.wait_for_output(errors, "waiting for the cargo token since", process)
+        self.assertEqual(attempts.read_text().splitlines(), ["125"])
         self.assertIn("lost the cargo token before its step started", errors.read_text())
         self.assertFalse((self.root / "cargo-calls").exists())
         self.assertEqual((lock / "holder_pid").read_text(), str(os.getpid()))
+        with admission.loop_turn():
+            # Release the fixture host before checking all reservations.
+            for reservation in admission.scenery_reservations:
+                replies = admission.server.handle_request(wire.ReleaseRequest("finish-host", reservation, 0))
+                self.assertEqual(replies, [wire.Ok()])
+            self.assertEqual(admission.caller_reservations(), {})
+            self.assertEqual(admission.server.reservations, {})
+        released = subprocess.run(["bash", str(BOARD), "release", str(board), "peer", "cargo",
+            "--pid", str(os.getpid())], capture_output=True, text=True,
+            check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
+        self.assertEqual(attempts.read_text().splitlines(), ["125", "0"])
+        self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
+        self.assertFalse(lock.exists())
         with admission.loop_turn():
             self.assertEqual(admission.server.reservations, {})
 
@@ -273,7 +292,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
         self.assertEqual(second.wait(timeout=TEST_HANG_GUARD_SECS), 0, second_errors.read_text())
         self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
-        self.assertEqual(admission.server.reservations, {})
+        self.assertEqual(admission.caller_reservations(), {})
 
 
 

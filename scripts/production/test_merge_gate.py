@@ -306,7 +306,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
         self.assertNotRegex(result.stdout, r"(?m)^tests:")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
-        runner = str(merge_gate.RUNNER)
+        runner = str(self.checkout / "scripts/test_times/module_run.py")
         self.assertCountEqual([call["args"] for call in launches],
                               [[runner, str(folder), nested.name]
                                for folder in (nested.parent, nested.parent.parent)] * 2)
@@ -567,7 +567,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertRegex(result.stdout, r"(?m)^Largest module peak: [\d.]+ GiB \(sampled memory\); module: (?:\w+/test_\w+\.py|\(not sampled\))$")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
         self.assertEqual(len(launches), self.module_count)
-        runner = str(merge_gate.RUNNER)
+        runner = str(self.checkout / "scripts/test_times/module_run.py")
         expected = [[runner, str(self.checkout / "scripts" / suite), "test_first.py"] for suite in self.suites]
         if "lib" in self.suites:
             expected.append([runner, str(self.checkout / "scripts/lib"), "test_second.py"])

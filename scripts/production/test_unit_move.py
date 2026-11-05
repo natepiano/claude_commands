@@ -301,7 +301,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
         rows = (self.owner, worker, other, other_worker)
         running = {row.id for row in rows}
         events: list[tuple[str, staff.StaffRow]] = []
-        def read_conversation(identity: str) -> herdr.LiveConversation | herdr.StoppedConversation:
+        def read_conversation(identity: str, _kind: str = "", *,
+                              codex: herdr.CodexConversations | None = None) -> herdr.LiveConversation | herdr.StoppedConversation:
+            _ = codex
             row = next(row for row in rows if row.current_session == identity)
             return herdr.LiveConversation("claude", (998041,)) if row.id in running else herdr.StoppedConversation()
         def stop(row: staff.StaffRow, _client: object) -> bool:
@@ -776,7 +778,8 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
                     result = self.command()
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(backend.resumes, [(kind,
-                    ["--resume", self.owner.current_session] if kind == "claude" else ["resume", self.owner.current_session])])
+                    ["--resume", self.owner.current_session, "--name", backend.starts[0].name]
+                    if kind == "claude" else ["resume", self.owner.current_session])])
                 self.assertEqual(backend.stops, [self.owner.current_session])
                 self.assertEqual(backend.starts[0].worktree, staff.PresentWorktree("natedev", self.destination))
                 self.assertEqual(backend.starts[0].id, self.owner.id)

@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import herdr
 import pane_launch
 import fake_herdr
+from scripts.message import codex_daemon
 from fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
@@ -314,6 +315,11 @@ class NativePaneSessionTests(StaffTestCase):
 
 
 class CodexAnomalyNameTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
+
     def test_codex_managed_daemon_distinguishes_thread_holders(self) -> None:
         managed = ["/opt/bin/codex", "app-server", "--listen", "unix://",
                    "--analytics-default-enabled", "--managed-daemon"]
@@ -347,7 +353,7 @@ class CodexAnomalyNameTests(StaffTestCase):
               patch.object(sessions, "process_start", return_value="fixture-start"),
               redirect_stderr(io.StringIO()) as output):
             self.assertEqual(herdr.running_codex_threads(thread_host=lambda _arguments: False), identities)
-            self.assertEqual(len(output.getvalue().splitlines()), 6)
+            self.assertEqual(len(output.getvalue().splitlines()), 5)
             self.assertTrue(all("Codex thread unknown" in line for line in output.getvalue().splitlines()))
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 _ = herdr.codex_rollout_thread(42)
@@ -357,7 +363,7 @@ class CodexAnomalyNameTests(StaffTestCase):
             self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), {live})
             (proc / "43" / "fd" / "0").unlink()
             self.assertEqual(herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon), set())
-            self.assertEqual(len(output.getvalue().splitlines()), 17)
+            self.assertEqual(len(output.getvalue().splitlines()), 14)
             self.assertTrue(all("Codex thread unknown" in line for line in output.getvalue().splitlines()))
 
     def assert_unknown_codex_note(self, source: Literal["tab", "registry", "pid"]) -> None:
@@ -3225,10 +3231,22 @@ class HerdrTests(unittest.TestCase):
             {"pane_id": f"w1:p{index}", "tab_id": f"w1:t{index}",
              "agent_session": {"value": members[name].current_session}}
             for index, name in enumerate(("boss", "alpha"), 1)]}}))
+        self.enterContext(fake_unit_host.private_process_registry())
+        for index, name in enumerate(("boss", "alpha"), 1):
+            pid = 992000 + index
+            fake_unit_host.process(os.environ, pid, 1, ["claude"], {})
+            registry = sessions.sessions_dir() / f"{pid}.json"
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            _ = registry.write_text(json.dumps({"pid": pid, "procStart": "1", "name": name,
+                "sessionId": members[name].current_session, "updatedAt": 1, "messagingSocketPath": ""}))
+            self.configure_herdr(["pane", "process-info", "--pane", f"w1:p{index}"], json.dumps({"result": {
+                "process_info": {"shell_pid": 990000 + index, "foreground_process_group_id": pid,
+                    "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual([command[2:] for command in self.commands()[-9:]], [
+        self.assertEqual([command[2:] for command in self.commands()[-11:]], [
             tab, ["pane", "rename", "w1:p2", "alpha"], ["tab", "list", "--workspace", "w1"], ["workspace", "list"],
-            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"], ["pane", "list"]])
+            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"], ["pane", "list"],
+            ["pane", "process-info", "--pane", "w1:p1"], ["pane", "process-info", "--pane", "w1:p2"]])
         saved = herdr.saved_layout("fixture")
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", layout_row_ids(["boss", "alpha"]))])
@@ -3897,12 +3915,16 @@ class HerdrTests(unittest.TestCase):
         reply = subprocess.CompletedProcess(["fixture"], 0, '{"result":{"agents":[]}}', "")
         with (patch.object(time, "monotonic", return_value=100.0),
               patch.object(herdr, "run_program", return_value=reply) as program):
-            for deadline, expected in ((100.25, 0.25), (99.0, 0.0), (200.0, 10.0)):
+            for deadline, expected in ((100.25, 0.25), (200.0, 10.0)):
                 with self.subTest(deadline=deadline):
                     _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=deadline)
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
                     self.assertEqual(self.herdr.agents(deadline=deadline), [])
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+            program.reset_mock()
+            with self.assertRaisesRegex(herdr.HerdrFailure, "deadline passed"):
+                _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=99.0)
+            program.assert_not_called()
             _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
             self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
             self.assertEqual(self.herdr.agents(), [])
@@ -5051,6 +5073,16 @@ class LayoutHerdr(herdr.Herdr):
             case ["agent", "list"]:
                 return {"agents": []}
             case ["pane", "process-info"]:
+                pane = next(tab for tab in self.tabs if tab["pane_id"] == arguments[-1])
+                if "session_id" in pane and "HERDR_PROC" in os.environ:
+                    pid = 992000 + self.tabs.index(pane)
+                    fake_unit_host.process(os.environ, pid, 1, ["claude"], {})
+                    registry = sessions.sessions_dir() / f"{pid}.json"
+                    registry.parent.mkdir(parents=True, exist_ok=True)
+                    _ = registry.write_text(json.dumps({"pid": pid, "procStart": "1", "name": pane["label"],
+                        "sessionId": pane["session_id"], "updatedAt": 1, "messagingSocketPath": ""}))
+                    return {"process_info": {"shell_pid": 42, "foreground_process_group_id": pid,
+                        "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}
                 activity = self.pane_activity(arguments[-1])
                 command = activity.commands[0] if isinstance(activity, herdr.PaneRunning) else "zsh"
                 foreground = 43 if isinstance(activity, herdr.PaneRunning) else 42
@@ -5255,6 +5287,94 @@ class RowTabTests(StaffTestCase):
             _ = self.client.move_row_tabs(self.rows["parent"].id)
         self.assertEqual(self.client.commands, [])
         self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_record_layout_binds_the_native_row_instead_of_a_stale_mark(self) -> None:
+        self.client.tabs = self.client.tabs[:1]
+        self.client.tabs[0]["mark"] = self.rows["stopped"].current_session
+
+        self.client.record_layout()
+
+        self.assertEqual(self.bindings(), [("old-production", self.rows["unit"].id)])
+
+    def test_record_layout_does_not_bind_a_mark_without_a_native_process(self) -> None:
+        self.client.tabs = self.client.tabs[:1]
+        self.client.tabs[0]["mark"] = self.rows["unit"].current_session
+        del self.client.tabs[0]["session_id"]
+
+        self.client.record_layout()
+
+        self.assertEqual(self.bindings(), [])
+
+    def test_record_layout_keeps_the_saved_place_when_pane_evidence_is_unknown(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        self.client.tabs[0]["mark"] = self.rows["unit"].current_session
+        self.client.tabs[1]["mark"] = self.rows["stopped"].current_session
+        self.client.unknown.add(self.client.tabs[1]["pane_id"])
+        saved = herdr.SavedSpace(name="remembered", seen=time.time(), tabs=[
+            herdr.SavedName(name=self.rows["stopped"].id, seen=time.time(), terminal_id="retained-terminal")])
+        path = herdr.layout_path("fixture")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(herdr.SavedLayout(at=time.time(), workspaces=[saved])))
+        record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows if row.id != self.rows["stopped"].id))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout(record=record)
+
+        self.assertEqual(self.bindings(), [("remembered", self.rows["stopped"].id), ("old-production", self.rows["unit"].id)])
+        self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
+        self.assertIn("pane evidence is unknown", errors.getvalue())
+
+    def test_unknown_pane_evidence_keeps_old_workspace_and_tab_bindings(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        self.client.tabs[1]["session_id"] = self.rows["stopped"].current_session
+        self.client.unknown.add(self.client.tabs[1]["pane_id"])
+        now = time.time()
+        old = now - herdr.LAYOUT_KEEP_SECONDS - 1
+        remembered = herdr.SavedSpace(name="remembered", seen=old, tabs=[
+            herdr.SavedName(name=self.rows["worker"].id, seen=old, terminal_id="old-workspace-terminal")])
+        stopped = herdr.SavedName(name=self.rows["stopped"].id, seen=old, terminal_id="old-tab-terminal")
+        saved = herdr.SavedLayout(at=old, workspaces=[remembered,
+            herdr.SavedSpace(name="old-production", seen=old, tabs=[
+                herdr.SavedName(name=self.rows["unit"].id, seen=old), stopped])])
+        path = herdr.layout_path("fixture")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(saved))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout()
+
+        result = herdr.saved_layout("fixture")
+        self.assertEqual(self.bindings(), [("remembered", self.rows["worker"].id),
+            ("old-production", self.rows["unit"].id), ("old-production", self.rows["stopped"].id)])
+        self.assertEqual(result["workspaces"][0], remembered)
+        self.assertEqual(result["workspaces"][1]["tabs"][1], stopped)
+        self.assertGreaterEqual(result["workspaces"][1]["tabs"][0]["seen"], now)
+        self.assertIn("pane evidence is unknown", errors.getvalue())
+        self.assertIn("row placement retained", errors.getvalue())
+
+    def test_known_pane_evidence_expires_old_workspace_and_tab_bindings(self) -> None:
+        self.client.tabs = self.client.tabs[:2]
+        del self.client.tabs[1]["session_id"]
+        now = time.time()
+        old = now - herdr.LAYOUT_KEEP_SECONDS - 1
+        saved = herdr.SavedLayout(at=old, workspaces=[
+            herdr.SavedSpace(name="remembered", seen=old, tabs=[
+                herdr.SavedName(name=self.rows["worker"].id, seen=old, terminal_id="old-workspace-terminal")]),
+            herdr.SavedSpace(name="old-production", seen=old, tabs=[
+                herdr.SavedName(name=self.rows["unit"].id, seen=old),
+                herdr.SavedName(name=self.rows["stopped"].id, seen=old, terminal_id="old-tab-terminal")])])
+        path = herdr.layout_path("fixture")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(saved))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout()
+
+        self.assertEqual(self.bindings(), [("old-production", self.rows["unit"].id)])
+        tabs = herdr.saved_layout("fixture")["workspaces"][0]["tabs"]
+        for tab in tabs:
+            self.assertGreaterEqual(tab["seen"], now)
+        self.assertEqual(errors.getvalue(), "")
 
     def test_transfer_preserves_shared_tabs_separate_tabs_and_nested_grid_splits(self) -> None:
         initial = [dict(pane) for pane in self.client.tabs]
@@ -5508,8 +5628,10 @@ class SavedLayoutTests(unittest.TestCase):
         _ = (proc / "42/stat").write_text("42 (shell) S 1 42 42 1 42 " + "0 " * 13 + "4200\n")
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "HERDR_PROC": str(proc)})))
+            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr", "HERDR_PROC": str(proc),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.enterContext(fake_unit_host.private_process_registry())
 
     def running(self) -> LayoutHerdr:
         client = LayoutHerdr()
