@@ -156,7 +156,8 @@ class RecordedResumeTests(ShutdownTestCase):
         for model in ("", "codex-model"):
             with self.subTest(model=model):
                 arguments = self.resumed_arguments(self.entry("codex", model))
-                expected = ["-c", 'projects={"/tmp/recorded-resume"={trust_level="trusted"}}', "resume", "current-id"]
+                expected = ["-C", "/tmp/recorded-resume", "-c",
+                            'projects={"/tmp/recorded-resume"={trust_level="trusted"}}', "resume", "current-id"]
                 if model:
                     expected.extend(("--model", model))
                 self.assertEqual(arguments, expected)

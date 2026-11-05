@@ -402,7 +402,8 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
                     result = self.command()
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(backend.resumes, [(kind,
-                    ["--resume", self.owner.current_session] if kind == "claude" else ["resume", self.owner.current_session])])
+                    ["--resume", self.owner.current_session, "--name", backend.starts[0].name]
+                    if kind == "claude" else ["resume", self.owner.current_session])])
                 self.assertEqual(backend.stops, [self.owner.current_session])
                 self.assertEqual(backend.starts[0].worktree, staff.PresentWorktree("natedev", self.destination))
                 self.assertEqual(backend.starts[0].id, self.owner.id)

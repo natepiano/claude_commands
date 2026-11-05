@@ -853,7 +853,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             nonlocal published, publishing
             self.assertEqual(kind, "codex")
             self.assertEqual(agent_arguments, ["-C", str(self.new_folder), "-c", 'projects={' + json.dumps(str(self.new_folder))
-                + '={trust_level="trusted"}}', "resume", self.owner.current_session])
+                + '={trust_level="trusted"}}', "resume", self.owner.current_session, "--model", "fixture-model"])
             self.assertIsInstance(opening, herdr.NoOpeningPrompt)
             self.assertGreater(timeout_ms, 0)
             (proc / str(backend.pid) / "fd").mkdir(parents=True, exist_ok=True)
