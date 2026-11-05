@@ -34,6 +34,28 @@ class StepProcess(TypedDict):
     group: int
 
 
+class TokenWaitNoteTests(unittest.TestCase):
+    def test_holder_without_trailing_newline_is_named_in_wait_note(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="verify-wait-note-") as directory:
+            board = Path(directory)
+            lock = board / "locks/cargo.d"
+            lock.mkdir(parents=True)
+            _ = (lock / "holder").write_bytes(b"w74")
+            script = "\n".join((
+                "set -euo pipefail",
+                'BOARD_DIR="$1"',
+                "TOKEN_WAITERS_AHEAD=0",
+                shell_function(VERIFY.read_text(), "token_wait_note"),
+                "token_wait_note still 5",
+            ))
+            result = subprocess.run(["bash", "-c", script, "wait-note-test", str(board)],
+                                    text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("w74 (pid unknown) holds it", result.stderr)
+            self.assertNotIn("it came free just now", result.stderr)
+
+
 class VerifyStepOwnerTests(unittest.TestCase):
     root: Path = Path()
     environment: dict[str, str] = {}
@@ -57,9 +79,12 @@ class VerifyStepOwnerTests(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BOARD_DIR": str(self.root / "board"),
             "BOARD_HELPER": str(BOARD),
-            "TOKEN_HELD": "1",
+            "TOKEN_HELD": "1", "BOARD_SLOT": "fixture",
+            "TOKEN_HOLD_S": "30", "TOKEN_RENEW_S": "60",
+            "HOLD_WAIT_DIR": str(self.root / "tmp"),
             "TEST_ROOT": str(self.root),
             "TEST_PYTHON": sys.executable,
+            "PY": str(VERIFY.parent.parent / "lib/py"),
             "TEST_WAIT": str(WAIT),
             "TEST_COMMAND": str(self.root / "step.py"),
         }
