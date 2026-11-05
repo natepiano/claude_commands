@@ -139,6 +139,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/shutdown/session_types.py` | read | snapshot |
 | `scripts/shutdown/shutdown.py` | read | initial_snapshot |
 | `scripts/shutdown/shutdown_record.py` | read | snapshot |
+| `scripts/shutdown/stop_results.py` | read | StaffRow and backend types (type check only) |
 | `scripts/shutdown/stop_resume.py` | read | initial_snapshot, row_operation |
 | `scripts/shutdown/unit_staff_test_support.py` | read | staff.json path |
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
