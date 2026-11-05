@@ -203,7 +203,7 @@ class PaneRestoreTests(unittest.TestCase):
                             "HERDR_PANE_RECORD_DIR": str(self.root / "herdr-panes")}),
                         mock.patch.object(sessions, "session_liveness", side_effect=session_liveness),
                         mock.patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness),
-                        mock.patch.object(herdr, "_codex_conversations", return_value=({}, [])),
+                        mock.patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(herdr, "open_tab", self.open_tab)):
             _ = cast(object, self.enterContext(patcher))
@@ -853,7 +853,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             nonlocal published, publishing
             self.assertEqual(kind, "codex")
             self.assertEqual(agent_arguments, ["-C", str(self.new_folder), "-c", 'projects={' + json.dumps(str(self.new_folder))
-                + '={trust_level="trusted"}}', "resume", self.owner.current_session])
+                + '={trust_level="trusted"}}', "resume", self.owner.current_session, "--model", "fixture-model"])
             self.assertIsInstance(opening, herdr.NoOpeningPrompt)
             self.assertGreater(timeout_ms, 0)
             (proc / str(backend.pid) / "fd").mkdir(parents=True, exist_ok=True)
