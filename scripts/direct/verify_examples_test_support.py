@@ -5,7 +5,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import cache_file_name
 
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
 import json
 import os
@@ -173,7 +173,7 @@ esac
             (self.root / name).mkdir()
         # This workspace's memory fixture must not inherit the host's PSI.
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()

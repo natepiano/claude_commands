@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_pressure_reading
+
 from scripts.lib.py_floor_test_support import cache_file_name
 
 from contextlib import redirect_stderr, redirect_stdout
@@ -34,7 +36,7 @@ def isolate_verify_inputs(environment: dict[str, str], root: Path) -> None:
     _ = cache.write_text(sys.executable + "\n", encoding="utf-8")
     _ = environment.pop("CLAUDE_PYTHON", None)
     pressure = root / "dev-feature-pressure"
-    _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+    write_pressure_reading(pressure)
     cgroup = root / "dev-feature-cgroup"
     cgroup.mkdir(exist_ok=True)
     environment.update({
