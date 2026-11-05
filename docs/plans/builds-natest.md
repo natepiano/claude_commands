@@ -772,40 +772,58 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 33 — `test_fast_track.py` runs in half its time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_fast_track.py` (rank 4 in `test_times top` at 216.9 s median, 108.7 CPU s, 55 tests, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:** Follow the Speed method. The showrunner approved this phase (2026-11-05). No builds unit holds `test_fast_track.py` or `fast_track.py`. Claim the files with cargo-berth before the first edit; send any holder to the showrunner.
-
-1. Profile before any edit. Phase 7 took this module from 304 s to 193 s (load 40-73), with a floor of about 3.5 s of real Git work in each of 55 tests. The median is now 216.9 s with 108.7 CPU s, so about half of the wall time has no CPU. Find where it goes: waits (polls, sleeps, timeouts, lock or admission waits), Git process starts, repository setup in each test, and Python starts. Compare against the Phase 7 floor, and name what grew since then. Write the result into this Spec and name the files and changes before the code step.
-   **Profile result (2026-11-05):**
-   - Baseline: 243.0 s wall, 110.8 CPU s. Admission waits take 0.02 s. Setup takes 2.9 s and cleanup 0.8 s over 55 tests; the class already shares its seed repository.
-   - 4,627 Git calls take 118.6 s in the test process. 22 fast-track CLI runs take 105.5 s, with their own Git work.
-   - What grew since Phase 7: the Phase 7 repair added 5 tests and a Python watchdog for each Git call. 3,612 watchdog starts take a median of 38.3 ms each; a shell watchdog takes 13.8 ms.
-   - Sleeps take 15.2 s, mostly subprocess deadline polls. The blocked-hook test waits for two 5 s deadlines by design.
-   - Change (as shipped): `GIT_HANG_GUARD` runs Git under `timeout -s KILL`, and only `test_git_wrappers_stop_a_blocked_hook` installs it. The other wrappers start Git directly. `merge_checkpoint_test_support.py` does not change.
-   - Production proposals (Spec step 3): repeated `rev-parse` (898), `update-ref` (777) and `cat-file` (283) calls around `fast_track.reconcile`; 403 fetches through `copies.py` remote refresh; the Phase 7 injected Git runner.
-2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
-3. A cut in `fast_track.py` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase. The Phase 7 proposal (one injected Git runner in `fast_track.py`) is already with the showrunner.
-4. A change to `merge_checkpoint_test_support.py` or `cli_fixture.py` keeps every importer green; name each one in the final run.
-5. Keep every test name and assertion, and each `@process_boundary` case as a process. Add no guard, refusal or check that this Work Order does not name.
+- `scripts/production/test_fast_track.py` starts no Python watchdog for each Git call. Only `test_git_wrappers_stop_a_blocked_hook` installs `GIT_HANG_GUARD`, which runs Git under `timeout -s KILL`; the other wrappers start Git directly.
+- Same-load pairs (3 runs): 168.5 s -> 97.9 s wall, 106.9 s -> 52.9 s CPU. Half time (84.25 s) is not reached. The full gate on this phase plus builds was green.
+- Floor at that load (about 101 s): production Git 42.9 s, fast-track CLI children 44.0 s, blocked-hook deadlines 10.0 s, promotion retries 4.0 s. Test Git takes 2.7 s.
+- Architecture proposals sent to the showrunner: one injected Git runner in `fast_track.py` (2,937 Git calls, 27.6 s); the repeated `rev-parse` (898), `update-ref` (777) and `cat-file` (283) calls around `fast_track.reconcile`; 403 fetches through the `copies.py` remote refresh.
 
 **Files:**
-- `scripts/production/test_fast_track.py` — the module
-- `scripts/production/merge_checkpoint_test_support.py` — only for a shared cut the profile names
+- `scripts/production/test_fast_track.py` — Git wrappers and the blocked-hook guard
 
-**Workers:** 1 writer (one module and its fixture; the files do not split)
+**Gotchas:**
+- A bash job-control guard (`set -m`) fails three ways: a hook child that keeps stdout open survives Git, Git cannot read terminal input (SIGTTIN), and a signal exit becomes an ordinary exit code. `timeout -s KILL` has none of these faults.
+
+**Ruled out:**
+- Deleting `GIT_HANG_GUARD` and the blocked-hook test (simplify F009): the Work Order keeps every test name, and the test proves the guard stops a blocked hook.
+
+### Phase 34 — Every test module imports from the repo root with no PYTHONPATH  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** every `scripts/**/test_*.py` module passes when it runs from the repo root with PYTHONPATH unset, with one layout fix for every folder and every checked behavior kept.
+
+**Spec:** natedev found these modules fail with an import error unless PYTHONPATH names their folder (via the showrunner, 2026-11-05). The showrunner made this the next phase after Phase 33. Claim each file with cargo-berth before the first edit; send any holder to the showrunner.
+
+1. Reproduce before any edit, in a `copies.py` clone with PYTHONPATH unset. Run each named module from the repo root as `python3 -m unittest scripts/<folder>/<module>.py`. Record each import error and the import line that causes it. The named modules: `scripts/production/test_next_item.py`; two `scripts/notify` test modules (`pushover`); `scripts/lib` tests (no package file; needs a module list); `scripts/production/test_production_lifecycle.py` (`fake_unit_host`); `scripts/mac_test/test_offload.py` (`offload`); `scripts/build_hold` tests; `scripts/buildlog/test_width_trial.py` (`store`); `scripts/shutdown` tests (`test_support`).
+2. Run the same form for every other `test_*.py` under `scripts/`, and list each module with the same fault.
+3. Name the one cause and the one layout fix for every folder. Write both into this Spec, with the files to change, before the code step. Fix at the cause. A `sys.path` insert in each module is not one fix.
+4. Keep the gate's form green: `module_run.py` runs `unittest discover -s <folder> -p <module>` from the repo root.
+5. Add no guard, refusal or check, and no test that scans imports (user rule, 2026-11-05).
+6. Do not edit `folder_audit.py`, `build_hold.py`, `mac_idle.py`, `rust_release.py` or `aws_target/ledger.py` until the showrunner sends natedev messaging's main hash. A fix that needs one of them waits; name it in the report.
+
+**Files:**
+- `scripts/production/test_next_item.py`, `scripts/production/test_production_lifecycle.py`
+- `scripts/notify/` — its test modules
+- `scripts/lib/` — its test modules and any package file the fix names
+- `scripts/mac_test/test_offload.py`
+- `scripts/build_hold/` — its test modules
+- `scripts/buildlog/test_width_trial.py`
+- `scripts/shutdown/` — its test modules
+- `scripts/` — any other test module that step 2 lists
+
+**Workers:** 1 writer (one layout fix; step 3 names the files, then they can split by folder)
 - `impl` — all files above
+- `test` — opens as impl
 
 **Constraints from prior phases:**
-- Phase 7: `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary. `cli_fixture.py` `@process_boundary` keeps a named test as a process. The Git hang guard runs Git under `timeout -s KILL` and is installed only by `test_git_wrappers_stop_a_blocked_hook` (Phase 33).
 - Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
-- Phase 31: the manual admission clock advance is a workaround (showrunner ruling); queue-unit fixes the start spacing in the shared admission fixture. Do not advance the admission clock by hand.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_fast_track.py'` green, with the same test names and assertions
-- each importer in Spec step 4 green when a support file changes, with its before and after time in same-load pairs
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- each module from steps 1 and 2 green with `env -u PYTHONPATH python3 -m unittest scripts/<folder>/<module>.py` from the repo root of a `copies.py` clone
+- each changed module green in the gate form `python3 -m unittest discover -s scripts/<folder> -p '<module>'`
+- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
