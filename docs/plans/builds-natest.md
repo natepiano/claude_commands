@@ -447,53 +447,49 @@ The recording exists: `buildlog/parse.test_results` keeps each nextest test that
 - `scripts/buildlog/index.py`, `scripts/buildlog/test_index.py` — the Mac identity and the query index
 - `config/test_times.conf` — `NEXTEST_SLOW_TEST_S`
 - `scripts/buildlog/parse.py` — the threshold read (report-unit's file; see the showrunner answer)
+- `scripts/buildlog/test_parse.py` — the parser tests, with a private threshold config
 - `commands/test_times.md` — the doc line
 
 **Workers:** 1 writer + 1 tester
 - `impl` — `show.py`, `index.py`, `parse.py`, `config/test_times.conf`, `commands/test_times.md`
-- `test` — `test_show.py`, `test_index.py`, from the Spec: a fixture index with steps of two repositories ranks only the calling repository; a ~/.claude working directory keeps the module view; a Mac step whose call came from a hana natedev call ranks under hana; a test with only failed runs ranks last
+- `test` — `test_show.py`, `test_index.py`, `scripts/buildlog/test_parse.py` (a private config fixture for `NEXTEST_SLOW_TEST_S`), from the Spec: a fixture index with steps of two repositories ranks only the calling repository; a ~/.claude working directory keeps the module view; a Mac step whose call came from a hana natedev call ranks under hana; a test with only failed runs ranks last
 
 **State:** `steps.repo_identity` for Mac rows changes from `unknown` to the served call's identity. The `tests` table gains what the query needs. A schema change makes a new index file (Phase 10), so the first command after the merge rebuilds the index.
 
 **Constraints from prior phases:**
 - Phase 10: each schema keeps its own index file.
 - Phase 14: `top` ranks gate modules by the median of valid runs; `TOP_RUNS`, `TOP_CHECKOUT` and `TOP_MAX_AGE_DAYS` are in `config/test_times.conf`.
+- Phase 17: keep `remove_index()` (sidecars first, main file last), `LEGACY_INDEX_NAME`, `cleanup_unused_indexes(root, current, settings)` and the hourly mtime stamp in `update()`. The cleanup, sidecar and interrupted-removal tests in `test_index.py` stay green.
+- A live `show.py top` that rebuilds or updates the index holds the live `index.lock`. A run on 2026-11-04 held it 35 minutes. Acceptance runs never use the live root without a timeout.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/test_times -p 'test_show.py'` green
 - `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green
-- in a hana worktree, `python3 ~/.claude/scripts/test_times/show.py top` lists hana nextest tests, in under 0.5 s warm
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_parse.py'` green
+- from `~/rust/hana`, the candidate checkout's `show.py top` against a scratch `BUILDLOG_DIR` with copied logs, under `timeout 600`: measure the rebuild once, then the warm query lists hana nextest tests in under 0.5 s
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 17 — The build log keeps only the index files that a checkout used in the last day  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `~/.local/state/buildlog` holds no `index.sqlite` and no `index-<hash>.sqlite` file that no checkout opened in the last day.
-
-**Spec:** The showrunner returned C1047 on 2026-11-04: natedev held three index files of about 1.5 GB each (`index-be554ddd…` current, `index-fdcac9b9…` from 20:28, and the old-name `index.sqlite` from 18:06). `cleanup_unused_indexes` (`scripts/buildlog/index.py:1052`) already runs at the end of each `update()`, and `INDEX_PATTERN` already matches the old name, but `INDEX_UNUSED_DAYS` is 30 and `update()` stamps the current file only when it is more than one day old.
-
-1. Old name: `update()` removes `index.sqlite` at once, whatever its age. No code opens it since Phase 10.
-2. Rule for "no live checkout uses it": a schema file is in use when a checkout opened it in the last `INDEX_UNUSED_DAYS` days. Each `update()` sets the current file's mtime when it is more than `INDEX_TOUCH_MINUTES` (new key, 60) old, in place of one day. A reader that skips `update()` counts through `st_atime`. The current file is never removed.
-3. `INDEX_UNUSED_DAYS` changes from 30 to 1 (a changed key: the showrunner takes it to the user). Until the user answers, the worker writes the code and tests with the key read at use, and the config keeps 30.
-4. A removed file also loses its `-journal`, `-wal` and `-shm` files.
-5. Removal stays under `update_lock()`. A file removed between a peer's stat and open costs that peer one rebuild.
+- `cleanup_unused_indexes(root, current, settings)` runs at the end of each `update()`, under `update_lock()`. It deletes the legacy `index.sqlite` (`LEGACY_INDEX_NAME`) at any age, and each other `index-<hash>.sqlite` whose `max(st_atime, st_mtime)` is older than `INDEX_UNUSED_DAYS` (2). The current file always stays.
+- `update()` reads `config/buildlog.conf` once and sets the current file's mtime when it is older than `INDEX_TOUCH_MINUTES` (60).
+- `remove_index(path)` deletes the `INDEX_SIDECAR_SUFFIXES` files (`-journal`, `-wal`, `-shm`) first and the main file last. Cleanup, `reindex()` and `open_for_update()` use it. Cleanup also deletes orphan sidecars, so the next `update()` finishes an interrupted removal.
+- A removed file costs its next reader one rebuild. Report commands rebuild through `update()`; memory admission uses its fallback while the index is absent.
 
 **Files:**
-- `scripts/buildlog/index.py` — `cleanup_unused_indexes` and the stamp in `update()` only
-- `config/buildlog.conf` — `INDEX_TOUCH_MINUTES`, and `INDEX_UNUSED_DAYS` after the user answers
-- `scripts/buildlog/test_index.py` — the cleanup tests only
+- `scripts/buildlog/index.py` — `remove_index`, `INDEX_SIDECAR_SUFFIXES`, `LEGACY_INDEX_NAME`, cleanup, the hourly stamp
+- `config/buildlog.conf` — `INDEX_UNUSED_DAYS=2`, `INDEX_TOUCH_MINUTES=60`
+- `scripts/buildlog/test_index.py` — cleanup, sidecar, legacy, age and stamp tests
 
-**Workers:** 1 writer + 1 tester. The work runs in a separate clone of this branch (`builds-natest-p17`), because Phase 16 also edits `index.py` and `test_index.py`; the director brings the checkpoint commit into this branch.
-- `impl` — `index.py`, `config/buildlog.conf`
-- `test` — `test_index.py`, from the Spec: an old-name `index.sqlite` goes on the next update, whatever its age; a schema file opened 2 days ago goes; a schema file stamped 23 hours ago stays; the current file stays at any age; the companion files of a removed file go; `update()` stamps the current file after `INDEX_TOUCH_MINUTES`
+**Binds later work:**
+- A change to `index.py` keeps `remove_index()`, `LEGACY_INDEX_NAME`, the `settings` argument of `cleanup_unused_indexes`, and the hourly stamp in `update()`.
 
-**State:** index files on each host. A checkout that has not opened its file in a day rebuilds it on its next read.
+**Gotchas:**
+- Read-only paths (`index.read_only()`, the four `read_only_uri()` connects in `scripts/lint/memory_admit.py`) never stamp mtime, and relatime moves atime at most once a day. Keep `INDEX_UNUSED_DAYS` at 2 or more and `INDEX_TOUCH_MINUTES` well below it.
+- One full rebuild costs 61 s wall, 43 s CPU, 1.0 GB peak memory and a 1.5 GB file (natedev, 2026-11-04).
+- A live `show.py top` can hold `index.lock` for a long time; a test or acceptance run uses a scratch `BUILDLOG_DIR` and a timeout.
 
-**Constraints from prior phases:**
-- Phase 10: `index-<sha256>.sqlite` per schema; `index.index_path()` and `index.index_path_in(root)` name it.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- A 1-day window: a checkout that only reads its index could lose a file it uses each hour.
