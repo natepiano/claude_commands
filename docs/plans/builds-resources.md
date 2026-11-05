@@ -1337,7 +1337,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 
 **Ruled out:** caller-side `store` imports in six files, replaced by the one re-export.
 
-### Phase 57 — The gate comparison shows Cargo waits with and without running gates  · status: todo
+### Phase 57 — The gate comparison shows Cargo waits with and without running gates  · status: done
 **Depends on:** Phase 20 on `origin/main` for 24 hours. Global order: 31 → 33 → 26 → 15/27 → 39 → 20 → 56 → 11 → 60 → 17 → 18 → 19 → 8. Phase 57 runs beside this chain. Its measurement files are in the run folder.
 
 #### Work Order
