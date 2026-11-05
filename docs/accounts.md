@@ -430,7 +430,7 @@ The account moves log on natedev holds ordered, one-shot moves for Claude groups
 accounts.py next add units 1 claude4 --hold-minutes 30
 accounts.py next add units 1 claude2 --hold-minutes 30
 accounts.py next add showrunners 1 claude4 --hold-minutes 30
-accounts.py next add showrunners 1 claude2 --hold-minutes 30
+accounts.py next add showrunners 1 claude2 --else claude4
 accounts.py next add workers 1 codex2
 accounts.py next add workers 1 claude
 accounts.py next list
@@ -447,10 +447,15 @@ For units, showrunners and workers, agent-notes considers only the first entry p
 Later entries wait until it records and removes the first entry.
 A later pass can then process the next entry.
 Later Claude entries keep no hold during that wait.
-A due first entry that cannot run stays queued.
+Use `--else claude4` to try claude4 when the first target cannot run.
+Repeat `--else` to add more targets in order.
+The list shows `showrunners 1: at 1% → claude2, else claude4`.
+The move uses the first target with room and records the entry as done.
+A due first entry stays queued when none of its targets can run.
 It tells showrunners once when the blocking reason changes.
 Blocking reasons include missing or stale readings, low quota, and unresolved quota refusals.
-A due Claude entry that targets the current account prints `unchanged` and leaves the queue.
+The current account counts as usable, even with low quota.
+A due Claude entry that chooses the current account prints `unchanged` and leaves the queue.
 The example holds units at 1% for 30 minutes, then moves them to claude4.
 It holds them again when claude4 reads low, then moves them to claude2.
 Both groups can use the same account.

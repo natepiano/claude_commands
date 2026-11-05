@@ -58,20 +58,56 @@ fi
 
 WORKER_FILL="$(dirname "${BASH_SOURCE[0]}")/../production/worker_fill.py"
 OPENING_ROLE="${AGENT_BG_ROLE:-${UNIT_TEAM_ROLE:-}}"
-if [[ -z "${WORKER_SWITCH_FD:-}" && "$ATTACH" == 0 ]]; then
-  exec "$PY" "$WORKER_FILL" launch-claude --name "$MESH_NAME" --run "$ADMISSION_RUN" --role "$OPENING_ROLE" \
-    --prompt "$PROMPT_FILE" --staff-id "${WORKER_STAFF_ID:-}" --launcher bash "${BASH_SOURCE[0]}" --run "$ADMISSION_RUN" "$@"
-fi
-PROMPT_FILE="${WORKER_SWITCH_PROMPT:-$PROMPT_FILE}"
-
 switch_signal() {
-  printf '%s\n' "$1" >&"$WORKER_SWITCH_FD"
-  if [[ "$1" != dispatched ]]; then
+  printf '%s\n' "$1" >&"$SWITCH_WRITE"
+  if [[ "$1" == dispatched ]]; then
+    exec {SWITCH_READ}<&- {SWITCH_WRITE}>&-
+    wait "$SWITCH_PID" || return "$?"
+    trap - EXIT INT TERM HUP
+    ADMISSION_ACTIVE=0
+  else
     local reply
-    read -r -u "$WORKER_SWITCH_FD" reply
-    [[ "$reply" == published ]]
+    read -r -u "$SWITCH_READ" reply || return 2
+    if [[ "$reply" == failed ]]; then
+      wait "$SWITCH_PID" || return "$?"
+      return 2
+    fi
+    [[ "$reply" == published ]] || return 2
+    WORKER_PUBLISHED=1
   fi
 }
+
+ADMISSION_ACTIVE=0
+WORKER_PUBLISHED=0
+if [[ "$ATTACH" == 0 ]]; then
+  coproc ADMISSION { exec "$PY" "$WORKER_FILL" coordinate-claude --name "$MESH_NAME" --run "$ADMISSION_RUN" \
+    --role "$OPENING_ROLE" --prompt "$PROMPT_FILE" --staff-id "${WORKER_STAFF_ID:-}"; }
+  SWITCH_PID=$ADMISSION_PID
+  exec {SWITCH_READ}<&"${ADMISSION[0]}" {SWITCH_WRITE}>&"${ADMISSION[1]}"
+  close_switch() {
+    local status=$?
+    exec {SWITCH_READ}<&- {SWITCH_WRITE}>&-
+    kill "$SWITCH_PID" 2>/dev/null || true
+    wait "$SWITCH_PID" 2>/dev/null || true
+    if [[ "$ATTACH" == 0 && "$WORKER_PUBLISHED" == 0 && -n "${BG_ID:-}" ]]; then
+      "$CLAUDE_BIN" stop "$BG_ID" || echo "staff: ${MESH_NAME}: ${BG_ID}: cleanup unproved" >&2
+    fi
+    exit "$status"
+  }
+  trap close_switch EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  read -r -u "$SWITCH_READ" action || { wait "$SWITCH_PID"; exit 2; }
+  case "$action" in
+    unchanged) wait "$SWITCH_PID"; echo unchanged; exit 0 ;;
+    attach) ATTACH=1 ;;
+    launch) ;;
+    *) exit 2 ;;
+  esac
+  read -r -u "$SWITCH_READ" PROMPT_FILE || exit 2
+  ADMISSION_ACTIVE=1
+fi
 
 publish_worker() {
   # The launch banner can arrive before the registry entry.
@@ -114,7 +150,7 @@ PYREG
 if [[ "${ATTACH}" == "1" ]]; then
   read -r FAMILY NATIVE_ID REFERENCE < <("$PY" "$WORKER_FILL" member --run "$ADMISSION_RUN" --name "$MESH_NAME" --staff-id "${WORKER_STAFF_ID:-}")
   [[ "$FAMILY" == claude ]] || exit 2
-  [[ -z "${WORKER_SWITCH_FD:-}" ]] || switch_signal "$NATIVE_ID"
+  [[ "$ADMISSION_ACTIVE" == 0 ]] || switch_signal "$NATIVE_ID"
   BG_ID="${NATIVE_ID:0:8}"
   transcript_count() {
     NATIVE_ID="${NATIVE_ID}" "$PY" - <<'PY'
@@ -187,7 +223,7 @@ if [[ -n "${EFFORT}" ]]; then
   launch_args+=(--effort "${EFFORT}")
 fi
 
-banner="$(if [[ -n "${WORKER_SWITCH_FD:-}" ]]; then exec {WORKER_SWITCH_FD}>&-; fi
+banner="$(if [[ "$ADMISSION_ACTIVE" == 1 ]]; then exec {SWITCH_READ}<&- {SWITCH_WRITE}>&-; fi
           cd "${WORKING_DIR}" \
             && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u MODELS_CONFIG_FILE \
                    -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS -u CLAUDE_CODE_CHILD_SESSION \
@@ -204,7 +240,6 @@ if [[ -z "${BG_ID}" ]]; then
   exit 1
 fi
 if ! publish_worker; then
-  "${CLAUDE_BIN}" stop "${BG_ID}" || echo "staff: ${MESH_NAME}: ${BG_ID}: cleanup unproved" >&2
   exit 2
 fi
 fi
@@ -216,7 +251,7 @@ if [[ "$delivery" != SENT:* && "$delivery" != SKIPPED:* ]]; then
   exit 2
 fi
 
-[[ -z "${WORKER_SWITCH_FD:-}" ]] || switch_signal dispatched || exit 2
+[[ "$ADMISSION_ACTIVE" == 0 ]] || switch_signal dispatched || exit 2
 
 if [[ "$ATTACH" == 1 ]]; then
   if [[ -n "${UNIT_RUN_DIR:-}" && -n "${UNIT_TEAM_ROLE:-}" ]]; then

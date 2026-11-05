@@ -473,14 +473,6 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
     store = ledger_for_run(run)
     membership = staff.local_snapshot()
     reviewer_base = _reviewer_destination(run) if role == "review" else role
-    with store.locked(write=False) as ledger:
-        pass
-    permissions = {name: worker_admission.admit(name, run, role=role)
-                   for name, worker in ledger.workers.items()
-                   if worker.role == role and not isinstance(worker.ownership, Retired)}
-    for name, value in _read_roster(run).items():
-        if _worker_task_role(_object(value), membership) == role and name not in permissions:
-            permissions[name] = worker_admission.admit(name, run, role=role)
     with store.locked() as ledger:
         roster = _read_roster(run)
         for name, value in sorted(roster.items(), key=lambda item: (role == "review" and item[0] != reviewer_base, item[0])):
@@ -496,11 +488,12 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                 if name not in ledger.workers:
                     ledger.workers[name] = _worker_from_record(name, run, record)
                 try:
-                    permission = permissions.get(name)
-                    if permission is None:
-                        raise WorkerUnavailable(f"{name}: worker changed during admission")
+                    permission = worker_admission.admit(name, run, role=role)
                     _ = worker_admission.publish(permission, _text(session_staff.worker_session(record, membership)))
                     _reserve(run, name, store, owner_pid, paused=paused)
+                except worker_admission.AdmissionRefused as error:
+                    print(str(error), file=sys.stderr)
+                    continue
                 except WorkerUnavailable:
                     continue
                 ledger.workers[name].ownership = HeldBy(str(run))

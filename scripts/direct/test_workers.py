@@ -30,9 +30,9 @@ from scripts.direct import workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.message import sessions
-from scripts.production import staff, session_staff
+from scripts.production import staff, session_staff, worker_admission
 from scripts.usage import agents_log
-from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, isolated_source_readers, showrunner_relationship, unit_membership, fixture_worker_records
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker, StaffTestCase, isolated_source_readers, showrunner_relationship, unit_membership, fixture_worker_records
 
 
 SCRIPT = Path(__file__).with_name("workers.py")
@@ -616,6 +616,47 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertIn("Previously queued work.", json.dumps(turns[0]))
         self.assertEqual(json_object(pending)["messages"], [])
         self.assertEqual(self.methods("thread/start"), [])
+
+    def test_a_refused_candidate_does_not_block_a_healthy_allocation(self) -> None:
+        refused = fixture_worker("first-refused", staff.native_id(os.environ["CODEX_THREAD_ID"]),
+            backend=staff.CodexBackend(Path(os.environ["CODEX_HOME"])))
+        agents_log.append(refused.current_session, "impl", None, datetime.now(timezone.utc))
+        for boundary in ("admit", "publish"):
+            with self.subTest(boundary=boundary):
+                self.open_worker(name="healthy")
+                roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+                roster[refused.name] = {"staff_id": refused.id, "status": "failed",
+                    "model": "gpt-kept-sol", "effort": "xhigh", "port": self.server.port}
+                self.write_pool_roster(roster)
+                staff_file = Path(os.environ["STAFF_FILE"])
+                before = staff_file.read_bytes(), json_object(self.session_dir / codex_mesh.ROSTER_FILE)[refused.name]
+                original_admit, original_publish = worker_admission.admit, worker_admission.publish
+                attempts: list[str] = []
+
+                def admit(name: str, run: Path, *, role: str) -> worker_admission.WorkerStartAllowed:
+                    attempts.append(name)
+                    if name == refused.name:
+                        raise worker_admission.AdmissionRefused("candidate switch refused")
+                    return original_admit(name, run, role=role)
+
+                def publish(allowed: worker_admission.WorkerStartAllowed, identity: str) -> worker_admission.PublishedWorker:
+                    attempts.append(allowed.name)
+                    if allowed.name == refused.name:
+                        raise worker_admission.AdmissionRefused("candidate switch refused")
+                    return original_publish(allowed, identity)
+
+                with (patch.object(worker_admission, boundary, side_effect=admit if boundary == "admit" else publish),
+                      redirect_stderr(io.StringIO()) as errors):
+                    selected = workers.resolve(self.session_dir, "impl")
+                self.assertEqual(errors.getvalue().count("candidate switch refused"), 1)
+                self.assertEqual(selected, "healthy")
+                self.assertCountEqual(attempts, [refused.name, "healthy"])
+                self.assertEqual(staff_file.read_bytes(), before[0])
+                after = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+                self.assertEqual(after[refused.name], before[1])
+                self.assertTrue(workers.allocation_is_live(cast(dict[str, object], after["healthy"])))
+                self.assertEqual(self.methods("thread/start"), [])
+                self.assertEqual(self.methods("turn/start"), [])
 
     def test_two_simultaneous_resolves_in_one_run_reserve_distinct_workers(self) -> None:
         self.open_worker(name="impl")
