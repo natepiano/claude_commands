@@ -811,12 +811,13 @@ class CopyGuardDispatchTests(IsolatedHookTests):
         for case in shell_policy_cases():
             with self.subTest(command=case.command):
                 result = self.run_python([str(DISPATCH), "pre_tool_use"], {
-                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)})
+                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": "/"})
                 self.assertEqual(result.returncode, 2 if case.operation else 0, result.stderr)
                 if case.operation:
                     self.assertTrue(result.stderr.startswith(case.operation + ":"), result.stderr)
                 else:
                     self.assertNotIn("copies.py run", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_pre_tool_use_refuses_repository_creation_through_dispatcher(self) -> None:
         result = self.run_python([str(DISPATCH), "pre_tool_use"], {

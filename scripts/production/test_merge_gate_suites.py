@@ -18,6 +18,34 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    def test_modules_run_the_checkout_runner_and_import_from_the_checkout(self) -> None:
+        runner = self.checkout / "scripts/test_times/module_run.py"
+        source = Path(merge_gate.__file__).resolve().parents[1] / "test_times/module_run.py"
+        marker = self.state / "checkout-runner"
+        self.write(runner, source.read_text().replace(
+            'if __name__ == "__main__":',
+            f'Path({str(marker)!r}).write_text(str(Path(__file__).resolve()))\n\n'
+            + 'if __name__ == "__main__":'))
+        self.write(self.checkout / "checkout_identity.py", 'VALUE = "tested checkout"\n')
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE + '''
+    def test_imports_use_the_checkout(self):
+        import checkout_identity
+        self.assertEqual(checkout_identity.VALUE, "tested checkout")
+''')
+        result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(marker.read_text(), str(runner))
+        self.assert_all_modules_started()
+
+    def test_a_missing_checkout_runner_is_refused_before_any_job_starts(self) -> None:
+        runner = self.checkout / "scripts/test_times/module_run.py"
+        runner.unlink(missing_ok=True)
+        result = self.run_gate("--tests-only", "--full")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.strip(), f"REFUSED: test runner not found: {runner}")
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.module_events(), [])
+
     def test_recovery_suites_include_their_real_regression_modules(self) -> None:
         repo = Path(__file__).resolve().parents[2]
         found = {(suite, test_module_name(repo, suite, path))

@@ -470,6 +470,8 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "settings.json", '{"fixture": true}\n')
         self.write(self.checkout / "subject.txt", "base\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
+        self.write(self.checkout / "scripts/test_times/module_run.py",
+                   (SCRIPT.parents[1] / "test_times/module_run.py").read_text())
         for suite in self.suites:
             self.write(self.checkout / "scripts" / suite / "test_first.py", SUITE_MODULE)
         if "lib" in self.suites:

@@ -90,7 +90,6 @@ class UnitStatusFixture(unittest.TestCase):
         script = root / "scripts/production/unit_status.sh"
         script.parent.mkdir(parents=True)
         _ = shutil.copy2(SCRIPT, script)
-        _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
         message = root / "scripts/message"
         copy_session_modules(message)
         _ = shutil.copy2(SCRIPT.parents[1] / "message/process_table.py", message / "process_table.py")
@@ -111,8 +110,9 @@ class UnitStatusFixture(unittest.TestCase):
         (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
-        for name in ("agent_scope.py", "legacy_identity.py", "script_envelope.py", "atomic_file.py", "conf.py", "git_exclude.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py"):
-            _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
+        _ = shutil.copytree(SCRIPT.parents[1] / "lib", root / "scripts/lib", dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "test_*"))
+        _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
         for name in ("active", "sessions"):
             (root / name).mkdir()
         _ = (root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
