@@ -345,7 +345,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 #### Work Order
 
-**Goal:** the top 10 live modules of `test_times top` (no claimed or retired module) keep every checked behavior and lose each test that only repeats another.
+**Goal:** five of the slowest live modules of `test_times top` keep every checked behavior and lose each test that only repeats another.
 
 **Spec:**
 
@@ -354,10 +354,17 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 3. Measure the gain with same-load pairs (Speed method step 5).
 4. Report each removed test, its covering test, and the time saved; and each kept candidate with its reason.
 
+**Dispatch (2026-11-04):** `test_times top` gave 10 modules after the floor rule (`test_simplify_lens.py` and `test_fast_track.py` are within 20% of their floors) and without `test_codex_mesh.py` (retiring). The showrunner held five that open branches edit: `direct/test_verify_lint_cache_versions.py`, `direct/test_verify_ssh_targets_retained.py`, `style/test_crate_run.py`, `direct/test_verify_mac_lifecycle.py`, `direct/test_assign_launcher_reuse.py`. They go to a later phase when their branches land. Outside owners: verify-unit (the three `direct/` modules), aws-unit (`test_deploy.py`), the hana_shot owner (`test_hana_shot.py`). Test each against its owner's tip: merge origin/builds before the gate.
+
 **Files:**
-- `scripts/test_times/coverage_overlap.py` — read only; the director names the 10 test modules at dispatch and adds them here
+- `scripts/direct/test_verify_ssh_targets_routing.py`, `scripts/direct/test_verify_ssh_targets_results.py`, `scripts/direct/test_verify_ssh_targets_retry.py` — verify-unit's tests (gate medians 138, 73 and 73 s)
+- `scripts/aws_target/test_deploy.py` — aws-unit's tests (gate median 116 s)
+- `scripts/hana_shot/test_hana_shot.py` — the hana_shot owner's tests (gate median 66 s)
+- `scripts/test_times/coverage_overlap.py` — read only
 
 **Workers:** 2 writers — modules split by folder; no hub file.
+- `impl` — the three `scripts/direct/test_verify_ssh_targets_*.py` modules
+- `test` (opens as impl) — `scripts/aws_target/test_deploy.py`, `scripts/hana_shot/test_hana_shot.py`
 
 **State:** none
 
@@ -414,7 +421,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - 28 of 55 `test_fast_track.py` tests stay unknown through `unverified launch git`.
 - The checkpoint also carries the Phase 17 fixture repair: `test_target_report.py` and `test_show.py` write a private `buildlog.conf`, which `update()` reads.
 
-### Phase 16 — `/test_times top` ranks the slow tests of the calling session's repository  · status: todo
+### Phase 16 — `/test_times top` ranks the slow tests of the calling session's repository  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -498,22 +505,30 @@ The recording exists: `buildlog/parse.test_results` keeps each nextest test that
 2. Record: in `record.py` `step()`, when `recorded_repository_key` gives `store.UNKNOWN_IDENTITY` for a mirror caller (`verify-mac`, `verify-linux`) and `BUILDLOG_REPO_IDENTITY` is set, record that value. Read it through one typed reader beside `sent_tree_key()`. A known local key always wins.
 3. Index: keep the Phase 16 index rule for old rows. A step with a recorded identity has `identity_derived = 0`, so the resolver never changes it.
 4. The Mac gets the new `record.py` through the normal main promotion. Until then, Mac rows stay `unknown` and the index rule resolves them.
+5. Split `repository_key(directory)` out of `record.recorded_repository_key`. Callers that only need the key of a directory call it directly. Remove the `["git"]` argument vector that exists only to pass the empty-argv check (`record.py` about line 541, `show.py` top, four test call sites).
+6. Import `conf` under one module name in `parse.py` and `record.sync_config`. Today one step process loads `conf.py` twice (+1.8 ms).
+7. Move `recorded_repository_key`, `repository_key` and `remote_identity` into one light module that does not import the rest of `record.py`. `show.py` imports it in place of `record` (importing `record` costs 49.7 ms cold). Measure the cold `show.py` import cost before and after, with the same load.
 
 **Files:**
 - `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py` — send the key (verify-unit's files)
 - `scripts/buildlog/record.py` — record the sent key (report-unit's file)
-- the test modules of these three files — the regression tests
+- `scripts/buildlog/parse.py` — one `conf` import name (report-unit's file)
+- `scripts/buildlog/repository.py` — the new light module for the repository key
+- `scripts/test_times/show.py` — import the light module
+- `scripts/mac_test/test_offload.py`, `scripts/mac_test/test_linux_runner.py`, `scripts/buildlog/test_record.py`, `scripts/buildlog/test_parse.py`, `scripts/test_times/test_show.py` — the regression tests
 
 **Workers:** 1 writer + 1 tester
-- `impl` — `offload.py`, `linux_runner.py`, `record.py`
-- `test` — the tests: a mirror step with no origin records the identity sent from natedev; a known local key wins over a sent key; the Mac ssh command and the Linux environment carry the key, and omit it when it is unknown
+- `impl` — `offload.py`, `linux_runner.py`, `record.py`, `parse.py`, `repository.py`, `show.py`
+- `test` — the tests: a mirror step with no origin records the identity sent from natedev; a known local key wins over a sent key; the Mac ssh command and the Linux environment carry the key, and omit it when it is unknown; `repository_key` of a directory with and without an origin; one step process loads `conf.py` once
 
 **Constraints from prior phases:**
 - Phase 16: the index derives the identity of an `unknown` step from its call and marks it `identity_derived = 1`. Keep that rule for old rows.
-- Before work starts, read the open verify-unit and report-unit branches for edits to these three files. Claim the files on the berth board, and name them in the notice's also-touches line.
+- Before work starts, read the open verify-unit and report-unit branches for edits to these three files. Claim the outside files on the berth board, and name them in the notice's also-touches line.
 - report-unit Phase 20 (`be35f2d2b`) changes `record.py` `step()`. Never merge report's unlanded branch. Start the `record.py` edits only after report Phase 20 is merged into builds; then merge origin/builds. Until then, work only on `offload.py`, `linux_runner.py` and their tests (showrunner, 2026-11-04).
+- Items 5-7 came from the Phase 16 review. The showrunner put them in this phase on 2026-11-04. They also wait for report Phase 20 on builds. Test `parse.py` against report's tip and name it in also-touches.
 
 **Acceptance gate:**
-- the three test modules green on a tree with origin/builds merged after report Phase 20 lands
+- the changed test modules green on a tree with origin/builds merged after report Phase 20 lands
 - a mirror step test records the identity sent from natedev
+- the cold `show.py` import time before and after item 7, measured in same-load pairs, in the checkpoint notice
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`

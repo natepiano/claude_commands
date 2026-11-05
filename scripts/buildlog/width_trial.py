@@ -448,6 +448,8 @@ def _clock(epoch: float) -> str:
 def report(since: float, until: float, host: str = "natedev", root: Path | None = None) -> str:
     root = root if root is not None else store.root()
     index = buildlog_index.index_path_in(root)
+    if not index.exists():
+        _ = buildlog_index.update_in(root)
     steps = load_steps(index, since, until, host)
     arms: dict[int | None, list[Step]] = defaultdict(list)
     for step in steps:
