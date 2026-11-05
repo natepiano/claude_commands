@@ -595,7 +595,7 @@ Directory transfers delete removed source files from warm mirrors.
 The probe checks disk capacity, the script commit, and tool versions inside the selected shell.
 The runner checks tool versions again before execution. A mismatch permits local fallback without a test result.
 The local trust rules must permit shell evaluation before the sender claims Linux capacity.
-`build_budget_gib` sets the Linux memory budget. Repository build folder budgets cannot exceed it.
+`build_budget_gib` bounds the repository build folder budgets on disk.
 After each step, the runner uses the existing lint budget sweep on the selected build folder.
 The sweep removes the least recently used output and keeps the remaining output warm.
 Only a disk floor violation removes the whole folder.

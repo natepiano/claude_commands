@@ -33,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sweep
 import cargo_target_config
 from scripts.lib import file_lock
+from scripts.message import session_send
+from scripts.message.session_send_test_support import forbid_real_sender
 import conf
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -147,11 +149,28 @@ def phone_calls(send: mock.Mock) -> list[str]:
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    forbid_real_sender()
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         **config_environment(root), "USER_ZONE": "America/Los_Angeles",
     }))
+
+
+@contextmanager
+def fake_sender_process(sender: Path) -> Generator[mock.Mock]:
+    """Run both alert channels through the fixture sender."""
+    real_run = subprocess.run
+
+    def run(command: list[str], *, input: str | None, text: bool,
+            capture_output: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+        if Path(command[1]).name != "send.py":
+            raise AssertionError(f"unexpected sender command: {command}")
+        return real_run([command[0], str(sender), *command[2:]], input=input, text=text,
+                        capture_output=capture_output, timeout=timeout)
+
+    with mock.patch.object(subprocess, "run", side_effect=run) as process:
+        yield process
 
 
 class Target:
@@ -4419,8 +4438,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         self.assertNotIn("phone alert failed", errors.getvalue())
 
     def test_one_channel_delivering_counts_and_both_results_print(self) -> None:
-        fake_module = Path(self.enterContext(tempfile.TemporaryDirectory())) / "scripts/lint/sweep.py"
-        sender = fake_module.parents[1] / "message/send.py"
+        sender = Path(self.enterContext(tempfile.TemporaryDirectory())) / "message/send.py"
         sender.parent.mkdir(parents=True)
         _ = sender.write_text(
             """import os
@@ -4434,9 +4452,8 @@ raise SystemExit(int(os.environ[variable]))
         )
         output = io.StringIO()
         errors = io.StringIO()
-        real_run = subprocess.run
-        with (mock.patch.object(sweep, "__file__", str(fake_module)),
-              mock.patch.object(subprocess, "run", wraps=real_run) as run,
+        with (mock.patch.object(session_send, "SEND_SCRIPT", sender),
+              fake_sender_process(sender) as run,
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "1", "SWEEP_USER_EXIT": "0"}),
               redirect_stdout(output), redirect_stderr(errors)):
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.QUEUED)
@@ -4452,13 +4469,15 @@ raise SystemExit(int(os.environ[variable]))
         self.assertIn("message to natedev queued", output.getvalue())
         self.assertIn("phone alert delivered", output.getvalue())
 
-        with (mock.patch.object(sweep, "__file__", str(fake_module)),
+        with (mock.patch.object(session_send, "SEND_SCRIPT", sender),
+              fake_sender_process(sender),
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "0", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
             self.assertEqual(sweep.send_phone_push(render("nixos.disk_low", free="9", shortfall="1")),
                              sweep.FloorChannelOutcome.FAILED)
-        with (mock.patch.object(sweep, "__file__", str(fake_module)),
+        with (mock.patch.object(session_send, "SEND_SCRIPT", sender),
+              fake_sender_process(sender),
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "3", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.FAILED)
@@ -4536,8 +4555,7 @@ raise SystemExit(int(os.environ[variable]))
             self.assertIn(example.values["shortfall"] + " GiB", push.action.text)
 
     def test_failed_phone_send_reports_the_cause_printed_on_stdout(self) -> None:
-        fake_module = Path(self.enterContext(tempfile.TemporaryDirectory())) / "scripts/lint/sweep.py"
-        sender = fake_module.parents[1] / "message/send.py"
+        sender = Path(self.enterContext(tempfile.TemporaryDirectory())) / "message/send.py"
         sender.parent.mkdir(parents=True)
         _ = sender.write_text(
             """import sys
@@ -4549,7 +4567,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             encoding="utf-8",
         )
         errors = io.StringIO()
-        with (mock.patch.object(sweep, "__file__", str(fake_module)),
+        with (mock.patch.object(session_send, "SEND_SCRIPT", sender),
+              fake_sender_process(sender),
               redirect_stdout(io.StringIO()), redirect_stderr(errors)):
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
             self.assertEqual(sweep.send_phone_push(render("nixos.disk_low", free="9", shortfall="1")),

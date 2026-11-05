@@ -13,7 +13,6 @@ from pathlib import Path
 import sys
 import unittest
 from unittest import mock
-from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
 from typing import TYPE_CHECKING, cast
@@ -92,7 +91,7 @@ class ClientTests(unittest.TestCase):
                 assert isinstance(first.profile, gate.StepProfile)
                 self.assertEqual(first.profile.peak.bytes, 3 * GIB)
                 later = repository.commit("a later admitted head")
-                fixture.clock.advance(gate.read_memory_config().policy.timing.head_seconds + 1)
+                fixture.clock.advance(gate.read_memory_config().policy.timing.estimate_refresh_seconds + 1)
                 refreshed = client.step_request(list(first.argv), first.cwd, first.owner, first.since,
                     first.sidecar, first.episode, first.profile)
             assert isinstance(refreshed.profile, gate.StepProfile)
@@ -161,12 +160,12 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             config = fixture.root / "build_admission.conf"
-            write_memory_config(config, head_seconds="invalid")
+            write_memory_config(config, estimate_refresh_seconds="invalid")
             with fixture.serving(), redirect_stderr(io.StringIO()) as errors:
                 status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
             self.assertEqual(status, 2)
             self.assertIn(str(config), errors.getvalue())
-            self.assertIn("head_seconds", errors.getvalue())
+            self.assertIn("estimate_refresh_seconds", errors.getvalue())
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
             self.assertFalse(fixture.server.reservations)
 
@@ -221,10 +220,10 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(waits[0].reason, pressure)
             self.assertEqual([step.measured.bytes for step in waits[0].snapshot.running
                               if isinstance(step.measured, gate.MeasuredMemory)], [4 * GIB, GIB])
-            self.assertEqual(gate.pressure_text(pressure, waits[0].snapshot.policy),
+            self.assertEqual(gate.pressure_text(pressure),
                              "memory pressure: condition not recorded by service; full avg10 8.0; "
                              + "some avg10 15.0; swap 80.0% used")
-            self.assertEqual(queue_evidence.pressure_text(pressure, ZoneInfo("UTC"), waits[0].snapshot.policy),
+            self.assertEqual(queue_evidence.pressure_text(pressure, waits[0].snapshot.policy),
                              "memory pressure: full avg10 8.0%, some avg10 15.0%, swap used 80.0%; "
                              + "condition not recorded by service")
 
@@ -360,7 +359,7 @@ class ClientTests(unittest.TestCase):
                 if expired_cache:
                     assert isinstance(owner.profile, gate.StepProfile)
                     profile = replace(owner.profile, step="build", build_history_generation=gate.BuildHistoryGeneration(6),
-                        estimated_at=fixture.clock.now() - gate.read_memory_config().policy.timing.head_seconds - 1)
+                        estimated_at=fixture.clock.now() - gate.read_memory_config().policy.timing.estimate_refresh_seconds - 1)
                 transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))),
                     Exchange(reply_bytes(WAIT), b""), Exchange(reply_bytes(GRANTED)))
                 def history_peak(*_args: object, **_kwargs: object) -> gate.ExpectedPeak:
@@ -668,9 +667,9 @@ class ClientTests(unittest.TestCase):
     def test_recovered_key_with_an_unavailable_key_prints_only_the_refusal(self) -> None:
         with AdmissionFixture() as fixture:
             config = fixture.root / "build_admission.conf"
-            write_memory_config(config, head_seconds="321", **{"program_first_peak_gib.cargo": None})
+            write_memory_config(config, estimate_refresh_seconds="321", **{"program_first_peak_gib.cargo": None})
             commit_config_fixture(config)
-            write_memory_config(config, head_seconds="invalid", **{"program_first_peak_gib.cargo": "invalid"})
+            write_memory_config(config, estimate_refresh_seconds="invalid", **{"program_first_peak_gib.cargo": "invalid"})
             original = fixture.request()
             with redirect_stderr(io.StringIO()) as errors:
                 status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "clippy"])
@@ -891,9 +890,9 @@ class ClientTests(unittest.TestCase):
     def test_recovered_service_setting_warns_once_at_the_client_boundary(self) -> None:
         with AdmissionFixture() as fixture:
             config = fixture.root / "build_admission.conf"
-            write_memory_config(config, head_seconds="321")
+            write_memory_config(config, estimate_refresh_seconds="321")
             commit_config_fixture(config)
-            write_memory_config(config, head_seconds="invalid")
+            write_memory_config(config, estimate_refresh_seconds="invalid")
             request = fixture.request()
             with fixture.serving(), mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                     mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as errors:
@@ -903,9 +902,9 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(second, first)
             policy = fixture.server.last_policy
             assert isinstance(policy, gate.AdmissionPolicy)
-            self.assertEqual(policy.timing.head_seconds, 321)
+            self.assertEqual(policy.timing.estimate_refresh_seconds, 321)
             self.assertIn(str(config), errors.getvalue())
-            self.assertIn("head_seconds='invalid'", errors.getvalue())
+            self.assertIn("estimate_refresh_seconds='invalid'", errors.getvalue())
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
     def test_wait_callback_then_admission_accepts_new_source_names(self) -> None:

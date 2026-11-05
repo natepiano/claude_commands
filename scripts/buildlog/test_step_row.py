@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from functools import cached_property
 import io
 import json
 import os
@@ -12,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import record
@@ -24,13 +25,49 @@ from test_record import START, NEXTEST
 
 use_test_log()
 
+PHASE_CHARGE: record.TestPhaseChargeUse = {
+    "bytes": 8192, "selected_at": START + 1, "reservation_id": "own-reservation",
+    "need": {"kind": "test_phase_need", "bytes": 8192, "runs": 10,
+             "width": 4, "recorded_width": 2, "form": "scaled_up", "margin": 1.2},
+}
+PHASE_GRANT = json.dumps({
+    "reservation_id": "own-reservation", "repo_identity": "original-repository",
+    "test_scope": "full", "package": "", "filters": [],
+    "call_id": {"kind": "CallRecord", "call_id": "phase-call"},
+    "test_phase_charge_use": {"kind": "NoTestPhaseChargeUse"},
+})
+
 if TYPE_CHECKING:
     from ..lib.cargo_output import CargoOutputRoots
+    from ..lib.cargo_output_test_support import fake_cargo_output_roots
 else:
     from scripts.lib.cargo_output import CargoOutputRoots
+    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 
 class RecorderCompatibilityTests(unittest.TestCase):
+    def test_output_fixture_accepts_command_inputs_during_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary).resolve()
+            target = checkout / "selected-output"
+            build = checkout / "intermediate-output"
+            roots = CargoOutputRoots(checkout, target, build)
+            environment = {"BUILDLOG_DIR": str(checkout / "rows"), "BUILDLOG_TARGET_FOLDER": str(target)}
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(record, "output", return_value=None),
+                mock.patch.object(treekey, "tree_key", return_value=None),
+                fake_cargo_output_roots(roots),
+                contextlib.chdir(checkout),
+            ):
+                record.step(["0", str(int(START)), str(int(START) + 2), "1", "", "",
+                             "cargo", "check", "--target-dir", str(target)])
+                rows = [cast(dict[str, object], json.loads(line))
+                        for path in store.root().glob("*/*.jsonl") for line in path.read_text().splitlines()]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual((rows[0]["target_dir"], rows[0]["target_directory"], rows[0]["build_directory"]),
+                                 (str(target), str(target), str(build)))
+
     def test_scp_remote_identity_does_not_load_url_parsing(self) -> None:
         source = (
             "import sys; sys.path.insert(0, sys.argv[1]); import record; "
@@ -45,10 +82,11 @@ class RecorderCompatibilityTests(unittest.TestCase):
     def test_plain_phase_context_does_not_load_admission(self) -> None:
         source = (
             "import sys; sys.path.insert(0, sys.argv[1]); import record; "
-            "value = record.test_phase_context('{}', ['cargo', 'nextest', 'run', '-j4']); "
-            "assert value['test_threads'] == 4; assert 'memory_admit' not in sys.modules"
+            "value = record.test_phase_context(sys.argv[2], ['cargo', 'nextest', 'run', '-j4']); "
+            "assert value['test_threads'] == 4; assert value['call_id'] == 'phase-call'; "
+            "assert 'memory_admit' not in sys.modules; assert 'scripts.lint.memory_admit' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent)],
+        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent), PHASE_GRANT],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -146,8 +184,11 @@ class RecorderCompatibilityTests(unittest.TestCase):
                 self.assertEqual(record.recorded_target("second-host"), "second")
             read.assert_called_once_with()
 
-    def capture(self, terminal: bool) -> dict[str, object]:
+    def capture(self, terminal: bool, *, admission_history: str | None = None,
+                recover: bool = False) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as temporary:
+            phase_file = Path(temporary) / "phase.json"
+            history = Path(temporary) / "admission/anon_peaks.jsonl"
             held = Path(temporary) / "step.log"
             _ = held.write_text("Finished test profile [unoptimized + debuginfo] target(s) in 1.00s\n")
             environment = {
@@ -172,13 +213,29 @@ class RecorderCompatibilityTests(unittest.TestCase):
                 mock.patch.object(store, "host_name", return_value="fixture"),
                 mock.patch.object(subprocess, "run", side_effect=command),
                 mock.patch.object(record, "new_id", return_value="fixture-id"),
-                mock.patch.object(record, "read_cargo_output_roots", return_value=CargoOutputRoots(
+                mock.patch("scripts.lib.cargo_output.read_cargo_output_roots", return_value=CargoOutputRoots(
                     Path("/fixture/project"), Path("/fixture/target"), Path("/fixture/build"))),
                 mock.patch.object(treekey, "tree_key", return_value="tree"),
             ):
-                record.step(["0", str(int(START)), str(int(START) + 2), "1" if terminal else "0",
-                             "" if terminal else str(held), "",
-                             *NEXTEST])
+                if admission_history is not None:
+                    context = record.test_phase_context(PHASE_GRANT, NEXTEST)
+                    _ = phase_file.write_text(json.dumps({
+                        **context, "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+                    }))
+                    os.environ["BUILDLOG_TEST_PHASE_FILE"] = str(phase_file)
+                    history.parent.mkdir()
+                    _ = history.write_text(admission_history)
+                publication = (mock.patch.object(record, "write_step_line", side_effect=OSError("publication stopped"))
+                               if recover else contextlib.nullcontext())
+                with publication:
+                    record.step(["0", str(int(START)), str(int(START) + 2), "1" if terminal else "0",
+                                 "" if terminal else str(held), "", *NEXTEST])
+                if recover:
+                    history.unlink()
+                    phase_file.unlink()
+                    pending = list(record.pending_steps_root().glob("*.json"))
+                    self.assertEqual(len(pending), 1)
+                    self.assertIsInstance(record.finish_pending_step(pending[0]), record.PublishedStep)
             paths = list(Path(temporary).glob("fixture/*.jsonl"))
             self.assertEqual(len(paths), 1)
             return cast(dict[str, object], json.loads(paths[0].read_text()))
@@ -188,6 +245,161 @@ class RecorderCompatibilityTests(unittest.TestCase):
 
     def test_tee_row_matches_baseline(self) -> None:
         self.assertEqual(self.capture(False), TEE_BASELINE)
+
+    def assert_completed_charge(self, terminal: bool, *, recover: bool = False) -> None:
+        history = "\n".join(json.dumps(row) for row in (
+            {"reservation_id": "older", "test_phase_charge_use": {**PHASE_CHARGE, "bytes": 99999}},
+            {"reservation_id": "own-reservation", "test_phase_charge_use": PHASE_CHARGE},
+            {"reservation_id": "newer", "test_phase_charge_use": {**PHASE_CHARGE, "bytes": 1}},
+        )) + "\n"
+        # An incomplete append must not replace the completed evidence.
+        history += json.dumps({"reservation_id": "own-reservation", "test_phase_charge_use": None})
+        row = self.capture(terminal, admission_history=history, recover=recover)
+        self.assertEqual(row, {
+            **(TERMINAL_BASELINE if terminal else TEE_BASELINE),
+            "test_scope": "full", "package": "", "filters": [],
+            "call_id": "phase-call", "test_threads": None, "test_phase_charge": PHASE_CHARGE,
+            "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+            "reservation_id": "own-reservation",
+        })
+
+    def test_terminal_row_copies_its_completed_admission_charge(self) -> None:
+        self.assert_completed_charge(True)
+
+    def test_tee_row_copies_its_completed_admission_charge(self) -> None:
+        self.assert_completed_charge(False)
+
+    def test_steps_without_charge_evidence_record_null(self) -> None:
+        histories = ("", json.dumps({"reservation_id": "own-reservation"}) + "\n",
+                     json.dumps({"reservation_id": "other", "test_phase_charge_use": PHASE_CHARGE}) + "\n")
+        for terminal in (True, False):
+            for history in histories:
+                with self.subTest(terminal=terminal, history=history):
+                    row = self.capture(terminal, admission_history=history)
+                    self.assertIsNone(row["test_phase_charge"])
+
+    def test_saved_charge_survives_pending_record_recovery_without_history(self) -> None:
+        for terminal in (True, False):
+            with self.subTest(terminal=terminal):
+                self.assert_completed_charge(terminal, recover=True)
+
+    def test_admission_observation_does_not_read_completed_charge_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "phase.json"
+            _ = path.write_text(json.dumps({
+                "reservation_id": "own-reservation", "test_phase_peak_bytes": 4096,
+                "test_phase_started_at": START, "test_phase_charge": None,
+            }))
+            with mock.patch.object(record, "completed_test_phase_charge", side_effect=AssertionError("history read")):
+                phase = record.read_test_phase(path)
+            self.assertIsInstance(phase, record.TestPhaseRecord)
+            if isinstance(phase, record.TestPhaseRecord):
+                self.assertEqual(phase.window, record.ObservedTestPhase(4096, START))
+
+    def test_invalid_charge_publishes_each_step_with_one_error_line(self) -> None:
+        history = json.dumps({"reservation_id": "own-reservation",
+                              "test_phase_charge_use": {**PHASE_CHARGE, "bytes": "broken"}}) + "\n"
+        publish = record.write_step_line
+
+        def check_and_publish(pending: record.PendingStep) -> bool:
+            errors = (store.root() / "errors.log").read_text().splitlines()
+            self.assertEqual(len(errors), 1)
+            self.assertIn("test-phase charge 'own-reservation'", errors[0])
+            self.assertIsNone(pending.row["test_phase_charge"])
+            return publish(pending)
+
+        for terminal in (True, False):
+            with self.subTest(terminal=terminal), mock.patch.object(record, "write_step_line", side_effect=check_and_publish):
+                row = self.capture(terminal, admission_history=history)
+                self.assertIsNone(row["test_phase_charge"])
+                self.assertEqual(row["test_phase_peak_bytes"], 4096)
+
+    def test_invalid_charge_publishes_recovered_step_with_one_error_line(self) -> None:
+        for terminal in (True, False):
+            with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {"BUILDLOG_DIR": temporary}):
+                phase_file = Path(temporary) / "phase.json"
+                _ = phase_file.write_text(json.dumps({
+                    **record.test_phase_context(PHASE_GRANT, NEXTEST),
+                    "test_phase_peak_bytes": 4096, "test_phase_started_at": START,
+                }))
+                history = Path(temporary) / "admission/anon_peaks.jsonl"
+                history.parent.mkdir()
+                _ = history.write_text(json.dumps({"reservation_id": "own-reservation",
+                    "test_phase_charge_use": {**PHASE_CHARGE, "bytes": "broken"}}) + "\n")
+                pending = record.pending_steps_root() / "fixture.json"
+                pending.parent.mkdir()
+                _ = pending.write_text(json.dumps({
+                    "row_key": "fixture", "row": TERMINAL_BASELINE if terminal else TEE_BASELINE, "held_log": None, "peak_file": None,
+                    "test_phase_file": str(phase_file), "test_phase_read_error": "previous sidecar error",
+                    "month_row_end": 0,
+                }))
+                self.assertIsInstance(record.finish_pending_step(pending), record.PublishedStep)
+                row = cast(dict[str, object], json.loads(store.host_file("fixture", START).read_text()))
+                self.assertIsNone(row["test_phase_charge"])
+                self.assertEqual(row["test_phase_peak_bytes"], 4096)
+                self.assertEqual(len((Path(temporary) / "errors.log").read_text().splitlines()), 1)
+                self.assertFalse(phase_file.exists())
+                self.assertFalse(pending.exists())
+
+    def test_unobserved_phase_does_not_open_charge_history(self) -> None:
+        read_phase = record.read_test_phase
+
+        def unobserved(path: Path | record.NoTestPhaseRecord
+                       ) -> record.TestPhaseRecord | record.NoTestPhaseRecord | record.UnreadableTestPhaseRecord:
+            if isinstance(path, Path):
+                fields = cast(dict[str, object], json.loads(path.read_text()))
+                fields.update(test_phase_peak_bytes=None, test_phase_started_at=None)
+                _ = path.write_text(json.dumps(fields))
+            return read_phase(path)
+
+        with (
+            mock.patch.object(record, "read_test_phase", side_effect=unobserved),
+            mock.patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened,
+        ):
+            row = self.capture(True, admission_history="")
+        for call in opened.call_args_list:
+            if cast(Path, call.args[0]).name == "anon_peaks.jsonl":
+                self.assertEqual(call.kwargs.get("mode", call.args[1] if len(call.args) > 1 else "r"), "w")
+        self.assertIsNone(row["test_phase_charge"])
+        self.assertIsNone(row["test_phase_peak_bytes"])
+
+    def test_unknown_call_tag_keeps_the_phase_sidecar(self) -> None:
+        context = cast(dict[str, object], json.loads(PHASE_GRANT))
+        context["call_id"] = {"kind": "FutureCallRecord", "call_id": "future"}
+        fields = record.test_phase_context(json.dumps(context), NEXTEST)
+        self.assertIsNone(fields["call_id"])
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "phase.json"
+            _ = path.write_text(json.dumps(fields))
+            self.assertIsInstance(record.read_test_phase(path), record.TestPhaseRecord)
+            self.assertTrue(path.exists())
+
+    def test_grant_charge_does_not_affect_the_phase_context(self) -> None:
+        context = cast(dict[str, object], json.loads(PHASE_GRANT))
+        context["test_phase_charge_use"] = {"bytes": "broken"}
+        fields = record.test_phase_context(json.dumps(context), NEXTEST)
+        self.assertIsNone(fields["test_phase_charge"])
+        self.assertEqual(fields["call_id"], "phase-call")
+        self.assertNotIn("reservation_id", record.test_phase_context("{}", NEXTEST))
+
+    def test_only_matched_history_creates_a_charged_phase(self) -> None:
+        publish = record.write_step_line
+        phases: list[record.TestPhaseRecord | record.NoTestPhaseRecord | record.UnreadableTestPhaseRecord] = []
+
+        def capture_phase(pending: record.PendingStep) -> bool:
+            phases.append(pending.test_phase)
+            return publish(pending)
+
+        with mock.patch.object(record, "write_step_line", side_effect=capture_phase):
+            _ = self.capture(True, admission_history="")
+            _ = self.capture(True, admission_history=json.dumps({
+                "reservation_id": "own-reservation", "test_phase_charge_use": PHASE_CHARGE,
+            }) + "\n")
+        self.assertIsInstance(phases[0], record.ReservedTestPhaseRecord)
+        self.assertNotIsInstance(phases[0], record.ChargedTestPhaseRecord)
+        self.assertIsInstance(phases[1], record.ChargedTestPhaseRecord)
+        if isinstance(phases[1], record.ChargedTestPhaseRecord):
+            self.assertEqual(phases[1].charge, PHASE_CHARGE)
 
     def test_context_matches_baseline(self) -> None:
         output = io.StringIO()
@@ -199,6 +411,206 @@ class RecorderCompatibilityTests(unittest.TestCase):
         ):
             step_context.step_context(NEXTEST, "")
         self.assertEqual(output.getvalue(), "tree\n/fixture/target\n")
+
+
+class StepOutputFolderTests(unittest.TestCase):
+    @cached_property
+    def temporary(self) -> Path:
+        return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+
+    @property
+    def workspace(self) -> Path:
+        return self.temporary / "workspace"
+
+    @property
+    def outside(self) -> Path:
+        return self.temporary / "outside"
+
+    @property
+    def log_root(self) -> Path:
+        return self.temporary / "rows"
+
+    @override
+    def setUp(self) -> None:
+        source = self.workspace / "member/src"
+        source.mkdir(parents=True)
+        _ = (self.workspace / "Cargo.toml").write_text('[workspace]\nmembers = ["member"]\nresolver = "2"\n')
+        _ = (source.parent / "Cargo.toml").write_text(
+            '[package]\nname = "output-fixture"\nversion = "0.1.0"\nedition = "2024"\n')
+        _ = (source / "lib.rs").write_text("pub fn fixture() {}\n")
+        self.outside.mkdir()
+        # Phase 19 confirmed these answers with cargo metadata --format-version 1 --no-deps.
+        # Each row supplies that command's options, cwd, and CARGO_TARGET_DIR.
+        cases: list[tuple[list[str], Path, str | None, Path, Path]] = [
+            (["--config", 'build.target-dir="unused"', "--config",
+              'build.target-dir="' + str(self.workspace / "relative-output") + '"'],
+             self.workspace, None, self.workspace / "relative-output", self.workspace / "relative-output"),
+            (["--config", 'build.target-dir="' + str(self.temporary / "absolute-output") + '"'],
+             self.workspace, None, self.temporary / "absolute-output", self.temporary / "absolute-output"),
+            (['--config=build.target-dir="configured-output"'], self.workspace, None,
+             self.workspace / "configured-output", self.workspace / "configured-output"),
+            ([], self.workspace, "environment-output",
+             self.workspace / "environment-output", self.workspace / "environment-output"),
+            (["--config", 'build.target-dir="' + str(self.workspace / "configured-output") + '"'],
+             self.workspace, str(self.workspace / "environment-output"),
+             self.workspace / "environment-output", self.workspace / "environment-output"),
+            (["--manifest-path", "../workspace/member/Cargo.toml"], self.outside, None,
+             self.outside / "manifest-output", self.outside / "manifest-output"),
+            (["--config", 'build.build-dir="intermediate-output"'], self.workspace, None,
+             self.workspace / "target", self.workspace / "intermediate-output"),
+            (["--config", str(self.temporary / "settings/.cargo/config.toml")], self.workspace, None,
+             self.temporary / "settings/file-output", self.temporary / "settings/file-output"),
+            ([], self.workspace, "changed-output",
+             self.workspace / "changed-output", self.workspace / "changed-output"),
+            ([], self.workspace, None, self.workspace / "target", self.workspace / "target"),
+            (["--config", 'build.target-dir="' + str(self.workspace / "first-output") + '"'],
+             self.workspace, None, self.workspace / "first-output", self.workspace / "first-output"),
+        ]
+        table = self.temporary / "cargo-calls.json"
+        _ = table.write_text(json.dumps([
+            {"call": {"argv": ["metadata", "--format-version", "1", "--no-deps", *options],
+                      "cwd": str(cwd), "CARGO_TARGET_DIR": cargo_target},
+             "answer": {"workspace_root": str(self.workspace), "target_directory": str(target),
+                        "build_directory": str(build)}}
+            for options, cwd, cargo_target, target, build in cases
+        ]))
+        binaries = self.temporary / "bin"
+        binaries.mkdir()
+        cargo = binaries / "cargo"
+        _ = cargo.write_text("\n".join([
+            f"#!{sys.executable}",
+            "import json, os, sys",
+            f"with open({str(table)!r}) as source:",
+            "    cases = json.load(source)",
+            "call = {'argv': sys.argv[1:], 'cwd': os.getcwd(),",
+            "        'CARGO_TARGET_DIR': os.environ.get('CARGO_TARGET_DIR')}",
+            "for case in cases:",
+            "    if case['call'] == call:",
+            "        print(json.dumps(case['answer']))",
+            "        sys.exit(0)",
+            "print('Unexpected Cargo call: ' + json.dumps(call), file=sys.stderr)",
+            "sys.exit(1)",
+            "",
+        ]))
+        cargo.chmod(0o755)
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(("CARGO_", "BUILDLOG_"))}
+        environment.update({"CARGO_HOME": str(self.temporary / "cargo-home"),
+                            "BUILDLOG_DIR": str(self.log_root), "BUILDLOG_TARGET": "natedev",
+                            "PATH": str(binaries) + os.pathsep + environment.get("PATH", "")})
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        _ = cast(object, self.enterContext(mock.patch.object(record, "output", return_value=None)))
+        _ = cast(object, self.enterContext(mock.patch.object(treekey, "tree_key", return_value=None)))
+
+    def write_step(self, argv: list[str], target: Path, *, cwd: Path) -> dict[str, object]:
+        captured = step_context.target_folder_text(step_context.resolve_target_folder(argv, str(cwd), os.environ))
+        self.assertEqual(captured, str(target))
+        os.environ["BUILDLOG_TARGET_FOLDER"] = captured
+        return self.publish_step(argv, cwd=cwd)
+
+    def publish_step(self, argv: list[str], *, cwd: Path) -> dict[str, object]:
+        with contextlib.chdir(cwd):
+            record.step(["0", str(int(START)), str(int(START) + 2), "1", "", "", *argv])
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in self.log_root.glob("*/*.jsonl") for line in path.read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def assert_output_pair(self, row: dict[str, object], target: Path, build: Path) -> None:
+        self.assertEqual(row["target_dir"], str(target))
+        self.assertEqual(row["target_directory"], row["target_dir"])
+        self.assertEqual(row["build_directory"], str(build))
+        self.assertFalse((self.log_root / store.ERRORS_NAME).exists())
+
+    def test_relative_target_argument_overrides_config(self) -> None:
+        target = self.workspace / "relative-output"
+        row = self.write_step(["cargo", "check", "--config", 'build.target-dir="unused"',
+                               "--target-dir", "relative-output"], target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_absolute_target_argument_selects_output(self) -> None:
+        target = self.temporary / "absolute-output"
+        row = self.write_step(["cargo", "check", "--target-dir=" + str(target)],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_inline_config_selects_target_output(self) -> None:
+        config = self.workspace / ".cargo/config.toml"
+        config.parent.mkdir()
+        _ = config.write_text('[build]\ntarget-dir = "file-output"\n')
+        target = self.workspace / "configured-output"
+        row = self.write_step(["cargo", "check", "--config=build.target-dir=\"configured-output\""],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_env_assignment_selects_target_output(self) -> None:
+        target = self.workspace / "environment-output"
+        row = self.write_step(["env", "CARGO_TARGET_DIR=environment-output", "cargo", "check"],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_target_environment_overrides_cli_config_for_output_pair(self) -> None:
+        target = self.workspace / "environment-output"
+        configured = self.workspace / "configured-output"
+        row = self.write_step(["env", "CARGO_TARGET_DIR=" + str(target), "cargo", "check",
+                               "--config", 'build.target-dir="' + str(configured) + '"'],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_manifest_argument_selects_workspace_outside_working_folder(self) -> None:
+        config = self.outside / ".cargo/config.toml"
+        config.parent.mkdir()
+        _ = config.write_text('[build]\ntarget-dir = "manifest-output"\n')
+        target = self.outside / "manifest-output"
+        row = self.write_step(["cargo", "check", "--manifest-path", "../workspace/member/Cargo.toml"],
+                              target, cwd=self.outside)
+        self.assert_output_pair(row, target, target)
+
+    def test_build_directory_config_preserves_separate_intermediate_output(self) -> None:
+        target = self.workspace / "target"
+        build = self.workspace / "intermediate-output"
+        row = self.write_step(["cargo", "check", "--config", 'build.build-dir="intermediate-output"'],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, build)
+
+    def test_config_file_resolves_paths_from_its_parent_folder(self) -> None:
+        config = self.temporary / "settings" / ".cargo/config.toml"
+        config.parent.mkdir(parents=True)
+        _ = config.write_text('[build]\ntarget-dir = "file-output"\n')
+        target = self.temporary / "settings/file-output"
+        row = self.write_step(["cargo", "check", "--config", str(config)], target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
+
+    def test_env_chdir_resolves_relative_target_from_effective_working_folder(self) -> None:
+        target = self.workspace / "changed-output"
+        row = self.write_step(["env", "-C", "../workspace", "CARGO_TARGET_DIR=changed-output", "cargo", "check"],
+                              target, cwd=self.outside)
+        self.assert_output_pair(row, target, target)
+
+    def test_mismatched_output_pair_is_omitted_with_one_diagnostic(self) -> None:
+        target = self.workspace / "captured-output"
+        os.environ["BUILDLOG_TARGET_FOLDER"] = str(target)
+        row = self.publish_step(["cargo", "check"], cwd=self.workspace)
+        self.assertEqual(row["target_dir"], str(target))
+        self.assertNotIn("target_directory", row)
+        self.assertNotIn("build_directory", row)
+        errors = (self.log_root / store.ERRORS_NAME).read_text()
+        self.assertEqual(sum("step output folders:" in line for line in errors.splitlines()), 1)
+        self.assertIn(str(self.workspace / "target"), errors)
+        self.assertIn(str(target), errors)
+
+    def test_unresolved_target_keeps_successful_output_pair(self) -> None:
+        row = self.publish_step(["cargo", "check"], cwd=self.workspace)
+        self.assertEqual(row["target_dir"], "unresolved")
+        self.assertEqual(row["target_directory"], str(self.workspace / "target"))
+        self.assertEqual(row["build_directory"], str(self.workspace / "target"))
+        self.assertFalse((self.log_root / store.ERRORS_NAME).exists())
+
+    def test_first_target_argument_selects_start_and_end_output(self) -> None:
+        target = self.workspace / "first-output"
+        row = self.write_step(["cargo", "check", "--target-dir=first-output", "--target-dir=last-output"],
+                              target, cwd=self.workspace)
+        self.assert_output_pair(row, target, target)
 
 
 TERMINAL_BASELINE: dict[str, object] = {'kind': 'step',

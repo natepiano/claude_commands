@@ -9,13 +9,13 @@ import sqlite3
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import index
 import cgroup_capture
@@ -23,6 +23,11 @@ from cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePres
 import store
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.build_queue import queue_snapshot
+from scripts.build_queue.queue_evidence import room_text
+from scripts.lint import memory_admit as gate
 
 import conf
 from cargo_output import CargoOutputRoots, read_cargo_output_roots
@@ -47,14 +52,11 @@ class ZramPresent(TypedDict):
     compressed_bytes: int
 
 
-class TickMemorySnapshot(TypedDict):
+class MemorySnapshot(TypedDict):
     kind: Literal["memory_snapshot"]
     at: str
     host: str
     zram: ZramPresent | ZramAbsent
-
-
-class MemorySnapshot(TickMemorySnapshot):
     slices: SliceCollection
 
 
@@ -86,25 +88,31 @@ def cmdline_program(cmdline: str) -> str:
 @lru_cache(maxsize=1)
 def build_output_roots(index_file: Path, current_checkout: Path, host: str) -> frozenset[Path]:
     """Keep the active ledger's Cargo roots for this process."""
+    if TYPE_CHECKING:
+        from . import step_outputs
+    else:
+        import step_outputs
+
     roots: set[Path] = set()
     checkouts: set[Path] = {current_checkout}
-    try:
-        with closing(sqlite3.connect(f"{index_file.as_uri()}?mode=ro", uri=True)) as connection:
-            rows = cast(list[tuple[str, str, str, str]], connection.execute(
-                "SELECT DISTINCT target_directory, build_directory, worktree, cwd FROM steps WHERE host = ?",
-                (host,),
-            ).fetchall())
-        for target, build, worktree, cwd in rows:
-            roots.update(Path(path).resolve() for path in (target, build) if path and Path(path).is_absolute())
-            checkouts.update(Path(path) for path in (worktree, cwd) if path and Path(path).is_absolute())
-    except (OSError, sqlite3.Error):
-        pass
-    for checkout in checkouts:
-        if not (checkout / "Cargo.toml").is_file():
-            continue
-        outputs = read_cargo_output_roots(checkout)
-        if isinstance(outputs, CargoOutputRoots):
-            roots.update((outputs.target_directory, outputs.build_directory))
+    recorded = step_outputs.recorded_output_roots(index_file, host)
+    if isinstance(recorded, step_outputs.RecordedStepOutputs):
+        for row in recorded.rows:
+            target, folder = row.target_directory, row.target_folder
+            if (row.target_folder_override is step_outputs.TargetFolderOverride.PRESENT
+                    or (isinstance(folder, step_outputs.AbsoluteRecordedRoot) and folder != target)):
+                continue
+            roots.update(root.path.resolve() for root in (target, row.build_directory)
+                         if isinstance(root, step_outputs.AbsoluteRecordedRoot))
+            workspace = row.worktree if isinstance(row.worktree, step_outputs.AbsoluteRecordedRoot) else row.cwd
+            if isinstance(workspace, step_outputs.AbsoluteRecordedRoot):
+                checkouts.add(workspace.path)
+    workers = conf.read("buildlog").whole("METADATA_PROBE_WORKERS")
+    manifests = [checkout for checkout in checkouts if (checkout / "Cargo.toml").is_file()]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for outputs in executor.map(read_cargo_output_roots, manifests):
+            if isinstance(outputs, CargoOutputRoots):
+                roots.update((outputs.target_directory, outputs.build_directory))
     return frozenset(roots)
 
 
@@ -162,31 +170,28 @@ def slice_state(path: Path) -> SlicePresent | SliceAbsent:
 
 
 def zram_state(path: Path) -> ZramPresent | ZramAbsent:
-    if not path.is_dir():
-        return {"state": "absent"}
     try:
+        if not path.is_dir():
+            return {"state": "absent"}
         data, compressed, *_ = (path / "mm_stat").read_text().split()
         return {"state": "present", "data_bytes": int(data), "compressed_bytes": int(compressed)}
     except (OSError, ValueError, UnicodeError):
         return {"state": "absent"}
 
 
-def tick_snapshot(at: float, host: str) -> TickMemorySnapshot:
-    return {
-        "kind": "memory_snapshot",
-        "at": store.utc_iso(at),
-        "host": host,
-        "zram": zram_state(Path(os.environ.get("BUILDLOG_ZRAM", "/sys/block/zram0"))),
-    }
-
-
-def write_snapshot(at: float, host: str) -> None:
-    store.append_line(store.sample_file(host, at), tick_snapshot(at, host))
+def read_zram() -> ZramPresent | ZramAbsent:
+    return zram_state(Path(os.environ.get("BUILDLOG_ZRAM", "/sys/block/zram0")))
 
 
 def snapshot() -> MemorySnapshot:
     at, host = time.time(), store.host_name()
-    record: MemorySnapshot = {**tick_snapshot(at, host), "slices": cgroup_capture.read_slices()}
+    record: MemorySnapshot = {
+        "kind": "memory_snapshot",
+        "at": store.utc_iso(at),
+        "host": host,
+        "zram": read_zram(),
+        "slices": cgroup_capture.read_slices(),
+    }
     store.append_line(store.sample_file(host, at), record)
     return record
 
@@ -323,28 +328,31 @@ def nearest_snapshot(connection: sqlite3.Connection, instant: datetime) -> Snaps
     right = stored_bound(instant + timedelta(seconds=SNAPSHOT_DISTANCE_S))
     host = store.host_name()
     bounds = (host, left, right)
-    rows = cast(list[tuple[str, str, str, int]], connection.execute(
-        "SELECT at, host, slices, 0 FROM memory_snapshots "
-        + "WHERE host = ? AND at >= ? AND at < ? AND slices IS NOT NULL "
-        + "UNION ALL SELECT at, host, slices, 1 FROM samples "
-        + "WHERE host = ? AND at >= ? AND at < ? AND slices IS NOT NULL",
-        (*bounds, *bounds),
-    ).fetchall())
-    if not rows:
-        return {"kind": "unavailable"}
-    at, host, slices, _ = min(rows, key=lambda row: (
-        abs(datetime.fromisoformat(row[0]).timestamp() - instant.timestamp()), row[3], row[0],
-    ))
-    zram_rows = cast(list[tuple[str, str]], connection.execute(
-        "SELECT at, zram FROM memory_snapshots WHERE host = ? AND at >= ? AND at < ? AND zram IS NOT NULL",
-        bounds,
-    ).fetchall())
-    zram: ZramPresent | ZramAbsent = {"state": "absent"}
-    if zram_rows:
-        _, reading = min(zram_rows, key=lambda row: (
-            abs(datetime.fromisoformat(row[0]).timestamp() - instant.timestamp()), row[0],
+    timestamp = instant.timestamp()
+
+    def nearest_value(column: Literal["slices", "zram"]) -> tuple[str, str] | None:
+        rows = cast(list[tuple[str, str, int]], connection.execute(
+            f"SELECT at, {column}, 0 FROM memory_snapshots "
+            + f"WHERE host = ? AND at >= ? AND at < ? AND {column} IS NOT NULL "
+            + f"UNION ALL SELECT at, {column}, 1 FROM samples "
+            + f"WHERE host = ? AND at >= ? AND at < ? AND {column} IS NOT NULL",
+            (*bounds, *bounds),
+        ).fetchall())
+        if not rows:
+            return None
+        nearest = min(rows, key=lambda row: (
+            abs(datetime.fromisoformat(row[0]).timestamp() - timestamp), row[2], row[0],
         ))
-        zram = cast(ZramPresent | ZramAbsent, json.loads(reading))
+        return nearest[0], nearest[1]
+
+    slices_reading = nearest_value("slices")
+    if slices_reading is None:
+        return {"kind": "unavailable"}
+    at, slices = slices_reading
+    zram_reading = nearest_value("zram")
+    zram: ZramPresent | ZramAbsent = {"state": "absent"}
+    if zram_reading is not None:
+        zram = cast(ZramPresent | ZramAbsent, json.loads(zram_reading[1]))
     return {"kind": "memory_snapshot", "at": at, "host": host,
             "slices": cast(SliceCollection, json.loads(slices)), "zram": zram}
 
@@ -394,6 +402,12 @@ def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: S
 
 def window_report(connection: sqlite3.Connection, start: datetime, end: datetime) -> str:
     lines = [f"Memory, {local_time(start, with_date=True)} to {local_time(end, with_date=True)}"]
+    recorded = queue_snapshot.read_queue_snapshot(store.root() / "admission")
+    cap_line = ""
+    if isinstance(recorded, queue_snapshot.QueueSnapshot) and start.timestamp() <= recorded.written_at < end.timestamp():
+        cap_line = room_text(gate.head_policy(recorded.inputs, recorded.written_at,
+                            gate.AdmissionLimits(recorded.policy.safety_bytes), recorded.policy).room)
+    lines.append(cap_line or "Cap: no recorded admission pass in this window")
     early = earlyoom_kills(start, end)
     if early is JournalUnavailable.VALUE:
         lines.append("earlyoom kills: journal unavailable")

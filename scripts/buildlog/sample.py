@@ -180,6 +180,8 @@ def sample() -> SampleTaken:
     """Append the current machine counters to a separate monthly JSONL file."""
     if not all(path.exists() for path in (MEMINFO, PRESSURE, BOOT_ID)):
         raise SystemExit("buildlog sample is Linux only (requires /proc).")
+    from memory import read_zram
+
     at = time.time()
     host = store.host_name()
     boot_id = parse_boot_id(BOOT_ID.read_text())
@@ -200,6 +202,7 @@ def sample() -> SampleTaken:
         "at": store.utc_iso(at),
         "boot_id": boot_id,
         "slices": slices,
+        "zram": read_zram(),
         "filesystem": filesystem_reading(),
         "jobserver": {"builds": free_pool_tokens("/dev/steve"), "ci": free_pool_tokens("/dev/steve-ci")},
         "mem_used_bytes": memory.memory_bytes,

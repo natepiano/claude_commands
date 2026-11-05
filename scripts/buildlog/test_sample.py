@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import re
@@ -12,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
@@ -24,7 +22,7 @@ import cli
 import index
 import sample
 import store
-from cgroup_test_support import CPU, write_cgroup
+from cgroup_test_support import CPU, GIB, ZRAM_READING, write_cgroup, write_zram
 from test_index import use_test_log
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
@@ -37,7 +35,6 @@ use_test_log()
 
 CLI = Path(__file__).with_name("cli.py")
 Record = dict[str, object]
-TICK_SNAPSHOT_FIELDS = {"kind", "at", "host", "zram"}
 
 
 class SampleTests(unittest.TestCase):
@@ -58,6 +55,32 @@ class SampleTests(unittest.TestCase):
         for name, filename in (("CPU_PRESSURE", "cpu_pressure"), ("IO_PRESSURE", "io_pressure"), ("STAT", "stat")):
             _ = self.enterContext(patch.object(sample, name, proc / filename))
         _ = self.enterContext(patch.object(sample, "POWER_PROFILE_STATE", self.root / "absent-profile"))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_ZRAM": str(self.root / "absent-zram")})))
+
+    def test_sample_records_zram_from_selected_device(self) -> None:
+        zram = self.root / "zram0"
+        write_zram(zram)
+        with patch.dict(os.environ, {"BUILDLOG_ZRAM": str(zram)}):
+            row = self.power_profile_sample(self.root / "missing.ini")
+        self.assertEqual(row["zram"], ZRAM_READING)
+
+    def test_sample_keeps_memory_counters_when_zram_directory_is_unreadable(self) -> None:
+        blocked = self.root / "blocked"
+        zram = blocked / "zram0"
+        write_zram(zram)
+        blocked.chmod(0o000)
+        try:
+            with patch.dict(os.environ, {"BUILDLOG_ZRAM": str(zram)}):
+                row = self.power_profile_sample(self.root / "missing.ini", via_cli=True)
+        finally:
+            blocked.chmod(0o700)
+        self.assertEqual(row["zram"], {"state": "absent"})
+        self.assertEqual(row["mem_used_bytes"], 12 * 1024)
+
+    def test_sample_records_absent_zram_without_losing_memory_counters(self) -> None:
+        row = self.power_profile_sample(self.root / "missing.ini")
+        self.assertEqual(row["zram"], {"state": "absent"})
+        self.assertEqual(row["mem_used_bytes"], 12 * 1024)
 
     def test_default_filesystem_uses_resolved_intermediate_root(self) -> None:
         import filesystem
@@ -143,7 +166,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(slices["builds"]["current_bytes"], "unavailable")
         self.assertEqual(slices["builds"]["cpu"], CPU)
         self.assertEqual(slices["builds"]["io"], {"state": "unavailable"})
-        self.assertEqual(slices["ci"]["current_bytes"], 12 * 2**30)
+        self.assertEqual(slices["ci"]["current_bytes"], 12 * GIB)
         self.assertEqual(row["jobserver"], {"builds": {"state": "measured", "free_pool_tokens": 7},
                                             "ci": {"state": "measured", "free_pool_tokens": 7}})
 
@@ -163,7 +186,7 @@ class SampleTests(unittest.TestCase):
         with patch.object(cgroup_capture, "builds_path", return_value=builds), \
              patch.object(cgroup_capture, "ci_path", return_value=ci), patch.object(Path, "read_text", read):
             row = self.power_profile_sample(self.root / "missing.ini", via_cli=True)
-        self.assertEqual(cast(dict[str, Record], row["slices"])["builds"]["current_bytes"], 12 * 2**30)
+        self.assertEqual(cast(dict[str, Record], row["slices"])["builds"]["current_bytes"], 12 * GIB)
         for scope in (builds, ci):
             for name in ("memory.current", "memory.stat", "cpu.stat", "io.stat"):
                 self.assertEqual(reads.get(scope / name), 1, str(scope / name))
@@ -358,11 +381,8 @@ class SampleTests(unittest.TestCase):
             else:
                 _ = sample.sample()
         lines = next(self.root.glob("*/samples-*.jsonl")).read_text().splitlines()
-        self.assertEqual(len(lines), 2 if via_cli else 1)
+        self.assertEqual(len(lines), 1)
         row = cast(Record, json.loads(lines[0]))
-        if via_cli:
-            self.assertEqual(set(cast(Record, json.loads(lines[1]))), TICK_SNAPSHOT_FIELDS)
-            self.assertIn("slices", row)
         return row
 
     def test_sample_writes_power_profile_and_utc_state_mtime(self) -> None:
@@ -408,7 +428,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(result.stderr.splitlines(), ["buildlog sample is Linux only (requires /proc)."])
         self.assertEqual(list(self.root.rglob("*.jsonl")), [])
 
-    def test_cli_sample_appends_sample_and_snapshot_under_buildlog_dir(self) -> None:
+    def test_cli_sample_appends_one_row_with_zram_under_buildlog_dir(self) -> None:
         proc = self.root / "proc"
         proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16384 kB\nMemAvailable: 4096 kB\nSwapTotal: 8192 kB\nSwapFree: 1024 kB\n")
@@ -431,8 +451,10 @@ class SampleTests(unittest.TestCase):
                 ("memory.pressure", "some total=2500000\nfull total=100000\n"),
             ):
                 _ = (cgroup / name).write_text(value)
+        zram = self.root / "zram0"
+        write_zram(zram)
         environment = {**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_BUILDS_CGROUP": str(builds),
-                       "BUILDLOG_CI_CGROUP": str(ci), "BUILDLOG_ZRAM": str(self.root / "absent-zram")}
+                       "BUILDLOG_CI_CGROUP": str(ci), "BUILDLOG_ZRAM": str(zram)}
         command = (
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
             "import sample, cli; proc = Path(sys.argv[2]); "
@@ -463,7 +485,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(files[0].parent.name, host)
         self.assertRegex(files[0].name, r"^samples-\d{4}-\d{2}\.jsonl$")
         lines = files[0].read_text().splitlines()
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 1)
         record = cast(Record, json.loads(lines[0]))
         self.assertEqual(record["kind"], "sample")
         self.assertEqual(record["host"], host)
@@ -477,13 +499,9 @@ class SampleTests(unittest.TestCase):
             self.assertIsInstance(record[field], int)
             self.assertGreaterEqual(cast(int, record[field]), 0)
         self.assertFalse(index.index_path_in(self.root).exists())
-        snapshot = cast(Record, json.loads(lines[1]))
-        self.assertEqual(snapshot["kind"], "memory_snapshot")
-        self.assertEqual(snapshot["at"], record["at"])
-        self.assertEqual(snapshot["host"], host)
-        self.assertEqual(set(snapshot), TICK_SNAPSHOT_FIELDS)
+        self.assertEqual(record["zram"], ZRAM_READING)
         self.assertEqual(set(record), {
-            "kind", "host", "at", "boot_id", "slices", "filesystem", "jobserver",
+            "kind", "host", "at", "boot_id", "slices", "filesystem", "jobserver", "zram",
             "mem_used_bytes", "swap_used_bytes", "builds_anon_bytes", "sccache_in_service", "ci_anon_bytes",
             "stall_some_us", "stall_full_us", "cpu_stall_some_us", "cpu_stall_full_us",
             "io_stall_some_us", "io_stall_full_us", "cpu_idle_ticks", "cpu_iowait_ticks", "cpu_total_ticks",
@@ -491,29 +509,6 @@ class SampleTests(unittest.TestCase):
         })
         slices = cast(dict[str, Record], record["slices"])
         self.assertEqual(slices["ci"]["stall_some_us"], 2_500_000)
-
-    def test_snapshot_failure_still_keeps_minute_sample(self) -> None:
-        proc = self.root / "proc"
-        proc.mkdir(parents=True, exist_ok=True)
-        _ = (proc / "meminfo").write_text("MemTotal: 16 kB\nMemAvailable: 4 kB\nSwapTotal: 8 kB\nSwapFree: 1 kB\n")
-        _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
-        _ = (proc / "boot_id").write_text("test-boot\n")
-        stderr = io.StringIO()
-        with patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root),
-                                  "BUILDLOG_BUILDS_CGROUP": str(self.root / "absent-builds"),
-                                  "BUILDLOG_CI_CGROUP": str(self.root / "absent-ci"),
-                                  "BUILDLOG_ZRAM": str(self.root / "absent-zram")}), \
-             patch.object(sample, "MEMINFO", proc / "meminfo"), \
-             patch.object(sample, "PRESSURE", proc / "pressure"), \
-             patch.object(sample, "BOOT_ID", proc / "boot_id"), \
-             patch("memory.write_snapshot", side_effect=OSError("snapshot failed")), \
-             redirect_stderr(stderr):
-            self.assertEqual(cli.main(["sample"]), 0)
-        lines = next(self.root.glob("*/samples-*.jsonl")).read_text().splitlines()
-        self.assertEqual(len(lines), 1)
-        self.assertEqual(cast(Record, json.loads(lines[0]))["kind"], "sample")
-        self.assertIn("memory snapshot unavailable: snapshot failed", stderr.getvalue())
-
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -105,7 +105,7 @@ Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
 
 The service retains the run's process watch between steps.
-The run holds no memory reservation or CPU token between steps.
+The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
 When the run ends, waiting steps use their own arrival times for order again.
 The service persists run places with waiter places through the generic codec in `state.json`.
 After a restart, the service restores live run places and removes ended run places.
@@ -116,11 +116,31 @@ After a restart, the service restores live run places and removes ended run plac
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
 
+Each admitted run keeps aside `max(0, accepted need − anonymous use)`, plus its held slots.
+Room equals host free memory minus the 3 GiB safety minus run keep-asides minus the CI keep-aside.
+The first two minutes use the same calculation. A run never counts its use twice.
+The cap equals admitted anonymous use plus host free memory minus the safety.
+The display shows zero room for a shortfall. The cap explanation shows the shortfall.
+These readings never reduce a promise from history.
+
+Waiting runs follow priority, first run arrival, and PID order.
+A younger run starts only when its need fits after the first run's need remains protected.
+The first run can start despite insufficient room when no admitted run or held slot remains.
+Readable host memory, clear readable pressure, and a current estimate remain necessary.
+New starts have five seconds of spacing through `recovery_start_seconds`.
+
+An ended step retains its slot for `slot_gap_seconds`, currently ten seconds.
+A continuation reuses that slot without start spacing, even under pressure.
+A larger continuation requests only the extra memory before waiting runs.
+That extra requires sufficient room and clear readable pressure.
+The gap deadline or the run's process end releases an unused slot.
+A closed connection ends its wait and releases its claim.
+
 Every pass reads one `MemoryConfig` from `[memory]` in `config/build_admission.conf`.
 `read_admission_configuration()` returns `UsableAdmissionConfiguration` or `UnusableAdmissionConfiguration`.
 `read_memory_config()` resolves each key through `ConfigRead.origin()` once.
 It collects recovery diagnostics and emits them only after a successful read.
-Estimates receive the cargo peak, budget, and test margin from that resolved configuration.
+Estimates receive the cargo peak and history factors from that configuration.
 A recovered setting remains usable and produces one warning per process.
 An unavailable setting stops grants and returns a refusal that names the file and key.
 The service listens during a refusal and watches the nearest existing configuration directory.
@@ -141,11 +161,11 @@ Queries project the stored `PassResult` through `queue_read_from_pass`. A releas
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
 `/build:queue <position|session|folder>` shows the full queue, one blank line, and the selected cards.
 `mine` uses the same layout. The page resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
-`queue_evidence.py` formats the recorded need, charge basis, resource arithmetic, pressure, and release advice.
+`queue_evidence.py` formats the recorded need, run keep-aside, room calculation, head cause, and release advice.
 The card uses the reply's policy and limits. It reads no current admission configuration to reinterpret the reply.
-The evidence includes host RAM, optional load, running promises, charges, current use, and total current use.
-It also includes estimate history, shape tiers, failed-peak floors, factors, caps, package, filters, width, and completed CPU-token waits.
-A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`; the order-window deadline remains separate.
+The evidence includes host RAM, optional load, run needs, anonymous use, held slots, keep-asides, room, and start spacing.
+It also includes estimate history, shape tiers, failed-peak floors, factors, recorded limits, package, filters, width, and completed CPU-token waits.
+A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`. Start spacing has its own deadline.
 Admission and release calculations remain in `memory_admit.py`. An expired estimate requires a client refresh through the service.
 The page prints priority and unowned memory once in the queue view. It prints shared evidence once below the selected cards.
 `build_why.py` and its command are removed. There is no alias.
@@ -157,10 +177,10 @@ A failed first query shows `Build queue could not be read.`
 | `admit` | Wait, refusal, or a durable grant with reservation id, `.max`, `.wave`, and sampling context |
 | `launch` | Wait, refusal, or launch permission without a reservation |
 | `release` | Finalize one reservation |
-| `width` | Change test width and queue a new test-phase estimate |
+| `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
 | `priority_set`, `priority_clear` | Change the one unit priority |
-| `admit_head` | Permit the current head to exceed the budget when free memory permits |
+| `admit_head` | Waive existing keep-asides for the head when free memory permits |
 | `view`, `explain`, `mine` | Read the stored pass |
 
 `/build:queue bump <position|session|folder>` uses the card's selector resolver to select a waiting step.
@@ -179,23 +199,24 @@ Unavailable settings produce refusals rather than replacement policy values.
 
 ### Durable state and lifetime
 
-`admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, recovery spacing, and the replay ledger.
-The service replaces this file atomically. Reservation records include test-phase need, selected charge evidence, and finalization intent.
+`admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, start spacing, and the replay ledger.
+Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
+The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.
 `CallRecord` and `NoCallRecord` describe the call.
 
 `reservation_stem` gives each grant its `.max` and `.wave` paths. `invoke.sh` uses the grant's paths and sampling context.
 The sampler reads no reservation file. It marks the nextest test phase through `record.py test-phase-context`.
-The service watches owner pidfds and scope events. An ended owner retains its charge while its scope remains populated.
+The service watches owner pidfds and scope events. A populated scope retains its accepted need after its owner ends.
 An empty scope and ended owner permit finalization. A reused scope path gets a new watch.
 
 `finalize_reservation` is the one finalizer. `StateIntents.save` persists its evidence before the history append.
 The finalizer matches `reservation_id` to prevent a duplicate history row after a crash.
 `StateIntents.clear` removes the reservation after the append. Startup completes any saved intent.
-The finalizer copies selected test-phase evidence. It never selects new evidence during release.
+The finalizer records completed measurements for history. Release creates the run slot without changing the accepted need.
 
 At the first start without `state.json`, the service imports the old admission files through their existing readers.
-It imports live reservations, saved intents, waiter places, token handoffs, priority, head override, and recovery spacing.
+It imports live reservations, saved intents, waiter places, token handoffs, priority, head override, and start spacing.
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
 There is no admission lock.
@@ -212,7 +233,7 @@ The same record holds Cargo steps and `merge-gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
-1. `admitted` records the original arrival, admission time, wait seconds, need, need source, applied budget, and head window.
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
 2. `left` records a cancelled waiter or a waiter whose owner is gone.
 3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
 
@@ -236,9 +257,9 @@ It compares Cargo waits and pressure holds with and without overlapping gate int
 
 `head_policy` resolves the deployed head rule and ordered walk from one frozen snapshot.
 Admission, queue readers, blocker searches, and release searches use that result.
-The active window supplies the shell wait text and admission records.
-The queue card preserves captured window evidence until the service saves its first priority mark.
-The deployed rule keeps the recovery slot, queue priority, and the head-admission override.
+The head keeps its accepted need while it waits.
+Younger runs can start only if they leave room for that need.
+The rule applies with and without queue priority.
 
 The Phase 20 calibration has insufficient evidence.
 The calibration requires seven days under the deployed Phase 39 configuration.
@@ -247,7 +268,7 @@ Recorded wait minutes, replayed wait minutes, and their ratio are unavailable.
 The main reference has a 24 GiB build budget; this is not a calibration cohort.
 The comparative replay does not run. The capacity rule is not adopted.
 
-### Estimates and charges
+### Estimates and keep-asides
 
 The client calls `step_estimate` before admission and after `EstimateExpired`.
 Before each new build estimate, it reads `build_history` from the service, then reads history.
@@ -260,12 +281,13 @@ A publication retry also advances the generation. The service never prunes or re
 A refresh uses the open admission connection. An unregistered client uses a read-only `build_history` query.
 A pass retries a retained finalization intent even while its owner remains alive.
 It preserves the first `since` and episode across refreshes and reconnects.
-A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `head_seconds`.
+A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A cap-source waiter never expires. A `FixedCapSizing` program holds its cap without a history estimate or refresh.
 The merge gate asks for its own `--memory-cap-mib`, default 6144 MiB.
 Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory cap` in explanations.
-`step_promise` gives fixed-cap rows and release builds `LifetimePromise` until they end.
-Both the budget charge and free-memory growth term use that promise.
+`step_promise` gives every admitted step a `LifetimePromise` until it ends.
+The run calculation uses the accepted need before tests start.
+For nextest, an observed test phase can select the frozen test-phase need instead.
 
 Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
 Cargo estimates separate compile history from no-compile history.
@@ -500,55 +522,48 @@ A dev build uses `ceil(base × dev_size_factor + margin_bytes)`.
 `dev_size_factor` is 1.1. `dev_size_margin_gib` is 1.1 GiB, rounded upward to bytes.
 The Phase 39 replay uses the original 126-build cohort and the 64 measured builds from the latest three days.
 The cargo-berth increase sets the margin. The measured S2 build sets the factor.
-The S2 history peak of 6.3 GiB gives a promise of 8.03 GiB before the budget cap.
+The S2 history peak of 6.3 GiB gives a promise of 8.03 GiB without truncation.
 Release builds use `release_headroom`, currently 1.314. A build without same-shape history retains the same-profile fallback without headroom.
 The retry after a memory kill stays unchanged.
 
-Each estimate stores its rule and the budget cap it applies.
-`DevSizeHeadroom` stores its factor and margin. `LegacyDevMultiplierHeadroom` retains the older multiplier for saved records.
-`CappedAtBudget` stores the uncapped need and the applied cap.
-The reader checks those saved values without reading today's budget.
-An older record without a saved cap becomes `CapNotRecorded`.
-The queue then prints `capped at the build budget of that time` with the uncapped need.
-The original 126-build cohort uses a 21 GiB budget. No dev build exceeds its new promise.
-One release build exceeds its promise by 3.76 GiB.
-The recent 64-build cohort uses a 24 GiB budget. No dev build exceeds its new promise.
-Two release builds exceed their promises. The largest excess is 0.19 GiB.
-All three release excesses use fallback estimates without same-shape history.
-`peak_activity` labels cargo compilation as `compiling` and other work as `running`.
-The policy's ramp, pressure, recovery, head-window, and per-kind peak-hold values apply at each pass.
-The merge-gate peak hold is 180 seconds. Other kinds inherit `peak_hold_seconds`, currently 1500 seconds.
-No per-step near-peak timeline is retained; `.wave` holds only the latest pair.
-The 180-second merge-gate hold is a set value, not a measured p95. Fixed-cap lifetime promises supersede peak decay.
+Each estimate stores its history rule, factors, and failed-peak floor.
+`DevSizeHeadroom` stores its factor and margin.
+`LegacyDevMultiplierHeadroom` reads older saved multipliers through the existing `dev` wire tag.
+New estimates remain uncut. Historical `CappedAtBudget` and `CapNotRecorded` values remain readable.
 
-Nextest uses `TestPhaseCharge` after its sampler mark, ramp, and recorded test-phase need permit it.
-One estimate worker calls `test_phase_need` through `anonymous_history_rows`.
-Each job carries the reservation, width, revision, and event's resolved `MemoryConfig`.
-The loop accepts results only when the reservation and revision still match. Width changes increment the revision.
-A failed job stores nothing. A frozen need keeps its recorded margin; a later width request reads the margin again.
-A legacy need without a recorded margin decodes as `NoTestPhaseNeed("not_recorded")`. The step measures again.
-The first selected charge evidence is persisted outside the pure pass. A failed optional evidence write does not undo admission.
-
-Each pass counts `sccache.service` and unowned child scopes under `builds.slice`.
-`ci_memory_slice` in `[memory]` of `config/build_admission.conf` names the system CI slice.
-`systemctl show` supplies its cgroup path. Each pass reads its `memory.current`, `memory.stat`, swap, and `memory.max` through `unowned_slice_memory`.
-Step scopes, unowned scopes, the compiler cache, and CI use one resident working-set rule: `max(0, memory.current - memory.stat inactive_file)`.
-An idle CI slice charges this resident working set. Inactive file cache and swap hold no build budget.
-Process-tree readings charge RSS and record swap separately. Every reading retains `swap_bytes` for display.
-A `Runner.Worker` adds `ci_memory_margin_gib` for growth between passes, capped at the live slice limit.
-The charge never falls below the working set. Each pass reads the margin and the limit again.
-The promise reserves free RAM for the added margin. An unavailable reading refuses new grants and retries on the next pass.
-Releases remain available during a reading refusal.
-`UnownedSliceMemory` names each unowned scope and its size. Process-tree charges are subtracted to prevent duplicate charges.
-The CI slice and compiler cache always have service rows, including zero RAM readings.
-`IdleService` shows `idle` without an age.
-`RunningServiceJob` records the oldest live `Runner.Worker` start time and shows `running job` with its age.
-Listener uptime never supplies the CI job age. The compiler cache always shows `idle`.
-The board and card show RAM and a separate `GiB swapped` label.
-`NotServiceSlice` retains the build-scope activity rules.
-Existing saved peaks and reservation promises keep their recorded values, including swap in peaks recorded before resident accounting.
-New CI promises use resident working set plus the configured margin, capped at the slice limit.
-The held head shows free memory, reserve, and need from `HeadExplanation`.
+Each pass reads the resident working set and swap for service reports.
+CI RAM and unowned scopes reduce host free memory. They do not create a run promise.
+`ci_memory_slice` names the CI slice. A missing CI reading remains a labelled diagnostic.
+`ci_memory_margin_gib=7` supplies one CI keep-aside while `job_state` is `RunningServiceJob`.
+The service reads that value once with the other policy values.
+`AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
+`MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
+`MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
+Idle CI and unavailable CI readings add no CI keep-aside.
+CI RAM already reduces host free memory. The room calculation never subtracts it again.
+The service does not require `memory.max` for admission.
+The cap remains anonymous use plus free memory minus safety.
+The cap text names the CI keep-aside within kept memory.
+The page shows CI RAM outside the cap and the CI keep-aside beside it, before the cap.
+Neither CI part increases the page's taken total for admitted runs.
+`RunningServiceJob` and `IdleService` retain the CI job state.
+Anonymous scope counters use the same measure as the history peaks.
+Missing anonymous counters keep the full accepted need aside and make the cap unavailable.
+The service freezes `TestPhaseNeed` and its margin when it writes a nextest reservation need.
+A width update selects history again at the recorded width.
+`test_phase_need` uses the existing history selector through `store.locked_rows`.
+The selector uses the p90 test-phase peak from matching repository, scope, package, filters, and width history.
+`test_phase_margin=1.2` has range `1..`. Missing or invalid values use `TEST_PHASE_MARGIN_FALLBACK`, which is 1.2.
+The config reader resolves the margin once. Each reservation retains its selected margin.
+`record.read_test_phase` supplies the observed test window and test peak.
+After tests start, need equals `max(test peak so far, stored test-phase need) × stored margin`.
+Without a stored need or observed test window, need remains the full step estimate.
+The existing keep-aside formula remains `max(0, need − anonymous use)`.
+For a 12 GiB step, 3 GiB test use, and 3 GiB history need, margin 1.2 gives 3.6 GiB need.
+That run keeps 0.6 GiB aside instead of 9 GiB.
+The queue view, card, build-why, and memory page use the keep-aside captured by the last pass.
+Build-why explains the selection: `tests started: need X (test peak Y, history N x 1.2)`.
+No test-phase estimate worker remains.
 
 ### Clients and program places
 
@@ -673,7 +688,8 @@ The hold wait and token wait retain separate history records.
 
 ### Build log: records and schema
 
-Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
+Index `SCHEMA_VERSION = 33` (`scripts/buildlog/index.py`). `open_for_update` rebuilds the index on a version mismatch.
+Memory and coordination columns:
 
 | Table | Column | Meaning |
 | --- | --- | --- |
@@ -683,19 +699,24 @@ Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebu
 | `calls` | `mem_kills`, `mem_kill_stopped` | memory-killed attempts; 1 when a step was killed twice |
 | `samples` | `builds_anon_bytes`, `ci_anon_bytes` | the `anon` line of each slice's `memory.stat` (process memory); NULL when absent |
 | `samples` | `sccache_in_service` | 1 when `builds.slice/sccache.service/cgroup.procs` holds a process, 0 when empty, NULL without `builds.slice` |
+| `samples` | `zram` | JSON zram storage at the sample time; NULL in older rows |
 | `memory_snapshots` | `src, host, at, slices, zram` | JSON slice counters and zram, indexed on `at` |
 | `ci_jobs` | `run_state` | `JobRunState.RAN / SKIPPED / CARRIED_OVER` |
 
 `steps.wait_s` keeps metadata and pass-record lookup time plus the ordinary build wait; `mem_wait_s` is memory admission. `calls.hold_wait_s` records held-target waiting separately, including each declined Mac retry, and `calls.target` names where the call ended. The Waiting table keeps `Held target` apart from `Memory admission`.
 
-**Slice snapshots** (`scripts/buildlog/memory.py`). Each `buildlog sample` tick writes a sample row and a `memory_snapshot` row.
-Only the sample row holds slices during the tick.
-The tick snapshot row holds `kind`, `at`, `host`, and `zram` only.
-The standalone `buildlog snapshot` row keeps slices because it has no sample row beside it.
+### Slice snapshots
+
+`scripts/buildlog/memory.py` supplies the slice snapshots.
+Each `buildlog sample` tick writes one sample row with slices and zram.
+`memory_snapshots` holds standalone snapshots and the zram-only tick rows of older logs, so the memory window reads both tables.
+The standalone `buildlog snapshot` row keeps slices and zram.
 Each slice (`builds` or `ci`) stores its events, peaks, limits, and memory pressure total.
 An absent slice has `state: absent`. An unreadable pressure total has the value `unavailable`.
 The zram reading stores the data and compressed bytes from `mm_stat`.
-A snapshot failure prints `memory snapshot unavailable` and preserves the sample.
+It takes the nearest slices value, then the nearest zram value, each from both tables.
+With no slices in range, the result is unavailable.
+Snapshot rows have priority on equal distances.
 `BUILDLOG_BUILDS_CGROUP`, `BUILDLOG_CI_CGROUP`, and `BUILDLOG_ZRAM` select fixture paths for tests.
 
 **CI jobs.** A job is `carried_over` when its attempt is above 1 and `started_at` precedes `created_at`, else `skipped` when its conclusion is `skipped`, else `ran`. Only `ran` rows store `duration_s` and `queued_s`; `queued_s` is `started_at - created_at` when both parse and the result is zero or more, else NULL. `elapsed_seconds(start, end) -> float | None` is unrounded; `seconds_between` rounds to 3 places. `ci_job_days` excludes `carried_over` and keys days by the run attempt's `started_at`.
@@ -919,7 +940,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - **Unfaked memory pressure.** On 2026-10-29, `test_brp_launch_gate.py` took 169 s against a 6 s median because its pressure reading was unfaked.
 
 - **Memory gate sizes.** The first need comes from `program_first_peak_gib.cargo` in `config/build_admission.conf`. Build steps use shape tiers. Other steps retain measured, build-log, and pooled tiers. The service reads process memory before host memory during each pass.
-- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Lifetime promises retain the full need until the step ends. Other steps use the configured ramp and peak rules. Simultaneous callers cannot reserve the same room.
+- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Each step retains its accepted need unless an observed test phase selects its frozen test-phase need. Anonymous use reduces its keep-aside. Simultaneous callers cannot reserve the same room.
 - **Release outcomes vanish with the last holder file**; set-aside `*.damaged-*` files are never cleaned up. A holder joining a no-cycle hold learns nothing until the final release line tells it to broadcast.
 - **earlyoom never logs "killed";** its line is `sending SIGTERM to process <pid> uid ... "<comm>": ...`.
 - **zram is invisible to slice limits.** earlyoom counts zram's virtual size as swap; `MemoryMax` counts RAM only, and compressed pages are charged to no slice.
@@ -953,7 +974,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - **One slice for every session build, sccache included.** Every compile reaches the sccache server, so the server's cgroup is where compiles are charged; a limit on the step scopes alone would bound nothing.
 - **CI in its own pool, a smaller slice and a lower kill order.** Shared steve slots alone did not stop kills (a CI run lost both Linux jobs after it). Its own 14-slot pool keeps CI from starving sessions and the reverse; `PIPELINE_JOB_OOMSCOREADJ` is the only setting that reaches job processes, because the runner sets every job to 500 itself. At 100 a CI job goes after a build step (500) or a session process (200) of the same size.
 - **Build steps at 500, and no `--prefer`.** The level sets the order and size decides within it. A `--prefer` for compiler names (+300) let two hung hana tests (11.4 GB, 15.5 GB) outlive 26 smaller processes, six CI compilers among them; without it, a hung 15 GB test scores about 1100 against a 2 GB CI compiler's 750, and a session's rust-analyzer at 200 stays behind every build step of similar size. The adj is set inside the step's scope, so every process the step starts inherits it.
-- **Every session at once, through reserving gates.** The 11:12 PDT episode on 2026-10-04 (21 kills) came from a release into a gate that read memory before compilers grew. Release-profile builds keep their full promise until they end. Other steps keep a start promise, then charge the greater of current use and their observed peak. Every build starts through the memory gate after a release.
+- **Admission after a hold release.** The 2026-10-04 incident had 21 kills after compilers grew beyond the admission readings. Each admitted step keeps its selected need. Its anonymous use reduces its keep-aside. Every local build requests memory admission after a hold release.
 - **A damaged record releases everyone, not no one.** Setting it aside and falling back to a broadcast cannot strand held sessions; each still passes its own memory gate.
 - **Broadcast by id.** Names can belong to two sessions, and `top_level.py` once deduped them, so one of two same-named sessions never heard the hold.
 - **A memory kill re-runs once.** The kill says nothing about the tree; a second kill stops the call so a starved machine does not loop.
@@ -983,7 +1004,9 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 
 A second promise rule is measured and declined (showrunner, 2026-10-28: simple wins). The rule: a running build whose need is above a limit keeps its full promise; the running builds at or under it are promised the largest gap in full plus `max(0, 0.6 x need - anon)` each. The replay used 4 h of 5 s admission samples (2026-10-28 03:27-07:27Z, 240 waits, 1863 wait minutes), and "short" counts admitting ticks where the running builds' real growth after the tick passes `MemAvailable` minus the reserve. With a 6 GiB limit the rule saves 331 of 1863 minutes against 249 for the current rule, with the short rate at 0.8% against 0% (5 GiB: 326 min, 0.9%; 8 GiB: 501 min, 1.4%). The same rule limited by the waiting step's need never gets below 6.9% short. At about 4% of the wait for a second rule and a nonzero short rate, it is not built; a shortfall is the 2026-09-30 freeze. Do not measure it again unless the mix of steps changes.
 
-A scoped reservation stays charged and visible after its owner shell stops while its scope still holds a process; admission, queue and blocker reads use that same rule and keep `.max` and `.wave` until both the owner and scope have ended.
+A scoped reservation retains its accepted need while its scope contains a process.
+Admission and queue views use the same lifetime rule.
+The service retains `.max` and `.wave` until the owner and scope both end.
 
 A test-width update persists the reservation in `state.json` through `os.replace`. A stopped write leaves the previous state intact.
 
@@ -991,7 +1014,7 @@ A cleanup plan is written to a temporary file and linked into place only when no
 
 Python queue layouts, evidence tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
 
-**One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, head marks, and recovery outcomes.
+**One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, the head cause, run keep-asides, and start spacing.
 The service commits proposals and stores the pass. Queries project that pass through `queue_read_from_pass`.
 `QueueExplanation.decided_from` keeps the inputs for release calculations. Those calculations admit nothing and write nothing.
 `apply_queue_priority` supplies the priority order. The generic codec stores domain records for replies and service state.
@@ -1010,7 +1033,7 @@ The service owns the durable admission state and the socket.
 `RankedWaiter` adds `PriorityUnit` or `NormalOrder` to a resolved row through `rank_waiter`.
 A durable waiter has no `priority_rank` or resolved `order` field.
 The order is priority, the step's original order time, then pid.
-Token waiters keep their clocks and places but cannot hold head room.
+Token waiters keep their clocks and places but cannot protect room as the head.
 `TokenWaitersOnly` distinguishes a token-only queue from an empty queue.
 The renderers use the eligible head's position and token history.
 
@@ -1047,3 +1070,47 @@ It takes only the shortfall, in the existing least recently used order.
 The result line reports removed bytes, free bytes before and after, and skipped busy targets.
 `--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
 The nix-darwin job is a separate deployment step.
+
+
+### Free memory, head protection, and step slots
+
+`memory_room` calculates room from one captured admission pass.
+For each admitted run, kept bytes equal `max(0, selected need − anonymous use)` plus held slot bytes.
+Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
+The cap equals our anonymous use plus free memory minus safety. It does not limit an estimate.
+The first two minutes use the same formula. Use and kept bytes never count the need twice.
+
+The first eligible run follows queue priority, first run arrival, and PID.
+A younger run starts only if its need fits room minus the first run's need.
+Pressure or unreadable pressure holds new starts and extra memory only while it lasts.
+An unreadable pressure file shows `pressure unreadable: <path>` with a short error or `incomplete` when available.
+The client, card, and queue explanation retain that reason. The queue marker says `pressure unreadable`.
+An unreadable host memory reading retains its recorded reason too.
+If an unreadable reading holds queued starts for `reading_alert_seconds`, currently 300 seconds, the service sends one message to `natedev`.
+The message names the path and the hold time. `natedev` owns machine recovery and any later phone alert.
+The service measures the hold with its clock. A daemon thread sends the message without delaying admission.
+The sender reuses `scripts.message.session_send.session_send_argv` with sender `build-admission` and sends the text through stdin.
+The `build-admission-reading` claim prevents repeated delivery during the same unreadable stretch.
+Failed delivery releases the claim for retry. Restored readings clear the claim.
+The first run can start without sufficient room when no admission or held slot remains.
+It still needs readable host memory, clear pressure, a current estimate, and due spacing.
+CI and ownerless scopes do not count as admitted runs for this exception.
+
+Each new start sets the next start time through `start_spacing_after`.
+The interval is `recovery_start_seconds`, currently 5 seconds, for launches and build steps alike.
+A completed step leaves its run a slot for `slot_gap_seconds`, currently 10 seconds.
+A continuation within the slot bypasses order, spacing, and pressure.
+A larger continuation holds the slot and requests only its extra memory before new runs.
+A closed connection frees its claim. An idle slot expires or ends with its verified run owner.
+Repeated release cannot recreate a slot. A standalone request has no reusable slot.
+Slots are not saved. Restart keeps active reservations and run order, but drops handoffs and waiting extras.
+
+`queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
+The view shows zero room during a shortfall and records that shortfall in the cap explanation.
+The queue view and cards show captured process ids as `pid N` for each process row.
+`keep_aside_text` explains each admitted run's need, anonymous use, slot bytes, and kept bytes.
+`RoomCheck.basis` records `Fits`, `StartsAlone`, `WithinSlot`, `OverrideRoom`, or `DoesNotFit` in the admission walk.
+`admission_pass` records one `HeadCause` on `HeadAdmissionStatus`.
+`HeadExplanation` retains that cause for the view and release advice.
+The formatters read the captured cause and room without a second room calculation.
+No adaptive controller, fixed admission limit, order window, CI growth promise, or test-phase estimate worker remains.

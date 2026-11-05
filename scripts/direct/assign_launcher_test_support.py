@@ -49,9 +49,10 @@ def read_object(path: Path) -> dict[str, object]:
         records = cast(dict[str, object], json.load(handle))
     if path.name == codex_mesh.ROSTER_FILE:
         records = fixture_worker_records(records, staff.local_snapshot())
+        assignments = codex_mesh.task_assignments()
         for raw in records.values():
             entry = cast(dict[str, object], raw)
-            role = codex_mesh.task_role(str(entry.get("thread_id", "")))
+            role = codex_mesh.task_role(str(entry.get("thread_id", "")), assignments)
             if isinstance(role, codex_mesh.AssignedWorkerRole):
                 entry["role"] = role.role
     return records

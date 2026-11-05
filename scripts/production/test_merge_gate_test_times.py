@@ -180,6 +180,8 @@ class MergeGateTestTimesTests(MergeGateFixture):
         self.assertEqual((full["selection"], full["source"], full["status"]), ("full", "checkpoint", 0))
         self.assertEqual(full["sha"], self.git(self.checkout, "rev-parse", "HEAD"))
         self.clear_gate_events()
+        with self.admission.loop_turn():
+            self.admission.allow_next_start()
         second = self.run_gate("--tests-only")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         records = self.records()
@@ -214,6 +216,8 @@ class MergeGateTestTimesTests(MergeGateFixture):
 
             for failure in ("write", "config"):
                 with self.subTest(failure=failure):
+                    with self.admission.loop_turn():
+                        self.admission.allow_next_start()
                     if failure == "write":
                         with mock.patch.object(gate_record, "write_gate_run", side_effect=blocked_write):
                             result = self.run_gate("--tests-only", "--full")
