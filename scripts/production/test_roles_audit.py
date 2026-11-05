@@ -786,8 +786,9 @@ class SourceCheckTests(unittest.TestCase):
 class ProductionNameTests(unittest.TestCase):
     def test_reads_staff_units_and_finds_cross_role_collisions(self) -> None:
         doc = Path("/fixture/one.md")
-        first = audit.parse_production("one", doc, "# A\n- **Showrunner session:** alpha\n",
-                                       owned_units(doc, "render", "old", retired=("old",)))
+        timer = showrunners.Timer("one", "session:alpha", doc, "UTC")
+        with patch.object(showrunners, "timer_for", return_value=timer):
+            first = audit.parse_production("one", doc, owned_units(doc, "render", "old", retired=("old",)))
         second = audit.ProductionNames("two", "/fixture/two.md", "render-unit", ("tools-unit",))
         rows = audit.measure_production_names((first, second))
         self.assertEqual(first.units, ("render-unit", "old-unit"))

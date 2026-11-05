@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib.atomic_file import sync_folder, write_bytes_atomic, write_text_atomic
-from scripts.production import showrunners, staff, store_owner
+from scripts.production import staff, store_owner
 from scripts.shutdown.remote import local_machine
 import upgrade_record
 import upgrade_schedule
@@ -35,7 +36,8 @@ def _owner(document: Path) -> staff.StaffId:
             continue
         if doc.path.parent.resolve() != document.parent.resolve():
             continue
-        former = showrunners.former_slugs(doc.path.read_text(encoding="utf-8"))
+        former = [match.group(1) for line in doc.path.read_text(encoding="utf-8").splitlines()
+                  if line.startswith("- **Formerly:**") for match in re.finditer(r"`([^`]+)`", line)]
         if any(doc.path.with_name(f"{name}-production.md").resolve() == document.resolve() for name in former):
             matches.append(candidate.id)
     if len(matches) != 1:

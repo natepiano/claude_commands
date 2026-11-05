@@ -256,11 +256,11 @@ def registered_showrunners(
             continue
         live = sessions_by_id.get(row.current_session)
         registered.append(showrunners.Showrunner(
-            slug=timer.slug if isinstance(timer, showrunners.Timer) else row.name,
+            slug=timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name,
             session=live["name"] if live is not None else "",
             socket=live["messagingSocketPath"] if live is not None else "",
             doc=str(doc.path),
-            zone=timer.zone if isinstance(timer, showrunners.Timer) else user_zone_name()))
+            zone=timer.zone if isinstance(timer, showrunners.TimerRegistration) else user_zone_name()))
     return registered
 
 
@@ -321,7 +321,7 @@ def production_places(
         except (OSError, ValueError) as error:
             problem(diagnostics.problems, parent.name, error)
             continue
-        slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
+        slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
         owner = by_id.get(parent.current_session)
         relationship: UnderShowrunner | ProductionWithoutRunningShowrunner = (
             UnderShowrunner(slug, owner["name"], f"session:{parent.current_session}")
@@ -429,10 +429,10 @@ def stopped_run_place(run: Path) -> RunPlace:
         state = read_object(run / unit_runs.STATE_FILE)
     except (OSError, UnicodeError, ValueError):
         return RunPlace(NoDirector(), NoShowrunner(), "")
+    from scripts.direct import plan_history
+    if state.get(unit_runs.OWNER_FIELD):
+        state = plan_history.staff_directory(state, staff.snapshot())
     cwd = as_string(state.get("working_dir"))
-    production, unit = as_string(state.get("production")), as_string(state.get("unit"))
-    if production and unit:
-        return RunPlace(UnitWithoutRunningDirector(unit), ProductionWithoutRunningShowrunner(production), cwd)
     # Older runs may keep their identity only in the plan. Import the history
     # reader for that fallback, not for every lookup of recorded labels.
     from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit

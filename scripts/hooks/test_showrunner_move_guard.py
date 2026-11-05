@@ -11,6 +11,9 @@ import unittest
 from pathlib import Path
 from typing import Protocol, cast, override
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
 HOOK = Path(__file__).with_name("pre-tool-use-showrunner-move-guard.py")
 spec = importlib.util.spec_from_file_location("showrunner_move_guard", HOOK)
 assert spec is not None and spec.loader is not None
@@ -91,6 +94,10 @@ class SessionTest(unittest.TestCase):
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_text(
             f"TARGET=session:{SHOWRUNNER}\nCHECK=~/.claude/scripts/production/production_check.sh {doc}\n", encoding="utf-8")
+
+        _ = self.enterContext(isolated_staff_file(Path(root.name) / "staff.json", {}))
+        _ = fixture_member("showrunner", name="production", runtime_id=SHOWRUNNER,
+                           doc=staff.LiveDoc("natedev", doc))
 
     def run_hook(self, session_id: str, command: str, tool: str = "Bash") -> str:
         payload = {"session_id": session_id, "tool_name": tool, "tool_input": {"command": command}}

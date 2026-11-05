@@ -19,6 +19,7 @@ from unittest.mock import Mock, patch
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import live_units
 from scripts.production import showrunners
@@ -29,7 +30,7 @@ import style_units
 import style_ledger
 import display_cells
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, fixture_member
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id
 
 # Importable once unit_phases has put scripts/direct on the path.
 import phase_table
@@ -403,6 +404,7 @@ class UnitPhasesTests(unittest.TestCase):
         database.parent.mkdir(parents=True)
         with contextlib.closing(sqlite3.connect(database)) as connection, connection:
             _ = connection.executescript("""
+                CREATE TABLE rule_texts(blob TEXT, text BLOB);
                 CREATE TABLE tickets(id TEXT,unit TEXT,kind TEXT,family TEXT,rule TEXT,crate TEXT,
                     files TEXT,sites TEXT,rules TEXT,finding_ids TEXT,state TEXT,created_at TEXT);
                 CREATE TABLE held_findings(proposal TEXT,state TEXT,build_ticket TEXT,built_at TEXT);
@@ -423,14 +425,16 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIn("| names | active | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
         self.assertIn("| types | active | idle | idle | — | 0 | 0 | 0 |", output.getvalue())
 
-    def test_production_of_reads_the_timer_addressed_to_the_session(self) -> None:
+    def test_production_of_reads_the_staff_row_addressed_to_the_session(self) -> None:
         doc = self.root / "show-production.md"
         for name, target in (("showrunner-other", "session:someone-else"), ("showrunner-show", "session:caller")):
             directory = self.root / name
             directory.mkdir()
             _ = (directory / "conf").write_text(
                 f"TARGET={target}\nCHECK=zsh /opt/production_check.sh {doc}\n", encoding="utf-8")
-        self.assertEqual(showrunners.production_of("caller", self.root), doc)
+        caller = fixture_runtime_id("unit-phases-caller")
+        _ = fixture_member("showrunner", name="show", runtime_id=caller, doc=staff.LiveDoc("natedev", doc))
+        self.assertEqual(showrunners.production_of(caller, self.root), doc)
         self.assertIsNone(showrunners.production_of("nobody", self.root))
         self.assertIsNone(showrunners.production_of("", self.root))
 

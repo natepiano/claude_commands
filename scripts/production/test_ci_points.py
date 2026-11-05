@@ -204,9 +204,6 @@ class CiPointsTests(unittest.TestCase):
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Showrunner session:** test-showrunner",
             "- **Log:** `production.log`", "- **User zone:** America/Los_Angeles",
             "- **Updates:** every 15 minutes", "- **Push:** git", "",
-            "## Gates", "", "| Gate | Waiting | Waits on | Clears when |",
-            "| --- | --- | --- | --- |",
-            "| G1 | alpha-unit Phase 4 | beta-unit Phase 2 | checkpoint merged |", "",
             "## Production rules", "", "- CI runs on the production branch.", "",
         )))
 
@@ -622,9 +619,9 @@ PY
         state_list = produce.split("State:\n\n", 1)[1].split("\n\n", 1)[0]
         self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<STATE_DIR>/dailies_input_state`")
         calls = cast(list[tuple[str, str]], re.findall(
-            r"ci_points\.py\s+(due|watch|ci start|ci collect|notice clear|notice lift)\b([^`]*)`",
+            r"ci_points\.py\s+(due|watch|ci start|ci collect)\b([^`]*)`",
             produce, flags=re.DOTALL))
-        self.assertEqual(len(calls), 6, calls)
+        self.assertEqual(len(calls), 4, calls)
         stateful = [(command, body) for command, body in calls
                     if command in ("due", "watch", "ci start", "ci collect")]
         self.assertEqual(len(stateful), 4, calls)
@@ -958,23 +955,6 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(len(self.calls("send.py")), 0)
         self.assertEqual(self.log.read_text().count("review watch"), 1)
 
-    def test_notice_clear_names_waiting_unit_and_merge_hash(self) -> None:
-        tip = self.merge(2, unit="beta-unit")
-        result = self.run_ci("notice", "clear", "G1")
-        self.assert_step(result, "notice clear", True)
-        self.assertIn(f"send alpha-unit: From the showrunner: G1 clear — beta-unit phase 2 is on production as {tip}",
-                      result.stdout)
-
-    def test_notice_lift_requires_log_and_names_test_evidence(self) -> None:
-        missing = self.run_ci("notice", "lift", "G1")
-        self.assertEqual(missing.returncode, 2, missing.stdout + missing.stderr)
-        log = self.root / "scratch-test.log"
-        self.write(log, "tests passed\n")
-        lifted = self.run_ci("notice", "lift", "G1", "--log", str(log))
-        self.assert_step(lifted, "notice lift", True)
-        self.assertIn(f"send alpha-unit: From the showrunner: G1 lifted — your tests pass without beta-unit phase 2 ({log}). Continue.",
-                      lifted.stdout)
-
 
     def test_mixed_handoff_history_does_not_advance_the_ci_interval(self) -> None:
         for number in range(1, 5):
@@ -1002,13 +982,6 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         command = (self.stub_state / "validate-calls").read_text()
         self.assertIn("ci(example): validation fixes after alpha-unit phase 2", command)
         self.assertNotIn("hand-off", command)
-
-    def test_notice_clear_cannot_treat_a_child_named_like_the_target_as_a_unit_phase(self) -> None:
-        _ = self.git("commit", "--allow-empty", "-m", "Merge beta-unit hand-off (bbbbbbb) into production")
-        result = self.run_ci("notice", "clear", "G1")
-        self.assert_step(result, "notice clear", False)
-        self.assertIn("beta-unit phase 2 has no code merge", result.stdout)
-        self.assertNotIn("send alpha-unit", result.stdout)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ import phase_reservation  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.production.staff_test_support import (  # noqa: E402
-    fixture_runtime_id, fixture_worker, isolated_staff_file, unit_membership,
+    fixture_runtime_id, fixture_worker, fixture_unit_location, isolated_staff_file, showrunner_relationship, unit_membership,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -65,6 +65,7 @@ class BerthHookTests(unittest.TestCase):
     bin_dir: Path = Path()
     environment: dict[str, str] = {}
     held_head: str = ""
+    owner_id: staff.StaffId = staff.StaffId(fixture_runtime_id("berth-unit"))
 
     @override
     def setUp(self) -> None:
@@ -100,6 +101,9 @@ class BerthHookTests(unittest.TestCase):
             "HERDR_BIN": "/nonexistent/herdr",
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repo)
+        self.owner_id = owner.id
+        self.recorder_phases("15")
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
         # A test run from inside a seat inherits its run; each test names the run it wants.
         _ = self.environment.pop("UNIT_RUN_DIR", None)
@@ -120,6 +124,7 @@ class BerthHookTests(unittest.TestCase):
     def open_second_phase(self) -> None:
         """Phase 16 opens beside 15; each lists its files."""
         _ = self.state({"kind": "enrolled_awaiting_first_touch", "phase": "16"}, phase="16")
+        self.recorder_phases("15", "16")
         _ = (phase_reservation.phase_directory(self.session_dir, "15") / phase_reservation.FILES_FILE).write_text(
             "src/lib.rs\n")
         _ = (phase_reservation.phase_directory(self.session_dir, "16") / phase_reservation.FILES_FILE).write_text(
@@ -165,9 +170,9 @@ class BerthHookTests(unittest.TestCase):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         _ = (directory / "phases" / phase / "files").write_text("src/lib.rs\n")
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
-            "run_id": directory.name, "history_file": str(self.root / (directory.name + ".jsonl")),
-            "open_phases": [{"id": phase, "instance_id": "instance-" + phase, "status": "open"}],
-            "phase": {"id": phase, "instance_id": "instance-" + phase, "status": "open"},
+            "run_id": directory.name, "owner_staff_id": parent.id, "history_file": str(self.root / (directory.name + ".jsonl")),
+            "open_phases": [],
+            "phase": {"id": phase, "instance_id": "instance-" + phase, "status": "active"},
         }))
 
     def held_hook(self, patch: str) -> str:
@@ -288,6 +293,8 @@ class BerthHookTests(unittest.TestCase):
         directory.mkdir(parents=True)
         _ = (directory / phase_reservation.STATE_FILE).write_text(json.dumps(
             {"kind": "enrolled_awaiting_first_touch", "phase": "7"}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({
+            "owner_staff_id": self.owner_id, "phase": {"id": "7", "status": "active"}}))
         return run
 
     def test_a_seat_of_a_side_run_checks_its_own_runs_phase_not_the_markers(self) -> None:
@@ -388,6 +395,7 @@ class BerthHookTests(unittest.TestCase):
     def recorder_phases(self, *phases: str) -> None:
         records = [{"id": phase, "status": "active"} for phase in phases]
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "owner_staff_id": self.owner_id,
             "phase": records[-1] if records else {"id": "15", "status": "completed"},
             "open_phases": records[:-1]}))
 
@@ -468,6 +476,8 @@ class BerthHookTests(unittest.TestCase):
 
     def test_an_unreadable_recorder_state_checks_the_held_phases_without_a_traceback(self) -> None:
         state = self.session_dir / "progress_history_state.json"
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        _ = (directory / phase_reservation.WORKTREE_FILE).write_text(str(self.repo) + "\n")
         for content in ("not JSON", "[1]", "\udcff"):
             with self.subTest(content=content):
                 _ = state.write_bytes(content.encode("utf-8", "surrogateescape"))
@@ -670,7 +680,7 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in phase.iterdir()),
                          [phase_reservation.STATE_FILE, phase_reservation.BASELINE_FILE,
                           phase_reservation.BASELINE_STATUS_FILE])
-        self.assertEqual(sorted(path.name for path in self.session_dir.iterdir()), [phase_reservation.PHASES_DIR])
+        self.assertEqual(sorted(path.name for path in self.session_dir.iterdir()), [phase_reservation.PHASES_DIR, "progress_history_state.json"])
 
     def backstop(self, phase: str = "15") -> tuple[int, str]:
         _ = (phase_reservation.phase_directory(self.session_dir, phase) / phase_reservation.BASELINE_FILE).write_text(

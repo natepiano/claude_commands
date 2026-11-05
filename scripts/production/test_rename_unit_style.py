@@ -18,10 +18,9 @@ class UnitRenameStyleTests(UnitRenameFixture):
         self.write(worktree / "staff-held.txt", "The staff location holds this file.\n")
         parent = self.root / "parent-production.md"
         self.write(parent, "# Parent\n- **Merge branch:** demo\n")
-        self.write(self.doc, self.doc.read_text() + f"\n- **Parent production:** `{parent}`\n")
         with mock.patch.dict(os.environ, self.env):
             _ = recorded_showrunner("parent", parent)
-            owner = recorded_showrunner(SLUG, self.doc)
+            owner = recorded_showrunner(SLUG, self.doc, parent="parent")
             _ = fixture_unit_location(owner, "names-unit", worktree)
             with style_ledger.Ledger(self.checkout, database) as ledger:
                 holders = unit_files.unit_file_holders(self.checkout, self.doc, ledger)

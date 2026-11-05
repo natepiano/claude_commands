@@ -101,13 +101,16 @@ class PublishedWorker:
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
            run: Path | None = None, roster: Mapping[str, object] | None = None) -> staff.StaffRow:
-    """Resolve the run unit before using the caller or worker parents."""
+    """Resolve the recorded run owner or run unit before the roster and caller."""
     if run is not None:
         try:
             state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
         except (OSError, ValueError) as error:
             print(f"anomaly: {error}".replace("\n", " "), file=sys.stderr)
             state = {}
+        owner = unit_runs.run_owner(state, record)
+        if isinstance(owner, staff.StaffRow) and owner.kind in ("unit", "showrunner"):
+            return owner
         production = value if isinstance(value := state.get("production"), str) else ""
         unit = value if isinstance(value := state.get("unit"), str) else ""
     if unit:
@@ -128,7 +131,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             owner = record.parent_of(child) if child is not None else None
             if owner is not None:
                 return owner
-    row = record.by_current_session(staff_id)
+    row = record.by_current_session(staff_id) if staff_id else None
     if row is not None and row.kind == "worker":
         row = record.parent_of(row)
     if row is not None and row.kind in ("unit", "showrunner"):
