@@ -1404,16 +1404,12 @@ class Herdr:
         spaces = self.listed("workspace")
         tabs = self.listed("tab")
         panes = self.listed("pane")
+        found, known = self._row_panes(record, panes)
         owners: dict[str, list[str]] = {}
-        for pane in panes:
-            agent = pane.get("agent_session")
-            if not isinstance(agent, dict):
-                continue
-            native = cast(dict[str, object], agent).get("value")
-            row = record.by_current_session(native) if isinstance(native, str) else None
-            if row is not None:
+        for row_id, matches in found.items():
+            for pane in matches:
                 tab = json_text(pane.get("tab_id"), "herdr pane tab id")
-                owners.setdefault(tab, []).append(row.id)
+                owners.setdefault(tab, []).append(row_id)
         live: list[_LiveSpace] = []
         for space in spaces:
             workspace = json_text(space.get("workspace_id"), "herdr workspace id")
@@ -1425,8 +1421,9 @@ class Herdr:
                 live.append(_LiveSpace(workspace, label, identities))
         if live:
             saved = saved_layout(self.session)
-            for space in saved["workspaces"]:
-                space["tabs"] = [item for item in space["tabs"] if record.by_id(staff.StaffId(item["name"])) is not None]
+            if known:
+                for space in saved["workspaces"]:
+                    space["tabs"] = [item for item in space["tabs"] if record.by_id(staff.StaffId(item["name"])) is not None]
             _write_layout(self.session, merged_layout(saved, live, time.time()))
 
     def pane_tab(self, pane: str) -> tuple[str, int, SavedName]:
