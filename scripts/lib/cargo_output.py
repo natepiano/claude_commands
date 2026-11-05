@@ -5,7 +5,10 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import subprocess
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -20,12 +23,15 @@ class CargoOutputUnavailable:
     reason: str
 
 
-def read_cargo_output_roots(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
+def read_cargo_output_roots(checkout: Path, *, cargo: Sequence[str] = ("cargo",), options: Sequence[str] = (),
+                            environment: Mapping[str, str] | None = None
+                            ) -> CargoOutputRoots | CargoOutputUnavailable:
     """Keep missing output directories in a valid Cargo mapping."""
     try:
         result = subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            [*cargo, "metadata", "--format-version", "1", "--no-deps", *options],
             cwd=checkout, capture_output=True, text=True, check=False,
+            env=environment,
         )
         if result.returncode:
             return CargoOutputUnavailable(result.stderr.strip() or f"cargo metadata exited {result.returncode}")
