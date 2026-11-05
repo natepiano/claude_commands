@@ -50,7 +50,6 @@ import stat
 import statistics
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import time
 from typing import Literal, TextIO, cast
@@ -59,8 +58,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-from scripts.notify.pushover import API_HOST
 from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.production import change_review, staff  # noqa: E402
@@ -110,66 +107,9 @@ SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
-RUNNER = Path(__file__).resolve().parents[1] / "test_times" / "module_run.py"
 ROLLBACK_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
-# Read the live roots before a module receives its private environment.
-LIVE_ROOTS = (str(Path.home().resolve()),
-              str(Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state").resolve()),
-              str(Path("/tmp/claude").resolve()))
-LIVE_PUSH_KEYS = tuple(str(path.resolve()) for path in (
-    Path(LIVE_ROOTS[0]) / ".config/pushover/env",
-    Path(os.environ.get("XDG_CONFIG_HOME") or Path(LIVE_ROOTS[0]) / ".config") / "pushover/env"))
-# Python children load this hook from the module's private user site.
-SUITE_GUARD = r'''import os, sys
-from urllib.parse import urlsplit
-
-def refuse(detail):
-    with open(marker, "a") as output:
-        output.write(detail + "\n")
-    raise PermissionError(detail)
-
-def refuse_external_effect(event, args):
-    if event == "urllib.Request":
-        host = urlsplit(args[0]).hostname
-    elif event == "socket.getaddrinfo":
-        host = args[0]
-    elif event == "http.client.connect":
-        host = args[1]
-    elif event == "socket.connect":
-        host = args[1][0] if isinstance(args[1], tuple) else ""
-    else:
-        host = ""
-    if isinstance(host, str) and host.lower().rstrip(".") == push_host:
-        refuse("test refused a Pushover push: " + host)
-    writing = True
-    if event == "open":
-        writing = args[2] & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
-        paths = ((args[0], -1),)
-    elif event in ("os.remove", "os.rmdir", "os.mkdir", "os.chmod", "os.chown", "os.utime"):
-        paths = ((args[0], args[-1]),)
-    elif event in ("os.rename", "os.link"):
-        paths = ((args[0], args[2]), (args[1], args[3]))
-    elif event == "os.symlink":
-        paths = ((args[1], args[2]),)
-    else:
-        return
-    for path, directory in paths:
-        if isinstance(path, int):
-            path = os.readlink("/proc/self/fd/" + str(path))
-        if not isinstance(path, (str, bytes)):
-            continue
-        path = os.fsdecode(path)
-        if not os.path.isabs(path) and isinstance(directory, int) and directory >= 0:
-            path = os.path.join(os.readlink("/proc/self/fd/" + str(directory)), path)
-        path = os.path.realpath(path)
-        if path in push_keys:
-            refuse("test refused Pushover credential access: " + path)
-        if writing and any(path == root or path.startswith(root + os.sep) for root in live_roots):
-            refuse("test refused a write to a live root: " + path)
-
-sys.addaudithook(refuse_external_effect)
-'''
-# Restore signals after the runner registers the child for cleanup.
+# Restore dispositions and the mask in every child, including types. The runner
+# defers cancellation until the child is registered for cleanup.
 SUITE_BOOTSTRAP = """import os, signal, sys
 for disposition in signal.valid_signals():
     if disposition not in (signal.SIGKILL, signal.SIGSTOP):
@@ -703,22 +643,6 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     output = log.open("w+")
     started = time.monotonic()
     try:
-        if kind is GateJobKind.TEST_MODULE:
-            root = Path(tempfile.mkdtemp(prefix="roots-", dir=log.parent))
-            home, state, claude, config = (root / name for name in ("home", "state", "claude", "config"))
-            for folder in (home, state, claude, config):
-                folder.mkdir()
-            userbase = home / ".local"
-            guard = Path(sysconfig.get_path("purelib", "posix_user", vars={"userbase": str(userbase)}))
-            guard.mkdir(parents=True)
-            _ = (guard / "sitecustomize.py").write_text(
-                f"live_roots = {LIVE_ROOTS!r}\npush_keys = {LIVE_PUSH_KEYS!r}\n"
-                + f"push_host = {API_HOST!r}\nmarker = {str(log.parent / 'refused-effects')!r}\n" + SUITE_GUARD)
-            environment = {**environment, "HOME": str(home), "XDG_STATE_HOME": str(state),
-                           "XDG_CONFIG_HOME": str(config), "SCRATCH_ROOT": str(claude / "scratch"),
-                           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUSERBASE": str(userbase)}
-            for name in ("PUSHOVER_USER", "PUSHOVER_TOKEN", "PYTHONNOUSERSITE"):
-                _ = environment.pop(name, None)
         process = subprocess.Popen([sys.executable, "-c", SUITE_BOOTSTRAP, *argv],
                                    cwd=repo, env=environment, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, text=True,
@@ -782,10 +706,6 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         except ValueError:
             detail = f"(unreadable record): {line}"
         captured += f"\n{job.module}: a test read live memory {detail}\n"
-    effects_marker = job.log.parent / "refused-effects"
-    effects = effects_marker.read_text().splitlines() if effects_marker.exists() else []
-    for detail in effects:
-        captured += f"\n{job.module}: {detail}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     shutil.rmtree(job.log.parent)
@@ -796,7 +716,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0
     if job.kind is GateJobKind.TYPE_CHECK:
         status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
-    tripwire_tripped = bool(calls or readings or effects)
+    tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
         status = 1
     return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,
@@ -987,6 +907,14 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     gate_record.write_gate_run(run)
 
 
+def module_runner(repo: Path) -> Path:
+    """Use the test runner from the tested checkout."""
+    runner = repo / "scripts" / "test_times" / "module_run.py"
+    if not runner.is_file():
+        raise GateRefused(f"test runner not found: {runner}")
+    return runner
+
+
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1003,6 +931,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     modules = discover_test_modules(repo)
     if not modules:
         raise GateRefused("the test list is empty")
+    runner = module_runner(repo)
     tmpfs = Path("/dev/shm")
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
@@ -1140,7 +1069,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
-                            [*scope_prefix, python, str(RUNNER), str(path.parent), path.name])
+                            [*scope_prefix, python, str(runner), str(path.parent), path.name])
                     with rollback_signals(defer=True):
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)

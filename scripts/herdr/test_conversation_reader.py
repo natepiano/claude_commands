@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sys
+import time
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, override
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import herdr
 from scripts.agents import codex_mesh
 from scripts.lib import unit_runs
+from scripts.lib import operation_deadline
 from scripts.message import sessions
 from scripts.production import fake_unit_host
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
@@ -76,8 +78,68 @@ class ConversationReaderTests(StaffTestCase):
         self.codex(rollout=False)
         with patch.object(herdr, "_process_display_name", return_value="test-tab"):
             observed = herdr.read_conversation(self.launched, "codex")
-        self.assertEqual(observed, herdr.UnknownConversation("test-tab (Codex thread unknown)"))
+        self.assertEqual(observed, herdr.UnknownConversation(
+            f"{self.launched} is not proved live or stopped: 1 processes unknown, first: test-tab (Codex thread unknown)"))
         self.assertEqual(herdr.native_process(998071, "codex").identity, herdr.LaunchArgument(self.launched))
+
+    def test_supplied_snapshot_matches_fresh_live_unknown_and_stopped_reads(self) -> None:
+        self.codex()
+        for evidence in (herdr.RolloutThread(self.identity), herdr.LaunchArgument(self.launched),
+                         herdr.RolloutThread("other-thread")):
+            with (self.subTest(evidence=evidence),
+                  patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(evidence, "1", {})),
+                  patch.object(herdr, "_process_display_name", return_value="test-tab")):
+                fresh = herdr.read_conversation(self.identity, "codex")
+                snapshot = herdr.codex_conversations()
+                with patch.object(herdr, "codex_conversations") as scan:
+                    self.assertEqual(herdr.read_conversation(self.identity, "codex", codex=snapshot), fresh)
+                    self.assertEqual(herdr.read_conversation(self.identity, codex=snapshot), fresh)
+                scan.assert_not_called()
+                if isinstance(evidence, herdr.LaunchArgument):
+                    self.assertIsInstance(fresh, herdr.UnknownConversation)
+                elif evidence.id == self.identity:
+                    self.assertEqual(fresh, herdr.LiveConversation("codex", (998071,)))
+                else:
+                    self.assertEqual(fresh, herdr.StoppedConversation())
+
+    def test_claude_read_ignores_codex_snapshot_and_never_scans(self) -> None:
+        with (patch.object(herdr, "codex_conversations") as scan,
+              patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(998071))):
+            snapshot = herdr.CodexConversations({self.identity: (998072,)}, ("test-tab (Codex thread unknown)",))
+            self.assertEqual(herdr.read_conversation(self.identity, "claude", codex=snapshot), herdr.LiveConversation("claude", (998071,)))
+            self.assertEqual(herdr.read_conversation(self.identity, "claude"), herdr.LiveConversation("claude", (998071,)))
+        scan.assert_not_called()
+
+    def test_running_threads_uses_a_supplied_snapshot_and_reports_each_unknown_once(self) -> None:
+        snapshot = herdr.CodexConversations({self.identity: ()}, ("test-tab unknown", "test-tab unknown"))
+        with (patch.object(herdr, "codex_conversations") as scan,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(herdr.running_codex_threads(thread_host=lambda _argv: False, codex=snapshot), {self.identity})
+        scan.assert_not_called()
+        self.assertEqual(errors.getvalue(), "anomaly: test-tab unknown; not blocking\n")
+
+    def test_snapshot_scan_keeps_the_operation_deadline(self) -> None:
+        run = self.runs / "test-run"
+        run.mkdir()
+        (run / codex_mesh.SERVER_FILE).touch()
+        with (operation_deadline.within(deadline := time.monotonic() + 0.5),
+              patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded):
+            snapshot = herdr.codex_conversations()
+        self.assertEqual(snapshot.live, {self.identity: ()})
+        self.assertLessEqual(cast(float, loaded.call_args.args[1]), deadline + 0.001)
+
+    def test_unknown_other_process_names_the_target_first(self) -> None:
+        unknown = ["morty (Codex thread unknown)\nprivate detail", "other (Codex thread unknown)", "pid 42 (Codex thread unknown)"]
+        with patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, tuple(unknown))):
+            observed = herdr.read_conversation(self.identity, "codex")
+        self.assertIsInstance(observed, herdr.UnknownConversation)
+        assert isinstance(observed, herdr.UnknownConversation)
+        self.assertEqual(observed.reason, f"{self.identity} is not proved live or stopped: "
+                         + "3 processes unknown, first: morty (Codex thread unknown) private detail")
+        self.assertEqual(len(observed.reason.splitlines()), 1)
+        with redirect_stderr(io.StringIO()) as output:
+            herdr.conversation_note(observed)
+        self.assertEqual(output.getvalue().count(self.identity), 1)
 
     def test_complete_read_proves_stopped_for_both_runtimes(self) -> None:
         for kind in ("claude", "codex", ""):

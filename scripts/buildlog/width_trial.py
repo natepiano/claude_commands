@@ -491,8 +491,7 @@ def report(since: float, until: float, host: str = "natedev", root: Path | None 
     configuration = read_memory_config()
     r_values: dict[int | None, float | None] = {
         width: expected_peak(repository, "nextest", host, datetime.fromtimestamp(until, UTC), root, width,
-                             first_peak_bytes=configuration.program_first_peaks["cargo"],
-                             budget=configuration.build_budget_bytes).bytes / GIB
+                             first_peak_bytes=configuration.program_first_peaks["cargo"]).bytes / GIB
         for width in widths
     }
 

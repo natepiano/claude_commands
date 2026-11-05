@@ -1,12 +1,5 @@
 # builds-report — next items
 
-## Each test step's row records the memory charge admission gave its test phase
-- **Starts when:** resources-unit's test-phase entry charge lands in admission's reservation (its parked Phase 15 follow-up). Showrunner disposition 2026-10-30: next.
-- **Target:** `scripts/buildlog/record.py` (`test_phase_context`).
-- **Need:** every step row records `test_phase_charge` null today, because admission has no test-phase entry-charge field.
-- **Completion:** `record.test_phase_context` copies the charge (bytes, history cutoff, form, contributing widths) from the reservation into the row's `test_phase_charge` and computes nothing. Test: a reservation with the field records it for terminal and tee steps; a reservation without it records null.
-- **Source phase:** 4c.
-
 ## Admission reads the builds slice's memory from the one shared reader
 - **Starts when:** the shared cgroup reader is deployed on main. The showrunner assigns `memory_admit.py`'s owner. Showrunner disposition 2026-10-30: next.
 - **Target:** `scripts/lint/memory_admit.py` (`sccache_memory`).
@@ -28,24 +21,19 @@
 - **Completion:** a bevy_brp launch on natedev shows its absolute target folder in the build log index.
 - **Source phase:** 11 (simplify item 24).
 
-## Recorder sampling and Mac offload no longer load memory_admit
-- **Starts when:** queue 10z merges to builds, after natest P10 is on builds. Four units edit `memory_admit.py` now. Showrunner disposition 2026-11-04: next, report-unit owns it as one phase.
-- **Target:** `record.test_phase_context`, `record.admission_metadata`, `memory_admit.sampling_context`, and `offload.repository_identity` (`scripts/mac_test/offload.py`).
-- **Need:** Phase 16 moved width parsing (`parse.test_threads`) and the repository key (`record.remote_identity`) out of memory_admit. Tagged sampling calls still load memory_admit (`record.py` test-phase-context). `offload.repository_identity` imports all of memory_admit and runs 2-3 git processes to read one key.
-- **Constraints:** reuse `parse.test_threads` and `record.remote_identity`. Keep repository keys and the sampling inputs unchanged.
-- **Completion:** neither recorder sampling nor Mac repository identity loads memory_admit. Tests cover sampling output, old tagged calls, missing calls, remote keys and root keys. The recorded rows are unchanged. The phase notice gives the CPU per step before and after.
+## Mac offload reads the repository key without loading memory_admit
+- **Starts when:** queue 10z merges to builds. Four units edit `memory_admit.py` now. Showrunner disposition 2026-11-04: next, report-unit owns it as one phase.
+- **Target:** `offload.repository_identity` (`scripts/mac_test/offload.py:902`).
+- **Need:** `offload.repository_identity` imports all of memory_admit and runs 2-3 git processes to read one key. The recorder no longer loads memory_admit (Phases 16 and 18).
+- **Constraints:** reuse `record.recorded_repository_key` or `record.remote_identity`. Keep repository keys unchanged.
+- **Completion:** Mac offload does not load memory_admit. A test pins the keys for remote and root identities. The phase notice gives the CPU per call before and after.
 - **Source phase:** 16 (simplify items 10 and 13).
 
 ## The recorder takes the build folders from verify.sh
-- **Starts when:** verify-unit's remake of `verify.sh` merges (ETA 2026-11-04 20:30). Tell verify-unit at the start. Showrunner disposition 2026-11-04: next, report-unit owns both sides.
+- **Starts when:** verify-unit's remake of `verify.sh` merges (ETA 2026-11-05 01:30 EST). Tell verify-unit at the start. Showrunner disposition 2026-11-04: next, report-unit owns both sides.
 - **Target:** `scripts/buildlog/record.py` (`record.step`), `scripts/direct/verify.sh` (`GATE_METADATA`).
 - **Need:** `record.step` runs `cargo metadata` (30-120 ms CPU) and `rustc -V` (10-17 ms) on every step. `verify.sh` already knows `target_directory` and `build_directory`.
-- **Completion:** verify.sh passes the folders; the recorder runs `cargo metadata` only when they are missing. The phase notice gives the CPU per step before and after.
+- **Completion:** verify.sh passes the folders with evidence of the Cargo inputs that produced them. The recorder checks that evidence through `step_context` before it uses the folders. Missing or stale evidence uses the Phase 19 reader (`step_context.step_output_roots`). Keep the mismatch diagnostic and the saved pairs of pending retries. Test env wrappers, manifests, CLI config, target overrides, and a config change between steps. The phase notice gives the CPU per step from an interleaved A/B run against the prior checkpoint.
+- **Target also:** `scripts/buildlog/step_context.py` (Phase 19 moved the output-folder read there).
 - **Source phase:** 16 (simplify item 11).
 
-## Each memory tick writes one row
-- **Starts when:** natest P10 is on builds (the showrunner says when). Showrunner disposition 2026-11-04: next.
-- **Target:** `scripts/buildlog/index.py` (a `zram` column in `SAMPLE_COLUMNS`, schema version bump), `scripts/buildlog/sample.py`, `scripts/buildlog/memory.py`, `scripts/buildlog/cli.py`.
-- **Need:** each tick writes kind, at and host twice through two writers; the tick snapshot row holds only zram.
-- **Completion:** the sample row carries zram; the tick `memory_snapshot` row, `write_snapshot`, `tick_snapshot` and `TickMemorySnapshot` are gone; `memory_snapshot` stays only for `buildlog snapshot`. Old logs give the same report. About 105 KB/day less.
-- **Source phase:** 17 (simplify item 1).

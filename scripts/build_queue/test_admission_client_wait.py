@@ -38,10 +38,10 @@ def wait_client_main() -> int:
     clock.epoch = time.time()
     def estimate(argv: list[str], cwd: str, profile: gate.InferFromArgv | gate.StepProfile | gate.ProgramProfile,
                  now: datetime | Callable[[], datetime], root: Path, policy: gate.AdmissionPolicy, *,
-                 first_peak_bytes: int, budget: int,
+                 first_peak_bytes: int,
                  build_history_generation: Callable[[], gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration]
                  = gate.no_build_history_generation) -> gate.StepEstimate:
-        _ = argv, cwd, profile, now, root, policy, first_peak_bytes, budget, build_history_generation
+        _ = argv, cwd, profile, now, root, policy, first_peak_bytes, build_history_generation
         previous = calls.read_text().splitlines() if calls.exists() else []
         action = actions[min(len(previous), len(actions) - 1)]
         owner = int(sys.argv[sys.argv.index("--pid") + 1])
@@ -53,7 +53,7 @@ def wait_client_main() -> int:
         if action == "admit":
             path = Path(os.environ["BUILDLOG_MEMINFO"])
             _ = path.write_text(f"MemTotal: {60 * gate.GIB // 1024} kB\nMemAvailable: {60 * gate.GIB // 1024} kB\n")
-            _ = Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text("full avg10=0 total=0\n")
+            _ = Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text("full avg10=0 total=0\nsome avg10=0\n")
         peak = gate.ExpectedPeak(7 * gate.GIB,
             cast(gate.NeedSource, "future-source") if action == "unknown" else "measured", 5)
         return gate.StepEstimate(gate.StepProfile("fixture", "nextest", "tree", peak,
@@ -76,7 +76,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.root = self.admission.root
         self.admission.clock.epoch = time.time()
         self.admission.free(60 * gate.GIB)
-        _ = (self.root / "pressure").write_text("full avg10=10 total=0\n")
+        _ = (self.root / "pressure").write_text("full avg10=10 total=0\nsome avg10=0\n")
         self.grants = []
         self.grant_charges = []
         self.environment = {**os.environ,
@@ -95,7 +95,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
                 observations = [cast(CheckerCall, json.loads(line)) for line in calls.read_text().splitlines()]
                 observations[-1]["rows"] = {str(waiting.row["pid"]): waiting.row.copy()
                     for waiting in self.admission.server.waiters.values()}
-                _ = calls.write_text("".join(json.dumps(row) + "\n" for row in observations))
+                _ = calls.write_text("".join(json.dumps(gate.snapshot_value(row)) + "\n" for row in observations))
             if isinstance(reply, wire.Admitted):
                 self.grants.append(reply)
                 self.grant_charges.append(tuple((record.reservation_id, record.need)
@@ -159,11 +159,11 @@ class AdmissionClientWaitTests(unittest.TestCase):
             self.assertEqual(len(call["rows"]), 1)
             path, row = next(iter(call["rows"].items()))
             self.assertEqual(row["pid"], call["pid"])
-            self.assertIn("priority_since", row)
-            assert "priority_since" in row
-            places.append((path, row["pid"], row["since"], row["priority_since"]))
+            self.assertIn("order_since", row)
+            assert "order_since" in row
+            places.append((path, row["pid"], row["since"], row["order_since"]))
         self.assertEqual(places[0], places[1])
-        self.assertEqual((places[1][:3], places[1][3] < places[2][3]), (places[2][:3], True))
+        self.assertEqual(places[1], places[2])
         self.assertEqual(calls[-1]["rows"], {})
         # A reconnect can replay a grant while the client refreshes its estimate.
         self.assertEqual(len({grant.reservation for grant in self.grants}), 1)
