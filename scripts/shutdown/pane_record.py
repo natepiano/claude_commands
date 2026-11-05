@@ -4,6 +4,7 @@ Each herdr session has one file under `~/.local/state/herdr-panes`.
 The file keeps the account, flags, and environment for each pane. Staff supplies each unit folder.
 The Claude SessionStart hook records Claude launches.
 The normal herdr start path records Codex launches after it proves the foreground process.
+The seed command records plain Codex clients through their tab's staff row.
 
 Stored member references use fixed staff ids.
 Runtime observations prove the current conversation before a stop or resume.
@@ -249,7 +250,7 @@ def forget_unit(unit_id: str) -> list[str]:
 
 def _needed(name: str) -> bool:
     """An environment name a record reads; the value of any other name is dropped as it is read."""
-    return name == "CLAUDE_CONFIG_DIR" or name in KEPT_NAMES
+    return name in {"CLAUDE_CONFIG_DIR", "CODEX_HOME"} or name in KEPT_NAMES
 
 
 def _environment(parts: Sequence[bytes]) -> dict[str, str]:
@@ -349,8 +350,21 @@ def _conversation_of(config_dir: str, pid: int) -> str:
     return session_id if isinstance(session_id, str) else ""
 
 
+def codex_client_session(client: herdr.Herdr, pane_id: str) -> str:
+    """Read the current thread from the staff row named by the client's tab."""
+    from scripts.production import staff
+
+    try:
+        reference = client.pane_tab(pane_id)[2]["name"]
+        record = staff.initial_snapshot()
+    except (OSError, ValueError, herdr.HerdrFailure):
+        return ""
+    owner = record.by_member_reference(reference) or record.by_path(reference)
+    return owner.current_session if owner is not None else ""
+
+
 def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = None) -> int:
-    """Write the entry of each pane whose foreground runs Claude; name each pane it cannot read."""
+    """Record Claude and Codex panes; name each pane whose conversation cannot be read."""
     client = herdr.Herdr(session)
     for pane in client.panes():
         pane_id = pane["pane_id"]
@@ -361,26 +375,29 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
         processes = [herdr.json_object(item, context) for item in herdr.json_items(info.get("foreground_processes"), context)]
         found = [item for item in processes
                  if isinstance(argv := item.get("argv"), list)
-                 and herdr.is_claude_process([str(part) for part in cast(list[object], argv)])]
+                 and (herdr.is_claude_process([str(part) for part in cast(list[object], argv)])
+                      or herdr.is_codex_process([str(part) for part in cast(list[object], argv)]))]
         if not found:
             continue
+        arguments = [str(part) for part in cast(list[object], found[0].get("argv"))]
+        kind: Literal["claude", "codex"] = "codex" if herdr.is_codex_process(arguments) else "claude"
         pid = found[0].get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int):
-            print(f"{pane_id}: no Claude process id")
+            print(f"{pane_id}: no {kind} process id")
             continue
-        arguments = [str(part) for part in cast(list[object], found[0].get("argv"))]
         try:
             environment = _process_environment(pid)
         except (OSError, ValueError) as error:
             print(f"{pane_id}: cannot read the environment of {pid}: {error}")
             continue
         config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-        session_id = _conversation_of(config_dir, pid)
+        session_id = (codex_client_session(client, pane_id) if kind == "codex"
+                      else _conversation_of(config_dir, pid))
         if not session_id:
             print(f"{pane_id}: no conversation id for {pid}")
             continue
         cwd = found[0].get("cwd")
-        entry = launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments)
+        entry = launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments, kind=kind)
         entry["pid"] = pid
         started = sessions.process_start(pid)
         if not started:
@@ -393,7 +410,7 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Write the pane launch entries of the Claudes running now.")
+    parser = argparse.ArgumentParser(description="Record the Claude and Codex panes running now.")
     _ = parser.add_argument("command", choices=["seed"])
     _ = parser.add_argument("--session", default="")
     options = parser.parse_args()
