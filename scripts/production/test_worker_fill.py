@@ -88,7 +88,7 @@ class WorkerFillTests(StaffTestCase):
                 _ = evidence.write_text("{malformed unrelated evidence")
                 self.assertEqual(staff.find(kind="worker", parent=parent.id), [])
                 with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": parent.id}):
-                    allowed = worker_admission.admit("impl", run, role="impl")
+                    allowed = worker_admission.admit("impl", run)
                     self.assertEqual(staff.find(kind="worker", parent=parent.id), [])
                     admitted = worker_admission.publish(allowed, fixture_runtime_id("published-test-worker"))
                 self.assertEqual(admitted.row.parent, staff.ReportsTo(parent.id))
@@ -105,7 +105,7 @@ class WorkerFillTests(StaffTestCase):
         _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=parent.worktree)
         run = self.worker_run("demo", "models-unit", "director")
         with redirect_stderr(io.StringIO()) as errors:
-            allowed = worker_admission.admit("impl", run, role="impl")
+            allowed = worker_admission.admit("impl", run)
         self.assertEqual(allowed.parent, parent.id)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn("retired", errors.getvalue())

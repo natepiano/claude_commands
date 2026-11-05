@@ -144,7 +144,7 @@ from scripts.production.staff_test_support import fixture_runtime_id, fixture_se
 from scripts.shutdown import stop_resume
 args = sys.argv[1:]
 run = Path(args[args.index("--session-dir") + 1])
-allowed = admission.admit(args[args.index("--name") + 1], run, role="impl")
+allowed = admission.admit(args[args.index("--name") + 1], run)
 row = allowed.slot.row
 def start(handoff):
     identity = fixture_runtime_id("destination:" + row.id + "codex")

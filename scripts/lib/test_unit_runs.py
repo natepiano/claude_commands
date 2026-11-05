@@ -119,6 +119,34 @@ class UnitRunsTest(StaffTestCase):
                 self.assertEqual(unit_runs.main(["held", fixture_runtime_id("sid-me"), "--root", str(new), "--active", str(active)]), 0)
             self.assertEqual(shown.getvalue().splitlines(), [str(new / "run-marked"), str(new / "run-side")])
 
+    def test_held_scan_excludes_marker_folders_from_both_default_roots(self) -> None:
+        current, former = self.root / "unit", self.root / "delegate"
+        session = fixture_runtime_id("director")
+        for root in (current, former):
+            (root / "active").mkdir(parents=True)
+            for name in ("z-run", "a-run"):
+                run = root / name
+                run.mkdir()
+                self.staff_owner(run, session)
+        (former / "duplicate").symlink_to(current / "a-run", target_is_directory=True)
+        before = [list((root / "active").iterdir()) for root in (current, former)]
+        with patch.object(unit_runs, "RUN_ROOT", current), patch.object(unit_runs, "FORMER_RUN_ROOT", former):
+            found = unit_runs.held_by_session()
+        self.assertEqual(found, {session: [str(current / "a-run"), str(current / "z-run"),
+                                          str(former / "a-run"), str(former / "z-run")]})
+        self.assertEqual([list((root / "active").iterdir()) for root in (current, former)], before)
+
+    def test_held_scan_excludes_the_override_roots_marker_folder(self) -> None:
+        root = self.root / "override"
+        (root / "active").mkdir(parents=True)
+        run = root / "run"
+        run.mkdir()
+        session = fixture_runtime_id("director")
+        self.staff_owner(run, session)
+        before = list((root / "active").iterdir())
+        self.assertEqual(unit_runs.held_by_session(root), {session: [str(run)]})
+        self.assertEqual(list((root / "active").iterdir()), before)
+
     def test_shared_scan_keeps_a_late_marker_first_without_rereading_directors(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root, active = Path(folder) / "runs", Path(folder) / "active"

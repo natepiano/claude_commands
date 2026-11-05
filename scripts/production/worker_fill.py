@@ -18,7 +18,7 @@ from scripts.agents import worker_lifecycle
 def coordinate_claude(name: str, run: Path, prompt: Path, reference: str = "") -> int:
     """Hold the row until the Bash parent confirms dispatch."""
     wait_seconds = conf.read("direct").whole("CLAUDE_WORKER_REGISTER_WAIT_SECS")
-    allowed = worker_admission.admit(name, run, role="", reference=reference)
+    allowed = worker_admission.admit(name, run, reference=reference)
     request = worker_admission.assignment_id(prompt)
     started = False
 

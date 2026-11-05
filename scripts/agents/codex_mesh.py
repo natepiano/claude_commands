@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Pr
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
+from scripts.direct.worker_state import ROSTER_LIVE
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 from scripts.agents import worker_lifecycle
 from scripts.lib.agent_scope import agent_scope_prefix
@@ -3655,7 +3656,7 @@ def command_start(args: argparse.Namespace) -> int:
     name = _as_str(_attr(args, "name"))
     resident = getattr(args, "resident", False) is True
     try:
-        staff_admission = worker_admission.admit(name, Path(session_dir), role=_as_str(_attr(args, "role")) or "impl", reference=_as_str(_attr(args, "staff_id")))
+        staff_admission = worker_admission.admit(name, Path(session_dir), reference=_as_str(_attr(args, "staff_id")))
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -6115,8 +6116,8 @@ def _start_turn(
     allowed: WorkerStartAllowed | None = None
     accepted = ""
     if request:
-        allowed = worker_admission.admit(_as_str(_attr(args, "name")), Path(client.session_dir), role="",
-                                        reference=_as_str(_attr(args, "staff_id")))
+        allowed = worker_admission.admit(_as_str(_attr(args, "name")), Path(client.session_dir),
+                                         reference=_as_str(_attr(args, "staff_id")))
         previous = worker_admission.dispatch_record(allowed)
         if previous.assignment_id == request:
             if previous.state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
@@ -6620,7 +6621,7 @@ def command_reopen(args: argparse.Namespace) -> int:
         launcher = _as_int(record.get("launcher_pid"))
         revision = _roster_revision(record)
         reason = ""
-        if status not in ("ended", "running", "starting"):
+        if status not in ROSTER_LIVE | {"ended"}:
             reason = "worker is not ended, running or starting"
         elif not thread_id:
             reason = "missing thread id"
@@ -6636,7 +6637,7 @@ def command_reopen(args: argparse.Namespace) -> int:
             reason = _recovery_idle_reason(session_dir, name, thread_id)
             recovered_idle = not reason
         if reason:
-            prefix = "launcher died; " if status in ("running", "starting") and launcher > 0 and not _pid_alive(launcher) else ""
+            prefix = "launcher died; " if status in ROSTER_LIVE and launcher > 0 and not _pid_alive(launcher) else ""
             print(f"codex_mesh: {name}: {prefix}{reason}; pending work kept; reopen refused", file=sys.stderr)
             return 2
         path = _session_path(session_dir, ROSTER_FILE)
@@ -6802,7 +6803,7 @@ def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
                      effort: str = "", configuration: models_registry.LaunchModelConfiguration) -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
     try:
-        admitted = worker_admission.admit(name, Path(session_dir), role=role)
+        admitted = worker_admission.admit(name, Path(session_dir))
     except ValueError as error:
         raise unit_workers.WorkerUnavailable(str(error)) from error
     with worker_admission.worker_operation(admitted):
@@ -6884,7 +6885,7 @@ def command_adopt(args: argparse.Namespace) -> int:
     destination = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     record = _lookup(source, name)
-    parent = worker_admission.admit(name, Path(destination), role=_as_str(session_staff.worker_name(record)))
+    parent = worker_admission.admit(name, Path(destination))
     _ = staff.move(staff.StaffId(_as_str(record.get("staff_id"))), staff.ReportsTo(parent.parent))
     return 0
 
@@ -7065,7 +7066,7 @@ def _pause_roster_locked(session_dir: str, workers: BulkWorkers) -> None:
             continue
         if status != "paused":
             record.update({"status": "paused", "paused_from": status,
-                           "paused_turn": status in ("running", "starting")})
+                           "paused_turn": status in ROSTER_LIVE})
         _advance_roster_revision(record)
         roster[name] = record
     _publish_bulk_records(session_dir, roster, deadline=workers.deadline)
@@ -9077,11 +9078,9 @@ def _failure_account_detail(error: BaseException, serving: CodexServingState) ->
     return f"{name} ({codex_home_display(serving.home)}): {error}"
 
 
-def _admit_worker(name: str, session_dir: str, *, held_design: str = "", held_role: str = "",
-                  role: str = "impl") -> WorkerStartAllowed:
+def _admit_worker(name: str, session_dir: str, *, held_design: str = "") -> WorkerStartAllowed:
     """Use the staff parent of an existing worker, or admit a new worker."""
     recorded = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    role = held_role or _as_str(recorded.get("held_role")) or role
     held = held_design or _as_str(recorded.get("held_design_id"))
     if held and recorded.get("staff_id"):
         from scripts.astra import design_roles
@@ -9095,7 +9094,7 @@ def _admit_worker(name: str, session_dir: str, *, held_design: str = "", held_ro
         if row is None or row.parent != staff.ReportsTo(owner.id):
             raise ValueError("design worker membership is unavailable")
         return WorkerStartAllowed(row.name, owner.id, Path(session_dir), worker_admission.ExistingWorkerSlot(row))
-    return worker_admission.admit(name, Path(session_dir), role=role)
+    return worker_admission.admit(name, Path(session_dir))
 
 
 def command_prime(args: argparse.Namespace) -> int:
@@ -9103,9 +9102,7 @@ def command_prime(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     try:
-        admitted = _admit_worker(name, session_dir, held_design=_as_str(_attr(args, "held_design")),
-                                 held_role=_as_str(_attr(args, "held_role")),
-                                 role=_as_str(_attr(args, "role")) or "review")
+        admitted = _admit_worker(name, session_dir, held_design=_as_str(_attr(args, "held_design")))
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -9215,7 +9212,7 @@ def command_fork(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     try:
-        admitted = worker_admission.admit(name, Path(session_dir), role="review")
+        admitted = worker_admission.admit(name, Path(session_dir))
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -9490,7 +9487,6 @@ def main(argv: list[str] | None = None) -> int:
     prime = subparsers.add_parser("prime", help="create a read-only reviewer template without a turn")
     _ = prime.add_argument("--session-dir", required=True)
     _ = prime.add_argument("--name", required=True)
-    _ = prime.add_argument("--role", choices=WORKER_ROLES, default="review")
     _ = prime.add_argument("--instructions-file", required=True)
     _ = prime.add_argument("--model", default="")
     _ = prime.add_argument("--effort", default="")

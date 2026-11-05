@@ -1724,7 +1724,7 @@ class MeshCommandFixture(unittest.TestCase):
         return [request for request in self.server.requests if request.get("method") == method]
 
     def run_worker(self, args: argparse.Namespace, port: int, *, started_here: bool = False) -> codex_mesh.RunOutcome:
-        allowed = worker_admission.admit(cast(str, args.name), self.session_dir, role=cast(str, args.role))
+        allowed = worker_admission.admit(cast(str, args.name), self.session_dir)
         return codex_mesh._run_worker(args, port, staff_admission=allowed, started_here=started_here)  # pyright: ignore[reportPrivateUsage]
 
     def run_start(self) -> tuple[int, str]:
@@ -2125,7 +2125,7 @@ class StaffAdmissionTests(MeshCommandFixture):
 
     def test_interrupted_dispatch_uses_delivery_evidence_before_submission(self) -> None:
         self.assertEqual(self.run_start(), (0, ""))
-        allowed = worker_admission.admit("worker", self.session_dir, role="impl")
+        allowed = worker_admission.admit("worker", self.session_dir)
         request = worker_admission.assignment_id(self.session_dir / "prompt.txt")
         self.assertTrue(request)
         worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
@@ -2218,14 +2218,14 @@ class StaffAdmissionTests(MeshCommandFixture):
             observed.append(published.row)
             return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
 
-        allowed = worker_admission.admit(old.name, self.session_dir, role="impl")
+        allowed = worker_admission.admit(old.name, self.session_dir)
         with patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)):
             with self.assertRaisesRegex(OSError, "destination creation failed after source release"):
                 _ = worker_admission.switch_worker(allowed, "claude", start=start,
                     dispatch=dispatch, cleanup=lambda native: self.fail("uncreated destination was discarded: " + native))
             self.assertEqual(staff.by_id(old.id), old)
             self.assertEqual(observed, [])
-            allowed = worker_admission.admit(old.name, self.session_dir, role="impl", reference=old.id)
+            allowed = worker_admission.admit(old.name, self.session_dir, reference=old.id)
             result = worker_admission.switch_worker(allowed, "claude", start=start,
                 dispatch=dispatch, cleanup=lambda native: self.fail("published destination was discarded: " + native))
         self.assertEqual(observed, [result.row])
@@ -2271,7 +2271,7 @@ class StaffAdmissionTests(MeshCommandFixture):
         from scripts.shutdown import stop_resume
 
         old = self.codex_switch_source()
-        allowed = worker_admission.admit(old.name, self.session_dir, role="impl")
+        allowed = worker_admission.admit(old.name, self.session_dir)
         server = self.session_dir / codex_mesh.SERVER_FILE
         for reason, change in (("stop is unresolved", lambda: server.unlink()),
                                ("worker state unreadable", lambda: server.write_text("{unknown server state"))):

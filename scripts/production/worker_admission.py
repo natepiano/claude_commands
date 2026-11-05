@@ -163,19 +163,16 @@ def resolve_roster(run: Path, entries: dict[str, object]) -> dict[str, object]:
     return entries
 
 
-def admit(name: str, run: Path, *, role: str, production: str = "", unit: str = "", reference: str = "") -> WorkerStartAllowed:
+def admit(name: str, run: Path, *, reference: str = "") -> WorkerStartAllowed:
     """Refuse before starting a backend or taking lifecycle, inbox or roster locks."""
     try:
-        del role
         record = staff.snapshot()
         if reference:
             existing = record.by_id(staff.StaffId(reference))
             if existing is None or existing.kind != "worker" or not isinstance(existing.parent, staff.ReportsTo):
                 raise AdmissionRefused(f"{reference}: no worker staff row")
             return WorkerStartAllowed(existing.name, existing.parent.id, run, ExistingWorkerSlot(existing))
-        explicit = bool(production or unit)
-        owner = parent(record, staff_id="" if explicit else staff.runtime_id(),
-                       production=production, unit=unit, run=None if explicit else run)
+        owner = parent(record, staff_id=staff.runtime_id(), run=run)
         _ = staff.WorkerName.parse(name)
         if isinstance(owner.worktree, staff.RemovedWorktree):
             print(f"staff: {name}: parent {owner.id} is retired; admission continues", file=sys.stderr)

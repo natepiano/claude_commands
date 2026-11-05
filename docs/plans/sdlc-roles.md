@@ -126,7 +126,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Binds later work:**
 - Each kept context in `scripts/production/role_terms.toml` applies once, in its named file only. Kept text that is changed or copied to another file is flagged.
 - Names keeps independent counts for each term. Only `check` uses the longest matching phrase.
-- The stored `seat` field and `codex_seats` stay as kept contracts. A change to them must add a kept context in the same change.
+- The stored `seat` and `codex_seats` JSON fields stay as kept contracts. The resume function is `worker_resumes`.
 - The lexical after measure is in the design doc Step log: merged tree, n=596 live files; `seat` 15, `seats` 7, `Codex seat` 1, `Codex seats` 0; 22 kept, 0 eligible.
 - Kept history and migration values: `docs/as-built/message-clarity.md`, `docs/as-built/usage-ledger.md`, `scripts/usage/collect.py`.
 

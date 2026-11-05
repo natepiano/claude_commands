@@ -14,6 +14,7 @@ import time
 import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Barrier, Lock, local
 from typing import cast, final, override
@@ -26,7 +27,9 @@ from scripts.shutdown import restart, stop_resume
 from scripts.shutdown.stop_results import ClaudeStartState
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
-from scripts.shutdown.inventory import PausedSeat
+from scripts.lib.resume_message import PausedSeat
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
+from scripts.usage import agents_log
 import herdr
 import pane_record
 import pane_launch
@@ -67,6 +70,46 @@ class StopResumeTests(unittest.TestCase):
                         selection.assert_called_once_with(kind)
                     else:
                         selection.assert_not_called()
+
+    def test_moved_showrunner_resumes_only_its_worker_children_with_one_command_for_each_family(self) -> None:
+        fixture = StaffTestCase()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        pane_record.write("agents", self.entry)
+        doc = fixture.root / "production.md"
+        _ = doc.write_text("# Production\n\n## Units\n")
+        owner = fixture_member("showrunner", name="owner", runtime_id=self.entry["session_id"],
+                               doc=staff.LiveDoc("natedev", doc))
+        unit = fixture_member("unit", name="unit", parent=owner.id)
+        foreign = fixture_worker("foreign", unit.id)
+        codex = fixture_worker("codex-own", owner.id, backend=staff.CodexBackend(fixture.root / "codex"))
+        claude = fixture_worker("claude-own", owner.id)
+        runs = fixture.root / "runs"
+        run = runs / "unit-run"
+        run.mkdir(parents=True)
+        for child in (codex, claude):
+            agents_log.append(child.current_session, "impl", None, datetime.now(timezone.utc))
+        fixture.write_json(run / "impl_worker_impl.json", {"staff_id": claude.id, "slot": "impl", "model": "opus"})
+        _ = (run / "impl_status_impl").write_text("implementing\n")
+        fixture.write_json(run / "mesh_roster.json", {
+            codex.name: {"staff_id": codex.id, "status": "running"},
+            foreign.name: {"staff_id": foreign.id, "status": "running"}})
+        from scripts.lib import unit_runs as owned_runs
+        with (patch("scripts.lib.unit_runs.run_roots", return_value=(runs,)),
+              patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}),
+              patch.object(staff, "initial_snapshot", return_value=staff.local_snapshot()),
+              patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(456)) as start):
+            owned_runs.activate(run, owner.current_session)
+            self.assertEqual(owned_runs.director(run), owner.current_session)
+            result = stop_resume.resume(owner.current_session, why="account move", to="claude4")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        message = cast(str, start.call_args.args[3])
+        self.assertNotIn(f"--to {foreign.name}", message)
+        self.assertNotIn("foreign (", message)
+        for child in (codex, claude):
+            self.assertEqual(message.count(f"{child.name} (impl, was working):"), 1)
+            self.assertIn(f"--to {child.name}", message)
+            self.assertIn(str(run / f"{child.name}.resume-prompt.md"), message)
 
     def test_resume_without_a_pane_record_starts_the_staff_row(self) -> None:
         identity = self.entry["session_id"]

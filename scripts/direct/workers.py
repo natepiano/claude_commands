@@ -497,7 +497,7 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                         continue
                     if codex_mesh.worker_idle_reason(str(run), name, record, paused=paused, membership=membership):
                         continue
-                    permission = worker_admission.admit(name, run, role=role)
+                    permission = worker_admission.admit(name, run)
                     _ = worker_admission.publish(permission, _text(session_staff.worker_session(record, membership)))
                 elif record.get("status") in ("ended", "running", "starting"):
                     if codex_mesh.worker_idle_reason(str(run), name, record, membership=membership):

@@ -5,23 +5,45 @@ import json
 import shlex
 from datetime import datetime, timezone
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import NamedTuple, TypedDict, cast
 
 from scripts.lib.script_envelope import script_prompt
 from scripts.usage import agents_log
 
-if TYPE_CHECKING:
-    from scripts.shutdown.inventory import PausedSeat
-
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 
-@dataclass(frozen=True)
-class ResumeWorkers:
-    """Existing worker threads and their work directory, for the opening message."""
-    seats: Sequence[PausedSeat]
+class PausedSeat(TypedDict):
+    """A worker reference and the launcher that continues its task."""
+
+    run_dir: str
+    seat: str
+    role: str
+    staff_id: str
+    turn_live: bool
+    launcher_command: list[str]
+
+
+class Resumable(NamedTuple):
+    seat: PausedSeat
+
+
+class Idle(NamedTuple):
+    seat: PausedSeat
+
+
+class Unavailable(NamedTuple):
+    staff_id: str
+    name: str
+    reason: str
+
+
+WorkerResume = Resumable | Idle | Unavailable
+
+
+class ResumeWorkers(NamedTuple):
+    results: Sequence[WorkerResume]
     cwd: str
 
 
@@ -36,20 +58,22 @@ def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | N
         opening = context or f"You were stopped and resumed because {why}.{move} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
                      + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
-    if workers.seats:
-        lines.append("Resume your Codex workers; do not open new ones.")
-        for seat in workers.seats:
-            if seat["turn_live"]:
-                lines.append(f"{seat['seat']} ({seat['role']}, was working): {resume_worker_command(seat, workers.cwd)}")
-            else:
-                lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
-                             + f"Your next dispatch with --to {seat['seat']} resumes it.")
-        lines.append("Each command resumes the worker's existing thread.")
+    if workers.results:
+        lines.append("Resume your workers; do not open new ones.")
+        for result in workers.results:
+            match result:
+                case Unavailable(staff_id, name, reason):
+                    lines.append(f"anomaly: {name} ({staff_id}): {reason}")
+                case Resumable(seat):
+                    lines.append(f"{seat['seat']} ({seat['role']}, was working): {resume_worker_command(seat, workers.cwd)}")
+                case Idle(seat):
+                    lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
+                                 + f"Your next dispatch with --to {seat['seat']} resumes it.")
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
     elif why:
         lines.append("Codex workers keep their existing threads. Use implement.sh --to <worker> or "
                      + "codex_mesh.py resume for a paused worker; do not open a replacement thread.")
-    text = ("\n" if workers.seats else " ").join(lines)
+    text = ("\n" if workers.results else " ").join(lines)
     return script_prompt(text)
 
 
@@ -118,7 +142,6 @@ def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     if launcher == "review.sh":
         return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
     return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
-
 
 
 def _resume_task(seat: PausedSeat, cwd: str, prompt: str) -> str:

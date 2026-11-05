@@ -126,7 +126,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
             "CONF_DIR": str(CHECKOUT / "config"),
-            "CLAUDE_BIN": str(backend), "AGENT_BG_ROLE": "impl", "AGENT_BG_DETACH": "1", "AGENT_BG_SEND_SCRIPT": str(sender),
+            "CLAUDE_BIN": str(backend), "AGENT_BG_DETACH": "1", "AGENT_BG_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),
             "FIXTURE_REGISTRY_PATH": str(registry), "FIXTURE_REGISTRY_RECORD": json.dumps(record)}
@@ -239,13 +239,13 @@ class NativeClaudeWorkerTests(StaffTestCase):
                     self.assertIn("the worker completed the assignment", (self.root / "summary").read_text())
                 self.clear_worker(row)
 
-    def test_fresh_claude_publication_precedes_work_for_each_task_role_and_parent_state(self) -> None:
-        for count, (role, removed) in enumerate((("", False), ("impl", True)), 1):
-            with self.subTest(role=role, removed=removed):
+    def test_fresh_claude_publication_precedes_work_for_each_parent_state(self) -> None:
+        for count, removed in enumerate((False, True), 1):
+            with self.subTest(removed=removed):
                 if removed:
                     _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.work),
                                            expected=self.fixture.unit.worktree)
-                result = self.launch(AGENT_BG_ROLE=role, UNIT_TEAM_ROLE="")
+                result = self.launch(UNIT_TEAM_ROLE="")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 row = staff.by_id(staff.StaffId(self.fixture.identity))
                 assert row is not None

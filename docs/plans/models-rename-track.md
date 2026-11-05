@@ -15,7 +15,7 @@
 - **Test:** `env -u STAFF_OPERATION_FD -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --tests-only --checkout <tree>`, run from `~/.claude` main's copy after a merge of `origin/sdlc`.
 - **Lint:** `basedpyright <changed Python files> <every caller module of a changed file>`; pass is `0 errors, 0 warnings`.
 - **The four sdlc lines (2026-10-30):** good engineering first; no copies; when many things break the same way, the copy is the cause; fix at the cause.
-- **No unasked guards (user via sdlc, 2026-11-05):** add no guard, refusal or check that the Work Order did not ask for. A fix for a broken guard deletes the guard.
+- **No unasked guards (user via sdlc, 2026-11-05):** add no guard, refusal or check that the Work Order did not ask for. A fix for a broken guard deletes the guard. A new check goes to the user first; only the user approves it (user via sdlc, 09:17 EST: "if you need to add new checks you need to run them by me"). Each one reaches the user as a new question through `/unit:question`, with a simple statement of why it is important (user via sdlc, 09:20 EST). A review finding that asks for a new check is dropped unless the Work Order asks for it or the user approves it.
 
 ## Phases
 
@@ -210,7 +210,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - `scripts/shutdown/stop_resume.py`, `scripts/shutdown/stop_results.py` — source release and its reasons (shutdown-unit's files).
 - `commands/ask_a_friend.md` — calls `worker_fill.py end-friend`.
 
-**Binds later work:** the unused `role` parameter of `worker_admission.admit` and the `AGENT_BG_ROLE` assignments stay until the devtools one-launch path lands; the live family-switch proofs phase removes them at every caller. `release_source` and `ReleaseSource` stay as built beside shutdown-unit's `stop(session, *, deadline=math.inf)`. The tests `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch`, `test_worker_release_refusals_name_the_reason_and_next_action` and the `test_end_friend.py` stop and retry tests own the states above.
+**Binds later work:** phase 3r removed the `role` parameter of `worker_admission.admit` at every caller and the `AGENT_BG_ROLE` assignments. `release_source` and `ReleaseSource` stay as built beside shutdown-unit's `stop(session, *, deadline=math.inf)`. The tests `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch`, `test_worker_release_refusals_name_the_reason_and_next_action` and the `test_end_friend.py` stop and retry tests own the states above.
 
 **Gotchas:**
 - A ruling must be in the worker prompt. A queued codex_mesh message loses to the prompt's own text.
@@ -220,7 +220,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - A sixth staff refusal for an unknown dispatch state: the staff spec allows five; the anomaly line continues the operation.
 - Changing six other units' test files to remove `membership` from `UnitWorkerLedger.locked()`.
 
-### Phase 3s — A moved session resumes only its own workers  · status: todo
+### Phase 3s — A moved session resumes only its own workers  · status: done
 
 **Owner:** models-unit (sdlc, 2026-11-05: "You own it; one worker beside 5a after the 3q hash"). shutdown-unit agrees the `stop_resume.py` and `inventory.py` edits (2026-11-05).
 

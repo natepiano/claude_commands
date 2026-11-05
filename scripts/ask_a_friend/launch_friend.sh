@@ -38,7 +38,7 @@ printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
 
 case "${AGENT_FAMILY}" in
   claude)
-    if ! AGENT_BG_ROLE=review AGENT_BG_DETACH=1 AGENT_BG_EFFORT="${AGENT_EFFORT}" \
+    if ! AGENT_BG_DETACH=1 AGENT_BG_EFFORT="${AGENT_EFFORT}" \
          bash "${AGENTS_DIR}/agent_bg.sh" --run "${SESSION_DIR}" "${FRIEND}" "${WORKING_DIR}" \
            "${QUESTION_FILE}" "${ANSWER_FILE}" "${LOG_FILE}" \
            "${AGENT_MODEL}" >/dev/null; then

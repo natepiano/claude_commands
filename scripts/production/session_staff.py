@@ -85,32 +85,51 @@ def worker_session(entry: Mapping[str, object], record: staff.StaffSnapshot | No
     return member.current_session if member is not None else ""
 
 
-def worker_run_index(record: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[Path, ...]]:
-    """Read fixed staff references from each run once."""
+class WorkerRunEvidence(NamedTuple):
+    entries: list[tuple[Path, dict[str, object]]]
+    runs: list[Path]
+
+
+def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) -> dict[staff.StaffId, WorkerRunEvidence]:
+    """Read records and marker associations once, with one anomaly for each failed read."""
     from scripts.lib import unit_runs
-    marked: dict[Path, list[staff.StaffId]] = {}
-    for row in record.find(kind="worker"):
-        owner = record.parent_of(row)
-        marker = unit_runs.marker(owner.current_session) if owner is not None else None
-        if marker is not None and marker.is_file():
-            marked.setdefault(Path(marker.read_text().strip()), []).append(row.id)
-    paths = [*marked]
+    rows = tuple(rows)
+    owners = {owner.current_session: owner for row in rows if (owner := record.parent_of(row)) is not None}
+    marked: dict[Path, set[staff.StaffId]] = {}
+    for owner in owners.values():
+        try:
+            marker = unit_runs.marker(owner.current_session)
+            if marker.is_file():
+                marked.setdefault(Path(marker.read_text().strip()), set()).update(row.id for row in rows if row.parent == staff.ReportsTo(owner.id))
+        except (OSError, ValueError) as error:
+            print(f"anomaly: {owner.name}: {error}".replace("\n", " "), file=sys.stderr)
+    paths = [*marked, *unit_runs.run_folders()]
     if current := unit_runs.environ("RUN_DIR"):
         paths.append(Path(current))
-    paths.extend(path for root in unit_runs.run_roots() if root.is_dir()
-                 for path in root.iterdir() if path.is_dir())
-    found: dict[staff.StaffId, list[Path]] = {}
+    found: dict[staff.StaffId, WorkerRunEvidence] = {}
     for run in sorted(dict.fromkeys(paths), key=lambda run: run.stat().st_mtime if run.exists() else 0):
+        records: dict[staff.StaffId, dict[str, object]] = {}
         try:
-            entries = [*read_worker_roster(run / "mesh_roster.json").values()]
-            entries.extend(cast(object, json.loads(path.read_text())) for path in run.glob("impl_worker_*.json"))
-            identities = {staff.StaffId(value) for entry in entries if isinstance(entry, dict)
-                          and isinstance(value := cast(dict[str, object], entry).get("staff_id"), str)}
-            for identity in identities | set(marked.get(run, ())):
-                found.setdefault(identity, []).append(run)
+            entries = [cast(object, json.loads(path.read_text())) for path in run.glob("impl_worker_*.json")]
+            entries.extend(read_worker_roster(run / "mesh_roster.json").values())
+            records = {staff.StaffId(value): cast(dict[str, object], entry) for entry in entries if isinstance(entry, dict)
+                       and isinstance(value := cast(dict[str, object], entry).get("staff_id"), str)}
         except (OSError, ValueError) as error:
             print(f"anomaly: {run}: {error}".replace("\n", " "), file=sys.stderr)
-    return {identity: tuple(runs) for identity, runs in found.items()}
+        for identity in records.keys() | marked.get(run, set[staff.StaffId]()):
+            evidence = found.setdefault(identity, WorkerRunEvidence([], []))
+            evidence.runs.append(run)
+            if identity in records:
+                evidence.entries.append((run, records[identity]))
+    return found
+
+
+def worker_run_entries(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) -> dict[staff.StaffId, tuple[tuple[Path, dict[str, object]], ...]]:
+    return {identity: tuple(evidence.entries) for identity, evidence in _worker_runs(record, rows).items() if evidence.entries}
+
+
+def worker_run_index(record: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[Path, ...]]:
+    return {identity: tuple(evidence.runs) for identity, evidence in _worker_runs(record, record.find(kind="worker")).items()}
 
 
 def worker_name(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:

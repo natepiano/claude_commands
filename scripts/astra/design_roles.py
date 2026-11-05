@@ -710,8 +710,7 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
         _validate_binding(design.binding, design.repository, role)
     model, effort = resolve_model(role)
     prompt, _ = _prompt(design, role, '')
-    admitted = worker_admission.admit(
-        instance.name, mesh_directory(design_id), role="astra-" + role)
+    admitted = worker_admission.admit(instance.name, mesh_directory(design_id))
     with _lock(directory):
         current = read_design(design_id)
         instance = _instance(current, role)

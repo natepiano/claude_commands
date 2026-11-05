@@ -276,7 +276,6 @@ test_every_claude_print_launch_keeps_agents_and_reports_errors
 
 # The worker's registry-selected Claude path uses the same account.
 export STAFF_FILE="$TEST_DIR/staff.json"
-export AGENT_BG_ROLE=impl
 export FAKE_CLAUDE_PID=$$
 export FIXTURE_CHECKOUT="$SCRIPT_DIR/../.."
 python3 - "$TEST_DIR" <<'PYTHON'

@@ -110,7 +110,7 @@ def _managed_review(review: Path, log: Path) -> int:
         try:
             result = codex_mesh.main([
                 "prime", "--session-dir", str(run), "--name", name,
-                "--role", "astra-reviewer", "--instructions-file", str(run / "prompt.md"),
+                "--instructions-file", str(run / "prompt.md"),
                 "--model", MODEL, "--effort", REASONING,
                 "--sandbox", "read-only",
             ])

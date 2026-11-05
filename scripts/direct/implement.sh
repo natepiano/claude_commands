@@ -126,7 +126,7 @@ claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).resolve().parents[2]))
 from scripts.production import staff, session_staff, worker_admission
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
-from worker_state import worker_claim_lock, worker_record_path
+from worker_state import worker_claim_lock, worker_record_path, worker_status_path
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
@@ -146,7 +146,7 @@ def read(path):
 
 if action == "admit":
     try:
-        worker_admission.admit(name, root, role=pass_kind)
+        worker_admission.admit(name, root)
     except worker_admission.AdmissionRefused as error:
         print(error, file=sys.stderr)
         raise SystemExit(2)
@@ -172,7 +172,7 @@ with worker_claim_lock(root):
         if not identity and reference:
             identity_file.write_text(json.dumps(expected))
         print(model)
-        status_path = root / f"impl_status_{slot}"
+        status_path = worker_status_path(root, slot)
         claim = read(claim_file)
         pid = claim.get("pid", 0)
         stale_claim = False
@@ -351,7 +351,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
   printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
   if [[ "${AGENT_FAMILY}" == "claude" ]]; then
-    AGENT_BG_ROLE="${PASS_KIND}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach --run "${SESSION_DIR}" \
+    bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach --run "${SESSION_DIR}" \
       "${MESH_NAME}" "${WORKING_DIR}" "${FOLLOW_MESSAGE}" "${SUMMARY_FILE}" \
       "${LOG_FILE}" "${AGENT_MODEL}" &
   else
@@ -363,7 +363,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
       --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  AGENT_BG_ROLE="${PASS_KIND}" AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --run "${SESSION_DIR}" \
+  AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --run "${SESSION_DIR}" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${AGENT_MODEL}" &
 else

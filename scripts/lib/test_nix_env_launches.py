@@ -331,7 +331,6 @@ print('{"type":"result","result":"fixture completed"}')
         with isolated_staff_file(self.root / "staff.json", self.env):
             owner = unit_membership("child", "unit")
             self.env["CODEX_THREAD_ID"] = owner.id
-            self.env["AGENT_BG_ROLE"] = "impl"
             self.launch_contract("agents/agent_bg.sh", ["--run", str(self.root / "run"), "fixture", str(self.work), str(self.root / "prompt"),
                 str(self.root / "result"), str(self.root / "launch.log")], self.work)
         rows = [cast(dict[str, object], json.loads(line)) for line in self.started.read_text().splitlines()]

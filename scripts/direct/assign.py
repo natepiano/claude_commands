@@ -24,7 +24,7 @@ from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
 from scripts.direct import phase_reservation, workers
-from scripts.direct.worker_state import worker_claim_lock, worker_record_path
+from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_status_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
 from scripts.lint import style_review
@@ -392,7 +392,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 claim_path.unlink(missing_ok=True)
             else:
                 refuse(f"{dispatch.worker} is claimed by launcher {pid}")
-        status_path = dispatch.run / f"impl_status_{slot}"
+        status_path = worker_status_path(dispatch.run, slot)
         if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
             launcher = record.get("launcher_pid")
             if isinstance(launcher, int) and launcher > 0:
@@ -664,7 +664,7 @@ def main() -> int:
         worker = resolved.stdout.strip()
         reservation = workers.allocation_for_follow(run, worker)
     try:
-        _ = worker_admission.admit(worker, run, role=role)
+        _ = worker_admission.admit(worker, run)
     except ValueError as error:
         workers.release_allocation(run, worker, reservation)
         print(str(error), file=sys.stderr)

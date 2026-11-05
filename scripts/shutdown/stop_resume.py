@@ -462,9 +462,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry = entry.copy()
         entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
-        from inventory import codex_seats
-        import unit_runs
-
+        from scripts.shutdown.inventory import worker_resumes
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
 
@@ -506,11 +504,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
         copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
-        workers = NO_WORKERS
-        try:
-            workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
-        except (OSError, ValueError) as error:
-            print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
+        workers = ResumeWorkers(worker_resumes(row, names.tab_record), entry["cwd"]) if row is not None else NO_WORKERS
         message = resume_message(why, moved_from=source_label if to else None,
                                  moved_to=to, workers=workers)
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
