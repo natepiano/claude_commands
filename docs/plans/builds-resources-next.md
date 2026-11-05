@@ -57,16 +57,12 @@
   - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
 
 
-- [ ] **Scripts that use the build hold no longer pay for the build queue import**
-  - Target: `scripts/build_hold/build_hold.py` (the `admission_service` and `store` imports at :38-44) and `scripts/build_hold/test_build_hold.py`.
+- [ ] **Mac claims and releases read session ownership without importing the build queue**
+  - Target: `scripts/build_hold/build_hold.py`, a new `scripts/build_hold/session_owner.py`, `scripts/mac_test/mac_test.py` (:31), and their tests.
   - Why needed: six modules import `build_hold` at module level, and each one loads the build queue modules that only `admitted_processes()` uses.
-  - Completion condition: the two imports are inside `admitted_processes()`; a fresh-interpreter test shows that `import build_hold` loads no build queue module.
+  - Measured (natest): `build_hold.py:43` imports `admission_service` at once, 126-132 ms on each `mac_test.py` claim and release.
+  - Design (builds showrunner 2026-11-05): move `owning_session()`, `OwningSession` and `NoOwningSession` into `scripts/build_hold/session_owner.py`, which imports only `os` and `unit_runs`.
+    `build_hold.py` imports the three from it, so its callers keep their names. Change `mac_test.py:31` to import the light module (one owner switches all callers; the showrunner settles that edit in verify's file).
+  - Completion condition: a fresh-interpreter test shows that importing `session_owner` loads no build queue module; `mac_test.py` claim and release are measured before and after (126-132 ms of `admission_service` import today).
   - Start: when natedev says the send.py freeze on `build_hold.py` ends (the showrunner tells us).
-  - Revealed by: Phase 67 (builds showrunner 2026-11-05: next)
-
-- [ ] **The offload script loads its git helpers without the whole sweep**
-  - Target: `scripts/lint/sweep.py:4162-4203` (`repo_name`, `git_common_dir`, `source_git_dir`, `borrowed_git_dir`, `local_origin_git_dir`), a new git-helper module, `scripts/mac_test/offload.py`.
-  - Why needed: `offload` imports all of `sweep` for five small git helpers.
-  - Completion condition: the helpers are in one module; `sweep` and `offload` import it; `test_sweep.py` and `test_offload.py` pass.
-  - Start: after natest Phase 24 merges, because it holds `offload.py` (the showrunner tells us).
   - Revealed by: Phase 67 (builds showrunner 2026-11-05: next)
