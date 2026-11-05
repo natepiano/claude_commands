@@ -663,17 +663,29 @@ def record_entries(directory: Path) -> list[Path]:
         return []
 
 
-def marked_runs(roots: Roots) -> dict[str, str]:
-    """Markers protect their run even when the director is paused. Read errors reach the guard."""
+@dataclass(frozen=True)
+class RunMarkers:
+    paths: dict[str, str]
+    unreadable_sessions: frozenset[str]
+
+
+def marked_runs(roots: Roots) -> RunMarkers:
+    """Read valid run paths and the session names of bad markers."""
     marked: dict[str, str] = {}
+    unreadable: set[str] = set()
     for root in roots.runs:
         for marker in record_entries(Path(root) / RUN_MARKERS):
-            with marker.open(encoding="utf-8") as handle:
-                run = handle.readline().strip()
-            if not run or not os.path.isabs(run):
-                raise ValueError(f"{marker}: expected a run path")
-            marked[os.path.realpath(run)] = marker.name
-    return marked
+            try:
+                if marker.is_file(follow_symlinks=False):
+                    with marker.open(encoding="utf-8") as handle:
+                        run = handle.readline().strip()
+                    if os.path.isabs(run):
+                        marked[os.path.realpath(run)] = marker.name
+                        continue
+            except (OSError, UnicodeError, ValueError):
+                pass
+            unreadable.add(marker.name)
+    return RunMarkers(marked, frozenset(unreadable))
 
 
 @dataclass(frozen=True)
@@ -696,14 +708,14 @@ def session_run_use(live: frozenset[str]) -> SessionRunUse:
     return SessionRunUse(frozenset(worktrees))
 
 
-def run_folder_guards(roots: Roots, live: frozenset[str] | None,
-                      marked: dict[str, str]) -> dict[str, RunKeepReason]:
+def run_folder_guards(roots: Roots, live: frozenset[str] | None) -> dict[str, RunKeepReason]:
     folders = [entry.path for root in roots.runs for entry in listing(root)
                if entry.name != RUN_MARKERS and entry.is_dir(follow_symlinks=False)]
     try:
         if live is None:
             raise ValueError("session registry unreadable")
         use = session_run_use(live)
+        markers = marked_runs(roots)
     except (OSError, UnicodeError, ValueError):
         return dict.fromkeys(folders, RunKeepReason.UNREADABLE_RECORD)
     kept: dict[str, RunKeepReason] = {}
@@ -724,10 +736,14 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
                     raise ValueError("run worktree unreadable")
                 if working and os.path.realpath(working) in use.worktrees:
                     kept[folder] = RunKeepReason.SESSION_WORKTREE
-            if os.path.realpath(folder) in marked:
+            if os.path.realpath(folder) in markers.paths:
                 kept[folder] = RunKeepReason.ACTIVE_MARKER
-            if folder not in kept and unit_runs.director(Path(folder)) in live:
-                kept[folder] = RunKeepReason.DIRECTOR
+            if folder not in kept:
+                director = unit_runs.director(Path(folder))
+                if director in markers.unreadable_sessions:
+                    kept[folder] = RunKeepReason.UNREADABLE_RECORD
+                elif director in live:
+                    kept[folder] = RunKeepReason.DIRECTOR
             if not isinstance(state, MissingRecord) and state.get("history_file"):
                 history = state["history_file"]
                 if not isinstance(history, str):
@@ -872,7 +888,7 @@ def when(timestamp: float) -> str:
 
 
 def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozenset[str] | None,
-                 marked: dict[str, str], *,
+                 *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str | None:
     """Why an entry stays whatever its age: it is a root or run-marker folder, or a running session
@@ -889,11 +905,10 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
             return NO_SESSIONS
         return SESSION_RUNS if entry.name in live else None
     if root in roots.runs and entry.is_dir(follow_symlinks=False):
-        names = (marked.get(os.path.realpath(entry.path)), unit_runs.director(Path(entry.path)))
-        owners = {name for name in names if name}
-        if owners and live is None:
+        director = unit_runs.director(Path(entry.path))
+        if director and live is None:
             return NO_SESSIONS
-        return DIRECTOR_RUNS if live is not None and owners & live else None
+        return DIRECTOR_RUNS if live is not None and director in live else None
     return None
 
 
@@ -959,13 +974,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
         return
     live = running_session_ids()
     inner = session_folders(roots, live)
-    try:
-        marked = marked_runs(roots)
-        guarded = run_folder_guards(roots, live, marked)
-    except (OSError, UnicodeError, ValueError):
-        marked = {}
-        guarded = {entry.path: RunKeepReason.UNREADABLE_RECORD for root in roots.runs
-                   for entry in listing(root) if entry.name != RUN_MARKERS}
+    guarded = run_folder_guards(roots, live)
     workers = worker_use(guarded)
     for path in workers.unreadable_records:
         print(f"tmp sweep: {path}: {UNREADABLE}; keeping scratch and top-level /tmp/claude entries", file=sys.stderr)
@@ -975,7 +984,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     uses = entry_uses(paths.paths, judged + pairs)
     for root in judged:
         for entry in roots.entries(root, scratch_settings=scratch_settings):
-            reason = owner_reason(entry, root, roots, temp_live, marked, scratch_settings=scratch_settings)
+            reason = owner_reason(entry, root, roots, temp_live, scratch_settings=scratch_settings)
             if root in roots.copies and reason is None:
                 state = scratch.lifetime(Path(entry.path), now, scratch_settings=scratch_settings)
                 if isinstance(state, scratch.Live):
@@ -1125,7 +1134,10 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
         for root in roots.runs:
             relative = Path(entry.path).relative_to(root) if Path(entry.path).is_relative_to(root) else Path()
             if relative.parts:
-                roster = record_object(Path(root) / relative.parts[0] / "mesh_roster.json")
+                run = Path(root) / relative.parts[0]
+                if not run.is_dir(follow_symlinks=False):
+                    continue
+                roster = record_object(run / "mesh_roster.json")
                 if isinstance(roster, dict) and roster and all(
                         isinstance(worker, dict) and cast(dict[str, object], worker).get("status") == "ended"
                         for worker in roster.values()):

@@ -1681,3 +1681,41 @@ The `sweep.disk_floor` push body is `natedev has {free} free, below the {floor} 
 **Gotchas:** `test_push_texts.test_every_catalog_example_has_current_approval` stays red until the user approves `sweep.disk_floor`; only the user records that approval.
 
 **Ruled out:** shortening the push folder label before the unavailable fallback (Spec 6 sets the fallback; a label over about 220 characters is rare).
+
+### Phase 72 — One bad run marker keeps only its own run, and the sweep reads rosters only in folders  · status: done
+**Depends on:** none. Showrunner go 2026-11-05 (natedev C915 follow-up).
+
+#### Work Order
+
+**Goal:** a bad entry in a run marker folder keeps only its own session's run; every other run is judged as usual.
+
+**Measured:**
+1. A live `tmp_sweep.py --plan` on 2026-11-05 kept 73,739 paths with the reason `a run ownership record cannot be read`.
+2. The cause is an empty file `/tmp/claude/unit/active/mesh_roster.json.lock`. `marked_runs` (`tmp_sweep.py:666`) reads every entry in `active/` and raises `ValueError` on its empty first line.
+3. The caller's `except` (`tmp_sweep.py:965-967`) then marks every entry of both run roots `UNREADABLE_RECORD`, files included.
+4. `worker_use` then reads `<file>/mesh_roster.json` for the files `wo.json` and `.scratch.json`. The keep reason is the raw text `Not a directory`.
+5. `session_staff.worker_run_index` (`session_staff.py:101`) lists the `active` folder as a run, and the shared roster lock creates `active/mesh_roster.json.lock`. The file can come back; models-rename-track owns that caller.
+
+**Spec:**
+1. `marked_runs` raises nothing for one entry. An entry of `active/` is a bad marker when it is not a regular file, cannot be read, or has no absolute path on its first line.
+2. A bad marker keeps only the run folders whose director (`unit_runs.director`) is the bad marker's name, with `RunKeepReason.UNREADABLE_RECORD`. Every other run folder is judged as before.
+3. The fallback in the caller lists only folders (`is_dir(follow_symlinks=False)`), so `worker_use` reads a roster only inside a folder. A file at a run root never gets a raw error text as its keep reason.
+4. Good markers keep their runs with `RunKeepReason.ACTIVE_MARKER`, as now.
+5. Add no guard, refusal or check this Work Order does not ask for.
+
+**Constraints from prior phases:**
+- The run marker folders and their markers never go (`test_the_run_marker_folders_and_their_markers_never_go`).
+- An unreadable session registry still keeps every run folder (`test_an_unreadable_session_record_keeps_session_and_run_folders`).
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `marked_runs`, `run_folder_guards` and the caller fallback.
+- `scripts/lint/test_tmp_sweep.py` — three tests.
+
+**Workers:** `1 writer`
+- `impl` owns both files; the change is small.
+
+**Acceptance gate:**
+- A test puts an empty `mesh_roster.json.lock` in `unit/active`. A run with no other keep reason goes, and a marked run stays with `ACTIVE_MARKER`.
+- A test puts an empty marker named for a session in `unit/active`. That session's run stays with `UNREADABLE_RECORD`; another session's idle run goes.
+- A test makes the caller fallback run (a broken `active` link) with a file at a run root. The file gets no roster read and no raw error text; run folders stay with `UNREADABLE_RECORD`.
+- `test_tmp_sweep.py` passes. Basedpyright reports `0 errors, 0 warnings, 0 notes` over both files.
