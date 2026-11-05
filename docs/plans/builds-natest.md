@@ -60,6 +60,8 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   - A worker starts at most one detached run at a time, with at most 4 named test files; the wide suites go in one final gate run (sdlc, 2026-11-03). Fix every visible failure before a rerun; after a pass, do not run again until the edits are done (user, 2026-10-31).
   - No test run starts while a natedev build hold is in force (builds showrunner, 2026-11-03).
   - A change to another unit's file names that owner in the checkpoint notice (production doc, Production rules).
+  - Commit every new file in the disposable gate clone before the gate starts. The aws_target box replica copies only `git ls-files` (Phase 22: an untracked new module turned `test_control.py` red).
+  - Each dispatch names one worker that runs the changed modules and their callers after the last edit. With a writer and a tester, the writer runs the chain (Phase 22: each left it to the other).
 
 - **Speed method** (every speed phase):
   0. Targets: at dispatch, the director takes the top live rows of `test_times top` that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal.
@@ -537,49 +539,29 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 22 — Mirror step rows store the sent repository identity, and `show.py` loads a light repository module  · status: done
 **Depends on:** Phase 18, Phase 23
 
-#### Work Order
+#### As-built
 
-**Goal:** A new Mac or Linux mirror step records the repository identity of its natedev source checkout, so the index does not need to derive it.
-
-**Spec:** The builds showrunner accepted this architecture proposal from the Phase 16 review on 2026-11-04. This unit owns it. Edits to report-unit's files are allowed: `scripts/buildlog/record.py` and `scripts/buildlog/parse.py`. Phase 18 sends the key in `BUILDLOG_REPO_IDENTITY`.
-
-1. Record: in `record.py` `step()`, when `recorded_repository_key` gives `store.UNKNOWN_IDENTITY` for a mirror caller (`verify-mac`, `verify-linux`) and `BUILDLOG_REPO_IDENTITY` is set, record that value. Read it through one typed reader beside `sent_tree_key()` that returns `SentRepositoryIdentity | NoSentRepositoryIdentity`; an absent or empty value is `NoSentRepositoryIdentity`. A known local key always wins.
-2. Index: keep the Phase 16 index rule for old rows. A step with a recorded identity has `identity_derived = 0`, so the resolver never changes it.
-3. The Mac gets the new `record.py` through the normal main promotion. Until then, Mac rows stay `unknown` and the index rule resolves them.
-4. Split `repository_key(directory)` out of `record.recorded_repository_key`, then delete `recorded_repository_key`: its `argv` parameter exists only for an empty check. `step()` (`record.py` about line 1006) does the empty-argv check and calls `repository_key`. Every caller switches to `repository_key`; no `["git"]` dummy argument vector remains (`show.py` top, the test call sites). (showrunner, from report's simplify review, 2026-11-05.)
-5. Import `conf` under one module name in `parse.py` and `record.sync_config`. Today one step process loads `conf.py` twice (+1.8 ms).
-6. Move `repository_key` and `remote_identity` into one light module that does not import the rest of `record.py`. `show.py` imports it in place of `record` (importing `record` costs 49.7 ms cold; `show.py` imports `record` inside `main()`, about line 427). `record` keeps the two names as imports from the light module, so `scripts/lint/memory_admit.py` (about line 3229, `record.remote_identity`) needs no change. Measure the cold start of `show.py top` before and after, on a prepared index: the same logs, repository and host on both sides, with the index built outside the timed command. Report the index build time on its own line.
-7. Add `buildlog/repository.py` to `ADMISSION_CODE_PATHS` in `scripts/build_queue/admission_code.py`, after `buildlog/record.py`: `record.py` imports it, so it is admission code (showrunner, 2026-11-05).
+- `record.step()` records the `BUILDLOG_REPO_IDENTITY` value for a `verify-mac` or `verify-linux` step whose local key is `store.UNKNOWN_IDENTITY`. `sent_repository_identity()` reads it stripped and returns `SentRepositoryIdentity(value) | NoSentRepositoryIdentity`. A known local key wins, and an ordinary caller ignores a sent value. A recorded identity has `identity_derived = 0`; old `unknown` rows keep the Phase 16 index rule.
+- `scripts/buildlog/repository.py` imports only the standard library and `store`. It holds `GIT_TIMEOUT_S`, `output(args, cwd, timeout)`, `remote_identity(remote, directory)` and `repository_key(directory)`. `record.py` imports these names, so `record.remote_identity` still works for `memory_admit.py`. `recorded_repository_key` is deleted; `step()` checks for an empty argv and calls `repository_key`.
+- `scripts/test_times/show.py` imports `repository` in place of `record`. The cold start of `show.py top` fell from 184.8 ms to 126.9 ms (median of 5 same-load pairs, a prepared index). The index build is 15.5 ms.
+- `parse.py` and `record.sync_config` import `scripts.lib.conf`, so one step process loads `conf.py` once.
+- `scripts/build_queue/admission_code.py` lists `buildlog/repository.py` after `buildlog/record.py` (showrunner, 2026-11-05).
+- The Mac records the sent identity only after the normal main promotion.
 
 **Files:**
-- `scripts/buildlog/record.py` — record the sent key (report-unit's file)
+- `scripts/buildlog/repository.py` — the light repository key module
+- `scripts/buildlog/record.py` — the sent identity reader and the mirror rule (report-unit's file)
 - `scripts/buildlog/parse.py` — one `conf` import name (report-unit's file)
-- `scripts/buildlog/repository.py` — the new light module for the repository key
-- `scripts/test_times/show.py` — import the light module
-- `scripts/build_queue/admission_code.py` — list the light module as admission code (queue-unit's file)
-- `scripts/buildlog/test_step_row.py` — its repository-key test patches `record.output`; move the patch target with the code
-- `scripts/buildlog/test_record.py`, `scripts/buildlog/test_parse.py`, `scripts/test_times/test_show.py` — the regression tests
+- `scripts/test_times/show.py` — imports the light module
+- `scripts/build_queue/admission_code.py` — lists the light module (queue-unit's file)
+- `scripts/buildlog/test_record.py`, `scripts/buildlog/test_parse.py`, `scripts/buildlog/test_step_row.py`, `scripts/test_times/test_show.py` — the tests
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `record.py`, `parse.py`, `repository.py`, `show.py`, `admission_code.py`
-- `test` — `test_step_row.py` and the tests: a mirror step with no origin records the identity sent from natedev; a known local key wins over a sent key; `repository_key` of a directory with and without an origin; one step process loads `conf.py` once
+**Binds later work:**
+- A caller of the repository key uses `repository.repository_key(directory)`. report Phase 24's `offload.py` and `memory_admit.git_identity` callers switch to it when they land.
+- A test that stops the git call patches `repository.output`; patching `record.output` no longer reaches the key lookup.
 
-**Constraints from prior phases:**
-- Phase 16: the index derives the identity of an `unknown` step from its call and marks it `identity_derived = 1`. Keep that rule for old rows.
-- Phase 23: `test_show.py` patches `show.TOOL_REPOSITORY` to its fixture repository. Keep that patch target, or move it with the code in the same change.
-- Phase 18: `offload.py` and `linux_runner.py` send `KnownRepository.key` as `BUILDLOG_REPO_IDENTITY` to Mac and Linux mirror steps, and send nothing when the key is empty.
-- Before work starts, read the open verify-unit and report-unit branches for edits to these files. Claim the outside files on the berth board, and name them in the notice's also-touches line.
-- report-unit Phase 20 (`be35f2d2b`) is on builds and merged here. report-unit Phase 25 (`9ae49ff1f`, not landed) also changes `record.py` `step()`. This phase lands first; report resolves the overlap on its new hash (showrunner, 2026-11-05). Never merge report's unlanded branch.
-- This phase owns every caller of the functions it moves. report-unit Phase 24 adds a caller: `scripts/mac_test/offload.py` reads `record.recorded_repository_key`. Report Phase 24 also makes `memory_admit.git_identity` call it. If report Phase 24 is on builds before this phase lands, merge origin/builds and switch `offload.py` and `memory_admit.git_identity` to `repository.repository_key` in this phase (showrunner, 2026-11-05).
-- Items 4-6 came from the Phase 16 review. The showrunner put them in this phase on 2026-11-04. Name `record.py` and `parse.py` in also-touches.
-
-**Acceptance gate:**
-- the changed test modules green on a tree with origin/builds merged
-- a mirror step test records the identity sent from natedev, for `verify-mac` and `verify-linux`; an ordinary caller ignores a sent value; an absent and an empty value record nothing; a known local key wins; old rows keep the derived identity
-- `test_show.py` green in a clone with an origin and in a clone with no origin (the Phase 23 proof), after the repository functions move
-- the cold start of `show.py top` (a fresh process, a scratch `BUILDLOG_DIR`, under `timeout 600`) before and after item 6, on a prepared index, measured in same-load pairs, in the checkpoint notice
-- the existing evidence-order and recorded-identity tests in `test_index.py` stay green
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Gotchas:**
+- A gate clone must commit a new file before the gate: the aws_target box replica copies only `git ls-files`.
 
 ### Phase 23 — `test_show.py` passes in a checkout with no origin  · status: done
 **Depends on:** none
@@ -689,3 +671,34 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Only the modules that call `forbid_real_sender()` are guarded. The next-items backlog holds the proposal that the runner guards every module.
 - A change to `send.py` keeps the guard as the first statement of `main()`.
 
+### Phase 27 — `test_merge_gate_ledger.py` runs in half its time  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/production/test_merge_gate_ledger.py` (gate median 121.3 s, 14.8 CPU s; the top live module that no phase holds and that the verify-unit remake does not touch) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method. This phase runs while Phase 24 waits on the verify-unit remake (Phase 22 architect review, 2026-11-05). sdlc devtools-unit owns `merge_gate.py` and its test files; natest-unit changes the test files through cargo-berth's flow.
+
+1. Profile before any edit: for each of the 17 tests, find where the wall time goes. The module spends about 106 s of 121 s with no CPU, so look first for waits: poll intervals, sleeps, timeouts, lock or admission waits, and child jobs that wait on a clock. Name each wait, the code line that holds it, and the published state that could end it. Count the gate runs, module jobs and type jobs that each test starts. Write the result into this Spec and name the files and changes before the code dispatch.
+2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
+3. A cut in `merge_gate.py` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase.
+4. A change to `merge_gate_test_support.py` keeps every `test_merge_gate*.py` module green; name each one in the final run.
+
+**Files:**
+- `scripts/production/test_merge_gate_ledger.py` — the target module
+- `scripts/production/merge_gate_test_support.py` — only if the profile puts the cost in the shared fixture
+
+**Workers:** 1 writer (one module and its fixture; the files do not split)
+- `impl` — all files above
+
+**Constraints from prior phases:**
+- Phase 25: `MergeGateFixture.build_fixture` commits the real `module_run.py` into each fixture checkout, and the gate refuses a checkout with no runner.
+- Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/production -p 'test_merge_gate_ledger.py'` green, with the same test names and assertions
+- every `scripts/production/test_merge_gate*.py` module green when `merge_gate_test_support.py` changes
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
