@@ -2766,11 +2766,13 @@ def body_text(options: Options) -> str:
     return sys.stdin.read()
 
 
-def sender_shown_name(sender: str, observed: roster.Roster) -> str:
-    """Resolve display text without changing sender keys or reply addresses."""
+def sender_shown_name(sender: str, stamp: SenderStamp, observed: roster.Roster) -> str:
+    """Resolve the display from the native id without changing reply addresses."""
     import roster
 
-    matches = _sender_label_matches(sender, observed.entries)
+    if isinstance(stamp, UnavailableSender):
+        return sender
+    matches = _sender_label_matches(sender_native_id(stamp), observed.entries)
     if len(matches) == 1:
         return roster.shown_name(matches[0]).render()
     return sender
@@ -2929,9 +2931,9 @@ def _send(options: Options) -> Result:
         options = options._replace(answerable=True)
     emergency = options.to == USER and options.need == "blocked"
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
-    display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
-               else sender_shown_name(sender, observed) if options.to != USER else sender)
     stamp = (options.sender_origin.stamp if isinstance(options.sender_origin, ForwardedSender) else sender_stamp())
+    display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
+               else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
     if sender.casefold() == "morty" and not morty_stamp(stamp):
         print("send.py: sender 'morty' does not match MORTY_NATIVE_ID", file=sys.stderr)
     message = Message(destination, sender, summary, text, key, display, options.human, stamp)

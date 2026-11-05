@@ -118,7 +118,10 @@ This override never makes a list real.
 Lists outside this folder print the routing note without sending an alert or writing an alert record.
 It alerts only from the production staff record; a `STAFF_FILE` override never alerts.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
-A change goes to this root showrunner when its list has no staff showrunner or its production document is gone.
+A routed change goes to this root showrunner when its list has no staff showrunner or its production document is gone.
+An unknown producer id or a broken parent chain keeps the change unrouted.
+An unrouted change uses the list's document when available.
+Otherwise, it takes only the root showrunner's document and keeps its owner.
 The page, the verdict and the footer counts use the same owner.
 The router keeps an available document, including a document that an earlier verdict added to the list.
 Otherwise, the router uses the root showrunner's current document.
@@ -518,7 +521,9 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
 `unrouted_alert_recipient` selects the alert recipient and the root showrunner for changes that nobody can take.
-This rule applies when the list has no staff showrunner or its production document is gone.
+This owner rule applies to routed changes when the list has no staff showrunner or its production document is gone.
+An unknown producer id or a broken parent chain keeps the change unrouted.
+If the list has no document, the unrouted change takes only the root showrunner's document.
 If no document is available for the change or the root showrunner, the page shows the unavailable message.
 `unrouted_alert_retry_seconds` controls repeated alerts.
 
