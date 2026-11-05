@@ -118,6 +118,22 @@ class ScopeEvents:
 class ObservedAdmissionServer(service.AdmissionServer):
     """Expose loop instrumentation only at the shared test fixture boundary."""
 
+    def __init__(self, state_dir: Path, clock: service.Clock, readings: service.Readings,
+                 proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
+                 check_access: Callable[[str], None]) -> None:
+        self.check_access: Callable[[str], None] = check_access
+        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path)
+
+    @override
+    def persist(self) -> None:
+        self.check_access("persist")
+        super().persist()
+
+    @override
+    def run_pass(self) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
+        self.check_access("run_pass")
+        return super().run_pass()
+
     @staticmethod
     def reply_filter(reply: wire.Reply) -> wire.Reply:
         return reply
@@ -136,6 +152,7 @@ class ObservedAdmissionServer(service.AdmissionServer):
     @override
     def handle_request(self, request: wire.Request,
                        connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+        self.check_access("handle_request")
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and isinstance(self.proc, TestProcesses):
             self.proc.register(request.owner)
         return super().handle_request(request, connection)
@@ -194,11 +211,7 @@ class TestProcesses:
         """Supply private memory for an owner that a caller process created."""
         self.starts[owner.pid] = owner.start_time
         if not (self.path / str(owner.pid) / "stat").exists():
-            write_process(self.path, owner.pid, used)
-            stat = self.path / str(owner.pid) / "stat"
-            fields = stat.read_text().rsplit(") ", 1)[1].split()
-            fields[19] = owner.start_time
-            _ = stat.write_text(f"{owner.pid} (fixture) {' '.join(fields)}\n")
+            write_process(self.path, owner.pid, used, start=owner.start_time)
 
     def processes(self) -> dict[int, gate.ProcessIdentity]:
         return gate.process_table(self.path)
@@ -328,6 +341,8 @@ class AdmissionFixture(ExitStack):
             write_memory_config(self.root / "build_admission.conf")
         self.readings: PrivateReadings = PrivateReadings(self.root)
         self.loop_access: threading.RLock = threading.RLock()
+        self.serving_active: threading.Event = threading.Event()
+        self.loop_permission: threading.local = threading.local()
         try:
             self.server: ObservedAdmissionServer = self.new_server()
         except BaseException:
@@ -337,7 +352,7 @@ class AdmissionFixture(ExitStack):
 
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
         server = ObservedAdmissionServer(self.state_dir, self.clock, self.readings, self.proc,
-                                         fault=self.fault, socket_path=self.socket_path)
+                                         fault=self.fault, socket_path=self.socket_path, check_access=self.require_loop_turn)
         if start:
             server.start()
         return server
@@ -368,6 +383,7 @@ class AdmissionFixture(ExitStack):
                 stopped.set()
 
         worker = threading.Thread(target=serve, name="private-admission-loop")
+        self.serving_active.set()
         worker.start()
         try:
             yield self
@@ -376,6 +392,7 @@ class AdmissionFixture(ExitStack):
             worker.join(timeout=3)
             if worker.is_alive():
                 raise AssertionError("the private admission loop did not stop")
+            self.serving_active.clear()
             if failures:
                 raise failures[0]
 
@@ -387,13 +404,19 @@ class AdmissionFixture(ExitStack):
                 raise AssertionError(result.reason)
             return result
 
+    def require_loop_turn(self, method: str) -> None:
+        if self.serving_active.is_set() and not getattr(self.loop_permission, "depth", 0):
+            raise AssertionError(f"{method}: use loop_turn() while the fixture is serving")
+
     @contextmanager
     def loop_turn(self) -> Generator[None]:
         if not self.loop_access.acquire(timeout=3):
             raise AssertionError("the private admission loop did not yield within 3 seconds")
+        self.loop_permission.depth = getattr(self.loop_permission, "depth", 0) + 1
         try:
             yield
         finally:
+            self.loop_permission.depth -= 1
             self.loop_access.release()
 
     def configure(self, **seconds: float) -> None:
@@ -450,8 +473,9 @@ class AdmissionFixture(ExitStack):
     def finish_step(self, request: wire.AdmitRequest, *, end_owner: bool = False) -> wire.Admitted:
         """Admit and release a step without retaining its memory charge."""
         self.allow_next_start()
-        granted = only_admitted(self.server.handle_request(request))
-        replies = self.server.handle_request(wire.ReleaseRequest(f"finish-{request.episode}", granted.reservation, 0))
+        with self.loop_turn():
+            granted = only_admitted(self.server.handle_request(request))
+            replies = self.server.handle_request(wire.ReleaseRequest(f"finish-{request.episode}", granted.reservation, 0))
         if replies != [wire.Ok()]:
             raise AssertionError(f"step release failed: {replies!r}")
         if end_owner:
@@ -460,7 +484,8 @@ class AdmissionFixture(ExitStack):
 
     def queue_pids(self) -> list[int]:
         """Read the queue order through the public view request."""
-        reply, = self.server.handle_request(wire.ViewRequest())
+        with self.loop_turn():
+            reply, = self.server.handle_request(wire.ViewRequest())
         assert isinstance(reply, wire.ViewReply)
         return [row["pid"] for _, row in reply.reading.ordered]
 
@@ -475,7 +500,8 @@ class AdmissionFixture(ExitStack):
                 self.server.run_once(0)
 
     def build_history_generation(self) -> gate.BuildHistoryGeneration:
-        reply, = self.server.handle_request(wire.BuildHistoryRequest())
+        with self.loop_turn():
+            reply, = self.server.handle_request(wire.BuildHistoryRequest())
         assert isinstance(reply, wire.BuildHistoryReply)
         return gate.BuildHistoryGeneration(reply.generation)
 
@@ -612,11 +638,14 @@ class AdmissionFixture(ExitStack):
         write_process(self.proc.path, pid, GIB)
         return wire.Owner(pid, start), directory, stop
 
-    def scope(self, owner: wire.Owner) -> Path:
-        directory = self.root / f"scope-{owner.pid}"
-        directory.mkdir(exist_ok=True)
-        for name, text in {"cgroup.procs": str(owner.pid), "cgroup.events": "populated 1\n",
-                           "memory.current": str(GIB), "memory.stat": f"anon {GIB}\ninactive_file 0\n", "memory.swap.current": "0"}.items():
+    def scope(self, owner: wire.Owner, *, folder: str = "", members: tuple[int, ...] | None = None,
+              current: int = GIB, anonymous: int = GIB, swap: int = 0) -> Path:
+        directory = self.root / (folder or f"scope-{owner.pid}")
+        directory.mkdir(parents=True, exist_ok=True)
+        pids = (owner.pid,) if members is None else members
+        for name, text in {"cgroup.procs": "\n".join(map(str, pids)), "cgroup.events": "populated 1\n",
+                           "memory.current": str(current), "memory.stat": f"anon {anonymous}\ninactive_file 0\n",
+                           "memory.swap.current": str(swap)}.items():
             _ = (directory / name).write_text(text)
         sidecar = self.root / f"sample-{owner.pid}.cgroup"
         _ = sidecar.write_text(str(directory))

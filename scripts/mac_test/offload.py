@@ -8,6 +8,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from importlib import import_module
+import fcntl
 import math
 import os
 from pathlib import Path
@@ -35,10 +36,18 @@ import sweep
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import conf
 import treekey
+if TYPE_CHECKING:
+    from .mirror_root import MacMirrorRoot
+else:
+    from scripts.mac_test.mirror_root import MacMirrorRoot
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
 if TYPE_CHECKING:
+    from ..buildlog import record, repository, store
     from ..build_targets import target_config
 else:
+    import record
+    import repository
+    import store
     import target_config
 
 
@@ -959,15 +968,8 @@ def repository_identity(repo_root: Path) -> RepositoryIdentity:
     source = Path(sweep.source_git_dir(common))
     if not (source / "config").is_file():
         return KnownRepository(name)
-    # Load admission after module initialization to preserve its recorder boundary.
-    if TYPE_CHECKING:
-        from ..lint import memory_admit
-    else:
-        import memory_admit
-    identity = memory_admit.git_identity(["git"], str(source.parent))[0]
-    if isinstance(identity, memory_admit.RepositoryIdentity):
-        return KnownRepository(name, identity.key)
-    return KnownRepository(name)
+    key = repository.repository_key(str(source.parent))
+    return KnownRepository(name) if key == store.UNKNOWN_IDENTITY else KnownRepository(name, key)
 
 
 def comma_values(value: str) -> set[str]:
@@ -1034,8 +1036,12 @@ def write_result(
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
         status = 75
+        description = reason
+        if isinstance(result, DeclinedMacRun) and result.reason == "disk":
+            reason = "disk"
+            description = f"disk: {result.detail}" if result.detail else reason
         if not decline_already_shown(result.reason, last_decline):
-            print(f"mac_test: not running on the {label} ({reason})")
+            print(f"mac_test: not running on the {label} ({description})")
     fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
     if isinstance(destination, ResultFile):
         holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
@@ -1119,9 +1125,14 @@ def linux_mirror_root() -> Path:
     return Path('.local/state/build-target/mirror')
 
 
+def mac_mirror_root() -> MacMirrorRoot:
+    """Read the remote mirror root without expanding the local home folder."""
+    return MacMirrorRoot.read(conf.read("mac_test"))
+
+
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     if target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
-        return f".local/state/mac-test/mirror/{repository.legacy_mirror_name}"
+        return f"{mac_mirror_root().relative}/{repository.legacy_mirror_name}"
     if slot < 1:
         raise ValueError("slot must be positive")
     return f"{linux_mirror_root()}/{repository.path_key}/{slot}"
@@ -1396,6 +1407,83 @@ def probe_mac(
         reason = "the probe answer could not be read"
     print(f"mac_test: could not reach the {'Mac' if target in ('', 'mac') else target}: {reason}", file=sys.stderr, flush=True)
     return UNAVAILABLE_PROBE
+
+
+@dataclass(frozen=True)
+class MacDiskReady:
+    """The Mac meets the disk minimum."""
+
+    free_gib: float
+
+
+@dataclass(frozen=True)
+class SweepShort:
+    """The Mac remains below the disk minimum after the sweep."""
+
+    free_gib: float
+
+
+@dataclass(frozen=True)
+class SweepFailed:
+    """The sweep or its final disk reading failed."""
+
+    cause: str
+
+
+def ensure_mac_disk_floor(
+    controller: ProcessController, config: OffloadConfig, repository: KnownRepository,
+    probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
+) -> MacDiskReady | SweepShort | SweepFailed:
+    """Run one shared floor sweep, then read the Mac disk space again."""
+    if probe.free_gib >= config.free_floor_gib:
+        return MacDiskReady(probe.free_gib)
+    try:
+        directory = state_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        # Keep the inode stable so every waiter uses the same lock.
+        path = directory / f"floor-sweep-{quote(config.host, safe='')}.lock"
+        with path.open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            else:
+                _ = lock.seek(0)
+                _ = lock.truncate()
+                _ = lock.write("floor sweep was interrupted")
+                lock.flush()
+                settings = config_path() if isinstance(config.source, DefaultMacSettings) else config.source
+                timeout = conf.read(settings).number("floor_sweep_timeout_s")
+                result = controller.capture(
+                    [*ssh_prefix(config),
+                     "~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac"],
+                    CommandTimeLimit(timeout),
+                )
+                if isinstance(result, CommandTimedOut):
+                    cause = f"floor sweep timed out after {timeout:g} s"
+                elif isinstance(result, CommandCouldNotStart):
+                    cause = "floor sweep could not start"
+                elif result.status != 0:
+                    detail = " ".join(result.stderr.split())
+                    cause = f"floor sweep exited with status {result.status}" + (f": {detail}" if detail else "")
+                else:
+                    cause = "ok"
+                _ = lock.seek(0)
+                _ = lock.truncate()
+                _ = lock.write(cause)
+                lock.flush()
+            _ = lock.seek(0)
+            cause = lock.read()
+            after = probe_mac(controller, config, repository, target, slot)
+            if cause != "ok":
+                return SweepFailed(cause or "floor sweep result missing")
+            if not isinstance(after, ProbeSnapshot):
+                return SweepFailed("Mac disk reading failed after the floor sweep")
+            if after.free_gib < config.free_floor_gib:
+                return SweepShort(after.free_gib)
+            return MacDiskReady(after.free_gib)
+    except (OSError, ValueError) as error:
+        return SweepFailed(f"floor sweep unavailable: {error}")
 
 
 def ignored_paths(
@@ -1700,9 +1788,7 @@ def extended_regex_literal(text: str) -> str:
 def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1) -> str:
     """Define select_leftovers: the user's processes running from the scoped mirrors.
 
-    A repository's scope stops at its own mirror, so its leftover check never
-    reaches another repository's run. The `[.]` keeps each pattern from
-    matching this script's own text.
+    A repository's scope stops at its own mirror. Brackets around the first character prevent the pattern from matching its assignment.
     """
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         if not isinstance(scope, KnownRepository):
@@ -1713,13 +1799,15 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
             import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
                                                    require_boot_identity=target_config.is_aws_target(configured_ssh_target(target)))
+    root = mac_mirror_root().relative
+    mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
     if isinstance(scope, KnownRepository):
-        mirror = extended_regex_literal(remote_mirror(scope, target, slot))
+        mirror += "/" + extended_regex_literal(scope.legacy_mirror_name)
         command_pattern = f"{mirror}([/'\"[:space:]]|$)"
         cwd_pattern = f"^n.*/{mirror}(/|$)"
     else:
-        command_pattern = "[.]local/state/mac-test/mirror/"
-        cwd_pattern = "^n.*/[.]local/state/mac-test/mirror(/|$)"
+        command_pattern = f"{mirror}/"
+        cwd_pattern = f"^n.*/{mirror}(/|$)"
     return (
         f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
         + f"mirror_cwd_pattern={shlex.quote(cwd_pattern)}\n"
@@ -1929,7 +2017,10 @@ def claimed_run(
             if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup, InterruptedTargetStatus)):
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
-            if probe.free_gib < config.free_floor_gib:
+            disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot)
+            if isinstance(disk, SweepFailed):
+                return DeclinedMacRun("disk", elapsed_seconds(started), disk.cause)
+            if isinstance(disk, SweepShort):
                 return declined("disk", started)
             copy_started = time.monotonic()
             copied = copy_tree_with_key(controller, config, request, repository)
@@ -2247,10 +2338,6 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     """Append each attempt independently of the final verify call target."""
     if not request.target:
         return
-    if TYPE_CHECKING:
-        from ..buildlog import record
-    else:
-        import record
     repository = repository_identity(request.repo_root)
     queued = os.environ.get("BUILDLOG_MEM_WAIT_SINCE", "")
     first = os.environ.get("BUILDLOG_MEM_WAIT_FIRST_FILE", "")
@@ -2262,7 +2349,8 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
                if isinstance(result, NoTestMatchedOnMac) else "declined")
     attempt: record.SshAttempt = {
         "call_id": request.call_id, "target": request.target,
-        "repo_identity": repository.key if isinstance(repository, KnownRepository) else "unknown",
+        "repo_identity": (repository.key if isinstance(repository, KnownRepository) and repository.key
+                          else store.UNKNOWN_IDENTITY),
         "queued_at": float(queued) if queued else time.time() - elapsed_seconds(started),
         "departed_at": time.time() - elapsed_seconds(started), "slot": evidence.slot,
         "outcome": outcome, "completion": evidence.completion, "cleanup": evidence.cleanup,
