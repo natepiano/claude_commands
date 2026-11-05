@@ -1690,7 +1690,7 @@ The restart deadline (F007) moved to shutdown-unit Phase 4l.
 - `docs/as-built/hana-test-windows.md` — owner and marker text (item 7).
 - `scripts/herdr/test_herdr.py` — whole `scripts/lib` copy (item 8).
 
-### Phase 4z — A launcher and its agent child are one identity  · status: todo
+### Phase 4z — A launcher and its agent child are one identity  · status: done
 
 **Depends on:** 4e (native runtime ids select rows).
 
@@ -1717,6 +1717,32 @@ The restart deadline (F007) moved to shutdown-unit Phase 4l.
 **State:** none.
 
 **Acceptance gate:** the new tests fail without the change and pass with it; the production and shutdown suites pass; basedpyright 0/0 on the changed files; the source change is net negative or zero in source lines.
+
+### Phase 5b — The saved layout binds rows from the native process scan  · status: todo
+
+**Depends on:** 4e (native runtime ids select rows).
+
+#### Work Order
+
+**Goal:** `Herdr.record_layout` takes each tab's staff rows from the native process scan, never from herdr's `agent_session` mark, so a stale mark never binds a row to a tab (sdlc, 2026-11-05: a stale mark that binds a row is a wrong result).
+
+**Spec:**
+1. Today `record_layout` (herdr.py about line 1399) reads `pane["agent_session"]` and binds the row whose current session equals that value. herdr keeps the mark after the agent exits or changes, so a stale mark can bind a row to the wrong tab, and the saved restart place is wrong.
+2. Use the existing scan `Herdr._row_panes(record, panes)` (about line 1491). It reads native pane processes and returns the proved panes for each row and whether every pane was known. Do not add a second scan.
+3. Bind each row to the tab of each pane `_row_panes` proved for it. A pane whose evidence is unknown binds nothing; its row keeps its saved place (no row is dropped from the saved layout because of unknown evidence).
+4. A pane with an `agent_session` mark and no proved native process binds nothing.
+5. Cost: one `pane process-info` call per pane on each save. State it in the checkpoint message.
+6. Tests in `test_herdr.py`: a stale `agent_session` mark with a different live native session binds the native row; a mark with no native process binds nothing; unknown pane evidence keeps the saved place.
+
+**Files:**
+- `scripts/herdr/herdr.py` — `record_layout` uses `_row_panes`.
+- `scripts/herdr/test_herdr.py` — the regression tests; update fakes that set only `agent_session` to give native process info.
+
+**Workers:** `1 writer` — one slot owns both files.
+
+**State:** none.
+
+**Acceptance gate:** the new tests fail without the change and pass with it; the herdr, shutdown and production suites pass; basedpyright 0/0 on the changed files; the source change is net negative in source lines.
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: moved: shutdown-unit (sdlc, 2026-11-04)
 
