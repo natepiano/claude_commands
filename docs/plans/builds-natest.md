@@ -725,29 +725,16 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 29 — `test_mac_run.py` runs in half its time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_mac_run.py` (gate median 45.3 s, 43.5 CPU s, 17 tests) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:** Follow the Speed method. The builds showrunner asked for the next unheld module below the held style and herdr modules (2026-11-05). Ranks 20-26 are held on open branches; on 2026-11-05 no open branch changed `test_mac_run.py` or `mac_run.sh` outside main and builds.
-
-1. Profile before any edit. Wall time is close to CPU time, so look first at process starts and repeated setup: `mac_run.sh` starts, `state_command` starts, git calls and fixture builds for each test. The three slowest tests take 6-13 s, 4-8 s and 3-6 s.
-2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
-3. A cut in `mac_run.sh` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase.
-4. Write the profile result and the chosen cuts into the summary before the edit.
+- `scripts/production/test_mac_run.py` command stubs are zsh scripts in place of a new Python interpreter for each command. They write NUL-separated fields (arguments, labels, stdin), and `events()` reads them as bytes with no newline conversion, into the same `CommandEvent` rows. The held build keeps a Python process with `signal.pause()`.
+- The private production config holds two examples (one with an optional feature, one without) in place of nine; both argument forms stay covered.
+- The readiness wait uses the shared `wait_for_file` on the published `build-started` file in place of a 0.01 s poll.
+- All 17 tests and their bodies are the same. Same-load pairs at load 40 (median of 3): 55.5 s -> 40.5 s wall, 49.8 -> 37.2 CPU s. The gate on this phase plus builds was green.
+- Floor: `mac_run.sh` `config_value()` starts `python3 conf.py get` once for each key (339 starts, 23.5 s of a 49.5 s traced run); claim and release in `mac_test.py` take 19.3 s in 35 starts. The proposal is in the next-items file.
 
 **Files:**
-- `scripts/production/test_mac_run.py` — the target module
+- `scripts/production/test_mac_run.py` — zsh stubs, two config examples, the readiness wait
 
-**Workers:** 1 writer (one module; the file does not split)
-- `test` — all files above
-
-**Constraints from prior phases:**
-- Phase 25: the gate runs the tested tree's own `module_run.py`.
-- Phase 26: a test that starts the real `send.py` fails through the `TEST_SENDER_GUARD` marker.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. A test never reaches the real Mac.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_mac_run.py'` green, with the same test names and assertions
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- `basedpyright scripts/production/test_mac_run.py` prints `0 errors, 0 warnings, 0 notes`
+**Binds later work:**
+- A fixture log that holds raw arguments is read as bytes.
