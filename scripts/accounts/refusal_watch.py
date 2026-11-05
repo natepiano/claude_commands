@@ -610,7 +610,7 @@ def session_observation() -> Generator[None]:
 
 
 @herdr.process_action()
-def _action_group_members() -> dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]]:
+def _action_group_members() -> dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]]:
     """Read members fresh before refusal, queued or committed group moves."""
     return accounts.live_group_members()
 
@@ -750,8 +750,12 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                  and previous["state"] in ("requested", "cancelled", "continued", "group selected")))
     refusing_logins: set[str] = set()
     owners = live_owners(only=refused_ids) if refused_ids else []
+    all_members: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]] = (
+        _action_group_members() if owners else {"units": [], "showrunners": []})
+    owner_groups: dict[str, accounts.ClaudeGroup | Literal["ungrouped"]] = {
+        member.session_id: member.group for members in all_members.values() for member in members}
     owners = [session for session in owners if not isinstance(detected[session["session_id"]], ProofRefusal)
-              or accounts.session_group(session) == "ungrouped"]
+              or session["session_id"] not in owner_groups]
     if owners and not dry_run:
         refresh_usage()
         now = max(now, datetime.now(timezone.utc))
@@ -785,7 +789,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 _set_transition(state, session_id, refusal.entry_id, "waited", journaled_wait["move_id"])
     # A short reset wait applies to the whole group.
     for session in owners:
-        group_name = accounts.session_group(session)
+        group_name = owner_groups.get(session["session_id"], "ungrouped")
         if group_name == "ungrouped" or group_name in pending_groups:
             continue
         if group_name in unconfigured:
@@ -828,7 +832,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         previous = state["sessions"].get(session_id)
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] in ("requested", "cancelled", "continued", "group selected"):
             continue
-        if (accounts.session_group(session) in unconfigured
+        if (owner_groups.get(session["session_id"], "ungrouped") in unconfigured
                 and not (previous and previous["entry_id"] == refusal.entry_id and previous["state"] == "waited")):
             continue
         login = accounts.claude_login(Path(session.get("config_dir", str(accounts.main_config_dir()))))
@@ -868,7 +872,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         if isinstance(refusal, TranscriptRefusal):
             refusing_logins.add(login.casefold())
         subject = session_id + ": " + session["name"]
-        pending_head = accounts.session_group(session) in pending_groups
+        pending_head = owner_groups.get(session["session_id"], "ungrouped") in pending_groups
         if (isinstance(wait_reset, refusals.KnownReset) and (pending_head
                 or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
                 and timedelta(0) < wait_reset.at - now < reset_wait)):
@@ -883,16 +887,16 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             continue
         if pending_head:
             continue
-        group_name = accounts.session_group(session)
+        group_name = owner_groups.get(session["session_id"], "ungrouped")
         key = ("proof group" if proof_group else "proof:" + session_id if isinstance(refusal, ProofRefusal)
                else login.casefold()) if group_name == "ungrouped" else "group:" + group_name
         groups.setdefault(key, []).append((session, refusal, account_refusal))
     fingerprint = _reading_values_fingerprint()
     if dry_run:
         lines.insert(0, accounts.group_status_line(selected_groups))
-    all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = (_action_group_members()
-        if not proof_group and any(key.startswith("group:") for key in groups)
-        else {"units": [], "showrunners": []})
+    if not proof_group and any(key.startswith("group:") for key in groups):
+        all_members = _action_group_members()
+
     moved_groups: set[accounts.ClaudeGroup] = set()
     no_room_groups: set[accounts.ClaudeGroup] = set()
     for login, group in groups.items():
@@ -1003,8 +1007,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         eligible: set[accounts.ClaudeGroup] = {group for group in accounts.CLAUDE_GROUPS
                     if group not in moved_groups | waiting_groups | no_room_groups
                     and isinstance(accounts.group_label(selected_groups, group), str)}
-        def completion_members(observed: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]],
-                               group_name: accounts.ClaudeGroup, target: str) -> list[inventory_module.ListedSession]:
+        def completion_members(observed: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]],
+                               group_name: accounts.ClaudeGroup, target: str) -> list[accounts.LiveGroupMember]:
             return [session for session in observed[group_name]
                        if not accounts.session_on_account(session, target)
                        and not (session.session_id in state["sessions"] and state["sessions"][session.session_id]["state"] == "cancelled"

@@ -516,68 +516,9 @@ elif [ "${TEST_PAUSE_ROUTING_SLEEP:-0}" = 1 ]; then
     printf 'sleeping\n' > "$root/routing-sleep"
     gate="$root/continue-sleep"
 fi
-if [ -f "$root/memory-event.py" ] && [ "${TEST_ROUTING_WAIT:-0}" != 1 ]; then
-    exec "$TEST_REAL_PYTHON" "$root/memory-event.py" "$gate"
-elif [ -n "$gate" ]; then
+if [ -n "$gate" ]; then
     exec "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$gate"
 fi
-'''
-
-
-MEMORY_EVENT_STUB = r'''
-import os
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2]))
-from scripts.direct.local_release_wait import local_release_waiter
-from scripts.direct.wait_for_test_state import wait_for_file
-
-if len(sys.argv) > 1 and sys.argv[1]:
-    wait_for_file(Path(sys.argv[1]))
-root = Path(os.environ["TEST_RUNNER_STATE"])
-meminfo = Path(os.environ["BUILDLOG_MEMINFO"])
-clock = Path(os.environ["TEST_ROUTING_CLOCK"]) if os.environ.get("TEST_ROUTING_CLOCK") else root / "no-clock"
-probes = root / "retry-probes"
-idle = Path(os.environ["MAC_IDLE_STATE_DIR"]) / "calls"
-
-# A new memory wait announces its first held check before invoking its hook.
-# Advance that check once per Mac attempt; later checks need an input event.
-attempts = root / "runner-events.jsonl"
-checked = root / "memory-checked-attempt"
-attempt = str(len(attempts.read_text().splitlines()) if attempts.exists() else 0)
-if not checked.exists() or checked.read_text() != attempt:
-    checked.write_text(attempt)
-    raise SystemExit(0)
-
-def changed():
-    fields = meminfo.read_text().split()
-    return (len(fields) > 1 and int(fields[1]) > 0
-            or (root / "mac-free").exists() or (root / "free-once").exists()
-            or any(idle.glob("*.retry"))
-            or (clock.exists() and probes.exists() and probes.read_text().splitlines()
-                and clock.read_text().strip() != probes.read_text().splitlines()[-1]))
-
-# Subscribe before the predicate; the probe records the clock actually checked,
-# so a clock change before this process starts is also visible.
-with local_release_waiter(meminfo.parent, idle) as events:
-    import select
-    import time
-    from scripts.direct.local_release_wait import LocalReleaseEvents
-    deadline = time.monotonic() + float(os.environ["TEST_HANG_GUARD_SECS"])
-    while True:
-        events.arm()
-        if changed():
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("memory fixture was never released")
-        if isinstance(events, LocalReleaseEvents):
-            readable, _, _ = select.select([events.descriptor], [], [], remaining)
-            if readable:
-                _ = os.read(events.descriptor, 65536)
-        else:
-            events.wait(min(0.01, remaining))
 '''
 
 
@@ -585,8 +526,6 @@ with local_release_waiter(meminfo.parent, idle) as events:
 # sleep stand-in so both entry paths share the same event and interval records.
 ROUTING_WAIT_STUB = r'''import os
 import sys
-# This invocation waits for routing release, before memory admission begins.
-os.environ["TEST_ROUTING_WAIT"] = "1"
 os.execv("/bin/sh", ["sh", os.environ["TEST_ROUTING_SLEEP_SCRIPT"], *sys.argv[1:]])
 '''
 
@@ -874,7 +813,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "VERIFY_MAC_TEST_SCRIPT": str(self.root / "free-now.py"),
             "TEST_RUNNER_STATE": str(self.runner_state),
             "TEST_REAL_PYTHON": sys.executable,
-            "TEST_HANG_GUARD_SECS": str(TEST_HANG_GUARD_SECS),
             "TEST_ROUTING_SLEEP_SCRIPT": str(self.bin_directory / "sleep"),
             "TEST_WAIT_HELPER": str(VERIFY.with_name("wait_for_test_state.py")),
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
@@ -1164,12 +1102,10 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                         "the admission wait", (process,))
 
     def hold_memory(self) -> Path:
-        """Keep natedev's memory gate holding until the returned meminfo is rewritten."""
+        """Hold admission through its private memory reading. Preserve unrelated sleep commands."""
         _ = caller_admission(self, self.root, self.environment).occupy_host()
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n", encoding="utf-8")
-        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
-        self.write_executable(self.runner_state / "memory-event.py", MEMORY_EVENT_STUB)
         return meminfo
 
     def leave_once(self) -> dict[str, str]:

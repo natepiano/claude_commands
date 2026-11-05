@@ -285,6 +285,10 @@ Account creation, identity resolution, and missing-note instructions use that sa
 A new process sees a changed notes-folder setting.
 
 The default usage age is ten minutes.
+Codex alert readings use the same `usage_stale_minutes` setting.
+The quota relay limit defaults to 40 seconds, and the registry editor limit defaults to 30 seconds.
+Account commands and Claude usage HTTP requests each default to 15 seconds.
+The Codex account server has three seconds to stop after termination.
 The role-map transport has a five-second connection limit and a twenty-second command limit.
 The outage claim lease is fifteen minutes, longer than the normal send deadline.
 These values live in configuration; their values are not independent code defaults.

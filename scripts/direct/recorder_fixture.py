@@ -212,7 +212,7 @@ def configure_launcher_fixture(launcher: Path) -> None:
 
 def launcher_environment(root: Path) -> dict[str, str]:
     """Isolate registry writes, Python discovery and worker identity for launchers."""
-    environment = os.environ.copy()
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("HERDR_")}
     environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
                        UNIT_WORKER_POLL_SECS="0.01", UNIT_WORKER_WAIT_ATTEMPTS="30000", UNIT_SYNC_WRITES="0",
                        TEST_LEGACY_LAUNCH="1", MODELS_CONFIG_FILE=str(root / ".claude/config/models.conf"),
