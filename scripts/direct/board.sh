@@ -388,7 +388,9 @@ cmd_acquire() {
           previous="$(lock_holder "$dir")"
           previous_pid="$(cat "$dir/holder_pid" 2>/dev/null || true)"
           reclaimed_holders="$(cat "$dir/reclaimed_holders" 2>/dev/null || true)"
-          if ! cleanup_owned_group "$dir"; then
+          # A stale same-slot claim can change holders without ending the old step.
+          # Other slots must retain a live group with a different start.
+          if [[ "$reason" != expired || "$previous" != "$agent" ]] && ! cleanup_owned_group "$dir"; then
             exec 9>&-
             return 1
           fi

@@ -33,10 +33,6 @@ class VerifyTokenSameSlotTests(VerifyTokenOwnershipFixture):
         try:
             self.wait_for_running(first_running, first)
             self.assertTrue(first_running.exists(), "first cargo did not start")
-            # A different start permits reclaim without matching the live step.
-            stale = cast(dict[str, object], json.loads((lock / "owned").read_text()))
-            stale["start"] = "previous-process-start"
-            _ = (lock / "owned").write_text(json.dumps(stale))
             _ = (lock / "expires").write_text("0")
             second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                       env=second_environment, stdout=subprocess.DEVNULL,
@@ -45,6 +41,7 @@ class VerifyTokenSameSlotTests(VerifyTokenOwnershipFixture):
             self.wait_for_waiter(board, second)
             self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
             self.assertFalse(second_running.exists(), "the expired live step was reclaimed")
+            # Change the start only after checking that the live owner retains its claim.
             old_record = cast(dict[str, object], json.loads((lock / "owned").read_text()))
             old_record["start"] = "not-the-running-group"
             _ = (lock / "owned").write_text(json.dumps(old_record))
