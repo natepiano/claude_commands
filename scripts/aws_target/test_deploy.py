@@ -328,6 +328,9 @@ class DeploymentTests(CostFixture):
         bin_path = self.root / 'bin'
         bin_path.mkdir()
         self.fake_commands(f'#!{sys.executable}\n' + FAKE_AWS, 'aws')
+        status = {'Self': {'HostName': 'natedev', 'DNSName': 'natedev.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.1']},
+                  'Peer': {'mac': {'HostName': "Nate's MacBook Pro 2023", 'DNSName': 'nates-macbook-pro-2023.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.2']}}}
+        self.fake_commands(f'#!{sys.executable}\nprint({json.dumps(status)!r})\n', 'tailscale')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             'PATH': f'{bin_path}{os.pathsep}{os.environ["PATH"]}', 'DEPLOY_FIXTURE': str(self.root),
             'AWS_SHARED_CREDENTIALS_FILE': str(self.credentials),
@@ -1028,6 +1031,26 @@ class DeploymentTests(CostFixture):
                 with mock.patch.object(deploy.Deployment, '_box_stages', return_value=()):
                     success = subject.up(approve_resources=True)
         return success, output.getvalue()
+
+    def test_up_refuses_bad_policy_devices_before_price_or_admin_access(self) -> None:
+        status = {'Self': {'HostName': 'natedev', 'DNSName': 'natedev.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.1']}, 'Peer': {}}
+        self.fake_commands(f'#!{sys.executable}\nprint({json.dumps(status)!r})\n', 'tailscale')
+        with mock.patch.object(deploy.Deployment, '_price_present', side_effect=AssertionError('price must not run')) as price, \
+             mock.patch.object(admin_secrets, 'read_hidden', side_effect=AssertionError('no passphrase')) as prompt, \
+             mock.patch.object(box, 'tailnet_request', side_effect=AssertionError('no API')) as tailnet, \
+             mock.patch.object(admin_secrets.AdminSecretSession, 'get', side_effect=AssertionError('no admin access')) as credentials:
+            success, output = self.up_output(self.deployment())
+        self.assertFalse(success)
+        self.assertIn('nates-macbook-pro-2023: no match', output)
+        self.assertIn('machine names present: natedev', output)
+        price.assert_not_called()
+        prompt.assert_not_called()
+        tailnet.assert_not_called()
+        credentials.assert_not_called()
+        self.assertEqual(self.commands(), [])
+        result = ledger.mapping(remote.read_record(self.state / 'up.json')['up'])
+        self.assertEqual(result['status'], 'refused')
+        self.assertEqual(output, 'up: refused: ' + str(result['reason']) + '\n')
 
     def test_up_creates_each_stage_and_the_second_run_only_checks_live_state(self) -> None:
         _ = self.credentials.write_text('[unrelated]\naws_access_key_id=other-key\naws_secret_access_key=other-value\n')
