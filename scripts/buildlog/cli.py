@@ -5,7 +5,7 @@
   buildlog schema                   tables, columns, views and example queries
   buildlog report [YYYY-MM-DD]      one day (default today) as markdown: each kind by caller, then a summary
   buildlog costs [--days N]          phase time and ranked build costs, read-only
-  buildlog charts [--days 7|30]      open standalone build history charts, read-only
+  buildlog charts [--days 7|30] [--no-open]  publish build history charts and print the tailnet link, read-only
   buildlog moments [YYYY-MM-DD]     before/after build moments, read-only
   buildlog mac-report [--hours N]    Mac test outcomes over the last N hours and three local days
   buildlog reindex                  rebuild the index from the JSON lines
@@ -356,17 +356,12 @@ def main(argv: list[str]) -> int:
         return 0
     if command == "sample":
         import sample
-        import memory
         import mac_idle
 
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
             return 2
         taken = sample.sample()
-        try:
-            memory.write_snapshot(taken.at, taken.host)
-        except (OSError, ValueError) as error:
-            print(f"buildlog sample: memory snapshot unavailable: {error}", file=sys.stderr)
         if taken.host == "natedev":
             try:
                 mac_idle.watch_once(mac_idle.watch_paths(), taken.at, time.monotonic())

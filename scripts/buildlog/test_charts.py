@@ -9,12 +9,15 @@ import re
 import subprocess
 import sys
 import unittest
+import webbrowser
 from contextlib import closing
+from io import StringIO
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -28,7 +31,22 @@ from test_holds import hold_event
 from test_index import Record, call, ci_job, ci_run
 
 
-class ChartTests(unittest.TestCase):
+REVIEW_HOST = "100.100.100.100"
+
+
+def assert_review_link(test: unittest.TestCase, stdout: str, reviews: Path, cache: Path) -> str:
+    lines = stdout.splitlines()
+    test.assertEqual(len(lines), 1)
+    link = urlsplit(lines[0])
+    test.assertEqual(link.scheme, "http")
+    test.assertEqual(link.hostname, REVIEW_HOST)
+    test.assertTrue(all(str(cache) not in line for line in lines))
+    snapshot = reviews / unquote(link.path.lstrip("/"))
+    test.assertEqual(snapshot.read_bytes(), (cache / "buildlog/charts/latest.html").read_bytes())
+    return lines[0]
+
+
+class ChartFixture(unittest.TestCase):
     fixture: fixtures.MomentTests  # pyright: ignore[reportUninitializedInstanceVariable]
 
     def __init__(self, methodName: str = "runTest") -> None:
@@ -38,8 +56,15 @@ class ChartTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.fixture = fixtures.moment_fixture(self)
+        self.fixture.fixture.root.mkdir(parents=True, exist_ok=True)
         _ = cast(object, self.enterContext(mock.patch.object(record, "configured_targets", self.targets)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "REVIEW_LINKS_ROOT": str(self.fixture.fixture.root / "review-links"),
+            "REVIEW_LINKS_HOST": REVIEW_HOST,
+        })))
 
+
+class ChartTests(ChartFixture):
     def label_page(self) -> str:
         events = tuple(moments.BuildMoment(fixtures.START+timedelta(hours=1, seconds=number*10),
                                           f"Change {number}", "all") for number in range(4))
@@ -381,7 +406,7 @@ for(const mark of machine.querySelectorAll('.overlap-mark'))if(mark.getAttribute
         with mock.patch.dict(os.environ, {"XDG_CACHE_HOME":str(cache), "BUILDLOG_CHARTS_NO_OPEN":"1"}):
             result = fixtures.read_only_cli(self, ["charts", "--days", "7"])
         path = cache/"buildlog/charts/latest.html"
-        self.assertIn(str(path), result.stdout)
+        _ = assert_review_link(self, result.stdout, self.fixture.fixture.root / "review-links", cache)
         page = path.read_text()
         self.assertEqual(page.count('<svg id='), 3)
         self.assertNotIn('<script src=', page)
@@ -554,7 +579,9 @@ if(document.getElementById('cause').viewBox.baseVal.width>1120)failures.push('Th
         with closing(self.fixture.connection()), \
              mock.patch.dict(os.environ, {"USER_ZONE": "UTC", "TZ": "America/Los_Angeles"}), \
              mock.patch.object(moments, "MOMENTS", (event,)), \
-             mock.patch.object(charts, "publish") as publication:
+             mock.patch.object(charts, "publish") as publication, \
+             mock.patch("charts.review_link.snapshot", return_value=[f"http://{REVIEW_HOST}/zone/latest.html"]), \
+             mock.patch.object(sys, "stdout", StringIO()):
             self.assertEqual(charts.main(["--no-open"]), 0)
         series = cast(charts.ChartSet, publication.call_args.args[0])
         self.assertEqual(series.zone, "UTC")
@@ -563,3 +590,115 @@ if(document.getElementById('cause').viewBox.baseVal.width>1120)failures.push('Th
             "at": event.at.timestamp()*1000, "name": "zone marker", "scope": "all",
             "local": event.at.strftime("%b %d %H:%M UTC"),
         }])
+
+
+class ChartOpenTests(ChartFixture):
+    def test_local_display_excludes_every_ssh_session(self) -> None:
+        cases: tuple[tuple[dict[str, str], str, bool], ...] = (
+            ({}, "darwin", True),
+            ({}, "linux", False),
+            ({"DISPLAY": ":1"}, "linux", True),
+            ({"WAYLAND_DISPLAY": "wayland-0"}, "linux", True),
+            ({"DISPLAY": "", "WAYLAND_DISPLAY": ""}, "linux", False),
+            ({"SSH_CONNECTION": "client 1 server 2"}, "darwin", False),
+            ({"SSH_CONNECTION": ""}, "darwin", False),
+            ({"SSH_CONNECTION": "client 1 server 2", "DISPLAY": ":1"}, "linux", False),
+            ({"SSH_CONNECTION": "client 1 server 2", "WAYLAND_DISPLAY": "wayland-0"}, "linux", False),
+            ({"SSH_CONNECTION": "client 1 server 2", "DISPLAY": ":1"}, "darwin", False),
+        )
+        for environment, platform, expected in cases:
+            with self.subTest(environment=environment, platform=platform):
+                self.assertEqual(charts.local_display(environment, platform), expected)
+
+    def test_local_display_opens_the_printed_link(self) -> None:
+        _ = self.check_publication({"DISPLAY": ":1"}, browser_opens=True)
+
+    def test_sessions_without_a_local_display_print_the_link_without_opening(self) -> None:
+        for environment in ({}, {"SSH_CONNECTION": "client 1 server 2", "DISPLAY": ":1"}):
+            with self.subTest(environment=environment):
+                _ = self.check_publication(environment, browser_opens=False)
+
+    def test_browser_failures_preserve_the_printed_link(self) -> None:
+        cache = self.fixture.fixture.root / "cache"
+        path = cache / "buildlog/charts/latest.html"
+        series = charts.ChartSet(fixtures.START, fixtures.END, "UTC", (), (), ())
+        for result in (False, OSError("browser unavailable"), webbrowser.Error("browser unavailable")):
+            with self.subTest(result=result):
+                output, errors = StringIO(), StringIO()
+                browser = mock.Mock(return_value=result) if isinstance(result, bool) else mock.Mock(side_effect=result)
+                with mock.patch.dict(os.environ, {"DISPLAY": ":1"}), \
+                     mock.patch.object(charts, "local_display", return_value=True), \
+                     mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors), \
+                     mock.patch.object(webbrowser, "open", browser):
+                    self.assertEqual(charts.present_page(series, path, False), 0)
+                link = assert_review_link(self, output.getvalue(), self.fixture.fixture.root / "review-links", cache)
+                browser.assert_called_once_with(link)
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_no_open_controls_publish_only_the_link(self) -> None:
+        for args, environment in ((("--no-open",), {}), ((), {"BUILDLOG_CHARTS_NO_OPEN": "1"})):
+            with self.subTest(args=args, environment=environment):
+                _ = self.check_publication({"DISPLAY": ":1", **environment}, browser_opens=False, args=args)
+
+    def check_publication(self, environment: dict[str, str], *, browser_opens: bool,
+                          args: tuple[str, ...] = ()) -> str:
+        root = self.fixture.fixture.root
+        reviews = root / "review-links"
+        cache = root / "cache"
+        output, errors = StringIO(), StringIO()
+        browser = mock.Mock(return_value=True)
+        settings = {name: value for name, value in os.environ.items()
+                    if name not in ("SSH_CONNECTION", "DISPLAY", "WAYLAND_DISPLAY", "BUILDLOG_CHARTS_NO_OPEN")}
+        settings.update({"XDG_CACHE_HOME": str(cache), **environment})
+        with mock.patch.dict(os.environ, settings, clear=True), \
+             mock.patch("charts.sys.platform", "linux"), \
+             mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors), \
+             mock.patch.object(webbrowser, "open", browser), closing(self.fixture.connection()):
+            self.assertEqual(charts.main(list(args)), 0)
+        link = assert_review_link(self, output.getvalue(), reviews, cache)
+        if browser_opens:
+            browser.assert_called_once_with(link)
+        else:
+            browser.assert_not_called()
+        self.assertEqual(errors.getvalue(), "")
+        return link
+
+    def test_repeated_runs_print_the_same_link(self) -> None:
+        first = self.check_publication({}, browser_opens=False, args=("--no-open",))
+        second = self.check_publication({}, browser_opens=False, args=("--no-open",))
+        self.assertEqual(first, second)
+
+    def test_publish_failure_prints_one_reason_and_exits_nonzero(self) -> None:
+        root = self.fixture.fixture.root
+        reviews = root / "review-links"
+        _ = reviews.write_text("A regular file blocks the review folder.")
+        output, errors = StringIO(), StringIO()
+        browser = mock.Mock()
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(root / "cache")}), \
+             mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors), \
+             mock.patch.object(webbrowser, "open", browser), closing(self.fixture.connection()):
+            self.assertNotEqual(charts.main([]), 0)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("publication failed:", errors.getvalue())
+        self.assertIn(str(reviews), errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertTrue((root / "cache/buildlog/charts/latest.html").is_file())
+        browser.assert_not_called()
+
+    def test_unwritable_cache_prints_one_reason_and_exits_nonzero(self) -> None:
+        cache = self.fixture.fixture.root / "cache"
+        cache.mkdir(mode=0o500)
+        self.addCleanup(cache.chmod, 0o700)
+        output, errors = StringIO(), StringIO()
+        browser = mock.Mock()
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache)}), \
+             mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors), \
+             mock.patch.object(webbrowser, "open", browser), closing(self.fixture.connection()):
+            self.assertEqual(charts.main([]), 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("Permission denied", errors.getvalue())
+        self.assertIn("publication failed:", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+        browser.assert_not_called()
