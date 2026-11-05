@@ -62,7 +62,13 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Target: `scripts/production/mac_run.sh` (recent owner: builds-resources)
   - Why needed: `config_value()` starts `python3 conf.py get` once for each key. `test_mac_run.py` makes 339 such starts (23.5 s traced of a 49.5 s traced run); they set the Phase 29 floor.
   - Completion condition: send the showrunner a proposal for one `conf.py` start that prints every key `mac_run.sh` needs, with the same validation; estimated gain 12-14 s on the module.
-  - Also: `mac_test.py` claim and release take 19.3 s in 35 starts (owner verify-unit); profile their imports before a proposal (estimated 3-6 s).
+  - Taken by Phase 30 (2026-11-05): `mac_run.sh` sources `conf.sh`.
+- [ ] **Architecture proposal: the Mac claim and release commands import less**
+  - Target: `scripts/mac_test/offload.py`, `scripts/mac_test/mac_test.py` (owner verify-unit), `scripts/build_hold/build_hold.py` (held until natedev messaging's hash)
+  - Why needed: Phase 30 profile at load 10: claim 334.5 ms, release 276.6 ms; imports are about 230 ms of each. `build_hold.py:43` imports `admission_service` at once (126-132 ms cumulative); `offload.py:910` imports `memory_admit` a second time under another name (42 ms on claim); `offload` and `sweep` load at module start (about 41-53 ms, overlapping).
+  - Split (showrunner, 2026-11-05): natest takes items 1 and 3 and resources' add-on F006 (offload reads its git helpers from a small module, not all of `sweep`) in one phase after Phase 24 lands; one unit changes `offload.py`. resources takes item 2 as its add-on F005 after the `build_hold.py` freeze; natest sent the measure and the light `session_owner` module design (2026-11-05).
+  - Completion condition (natest part): one `memory_admit` import name in `offload.py`, a light release path and F006, each measured after the one before it lands. Originally: send the showrunner the three proposals in order (one `memory_admit` name; admission imports out of the claim and release path through one light shared module, not a copy; a light release path), each with its measured gain after the one before it lands. Estimated 200-260 ms for each claim and release pair.
+  - Revealed by: Phase 29 trace and Phase 30 profile, 2026-11-05.
   - Revealed by: Phase 29, 2026-11-05.
 - [ ] **Architecture proposal: one injected Git runner in fast_track.py**
   - Target: `scripts/production/fast_track.py` (owner: production) and `scripts/production/test_fast_track.py`

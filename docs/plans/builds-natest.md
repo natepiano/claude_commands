@@ -738,3 +738,39 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Binds later work:**
 - A fixture log that holds raw arguments is read as bytes.
+
+### Phase 30 — `mac_run.sh` reads its settings with no process for each key  · status: done
+**Depends on:** Phase 29
+
+#### Work Order
+
+**Goal:** `scripts/production/mac_run.sh` reads its 19 settings with the sourced shell reader `scripts/lib/conf.sh`, so a valid read starts no process. `test_mac_run.py` drops by about 12 s, and each real mac_run starts about 19 fewer Python processes.
+
+**Spec:** The builds showrunner gave this phase to natest on 2026-11-05 (Phase 29 floor). On 2026-11-05 no open branch changed `mac_run.sh`, `conf.py`, `conf.sh` or `test_conf_sh.py` outside main and builds.
+
+1. Today `config_value()` in `mac_run.sh` starts `python3 conf.py get FILE KEY` once for each key: 18 `production` keys and one `mac_test` key. Phase 29 traced 339 such starts in `test_mac_run.py` (23.5 s traced).
+2. `scripts/lib/conf.sh` already reads a valid value with shell builtins and hands a fault to `conf.py`, so the error text and exit stay the same. `review.sh` and `implement.sh` use it from bash. Use it in `mac_run.sh`: source it once and replace each `config_value` call with `conf_value`. Keep every key, every `|| exit 2`, and the order of reads.
+3. `mac_run.sh` is zsh, and `conf.sh` is written for bash 3.2 (it finds `conf.py` through `BASH_SOURCE`). Make `conf.sh` work when zsh sources it, in `conf.sh` itself, and keep bash 3.2 behavior unchanged. sdlc gave the go for this `conf.sh` change (showrunner, 2026-11-05). Add a zsh case to `test_conf_sh.py` beside the bash cases.
+4. The settings folder must stay the same for both readers: `CONF_DIR`, else `$HOME/.claude/config`. Check that `test_mac_run.py`'s private `HOME` config still reaches the reader.
+5. A per-run measure on natedev with the live config, read only: time the 19 reads as `conf.py get` processes and as `conf_value` calls, five runs each, with `/proc/loadavg`. This is the per-run saving for the notice.
+6. Profile only, a second worker, no edit: `scripts/mac_test/mac_test.py` `claim` and `release` (19.3 s in 35 starts in Phase 29's trace). Measure import time (`python3 -X importtime`) and handler time for each, on a private state folder. Report the costly imports and an estimated saving. A code change there goes to the showrunner first (verify-unit's file).
+
+**Files:**
+- `scripts/production/mac_run.sh` — source `conf.sh`; `conf_value` for each read
+- `scripts/lib/conf.sh` — works when zsh sources it
+- `scripts/lib/test_conf_sh.py` — the zsh case
+- `scripts/production/test_mac_run.py` — only if the fixture must point the reader at its config
+
+**Workers:** 1 writer + 1 profiler (the profile edits no file)
+- `impl3` — all files above
+- `test` — the `mac_test.py` claim and release profile (step 6), report only
+
+**Constraints from prior phases:**
+- Phase 29: `test_mac_run.py` uses zsh command stubs and two config examples; same-load pairs 55.5 -> 40.5 s at load 40.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`. A test never reaches the real Mac.
+
+**Acceptance gate:**
+- `scripts/production/test_mac_run.py`, `scripts/lib/test_conf_sh.py` and `scripts/lib/test_conf.py` green, with the same test names and assertions
+- same-load pairs (`pairs.sh`) of `test_mac_run.py` before and after
+- the per-run measure of step 5 in the checkpoint notice
+- `basedpyright` on each changed Python file prints `0 errors, 0 warnings, 0 notes`; `zsh -n mac_run.sh` and `bash -n conf.sh` pass
