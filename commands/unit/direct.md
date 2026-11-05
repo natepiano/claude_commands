@@ -597,6 +597,12 @@ beside the repair being dispatched — then continue. Never stop, ask permission
 re-open a decision the user has already made about this run, or edit
 `~/.claude/config/direct.conf` mid-run to change what gets said.
 
+**The gate reads only the ledger.** `converged` means that no gating finding is
+open. It does not mean that the tests pass: a test result reaches the gate only
+through a finding. Before each `gate` after a repair, read the worker's summary
+and open a blocker for each failing test or lint line that no finding covers.
+A later round gates blockers only, so a red with no finding reads as `converged`.
+
 **Dispatching a repair fixes nothing.** `dispatch` leaves its batch
 `repair_in_flight`, and `gate` and `verdict` both refuse a finding still in
 flight, so a repair that never finished cannot reach a reviewer pre-labelled as
