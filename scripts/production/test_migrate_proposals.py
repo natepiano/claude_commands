@@ -13,15 +13,15 @@ from scripts.production import migrate_proposals, proposal_issue
 from issues import Issue, frontmatter
 
 
-def row(name: str, kind: staff.Kind, parent: str = "") -> staff.StaffRow:
+def row(name: str, kind: staff.Kind, parent: staff.ReportsTo | staff.StaffRoot) -> staff.StaffRow:
     identity = staff.StaffId(fixture_runtime_id(name))
-    return staff.StaffRow(identity, kind, name, staff.StaffId(parent) if parent else None, current_session=identity)
+    return staff.StaffRow(identity, kind, name, parent, current_session=identity)
 
 
 class ProposalIdentityTests(unittest.TestCase):
     def test_interrupted_migration_matches_clean_run_and_rerun_preserves_bytes(self) -> None:
-        owner = row("demo", "showrunner")
-        unit = row("names-unit", "unit", owner.id)
+        owner = row("demo", "showrunner", staff.StaffRoot())
+        unit = row("names-unit", "unit", staff.ReportsTo(owner.id))
         record = staff.StaffSnapshot((owner, unit))
         original = ('---\ntags: [proposal]\nunit: names-unit\nproposed_by: names-unit (demo)\n'
                     'approved_in: demo\nshowrunner: demo\nplan: old.md\n---\nBody.\n')

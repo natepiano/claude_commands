@@ -236,7 +236,9 @@ class StaffSourcesTests(StaffTestCase):
         sources = MemberSources({}, (launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            evidence = staff_sources.observe_workers(record, sources)
+            with self.assertRaises(staff.StaffUnreadable):
+                _ = staff_sources.observe_workers(record, sources)
+            evidence = staff_sources.observe_workers(record, sources, unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
         expected = "staff sources: Codex process 42401: native thread identity is unavailable"
         self.assertEqual(evidence.diagnostics, (expected,))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
@@ -269,7 +271,10 @@ class StaffSourcesTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
+            with self.assertRaises(staff.StaffUnreadable):
+                _ = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
+            evidence = staff_sources.observe_workers(
+                staff.snapshot(), MemberSources({}, (launch,)), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
         self.assertEqual(evidence.diagnostics, (
             "staff sources: Codex process 42401: native thread identity is unavailable",))
 
@@ -313,7 +318,10 @@ class StaffSourcesTests(StaffTestCase):
             42401, 1, "node", 'node /modules/@openai/codex/bin/codex.js --config "unfinished')}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment") as environment):
-            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            with self.assertRaises(staff.StaffUnreadable):
+                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            evidence = staff_sources.observe_workers(
+                staff.StaffSnapshot(()), MemberSources({}, ()), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
         environment.assert_not_called()
         self.assertEqual(evidence.diagnostics,
                          ("staff sources: Codex process scan: pid 42401: No closing quotation",))
@@ -323,7 +331,10 @@ class StaffSourcesTests(StaffTestCase):
         from scripts.message import process_table
 
         with mock.patch.object(process_table, "snapshot", side_effect=OSError("process table unavailable")):
-            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            with self.assertRaises(staff.StaffUnreadable):
+                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            evidence = staff_sources.observe_workers(
+                staff.StaffSnapshot(()), MemberSources({}, ()), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
         self.assertEqual(evidence.diagnostics, ("staff sources: Codex processes: process table unavailable",))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
@@ -700,7 +711,7 @@ class StaffSourcesTests(StaffTestCase):
         invalid = run / "a.pending.json"
         valid = run / "zz.pending.json"
         _ = empty.write_text("")
-        self.write_json(invalid, {"messages": []})
+        self.write_json(invalid, {"messages": [42]})
         native = fixture_runtime_id("pending-native")
         parent = fixture_runtime_id("pending-parent")
         self.write_json(valid, {"thread_id": "", "messages": [],

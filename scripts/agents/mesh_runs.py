@@ -545,7 +545,8 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
                                 text, message_id=message_id)
         repeat_guard.transport_result("mesh-runs", receiver, text, "queued")
         return f"queued for held role {name}; its holder controls the next assignment"
-    held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False, sender="mesh-runs")
+    durable = Path(session_dir).resolve() in {path.resolve() for path in design_roles.durable_meshes()}
+    held = codex_mesh.hold_message(session_dir, name, text, without_launcher=durable, sender="mesh-runs")
     match held:
         case codex_mesh.RepeatHeld(copies):
             return f"held repeated run result: copy {copies}"

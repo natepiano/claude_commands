@@ -304,6 +304,8 @@ class RosterTests(unittest.TestCase):
 
         self.director_run = self.runs / "director-run"
         self.director_run.mkdir()
+        _ = (self.director_run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: unit.id}),
+                                                               encoding="utf-8")
         _ = (self.runs / "active" / "17e44ec4-3e24-5ae1-b10d-5cf30de9455b").write_text(
             str(self.director_run) + "\n", encoding="utf-8",
         )
@@ -1152,7 +1154,7 @@ class RosterTests(unittest.TestCase):
 
 
     def test_bad_durable_binding_leaves_a_named_peer_send_quiet(self) -> None:
-        bad = write_empty_binding_record(self.root)
+        _ = write_empty_binding_record(self.root)
         peer = self._entry('natedev', 'freestanding', 'session:peer-session')
         os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
         output, errors = io.StringIO(), io.StringIO()

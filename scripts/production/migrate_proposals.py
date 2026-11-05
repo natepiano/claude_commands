@@ -29,7 +29,7 @@ def reference(record: staff.StaffSnapshot, value: str, kinds: tuple[staff.Kind, 
         parent = reference(record, named[2].strip(), ("showrunner",))
         value = named[1].strip()
     rows = [row for row in record.rows if row.kind in kinds and row.name == value
-            and (not parent or row.parent == parent)]
+            and (not parent or row.reports_to(staff.StaffId(parent)))]
     if len(rows) != 1:
         raise UnresolvedReference(f"{value}: no unique staff row")
     return rows[0].id

@@ -25,21 +25,21 @@ from scripts.direct import phase_reservation, plan_history  # noqa: E402
 from scripts.agents import worker_lifecycle
 from scripts.lib import atomic_file
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import fixture_member, fixture_unit_location, isolated_staff_file
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}
 
 
-def record_unit(test: unittest.TestCase, run: Path, home: Path) -> None:
-    """Give the run a private staff row with a home folder."""
+def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str) -> None:
+    """Record a private unit and its durable run owner."""
     _ = test.enterContext(isolated_staff_file(run / "staff.json", {}))
     _ = (run / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
     owner = fixture_member("showrunner", name="reservation")
-    row = fixture_member("unit", name="reservation", parent=owner.id,
-                         worktree=staff.PresentWorktree("natedev", home))
-    _ = (run / "director").write_text(str(row.id) + "\n")
+    row = fixture_unit_location(owner, "reservation", home)
+    _ = (run / plan_history.STATE_FILENAME).write_text(json.dumps({
+        "owner_staff_id": row.id, "phase": {"id": phase, "status": "active"}, "open_phases": []}))
 
 
 @final
@@ -56,7 +56,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.first = root / "worktree-x"
         self.second = root / "worktree-y"
         self.first.mkdir()
-        record_unit(self, self.session, self.first)
+        record_unit(self, self.session, self.first, "1")
         for command in (
             ["init", "-q", "-b", "main"],
             ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
@@ -68,9 +68,11 @@ class WorktreeAttributionTests(unittest.TestCase):
 
     def phases(self, worktrees: dict[str, Path]) -> list[phase_reservation.OpenPhase]:
         records = [{"id": name, "instance_id": name, "status": "active"} for name in ("1", "2")]
-        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps({
+        state = cast(dict[str, object], json.loads((self.session / plan_history.STATE_FILENAME).read_text()))
+        state.update({
             "phase": records[-1], "open_phases": records[:-1],
-        }))
+        })
+        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps(state))
         for name in ("1", "2"):
             directory = phase_reservation.phase_directory(self.session, name)
             directory.mkdir(parents=True)
@@ -88,10 +90,13 @@ class WorktreeAttributionTests(unittest.TestCase):
         return code, errors.getvalue()
 
     def test_missing_unit_row_names_the_owner(self) -> None:
-        _ = (self.session / "director").write_text("missing-owner\n")
+        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps({"owner_staff_id": "missing-owner"}))
         directory = phase_reservation.phase_directory(self.session, "1")
-        with self.assertRaisesRegex(phase_reservation.StateRefused, "run owner 'missing-owner': unit staff row is unavailable"):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), self.assertRaisesRegex(phase_reservation.StateRefused,
+                                                                      "run owner is unavailable"):
             _ = phase_reservation.phase_worktree(directory)
+        self.assertIn("run owner missing-owner: unit staff row is unavailable", errors.getvalue())
 
     def test_claim_records_the_first_commit_and_dirty_status(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
@@ -379,7 +384,7 @@ class PhaseStateTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.session = Path(folder.name)
-        record_unit(self, self.session, self.session)
+        record_unit(self, self.session, self.session, "34h")
 
     def phase_dir(self) -> Path:
         return phase_reservation.phase_directory(self.session, "34h")
@@ -443,7 +448,13 @@ class PhaseStateTests(unittest.TestCase):
     def test_a_finished_phase_reopens_with_its_kept_board_answer(self) -> None:
         _ = self.run_verb("enroll", "--board", "board_ready")
         self.assertEqual(self.run_verb("clear"), (0, ""))
+        path = self.session / plan_history.STATE_FILENAME
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        state["phase"] = {"id": "34h", "status": "completed"}
+        _ = path.write_text(json.dumps(state))
         self.assertEqual(phase_reservation.open_phases(self.session), [])
+        state["phase"] = {"id": "34h", "status": "active"}
+        _ = path.write_text(json.dumps(state))
         self.assertEqual(phase_reservation.restore(self.phase_dir(), "34h"), "enrolled_awaiting_first_touch")
         self.assertEqual([phase.phase for phase in phase_reservation.open_phases(self.session)], ["34h"])
         # An open phase is left as it is, and a phase never enrolled has nothing to restore.
@@ -484,7 +495,7 @@ class PhaseRepairTests(unittest.TestCase):
         self.session = self.root / "unit session"
         self.directory = phase_reservation.phase_directory(self.session, "34h")
         self.directory.mkdir(parents=True)
-        record_unit(self, self.session, self.repo)
+        record_unit(self, self.session, self.repo, "34h")
         _ = (self.directory / phase_reservation.BASELINE_FILE).write_text("a" * 40 + "\n")
         binary = self.root / "bin"
         binary.mkdir()
@@ -502,9 +513,11 @@ class PhaseRepairTests(unittest.TestCase):
 
     def recorder_phases(self, *phases: str) -> None:
         records = [{"id": phase, "status": "active"} for phase in phases]
-        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps({
+        state = cast(dict[str, object], json.loads((self.session / plan_history.STATE_FILENAME).read_text()))
+        state.update({
             "phase": records[-1] if records else {"id": "34h", "status": "completed"},
-            "open_phases": records[:-1]}))
+            "open_phases": records[:-1]})
+        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps(state))
 
     def test_a_checkpoint_released_phase_cannot_restore_a_live_mapping(self) -> None:
         _ = phase_reservation.enroll(self.directory, "34h", "board_ready")

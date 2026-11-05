@@ -35,6 +35,7 @@ from scripts.message import sessions as reader_sessions
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, recorded_unit
 from scripts.shutdown import stop_resume
+from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown import pane_record as hook_pane_record
 
 if TYPE_CHECKING:
@@ -310,7 +311,10 @@ class UnitWatchdogTests(unittest.TestCase):
             return (reader_sessions.LiveSessionProcess(observed.pid) if isinstance(observed, sessions.LiveSessionProcess)
                     else reader_sessions.SessionNotLive())
 
-        def tab(identity: str) -> herdr.TabSession:
+        unread_names = LaunchNamesNotRead()
+
+        def tab(identity: str, *, names: LaunchNames | LaunchNamesNotRead = unread_names) -> herdr.TabSession:
+            _ = names
             return herdr.TabSession(identity, self.units[identity]["name"], "fixture", identity)
 
         def signal_claude(pid: int, requested: int) -> None:

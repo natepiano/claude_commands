@@ -26,6 +26,8 @@ class AssignClaudeDoorTests(AssignLauncherFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # The file claim requires a commit for the phase baseline.
+        self.commit_project()
         _ = write_registry(self.registry, {
             "assignments": {"direct": "claude"},
             "direct.claude": {"impl": "opus:high", "test": "opus:high",
@@ -72,9 +74,10 @@ class AssignClaudeDoorTests(AssignLauncherFixture):
         self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
         self.assertEqual(arguments[arguments.index("--effort") + 1], "high")
         self.assertEqual(self.methods("thread/start"), [])
-        # The stub returns no session banner, so the real launcher reports that failure.
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        # The stub returns no session banner, so admission cannot prove its identity.
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("could not start a background session", result.stderr)
+        self.assertIn("Claude launcher ended before native identity proof", result.stderr)
         self.assertNotIn(assign_gate.REFUSAL, result.stderr)
 
     def test_claude_ancestor_reaches_the_configured_claude_stub(self) -> None:

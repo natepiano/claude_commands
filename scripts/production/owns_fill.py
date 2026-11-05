@@ -80,7 +80,7 @@ def fill_unit(production: str, cells: dict[str, str], snapshot: staff.StaffSnaps
         identity = unit_names.unit_id(name)
         matches = [row for row in snapshot.rows if row.kind == "unit"
                    and unit_names.unit_id(row.name) == identity
-                   and owner is not None and row.parent == owner.id]
+                   and owner is not None and row.reports_to(owner.id)]
         if len(matches) != 1:
             counts.skipped += 1
             print(f"{prefix} no unique staff row; skipped")

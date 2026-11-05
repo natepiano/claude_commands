@@ -170,13 +170,8 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -
         dependencies(staff.record_path())
         dependencies(run / STATE_FILE)
     try:
-        fields = _json_object((run / STATE_FILE).read_text(encoding="utf-8"))
-        record = staff.local_snapshot()
-        owner = run_owner(fields, record)
-        if isinstance(owner, staff.StaffRow):
-            return owner.current_session
         find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
-        return find_parent(record, run=run).current_session
+        return find_parent(staff.local_snapshot(), run=run).current_session
     except (OSError, ValueError) as error:
         print(f"anomaly: {run}: {error}", file=sys.stderr)
         return ""

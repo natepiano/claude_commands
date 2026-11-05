@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file, unit_runs  # noqa: E402
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, showrunner_relationship
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
 if TYPE_CHECKING:
     from scripts.message import sessions
 else:
@@ -101,6 +101,35 @@ class UnitRunsTest(StaffTestCase):
         parent = showrunner_relationship("runs-fixture")
         owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
         _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name}))
+
+    def test_director_without_progress_state_resolves_roster_parent_without_output(self) -> None:
+        production = fixture_member("showrunner", name="roster-production")
+        owner = fixture_member("unit", name="roster-unit", parent=production.id)
+        worker = fixture_worker("impl", owner.id)
+        run = self.root / "roster-run"
+        run.mkdir()
+        _ = (run / "mesh_roster.json").write_text(json.dumps({"impl": {"staff_id": worker.id}}))
+        self.assertFalse((run / unit_runs.STATE_FILE).exists())
+        with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(unit_runs.director(run), owner.current_session)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_director_reports_existing_invalid_or_unreadable_progress_state(self) -> None:
+        _ = fixture_member("showrunner", name="state-diagnostics")
+        for kind in ("invalid", "unreadable"):
+            with self.subTest(kind=kind):
+                run = self.root / kind
+                run.mkdir()
+                path = run / unit_runs.STATE_FILE
+                if kind == "invalid":
+                    _ = path.write_text("{")
+                else:
+                    path.mkdir()
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    _ = unit_runs.director(run)
+                self.assertIn("anomaly:", errors.getvalue())
+                self.assertIn(str(path), errors.getvalue())
 
     def test_both_roots_are_read_the_new_name_first(self) -> None:
         self.assertEqual(unit_runs.run_roots(), (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate")))
