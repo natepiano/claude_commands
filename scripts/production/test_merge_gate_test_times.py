@@ -77,6 +77,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
 
     @gate_suites("hooks", "notify", "direct")
     def test_record_keeps_each_attempt_and_only_failed_or_slow_tests(self) -> None:
+        self.configure_gate("merge_gate_governor_gib=5.5")
         for suite in self.suites:
             extra = SLOW_TESTS if suite == "direct" else ""
             self.write(self.checkout / "scripts" / suite / "test_first.py", SUITE_MODULE + FIXED_DURATION + extra)
@@ -120,7 +121,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
         self.assertGreaterEqual(record["wall_s"], 0)
         self.assertEqual(record["hold_wait_s"], 0)
         self.assertGreater(record["max_jobs"], 0)
-        self.assertEqual(record["cap_mib"], merge_gate.DEFAULT_MEMORY_CAP_MIB)
+        self.assertEqual(record["cap_mib"], 5632)
         self.assertGreaterEqual(record["peak_mib"], 0)
         self.assertCountEqual([(suite["suite"], suite["status"]) for suite in record["suites"]],
                               [(suite, 0) for suite in self.suites])
@@ -310,19 +311,6 @@ class MergeGateTestTimesTests(MergeGateFixture):
         self.assertEqual(hold_waits, [record["hold_wait_s"]])
         self.assertGreater(record["hold_wait_s"], 0)
         self.assertGreaterEqual(record["wall_s"], 0)
-
-    def test_a_memory_cap_failure_records_red_when_all_modules_pass(self) -> None:
-        with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "process_memory_mib", return_value={os.getpid(): 100.0}), \
-                redirect_stdout(io.StringIO()) as output:
-            run = merge_gate.run_suites(self.checkout, memory_cap_mib=48, full=True)
-        self.assertFalse(run.passed)
-        self.assertIn("sampled memory exceeded the cap", output.getvalue())
-        record = self.only_record()
-        self.assertEqual((record["status"], record["aborted"], record["cap_mib"], record["peak_mib"]), (1, False, 48, 100.0))
-        self.assertEqual([(row["suite"], row["module"], row["status"]) for row in record["modules"]],
-                         [("hooks", "test_first.py", 0)])
-        self.assertEqual([(suite["suite"], suite["status"]) for suite in record["suites"]], [("hooks", 0)])
 
     def test_a_failed_marker_unlink_does_not_write_an_aborted_record(self) -> None:
         marker = self.state / "runner" / "full-required"

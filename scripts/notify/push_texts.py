@@ -14,8 +14,12 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
+    from ..lib.conf import UseConfiguredValue
+    from ..message import session_send
     from ..message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 else:
+    from scripts.lib.conf import UseConfiguredValue
+    from scripts.message import session_send
     from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
 from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
@@ -24,7 +28,6 @@ from user_action import (ActionRequired, NoActionRequired, UserAction, Notificat
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
 TEMPLATE_REQUIRED = "phone pushes require --text-id: decision.choices for choices, alert.blocked for emergencies, or nate.adhoc for notes"
-SEND_SCRIPT = Path(__file__).resolve().parents[1] / "message/send.py"
 # A unit id such as "types-unit": the whole value is one session name. The user knows it as "types".
 _UNIT_ID = re.compile(r"[A-Za-z0-9][\w-]*-unit")
 
@@ -210,11 +213,12 @@ def shown(entry: PushText) -> str:
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",
-                   priority: str = "", due: str = "", question: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False) -> list[str]:
+                   priority: str = "", due: str = "", question: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False,
+                   send_script: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[str]:
     """The send.py argv; a `key` lets `send.py retire --to user --key KEY` stop a blocked push's repeats.
     `self_clearing`: the caller retires its own blocked push, so send.py needs no --clears-when."""
-    command = [sys.executable, str(SEND_SCRIPT), "--to", "user", "--from", sender or rendered.sender,
-               "--need", rendered.need, "--text-id", rendered.id]
+    command = session_send.send_argv("--to", "user", "--from", sender or rendered.sender,
+                                     "--need", rendered.need, "--text-id", rendered.id, send_script=send_script)
     if key:
         command.extend(["--key", key])
     if self_clearing:
@@ -236,7 +240,7 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
 
 def user_retire_argv(sender: str, key: str) -> list[str]:
     """The send.py argv that stops the repeats of the emergency push `user_send_argv` sent with `key`."""
-    return [sys.executable, str(SEND_SCRIPT), "retire", "--to", "user", "--from", sender, "--key", key]
+    return session_send.send_argv("retire", "--to", "user", "--from", sender, "--key", key)
 
 
 class FilledExampleRecord(TypedDict):

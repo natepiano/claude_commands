@@ -283,7 +283,10 @@ A pass retries a retained finalization intent even while its owner remains alive
 It preserves the first `since` and episode across refreshes and reconnects.
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A cap-source waiter never expires. A `FixedCapSizing` program holds its cap without a history estimate or refresh.
-The merge gate asks for its own `--memory-cap-mib`, default 6144 MiB.
+The merge gate reads `merge_gate_reservation_gib` at use for its queue reservation; the initial value is 4 GiB.
+It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
+The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
+Memory peaks do not kill jobs or fail the gate.
 Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory cap` in explanations.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
