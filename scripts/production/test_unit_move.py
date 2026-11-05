@@ -29,6 +29,11 @@ from scripts.shutdown import pane_record, restart, shutdown_record
 import herdr
 
 
+def setUpModule() -> None:
+    # Session fixtures have no panes unless a test supplies pane evidence.
+    _ = unittest.enterModuleContext(mock.patch.object(herdr.Herdr, "panes", return_value=[]))
+
+
 class AddUnitResumeFolderTests(AddUnitTestCase):
     def test_resuming_a_stopped_unit_tab_retires_the_old_record_before_a_folder_move(self) -> None:
         import add_unit
@@ -122,6 +127,45 @@ class UnitFolderMoveTests(FolderRenameFixture):
             self.assertEqual(backend.stops, [self.owner.current_session])
             self.assertEqual(len(backend.starts), 1)
             self.assert_finished_rerun(backend)
+
+    def test_resume_in_a_new_pane_closes_the_old_terminal_and_keeps_a_reused_pane(self) -> None:
+        import herdr
+
+        restore = self.enterContext(saved_fixture(self.root))
+        for resumed_pane, close_fails in (("w1:p3", False), ("w1:p1", False), ("", False), ("w1:p3", True)):
+            restore()
+            with self.subTest(resumed_pane=resumed_pane, close_fails=close_fails):
+                backend = FolderSessionFixture(self.owner, live=True)
+                panes: list[herdr.PaneIdentity] = [
+                    {"pane_id": "w1:p1", "terminal_id": "old-terminal", "workspace_id": "w1",
+                     "session_id": self.owner.current_session},
+                    {"pane_id": "w1:p2", "terminal_id": "sibling-terminal", "workspace_id": "w1",
+                     "session_id": None},
+                ]
+
+                def start(row: staff.StaffRow, record: staff.StaffSnapshot, client: object) -> str:
+                    _ = backend.start(row, record, client)
+                    panes[0]["session_id"] = None
+                    return resumed_pane
+
+                with (backend.installed(), mock.patch.object(restart, "start_row", side_effect=start),
+                      mock.patch.object(herdr.Herdr, "panes", side_effect=lambda: panes.copy()),
+                      mock.patch.object(herdr.Herdr, "close_retained_pane",
+                                        side_effect=OSError("fixture close failed") if close_fails else None) as close):
+                    result = self.move_folder()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assert_moved(backend)
+                    self.assertEqual(backend.stops, [self.owner.current_session])
+                    self.assertEqual(len(backend.starts), 1)
+                    self.assertTrue(backend.live)
+                    self.assertEqual(close.call_args_list,
+                        [mock.call("w1:p1", terminal="old-terminal")] if resumed_pane == "w1:p3" else [])
+                    if close_fails:
+                        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                        self.assertIn("fixture close failed", result.stderr)
+                    else:
+                        self.assertEqual(result.stderr, "")
+                    self.assert_finished_rerun(backend)
 
     def test_history_mesh_and_launch_files_keep_their_bytes_and_times(self) -> None:
         files = (self.records / "agents.json", self.root / "runs/mesh_roster.json",
@@ -488,10 +532,10 @@ class UnitFolderMoveTests(FolderRenameFixture):
         with (mock.patch.object(herdr, "codex_conversations", return_value=codex),
               mock.patch.object(herdr, "read_conversation", return_value=unknown) as read,
               mock.patch.object(sessions, "running_sessions", return_value=[]),
-              mock.patch.object(herdr, "running_codex_threads", return_value=set()),
+              mock.patch.object(herdr, "running_codex_threads", return_value=set()) as threads,
               mock.patch.object(os, "kill") as killed, redirect_stderr(io.StringIO()) as output):
             self.assertEqual(restart.live_rows(staff.StaffSnapshot((self.owner,)), client), [])
-        read.assert_called_once_with(self.owner.current_session, codex=codex)
+        read.assert_called_once_with(self.owner.current_session, codex=threads.call_args.kwargs["codex"])
         killed.assert_not_called()
         self.assertEqual(output.getvalue().splitlines(), [
             "anomaly: source (conversation unreadable); not blocking"])

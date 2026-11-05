@@ -95,8 +95,13 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 `cgroup_capture.read_cgroup(path)` supplies `memory.slice_state()` and the sample's
 `slices` with one reading of each file.
 See [Slice snapshots](build-memory-admission.md#slice-snapshots) for tick rows and the memory window reader.
-The builds and CI slices remain separate. An absent cgroup has `state: absent`;
-an unreadable scalar is `unavailable` and does not discard other readings.
+The builds and CI slices remain separate. An absent cgroup has `state: absent`.
+An unreadable scalar is `unavailable` and does not discard other readings.
+
+`EarlyoomKill.is_build` counts the configured `build_oom_score_adj` as a build kill.
+It also counts an absolute program when a resolved parent folder satisfies `sweep.is_cargo_target`.
+`outside_build_gate` uses that folder rule only when the kill lacks the configured build adjustment.
+Removed Cargo folders provide no build evidence.
 
 - `current_bytes` is `memory.current`, the whole charge enforced by `memory.max`.
   It already includes children, sccache, file cache and kernel memory. Nothing

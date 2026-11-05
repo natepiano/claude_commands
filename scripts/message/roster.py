@@ -806,10 +806,14 @@ def _worker_slot(run: Path, name: str, record: Mapping[str, object], problems: l
     return fallback
 
 
+def _role_log() -> agents_log.RoleLog:
+    return agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+
+
 def _worker_assignment(run: Path, slot: str, record: Mapping[str, object],
-                       membership: staff.StaffSnapshot) -> WorkerAssignment:
-    assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-                                    session_staff.worker_session(record, membership), datetime.now(timezone.utc))
+                       membership: staff.StaffSnapshot, role_log: agents_log.RoleLog) -> WorkerAssignment:
+    assignment = agents_log.role_at(role_log, session_staff.worker_session(record, membership),
+                                    datetime.now(timezone.utc))
     if isinstance(assignment, agents_log.Unassigned):
         return WorkerAssignment("no role", str(run), AssignmentUnrecorded(), slot)
     role = worker_role({"role": assignment.role})
@@ -889,7 +893,7 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     place = places.get(unit_runs.director(run))
     if place is not None:
         showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
-    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership)
+    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership, _role_log())
     entry = RosterEntry(machine="", kind="codex", role="worker", name=name, status="",
                         reach=Messageable(name), cwd="", showrunner=showrunner,
                         director=director, assignment=assignment)
@@ -1243,6 +1247,7 @@ def _unit_workers(
     process_cwds = _process_cwds(table)
     entries: list[RosterEntry] = []
     worker_threads: set[str] = set()
+    role_log = _role_log()
     for run in runs:
         server_homes = _run_server_homes(run)
         place = _run_place(run, claude_entries, production_places)
@@ -1287,7 +1292,8 @@ def _unit_workers(
                 cwd=cwd,
                 showrunner=showrunner,
                 director=director,
-                assignment=_worker_assignment(Path(run_path), _worker_slot(run.path, name, record, problems), record, membership),
+                assignment=_worker_assignment(Path(run_path), _worker_slot(run.path, name, record, problems), record, membership,
+                                              role_log),
                 thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
                 account=_worker_account(run, record, server_homes),
             ))

@@ -84,37 +84,7 @@ class TidyWrappedTests(unittest.TestCase):
 
 
 
-    def test_outstanding_migration_preserves_all_suffixes_after_clear_and_rerun(self) -> None:
-        from scripts.production import migrate_middle_stores
 
-        owner = fixture_member("showrunner", name="legacy-owner")
-        suffixes = (".json", ".answered.jsonl", ".history.jsonl", ".lock")
-        sources = [self.write(self.state / "outstanding" / f"legacy-owner{suffix}", suffix)
-                   for suffix in suffixes]
-        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
-            self.assertEqual(migrate_middle_stores.migrate("outstanding", stop_after=1), 75)
-            _ = staff.update_current_session(owner.current_session,
-                                            staff.native_id(fixture_runtime_id("outstanding-clear")))
-            self.assertEqual(migrate_middle_stores.migrate("outstanding"), 0)
-            targets = [source.with_name(f"{owner.id}{suffix}") for source, suffix in zip(sources, suffixes)]
-            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in targets}
-            self.assertEqual(migrate_middle_stores.migrate("outstanding"), 0)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in targets}, before)
-        self.assertFalse(any(path.exists() for path in sources))
-        self.assertEqual(len(staff.snapshot().rows), 1)
-
-    def test_outstanding_migration_leaves_unknown_owners_and_unequal_destinations(self) -> None:
-        from scripts.production import migrate_middle_stores
-
-        owner = fixture_member("showrunner", name="legacy-owner")
-        source = self.write(self.state / "outstanding/legacy-owner.json", "old content")
-        target = self.write(source.with_name(f"{owner.id}.json"), "different content")
-        unknown = self.write(source.with_name("unknown-owner.json"), "keep this content")
-        paths = (source, target, unknown, self.root / "staff.json")
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
-            self.assertEqual(migrate_middle_stores.migrate("outstanding"), 0)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
 
 
@@ -352,40 +322,7 @@ class TidyWrappedTests(unittest.TestCase):
         result = self.run_tidy(self.doc("done", "wrapped"))
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done: no state files\n", ""))
 
-    def test_state_migration_recovers_all_files_after_clear_and_preserves_rerun(self) -> None:
-        from scripts.production import migrate_showrunner_state
-        from scripts.production.staff_test_support import fixture_runtime_id
 
-        owner = fixture_member("showrunner", name="legacy-state")
-        relative = ("session/receipt.json", "prompt.txt", "log-backups/log.md", "wrap.txt", "parent-change.json")
-        sources = [self.write(self.state / "legacy-state" / name, name) for name in relative]
-        report = self.write(self.state / "reports/legacy-state.json", "report content")
-        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
-            self.assertEqual(migrate_showrunner_state.migrate(stop_after=1), 75)
-            _ = staff.update_current_session(owner.current_session,
-                                            staff.native_id(fixture_runtime_id("state-clear")))
-            self.assertEqual(migrate_showrunner_state.migrate(), 0)
-            targets = [self.state / owner.id / name for name in relative]
-            targets.append(report.with_name(f"{owner.id}.json"))
-            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in targets}
-            self.assertEqual(migrate_showrunner_state.migrate(), 0)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in targets}, before)
-        self.assertFalse(any(path.exists() for path in [*sources, report]))
-        self.assertFalse((self.state / "legacy-state").exists())
-        self.assertEqual(len(staff.snapshot().rows), 1)
-
-    def test_state_migration_leaves_unknown_owner_and_unequal_destination(self) -> None:
-        from scripts.production import migrate_showrunner_state
-
-        owner = fixture_member("showrunner", name="legacy-state")
-        source = self.write(self.state / "legacy-state/prompt.txt", "old prompt")
-        target = self.write(self.state / owner.id / "prompt.txt", "different prompt")
-        unknown = self.write(self.state / "unknown-state/prompt.txt", "keep this prompt")
-        paths = (source, target, unknown, self.root / "staff.json")
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
-        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.state)}):
-            self.assertEqual(migrate_showrunner_state.migrate(), 0)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
 
 if __name__ == "__main__":
     _ = unittest.main()

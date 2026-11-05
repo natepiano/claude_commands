@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import time
 from typing import Protocol, cast, final
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -72,15 +73,34 @@ class TailnetTransport(Protocol):
 
 
 def tailnet_request(method: str, endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> PolicyReply:
-    """Keep HTTP error bodies and credentials out of deployment errors."""
+    """Report HTTP validation errors without request credentials or user fields."""
     try:
         request = Request('https://api.tailscale.com/api/v2/' + endpoint, data=body or None,
                           headers=headers, method=method)
         with cast(HTTPResponse, urlopen(request, timeout=timeout)) as response:
             content = response.read()
             return PolicyReply(json_record(content) if content else {}, response.headers.get('ETag', ''))
-    except (OSError, ValueError):
-        raise BoxRefused(f'Tailscale {method} {endpoint}: request failed') from None
+    except HTTPError as error:
+        content = error.read().decode(errors='replace')
+        detail = ' '.join(content.split())[:500] if content.strip() else str(error.reason)
+        try:
+            value = cast(object, json.loads(content))
+        except ValueError:
+            value = None
+        if isinstance(value, dict):
+            record = cast(dict[str, object], value)
+            message = record.get('message')
+            details = [message] if isinstance(message, str) and message else []
+            data = record.get('data')
+            for entry in cast(list[object], data) if isinstance(data, list) else []:
+                errors = cast(dict[str, object], entry).get('errors') if isinstance(entry, dict) else None
+                if isinstance(errors, list):
+                    details.extend(item for item in cast(list[object], errors) if isinstance(item, str))
+            detail = '; '.join(' '.join(item.split()) for item in details) or str(error.reason)
+        raise BoxRefused(f'Tailscale {method} {endpoint}: HTTP {error.code}: {detail}') from None
+    except (OSError, ValueError) as error:
+        reason = error.reason if isinstance(error, URLError) else error
+        raise BoxRefused(f'Tailscale {method} {endpoint}: request failed: {reason}') from None
 
 
 @dataclass(frozen=True)
@@ -192,7 +212,9 @@ class BoxSetup:
         result = self.execute(arguments, capture_output=True, text=True,
                               timeout=conf.read(self.settings).whole('box_setup_timeout_s'), check=False)
         if result.returncode:
-            raise BoxRefused(f'{arguments[0]} failed during box setup (exit {result.returncode})')
+            last = next((line for line in reversed(result.stderr.splitlines()) if line.strip()), '')
+            detail = ': ' + ' '.join(last.split())[:300] if last else ''
+            raise BoxRefused(f'{arguments[0]} failed during box setup (exit {result.returncode}){detail}')
         return result.stdout.strip()
 
     def _api(self) -> AwsCli:
@@ -320,11 +342,28 @@ class BoxSetup:
         if address not in ipaddress.ip_network('100.64.0.0/10') and address not in ipaddress.ip_network('fd7a:115c:a1e0::/48'):
             raise BoxRefused('SSM returned an address outside Tailscale')
         self.joined = JoinedBox(str(address), ledger.text(state, 'id'))
+        self._write_host_keys(self.joined)
         saved = deployment_record(self.directory)
         if (saved.get('tailscale_node_id'), saved.get('tailscale_instance_id')) != (self.joined.node_id, self._instance()):
             saved.update(tailscale_node_id=self.joined.node_id, tailscale_instance_id=self._instance())
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
         return True
+
+    def _write_host_keys(self, joined: JoinedBox) -> None:
+        peers = (ledger.mapping(peer) for peer in ledger.mapping(self._status().get('Peer')).values())
+        peer = next((peer for peer in peers if peer.get('ID') == joined.node_id), dict[str, object]())
+        keys = public_strings(peer.get('sshHostKeys'))
+        if not keys:
+            return
+        names = (offload.read_connection_settings(self.settings).host, joined.address)
+        known_hosts = Path.home() / '.ssh' / 'known_hosts'
+        known_hosts.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        known_hosts.touch(mode=0o600, exist_ok=True)
+        for name in names:
+            _ = self._run(['ssh-keygen', '-R', name, '-f', str(known_hosts)])
+        with known_hosts.open('a') as handle:
+            for key in keys:
+                _ = handle.write(','.join(names) + ' ' + key + '\n')
 
     def join(self) -> None:
         _ = self.start()

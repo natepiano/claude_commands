@@ -1005,6 +1005,13 @@ class RosterTests(unittest.TestCase):
             roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
 
+    def test_a_roster_build_reads_the_role_log_once(self) -> None:
+        with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
+            entries = self._entries()
+
+        self.assertGreater(sum(entry.role == "worker" for entry in entries.values()), 1)
+        self.assertEqual(read.call_count, 1)
+
     def test_mesh_assignment_states_come_from_records_and_not_names(self) -> None:
         self._write_mesh(self.director_run, {
             "arbitrary": {"thread_id": "c11994bc-45da-585c-bb8c-b9aa62be4800", "status": "done", "role": "impl"},
@@ -1872,22 +1879,6 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(roster.is_top_level(helper))
         self.assertEqual(self.ssh_calls(), [])
 
-    def test_a_duplicate_mark_on_another_unit_keeps_this_units_director(self) -> None:
-        read = unit_lookup.every_labeled_session
-
-        def with_duplicate(*, record: staff.StaffSnapshot | None = None,
-                           running: list[sessions.SessionRecord] | None = None) -> unit_lookup.LabeledProductions:
-            found = read(record=record, running=running)
-            return unit_lookup.LabeledProductions(
-                found.units, {"alpha": {"unit-two": "unit-two: its mark is on herdr sessions copy and first"}})
-
-        with mock.patch.object(unit_lookup, "every_labeled_session", side_effect=with_duplicate), \
-                mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
-            found = roster.roster(os.environ, roster.ThisMachine())
-        self.assertEqual(found.problems, [])
-        director = next(entry for entry in found.entries if entry.name == "director")
-        self.assertEqual(director.role, "unit director")
-        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
 
     def test_socketless_director_in_marked_pane_keeps_unit_without_worktree_match(self) -> None:
         self._write_session(

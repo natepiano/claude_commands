@@ -668,6 +668,40 @@ class RoleMapTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             ssh.assert_called_once_with(("role-map-read",))
 
+    def test_status_caches_upcoming_moves_with_the_role_map_for_stored_and_offline_reads(self) -> None:
+        self.seed(self.server_home, groups={"units": "claude2"})
+        with (scratch_account_home(self.server_home, {}, clear=False),
+              patch.object(socket, "gethostname", return_value="natedev")):
+            _ = next_moves.add_next_move("showrunners", 1, "claude3", fallback_targets=("claude2",))
+            expected = ["Upcoming moves:", *next_moves.list_next_moves().splitlines()]
+        with patch.object(role_map, "ssh_role_map", side_effect=self.remote) as ssh:
+            code, output, error = self.cli("status", "--json")
+        self.assertEqual((code, error), (0, ""))
+        ssh.assert_called_once_with(("role-map-read",))
+        self.assertEqual(json.loads(output)["upcoming_moves"], expected)
+        cache = role_map.role_map_cache_file()
+        self.assertEqual(json.loads(cache.read_text())["map"]["upcoming_moves"], expected)
+        before = self.files(self.home)
+        with (patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored status reached ssh")) as ssh,
+              patch.object(subprocess, "run", side_effect=AssertionError("stored status spawned a process")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("stored status spawned Popen"))):
+            for flags in ((), ("--json",)):
+                with self.subTest(flags=flags):
+                    code, output, error = self.cli("status", "--stored", *flags)
+                    self.assertEqual((code, error), (0, ""))
+                    if flags:
+                        self.assertEqual(json.loads(output)["upcoming_moves"], expected)
+                    else:
+                        self.assertIn("\n".join(expected), output)
+            ssh.assert_not_called()
+        self.assertEqual(self.files(self.home), before)
+        with patch.object(role_map, "ssh_role_map", side_effect=OSError("fixture offline")) as ssh:
+            code, output, error = self.cli("status", "--json")
+        self.assertEqual((code, error), (0, ""))
+        ssh.assert_called_once_with(("role-map-read",))
+        self.assertEqual(json.loads(output)["upcoming_moves"], expected)
+        self.assertEqual(self.files(self.home), before)
+
     def test_unset_workers_role_refuses_instead_of_resolving_a_default_home(self) -> None:
         self.seed(self.server_home, groups={})
         _ = (self.server_home / ".claude/config/accounts.json").write_text("{}")

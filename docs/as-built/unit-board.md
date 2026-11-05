@@ -88,7 +88,7 @@ Run `scripts/lib/py scripts/direct/board_json.py --migrate-cache` to migrate the
 
 ### The mod
 
-`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`.
+`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`. Claude Code 2.1.316 and later reads the mod in place from `~/.claude/mods/unit-board`, because `nate-local` is a local folder marketplace and lists the mod by a relative path. `claude plugin list` shows `Read from: ~/.claude/mods/unit-board`. A promoted change takes effect at the next session start or `/reload-plugins`, and no copy exists in `~/.claude/plugins/cache`. A session started on an older Claude Code loads a copy from that cache instead. Restart such a session on the current Claude Code.
 
 | File | Role |
 | --- | --- |
@@ -215,7 +215,9 @@ The build queue reads process memory every ten seconds while open.
   Each role has a separate row with its own counts.
   The first row shows all account values.
   Later rows show only the role and its counts.
-  The view sums the available entries in `role_counts_by_machine` without changing their separate JSON representation.
+  Python combines available machine counts once in `role_counts`, in role order.
+  The view reads these counts directly; `role_counts_by_machine` keeps the separate machine records.
+  A role with no reported members has zero counts; `spare` has no count.
   A totals row sums the known activity counts.
   Codex shell counts remain unknown; they do not become zero.
   The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
@@ -310,7 +312,7 @@ The accounts view uses `accounts.py status --json --stored` to read saved usage 
 It watches usage, group selection, worker selection, role-map cache, peer-count cache, and reported session inputs.
 When the generator reports session inputs, each open-pane tick refreshes local liveness counts.
 The stored read uses an existing peer-count cache without waiting for its refresh.
-The separate machine counts let the view sum available observations without hiding a missing peer.
+Python combines available observations in `role_counts`; the separate machine records and problem lines identify a missing peer.
 Aligned headers and complete facts keep the same contract readable in wide and narrow panes.
 
 

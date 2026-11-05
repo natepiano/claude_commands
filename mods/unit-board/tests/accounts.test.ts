@@ -310,6 +310,67 @@ function hasSensitivePath(paths: readonly string[]) {
   return paths.some(path => /(?:\.claude\.json|auth\.json|id_token)/.test(path));
 }
 describe('accounts table', () => {
+  for (const columns of [140, 50]) {
+    test(`${columns} cells: a partial move shows actual counts and selected empty roles`, async ($, on) => {
+      const fake = accountsHost(on);
+      const data = statusFixture();
+      const base = data.accounts[0]!;
+      data.accounts = [
+        { ...base, label: 'claude2', roles: ['units', 'showrunners'], selected_roles: ['units', 'showrunners'],
+          role_counts: [{ busy: 1, shell: 0, idle: 0, total: 1 }, { busy: 0, shell: 0, idle: 0, total: 0 }] },
+        { ...base, label: 'claude4', roles: ['units'], selected_roles: [],
+          role_counts: [{ busy: 1, shell: 1, idle: 1, total: 3 }] },
+      ];
+      data.problems = [];
+      fake.replace(data);
+      await $.command.run(command());
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane',
+        surface: 'terminal', props: { ...props, bodyColumns: columns } });
+      const tree = await ui.drawn();
+      const selected = normalized(accountLines(tree, 'claude2')).replace(/ · /g, ' ');
+      const previous = normalized(accountLines(tree, 'claude4')).replace(/ · /g, ' ');
+      expect(selected).toContain('units ✓');
+      expect(selected).toContain('showrunners ✓');
+      expect(previous).toContain('units');
+      expect(previous).not.toContain('✓');
+      if (columns === 140) {
+        expect(selected).toContain('units ✓ 1 0 0 1');
+        expect(selected).toContain('showrunners ✓ 0 0 0 0');
+        expect(previous).toContain('units 1 1 1 3');
+      } else {
+        expect(selected).toContain('role units ✓ busy 1 shell 0 idle 0 total 1');
+        expect(selected).toContain('role showrunners ✓ busy 0 shell 0 idle 0 total 0');
+        expect(previous).toContain('role units busy 1 shell 1 idle 1 total 3');
+      }
+      const lines = rowLines(tree);
+      const total = lines.findIndex(line => line.trim().startsWith('total'));
+      expect(normalized(lines.slice(total))).toContain(columns === 140 ? 'total 2 1 1 4' : 'total busy 2 · shell 1 · idle 1 · total 4');
+    });
+  }
+
+  for (const upcoming of [
+    ['Upcoming moves:', 'showrunners 1: at 1% → claude3, else claude2', '', 'units 1: at 1% → claude4', '', 'workers 1: at 1% → codex2'],
+    ['Upcoming moves: none'],
+    ['Upcoming moves: unavailable from natedev; next: remote list failed: fixture host unreachable'],
+  ]) {
+    test(`upcoming moves appear under the table: ${upcoming[0]}`, async ($, on) => {
+      const fake = accountsHost(on);
+      const data = statusFixture();
+      data.upcoming_moves = upcoming;
+      fake.replace(data);
+      await $.command.run(command());
+      const ui = await mount($);
+      const lines = rowLines(await ui.drawn());
+      const heading = lines.indexOf(upcoming[0]!);
+      const total = lines.findIndex(line => line.trim().startsWith('total'));
+      const problems = lines.indexOf('Problems');
+      expect(heading).toBeGreaterThan(total);
+      expect(problems).toBeGreaterThan(heading);
+      expect(lines.slice(heading, heading + upcoming.length)).toEqual(upcoming);
+      expect(fake.accountRuns()).toEqual([ARGV]);
+    });
+  }
+
   for (const columns of [140, 60, 30]) {
     test(`${columns} cells: the next role has only its own role and counts`, async ($, on) => {
       const fake = accountsHost(on);
@@ -334,10 +395,13 @@ describe('accounts table', () => {
   }
 
   for (const columns of [140, 50, 30]) {
-    test(`${columns} cells: counts sum both machines and retain separate machine data`, async ($, on) => {
+    test(`${columns} cells: reads combined counts and retains separate machine data`, async ($, on) => {
       const fake = accountsHost(on);
       const data = statusFixture();
       data.accounts = [data.accounts[0]!, data.accounts[1]!];
+      data.accounts[0]!.role_counts = [
+        { busy: 3, shell: 2, idle: 1, total: 6 }, { busy: 1, shell: 1, idle: 3, total: 5 }];
+      data.accounts[1]!.role_counts = [{ busy: 3, shell: null, idle: 2, total: 5 }];
       data.accounts[0]!.role_counts_by_machine = {
         natedev: { 'unit directors': { busy: 1, shell: 1, idle: 1, total: 3 },
           showrunners: { busy: 1, shell: 0, idle: 1, total: 2 } },
@@ -371,6 +435,32 @@ describe('accounts table', () => {
         .toBe('total 7 3 6 16');
       else expect(normalized(lines.slice(lines.indexOf('total')))).toContain('total busy 7 · shell 3 · idle 6');
       expect(JSON.stringify(data)).toBe(before);
+      data.accounts[1]!.role_counts_by_machine = {};
+      expect(accountDisplay(data.accounts[1]!).roleCounts).toEqual([
+        { kind: 'available', value: { busy: 3, shell: null, idle: 2, total: 5 } },
+      ]);
+    });
+  }
+
+  for (const tool of ['claude', 'codex'] as const) {
+    test(`${tool}: unreported roles show zero and spare has no count`, async ($, on) => {
+      const fake = accountsHost(on);
+      const zero = { busy: 0, shell: tool === 'claude' ? 0 : null, idle: 0, total: 0 };
+      const data = statusFixture();
+      data.accounts = [{ ...data.accounts[0]!, tool, roles: ['units', 'spare'], selected_roles: ['units'],
+        role_counts: [zero, null], role_counts_by_machine: { natedev: {}, mac: {} } }];
+      fake.replace(data);
+      expect(accountDisplay(data.accounts[0]!).roleCounts).toEqual([
+        { kind: 'available', value: zero }, { kind: 'unavailable' },
+      ]);
+      await $.command.run(command());
+      const ui = await mount($);
+      const lines = rowLines(await ui.drawn());
+      const row = lines.find(line => line.includes('Low'))!;
+      expect(row.trim().replace(/\s+/g, ' ')).toContain(tool === 'claude' ? 'units ✓ 0 0 0 0' : 'units ✓ 0 0 0');
+      const shell = lines[0]!.indexOf('shell');
+      expect(row.slice(shell, shell + 5).trim()).toBe(tool === 'claude' ? '0' : '');
+      expect(lines.find(line => line.trim().startsWith('spare'))!.trim()).toBe('spare');
     });
   }
 

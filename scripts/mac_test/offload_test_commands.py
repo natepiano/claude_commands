@@ -93,6 +93,16 @@ if [[ $command != ssh ]]; then
     exit 99
 fi
 remote=${!#}
+if [[ $remote == *'sweep.py --floor-only --host mac' ]]; then
+    printf 'called\n' >> "$root/sweeps"
+    if [[ -p $root/continue-sweep ]]; then await_release continue-sweep; fi
+    if [[ -f $root/sweep-failure ]]; then
+        cat "$root/sweep-failure" >&2
+        exit 7
+    fi
+    printf 'done\n' > "$root/sweep-finished"
+    exit 0
+fi
 if [[ $remote == *fetch_kib=* ]]; then
     if (( ${hold_fetch_probe:-0} )); then
         printf 'started\n' > "$root/fetch-probe-started"
@@ -150,6 +160,10 @@ fi
 printf 'started\n' > "$root/probe-started"
 if (( hold_probe )); then await_release continue-probe; fi
 if [[ -n $probe_error ]]; then printf '%s\n' "$probe_error" >&2; fi
+if [[ -f $root/sweep-finished && -f $root/free-after-sweep ]]; then
+    read -r free_after < "$root/free-after-sweep"
+    probe_lines=("free_gib=$free_after" 'host=Mac' 'rc=0')
+fi
 for line in "${probe_lines[@]}"; do printf '%s\n' "$line"; done
 exit "$probe_status"
 '''

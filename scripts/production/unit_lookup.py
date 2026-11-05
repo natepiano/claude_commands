@@ -2,7 +2,7 @@
 """Find recorded production units and join their herdr panes by staff identity.
 
 Current names, places and messaging sockets come from herdr and live session
-records. Run state comes from /unit:direct records. Duplicate processes are refused.
+records. Run state comes from /unit:direct records.
 """
 from __future__ import annotations
 
@@ -483,7 +483,8 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
                         break
                     seen.add(current)
                     if holders.get(current) == holders[process.pid]:
-                        inherited.add(current)
+                        # A registered Claude keeps its pane; its headless claude child is the copy.
+                        inherited.add(process.pid if current in claudes else current)
             except (OSError, ValueError, IndexError, subprocess.SubprocessError):
                 # Keep this process evidence when its ancestry is unavailable.
                 pass
@@ -536,7 +537,7 @@ def every_labeled_session(*, record: staff.StaffSnapshot | None = None,
 
 def labeled_sessions(production_name: str, *, record: staff.StaffSnapshot | None = None,
                  sources: MemberSources | None = None) -> dict[str, LabeledSession]:
-    """Return unit states. Duplicate processes have an unknown state."""
+    """Return the selected process state for each unit."""
     found = every_labeled_session(record=record, sources=sources)
     return found.status_units(production_name)
 
@@ -544,7 +545,7 @@ def labeled_sessions(production_name: str, *, record: staff.StaffSnapshot | None
 def labeled_session(production_name: str, name: str, *, record: staff.StaffSnapshot | None = None,
                 sources: MemberSources | None = None,
                 running: Sequence[SessionRecord] | None = None) -> LabeledSession | None:
-    """Return one unit session. Unreadable herdr or duplicate processes raise OSError."""
+    """Return one unit of the production. Unreadable herdr raises OSError."""
     record = record if record is not None else staff.snapshot()
     sources = sources if sources is not None else member_sources(record=record)
     selected = sources.member(UnitMember(production_name, name), record)
@@ -555,8 +556,6 @@ def labeled_session(production_name: str, name: str, *, record: staff.StaffSnaps
         found = retained_session_labels(marked, selected.row, production_name, record=record, sources=sources)
     else:
         found = group_labeled_sessions(marked, record=record, sources=sources)
-    if fault := found.faults.get(production_name, {}).get(label):
-        raise OSError(fault)
     return found.units.get(production_name, {}).get(label)
 
 

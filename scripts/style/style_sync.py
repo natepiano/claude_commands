@@ -29,15 +29,13 @@ import process_group
 from add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
 from scripts.copies import copies
-from scripts.message import send_result
-from scripts.message import send_budget
+from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners, unit_names
 import style_ledger
 from process_failure import failure_detail
 import scratch
 
 PYTHON = SCRIPTS / "lib/py"
-SEND = SCRIPTS / "message/send.py"
 SEND_SECONDS = 10
 ROSTER = SCRIPTS / "message/roster.py"
 SHOWRUNNERS = SCRIPTS / "production/showrunners.py"
@@ -81,7 +79,7 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             raise Refusal(address.stderr.strip() or f"no address for {standing.name}")
         caller = showrunners.own_name() or "style_sync"
         sent = subprocess.run([
-            str(PYTHON), str(SEND), "--to", address.stdout.strip(), "--from", caller,
+            str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address.stdout.strip(), "--from", caller,
             "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
             "--key", f"style-sync:{standing.name}",
             "--timeout", str(SEND_SECONDS),
@@ -421,7 +419,7 @@ def handoff_notice(name: str, parent: str, checkpoint: str) -> HandoffDelivery:
     if not address:
         raise Refusal(f"no address for {parent}")
     result = subprocess.run([
-        str(PYTHON), str(SEND), "--to", address, "--from", name,
+        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", name,
         "--text", f"From the showrunner of {name}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
     ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
@@ -500,7 +498,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                 if len(addresses) != 1:
                     raise Refusal(f"{len(addresses)} directors")
                 result = subprocess.run([
-                    str(PYTHON), str(SEND), "--to", addresses[0], "--from", standing.name,
+                    str(PYTHON), str(session_send.SEND_SCRIPT), "--to", addresses[0], "--from", standing.name,
                     "--text", f"From the showrunner of {standing.name}: ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS),
                 ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))

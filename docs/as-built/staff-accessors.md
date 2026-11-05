@@ -5,8 +5,10 @@ Use it to find each place to change in a staff migration. The spec is `docs/plan
 
 The check in `scripts/production/test_staff_accessors.py` fails when this table omits an accessor. Before a migration, run the check and add each file it names.
 
-Made from the code on 2026-11-04. Tests are left out. `staff.py` is the one owner of reads and writes;
-on natedev each Python accessor reads `staff.json` in its own process, and on the Mac `staff.py` asks natedev over ssh.
+Updated from the combined branch on 2026-11-05. The table excludes Python test modules.
+`staff.py` owns reads and writes.
+On natedev, each Python accessor reads `staff.json` in its own process.
+On the Mac, `staff.py` asks natedev over SSH.
 
 Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, retire_pending, set_doc, set_worktree, update_current_session.
 
@@ -37,25 +39,22 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/direct/board_json.py` | read | active, snapshot |
 | `scripts/direct/implement.sh` | read | local_snapshot |
 | `scripts/direct/implement_launcher_test_support.py` | read | staff.json path |
-| `scripts/direct/phase_reservation.py` | read | snapshot |
+| `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
 | `scripts/direct/progress_history.py` | read | active, initial_snapshot, snapshot |
 | `scripts/direct/recorder_fixture.py` | read | PresentWorktree |
 | `scripts/direct/remove_workers.py` | write | local_snapshot, retire |
-| `scripts/direct/review.sh` | read | local_snapshot |
+| `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
 | `scripts/direct/workers.py` | read | initial_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
-| `scripts/hierarchies/measure.py` | read | active, snapshot |
-| `scripts/hierarchies/push_audit.py` | read | active, snapshot |
-| `scripts/hierarchies/worker_adoption.py` | read | StaffId, row_operation, local_snapshot |
-| `scripts/hierarchies/worker_owners.py` | read | local_snapshot |
-| `scripts/hooks/conversation_pause.py` | read | LiveDoc, WrappedDoc |
-| `scripts/hooks/conversation_pause_test_support.py` | read | LiveDoc |
+| `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation, ReportsTo, StaffId |
+| `scripts/hooks/conversation_pause.py` | read | LiveDoc, WrappedDoc (types only) |
+| `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
@@ -92,9 +91,6 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
 | `scripts/production/merge_gate.py` | read | staff.json path |
 | `scripts/production/merge_gate_test_support.py` | read | LiveDoc |
-| `scripts/production/migrate_middle_stores.py` | read | operation, snapshot |
-| `scripts/production/migrate_next_pins.py` | read | operation, snapshot |
-| `scripts/production/migrate_showrunner_state.py` | read | operation, snapshot |
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_doc.py` | read | StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
@@ -170,7 +166,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-157 accessors: 27 write, 129 read, 1 owner.
+151 accessors: 28 write, 122 read, 1 owner.
 
 ## Approved copies
 

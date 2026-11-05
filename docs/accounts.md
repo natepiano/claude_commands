@@ -30,6 +30,12 @@ It never opens a session.
 `/showrunner:accounts` opens the accounts board.
 `/showrunner:accounts close` closes it.
 The board refreshes stored readings every ten seconds.
+The board and terminal table show upcoming moves under the table and before the problems.
+Both use the exact group text from `accounts.py next list`.
+An empty queue shows `Upcoming moves: none`.
+On the Mac, the role-map reply supplies the list and saves it in the role-map cache.
+Stored and offline reads use the saved list without another SSH call.
+Without a saved list, the board shows `Upcoming moves: unavailable; natedev unreachable`.
 Run account operations in a terminal with `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py`.
 The terminal status table lists the numbered Claude and Codex accounts.
 The table includes accounts without a login.
@@ -40,8 +46,10 @@ Usage reads use the home that holds the login.
 A noted account without a usable home has a `not set up` row when no home holds its login.
 Each role has a separate row.
 The first role row shows the account's values.
-Later rows show only the role.
-The text table keeps its existing columns and has no session counts.
+Later rows show only the role and its counts.
+The text table puts counts in the Role cell, such as `units ✓ 21 (busy 5, shell 1, idle 15)`.
+A role appears on each account where its members run.
+`✓` marks its selected account, including when it has zero members.
 An account with one role or no role keeps its existing row.
 In a terminal:
 
@@ -53,7 +61,7 @@ In a terminal:
 | --- | --- |
 | Folder | The account folder. |
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
-| Role | One role per row: `units`, `showrunners`, `workers`, or `spare`. |
+| Role | One observed role per row, with activity counts. `✓` marks its selected account. |
 | Weekly left | Percent of the weekly window left. A dash when the account has no weekly window. |
 | Weekly resets | When the weekly window resets. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
@@ -62,9 +70,26 @@ In a terminal:
 
 Each Codex account can stay signed in in its own home. The table's `workers` role follows natedev's shared role map. An unset workers role refuses the launch. It does not select `~/.codex` as a fallback. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
-Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Credits older than ten minutes show `stale since <time>` rather than a balance. The board fetches stale Codex readings itself on both Linux and the Mac; `--stored` makes no live request. Each Codex login has one row, even when two homes hold it; duplicate-home problems still name the homes. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. Its reading time includes the month and day when it is not from today. It names the last usage attempt time, or says "the attempt time is not recorded". It does not promise when another read will run. A good read clears the star and footnote. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
+Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Credits older than ten minutes show `stale since <time>` rather than a balance. The board fetches stale Codex readings itself on both Linux and the Mac; `--stored` makes no live usage request. Each Codex login has one row, even when two homes hold it; duplicate-home problems still name the homes. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. Its reading time includes the month and day when it is not from today. It names the last usage attempt time, or says "the attempt time is not recorded". It does not promise when another read will run. A good read clears the star and footnote. The default table shows accounts and upcoming moves; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
 
-`status --json` prints `{"accounts": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the lines below the normal table. Each account has `label`, `tool` (`claude` or `codex`), `roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles are a list, so one Claude account can hold both `units` and `showrunners`; Codex roles are `workers` or `spare`. Each `role_counts` entry counts local members for the role at the same index, as `{busy, shell, idle, total}`: a Claude session takes its session-record state, and a Codex worker is busy while its turn runs or starts, else idle, with a null `shell`. `spare` has a null entry. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
+`status --json` prints `{"accounts": [...], "upcoming_moves": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the problem lines below the normal table.
+`upcoming_moves` contains the rendered upcoming move lines, including the heading.
+
+Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`.
+`tool` is `claude` or `codex`.
+Roles include observed members and selected roles with zero members.
+`selected_roles` identifies the selected account independently.
+Codex roles are `workers` or `spare`.
+Each `role_counts` entry combines available machine counts for the role at the same index, as `{busy, shell, idle, total}`.
+Claude sessions use their session-record state; stopped members use `shell`.
+Codex workers are busy while their turns run or start; otherwise, they are idle.
+Codex shell counts are null.
+A role with no reported members has zero counts; `spare` has a null entry.
+Missing readings are null.
+Reset and read times are ISO 8601 UTC strings.
+Credits are a number, `"unlimited"`, or null.
+Claude has null credits and `use_credits: false`.
+Codex `use_credits` is true unless its note says `use_credits: off`.
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
@@ -74,8 +99,17 @@ The first role row includes all account values.
 Later rows show only the role and its counts.
 For example, `units` can have a busy count of `3`, followed by `showrunners` with `2`.
 Spare counts are blank.
-Claude session records supply `busy`, `shell`, or `idle`.
+Running Claude session records supply `busy` during a turn.
+Other running Claude sessions count as idle, including records with an old `shell` state.
+A missing messaging socket does not make a running Claude session count as shell.
+A stopped staff member counts as `shell` on its last saved launch account.
+Live process account settings take precedence over saved launch accounts.
+The Mac reads those settings through the kernel, without a subprocess for each member.
+Members without an observed account are not assigned to the selected account.
+The detail view uses the same count snapshot as the main table.
 Missing or unknown activity counts as idle.
+Codex workers count only when their recorded port belongs to a live server.
+Old roster entries without a server port do not count.
 Codex workers count as busy for `running` or `starting`, and idle otherwise.
 Codex shell counts are unknown and stay blank.
 The last row sums known counts across all accounts and roles.
@@ -85,7 +119,7 @@ The board has no `in use` or `read` column or fact.
 Failed reads and old readings appear in Problems.
 The dot stays red until the account has a current reading without a read failure.
 
-Counts use local session records, saved launches, staff membership, notifier registrations, and mesh records.
+Counts read local session records, saved launches, staff membership, and mesh records once per status read.
 `session-counts-read` prints live local counts without a file write.
 Status reads compute local counts without a file write.
 Every board read starts a background fetch of the other machine's counts through the shared role-map transport.
@@ -103,8 +137,9 @@ A later successful fetch restores the combined counts on the next board tick.
 Each JSON account has `role_counts_by_machine`, keyed by machine and then role.
 Each role value contains `busy`, `shell`, `idle`, and `total`.
 The JSON omits unavailable machines from this field.
-The existing `role_counts` field retains local counts in role order.
-The board sums `role_counts_by_machine`; older data without this field uses `role_counts`.
+Python combines the available machine counts once in `role_counts`, in role order.
+The board and text table read `role_counts` without combining machine records again.
+Claude shell counts include each available machine; Codex shell counts stay null.
 The JSON has no session identities or account directories.
 
 The JSON `session_inputs` lists the files and directories that the board watches, including the peer cache.
@@ -112,7 +147,7 @@ Each existing ten-second tick refreshes local liveness.
 A dead process disappears from local counts even when no file changes.
 The reader skips damaged launch entries and retains valid entries.
 A failed refresh retains its watches and retries on the next tick.
-An unavailable local staff record supplies no unit membership.
+An unavailable local staff record supplies no group membership.
 
 
 Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. An MCP server difference is the one exception. It has one line per account, server and direction, and it counts only the projects where the account differs from the same project in `~/.claude`: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp`. The home scope counts as the project `~`; both files read the same `~/.claude` project. The command at the end makes that server match the baseline in every differing project. It writes atomically, preserves the file mode and keeps a `.claude.json.mcp-backup-<time>` beside the account file. It preserves other servers and account settings. The read-only `mcp-projects <account> <server> <off|on>` command remains available to inspect those paths before a repair. The table and JSON `problems` use the same lines; JSON omits the `* ` footnote prefix. A direct folder or sign-in check replaces the empty-row summary for that cause.
@@ -123,7 +158,7 @@ A reserved test-domain login has its own cause. For example: `~/.codex: test sig
 
 Each Claude group with no account has a note: `units: not configured; the role map selects no account; run accounts.py move units <claudeN>` (or `showrunners`). A configured group has no such note; its account has the group in the Role column. The JSON `problems` list has the same notes.
 
-`status --stored`, with or without `--json`, skips live usage requests and network or host discovery. Session counts read local registry and retained launch files, notifier registrations and live mesh rosters, using their existing local process-liveness checks. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. Using this saved map is expected in stored mode and adds no problem line. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
+`status --stored`, with or without `--json`, skips live usage requests and network or host discovery. Session counts read local session records, saved launches, staff membership and live mesh rosters. They use the existing local process checks. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. Using this saved map is expected in stored mode and adds no problem line. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
 
 Without `--stored`, a role map that cannot be fetched or read from cache refuses status with an error on stderr and exit 1, for both the table and JSON.
 
@@ -531,7 +566,7 @@ Watcher inventories read live sessions and `staff.json` membership. They neither
 
 The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
 
-Group membership uses the lightweight listing; absent registration targets are checked separately. Manual move previews are described above.
+The board and group moves share one staff member list. Each live member uses its process account. Timer registrations do not decide membership. Absent registration targets are checked separately.
 
 A known 5-hour reset in less than 20 minutes waits once per session and reset. With a queued Claude group head, any known refusal reset waits and continues on the current account when it ends; an unknown reset waits for the head, and queued workers retain their brief reset wait. Without a pending next entry, other refusals move; no room sends one account notice until a usage reading changes. When a refusal requires a move, the watcher uses the same immediate stop-and-resume path as a manual move.
 

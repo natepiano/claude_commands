@@ -225,7 +225,8 @@ class StaffRouting:
             if root is not None:
                 root_document = document if document is not None else self.production_by_runner.get(root.id)
                 if root_document is not None:
-                    return ChangeAssignment(ShowrunnerOwnChange(root.id, root.name), root_document)
+                    return ChangeAssignment(owner if isinstance(owner, UnroutedChange)
+                                            else ShowrunnerOwnChange(root.id, root.name), root_document)
         return ChangeAssignment(owner, document if document is not None else UnavailableProduction(review_list))
 
     def unrouted(self, review_list: Path, row: dict[str, str], note: str, producer: str) -> UnroutedChange:

@@ -580,20 +580,12 @@ def holder_text(unit: LabeledSession) -> str:
 class LabeledProductions:
     # Session labels grouped by production and unit.
     units: dict[str, dict[str, LabeledSession]]
-    # Why a unit was left out, by production production_name and then unit id: multiple processes claim its runtime identity.
-    faults: dict[str, dict[str, str]]
     members: dict[str, tuple[str, ...]] = field(default_factory=dict, compare=False)
 
     def status_units(self, production_name: str) -> dict[str, LabeledSession]:
-        """Include ambiguous units without selecting a process or pane."""
-        result = dict(self.units.get(production_name, {}))
-        for name, reason in self.faults.get(production_name, {}).items():
-            result[name] = LabeledSession(name, ClaudeUnknown(reason), Place("", ""))
-        return result
+        """Return the selected process for each unit in the production."""
+        return dict(self.units.get(production_name, {}))
 
-    def production_fault(self, production_name: str) -> str:
-        """Every left-out unit of the production, in one line; empty when none was left out."""
-        return "; ".join(detail for _, detail in sorted(self.faults.get(production_name, {}).items()))
 
 
 def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> dict[str, tuple[staff.StaffRow, ...]]:
@@ -605,7 +597,7 @@ def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> d
 def group_labeled_sessions(marked: Iterable[LabeledSession], *,
                        record: staff.StaffSnapshot | None = None,
                        sources: MemberSources | None = None) -> LabeledProductions:
-    """Join native runtime identities to their recorded parents and refuse duplicate processes."""
+    """Join native runtime identities to their recorded parents."""
     record = record if record is not None else staff.snapshot()
     sources = sources if sources is not None else member_sources(record=record)
     return _group_labeled_sessions(marked, record, production_members(record, sources), sources.launches)
@@ -627,7 +619,6 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
     shared_session = herdr.shared_session()
     parents = {row.id: production_name for production_name, rows in membership.items() for row in rows}
     found: dict[str, dict[staff.StaffId, list[LabeledSession]]] = {}
-    faults: dict[str, dict[str, str]] = {}
     observed = tuple(marked)
     pane_rows: dict[Place, set[staff.StaffId]] = {}
     for unit in observed:
@@ -671,16 +662,12 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
             row = record.by_id(identity)
             assert row is not None
             name = row.name
-            if len(places) > 1:
-                sessions = " and ".join(sorted(holder_text(place) for place in places))
-                reason = f"{name}: multiple processes claim its runtime identity: {sessions}"
-                faults.setdefault(production_name, {})[name] = reason
-                print(f"anomaly: {reason}", file=sys.stderr)
-            else:
-                selected = places[0]
-                units[production_name][name] = selected if selected.unit == name else replace(selected, unit=name)
-    return LabeledProductions(units, faults, {production_name: tuple(row.name for row in rows)
-                                           for production_name, rows in membership.items()})
+            selected = next((unit for unit in places if isinstance(unit.process, ObservedProcess)
+                             and (herdr.is_claude_process([unit.process.command])
+                                  or herdr.is_codex_process([unit.process.command]))), places[0])
+            units[production_name][name] = selected if selected.unit == name else replace(selected, unit=name)
+    return LabeledProductions(units, {production_name: tuple(row.name for row in rows)
+                                     for production_name, rows in membership.items()})
 
 
 def session_staff_and_directors(

@@ -304,31 +304,28 @@ Bump for builds: the bump gate on main be390f93c runs without this unit's PYTHON
 
 **Files:** `scripts/buildlog/charts.py`, `scripts/buildlog/costs.py`, `scripts/buildlog/test_charts.py`, `scripts/buildlog/test_costs.py`.
 
-### Phase 15 — The build page ranks the top costs with the action that cuts each  · status: todo
-**Depends on:** Phase 14; queue-unit's Phase 10m (it moves the Build Memory page and its feed into the repo)
+### Phase 15 — The build page gets its chart and top-cost data from one typed function  · status: done
+**Depends on:** Phase 14
 
-The user, 2026-11-04, change review C948 (`buildlog costs`): "send this to builds to review - i'm not sure about this". The builds showrunner ran it. The data is useful: memory wait is 236 step-hours a day, eight times the next cost. The output does not tell the user what to do. Ruling:
+The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the top 3 costs move onto the one build page, each with the action that cuts it and its owner, beside the build history charts (C950). queue-unit's Phase 10m draws the page; this phase gives it typed data, no HTML. The top 3 rank the last 2 days, so a fixed cost does not stay on top.
 
-1. Delete the `buildlog costs` command. The ranking moves onto the one build page the user uses. builds names that page.
-2. Show at most the top 3 costs. Each line gives the cost in plain words and hours, then the action that cuts it and its owner. The action text lives in config, not code.
-3. Show hours in the user's zone. No seconds, no UTC, no microseconds.
-4. Move the Definitions block into the as-built doc.
-5. Check the memory-wait number first. 236 h a day means about 10 steps wait at all times. queue-unit's 10l bug (on main now) made a waiting step with the AWS hook hold its grant and never start. Say how many of the 236 h came from that bug.
-6. The build history charts (C950) go on the same page. No second page. Phase 22 made `buildlog charts` publish its own page and print its tailnet link. After this phase, `buildlog charts` publishes no page of its own: it prints the tailnet link of the shared build page. With no link available, it prints the reason and exits non-zero.
+#### As-built
 
-The page is queue-unit's Build Memory page (`memory_live.html`, fed by `memory_feed.py`); queue's 10m moves it into the repo. Agreed with queue-unit 2026-11-04: report-unit gives typed data, no HTML, from `charts.page_section(days)` and `costs.top_costs(n=3)`. queue's feed calls them and its page draws them. A 7-day read stays under 1 s. Send queue-unit the signatures and types when they land.
+- `charts.page_data(days: int, n: int = 3) -> PageData | IndexUnavailable` gives queue's build page feed its data. It opens the index once (`read_index`), reads costs once over the page window in one snapshot (`read_snapshot`), and builds the charts and the top costs from that one reading. `page_data(7)` takes 0.42-0.48 s wall on the live index.
+- `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`: `start` and `end` bound the recent window, in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`. `CostAction(action, owner)`.
+- `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
+- Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
+- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
+- `buildlog charts` output is unchanged; `main` and `page_data` share `read_index`, and `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
 
-Memory-wait check, done 2026-11-04 (`memory_wait_check.md` in the phase folder): the 236 h/day is a 7-day average that old days drive. Oct 29-31 had 347-533 h/day; Nov 1-3 had 7-90 h/day. The 10l bug adds at most 125 h in total (Nov 2-4). `costs.py` counts each wait correctly. builds ruling: the top 3 rank the last 2 days, so a fixed cost does not stay on top. Each line shows one number. It shows the 7-day value beside it only when the two differ by more than half. The window length lives in config.
+**Files:**
+- `scripts/buildlog/charts.py` — `page_data`, its types, the snapshot and index helpers.
+- `scripts/buildlog/test_charts.py` — `PageDataTests`.
+- `config/buildlog.conf` — recent days, actions and owners.
 
-Each fix returns as a new Change-Review row.
+**Binds later work:** queue's build page feed calls `charts.page_data`; it stays when `buildlog charts` moves to the shared page.
 
-Acceptance: one page request through queue's feed calls both providers for 7 days in under 1 s total. Interface tests pass `NoDataYet`, `CostUnavailable` and `MacIdleUpperBound` through to the feed unchanged. Phase 16's `test_machine_aliases_read_sync_configuration_once` stays green. A test proves `buildlog charts` prints the shared page's tailnet link and writes no page; a test proves a missing link prints the reason and exits non-zero.
-
-**Constraints from prior phases:** `costs.machine_name` reads `sync_config()` once and calls `record._target_hosts` (Phase 16).
-
-**Workers:** 1 writer (report-unit's providers and their interface tests). queue-unit owns the page and the feed integration test.
-
-**Files:** `scripts/buildlog/costs.py`, `cli.py`, `charts.py`, their tests, `config/buildlog.conf` (action text and ranking window) and the test that reads it, `docs/as-built/` (Definitions).
+**Ruled out:** a `read_costs` keyword that skips phase rows (one read makes it unnecessary); a snapshot inside `read_costs` for every reader (`buildlog costs` is its only unsnapshotted reader and goes away with the shared page).
 
 ### Phase 16 — Each build step spends less CPU to write its build-log row  · status: done
 **Depends on:** none (from next items; showrunner disposition 2026-10-30: next)
@@ -336,7 +333,7 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 #### As-built
 
 - `record.py` loads config, target, hash, gzip, json, store and url parsing only on the paths that use them. The pending writer uses `os.open(O_EXCL, 0o600)` and `os.replace`; ids come from `os.urandom`.
-- One owner for each rule: `record.remote_identity` (repository key; admission's `git_identity` calls it), `record.recorded_repository_key` (origin remote, else `git-root:<first root>`), `parse.test_threads` (admission keeps the name `memory_admit.test_threads`), `record._target_hosts` (one `sync_config()` read for all targets).
+- One owner for each rule: `repository.remote_identity` (repository key), `repository.repository_key` (origin remote, else `git-root:<first root>`; admission's `git_identity` calls it), `parse.test_threads` (admission keeps the name `memory_admit.test_threads`), `record._target_hosts` (one `sync_config()` read for all targets).
 - `remote_identity` has an SCP shortcut that skips `urllib.parse`; it builds the path as the urlsplit path does, so keys are unchanged. `test_step_row.py` pins the keys in a table and uses a temporary build log.
 - CPU ms per call, bevy_brp with a real Cargo.toml, before -> after (merged tree 08397569e): terminal 294.8 -> 150.3, tee 289.3 -> 151.4, call 118.2 -> 86.3, step-context 77.2 -> 60.0, test-phase-context 208.2 -> 80.9. The driver is in the phase 18 folder (`cpu_driver.py`).
 
@@ -482,3 +479,118 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 - Pooling the `disk.py` timer probes — background wall time only; CPU stays the same.
 - Probing fewer checkouts from recorded pairs or saved roots — the roots go wrong after a Cargo config change.
 - A test that a fractional worker count is refused — it tests only the conf library, which `scripts/lib/test_conf.py` covers.
+
+### Phase 24 — Mac offload reads the repository key without loading memory_admit  · status: done
+**Depends on:** queue 10z on builds (done, b7ad7675c).
+
+#### As-built
+
+- `offload.repository_identity` reads `repository.repository_key(str(source.parent))`: the normalized origin URL, else `git-root:<root commit>`, else `store.UNKNOWN_IDENTITY`, which maps to `KnownRepository(name)` with no key. A lookup runs 1 git process in place of 3. Keys are unchanged; offload CPU per lookup drops by about 75 ms.
+- `persist_attempt` writes `repository.key`, else `store.UNKNOWN_IDENTITY`. A keyless repository no longer writes an empty `repo_identity` that `index.py` reads as a real identity.
+- `memory_admit.git_identity` reads the same function and keeps only its name and legacy-name rules, so one place holds the key rule. `git_output` is gone.
+- `offload.py` imports `record` and `store` at module top; it calls no `memory_admit` function.
+- `test_linux_runner` wraps its in-process child `exec` in `contextlib.chdir(os.getcwd())`, so the fake child cannot move the test process's working folder.
+
+**Files:**
+- `scripts/mac_test/offload.py` — repository key for claims, mirrors and attempts.
+- `scripts/lint/memory_admit.py` — `git_identity` name rules over the shared key.
+- `scripts/mac_test/test_target_slots.py` — `RepositoryKeyTests`: origin forms, root-commit key, no commits, unknown attempt, and a `sys.setprofile` check that a lookup runs no `memory_admit.py` code.
+- `scripts/lint/test_memory_admit.py` — real-repository key and legacy-name cases.
+- `scripts/mac_test/test_linux_runner.py` — working-folder restore.
+
+**Gotchas:**
+- Importing `offload` still loads `scripts.lint.memory_admit` through `sweep` -> `build_hold` -> the admission modules. resources-unit owns that chain.
+- Check "no `memory_admit` code runs" by the files a call executes, not by `sys.modules` names: the chain loads `scripts.lint.memory_admit`, not the bare name.
+
+**Ruled out:** passing the eligibility `KnownRepository` into `persist_attempt` (about 4 ms per offload run); deleting `git_reply` fixture branches that other `record` paths still reach. natest-unit moved the key to `repository.repository_key(directory)` with no `argv`; the merge of builds 5493dfa93 switched `offload.py` and `memory_admit.git_identity` to it.
+
+### Phase 25 — A kill counts as a build when its program is under a Cargo target folder  · status: done
+
+#### As-built
+
+- `memory.build_output_program(program)` returns True when a resolved parent folder of an absolute program satisfies `sweep.is_cargo_target`. A relative program is never a build. `sweep` is imported lazily under the module name `sweep`, as in `disk.py`.
+- `EarlyoomKill.is_build` is the configured `build_oom_score_adj` or a target program. `outside_build_gate` is a target program without that adjustment. One `_target_program` helper holds the folder check.
+- No root cache, no index read and no `cargo metadata` probe run. The first kill lookup in a fresh process takes 0.09 s CPU and 0.09 s wall on natedev.
+- A kill under a removed Cargo folder is not a build. On natedev, 5 of 6 logged kills count as build.
+- The build report's kill definition line says "under a Cargo target folder".
+
+**Files:**
+- `scripts/buildlog/memory.py` — the classifier.
+- `scripts/buildlog/test_memory_window.py` — `cargo_output(path)` fixture helper; `BuildOutputProgramTests`.
+- `scripts/buildlog/test_moments.py` — moment tests use `cargo_output` folders.
+- `scripts/buildlog/report.py` — kill definition line.
+- `docs/as-built/buildlog-memory-stalls.md` — classifier paragraph.
+
+**Gotchas:**
+- `METADATA_PROBE_WORKERS` stays in `config/buildlog.conf` with no reader until the user answers the key deletion question.
+- Tests that classify kills need a fixture folder with Cargo markers; a plain `target/debug` path is not a build.
+
+**Ruled out:** a per-kill `cached_property` (under 1 ms per report).
+
+### Phase 26 — buildlog costs is gone and buildlog charts opens the shared build page  · status: todo
+**Depends on:** Phase 15; queue-unit's Phase 10m (the build page and its feed in the repo, drawing Phase 15's `page_data`)
+
+From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `buildlog costs`, and `buildlog charts` prints the shared page's tailnet link, with a non-zero exit and a reason when there is no link. The user's C948 ruling (2026-11-04, through builds): the ranking lives on the one build page; hours show in the user's zone, with no seconds, UTC or microseconds; the Definitions block moves into the as-built doc.
+
+#### Work Order
+
+**Goal:** One build page. `buildlog costs` no longer exists. `buildlog charts` publishes no page of its own: it prints the tailnet link of queue's shared build page, or prints the reason and exits non-zero when no link is available.
+
+**Spec:**
+- Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 270) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
+- Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
+- `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It asks queue 10m's page command for the page's tailnet link (10m names it; read its as-built before the Work Order is used) and prints it, or opens it when a local display exists and `--no-open` is absent. With no link, it prints `buildlog charts: <reason>` to stderr and exits 1.
+- Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
+
+**Files:**
+- `scripts/buildlog/cli.py` — no `costs` command.
+- `scripts/buildlog/costs.py` — no text output.
+- `scripts/buildlog/charts.py` — `main` prints the shared page link; page code removed.
+- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py` — tests for removed output go; new link tests.
+- `docs/as-built/buildlog-memory-stalls.md` — Definitions.
+
+**Workers:** 1 writer — `rowcpu` owns all files; nothing splits.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's.
+
+**Acceptance gate:**
+- A test proves `buildlog charts` prints the shared page's tailnet link and writes no page file.
+- A test proves a missing link prints the reason and exits non-zero.
+- `buildlog costs` prints the CLI's unknown-command usage and exits 2.
+- `scripts.buildlog.test_charts`, `test_costs`, `test_report`, `test_cli` (if present) green with and without `PYTHONPATH`.
+- `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.
+
+### Phase 27 — A step whose Cargo folders are unknown records them as unknown  · status: todo
+**Depends on:** Phase 24, Phase 25; resources-unit's Phase 66 on builds (its recorded-root reader)
+
+From the builds showrunner (not the user), 2026-11-05, defect from resources-unit: `index.add_step` does not keep the output pair unknown when the recorder left it out. After resources' Phase 66, an override row whose metadata failed gives sweep `(workspace, folder, folder)`, so `build_directory` is wrong when Cargo's build-dir differs. No natedev row has it today. Ruling: store unknown, not a made-up pair; put it in a phase after 24-25.
+
+Director decision: a record with no pair is unknown for both columns, old records too. Records from before the pair and records whose metadata failed carry the same fields (`v` is 1 for both), so a fallback for one is a made-up pair for the other.
+
+#### Work Order
+
+**Goal:** A step row has a real Cargo output pair or `unknown` for both folders. The index never builds the pair from `target_dir`.
+
+**Spec:**
+- `scripts/buildlog/index.py` `add_step` (about line 834): `target_directory` and `build_directory` come only from the record. When the record lacks either one, store `store.UNKNOWN_IDENTITY` in both. Keep `target_dir`, `target_folder` and `build_history_group` as they are: they read `target_dir`, not the pair.
+- Column text (about line 164): `target_directory` — "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` — "resolved Cargo intermediate root; unknown when the record has no output pair".
+- The existing index must not keep made-up pairs. Confirm that the changed column text (or a `SCHEMA_VERSION` bump) makes `index.update()` rebuild every step row. Report the rebuild time on the live index.
+- Readers: `scripts/lint/build_shape.py` `recorded_root` reads `unknown` as `UnknownRecordedRoot`, and `recorded_output_roots` skips a row whose `target_folder` differs from `target_directory`. Find every other reader of the two columns with LSP `findReferences` and `grep -rn "target_directory\|build_directory" scripts --include=*.py`; name each one in the summary with how it reads `unknown`. Do not edit another unit's file; report a reader that misreads `unknown`.
+
+**Files:**
+- `scripts/buildlog/index.py` — `add_step` and the column text.
+- `scripts/buildlog/test_index.py` — pair tests.
+
+**Workers:** 1 writer — `rowcpu` owns both files.
+
+**State:** none.
+
+**Constraints from prior phases:** Do not edit `scripts/buildlog/store.py` until queue 10q merges; this phase reads only `store.UNKNOWN_IDENTITY`. Do not edit `scripts/lint/build_shape.py` or `scripts/lint/sweep.py` (resources-unit). Merge builds before dispatch so resources' Phase 66 reader is in the tree.
+
+**Acceptance gate:**
+- `test_index` `test_output_roots_survive_indexing_and_legacy_steps_stay_readable` changes its `legacy` row to `(unknown, unknown)` (approved by this phase's goal) and adds a row with `target_dir` set to an absolute folder, an override `argv`, and no pair: it indexes as `(unknown, unknown)`.
+- A test through `build_shape.recorded_output_roots` on an index built by `index.update()` proves that such a row adds no `(folder, folder)` pair.
+- `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
+- `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py`: 0 errors, 0 warnings, 0 notes.

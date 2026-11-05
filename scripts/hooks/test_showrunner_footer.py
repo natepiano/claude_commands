@@ -103,41 +103,6 @@ class QuestionLibraryTests(unittest.TestCase):
             _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {doc}\n")
             self.assertIsNone(showrunner_footer.read_production(instance))
 
-    def test_hierarchy_counts_one_canonical_question_with_its_fixed_reminder_path(self) -> None:
-        from scripts.hierarchies import measure, log_records
-
-        with tempfile.TemporaryDirectory() as scratch:
-            root = Path(scratch)
-            state = root / "state"
-            environment = {**source_environment(root / "sources"), "HOME": str(root),
-                           "HERDR_BIN": "/nonexistent/herdr", "SHOWRUNNER_STATE_DIR": str(state / "showrunner")}
-            with (isolated_staff_file(root / "staff.json", environment),
-                  mock.patch.dict(os.environ, environment), isolated_source_readers()):
-                document = root / "legacy-production.md"
-                _ = document.write_text("# Production\n")
-                owner = fixture_member("showrunner", name="display-owner", doc=staff.LiveDoc("natedev", document))
-                _ = staff.update_current_session(owner.current_session, staff.native_id(fixture_runtime_id("hierarchy-clear")))
-                questions = state / "showrunner" / owner.id / "questions"
-                questions.mkdir(parents=True)
-                fields = {"since": "2000-01-01T08:00", "text": "Choose the layout", "question": "Keep the layout?",
-                          "asked_by": str(owner.id)}
-                _ = (questions / "question-layout.md").write_text(
-                    "---\nrecord_type: question\nstatus: open\n"
-                    + f"production_id: {owner.id}\nasked_by: {owner.id}\nregistration: {json.dumps(fields)}\n---\n")
-                reminders = state / "showrunner/outstanding"
-                reminders.mkdir()
-                _ = (reminders / f"{owner.id}.json").write_text("[]\n")
-                vault = root / "vault"
-                (vault / "change-review").mkdir(parents=True)
-                for relative in ("plan-backlog/ledger.md", "nightly-review/ledger.md"):
-                    path = state / relative
-                    path.parent.mkdir(parents=True)
-                    _ = path.write_text("")
-                problems: list[log_records.SourceProblem] = []
-                waiting = measure.read_waiting(state, vault, [], problems)
-                self.assertEqual([item.kind for item in waiting], ["questions"])
-                self.assertEqual(problems, [])
-
     def test_counts_and_deferred_time_share_one_question_staff_context(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

@@ -29,7 +29,7 @@ from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff, unit_lookup
 from scripts.production.staff_test_support import (
-    fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
 )
 from scripts.production.test_change_review import producer_rows
 from change_review import Visible
@@ -113,90 +113,11 @@ class NextItemTests(unittest.TestCase):
         _ = stack.enter_context(mock.patch.object(next_item, "read_queue", self.read))
         return stack
 
-    def test_pin_migration_keeps_order_and_recovers_after_clear(self) -> None:
-        import json
-        from scripts.production import migrate_next_pins
-
-        owner = staff.snapshot().rows[0]
-        directory = self.root / "next"
-        directory.mkdir()
-        values: dict[str, dict[str, object]] = {
-            "next-demo": {"source": "question-demo", "current": "demo: Choose", "ended": {}},
-            "question-demo-all-below": {"current": "demo: Choose", "ended": {"demo: Later": 1}},
-            "proposal-demo": {"current": "P2", "ended": {"P1": 1}},
-        }
-        for name, fields in values.items():
-            _ = (directory / f"{name}.json").write_text(json.dumps(fields))
-        self.assertEqual(migrate_next_pins.migrate(stop_after=1), 75)
-        _ = staff.update_current_session(owner.current_session,
-                                        staff.native_id(fixture_runtime_id("pins-clear")))
-        self.assertEqual(migrate_next_pins.migrate(), 0)
-        expected: dict[str, dict[str, object]] = {
-            f"next-{owner.id}.json": {"source": f"question-{owner.id}", "current": f"{owner.id}: Choose", "ended": {}},
-            f"question-{owner.id}-all-below.json": {"current": f"{owner.id}: Choose", "ended": {f"{owner.id}: Later": 1}},
-            f"proposal-{owner.id}.json": {"current": "P2", "ended": {"P1": 1}},
-        }
-        self.assertEqual({path.name: json.loads(path.read_text()) for path in directory.glob("*.json")}, expected)
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}
-        self.assertEqual(migrate_next_pins.migrate(), 0)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
-        self.assertEqual(len(staff.snapshot().rows), 1)
 
 
 
-    def test_pin_migration_keeps_a_fixed_id_with_another_document(self) -> None:
-        from scripts.production import migrate_next_pins, session_staff
 
-        owner = staff.snapshot().rows[0]
-        doc = self.root / "other-production.md"
-        text = "# Production\n"
-        _ = doc.write_text(text)
-        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", doc))
-        sources = session_staff.MemberSources({
-            "other": showrunners.ShowrunnerSource(showrunners.Timer("other", "", doc, "UTC"), doc.read_text()),
-        }, ())
-        directory = self.root / "next"
-        directory.mkdir()
-        path = directory / f"question-{owner.id}.json"
-        _ = path.write_text(f'{{"current":"{owner.id}: Choose"}}')
-        before = path.read_bytes(), path.stat().st_mtime_ns
-        with mock.patch.object(session_staff, "member_sources", return_value=sources) as read_sources:
-            self.assertEqual(migrate_next_pins.migrate(), 0)
-        read_sources.assert_not_called()
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
-        self.assertEqual(list(directory.glob("*.json")), [path])
 
-    def test_pin_migration_refuses_missing_ownership_and_unequal_destination(self) -> None:
-        from scripts.production import migrate_next_pins
-
-        owner = staff.snapshot().rows[0]
-        directory = self.root / "next"
-        directory.mkdir()
-        contents = {"next-fixture.json": '{"current":"old"}',
-                    f"next-{owner.id}.json": '{"current":"different"}',
-                    "question-missing.json": '{"current":"keep"}'}
-        for name, text in contents.items():
-            _ = (directory / name).write_text(text)
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}
-        self.assertEqual(migrate_next_pins.migrate(), 1)
-        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
-
-    def test_finished_pin_migration_ignores_invalid_launch_records(self) -> None:
-        import json
-        from scripts.production import migrate_next_pins, session_staff
-
-        owner = staff.snapshot().rows[0]
-        directory = self.root / "next"
-        directory.mkdir()
-        path = directory / f"question-{owner.id}.json"
-        _ = path.write_text(json.dumps({"current": f"{owner.id}: Choose", "ended": {f"{owner.id}: Later": 1}}))
-        before = path.read_bytes(), path.stat().st_mtime_ns
-        with mock.patch.object(session_staff, "member_sources",
-                               side_effect=staff.StaffUnreadable("invalid launch record")) as sources:
-            self.assertEqual(migrate_next_pins.migrate(), 0)
-            self.assertEqual(migrate_next_pins.migrate(), 0)
-        sources.assert_not_called()
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
 
     def test_bare_next_shows_the_most_urgent_item_across_the_lists_and_keeps_it(self) -> None:

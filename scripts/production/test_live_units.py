@@ -31,7 +31,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         from scripts.production import live_units, unit_lookup
 
         fixture = self.row_production()
-        every = unit_lookup.LabeledProductions({}, {}, {fixture.runner.name: ("member",)})
+        every = unit_lookup.LabeledProductions({}, {fixture.runner.name: ("member",)})
         unavailable = fixture.worktree.with_name("unavailable-member")
         for failure in ("branch", "configuration"):
             with self.subTest(failure=failure):
@@ -55,7 +55,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         from scripts.production import live_units, session_staff
 
         fixture = self.row_production()
-        every = session_staff.LabeledProductions({}, {}, {fixture.runner.name: ("member",)})
+        every = session_staff.LabeledProductions({}, {fixture.runner.name: ("member",)})
         before = self.staff_file.read_bytes()
         selected = live_units.units_in(fixture.doc, every)
         self.assertEqual([unit.unit for unit in selected], ["member-unit"])

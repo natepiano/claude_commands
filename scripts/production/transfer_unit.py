@@ -12,7 +12,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.production import staff, staff_move, staff_sources, unit_names
+from scripts.production import showrunners, staff, staff_move, staff_sources, unit_names
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused
 
@@ -44,6 +44,11 @@ def apply(from_name: str, unit: str, to_name: str) -> UnitTransfer:
         changed = request.member.parent != staff.ReportsTo(request.parent.id)
         if changed:
             _ = staff.move(request.member.id, staff.ReportsTo(request.parent.id))
+            notice = showrunners.send_to_address(
+                f"staff:{request.member.id}", f"transfer:{request.member.id}:{request.parent.id}",
+                f"Your unit now belongs to production {request.receiving.name}.", recipient=request.unit)
+            for line in notice.lines:
+                print(line)
         _ = staff_move.move_unit(from_name, request.unit, request.receiving.name,
                                  identity=staff_move.PinnedUnit(request.member.id, request.parent.id))
         print("done" if changed else "unchanged")

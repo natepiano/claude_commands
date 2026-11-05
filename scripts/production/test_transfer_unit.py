@@ -91,18 +91,38 @@ class UnitTransferTests(UnitTransferFixture):
         parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
         with mock.patch.object(staff_move, "move_unit", wraps=staff_move.move_unit) as move_tab:
-            self.assert_ok(self.transfer("apply"))
+            result = self.transfer("apply")
+            self.assert_ok(result)
         move_tab.assert_called_once_with("demo", "alpha-unit", "other",
                                          identity=staff_move.PinnedUnit(row.id, parent.id))
         self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(parent.id)))
         changed = {path for path in before if path.read_bytes() != before[path]}
         self.assertEqual(changed, {self.staff_file})
-        self.assertEqual(self.messages(), [])
+        expected = [["--to", f"staff:{row.id}", "--from", "showrunners", "--key",
+                     f"transfer:{row.id}:{parent.id}", "--text", "Your unit now belongs to production other."]]
+        self.assertEqual(self.messages(), expected)
+        self.assertIn("told alpha-unit", result.stdout)
         self.assertFalse(any("shutdown.py" in word or "launch_agent" in word
                              for command in self.commands for word in command))
         settled = {path: path.read_bytes() for path in before}
         self.assert_ok(self.transfer("apply"))
         self.assertEqual({path: path.read_bytes() for path in before}, settled)
+        self.assertEqual(self.messages(), expected)
+
+    def test_tab_move_failure_keeps_one_notice_after_the_parent_changes(self) -> None:
+        row = unit_membership("demo", "alpha-unit")
+        parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
+        with mock.patch.object(staff_move, "move_unit", side_effect=OSError("tab move failed")):
+            result = self.transfer("apply")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("tab move failed", result.stderr)
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(parent.id)))
+        expected = [["--to", f"staff:{row.id}", "--from", "showrunners", "--key",
+                     f"transfer:{row.id}:{parent.id}", "--text", "Your unit now belongs to production other."]]
+        self.assertEqual(self.messages(), expected)
+        self.assertIn("told alpha-unit", result.stdout)
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(self.messages(), expected)
 
     def test_transfer_preserves_branch_tips_and_plan_bytes(self) -> None:
         plan = self.unit / "docs/plans/alpha.md"

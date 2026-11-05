@@ -32,7 +32,7 @@ above it, and by default not those of the showrunners below it, which show
 their own. So each showrunner's review is complete for its level (user,
 2026-10-27). `all-below` adds every production below it, at any depth. The
 user runs `/next` in the showrunner whose work they want. Run it in the
-showrunner session, or pass that production's doc.
+showrunner session, or pass the showrunner name.
 
 ## Order
 
@@ -55,11 +55,37 @@ current until it has its answer, also when a more urgent item arrives.
 
 ## Show
 
-Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show
-[--kind <kind>] [--order oldest|newest] [--all-below]`. Outside the showrunner session add
-`--production <showrunner name>`, for every kind. It prints the item's kind on the first line, then the
-item, or a line that nothing waits. Present the item by its kind's section
-below.
+1. Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show [--kind <kind>] [--order oldest|newest] [--all-below]`.
+2. Add `--production <showrunner name>` outside the showrunner session, for every kind.
+3. Judge the item against current events.
+4. Print its verdict line.
+5. Present the item under its kind's section below.
+
+The command prints the item's kind, then the item or a message that no item waits.
+
+## Current events
+
+Judge every item of every kind before you show it (user, 2026-11-05). The item
+may be days old. The work around it may have changed. Use what you already know
+first, read git only for the files the item names, and start no worker.
+
+Check, and stop when the answer is clear:
+
+1. The open plans, and the current phase of the owning unit (`/showrunner:units`).
+2. Merges since the item's date: `git log --since=<date> -- <files it names>`.
+3. The user's recent rulings: your memory and this session.
+
+Print one verdict line with its evidence (commit, plan, ruling or phase):
+
+- `current`: nothing since its date changes it.
+- `obsolete`: the work is done, removed or replaced.
+- `in conflict`: it clashes with work in progress or a ruling, such as a tuning
+  proposal for code the user is redoing. Name that work.
+
+Then recommend the kind's own answer from the verdict: for `current`, the answer
+the item deserves; for `obsolete`, close it; for `in conflict`, defer it, decline
+it or reshape it. Show an obsolete item too: the user answers it. The one
+exception is an efficiency item already fixed, which its section records as done.
 
 ## To the end
 
@@ -99,11 +125,11 @@ in `<night>/config.md`, `<night>/rust.md` and `<night>/messages.md` beside the
 ledger. Where a cheap check exists (its measurement script, the line it cites),
 confirm the candidate still holds; record one already fixed as done.
 
-Present only this one; never list the backlog. Open with the line as it reads
-today next to the line as proposed (file:line), then the measured gain, then
-the cost. End with one choice line: `approve (recommended — reason) / decline /
-defer / elaborate`. A fix that belongs to another session offers `relay` in
-place of `approve`.
+Present only this one; never list the backlog. After the verdict, give the line
+as it reads today next to the line as proposed (file:line), then the measured
+gain, then the cost. End with one choice line, its recommendation from the
+verdict: `approve (recommended — reason) / decline / defer / elaborate`. A fix
+that belongs to another session offers `relay` in place of `approve`.
 
 Record the outcome on the candidate's own ledger line as soon as it is decided:
 its `— proposed` becomes `— accepted <date>, applied (<repo> <sha>)`,
