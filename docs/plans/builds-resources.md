@@ -1710,31 +1710,11 @@ A measurement only; no repository code changed. The report is in the unit run fo
 **Ruled out:** a floor rule that keeps hana `target/external-client` — the builds showrunner dropped it on 2026-11-05: the fresh-clone cause is gone, and 1 eviction in 3 days does not pay for 1.3 GB per checkout. The Mac cold run is a next item.
 
 ### Phase 74 — Find what made the 11-05 12:00 Mac prelude compile run cold  · status: done
-**Depends on:** none. Showrunner go 2026-11-05 (bounded; next item from Phase 73). Its report is in the run folder.
+#### As-built
+A measurement only; no repository code changed. The report is in the unit run folder (`phases/74/mac_cold_report.md`).
+- The 162 s run (step `Nates-MacBook-Pro-2023-20261105T170021-b2e1fa`) used the Mac mirror `~/.local/state/mac-test/mirror/hana`, made on 2026-10-09; it was not a new mirror.
+- Its `target` folder was made again at 11:17:11 EST, after the same-path step that ended at 11:14:00. No record names what removed it.
+- The suspect is the post-run cleanup in `scripts/mac_test/offload.py:1640-1647`: it removes the whole target when free space is under the Mac floor (100 GiB). `report_cleanup` (`offload.py:905-912`) prints no line for a removal.
+- It is the only cold Mac run of the test from 11-02 to 11-05 13:47 EST (later runs: 33.9 s and 5.9 s).
 
-#### Work Order
-
-**Goal:** name the cause of the cold hana_rigging prelude compile run on the Mac at 2026-11-05 12:00:21 EST (162.338 s), and say whether that cause repeats.
-
-**Measured:**
-1. Phase 73 found the run in the build index with no matched deletion or clone record.
-2. Warm Mac runs of the same test take 0.3-5.9 s (hana fastest unit, Phase 10 report).
-
-**Spec:**
-1. Find the Mac checkout (mirror path) and its target folder that the 12:00:21 run used, from the build index row and the Mac test records.
-2. Check each candidate cause before that run, and give the time and the record for each: a Mac mirror change that removed or replaced the target folder; a Mac floor or cleanup deletion of the folder; a new mirror path with no earlier build.
-3. Name the cause, or write `not measured` with the reason. Count how often the same cause made a Mac run of this test cold from 2026-11-02 00:00 EST to the phase start.
-4. Propose one fix at the cause only if it repeats (two or more cold runs). Give the code that changes (file:line), the seconds saved and the disk cost.
-5. Read natedev and Mac state read-only. Run a tool that can write state only on a copies.py copy. Change no repository file, no config and no Mac file.
-6. Add no guard, refusal or check this Work Order does not ask for. Post blocked to ask instead.
-
-**Files:**
-- `phases/74/mac_cold_report.md` — in the unit run folder: the run, the cause with its record, the repeat count, and a fix only when it repeats.
-
-**Workers:** `1 writer`
-- `impl` reads the sources and writes the report.
-
-**Acceptance gate:**
-- The report names the Mac checkout and target folder of the 12:00:21 run.
-- The report names the cause with its record, or `not measured` with the reason.
-- The report gives the repeat count, and a fix only when the count is two or more.
+**Ruled out:** a fix — the cause does not repeat.
