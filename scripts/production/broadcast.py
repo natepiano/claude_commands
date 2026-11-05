@@ -25,8 +25,9 @@ MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
 import roster  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
+from scripts.message import session_send
 
-SEND = Path(os.environ.get("BROADCAST_SEND") or MESSAGE / "send.py")
+SEND = Path(os.environ.get("BROADCAST_SEND") or session_send.SEND_SCRIPT)
 USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | --units TEXT"
          + " | --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...")
 # One relay peaked at 272 MB when measured (2026-10-07), so this many together hold about 6.5 GB.
@@ -151,7 +152,7 @@ def ending(told: Collection[BroadcastGroup], scope: roster.RosterScope = roster.
 
 def send(session: str, sender: str, text: str, *options: str) -> str:
     """One message through send.py; the empty string when it was sent, else send.py's own line."""
-    done = subprocess.run([sys.executable, str(SEND), "--to", session, "--from", sender, *options, "--text", text],
+    done = subprocess.run(session_send.send_argv("--to", session, "--from", sender, *options, "--text", text, send_script=SEND),
                           capture_output=True, text=True, check=False)
     return "" if done.returncode == 0 else (done.stdout or done.stderr).strip() or f"exit {done.returncode}"
 

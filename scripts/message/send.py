@@ -79,6 +79,7 @@ own push (stall_watch.py, escalate.py); sessions that send by hand give `--clear
 (user, 2026-10-05) Outcomes have a header followed by any payload lines and are logged with the full
 message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
+  RETRY: why     keyed delivery in progress; retry later        exit 6
   SKIPPED: why   acknowledged, inside the repeat window, or       exit 0
                  an emergency push with the key is still live
   PENDING: why   an earlier send has not confirmed acceptance     exit 5
@@ -685,6 +686,17 @@ class MeshWorker:
 RecipientSelection = RosterLookup | MeshWorker
 
 
+@dataclass(frozen=True)
+class TransportRecipientIdentity:
+    """Keep the established per-address key identity."""
+
+
+@dataclass(frozen=True)
+class LogicalRecipientIdentity:
+    """A stable recipient whose transport address may change."""
+    name: str
+
+
 class Options(NamedTuple):
     selection: RecipientSelection
     sender: str | None
@@ -713,6 +725,8 @@ class Options(NamedTuple):
     sender_origin: RuntimeSender | ForwardedSender = RuntimeSender()
     due: str = ""
     reference: push_reference.PushReference = push_reference.NO_REFERENCE
+
+    recipient_identity: TransportRecipientIdentity | LogicalRecipientIdentity = TransportRecipientIdentity()
 
     @property
     def to(self) -> str:
@@ -1173,6 +1187,53 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 # ---------------------------------------------------------------------------
 # Keys
 # ---------------------------------------------------------------------------
+
+
+@contextmanager
+def delivery_turn(message: Message) -> Generator[bool]:
+    """Exclude only this key and recipient; never hold the global state lock during transport."""
+    if message.key is None:
+        yield True
+        return
+    directory = STATE / "delivery-locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    identity = json.dumps([message.key, message.to])
+    path = directory / (hashlib.sha256(identity.encode()).hexdigest() + ".lock")
+    with path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False) -> str | None:
+    """Read prior acceptance under a delivery turn; a lock alone never means sent."""
+    if message.key is None:
+        return None
+    with key_states() as states:
+        state = states.get(message.key, {"last": {}})
+        if "acknowledged" in state:
+            return acknowledged_skip_reason(message.key, state["acknowledged"])
+        last = state["last"].get(message.to)
+        if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
+            if live:
+                return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
+            minutes = repeat.total_seconds() / 60
+            return f"key {message.key!r} last sent to {message.to} at {last}, inside its {minutes:g}-minute window"
+    return None
+
+
+def record_acceptance(message: Message, at: datetime) -> None:
+    """Only a confirmed transport or recoverable queue/kept handoff enters the repeat window."""
+    if message.key is not None:
+        with key_states() as states:
+            state = states.setdefault(message.key, {"last": {}})
+            state["last"][message.to] = at.isoformat()
 
 
 @dataclass(frozen=True)
@@ -2256,6 +2317,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--human"]
     if message.key is not None:
         forwarded += ["--key", message.key]
+        if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+            forwarded += ["--recipient-key", options.recipient_identity.name]
     if message.to == USER:
         forwarded += ["--need", options.need]
         if options.reference["kind"] != "none":
@@ -2516,6 +2579,7 @@ def parse(argv: list[str]) -> Options:
     _ = clears.add_argument("--self-clearing", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
                                            + " the user replaces an older kept one with this key from the same sender"))
+    _ = parser.add_argument("--recipient-key", help="stable logical recipient for keyed deduplication across address changes")
     _ = parser.add_argument("--repeat-minutes", type=float,
                            help="skip a delivered or kept send with --key inside this window; failed sends do not count")
     location = parser.add_mutually_exclusive_group()
@@ -2634,7 +2698,8 @@ def parse(argv: list[str]) -> Options:
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference", "recipient_identity"}}
+    recipient_key = optional_str(attr(args, "recipient_key"))
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or delivery_timeout(),
@@ -2645,13 +2710,16 @@ def parse(argv: list[str]) -> Options:
                       human=get["human"] is True, no_accounting=get["no_accounting"] is True,
                       report_recipient=get["report_recipient"] is True,
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
-                      sender_origin=origin, due=due, reference=reference)
+                      sender_origin=origin, due=due, reference=reference,
+                      recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity())
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
         parser.error("--need goes with --to user")
     if options.to == USER and options.need != "note" and not isinstance(options.action, ActionRequired):
         parser.error(f"--need {options.need} requires --action. {FIX}")
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and options.key is None:
+        parser.error("--recipient-key needs --key")
     if options.repeat_minutes is not None and options.key is None:
         parser.error("--repeat-minutes needs --key")
     if get["clears_when"] is not None and not options.clears_when.strip():
@@ -2796,6 +2864,17 @@ def delivered_text(message: Message, entry_id: str) -> str:
 
 
 def send(options: Options) -> Result:
+    if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
+        return _send(options)
+    identity = Message(options.recipient_identity.name, options.sender or default_sender(),
+                       options.summary or "", "", options.key)
+    with delivery_turn(identity) as acquired:
+        if not acquired:
+            return Result("retry", f"key {options.key!r} has a delivery in progress; retry")
+        return _send(options)
+
+
+def _send(options: Options) -> Result:
     import roster
 
     if options.to == USER and not options.text_id:
@@ -2839,7 +2918,8 @@ def send(options: Options) -> Result:
         usage_error(member.reason)
     if isinstance(member, NoStaffRecipient) and destination != options.to:
         member = resolve_staff_recipient(destination, membership, records=records, observed=observed.entries)
-    stable = StableRecipient(f"staff:{member.id}" if isinstance(member, staff.StaffRow) else options.to)
+    stable = StableRecipient(options.recipient_identity.name if isinstance(options.recipient_identity, LogicalRecipientIdentity)
+                             else f"staff:{member.id}" if isinstance(member, staff.StaffRow) else options.to)
     registered = sessions.addressed(destination, records)
     legacy_aliases = (destination,)
     if registered is not None:
@@ -2868,10 +2948,15 @@ def send(options: Options) -> Result:
     refused = emergency and not options.clears_when and not options.self_clearing
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
-    claim_result = ClaimGranted() if refused or held is not None else claim(
-        message, stable, window, started, delivery_limit=options.timeout,
-        legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
-        posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
+    identity = replace(message, to=stable.value)
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+        skip = None if refused or held is not None else confirmed_skip(identity, window, started, live=live)
+        claim_result = RepeatAccepted(skip) if skip is not None else ClaimGranted()
+    else:
+        claim_result = ClaimGranted() if refused or held is not None else claim(
+            message, stable, window, started, delivery_limit=options.timeout,
+            legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
+            posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
     if not refused and held is None and isinstance(claim_result, ClaimGranted) and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
@@ -2960,13 +3045,18 @@ def send(options: Options) -> Result:
         _ = remove_queued_key(message.to, message.key, recipient=stable, order=order)
         if options.to != message.to:
             _ = remove_queued_key(options.to, message.key, recipient=stable, order=order)
-    # A failed send can retry. A queue or kept push owns its copy until delivery.
-    if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
-            and result.outcome in {"failed", "refused", "held", "pending"}):
-        forget_sent(key, stable.value, started)
-    elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
-          and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
-        accept_sent(key, stable.value, started)
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+        if (not refused and held is None and isinstance(claim_result, ClaimGranted)
+                and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
+            record_acceptance(identity, started)
+    else:
+        # A failed send can retry. A queue or kept push owns its copy until delivery.
+        if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+                and result.outcome in {"failed", "refused", "held", "pending"}):
+            forget_sent(key, stable.value, started)
+        elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
+              and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
+            accept_sent(key, stable.value, started)
     if emergency and options.clears_when and key is not None and not cold_check and result.outcome == "sent":
         posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
         record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
