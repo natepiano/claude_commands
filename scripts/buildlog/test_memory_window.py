@@ -801,8 +801,10 @@ class BuildOutputRootsTests(unittest.TestCase):
         return path
 
     def recorded_step(self, target: str, build: str, *, worktree: str = "", cwd: str = "",
-                      host: str = "natedev", argv: tuple[str, ...] = ("cargo", "check")) -> None:
-        record_root_attempt(self.index_file, worktree, target, build, cwd=cwd, host=host, argv=argv)
+                      host: str = "natedev", argv: tuple[str, ...] = ("cargo", "check"),
+                      target_folder: str = "") -> None:
+        record_root_attempt(self.index_file, worktree, target, build, cwd=cwd, host=host, argv=argv,
+                            target_folder=target_folder)
 
     def probe(self, side_effect: Callable[[Path], CargoOutputRoots | CargoOutputUnavailable] | Exception,
               index_file: Path | None = None) -> tuple[frozenset[Path], MagicMock]:
@@ -847,6 +849,31 @@ class BuildOutputRootsTests(unittest.TestCase):
         roots, metadata = self.build_roots({})
         self.assertEqual(roots, frozenset((target, build)))
         self.assertCountEqual(metadata.call_args_list, [mock_call(self.current), mock_call(workspace)])
+
+    def test_build_program_classification_applies_the_recorded_row_rules(self) -> None:
+        usable = self.base / "usable"
+        mismatched = self.base / "mismatched"
+        recorded_cwd = self.checkout("recorded-cwd")
+        self.recorded_step(str(usable / "target"), str(usable / "build"))
+        self.recorded_step(str(mismatched / "target"), str(mismatched / "build"),
+                           target_folder=str(mismatched / "other-target"))
+        self.recorded_step("", "", worktree="relative-worktree", cwd=str(recorded_cwd))
+
+        def outputs(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
+            if checkout == recorded_cwd:
+                return CargoOutputRoots(checkout, checkout / "target", checkout / "build")
+            return CargoOutputUnavailable("fixture")
+
+        with (
+            patch.object(index, "index_path", return_value=self.index_file),
+            patch.object(store, "host_name", return_value="natedev"),
+            patch.object(Path, "cwd", return_value=self.current),
+            patch.object(memory, "read_cargo_output_roots", side_effect=outputs),
+        ):
+            for root, expected in ((usable, True), (mismatched, False), (recorded_cwd, True)):
+                for directory in ("target", "build"):
+                    with self.subTest(root=root.name, directory=directory):
+                        self.assertEqual(memory.build_output_program(str(root / directory / "debug/test")), expected)
 
     def test_incomplete_pairs_keep_absolute_sides_without_a_workspace(self) -> None:
         target = self.base / "target"

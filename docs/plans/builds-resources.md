@@ -1727,14 +1727,14 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Binds later work:** Memory kill classification reads these rows and applies its own rule; `scripts/buildlog/memory.py` still calls `build_shape.recorded_output_roots`, and `scripts/buildlog/test_memory_window.py` still imports from `test_build_shape`, until the report-unit memory work merges. The floor's override-row evidence adds a row-time fact to `RecordedStepOutput`; the distinct row count and the reader CPU are measured again.
 
 **Gotchas:**
-- `scripts/buildlog` has no `.` extra path for basedpyright. Import package modules with `if TYPE_CHECKING: from .x import …` else `from scripts.buildlog.x import …`.
+- Keep one copy of each module in a process. At run time, import a `scripts/buildlog` module in the form its other importers use; `step_outputs` is bare today (`scripts/lint/sweep.py`, `scripts/buildlog/width_trial.py`). Type checking uses `if TYPE_CHECKING: from .x import …`.
 - `create_step_index` keeps each column's declared type word. TEXT for every column breaks the build_shape tests.
 - `scripts/build_queue/head_facts.py:17` loads a second `store` module copy through a bare import. Its owner fixes it.
 - The Phase 62 protections hold: no recorded evidence is `NoRecordedEvidence`, an override row gives sweep no evidence, and an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>`.
 
 **Ruled out:** One reader that applies sweep's deletion rules for every caller (memory classification needs its own rule); argv inside `DISTINCT` (15,838 rows for 1,120 pairs).
 
-### Phase 65 — Memory kill classification reads the shared step output rows and applies its own rule  · status: todo
+### Phase 65 — Memory kill classification reads the shared step output rows and applies its own rule  · status: done
 **Depends on:** Phase 64 (the reader moved to `scripts/buildlog/step_outputs.py`); report-unit Phase 20 and its follow-up for `scripts/buildlog/memory.py` on `origin/builds`. Do not merge report's branch; merge `origin/builds` once both are there.
 
 #### Work Order
@@ -1756,7 +1756,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - The unit that lands second resolves the breaks (showrunner, 2026-11-05). When resources-unit lands Phases 63-64 after report-unit Phase 20, that merge carries Spec 1, 3 and 4, so the merged tree passes its tests; this phase then keeps Spec 2. When report-unit lands second, it makes those moves; this phase keeps Spec 2. Never leave a merged tree with the old import.
 - Keep memory kill classification results equal to report-unit Phase 20's results on the same fixture rows.
 - `step_outputs` returns facts only; a caller rule stays in its caller.
-- `scripts/buildlog` has no `.` extra path in `pyrightconfig.json`. Import package modules as `if TYPE_CHECKING: from .x import …` else `from scripts.buildlog.x import …` (see `scripts/buildlog/step_outputs.py`).
+- Keep one copy of each module in a process. At run time, import a `scripts/buildlog` module in the form its other importers use; `step_outputs` is bare today (`scripts/lint/sweep.py`, `scripts/buildlog/width_trial.py`). Type checking uses `if TYPE_CHECKING: from .x import …`.
 
 **Files:**
 - `scripts/buildlog/memory.py`, `scripts/lib/cargo_target_config.py` — the caller and its rule; the config reader.
@@ -1788,20 +1788,23 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 2. Use each row's `started_at` (the steps table, `scripts/buildlog/index.py`) as its row time. A step that started before the cut can have its pending row published later by `finish_pending_step()` (`scripts/buildlog/record.py`), so publication time proves nothing.
 3. Return the row time from the reader as a named state: a known time, or an unknown time for a missing or unparseable `started_at`. Group the distinct facts and return the newest `started_at` of each group (`GROUP BY` the facts with `MAX(started_at)`), so the row count stays the Phase 64 distinct count.
 4. In sweep's rule: for a fact whose newest row started strictly after the cut, the target-folder check alone decides, and the argv override skip does not apply. An unknown time, or a time at or before the cut, keeps the override skip.
+5. Put two facts on `RecordedStepOutput`: the workspace (the worktree when it is absolute, else the cwd) and whether an absolute target folder differs from the target directory. Use them in sweep and in `memory.build_output_roots`. Each caller keeps its own override rule and result shape. Memory keeps its argv override skip.
 
 **Constraints from prior phases:**
 - Keep the Phase 62 protections: a target with no recorded evidence is `NoRecordedEvidence` and is never deleted or a floor holder; an absolute `target_folder` that differs from `target_directory` gives no evidence; an unreadable index prints `lint sweep: recorded output roots unavailable: <reason>`.
 - The current rule is safe; it only loses evidence. This phase must not make any old row give evidence.
 - Phase 64: `step_outputs.recorded_output_roots` returns row facts only, with SQL `DISTINCT` and a `target-dir` prefilter; sweep's `_recorded_mapping_rows` applies the rule. Reader CPU was 117.65 ms for 1,120 distinct workspace pairs on natedev.
-- `scripts/buildlog` imports package modules as `if TYPE_CHECKING: from .x import …` else `from scripts.buildlog.x import …`.
+- Keep one copy of each module in a process. At run time, import a `scripts/buildlog` module in the form its other importers use; `step_outputs` is bare today. Type checking uses `if TYPE_CHECKING: from .x import …`.
+- Phase 65 review: `memory.py` (`build_output_roots`) and sweep repeat the same mismatch test and workspace choice word for word.
 
 **Files:**
-- `scripts/buildlog/step_outputs.py` — the row time as a row fact.
+- `scripts/buildlog/step_outputs.py` — the row time, the workspace and the target-folder mismatch as row facts.
 - `scripts/lint/sweep.py` — the override rule by row time.
+- `scripts/buildlog/memory.py` — reads the shared row facts.
 - `scripts/buildlog/step_outputs_test_support.py`, `scripts/buildlog/test_step_outputs.py`, `scripts/lint/test_sweep.py` — tests and the shared index fixture.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` owns `step_outputs.py` and `sweep.py`.
+- `impl` owns `step_outputs.py`, `sweep.py` and `memory.py`.
 - `test` owns `step_outputs_test_support.py` and the tests.
 
 **Acceptance gate:**
