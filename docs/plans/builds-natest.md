@@ -727,7 +727,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - A shell reader of config gives the same value and exit as `conf.py get`, or gives the read to `conf.py`.
 - `review.sh`, `implement.sh` and `mac_run.sh` source `conf.sh`; a change to it runs their tests.
 
-### Phase 31 — `test_verify_lint_judgment.py` runs in half its time  · status: todo
+### Phase 31 — `test_verify_lint_judgment.py` runs in half its time  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -739,6 +739,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 1. Profile before any edit. Each `invoke_verify("lint", ...)` costs about 5.5-7 s; a test with one run costs about 3.6 s. Four tests hold 176 s of the 205 s: `test_compile_errors_and_unknown_101_repair_and_return_final_judgment` (10 subtests, 70.7 s), `test_first_judgment_nonlint_status_never_repairs` (11 subtests, 60.9 s), `test_fix_limit_is_read_from_config` (3 subtests, 25.5 s) and `test_lint_finding_repairs_formats_and_returns_final_judgment` (3 subtests, 19.4 s). For one `verify.sh lint` run in the fixture, name where the time goes: process starts, Python imports, config reads, admission or token waits, fixed sleeps, and the stub cargo. Check first whether a later run in one test waits on an admission spacing or a token the earlier run left, as in Phase 27. Write the result into this Spec and name the files and changes before the code step.
    **Profile result (2026-11-05, load 28-58):** baseline 215.0 s wall, 160.7 CPU s, 33 `verify.sh lint` runs in 10 tests. The main cost is production process work in `verify.sh` and `scripts/lint/`: at least 36 Python starts for a no-repair run and 61 for a repair run. Step-record state writes (`verify.sh:356-358`, `verify.sh:1925-1934`) and admission client starts (`scripts/lint/memory_gate.sh:17-22`) hold most of it. A later run in one test waits about 2.0 s for admission start spacing (`recovery_start_seconds=5`); there is no token or hold wait and no fixed sleep. The route floor after a clock advance is 3.1 s with no repair and 5.2 s with repair, so half time (107.5 s) is under the floor of the production route.
    **Code step:** the fixture does not advance the admission clock by hand. A manual `allow_next_start()` advance is a workaround (showrunner, 2026-11-05): queue-unit fixes the start spacing in the shared admission fixture, and this module is measured again after that fix. The fixture keeps one admission service lookup. `test_compile_errors_and_unknown_101_repair_and_return_final_judgment` runs each compile diagnostic once, with the final status alternating 0 and 101, so each diagnostic and each status stays checked. The repair decision has no callable home (`verify.sh:3711-3714`), so Spec step 4 does not apply. Three production proposals went to their owners: step-record state reuse (verify), a lighter admission client start (queue) and a callable repair decision (verify).
+   **Result (same-load pairs, 3 rounds):** 237.4 s to 198.6 s wall (16% less), 180.9 to 148.5 CPU s; `test_verify_build_key.py` 4.0 to 3.9 s. The floor is the production route; queue-unit's spacing fix and the three proposals hold the rest.
 2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
 3. A cut in `verify.sh`, `scripts/lint/*.sh` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase.
 4. A subtest table that checks a pure status or diagnostic rule may move to a direct test of that rule only when the rule has one callable home. Keep at least one end-to-end `verify.sh lint` run for each route: no repair, one repair, and the fix limit. Keep every test name, and keep each status and diagnostic case as a checked case.
@@ -746,7 +747,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Files:**
 - `scripts/direct/test_verify_lint_judgment.py` — the module
-- `scripts/direct/verify_lint_cache_test_support.py` — only for a shared per-run cut the profile names
+- `scripts/direct/test_verify_build_key.py` — drops a second admission lookup that it did not use
 
 **Workers:** 1 writer (one module and its fixture; the files do not split)
 - `impl` — all files above

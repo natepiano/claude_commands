@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-
 import os
 import json
 import shlex
@@ -18,8 +16,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
-    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
-
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -35,7 +31,6 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         _ = self.git("add", "-f", ".gitignore", "Cargo.toml", "src/lib.rs")
         _ = self.git("commit", "-q", "-m", "fixture source")
         _ = self.enable_cache()
-        self.admission = caller_admission(self, self.root, self.environment)
 
     def git(self, *arguments: str) -> str:
         result = subprocess.run(
