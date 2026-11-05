@@ -535,7 +535,6 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 ### Phase 22 — Mirror step rows store the sent repository identity, and `show.py` loads a light repository module  · status: todo
 **Depends on:** Phase 18, Phase 23
-**Blocked by:** report-unit Phase 20 (`be35f2d2b`) on builds — it changes `record.py` `step()`
 
 #### Work Order
 
@@ -546,9 +545,9 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 1. Record: in `record.py` `step()`, when `recorded_repository_key` gives `store.UNKNOWN_IDENTITY` for a mirror caller (`verify-mac`, `verify-linux`) and `BUILDLOG_REPO_IDENTITY` is set, record that value. Read it through one typed reader beside `sent_tree_key()` that returns `SentRepositoryIdentity | NoSentRepositoryIdentity`; an absent or empty value is `NoSentRepositoryIdentity`. A known local key always wins.
 2. Index: keep the Phase 16 index rule for old rows. A step with a recorded identity has `identity_derived = 0`, so the resolver never changes it.
 3. The Mac gets the new `record.py` through the normal main promotion. Until then, Mac rows stay `unknown` and the index rule resolves them.
-4. Split `repository_key(directory)` out of `record.recorded_repository_key`. Callers that only need the key of a directory call it directly. Remove the `["git"]` argument vector that exists only to pass the empty-argv check (`record.py` about line 541, `show.py` top, four test call sites).
+4. Split `repository_key(directory)` out of `record.recorded_repository_key`, then delete `recorded_repository_key`: its `argv` parameter exists only for an empty check. `step()` (`record.py` about line 1006) does the empty-argv check and calls `repository_key`. Every caller switches to `repository_key`; no `["git"]` dummy argument vector remains (`show.py` top, the test call sites). (showrunner, from report's simplify review, 2026-11-05.)
 5. Import `conf` under one module name in `parse.py` and `record.sync_config`. Today one step process loads `conf.py` twice (+1.8 ms).
-6. Move `recorded_repository_key`, `repository_key` and `remote_identity` into one light module that does not import the rest of `record.py`. `show.py` imports it in place of `record` (importing `record` costs 49.7 ms cold; `show.py` imports `record` inside `main()`, about line 427). `record` keeps the three names as imports from the light module, so `scripts/lint/memory_admit.py` (about line 3284, `record.remote_identity`) needs no change. Measure the cold start of `show.py top` before and after, on a prepared index: the same logs, repository and host on both sides, with the index built outside the timed command. Report the index build time on its own line.
+6. Move `repository_key` and `remote_identity` into one light module that does not import the rest of `record.py`. `show.py` imports it in place of `record` (importing `record` costs 49.7 ms cold; `show.py` imports `record` inside `main()`, about line 427). `record` keeps the two names as imports from the light module, so `scripts/lint/memory_admit.py` (about line 3229, `record.remote_identity`) needs no change. Measure the cold start of `show.py top` before and after, on a prepared index: the same logs, repository and host on both sides, with the index built outside the timed command. Report the index build time on its own line.
 
 **Files:**
 - `scripts/buildlog/record.py` — record the sent key (report-unit's file)
@@ -567,11 +566,12 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Phase 23: `test_show.py` patches `show.TOOL_REPOSITORY` to its fixture repository. Keep that patch target, or move it with the code in the same change.
 - Phase 18: `offload.py` and `linux_runner.py` send `KnownRepository.key` as `BUILDLOG_REPO_IDENTITY` to Mac and Linux mirror steps, and send nothing when the key is empty.
 - Before work starts, read the open verify-unit and report-unit branches for edits to these files. Claim the outside files on the berth board, and name them in the notice's also-touches line.
-- report-unit Phase 20 (`be35f2d2b`) changes `record.py` `step()`. Never merge report's unlanded branch. Start the `record.py` edits only after report Phase 20 is merged into builds; then merge origin/builds. (showrunner, 2026-11-04).
-- Items 4-6 came from the Phase 16 review. The showrunner put them in this phase on 2026-11-04. They also wait for report Phase 20 on builds. Test `parse.py` against report's tip and name it in also-touches.
+- report-unit Phase 20 (`be35f2d2b`) is on builds and merged here. report-unit Phase 25 (`9ae49ff1f`, not landed) also changes `record.py` `step()`. This phase lands first; report resolves the overlap on its new hash (showrunner, 2026-11-05). Never merge report's unlanded branch.
+- This phase owns every caller of the functions it moves. report-unit Phase 24 adds a caller: `scripts/mac_test/offload.py` reads `record.recorded_repository_key`. Report Phase 24 also makes `memory_admit.git_identity` call it. If report Phase 24 is on builds before this phase lands, merge origin/builds and switch `offload.py` and `memory_admit.git_identity` to `repository.repository_key` in this phase (showrunner, 2026-11-05).
+- Items 4-6 came from the Phase 16 review. The showrunner put them in this phase on 2026-11-04. Name `record.py` and `parse.py` in also-touches.
 
 **Acceptance gate:**
-- the changed test modules green on a tree with origin/builds merged after report Phase 20 lands
+- the changed test modules green on a tree with origin/builds merged
 - a mirror step test records the identity sent from natedev, for `verify-mac` and `verify-linux`; an ordinary caller ignores a sent value; an absent and an empty value record nothing; a known local key wins; old rows keep the derived identity
 - `test_show.py` green in a clone with an origin and in a clone with no origin (the Phase 23 proof), after the repository functions move
 - the cold start of `show.py top` (a fresh process, a scratch `BUILDLOG_DIR`, under `timeout 600`) before and after item 6, on a prepared index, measured in same-load pairs, in the checkpoint notice
@@ -664,7 +664,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Binds later work:**
 - A change to `module_run.py` takes effect for the tree that carries it; the installed copy no longer runs another tree's tests.
 
-### Phase 26 — The sender guard also stops `send.py` started from its own folder or as a module  · status: todo
+### Phase 26 — The sender guard also stops `send.py` started from its own folder or as a module  · status: done
 **Depends on:** Phase 25
 
 #### Work Order
