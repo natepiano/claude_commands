@@ -23,10 +23,9 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.test_times.line_collector import (
-    REPOSITORY, ChildReport, ExecutedLine, LineCollector, read_child_reports,
+    REPOSITORY, SHARED_TEST, SHARED_THREAD, ChildLaunch, ChildReport, ExecutedLine, LineCollector, read_child_reports,
 )
 from scripts.lib import conf
-from scripts.lib.code_kind import is_test_code
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.buildlog import treekey
 from scripts.production.gate_modules import discover_test_modules
@@ -34,8 +33,6 @@ from scripts.test_times.module_run import TimedResult, TimedRunner, timed_outcom
 
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus
-
-SHARED_TEST = "__shared__"
 
 
 @dataclass(frozen=True)
@@ -94,40 +91,118 @@ class ChildEnvironment:
                 _ = os.environ.pop(name, None)
 
 
-def child_causes(collector: LineCollector, children: dict[str, list[ChildReport]]) -> dict[str, set[str]]:
-    """Exclude unverified launches, shared children, and child lifetimes that overlap tests."""
-    causes: dict[str, set[str]] = {test_id: set() for test_id in collector.completed}
+@dataclass
+class ChildEvidence:
+    """Keep reports and resolved owners without changing launch records."""
+
+    reports: dict[str, list[ChildReport]]
+    launches: dict[str, ChildLaunch]
+    owners: dict[str, str]
+    all_reports: list[ChildReport]
+
+
+def child_evidence(collector: LineCollector, reports: list[ChildReport]) -> ChildEvidence:
+    launches = {launch["launch_id"]: launch for launch in collector.shared_launches}
+    for recorded in collector.completed.values():
+        launches.update((launch["launch_id"], launch) for launch in recorded.launches)
+    parents: dict[str, str] = {}
+    fallback_owners: dict[str, str] = {}
+    for report in reports:
+        fallback_owners[report["launch_id"]] = report["test_id"]
+        for launch in report["launches"]:
+            launches[launch["launch_id"]] = launch
+            if report["launch_id"]:
+                parents[launch["launch_id"]] = report["launch_id"]
+
+    def ownership(launch_id: str, seen: frozenset[str]) -> str:
+        launch = launches.get(launch_id)
+        if launch is None:
+            return fallback_owners.get(launch_id, SHARED_TEST)
+        if launch["owner"] == SHARED_THREAD:
+            return SHARED_THREAD
+        if launch_id in parents and launch_id not in seen:
+            return ownership(parents[launch_id], seen | {launch_id})
+        return launch["owner"]
+
+    owners = {launch_id: ownership(launch_id, frozenset()) for launch_id in launches}
+    grouped: dict[str, list[ChildReport]] = defaultdict(list)
+    for report in reports:
+        owner = owners.get(report["launch_id"], report["test_id"])
+        grouped[owner].append(report)
+    return ChildEvidence(grouped, launches, owners, reports)
+
+
+def child_causes(collector: LineCollector, evidence: ChildEvidence) -> dict[str, set[str]]:
+    """Check completed reports separately from each child's lifetime."""
+    causes = {test_id: set(recorded.causes) for test_id, recorded in collector.completed.items()}
+    reports_by_launch: dict[str, list[ChildReport]] = defaultdict(list)
+    for report in evidence.all_reports:
+        reports_by_launch[report["launch_id"]].append(report)
+    report_ends: dict[int, float] = {}
+
+    def report_end(report: ChildReport, seen: frozenset[str]) -> float:
+        key = id(report)
+        if key in report_ends:
+            return report_ends[key]
+        if report["completed"]:
+            end = report["exited"]
+        else:
+            transition = report["exec_launch_id"]
+            successors = reports_by_launch.get(transition, []) if transition and transition not in seen else []
+            end = max((report_end(successor, seen | {transition}) for successor in successors), default=math.inf)
+        report_ends[key] = end
+        return end
+
+    ends = {launch_id: max(report_end(report, frozenset()) for report in reports)
+            for launch_id, reports in reports_by_launch.items()}
+    reported = {report["launch_id"] for report in evidence.all_reports if math.isfinite(report_ends[id(report)])}
+    for report in evidence.all_reports:
+        ends.update(report["ends"])
+    ends.update(collector.ends)
+    launches_by_owner: dict[str, list[ChildLaunch]] = defaultdict(list)
+    for launch_id, launch in evidence.launches.items():
+        launches_by_owner[evidence.owners[launch_id]].append(launch)
+
     for test_id, recorded in collector.completed.items():
-        reports = children.get(test_id, [])
-        launches = recorded.launches + [launch for report in reports for launch in report["launches"]]
+        reports = evidence.reports.get(test_id, [])
+        for report in reports:
+            causes[test_id].update(report["causes"])
+        launches = launches_by_owner.get(test_id, [])
         for launch in launches:
             if launch["kind"] == "unverified":
                 causes[test_id].add(f'unverified launch {launch["program"]}')
         starts = [launch for launch in launches if launch["kind"] == "python"]
-        reported = {report["launch_id"] for report in reports}
         arrived = sum(launch["launch_id"] in reported for launch in starts)
         if arrived < len(starts):
             causes[test_id].add(f"{len(starts)} python children, {arrived} reported")
         fork_counts = [(recorded.pid, recorded.forks)] + [(report["pid"], report["forks"]) for report in reports]
-        if any(forks > sum(report["fork_parent_pid"] == pid for report in reports) for pid, forks in fork_counts):
-            causes[test_id].add("fork")
-        exited_launches = recorded.exited_launches | {launch_id for report in reports for launch_id in report["exited_launches"]}
-        pending = recorded.pending_launches - reported
-        missing = any(launch["launch_id"] not in reported | exited_launches for launch in starts)
-        end = math.inf if pending or missing else max((report["exited"] for report in reports), default=recorded.stopped)
-        if end > recorded.stopped:
-            causes[test_id].add("child outlived its test")
-            for later_id, later in collector.completed.items():
-                if recorded.started < later.started < end:
-                    causes[later_id].add("child outlived its test")
-    shared_reports = children.get(SHARED_TEST, [])
-    shared_launches = collector.shared_launches + [launch for report in shared_reports for launch in report["launches"]]
-    starts_by_launch = {launch["launch_id"]: launch["started"] for launch in shared_launches}
-    for report in shared_reports:
-        start = starts_by_launch.get(report["launch_id"], -math.inf)
+        for pid, forks in fork_counts:
+            if forks == 0:
+                continue
+            transitions = {report["collector_id"] for report in reports
+                           if report["fork_parent_pid"] == pid and report["exec_launch_id"]
+                           and report["exec_launch_id"] in reported}
+            if forks > len(transitions):
+                causes[test_id].add("fork")
+
+    for launch_id, launch in evidence.launches.items():
+        owner = evidence.owners[launch_id]
+        if owner == SHARED_TEST and launch["kind"] != "python":
+            continue
+        started = launch["started"]
+        end = ends.get(launch_id, math.inf)
         for test_id, recorded in collector.completed.items():
-            if start < recorded.started < report["exited"]:
-                causes[test_id].add("shared child")
+            at_start = started < recorded.started < end
+            at_stop = started < recorded.stopped < end
+            overlap = started < recorded.stopped and recorded.started < end
+            if owner == SHARED_THREAD:
+                if overlap:
+                    causes[test_id].add("shared thread")
+            elif owner == test_id:
+                if at_stop:
+                    causes[test_id].add("child outlived its test")
+            elif at_start:
+                causes[test_id].add("shared child" if owner == SHARED_TEST else "child outlived its test")
     return causes
 
 
@@ -160,20 +235,18 @@ def collect(suite: Callable[[], unittest.TestSuite], repository: Path = REPOSITO
         finally:
             collector.stop()
             environment.restore()
-        children: dict[str, list[ChildReport]] = defaultdict(list)
-        for report in read_child_reports(Path(directory)):
-            children[report["test_id"]].append(report)
-    causes = child_causes(collector, children)
+        evidence = child_evidence(collector, read_child_reports(Path(directory)))
+    causes = child_causes(collector, evidence)
     tests: list[TestCoverage] = []
     for test_id, status, duration in timed_outcomes(result):
         recorded = collector.completed.get(test_id)
         lines: set[ExecutedLine] = set() if recorded is None else recorded.lines
-        for report in children.get(test_id, []):
+        for report in evidence.reports.get(test_id, []):
             lines.update((path, line) for path, line in report["lines"])
         reasons = causes.get(test_id, set())
         child = "unknown: " + "; ".join(sorted(reasons)) if reasons else "none"
         tests.append(TestCoverage(test_id, status, duration,
-                                  frozenset((path, line) for path, line in lines if not is_test_code(Path(path))), child))
+                                  frozenset(lines), child))
     return result, tests
 
 

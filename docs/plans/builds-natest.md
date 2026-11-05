@@ -386,7 +386,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Gotchas:**
 - A file in the `files` list of two open phases blocks the edit hook. Give each file to one phase when the plan is written.
 
-### Phase 15 — The coverage tool checks which children and threads are alive at each test boundary  · status: todo
+### Phase 15 — The coverage tool checks which children and threads are alive at each test boundary  · status: done
 **Depends on:** Phase 12
 
 #### Work Order
@@ -493,3 +493,36 @@ The recording exists: `buildlog/parse.test_results` keeps each nextest test that
 
 **Ruled out:**
 - A 1-day window: a checkout that only reads its index could lose a file it uses each hour.
+
+### Phase 18 — Mac and Linux mirror steps record the repository identity that natedev sends  · status: todo
+**Depends on:** Phase 16
+
+#### Work Order
+
+**Goal:** A new Mac or Linux mirror step records the repository identity of its natedev source checkout, so the index does not need to derive it.
+
+**Spec:** The builds showrunner accepted this architecture proposal from the Phase 16 review on 2026-11-04. This unit owns it. Edits to other units' files are allowed: `scripts/mac_test/offload.py` and `scripts/mac_test/linux_runner.py` (verify-unit), `scripts/buildlog/record.py` (report-unit).
+
+1. Send: the natedev side computes the repository key of the source checkout with `record.recorded_repository_key` (no copy). It passes the key as `BUILDLOG_REPO_IDENTITY` in the mirror command, beside `BUILDLOG_CALL_ID` and `BUILDLOG_SENT_TREE_KEY`: in `offload.py` (the ssh command, about line 1500) and in `linux_runner.py` (the `environment` mapping, about line 720). An `unknown` key is not sent.
+2. Record: in `record.py` `step()`, when `recorded_repository_key` gives `store.UNKNOWN_IDENTITY` for a mirror caller (`verify-mac`, `verify-linux`) and `BUILDLOG_REPO_IDENTITY` is set, record that value. Read it through one typed reader beside `sent_tree_key()`. A known local key always wins.
+3. Index: keep the Phase 16 index rule for old rows. A step with a recorded identity has `identity_derived = 0`, so the resolver never changes it.
+4. The Mac gets the new `record.py` through the normal main promotion. Until then, Mac rows stay `unknown` and the index rule resolves them.
+
+**Files:**
+- `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py` — send the key (verify-unit's files)
+- `scripts/buildlog/record.py` — record the sent key (report-unit's file)
+- the test modules of these three files — the regression tests
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `offload.py`, `linux_runner.py`, `record.py`
+- `test` — the tests: a mirror step with no origin records the identity sent from natedev; a known local key wins over a sent key; the Mac ssh command and the Linux environment carry the key, and omit it when it is unknown
+
+**Constraints from prior phases:**
+- Phase 16: the index derives the identity of an `unknown` step from its call and marks it `identity_derived = 1`. Keep that rule for old rows.
+- Before work starts, read the open verify-unit and report-unit branches for edits to these three files. Claim the files on the berth board, and name them in the notice's also-touches line.
+- report-unit Phase 20 (`be35f2d2b`) changes `record.py` `step()`. Never merge report's unlanded branch. Start the `record.py` edits only after report Phase 20 is merged into builds; then merge origin/builds. Until then, work only on `offload.py`, `linux_runner.py` and their tests (showrunner, 2026-11-04).
+
+**Acceptance gate:**
+- the three test modules green on a tree with origin/builds merged after report Phase 20 lands
+- a mirror step test records the identity sent from natedev
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
