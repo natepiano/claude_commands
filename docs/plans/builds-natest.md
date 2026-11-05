@@ -502,36 +502,19 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 19 — The coverage tool runs under a mocked `subprocess.Popen` and its git child test passes at high load  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `coverage_overlap.py` collects a module whose fixture replaces `subprocess.Popen` with a mock, and `test_git_child_keeps_coverage_known` passes at load 60.
-
-**Spec:** Both defects are in this unit's own Phase 15 code. The showrunner ruled the flaky test a bounded fix after Phase 13 (2026-11-04).
-
-1. Mocked Popen: `line_collector.py` checks `isinstance(process, subprocess.Popen)` at the time of the call (`stack_popen`, about line 150, and the audit hook, about line 226). A fixture that sets `subprocess.Popen` to a mock makes the second argument a non-type, and the test fails with `TypeError: isinstance() arg 2 must be a type`. Seen on `scripts/direct/test_verify_ssh_targets_routing.py` `test_held_local_target_does_not_block_linux_check` (fixture `verify_mac_offload_test_support.py` about line 980). Keep the real class at import, beside `POPEN_INIT`, and check against it.
-2. Flaky test: `test_coverage_overlap.py` `test_git_child_keeps_coverage_known` failed once at load 60 and passed on rerun; 0 of 25 repeats failed at load 54. Find the cause from the failure text. Fix the cause in the collector or the fixture; do not add a retry or a longer wait. A probe found the likely cause: candidate selection drops the slower test first, so the test assumes git ends before the fixture's computation. When git is slower, the candidate reverses, although both tests stay known.
-3. Import failure: in ~/.claude main, `coverage_overlap.py scripts/production test_fast_track.py` cannot import the module (`memory_test_support` refuses installed scripts). `unittest` then makes one `_FailedTest`, and the tool prints `No removal candidates. Known tests: 1/1` and exits 1. When a selected module does not import (`TestLoader.errors` after `discover`), print one line per module to stderr, `coverage overlap: <file> does not import: <last line of the error>`, print no table and no summary, and exit 2. Do not run the suite. The builds showrunner asked for this on 2026-11-04 (change-review rows C1056 and C1058 returned).
+- `line_collector.py` keeps `POPEN_CLASS = subprocess.Popen` at import, beside `POPEN_INIT`. `stack_popen` and the audit hook check `isinstance` against it, so a fixture that replaces `subprocess.Popen` with a mock collects with no error. `test_verify_ssh_targets_routing.py` runs all 13 tests under the collector.
+- The flaky git test was not a collector defect. Both tests stay known; candidate selection takes the slower of two tests with equal coverage, so the candidate reverses when git is slower. `test_git_child_keeps_coverage_known` asserts the slower row as the candidate, covered by the faster one. A deterministic `select_candidates` test checks both duration orders. The git test passed 25 of 25 repeats at load about 66.
+- `coverage_overlap.py`: `load_suite` reads the new `TestLoader.errors` after each selected module's discovery and raises `ModuleImportsFailed`. `main` prints `coverage overlap: <file> does not import: <last error line>` for each failed module to stderr, prints no table and no summary, runs no test, and returns 2.
 
 **Files:**
 - `scripts/test_times/line_collector.py` — the Popen class kept at import
 - `scripts/test_times/coverage_overlap.py` — the import-failure line and exit 2
-- `scripts/test_times/test_coverage_overlap.py` — a regression test with a mocked `subprocess.Popen`; the flaky test fix
+- `scripts/test_times/test_coverage_overlap.py` — the mocked Popen, both-order and import-failure tests
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `line_collector.py`, `coverage_overlap.py`; the import-failure test in `test_coverage_overlap.py` (follow-up, after the tester finished)
-- `test` — `test_coverage_overlap.py`: a fixture module that patches `subprocess.Popen` with a mock collects without an error; the git child test under parallel load
-
-**Constraints from prior phases:**
-- Phase 15: an unknown test names its cause and is never a removal candidate. Keep every cause and its tests.
-- Phase 13: the five slowest modules gave no removal (see its As-built). Most of their tests are unknown through unverified launches of bash, git, rustc, ssh and rsync.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/test_times -p 'test_coverage_overlap.py'` green
-- `python3 scripts/test_times/coverage_overlap.py scripts/direct test_verify_ssh_targets_routing.py` runs all 13 tests with no collector error
-- a deterministic test with fixed durations in both orders (git slower, git faster) keeps both tests known and asserts the candidate for each order
-- the git child test passes 25 of 25 repeats at a load of 55 or more
-- a fixture module that raises at import gives the one stderr line, no summary, and exit 2
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Binds later work:**
+- Read a process class at import, never at call time: a fixture can replace it.
 
 ### Phase 20 — The hana_shot test module stops its fixture servers at once  · status: done
 **Depends on:** none
