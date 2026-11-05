@@ -1064,27 +1064,7 @@ Each change lands inside its store's landing, with the migration and rewriter re
 
 ### Phase 3d — Store migrations continue past anomalies  · status: done
 
-**Depends on:** 3y (landed 798b227ce). Lands before the 3y migrations run on natedev and the Mac.
-
-#### Work Order
-
-**Goal:** `migrate_showrunner_state.py` and `migrate_middle_stores.py` move every folder and file whose showrunner has a staff row. No folder is left split between its old and new place.
-
-**Spec (sdlc, 2026-11-04, from its rehearsal on a copy of natedev's state; staff-lifecycle.md section 4):**
-1. A unit reference with no staff row prints one anomaly line and the migration continues. The file keeps the text or drops the entry, as its reader needs.
-2. One file never stops its folder. A file that cannot move prints one anomaly line and stays; the other files move.
-3. Two old names with one staff id merge their `*.history.jsonl` in time order.
-4. A folder or file whose showrunner has no staff row stays in place with one anomaly line. Anomalies exit 0; a rerun of the finished migration changes nothing and exits 0.
-
-**Files:**
-- `scripts/production/migrate_showrunner_state.py`, `scripts/production/test_migrate_showrunner_state.py`
-- `scripts/production/migrate_middle_stores.py`, `scripts/production/test_migrate_middle_stores.py`
-
-**Workers:** `2 writers`
-- `cdport` — `migrate_showrunner_state.py` and its test file.
-- `e-fixa` — `migrate_middle_stores.py` and its test file.
-
-**Acceptance gate:** each new test fails without its fix; `test_tidy_wrapped.py` and the production suite pass; basedpyright 0/0/0 on the changed files. A rehearsal on a copy of the state folder on natedev and on the Mac shows zero unavailable for each folder that has a showrunner row, and lists the folders left in place.
+**As built:** `migrate_showrunner_state.py` and `migrate_middle_stores.py` follow staff-lifecycle.md section 4. A unit reference with no staff row prints one `anomaly:` line and the file goes on; `dailies_judgment.json` drops the entry (its reader refuses unknown units), every other file keeps the old text. One file never stops its folder. A folder, report or outstanding file with no showrunner row stays in place. Two old names with one staff id merge `*.history.jsonl` and `*.answered.jsonl` by their `time` field; an empty `.lock` goes. Both end with `moved N; left in place M; unavailable K` and exit 1 only for real read or write errors of an owned item. Rehearsal on copies: natedev showrunner_state moved 3454 (cargo-tile, demo left in place), outstanding moved 30 (nested-g1, nested-g2, hanadocs-info left in place), unavailable 0; the Mac has no showrunner state.
 
 ### Phase 3z — Shutdown and style stores keyed by staff id  · status: done
 
