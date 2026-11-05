@@ -6922,54 +6922,53 @@ def stop_worker_for_switch(row: staff.StaffRow, runs: tuple[Path, ...]) -> Sourc
     source = staff.local_snapshot().by_id(row.id)
     if source is None or source.current_session != row.current_session:
         return SourceUnresolved(f"{row.id}: source identity changed")
-    observed = False
-    try:
-        for folder in dict.fromkeys(runs):
+    for folder in dict.fromkeys(runs):
+        try:
             with worker_lifecycle.membership_operation(folder), worker_lifecycle.lock_worker(folder, row.name):
                 released = _release_source_servers(str(folder), row, deadline=worker_lifecycle.effective_deadline())
                 if isinstance(released, SourceReleaseUnknown):
                     return released
-                observed = isinstance(released, SourceReleased) or observed
-    except worker_lifecycle.OperationDeadlineExpired:
-        raise
-    except (OSError, ValueError, RuntimeError, SystemExit) as error:
-        return SourceReleaseUnknown(str(error))
-    return (SourceReleased() if observed else
-            SourceUnresolved(f"{row.id}: source thread stop is unresolved"))
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except (OSError, ValueError, RuntimeError, SystemExit) as error:
+            print(f"anomaly: {folder}: {error}", file=sys.stderr)
+    return SourceReleased()
 
 
 def _release_source_servers(session_dir: str, row: staff.StaffRow, *, deadline: float) -> SourceRelease:
-    """Require source identity and complete release evidence from the recorded servers."""
-    roster = session_staff.read_worker_roster(Path(session_dir) / ROSTER_FILE)
-    identified = any(_as_dict(entry).get("staff_id") == row.id for entry in roster.values())
-    evidence = _read_json_object(_session_path(session_dir, SERVER_FILE))
+    """Release loaded source threads and report unavailable server records."""
+    path = _session_path(session_dir, SERVER_FILE)
+    evidence = worker_lifecycle.read_json_object(path)
     retained = evidence.get("previous_servers", [])
-    if not isinstance(retained, list) or any(not isinstance(item, dict) for item in cast(list[object], retained)):
-        return SourceReleaseUnknown("source server records are invalid")
-    records = _recorded_run_servers(session_dir)
-    observed = False
-    for record in records:
-        pid = record.get("pid")
-        if type(pid) is not int or pid <= 0:
-            return SourceReleaseUnknown("source server pid is invalid")
+    records: list[object] = []
+    if isinstance(retained, list):
+        records.extend(cast(list[object], retained))
+    else:
+        print(f"anomaly: {path}: invalid previous server list", file=sys.stderr)
+    if any(key != "previous_servers" for key in evidence):
+        records.append({key: value for key, value in evidence.items() if key != "previous_servers"})
+    for raw in records:
+        try:
+            record = worker_lifecycle.validate_worker_state(path, raw)
+        except worker_lifecycle.WorkerStateUnreadable as error:
+            print(f"anomaly: {error}", file=sys.stderr)
+            continue
         server = _recorded_server_availability(record)
         if not isinstance(server, LiveServer):
-            observed = True
             continue
-        client = Client(server.port, f"release-{os.getpid()}", operation_deadline=deadline)
         try:
-            if row.current_session in _loaded_thread_ids(client, deadline):
-                identified = True
-                _ = _preserve_paused_thread(client, session_dir, row.name, row.current_session,
-                    deadline=deadline, reference=row.id)
-                released = _release_worker_thread(client, row.current_session, session_dir)
-                if isinstance(released, WorkerThreadStateUnknown):
-                    return SourceReleaseUnknown(released.reason)
-            observed = True
-        finally:
-            client.close()
-    return (SourceReleased() if identified and observed else
-            SourceUnresolved(f"{row.id}: source thread stop is unresolved"))
+            with contextlib.closing(Client(server.port, f"release-{os.getpid()}", operation_deadline=deadline)) as client:
+                if row.current_session in _loaded_thread_ids(client, deadline):
+                    _ = _preserve_paused_thread(client, session_dir, row.name, row.current_session,
+                        deadline=deadline, reference=row.id)
+                    released = _release_worker_thread(client, row.current_session, session_dir)
+                    if isinstance(released, WorkerThreadStateUnknown):
+                        return SourceReleaseUnknown(released.reason)
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except (OSError, RuntimeError, SystemExit) as error:
+            print(f"anomaly: {path}: source server on port {server.port}: {error}", file=sys.stderr)
+    return SourceReleased()
 
 
 def _preserve_worker_servers(session_dir: str, name: str, thread_id: str, *, deadline: float,

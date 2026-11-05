@@ -1102,7 +1102,8 @@ class MeshCommandFixture(unittest.TestCase):
             # The stub uses a thread in this process; real child processes use the real reaper.
             return True if pid == os.getpid() else reap_process(pid, deadline=deadline)
 
-        self.patches.enter_context(patch.object(codex_mesh, "_reap", reap_fixture))
+        self.addCleanup(setattr, codex_mesh, "_reap", reap_process)
+        setattr(codex_mesh, "_reap", reap_fixture)
 
         def protect_runner(pid: object, signum: int, *, group: bool = False) -> None:
             if pid == os.getpid() and signum != 0:
@@ -2245,30 +2246,43 @@ class StaffAdmissionTests(MeshCommandFixture):
         self.assertEqual(loaded, {sibling})
         self.assertEqual(starts, [identity, identity])
 
-    def test_source_release_requires_identity_and_complete_server_evidence(self) -> None:
+    def test_source_release_reports_invalid_records_and_continues(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
         row = session_staff.worker_row(self.worker_record())
         assert row is not None
         stopped: dict[str, object] = {"pid": 987654321, "port": 9}
-        cases: tuple[tuple[str, dict[str, object] | None, bool, type[object]], ...] = (
-            ("null current pid", {"pid": None, "port": 9, "previous_servers": [stopped]}, True, stop_results.SourceReleaseUnknown),
-            ("empty retained record", {"previous_servers": [{}]}, True, stop_results.SourceReleaseUnknown),
-            ("unrelated server", stopped, False, stop_results.SourceUnresolved),
-            ("mixed retained records", {"previous_servers": [stopped, {}]}, True, stop_results.SourceReleaseUnknown),
-            ("missing current pid", {"port": 9, "previous_servers": [stopped]}, True, stop_results.SourceReleaseUnknown),
-            ("stopped retained servers", {"previous_servers": [stopped]}, True, stop_results.SourceReleased),
-            ("missing server file", None, True, stop_results.SourceUnresolved),
+        live: dict[str, object] = {"pid": os.getpid(), "port": self.server.port}
+        cases: tuple[tuple[str, dict[str, object] | None, str], ...] = (
+            ("null current pid", {"pid": None, "port": 9}, "invalid server pid"),
+            ("empty retained record", {"previous_servers": [{}]}, "invalid server pid"),
+            ("unrelated server", stopped, ""),
+            ("mixed retained records", {**live, "previous_servers": [{}]}, "invalid server pid"),
+            ("invalid retained list", {**live, "previous_servers": "damaged"}, "invalid previous server list"),
+            ("invalid retained entry", {**live, "previous_servers": ["damaged"]}, "worker state unreadable"),
+            ("missing current pid", {"port": 9}, "invalid server pid"),
+            ("stopped retained servers", {"previous_servers": [stopped]}, ""),
+            ("missing server file", None, ""),
         )
-        for label, evidence, identified, expected in cases:
+        for label, evidence, diagnostic in cases:
             with self.subTest(evidence=label):
-                self.write_pool_roster({"worker": {"staff_id": row.id, "status": "done"}} if identified else {})
+                self.write_pool_roster({})
                 server = self.session_dir / codex_mesh.SERVER_FILE
                 if evidence is None:
                     server.unlink(missing_ok=True)
                 else:
                     _ = server.write_text(json.dumps(evidence))
-                result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
-                self.assertIsInstance(result, expected)
+                listed_before = len(self.methods("thread/loaded/list"))
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
+                self.assertIsInstance(result, stop_results.SourceReleased)
+                if diagnostic:
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertTrue(errors.getvalue().startswith("anomaly: "), errors.getvalue())
+                    self.assertIn(diagnostic, errors.getvalue())
+                else:
+                    self.assertEqual(errors.getvalue(), "")
+                if evidence is not None and evidence.get("port") == self.server.port:
+                    self.assertEqual(len(self.methods("thread/loaded/list")), listed_before + 1)
 
     def test_source_release_ignores_an_unrelated_live_pid_without_a_live_server(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
@@ -2281,9 +2295,93 @@ class StaffAdmissionTests(MeshCommandFixture):
                 self.write_pool_roster({"worker": {"staff_id": row.id, "status": "done"}})
                 contents = {"previous_servers": [evidence]} if retained else evidence
                 atomic_file.write_text_atomic(server, json.dumps(contents))
-                result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
                 self.assertIsInstance(result, stop_results.SourceReleased)
+                self.assertEqual(errors.getvalue(), "")
                 os.kill(os.getpid(), 0)
+
+    def test_source_release_reports_connection_failures_and_checks_the_next_server(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        row = session_staff.worker_row(self.worker_record())
+        assert row is not None
+        server = self.session_dir / codex_mesh.SERVER_FILE
+        failures = (OSError("connection unavailable"), RuntimeError("transport failed"),
+                    SystemExit("transport stopped"), TimeoutError("connection timed out"))
+        connect = socket.create_connection
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                atomic_file.write_text_atomic(server, json.dumps({"pid": os.getpid(), "port": self.server.port,
+                    "previous_servers": [{"pid": os.getpid(), "port": 1}]}))
+
+                def connection(address: tuple[str, int], *, timeout: float) -> socket.socket:
+                    if address[1] == 1:
+                        raise failure
+                    return connect(address, timeout=timeout)
+
+                listed_before = len(self.methods("thread/loaded/list"))
+                with (patch.object(socket, "create_connection", side_effect=connection),
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
+                self.assertIsInstance(result, stop_results.SourceReleased)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertTrue(errors.getvalue().startswith("anomaly: "), errors.getvalue())
+                self.assertIn(str(failure), errors.getvalue())
+                self.assertEqual(len(self.methods("thread/loaded/list")), listed_before + 1)
+
+    def test_source_release_reports_a_failed_loaded_thread_read(self) -> None:
+        row = self.codex_switch_source()
+        self.failing_method = "thread/loaded/list"
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
+        self.assertIsInstance(result, stop_results.SourceReleased)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("anomaly: ", errors.getvalue())
+        self.assertIn("scripted request failure", errors.getvalue())
+        self.assertEqual(self.methods("thread/unsubscribe"), [])
+
+    def test_source_release_reports_a_damaged_run_and_checks_the_next_run(self) -> None:
+        row = self.codex_switch_source()
+        atomic_file.write_text_atomic(self.session_dir / codex_mesh.SERVER_FILE, "{damaged")
+        next_run = self.home / "next-source-run"
+        next_run.mkdir()
+        atomic_file.write_text_atomic(next_run / codex_mesh.SERVER_FILE,
+            json.dumps({"pid": os.getpid(), "port": self.server.port}))
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            result = codex_mesh.stop_worker_for_switch(row, (self.session_dir, next_run))
+        self.assertIsInstance(result, stop_results.SourceReleased)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertTrue(errors.getvalue().startswith("anomaly: "), errors.getvalue())
+        self.assertIn(str(self.session_dir), errors.getvalue())
+        self.assertEqual(len(self.methods("thread/loaded/list")), 1)
+
+    def test_source_release_refuses_when_a_loaded_thread_cannot_be_stopped(self) -> None:
+        row = self.codex_switch_source()
+        respond = self.server.respond
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/loaded/list":
+                return [_reply(request, {"data": [THREAD_ID], "nextCursor": None})]
+            return respond(request)
+
+        self.server.respond = reply
+        self.failing_method = "thread/unsubscribe"
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            result = codex_mesh.stop_worker_for_switch(row, (self.session_dir,))
+        self.assertIsInstance(result, stop_results.SourceReleaseUnknown)
+        assert isinstance(result, stop_results.SourceReleaseUnknown)
+        self.assertIn("scripted request failure", result.reason)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(len(self.methods("thread/unsubscribe")), 1)
+
+    def test_source_release_refuses_a_changed_source_identity(self) -> None:
+        row = self.codex_switch_source()
+        replaced = dataclasses.replace(row, current_session=staff.StaffId(fixture_runtime_id("replaced worker")))
+        result = codex_mesh.stop_worker_for_switch(replaced, (self.session_dir,))
+        self.assertIsInstance(result, stop_results.SourceUnresolved)
+        assert isinstance(result, stop_results.SourceUnresolved)
+        self.assertIn("source identity changed", result.reason)
+        self.assertEqual(self.methods("thread/loaded/list"), [])
 
     def test_only_active_records_belong_to_the_matching_launcher(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
@@ -2292,26 +2390,31 @@ class StaffAdmissionTests(MeshCommandFixture):
             with self.subTest(status=status):
                 self.assertEqual(owner.owns({**self.worker_record(), "launcher_pid": os.getpid(), "status": status}), status != "done")
 
-    def test_unresolved_or_unknown_source_servers_preserve_the_slot_and_dispatch_nothing(self) -> None:
+    def test_source_release_anomaly_does_not_block_family_switch(self) -> None:
         from scripts.shutdown import stop_resume
 
         old = self.codex_switch_source()
         allowed = worker_admission.admit(old.name, self.session_dir, role="impl")
         server = self.session_dir / codex_mesh.SERVER_FILE
-        for reason, change in (("stop is unresolved", lambda: server.unlink()),
-                               ("worker state unreadable", lambda: server.write_text("{unknown server state"))):
-            with self.subTest(reason=reason):
-                _ = change()
-                before = Path(os.environ["STAFF_FILE"]).read_bytes(), self.worker_record()
+        atomic_file.write_text_atomic(server, "{unknown server state")
+        identity = fixture_runtime_id("destination after source anomaly")
+        fixture_session(identity, staff.ClaudeBackend())
+        dispatched: list[staff.StaffRow] = []
 
-                with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)),
-                      self.assertRaisesRegex(worker_admission.AdmissionRefused, reason)):
-                    _ = worker_admission.switch_worker(allowed, "claude", start=lambda handoff: self.fail("unproved source release started a destination: " + str(handoff)),
-                        dispatch=lambda published: worker_admission.SwitchState.ASSIGNMENT_ACCEPTED,
-                        cleanup=lambda native: self.fail("uncreated destination cleanup: " + native))
-                self.assertEqual((Path(os.environ["STAFF_FILE"]).read_bytes(), self.worker_record()), before)
-                self.assertEqual(self.methods("thread/unsubscribe"), [])
-                self.assertEqual(self.methods("turn/start"), [])
+        def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
+            dispatched.append(published.row)
+            return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
+
+        with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            result = worker_admission.switch_worker(allowed, "claude", start=lambda handoff: identity,
+                dispatch=dispatch, cleanup=lambda native: self.fail("destination cleanup: " + native))
+        self.assertEqual(dispatched, [result.row])
+        self.assertEqual(result.row.id, old.id)
+        self.assertEqual(result.row.current_session, staff.StaffId(identity))
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertTrue(errors.getvalue().startswith("anomaly: "), errors.getvalue())
+        self.assertIn("worker state unreadable", errors.getvalue())
 
     def test_start_uses_staff_worktree_instead_of_caller_or_saved_shell_folder(self) -> None:
         parent = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
