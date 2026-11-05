@@ -261,6 +261,9 @@ Never paste its secret into a command, log, or tracked file.
 Device names in `config/aws-build-tailscale.json` must equal a machine name (first label of `DNSName` in `tailscale status`); `up` checks this first.
 
 The policy stage prints each change to `tag:build-aws` rules.
+The network rule permits only natedev and the Mac on port 22.
+The SSH rule permits `autogroup:member` as `natepiano`; the network rule still limits access to these devices.
+HTTP refusals include the status and validation details without user fields; network refusals include the failure reason.
 It preserves unrelated rules and refuses a broad outbound rule that needs policy review.
 The join stage waits for SSM and sends one short-lived auth key through SSM stdin.
 The key never enters a command argument or a disk file.

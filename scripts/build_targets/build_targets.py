@@ -285,15 +285,22 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         eligibility = offload.mac_step_eligibility(config, repo_root, package, verb, name)
         if isinstance(eligibility, offload.IneligibleMacStep):
             return ExcludedTarget(target, eligibility.reason)
-        probe = offload.probe_mac(offload.ProcessController(), config, eligibility, name)
+        controller = offload.ProcessController()
+        probe = offload.probe_mac(controller, config, eligibility, name)
         if isinstance(probe, offload.UnresolvedSlotStartup):
             return ExcludedTarget(target, "busy")
         if isinstance(probe, offload.UnavailableProbe):
             return ExcludedTarget(target, "unreachable")
         if isinstance(probe, offload.InterruptedTargetStatus):
             return ExcludedTarget(target, "busy")
-        if probe.free_gib < config.free_floor_gib:
+        with offload.interrupt_handlers(controller):
+            disk = offload.ensure_mac_disk_floor(controller, config, eligibility, probe, name)
+        if isinstance(disk, offload.SweepFailed):
+            print(f"build targets: Mac disk exclusion: {disk.cause}", file=sys.stderr)
+        if not isinstance(disk, offload.MacDiskReady):
             return ExcludedTarget(target, "disk")
+    except offload.OffloadInterrupted as interrupted:
+        raise SystemExit(128 + interrupted.signal_number) from None
     except (OSError, UnicodeError, ValueError) as error:
         return ExcludedTarget(target, f"state unreadable: {error}")
     return EligibleTarget(target)
