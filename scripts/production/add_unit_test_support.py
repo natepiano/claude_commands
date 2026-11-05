@@ -63,6 +63,14 @@ MARKED_HERDR_PLACE = HerdrPlace("marked-herdr", "w7:p1")
 SHARED = herdr.SHARED_SESSION
 NO_LAUNCH_FIXTURE = add_unit.NoLabeledSession()
 SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime(2026, 10, 17, tzinfo=timezone.utc))
+LINUX_LAUNCHER_CLI = """import runpy, sys
+from unittest.mock import patch
+from scripts.production.fake_unit_host import private_process_registry
+from scripts.shutdown import remote
+script = sys.argv.pop(1)
+with private_process_registry(), patch.object(remote, 'local_machine', return_value='natedev'):
+    runpy.run_path(script, run_name='__main__')
+"""
 
 
 def fixture_process_start(pid: int) -> str | None:
@@ -587,12 +595,7 @@ class AddUnitTestCase(ShutdownTestCase):
         self.prepare_herdr_launch(*args)
         arguments = ["--production", str(self.doc), *args]
         if subprocess_cli:
-            bootstrap = ("import runpy, sys\n"
-                         "from scripts.production.fake_unit_host import private_process_registry\n"
-                         "script = sys.argv.pop(1)\n"
-                         "with private_process_registry():\n"
-                         "    runpy.run_path(script, run_name='__main__')\n")
-            return subprocess.run([sys.executable, "-c", bootstrap, str(SCRIPT), *arguments],
+            return subprocess.run([sys.executable, "-c", LINUX_LAUNCHER_CLI, str(SCRIPT), *arguments],
                                   env=self.env, capture_output=True, text=True,
                                   timeout=timeout, check=False)
         return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,
