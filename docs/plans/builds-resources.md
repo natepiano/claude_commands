@@ -1720,32 +1720,20 @@ A measurement only; no repository code changed. The report is in the unit run fo
 **Ruled out:** a fix — the cause does not repeat.
 
 ### Phase 75 — The Mac post-run cleanup prints one line when it removes a target  · status: done
-**Depends on:** none. Showrunner go 2026-11-05 (from Phase 74). natest Phase 24 is on main, so `offload.py` is free to edit.
 
-#### Work Order
+#### As-built
 
-**Goal:** when the post-run cleanup removes a Mac mirror's `target` folder, the run prints one line with the path, its size and the Mac free space against the floor, so the next cold Mac run has a record.
+When free space on the Mac is under the floor, the post-run cleanup measures the mirror's `target` with `du -sk` before `rm`, then sends `mac_cleanup=0 <kib|-> <free GiB>`. The free-space test, the floor and the `rm` are unchanged.
 
-**Measured:**
-1. Phase 74: a Mac mirror target was removed between 11:14 and 11:17 on 2026-11-05, and no record names the removal.
-2. `scripts/mac_test/offload.py:1638-1647` builds the cleanup command: it removes the whole target when free space is under `free_floor_gib` (100 GiB on the Mac) and prints `mac_cleanup=0`. `report_cleanup` (`offload.py:905-912`) prints nothing for a removal.
-
-**Spec:**
-1. In the cleanup command, before `rm`, measure the target's size (`du -sk`). Send the size and the free GiB back with the success marker. When `du` fails, send the size as not measured; the removal still runs.
-2. `parse_cleanup` reads the new marker. `CleanupDone` carries the size (or not measured) and the free GiB. The free-space test, the floor and the `rm` stay as they are.
-3. `report_cleanup` prints one line for `CleanupDone`, for example: `hana build output removed: ~/.local/state/mac-test/mirror/hana/target, 31.2 GiB; Mac free 92 GiB under the 100 GiB floor`.
-4. Change nothing else in the cleanup. Add no guard, refusal or check this Work Order does not ask for. Post blocked to ask instead.
+- `parse_cleanup` returns `CleanupDone(size, free_gib)` for that marker. `size` is `MeasuredCleanupSize(kib)` or `CleanupSizeNotMeasured`, and a failed `du` still removes the target.
+- A bare `mac_cleanup=0` from `linux_runner.py` is `CleanupRemovedWithoutFacts`: a confirmed removal that prints no line.
+- `report_cleanup` prints one line for `CleanupDone`: `Mac build output removed: ~/.local/state/mac-test/mirror/hana/target, 31.2 GiB; Mac free 59 GiB under the 60 GiB floor`. The line starts with the target label.
+- `mirror_target(repository, target, slot)` builds both the removed path and the printed path.
 
 **Files:**
-- `scripts/mac_test/offload.py` — the cleanup command, `CleanupDone`, `parse_cleanup`, `report_cleanup`.
-- `scripts/mac_test/test_offload_cleanup.py` — the new marker, the printed line, and a failed `du`.
-- `scripts/mac_test/test_offload_forward.py` — the expected command text.
-- `scripts/mac_test/offload_test_support.py`, `scripts/mac_test/test_offload_cleanup_results.py` and `scripts/direct/verify_ssh_targets_test_support.py` — fixtures send the new success marker; one results test expects the removal line.
+- `scripts/mac_test/offload.py` — the cleanup command, the outcome types, `parse_cleanup`, `report_cleanup`, `mirror_target`.
+- `scripts/mac_test/test_offload_cleanup.py`, `scripts/mac_test/test_offload_cleanup_results.py`, `scripts/mac_test/test_offload_forward.py`, `scripts/mac_test/offload_test_support.py` — the marker, the printed line, a failed `du`, and the command text.
 
-**Workers:** `1 writer`
-- `impl` writes the code and the tests.
+**Gotchas:** `claimed_run` and `parse_cleanup` serve the Mac and the Linux targets. `scripts/direct/verify_ssh_targets_test_support.py` keeps the bare marker because its fixture also stands for the Linux targets; the Mac marker there hides a break.
 
-**Acceptance gate:**
-- `test_offload_cleanup.py`, `test_offload_forward.py` and `test_offload.py` pass.
-- basedpyright reports 0 errors and 0 warnings on the changed files.
-- A removal prints the one line with the path, the size and the free GiB against the floor; a kept or skipped target prints no new line.
+**Ruled out:** `linux_runner.py` printing the new marker: the line's text says "Mac free", and that runner needs no line.
