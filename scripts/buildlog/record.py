@@ -50,7 +50,6 @@ exit status is 0. Records are JSON lines (store.py); index.py reads them.
 from __future__ import annotations
 
 import fcntl
-import importlib
 import json
 import math
 import os
@@ -61,10 +60,15 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from test_phase import (
+    CallRecord,
+    NoCallRecord,
+    TestPhaseChargeUse as TestPhaseChargeUse,
+    NoTestPhaseChargeUse,
+    parse_test_phase_charge_use,
     NO_TEST_PHASE_RECORD as NO_TEST_PHASE_RECORD,
     NoTestPhaseRecord as NoTestPhaseRecord,
     ObservedTestPhase as ObservedTestPhase,
@@ -85,30 +89,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
 if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 else:
-    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 if TYPE_CHECKING:
     from ..aws_target.config import MeasurementUnavailable
 
 
 __all__ = ["_target_hosts"]
 
-
-class RecordedCall(Protocol):
-    call_id: str
-
-
-class AdmissionMetadata(Protocol):
-    Call: object
-    CallRecord: type[RecordedCall]
-
-    def parse_snapshot_value(self, value: object, schema: object) -> object: ...
-
-
-def admission_metadata() -> AdmissionMetadata:
-    """Load admission only when recording needs its metadata, after initialization."""
-    return cast(AdmissionMetadata, cast(object, importlib.import_module("memory_admit")))
 
 RECORD_VERSION = 1
 TARGET_DIR_UNSET = "unset"
@@ -669,6 +658,60 @@ def pending_steps_root() -> Path:
     return store.root() / "pending-steps"
 
 
+@dataclass(frozen=True)
+class ReservedTestPhaseRecord(TestPhaseRecord):
+    reservation_id: str
+
+
+@dataclass(frozen=True)
+class ChargedTestPhaseRecord(ReservedTestPhaseRecord):
+    charge: TestPhaseChargeUse
+
+
+def completed_test_phase_charge(reservation_id: str) -> TestPhaseChargeUse | NoTestPhaseChargeUse:
+    """Copy the completed reservation's evidence without parsing unrelated history rows."""
+    import mmap
+
+    try:
+        path = store.root() / "admission/anon_peaks.jsonl"
+        try:
+            handle = path.open("rb")
+        except FileNotFoundError:
+            return NoTestPhaseChargeUse()
+        with handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            end = store.last_whole_row_end(handle)
+            if not end:
+                return NoTestPhaseChargeUse()
+            identity = json.dumps(reservation_id).encode("utf-8")
+            with mmap.mmap(handle.fileno(), end, access=mmap.ACCESS_READ) as contents:
+                while (position := contents.rfind(identity, 0, end)) >= 0:
+                    start = contents.rfind(b"\n", 0, position) + 1
+                    stop = contents.find(b"\n", position, end)
+                    try:
+                        loaded = cast(object, json.loads(contents[start:stop]))
+                    except ValueError:
+                        loaded = None
+                    if isinstance(loaded, dict):
+                        row = cast(dict[str, object], loaded)
+                        if row.get("reservation_id") == reservation_id:
+                            evidence = row.get("test_phase_charge_use")
+                            if evidence is None:
+                                return NoTestPhaseChargeUse()
+                            if not isinstance(evidence, dict):
+                                raise ValueError("test-phase charge is not an object")
+                            return parse_test_phase_charge_use(cast(dict[str, object], evidence))
+                    end = start
+        return NoTestPhaseChargeUse()
+    except (OSError, ValueError) as error:
+        try:
+            with (store.root() / store.ERRORS_NAME).open("a") as errors:
+                _ = errors.write(f"{store.utc_iso(time.time())} test-phase charge {reservation_id!r}: {error!r}\n")
+        except OSError:
+            pass
+        return NoTestPhaseChargeUse()
+
+
 def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
     import parse
@@ -679,20 +722,24 @@ def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, obje
     fields = cast(dict[str, object], loaded)
     call = fields.get("call_id")
     if isinstance(call, dict):
-        metadata = admission_metadata()
-        recorded_call = metadata.parse_snapshot_value(cast(dict[str, object], call), metadata.Call)
-        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, metadata.CallRecord) else None
+        call = cast(dict[str, object], call)
+        if call.get("kind") == CallRecord.__name__ and isinstance(call.get("call_id"), str):
+            fields["call_id"] = call["call_id"]
+        elif call.get("kind") == NoCallRecord.__name__:
+            fields["call_id"] = None
+        else:
+            fields["call_id"] = None
     # Admission's parser returns the first width. Supplying nextest's environment
     # default last preserves an explicit flag, including a nonnumeric one.
     width_argv = argv
     if "NEXTEST_TEST_THREADS" in os.environ:
         width_argv = [*argv, "--test-threads", os.environ["NEXTEST_TEST_THREADS"]]
     context = _test_phase_context({**fields, "test_threads": parse.test_threads(width_argv)})
-    return {
-        **context,
-        # Admission has no entry-charge record (bytes, cutoff, form, widths).
-        "test_phase_charge": None,
-    }
+    result: dict[str, object] = {**context, "test_phase_charge": None}
+    reservation_id = fields.get("reservation_id")
+    if isinstance(reservation_id, str) and reservation_id:
+        result["reservation_id"] = reservation_id
+    return result
 
 
 def _test_phase_context(fields: Mapping[str, object]) -> TestPhaseContext:
@@ -733,7 +780,11 @@ def _test_phase_record(fields: Mapping[str, object]) -> TestPhaseRecord:
         window = ObservedTestPhase(peak, float(started))
     else:
         raise ValueError("test-phase peak or start time is invalid")
-    return TestPhaseRecord(window, _test_phase_context(fields))
+    context = _test_phase_context(fields)
+    reservation_id = fields.get("reservation_id")
+    if isinstance(reservation_id, str) and reservation_id:
+        return ReservedTestPhaseRecord(window, context, reservation_id)
+    return TestPhaseRecord(window, context)
 
 
 def read_test_phase(path: Path | NoTestPhaseRecord) -> TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord:
@@ -756,6 +807,10 @@ def test_phase_fields(phase: TestPhaseRecord | NoTestPhaseRecord) -> dict[str, o
     }
     if isinstance(phase, TestPhaseRecord):
         fields.update({key: value for key, value in phase.context.items() if key != "repo_identity"})
+        if isinstance(phase, ReservedTestPhaseRecord):
+            fields["reservation_id"] = phase.reservation_id
+        if isinstance(phase, ChargedTestPhaseRecord):
+            fields["test_phase_charge"] = phase.charge
         if isinstance(phase.window, ObservedTestPhase):
             fields.update(test_phase_peak_bytes=phase.window.peak_bytes,
                           test_phase_started_at=phase.window.started_at)
@@ -880,6 +935,10 @@ def finish_pending_step(path: Path) -> PublishedStep:
     pending = _read_pending_step(path)
     if isinstance(pending.test_phase, UnreadableTestPhaseRecord):
         phase = read_test_phase(pending.test_phase_file)
+        if isinstance(phase, ReservedTestPhaseRecord) and isinstance(phase.window, ObservedTestPhase):
+            charge = completed_test_phase_charge(phase.reservation_id)
+            if isinstance(charge, dict):
+                phase = ChargedTestPhaseRecord(phase.window, phase.context, phase.reservation_id, charge)
         if isinstance(phase, UnreadableTestPhaseRecord):
             raise OSError(f"test-phase sidecar unreadable: {phase.reason}")
         pending = replace(pending, row={**pending.row, **test_phase_fields(phase)}, test_phase=phase)
@@ -962,10 +1021,21 @@ def step(args: list[str]) -> None:
                 store.note_error(f"parse {name} {held}")
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
-        output_roots = read_cargo_output_roots(Path(directory)) if name != "sweep" else CargoOutputUnavailable("sweep step")
+        output_roots = step_context.step_output_roots(argv, cwd) if name != "sweep" else CargoOutputUnavailable("sweep step")
+        target_folder = step_context.captured_target_folder(os.environ.get("BUILDLOG_TARGET_FOLDER", ""))
+        if (isinstance(output_roots, CargoOutputRoots)
+                and isinstance(target_folder, step_context.CargoTargetFolder)
+                and output_roots.target_directory != target_folder.path):
+            store.note_error(f"step output folders: target_directory {output_roots.target_directory} "
+                             + f"differs from target_dir {target_folder.path}")
+            output_roots = CargoOutputUnavailable("step target folder mismatch")
         memory = peak_and_stall(peak)
         step_slice = "none" if not peak else "builds" if Path(peak).is_file() else "fallback"
         phase = read_test_phase(phase_file)
+        if isinstance(phase, ReservedTestPhaseRecord) and isinstance(phase.window, ObservedTestPhase):
+            charge = completed_test_phase_charge(phase.reservation_id)
+            if isinstance(charge, dict):
+                phase = ChargedTestPhaseRecord(phase.window, phase.context, phase.reservation_id, charge)
         record: dict[str, object] = {
             "kind": "step",
             "v": RECORD_VERSION,
@@ -981,8 +1051,7 @@ def step(args: list[str]) -> None:
             "step": name,
             "argv": argv,
             "cwd": cwd,
-            "target_dir": step_context.target_folder_text(
-                step_context.captured_target_folder(os.environ.get("BUILDLOG_TARGET_FOLDER", ""))),
+            "target_dir": step_context.target_folder_text(target_folder),
             **({"target_directory": str(output_roots.target_directory),
                 "build_directory": str(output_roots.build_directory)}
                if isinstance(output_roots, CargoOutputRoots) else {}),
