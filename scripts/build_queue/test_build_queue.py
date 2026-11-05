@@ -13,6 +13,9 @@ import io
 import json
 import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -27,6 +30,7 @@ from scripts.build_queue.queue_fixture import (
 from scripts.build_queue.queue_lines import QueueLines, Span, json_form, plain
 from scripts.lib.terminal_cells import terminal_width
 from scripts.buildlog import store
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.lint import memory_admit
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
@@ -35,6 +39,8 @@ from scripts.message.unit_labels import UnitLabels, unit_labels_for
 from scripts.production import staff
 
 GIB = memory_admit.GIB
+
+
 
 
 class LabelReadMock(Protocol):
@@ -46,13 +52,14 @@ class LabelReadMock(Protocol):
     def reset_mock(self) -> None: ...
 
 
-class QueueTests(unittest.TestCase):
+class QueueTests(NotificationGuardedTestCase):
     fixture: QueueFixture = cast(QueueFixture, cast(object, None))
     root: Path = Path()
     labels_read: LabelReadMock = cast(LabelReadMock, cast(object, None))
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.fixture = self.enterContext(QueueFixture(captured=False))
         self.root = self.fixture.root
         _ = cast(object, self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=self.fixture.read)))
@@ -60,6 +67,7 @@ class QueueTests(unittest.TestCase):
         config = self.root / "build_admission.conf"
         write_memory_config(config)
         self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "CONF_DIR": str(config.parent)}))
+        self.enterContext(mock.patch.dict(os.environ, {"MAC_IDLE_STATE_DIR": str(self.root / "mac-idle")}))
 
     @staticmethod
     def entry(session: str, name: str) -> tuple[str, UnitLabels]:
@@ -84,7 +92,8 @@ class QueueTests(unittest.TestCase):
             lines.insert(0, queue_view.check_line(*queue_view.pressure_check(checks.decision.pressure, model)))
         return plain(lines)
 
-    def invoke(self, reading: memory_admit.QueueRead, *arguments: str) -> tuple[int, str, str]:
+    def invoke(self, reading: memory_admit.QueueRead,
+               *arguments: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.object(memory_admit, "queue_read", return_value=reading) as read, \
              mock.patch.object(admission_client, "mine", return_value=reading) as mine, \
@@ -167,6 +176,61 @@ class QueueTests(unittest.TestCase):
         text = head_facts.bump_text(facts, ZoneInfo("UTC"), short=True)
         self.assertIn("1 bump since it joined, most: bumped check (1)", text)
         self.assertNotIn("1 bumps", text)
+
+
+    def test_queue_help_starts_without_pythonpath(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
+        for name in ("build_queue.py",):
+            with self.subTest(script=name):
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name(name)), "--help"],
+                    env=environment, capture_output=True, text=True, timeout=30, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_mac_idle_alert_precedes_queue_and_selection_in_text_and_json(self) -> None:
+        _ = write_idle_alert(self.root / "mac-idle", NOW)
+        reading = head_reading(now=NOW)
+        expected = ("MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
+                    + time.strftime("%H:%M", time.gmtime(NOW - 600))
+                    + " (P15 F11 L0 run); /build:mac unblock clears it.")
+        with mock.patch.object(time, "time", return_value=NOW), \
+             mock.patch.object(build_queue, "user_zone", return_value=ZoneInfo("UTC")):
+            for arguments in ((), ("1",)):
+                with self.subTest(arguments=arguments):
+                    code, output, errors = self.invoke(reading, *arguments)
+                    self.assertEqual((code, errors), (0, ""))
+                    self.assertEqual(output.splitlines()[0], expected)
+                    data = self.snapshot(reading, *arguments)
+                    self.assertEqual(data["lines"][0], [{"text": expected, "tone": "error", "bold": True}])
+                    self.assertGreater(len(data["lines"]), 1)
+
+    def test_mac_idle_alert_read_does_not_mask_admission_failure(self) -> None:
+        _ = write_idle_alert(self.root / "mac-idle", NOW)
+        with mock.patch.object(memory_admit, "queue_read", side_effect=wire.AdmissionUnavailable("fixture unavailable")), \
+             mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(build_queue.main(), 2)
+        self.assertIn("admission service unavailable: fixture unavailable", errors.getvalue())
+
+    def test_stale_mac_reading_precedes_queue(self) -> None:
+        _ = write_idle_alert(self.root / "mac-idle", NOW, written_age=301)
+        with mock.patch.object(time, "time", return_value=NOW):
+            data = self.snapshot(head_reading(now=NOW))
+        first = data["lines"][0][0]
+        self.assertTrue(first["text"].startswith("MAC IDLE WATCH: no reading since "))
+        self.assertTrue(first["text"].endswith("; check buildlog-sample.timer."))
+        self.assertEqual(first.get("tone"), "error")
+
+    def test_alert_fixture_read_stays_local_and_finishes_under_50_ms(self) -> None:
+        from scripts.buildlog import mac_idle_alert
+
+        path = write_idle_alert(self.root / "mac-idle", NOW)
+        with mock.patch("subprocess.run", side_effect=AssertionError("alert read starts a process")):
+            started = time.perf_counter()
+            line = mac_idle_alert.alert_line(path, NOW, ZoneInfo("UTC"))
+            elapsed = time.perf_counter() - started
+        self.assertIsNotNone(line)
+        self.assertIn("Blocked by research", line or "")
+        self.assertLess(elapsed, 0.05)
 
 
     def test_expired_head_json_paints_the_same_sixty_column_error_as_inline(self) -> None:

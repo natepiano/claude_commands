@@ -43,7 +43,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: `module_seconds.json` keeps 728 keys for 664 test files; old `delegate/*` keys remain after the folder moved. Memory admission reads the peak file the same way.
   - Completion condition: send the showrunner a proposal to drop keys whose module file is gone, with the key counts.
   - Revealed by: plan research, 2026-11-03.
-- [ ] **The build log test suite finishes about 20 seconds sooner.**
+- [x] **The build log test suite finishes about 20 seconds sooner.** Taken by Phase 28 (2026-11-05): parallel starts, one process for each module.
   - Target: `scripts/buildlog/test_index.py` — `LogIsolationTests.test_each_module_uses_a_temporary_log`
   - Why needed: the test starts one Python process for each of the 33 `test_*.py` modules in `scripts/buildlog`: 24.5 s of the 34.8 s suite run at load 70 (11:24 EST, 2026-11-03). It is the slowest test in the index suite, and each new module adds one more process.
   - Completion condition: one process imports every module and reports each module's log root; the test keeps one assertion per module and takes under 3 s on an idle natedev.
@@ -58,6 +58,12 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: the gate's slowdown warning compares with a rolling median, which slowly accepts a slowdown as normal (Astra plan review, 2026-11-04).
   - Completion condition: each module a speed phase improved has its after median stored as a reference; a gate median 20% over it is reported at phase start.
   - Revealed by: Astra plan review; starts after Phase 14 lands (showrunner ruling 2026-11-04).
+- [ ] **Architecture proposal: `mac_run.sh` reads its config keys in one start**
+  - Target: `scripts/production/mac_run.sh` (recent owner: builds-resources)
+  - Why needed: `config_value()` starts `python3 conf.py get` once for each key. `test_mac_run.py` makes 339 such starts (23.5 s traced of a 49.5 s traced run); they set the Phase 29 floor.
+  - Completion condition: send the showrunner a proposal for one `conf.py` start that prints every key `mac_run.sh` needs, with the same validation; estimated gain 12-14 s on the module.
+  - Also: `mac_test.py` claim and release take 19.3 s in 35 starts (owner verify-unit); profile their imports before a proposal (estimated 3-6 s).
+  - Revealed by: Phase 29, 2026-11-05.
 - [ ] **Architecture proposal: one injected Git runner in fast_track.py**
   - Target: `scripts/production/fast_track.py` (owner: production) and `scripts/production/test_fast_track.py`
   - Why needed: the module's floor is 55 tests at about 3.5 s each of real Git work (Phase 7); the test file alone cannot go lower.
@@ -71,3 +77,4 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | --- | --- | --- | --- |
 | `direct/test_simplify_lens.py` | 118 | one real review-launcher run per test (3-6 s) | 6 |
 | `production/test_fast_track.py` | 193 | real Git work, about 3.5 s per test | 7 |
+| `production/test_mac_run.py` | 40.5 (load 40) | one `conf.py` start for each config key in `mac_run.sh` | 29 |

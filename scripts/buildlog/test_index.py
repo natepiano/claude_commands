@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,8 @@ TESTDATA = Path(__file__).with_name("testdata")
 STAMP = "2026-10-02T12:00:00.000Z"
 FIXTURE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS fixture_index ON steps (status)"
 SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
+# Eight workers overlap imports and limit the number of Python processes.
+ISOLATION_IMPORT_WORKERS = 8
 Record = dict[str, object]
 _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
@@ -53,10 +56,15 @@ COORDINATION_VARIABLES = (
 def use_test_log() -> None:
     os.environ["BUILDLOG_DIR"] = str(_TEST_ROOT)
     os.environ["BUILDLOG_TRANSCRIPTS"] = str(Path(_TEST_LOG.name) / "transcripts")
-    os.environ.update({name: str(_TEST_ROOT / name) for name in COORDINATION_VARIABLES})
 
 
 use_test_log()
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(mock.patch.dict(
+        os.environ, {name: str(_TEST_ROOT / name) for name in COORDINATION_VARIABLES},
+    ))
 
 
 def local_day(stamp: str) -> str:
@@ -207,28 +215,49 @@ def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]
 
 
 class LogIsolationTests(unittest.TestCase):
+    def test_import_preserves_the_callers_coordination_environment(self) -> None:
+        environment = dict(os.environ)
+        for name in COORDINATION_VARIABLES:
+            _ = environment.pop(name, None)
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import os, test_index; print({key: os.environ[key] "
+             + "for key in test_index.COORDINATION_VARIABLES if key in os.environ})"],
+            cwd=Path(__file__).parent, env=environment, capture_output=True, text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "{}")
+
     def test_each_module_uses_a_temporary_log(self) -> None:
         environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_DIR"}
         real_root = Path.home() / ".local/state/buildlog"
-        for module in sorted(Path(__file__).parent.glob("test_*.py")):
-            with self.subTest(module=module.name):
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        "import importlib, store, sys; sys.path.insert(0, sys.argv[2]); "
-                        + "importlib.import_module(sys.argv[1]); print(store.root())",
-                        module.stem,
-                        str(Path(__file__).resolve().parents[2]),
-                    ],
-                    cwd=module.parent,
-                    env=environment,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
+
+        def import_module(module: Path) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import importlib, store, sys; sys.path.insert(0, sys.argv[2]); "
+                    + "importlib.import_module(sys.argv[1]); print(store.root())",
+                    module.stem,
+                    str(Path(__file__).resolve().parents[2]),
+                ],
+                cwd=module.parent,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        modules = sorted(Path(__file__).parent.glob("test_*.py"))
+        with ThreadPoolExecutor(max_workers=ISOLATION_IMPORT_WORKERS) as pool:
+            futures = [(module, pool.submit(import_module, module)) for module in modules]
+            for module, future in futures:
+                with self.subTest(module=module.name):
+                    result = future.result()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotEqual(Path(result.stdout.strip()), real_root, module.name)
 
 
 def encode(record: Record) -> bytes:

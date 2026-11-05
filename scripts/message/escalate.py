@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from scripts.lib.process_failure import failure_detail
 from scripts.production.showrunners import load_settings
 from scripts.production import staff
-from scripts.message import send_budget
+from scripts.message import send_budget, session_send
 import push_texts
 import push_reference
 if TYPE_CHECKING:
@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
 STATE = Path(os.environ.get("ESCALATE_STATE_DIR")
              or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "escalate")
-SEND = Path(os.environ.get("ESCALATE_SEND") or Path(__file__).with_name("send.py"))
+SEND = Path(os.environ.get("ESCALATE_SEND") or session_send.SEND_SCRIPT)
 NOTIFIER = Path(os.environ.get("ESCALATE_NOTIFIER") or Path(__file__).with_name("notifier.sh"))
 PY = Path(__file__).resolve().parent.parent / "lib" / "py"
 JOB = "escalate"
@@ -454,8 +454,8 @@ def close(key: str) -> bool:
             return False
         if isinstance(held, HeldMessage) and held.outcome == "sent" and held.need == "blocked":
             try:
-                done = subprocess.run([sys.executable, str(SEND), "retire", "--to", "user", "--from", JOB,
-                                       "--key", user_key(key)], capture_output=True, text=True, check=False, timeout=60)
+                done = subprocess.run(session_send.send_argv("retire", "--to", "user", "--from", JOB,
+                                       "--key", user_key(key), send_script=SEND), capture_output=True, text=True, check=False, timeout=60)
                 problem = "" if done.returncode == 0 else (
                     failure_detail(done, lines=1)).replace("\n", "; ")
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -492,8 +492,8 @@ def _cancel_outgoing_codex_holds(home: Path, login: str) -> None:
                 label = held.owner.label if isinstance(held, HeldMessage) and isinstance(held.owner, KnownCodexAccount) else "Codex"
                 relays = tuple(HeldRelay(recipient=name, key=f"5-hour {label}") for name in dict.fromkeys(names))
             for relay in relays:
-                _ = subprocess.run([sys.executable, str(SEND), "retire", "--to", relay["recipient"],
-                                    "--from", "quota_alert", "--key", relay["key"]],
+                _ = subprocess.run(session_send.send_argv("retire", "--to", relay["recipient"],
+                                    "--from", "quota_alert", "--key", relay["key"], send_script=SEND),
                                    capture_output=True, text=True, check=False)
             path.unlink(missing_ok=True)
 
@@ -514,7 +514,7 @@ def deliver(held: HeldMessage, key: str) -> str:
     command = push_texts.user_send_argv(rendered, sender=JOB, key=user_key(key),
                                       self_clearing=held.need == "blocked",
                                       question=held.reference["path"] if held.reference["kind"] == "question" else "")
-    command[1] = str(SEND)
+    command = session_send.send_argv(*command[2:], send_script=SEND)
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=send_budget.user_seconds(review.user_send_seconds()))
     return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
@@ -530,9 +530,9 @@ def forward_review_hold(held: HeldMessage, reason: str, entry_key: str) -> list[
             relays.append(HeldRelay(recipient=recipient, key="review-held-" + entry_key))
     for relay in relays:
         try:
-            done = subprocess.run([sys.executable, str(SEND), "--to", relay["recipient"], "--from", JOB,
+            done = subprocess.run(session_send.send_argv("--to", relay["recipient"], "--from", JOB,
                                    "--key", relay["key"], "--summary", "Relayed push needs revision",
-                                   "--text", f"Your relayed push {held.summary!r} was not sent. {reason} Revise and resend it."],
+                                   "--text", f"Your relayed push {held.summary!r} was not sent. {reason} Revise and resend it.", send_script=SEND),
                                   capture_output=True, text=True, check=False, timeout=send_budget.seconds())
             if done.returncode not in (0, 1):
                 errors.append(f"{relay['recipient']}: {failure_detail(done)}")

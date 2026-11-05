@@ -30,6 +30,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/bevy_upgrade/migrate_bevy_watch.py` | read | operation, snapshot |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
+| `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
@@ -158,7 +159,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-144 accessors: 26 write, 117 read, 1 owner.
+145 accessors: 26 write, 118 read, 1 owner.
 
 ## Approved copies
 
