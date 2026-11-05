@@ -23,4 +23,3 @@
 **Files:** `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py`.
 
 **Constraint:** keep the incomplete-observation output and exit status of `staff.py show --json --live`.
-
