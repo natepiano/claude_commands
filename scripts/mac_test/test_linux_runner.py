@@ -307,6 +307,28 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(event["environment"]["BUILDLOG_SYNC"], "1")
         self.assertEqual(event["cwd"], str(self.mirror))
 
+    def test_linux_command_forwards_repository_identity_only_when_nonempty(self) -> None:
+        for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
+            with self.subTest(key=key):
+                self.identity = offload.KnownRepository("phase-copy", key)
+                arguments = shlex.split(self.command(self.request()))
+                if key:
+                    self.assertEqual(arguments.count("--repo-identity"), 1)
+                    self.assertEqual(arguments[arguments.index("--repo-identity") + 1], key)
+                else:
+                    self.assertNotIn("--repo-identity", arguments)
+
+    def test_linux_step_environment_omits_an_empty_repository_identity(self) -> None:
+        self.identity = offload.KnownRepository(self.identity.name)
+        mirror = self.root / offload.remote_mirror(self.identity, "aws", 2)
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.mirror.rename(mirror)
+        self.mirror = mirror
+
+        event = self.assert_ran(self.request())
+
+        self.assertNotIn("BUILDLOG_REPO_IDENTITY", event["environment"])
+
     def test_sigterm_prints_one_interruption_marker_and_preserves_the_child_status(self) -> None:
         self.environment["FAKE_LINT_STATUS"] = "143"
 
@@ -429,6 +451,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual(event["environment"].get("BUILDLOG_BUILD_BUDGET_GIB"), "32")
         self.assertEqual(event["environment"].get("LINT_SWEEP_BUDGET_GIB"), "31")
         self.assertEqual(event["environment"].get("BUILDLOG_SENT_TREE_KEY"), "sent-tree-key")
+        self.assertEqual(event["environment"].get("BUILDLOG_REPO_IDENTITY"), self.identity.key)
         self.assertEqual(event["environment"].get("BUILDLOG_CALL_ID"), "call with spaces")
         self.assertFalse((self.mirror / "INJECTION").exists())
 
