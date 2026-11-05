@@ -242,7 +242,7 @@ class SessionLaunchTests(ShutdownTestCase):
 
 
 class RecordedResumeTests(ShutdownTestCase):
-    folder: Path = Path("/tmp/recorded-resume")
+    folder: Path = Path("/tmp/recorded-resume").resolve()
 
     def entry(self, kind: Literal["claude", "codex"], model: str) -> pane_record.PaneLaunch:
         return {"kind": kind, "pane_id": "w1:p1", "session_id": "recorded-id",
@@ -270,8 +270,8 @@ class RecordedResumeTests(ShutdownTestCase):
         for model in ("", "codex-model"):
             with self.subTest(model=model):
                 arguments = self.resumed_arguments(self.entry("codex", model))
-                expected = ["-C", "/tmp/recorded-resume", "-c",
-                            'projects={"/tmp/recorded-resume"={trust_level="trusted"}}', "resume", "current-id"]
+                expected = ["-C", str(self.folder), "-c",
+                            'projects={' + json.dumps(str(self.folder)) + '={trust_level="trusted"}}', "resume", "current-id"]
                 if model:
                     expected.extend(("--model", model))
                 self.assertEqual(arguments, expected)
