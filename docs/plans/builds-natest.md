@@ -578,7 +578,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Binds later work:**
 - A test reads no identity from the real checkout. Patch `show.TOOL_REPOSITORY` to a fixture repository.
 
-### Phase 24 — `test_verify_ssh_targets_routing.py` runs in half its time  · status: todo
+### Phase 24 — `test_verify_ssh_targets_routing.py` runs in half its time  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -608,17 +608,17 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/build_targets/build_targets.py` — the light command entry point
 - `scripts/build_targets/target_config.py` — the moved name check
 - `scripts/mac_test/offload.py` — `configured_ssh_target` calls the moved name check
-- `scripts/build_targets/test_targets.py` — a test that `platform` loads no coordination module
+- `scripts/build_targets/test_targets.py` — always run; no new test (user rule 2026-11-05: a new check goes to the user first, with a reason; the two import tests were dropped)
 - `scripts/direct/step_record.py` — only if code step 3 runs
-- `scripts/direct/test_step_record.py` — only if code step 3 runs: a test that `state` loads only what it reads
-- `scripts/build_targets/test_build_targets.py` — always run; edit only if code step 3 runs: tests that `eligible` and `reserve` load only what they read
+- `scripts/direct/test_step_record.py` — only if code step 3 runs; no new test
+- `scripts/build_targets/test_build_targets.py` — always run; no new test
 
 **Workers:** 1 writer (one cross-module change; the files do not split)
 - `impl` — all files above
 
 **Constraints from prior phases:**
 - Phase 19: the module runs under the coverage collector with a mocked `subprocess.Popen`. Keep that working.
-- The import saving depends on resources' cut at `sweep.py`: today `offload` loads `memory_admit` through `sweep.py` -> `build_hold` -> `admission_service` (report-unit finding, showrunner 2026-11-05). Profile after that cut is on builds.
+- `build_targets.py` (line 142) and `targets.py:21` import `build_hold` directly, and `build_hold.py:40-46` imports `admission_service`, which imports `memory_admit` (`admission_service.py:28`). A cut at `sweep.py` alone does not remove `memory_admit` from `eligible`, `reserve`, `register-local`, `wait-local` or `check-local`; the module-level `admission_service` import in `build_hold.py` (owner: resources) is the cut (Phase 24 simplify review, 2026-11-05).
 - The verify remake added behavior this phase keeps: explicit configuration paths in `target_config.py`, `step_record.py write --clock-offset` (`step_record.py:56`), and `test_clean_target_import_loads_mac_test_once` (`test_build_targets.py:77`). Keep each one and every existing assertion.
 - `StepRecord.__init__` (`step_record.py:361`) still accepts `None` where `WorkspacePackages` names that meaning. If this phase changes that path, convert JSON null at the decoding boundary and keep the semantic package and target-selection types.
 - report-unit Phase 24 (2026-11-05) edits only `offload.py` `repository_identity` (now line 959). It does not touch `configured_ssh_target` or the `target_config` import. The second lander resolves the one-function overlap.
@@ -628,7 +628,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets_routing.py'` green, with the same test names and assertions
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - the checkpoint notice gives the measured module time before and after, and the cost of one `verify.sh` `target_platform` call before and after
-- a test proves that `build_targets.py platform` loads no coordination module
+- the cost of one `build_targets.py platform` start, measured before and after
 - existing tests that patch `build_targets` command dependencies stay green unchanged
 - `python3 -m unittest discover -s scripts/build_targets -p 'test_build_targets.py'` and `-p 'test_targets.py'` green
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
@@ -760,3 +760,38 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Binds later work:**
 - A shell reader of config gives the same value and exit as `conf.py get`, or gives the read to `conf.py`.
 - `review.sh`, `implement.sh` and `mac_run.sh` source `conf.sh`; a change to it runs their tests.
+
+### Phase 31 — `test_verify_lint_judgment.py` runs in half its time  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_verify_lint_judgment.py` (rank 3 at 210.4 s, 172.2 CPU s, 10 tests; the highest ranked module that no phase holds) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method. verify-unit owns `verify.sh`, `scripts/lint/` and the verify test support files; no open verify phase holds this module or its support files (showrunner, 2026-11-05). Rank 1 `test_verify_mac_only.py` waits on verify's hang fix in `verify_mac_offload_test_support.py`; rank 2 `agents/test_codex_mesh.py` stays excluded.
+
+1. Profile before any edit. Each `invoke_verify("lint", ...)` costs about 5.5-7 s; a test with one run costs about 3.6 s. Four tests hold 176 s of the 205 s: `test_compile_errors_and_unknown_101_repair_and_return_final_judgment` (10 subtests, 70.7 s), `test_first_judgment_nonlint_status_never_repairs` (11 subtests, 60.9 s), `test_fix_limit_is_read_from_config` (3 subtests, 25.5 s) and `test_lint_finding_repairs_formats_and_returns_final_judgment` (3 subtests, 19.4 s). For one `verify.sh lint` run in the fixture, name where the time goes: process starts, Python imports, config reads, admission or token waits, fixed sleeps, and the stub cargo. Check first whether a later run in one test waits on an admission spacing or a token the earlier run left, as in Phase 27. Write the result into this Spec and name the files and changes before the code step.
+   **Profile result (2026-11-05, load 28-58):** baseline 215.0 s wall, 160.7 CPU s, 33 `verify.sh lint` runs in 10 tests. The main cost is production process work in `verify.sh` and `scripts/lint/`: at least 36 Python starts for a no-repair run and 61 for a repair run. Step-record state writes (`verify.sh:356-358`, `verify.sh:1925-1934`) and admission client starts (`scripts/lint/memory_gate.sh:17-22`) hold most of it. A later run in one test waits about 2.0 s for admission start spacing (`recovery_start_seconds=5`); there is no token or hold wait and no fixed sleep. The route floor after a clock advance is 3.1 s with no repair and 5.2 s with repair, so half time (107.5 s) is under the floor of the production route.
+   **Code step:** the fixture does not advance the admission clock by hand. A manual `allow_next_start()` advance is a workaround (showrunner, 2026-11-05): queue-unit fixes the start spacing in the shared admission fixture, and this module is measured again after that fix. The fixture keeps one admission service lookup. `test_compile_errors_and_unknown_101_repair_and_return_final_judgment` runs each compile diagnostic once, with the final status alternating 0 and 101, so each diagnostic and each status stays checked. The repair decision has no callable home (`verify.sh:3711-3714`), so Spec step 4 does not apply. Three production proposals went to their owners: step-record state reuse (verify), a lighter admission client start (queue) and a callable repair decision (verify).
+2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
+3. A cut in `verify.sh`, `scripts/lint/*.sh` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase.
+4. A subtest table that checks a pure status or diagnostic rule may move to a direct test of that rule only when the rule has one callable home. Keep at least one end-to-end `verify.sh lint` run for each route: no repair, one repair, and the fix limit. Keep every test name, and keep each status and diagnostic case as a checked case.
+5. `verify_lint_cache_test_support.py` also serves `test_verify_lint_cache_versions.py`, `test_verify_lint_cache_mend.py`, `test_verify_lint_cache_token_loss.py`, `test_verify_python_starts.py`, `test_verify_token_renew.py` and `test_verify_verbs.py`. A change there keeps all of them green and measures each.
+
+**Files:**
+- `scripts/direct/test_verify_lint_judgment.py` — the module
+- `scripts/direct/verify_lint_cache_test_support.py` — only for a shared per-run cut the profile names
+
+**Workers:** 1 writer (one module and its fixture; the files do not split)
+- `impl` — all files above
+
+**Constraints from prior phases:**
+- Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
+- Phase 30: `conf.sh` reads the host name once when sourced and ignores inherited `HOSTNAME` and `HOST`; a change to it runs the `review.sh`, `implement.sh` and `mac_run.sh` tests.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `scripts/direct/test_verify_lint_judgment.py` green, with the same test names and every case checked
+- each module in Spec step 5 green when the support file changes, with its before and after time in same-load pairs
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
