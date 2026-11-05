@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import live_units
 from scripts.production import proposal_issue
 import style_units
-import style_ledger
+from scripts.style import style_ledger
 import unit_lookup
 import display_cells
 from scripts.herdr.herdr import HerdrPlace

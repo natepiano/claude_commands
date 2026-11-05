@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import hashlib
 import json
@@ -13,18 +13,18 @@ from collections.abc import Callable
 from contextlib import closing
 from typing import cast, final
 from unittest import mock
-import style_ledger
-import rules
-from approved_renames import AppliedInCode, Folder, NoAppliedCheck, NoOuterBindingBlock, RenameNotApplied
-import declarations
+from scripts.style import style_ledger
+from scripts.style import rules
+from scripts.style.approved_renames import AppliedInCode, Folder, NoAppliedCheck, NoOuterBindingBlock, RenameNotApplied
+from scripts.style import declarations
 
-from ledger_test_support import (remove_generation_schema, LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT, style_unit_id)
+from scripts.style.ledger_test_support import (remove_generation_schema, LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT, style_unit_id)
 
 
 @final
 class StyleLedgerFindingsTests(LedgerTestCase):
     def test_current_parameters_control_every_ledger_built_boundary(self) -> None:
-        from test_approved_renames import PARAMETER_CHANGES
+        from scripts.style.test_approved_renames import PARAMETER_CHANGES
         for label, source, current, blocked in PARAMETER_CHANGES:
             for boundary in ("ticket_merge", "mark_built", "mark_built_at_merge"):
                 for clear_base in (False, True):
@@ -90,7 +90,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                             case.doCleanups()
 
     def test_bulk_release_records_only_current_parameter_blockers(self) -> None:
-        from test_approved_renames import PARAMETER_CHANGES
+        from scripts.style.test_approved_renames import PARAMETER_CHANGES
         for label, source, current, blocked in PARAMETER_CHANGES:
             with self.subTest(parameter=label):
                 case = StyleLedgerFindingsTests()
@@ -120,7 +120,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     case.doCleanups()
 
     def test_unread_local_body_refuses_every_built_boundary_after_a_signature_change(self) -> None:
-        from test_approved_renames import UNREAD_LOCAL_BODIES
+        from scripts.style.test_approved_renames import UNREAD_LOCAL_BODIES
         for label, source in UNREAD_LOCAL_BODIES:
             for clear_base in (False, True):
                 with self.subTest(body=label, clear_base=clear_base):
@@ -135,7 +135,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                         case.doCleanups()
 
     def test_proved_item_with_unread_body_passes_every_built_boundary(self) -> None:
-        from test_approved_renames import UNREAD_ITEM_BODIES
+        from scripts.style.test_approved_renames import UNREAD_ITEM_BODIES
         for label, source in UNREAD_ITEM_BODIES:
             with self.subTest(body=label):
                 case = StyleLedgerFindingsTests()
@@ -169,7 +169,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     case.doCleanups()
 
     def test_generic_parameters_refuse_every_built_boundary(self) -> None:
-        from test_approved_renames import GENERIC_PARAMETER_BINDINGS
+        from scripts.style.test_approved_renames import GENERIC_PARAMETER_BINDINGS
         self.assert_local_declarations_refuse_every_built_boundary(GENERIC_PARAMETER_BINDINGS)
         case = StyleLedgerFindingsTests()
         case.setUp()
@@ -218,11 +218,11 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     case.doCleanups()
 
     def test_nested_field_expression_bindings_refuse_every_built_boundary(self) -> None:
-        from test_approved_renames import FIELD_EXPRESSION_BINDINGS
+        from scripts.style.test_approved_renames import FIELD_EXPRESSION_BINDINGS
         self.assert_local_declarations_refuse_every_built_boundary(FIELD_EXPRESSION_BINDINGS)
 
     def assert_a_true_field_keeps_its_nonlocal_build_path(self) -> None:
-        from test_approved_renames import TRUE_FIELD_BINDING
+        from scripts.style.test_approved_renames import TRUE_FIELD_BINDING
         self.assert_nonlocal_declaration_builds(TRUE_FIELD_BINDING, 2)
 
     def assert_nonlocal_declaration_builds(self, source: str, line: int) -> None:
@@ -255,7 +255,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(ledger.database.read_bytes(), before)
 
     def test_authoritative_anchor_matrix_at_every_built_boundary(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         original = IDENTICAL_BINDING_ITEMS
         changed = original.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
         reordered = changed[changed.index("fn second"):]+changed[:changed.index("fn second")]
@@ -339,25 +339,25 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertIsInstance(ledger.proposal_findings(issue)[0].state, style_ledger.Built)
 
     def test_identical_sibling_cannot_satisfy_current_admission_with_a_saved_base(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         self.assert_outer_scope_refuses_built(
             IDENTICAL_BINDING_ITEMS, 2, "rename blocked by outer binding 'checkout_info' at line 1",
             edited=IDENTICAL_BINDING_ITEMS.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1))
 
     def test_identical_sibling_cannot_satisfy_current_admission_without_a_saved_base(self) -> None:
-        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        from scripts.style.test_approved_renames import IDENTICAL_BINDING_ITEMS
         self.assert_outer_scope_refuses_built(
             IDENTICAL_BINDING_ITEMS, 2, "rename blocked by outer binding 'checkout_info' at line 1", clear_base=True,
             edited=IDENTICAL_BINDING_ITEMS.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1))
 
     def test_duplicate_item_path_refuses_every_built_boundary(self) -> None:
-        from test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
+        from scripts.style.test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
         self.assert_outer_scope_refuses_built(
             DUPLICATE_BINDING_ITEM_PATH, 2, "recorded item path is not unique in current source", unproved=True,
             edited=DUPLICATE_BINDING_ITEM_PATH.replace("|g| g", "|checkout_info| checkout_info", 1))
 
     def test_proven_capture_edits_build_at_each_built_boundary(self) -> None:
-        from test_approved_renames import CAPTURE_BINDING_ITEM
+        from scripts.style.test_approved_renames import CAPTURE_BINDING_ITEM
         for boundary in ("ticket_merge", "mark_built", "mark_built_at_merge"):
             with self.subTest(boundary=boundary):
                 case = StyleLedgerFindingsTests()
@@ -411,7 +411,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             edited="fn label(checkout_info: usize) {\n    map(|checkout_info| checkout_info + 1)\n}\n")
 
     def test_impl_and_trait_inner_attributes_refuse_every_built_boundary(self) -> None:
-        from test_approved_renames import INHERITED_INNER_ATTRIBUTES
+        from scripts.style.test_approved_renames import INHERITED_INNER_ATTRIBUTES
         for label, source in INHERITED_INNER_ATTRIBUTES:
             with self.subTest(scope=label):
                 case = StyleLedgerFindingsTests()
@@ -450,7 +450,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             "unresolved attribute macro 'inject' at line 1", unproved=True)
 
     def test_presence_refusals_persist_reopen_and_cannot_be_marked_built(self) -> None:
-        from test_approved_renames import PRESENCE_REFUSALS
+        from scripts.style.test_approved_renames import PRESENCE_REFUSALS
         for label, source, line, expected in PRESENCE_REFUSALS:
             with self.subTest(form=label):
                 # Each row uses a separate test fixture, with the existing ticket setup.

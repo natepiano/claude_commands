@@ -178,6 +178,41 @@ class QueueEvidenceTests(unittest.TestCase):
             f"MemAvailable: {gib(available) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         self.change_head(need=gib(need))
 
+    def test_unavailable_run_use_names_the_run_without_showing_an_anonymous_sum(self) -> None:
+        self.reset_running(available=20, need=8)
+        for pid, name in ((100, "merge-holder"), (101, "other-holder")):
+            path = self.running(pid, name, "merge-gate", 6, 4, 180)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            row["sidecar"] = ""
+            row["reservation_id"] = name
+            _ = path.write_text(json.dumps(row))
+            _ = (self.proc / str(pid) / "status").write_text("VmRSS: 4194304 kB\nVmSwap: 1048576 kB\n")
+        status = self.proc / "100/status"
+        read_text = Path.read_text
+        for denied in (False, True):
+            with self.subTest(denied=denied):
+                _ = status.write_text("VmRSS: 4194304 kB\nVmSwap: 1048576 kB\n")
+
+                def read_private(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if denied and path == status:
+                        raise PermissionError(13, "Permission denied", str(path))
+                    return read_text(path, encoding=encoding, errors=errors)
+
+                with mock.patch.object(Path, "read_text", read_private):
+                    captured = fixture_queue_read(self.directory, gate.process_table(self.proc), NOW)
+                room = captured.explanation.room
+                assert isinstance(room, gate.MemoryRoom)
+                self.assertIsInstance(room.cap, gate.CapUnavailable)
+                text = queue_evidence.room_text(room)
+                self.assertIn("unavailable", text)
+                self.assertIn("merge-holder", text)
+                self.assertEqual(text.count("merge-holder"), 1)
+                self.assertEqual(text.count("other-holder"), 1)
+                self.assertEqual(text.count("anonymous use unavailable"), 1)
+                self.assertNotIn("anonymous use 0.0", text)
+                self.assertNotIn("anonymous use 4.0", text)
+                self.assertIn("room", text)
+
     def test_pressure_formatters_keep_the_recorded_hold_condition(self) -> None:
         pressure_path = self.root / "pressure"
         for full, some, swap, detail in (

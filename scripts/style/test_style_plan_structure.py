@@ -2,26 +2,23 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import io
-import sys
 import unittest
 from contextlib import redirect_stdout
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
-import unit_plans
+from scripts.style import style_plan
+from scripts.style import unit_plans
 
-import berth_board
-import rules
-import style_ledger
+from scripts.lib import berth_board
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from scripts.style.style_plan_test_support import StylePlanFixture
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 

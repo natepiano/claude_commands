@@ -16,35 +16,20 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
+from typing import Literal, NotRequired, TypedDict, cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, config_environment
-else:
-    from scripts.lint.memory_test_support import write_config_fixture, config_environment
+from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 from scripts.mac_test import offload, mac_test
+from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lib.process_group import send_process_group
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lib.process_group import send_process_group
-
-if TYPE_CHECKING:
-    from ..production.cli_fixture import invoke_cli
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-    from scripts.production.cli_fixture import invoke_cli
+from scripts.lib import test_hang_guard
+from scripts.lib.process_group import send_process_group
+from scripts.production.cli_fixture import invoke_cli
 
 SCRIPT = Path(__file__).with_name("offload.py")
 
@@ -116,9 +101,11 @@ class RemoteClaimRecord(TypedDict):
 
 HANA = offload.KnownRepository("hana")
 
-HANA_COMMAND_PATTERN = "[.]local/state/mac-test/mirror/hana([/'\"[:space:]]|$)"
+FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
 
-HANA_CWD_PATTERN = "^n.*/[.]local/state/mac-test/mirror/hana(/|$)"
+HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
+
+HANA_CWD_PATTERN = "^n.*/" + offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana(/|$)"
 
 CLAIM_STUB = r'''
 from __future__ import annotations
@@ -575,7 +562,7 @@ raise SystemExit(offload.main())
         self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
         self.assertNotIn("pkill", remote)
         self.assertNotIn("PIPESTATUS", remote)
-        self.assertNotIn(".local/state/mac-test/mirror/", remote.replace("[.]local/state/mac-test/mirror/", ""))
+        self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/", ""))
 
     def remote_claim(self) -> RemoteClaimRecord:
         return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))

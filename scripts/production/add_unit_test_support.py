@@ -35,11 +35,11 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
+from scripts.production import add_unit
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.message import sessions
 import inventory
 import restart
@@ -597,7 +597,7 @@ class AddUnitTestCase(ShutdownTestCase):
                          "script = sys.argv.pop(1)\n"
                          "with private_process_registry():\n"
                          "    runpy.run_path(script, run_name='__main__')\n")
-            return subprocess.run([sys.executable, "-c", bootstrap, str(SCRIPT), *arguments],
+            return subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", bootstrap, str(SCRIPT), *arguments],
                                   env=self.env, capture_output=True, text=True,
                                   timeout=timeout, check=False)
         return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,

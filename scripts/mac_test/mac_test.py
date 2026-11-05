@@ -20,37 +20,21 @@ import sys
 import tempfile
 import time
 import threading
-from typing import TYPE_CHECKING, Literal, NotRequired, TypeGuard, TypedDict, cast
+from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from scripts.build_hold import override_guard
 from scripts.build_hold import build_hold
 from scripts.mac_test import offload
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-    from ..build_targets import target_config
-    from ..build_targets.target_config import ConfigError
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start as process_identity
-    from scripts.build_targets import target_config
-    from scripts.build_targets.target_config import ConfigError
-
-
-if TYPE_CHECKING:
-    from ..buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
-
+from scripts.message import session_send
+from scripts.lib import process_start as process_identity
+from scripts.build_targets import target_config
+from scripts.build_targets.target_config import ConfigError
+from scripts.buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -1091,25 +1075,12 @@ def send_message(
     repeat_minutes: float,
     text: str,
 ) -> bool:
-    send_script = message_script("MAC_TEST_SEND", "send.py")
+    send_script = Path(os.environ.get("MAC_TEST_SEND", str(session_send.SEND_SCRIPT))).expanduser()
     try:
         result = subprocess.run(
-            [
-                str(Path(__file__).resolve().parents[1] / "lib/py"),
-                str(send_script),
-                "--to",
-                target,
-                "--from",
-                "mac-test",
-                "--summary",
-                summary,
-                "--key",
-                key,
-                "--repeat-minutes",
-                f"{repeat_minutes:g}",
-                "--text",
-                text,
-            ],
+            session_send.send_argv("--to", target, "--from", "mac-test", "--summary", summary,
+                                   "--key", key, "--repeat-minutes", f"{repeat_minutes:g}",
+                                   "--text", text, send_script=send_script),
             capture_output=True,
             text=True,
             check=False,

@@ -17,12 +17,11 @@ from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 
 from scripts.notify import gpu_xid
 from scripts.notify import push_texts
+from scripts.message import session_send
 from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
@@ -171,6 +170,19 @@ class PushTextTests(unittest.TestCase):
         argv = push_texts.user_send_argv(push, question="/tmp/question-layout.md")
         self.assertEqual(argv[argv.index("--question") + 1], "/tmp/question-layout.md")
 
+    def test_user_commands_use_the_current_sender_and_preserve_an_explicit_override(self) -> None:
+        entry = self.entry()
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        with tempfile.TemporaryDirectory() as folder:
+            current, override = Path(folder) / "current.py", Path(folder) / "override.py"
+            with mock.patch.object(session_send, "SEND_SCRIPT", current):
+                default = push_texts.user_send_argv(push)
+                explicit = push_texts.user_send_argv(push, send_script=override)
+                retired = push_texts.user_retire_argv("sender", "held")
+        self.assertEqual(default[:2], [sys.executable, str(current)])
+        self.assertEqual(explicit, [sys.executable, str(override), *default[2:]])
+        self.assertEqual(retired, [sys.executable, str(current), "retire", "--to", "user", "--from", "sender", "--key", "held"])
+
     def test_decision_choices_builds_the_approved_rows_and_keeps_structured_values(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         push = push_texts.render_entry(entry, entry.examples[0].values)
@@ -257,7 +269,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_reports_known_codes_without_extra_output(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
             with self.subTest(xid=code):
-                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, meaning + "\n")
@@ -266,7 +278,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_refuses_unknown_codes_on_one_line(self) -> None:
         for code, shown in (("999", "'999'"), ("999\nsecond line", "'999\\nsecond line'")):
             with self.subTest(code=code):
-                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")

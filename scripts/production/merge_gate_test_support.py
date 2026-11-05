@@ -17,7 +17,6 @@ from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
@@ -413,7 +412,8 @@ class MergeGateFixture(unittest.TestCase):
 
     def occupy_memory_queue(self) -> wire.Admitted:
         request = self.admission.request(need=21 * memory_admit.GIB, step="build")
-        return only_admitted(self.admission.server.handle_request(request))
+        with self.admission.loop_turn():
+            return only_admitted(self.admission.server.handle_request(request))
 
     def assert_gate_released(self) -> None:
         self.assertEqual(self.admission.server.reservations, {})
@@ -565,7 +565,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def run_promote_only(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
+            [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
              "--promote-only", "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh")], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)

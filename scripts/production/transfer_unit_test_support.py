@@ -6,14 +6,12 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import fake_herdr
 from scripts.production import showrunners
@@ -22,7 +20,7 @@ from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-import transfer_unit
+from scripts.production import transfer_unit
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 
@@ -74,6 +72,7 @@ class UnitTransferFixture(StaffTestCase):
                    "TARGET=session:cc9c5b71-6f71-5499-a4bb-e6ad5d02930d\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
                    str(self.receiving / "docs/plans/other-production.md")]) + "\n")
         for module, name, value in (
+            (showrunners, "SEND", self.root / "fake_send.py"),
             (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
             (showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),

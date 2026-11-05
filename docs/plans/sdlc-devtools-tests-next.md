@@ -28,7 +28,12 @@
   - Completion condition: the field is deleted; resume output is unchanged for every caller.
   - Revealed by: models-unit Phase 3s simplify lens (sdlc [89f9ddb9]): do it in the next phase that touches `resume_worker_command`; leave 3t 738d508a3 as is.
 - [ ] **Cut the Git process starts in fast_track and the copies refresh**
-  - Target: `scripts/direct/fast_track.py` (`reconcile` and its Git calls), `scripts/direct/test_fast_track.py`, `scripts/copies/copies.py` (remote refresh).
+  - Target: `scripts/production/fast_track.py` (`reconcile` and its Git calls), `scripts/production/test_fast_track.py`, `scripts/copies/copies.py` (remote refresh).
   - Why needed: build speed is a top priority. The natest P33 profile measured: `test_fast_track.py` drives 2937 Git calls in `fast_track.py` (27.6 s). `reconcile` repeats `rev-parse` (898), `update-ref` (777) and `cat-file` (283). The `copies.py` remote refresh makes 403 fetches (870 calls, 10.1 s).
   - Completion condition: one injected Git runner serves `fast_track.py`, so tests start fewer processes. `reconcile` reads each ref and object once. The remote refresh fetches each remote once. Fewer measured Git calls and less time in a new profile. Add no check.
   - Revealed by: builds natest P33 profile (sdlc [125256f1]); after 3t/3y.
+- [ ] **Delete the move-conductor env copy in fast_track**
+  - Target: `scripts/production/fast_track.py:421` (the `PYTHONUNBUFFERED`, `REFUSAL_WATCH_INVENTORY`, `STAFF_OPERATION_FD` filter).
+  - Why needed: the filter is a copy of the three move-conductor env names, a work-around. `stop_resume._pane_command` is the one place.
+  - Completion condition: the filter is deleted; the fast-track check environment comes from `os.environ` as is; the fast_track tests pass.
+  - Revealed by: sdlc [24514b9d]; after shutdown's env-leak fix 1d06ff2f0 lands (after 3y).

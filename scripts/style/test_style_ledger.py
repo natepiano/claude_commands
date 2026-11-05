@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import unittest
 import fcntl
@@ -20,19 +20,19 @@ from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from typing import IO, cast, final
 from unittest import mock
-import rules
-import style_ledger
-from approved_renames import AppliedInCode
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.approved_renames import AppliedInCode
 
 
-from ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE, style_unit_id)
+from scripts.style.ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE, style_unit_id)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
     def test_path_attributes_classify_meta_roles_and_nested_cfg_attr_payloads(self) -> None:
-        from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
+        from scripts.style.style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
         data = ('#[cfg(path = "predicate.rs")] fn f() {} '
                 '#[cfg_attr(path = "predicate.rs", allow(dead_code))] fn g() {} '
                 '#[custom(path = "argument.rs")] fn h() {} '

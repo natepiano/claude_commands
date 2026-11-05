@@ -5,14 +5,12 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner
@@ -31,7 +29,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         from scripts.production import live_units, unit_lookup
 
         fixture = self.row_production()
-        every = unit_lookup.LabeledProductions({}, {}, {fixture.slug: ("member",)})
+        every = unit_lookup.LabeledProductions({}, {fixture.slug: ("member",)})
         unavailable = fixture.worktree.with_name("unavailable-member")
         for failure in ("branch", "configuration"):
             with self.subTest(failure=failure):
@@ -55,7 +53,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         from scripts.production import live_units, session_staff
 
         fixture = self.row_production()
-        every = session_staff.LabeledProductions({}, {}, {fixture.slug: ("member",)})
+        every = session_staff.LabeledProductions({}, {fixture.slug: ("member",)})
         before = self.staff_file.read_bytes()
         selected = live_units.units_in(fixture.doc, every)
         self.assertEqual([unit.unit for unit in selected], ["member-unit"])
@@ -130,7 +128,7 @@ class LiveUnitsTests(unittest.TestCase):
             "messagingSocketPath": str(path), "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *(arguments or ("--production", str(self.doc)))],
+        return subprocess.run([str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT), *(arguments or ("--production", str(self.doc)))],
                               env=self.environment, capture_output=True, text=True, check=False)
 
     def test_offline_staff_unit_is_listed_without_a_worktree(self) -> None:
@@ -181,7 +179,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.members("alpha")
         self.hosts({"$1": marked("alpha-label", "w41:p1", "alpha")})
         listed = self.run_script()
-        target = subprocess.run([sys.executable, str(SCRIPT.with_name("unit_lookup.py")),
+        target = subprocess.run([str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT.with_name("unit_lookup.py")),
                                  "pane", "show", "alpha"], env=self.environment,
                                 capture_output=True, text=True, check=False)
         self.assertEqual((listed.returncode, target.returncode), (0, 0), listed.stderr + target.stderr)

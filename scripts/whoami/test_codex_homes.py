@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import asyncio
 import base64
 import json
@@ -14,18 +13,18 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import cast, override
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.note_file import note_name
 from scripts.accounts import accounts, role_map
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production import showrunners
 
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 from scripts.whoami import usage_store
-import whoami
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (
     CheckedNamedClaudeAccount,
     ClaudeAccountsInUse,
@@ -505,6 +504,19 @@ class CodexHomesTests(unittest.TestCase):
             _ = await server.request(1, "initialize", {})
         with self.assertRaises(agent_accounts.CodexServerClosed):
             asyncio.run(request())
+
+    def test_server_close_reads_the_account_timeout(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        _ = config.write_text(config.read_text().replace("codex_close_timeout_seconds=3", "codex_close_timeout_seconds=7"))
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = None
+        server = agent_accounts.CodexServer(process)
+        with patch.object(asyncio, "wait_for", wraps=asyncio.wait_for) as wait:
+            asyncio.run(server.close())
+        cast(MagicMock, process.terminate).assert_called_once_with()
+        cast(AsyncMock, process.wait).assert_awaited_once_with()
+        self.assertEqual(wait.call_args.kwargs["timeout"], 7)
+        cast(MagicMock, process.kill).assert_not_called()
 
     def test_home_preparation_stops_at_its_limit_with_the_home_and_reason(self) -> None:
         home = self.home / ".codex1"

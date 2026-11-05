@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Notify standing style productions and record workspace lint coverage."""
 
 from __future__ import annotations
@@ -16,28 +16,23 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders
 from types import FrameType, MappingProxyType
 from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "lib"))
-import process_group
+from scripts.lib import process_group
 
-from add_style import NoStyleProduction, standing_style_production
+from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
 from scripts.copies import copies
-from scripts.message import send_result
-from scripts.message import send_budget
+from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners, unit_names
-import style_ledger
+from scripts.style import style_ledger
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import scratch
 
 PYTHON = SCRIPTS / "lib/py"
-SEND = SCRIPTS / "message/send.py"
 SEND_SECONDS = 10
 ROSTER = SCRIPTS / "message/roster.py"
 SHOWRUNNERS = SCRIPTS / "production/showrunners.py"
@@ -82,7 +77,7 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
         caller_doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
         caller = showrunners.production_slug(str(caller_doc)) if caller_doc else "style_sync"
         sent = subprocess.run([
-            str(PYTHON), str(SEND), "--to", address.stdout.strip(), "--from", caller,
+            str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address.stdout.strip(), "--from", caller,
             "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
             "--key", f"style-sync:{standing.slug}",
             "--timeout", str(SEND_SECONDS),
@@ -423,7 +418,7 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
     if not address:
         raise Refusal(f"no address for {parent}")
     result = subprocess.run([
-        str(PYTHON), str(SEND), "--to", address, "--from", slug,
+        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", slug,
         "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
     ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
@@ -502,7 +497,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                 if len(addresses) != 1:
                     raise Refusal(f"{len(addresses)} directors")
                 result = subprocess.run([
-                    str(PYTHON), str(SEND), "--to", addresses[0], "--from", standing.slug,
+                    str(PYTHON), str(session_send.SEND_SCRIPT), "--to", addresses[0], "--from", standing.slug,
                     "--text", f"From the showrunner of {standing.slug}: ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS),
                 ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))

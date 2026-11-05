@@ -24,15 +24,15 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
-import unit_lookup
+from scripts.production import add_unit
+from scripts.production import unit_lookup
 from scripts.message import sessions
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, SHARED, RemoteControlDeadlineClock
+from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, SHARED, RemoteControlDeadlineClock
 
 
 LAUNCHED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -141,13 +141,12 @@ class AddUnitLaunchTests(AddUnitTestCase):
         script = self.root / "clocked_add_unit.py"
         _ = script.write_text(
             "import sys\nfrom datetime import datetime\nfrom unittest.mock import patch\n"
-            + f"sys.path.insert(0, {str(Path(add_unit.__file__).parent)!r})\n"
-            + "import add_unit\n"
+            + "from scripts.production import add_unit\n"
             + f"at = datetime.fromisoformat({LAUNCHED_AT.isoformat()!r})\n"
             + "with patch.object(add_unit, 'datetime', wraps=datetime) as clock:\n"
             + "    clock.now.side_effect = lambda zone: at.astimezone(zone)\n"
             + "    raise SystemExit(add_unit.main(sys.argv[1:]))\n", encoding="utf-8")
-        _ = self.enterContext(patch("add_unit_test_support.SCRIPT", script))
+        _ = self.enterContext(patch("scripts.production.add_unit_test_support.SCRIPT", script))
 
     def test_real_brief_admission_can_switch_to_its_approved_plan(self) -> None:
         _ = self.successful("alpha", "--brief", "Write a full plan.", subprocess_cli=True)

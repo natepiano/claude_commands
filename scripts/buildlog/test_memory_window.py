@@ -5,40 +5,26 @@ from __future__ import annotations
 
 
 
+import contextlib
 import json
 import os
 import socket
-import sqlite3
 import subprocess
-import sys
 import tempfile
-import threading
 import unittest
-from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
-from unittest.mock import MagicMock, call as mock_call, patch
+from typing import cast, override
+from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-    from ..lint.test_build_shape import create_step_index, record_root_attempt
-else:
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
-    from scripts.lint.test_build_shape import create_step_index, record_root_attempt
+from scripts.lint.memory_test_support import config_environment
 
-from scripts.buildlog import index
-from scripts.buildlog import memory
-from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+from scripts.buildlog import index, memory, store
+from scripts.lib import scratch
+from scripts.lint import sweep
 from scripts.buildlog.cgroup_test_support import CPU, GIB, IO_LINES, ZRAM_READING, slice_reading, write_cgroup, write_zram
-from scripts.buildlog import store
 from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 START = "2026-10-04T23:30-07:00"
@@ -50,6 +36,12 @@ END_UTC = "2026-10-05T07:30:00.000Z"
 def write_lint_config(root: Path, adjustment: int | str, *, include_adjustment: bool = True) -> Path:
     path = root / "lint.conf"
     _ = path.write_text(f"# whole: -1000..1000\nbuild_oom_score_adj={adjustment}\n" if include_adjustment else "clippy=on\n")
+    return path
+
+
+def cargo_output(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _ = (path / sweep.RUSTC_INFO).write_text("{}")
     return path
 
 
@@ -171,13 +163,6 @@ class MemoryWindowTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
-    def index_output_roots(self, *roots: Path) -> None:
-        self.write(store.root() / "natedev" / "output-roots.jsonl", *(
-            step(f"output-root-{number}", target_directory=str(root), build_directory=str(root), cwd="", worktree="")
-            for number, root in enumerate(roots)
-        ))
-        _ = index.update()
-
     def stub_journal(self, *, early: list[Record] | None = None,
                      kernel: list[Record] | None = None, exit_code: int = 0) -> None:
         default_early = journal_entry(datetime.fromisoformat("2026-10-05T06:59:00+00:00"),
@@ -207,12 +192,12 @@ class MemoryWindowTests(unittest.TestCase):
             return memory.earlyoom_kills(datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC))
 
     def test_earlyoom_reader_classifies_gate_target_programs_and_other_kills(self) -> None:
-        self.index_output_roots(Path("/work/hana/target"))
+        target = cargo_output(self.base / "cargo-output")
         at = datetime.fromisoformat(START_UTC)
         messages = [
             earlyoom_message(101, cmdline="/usr/bin/rustc --crate-name hana"),
             earlyoom_message(102, command="hana-test", signal="SIGKILL", adj=200,
-                             cmdline="/work/hana/target/debug/deps/hana-abc --test"),
+                             cmdline=f"{target}/debug/deps/hana-abc --test"),
             earlyoom_message(103, command="python", adj=200,
                              cmdline="/usr/bin/python /work/target/debug/helper"),
             earlyoom_message(104, command="legacy", adj=None),
@@ -235,7 +220,7 @@ class MemoryWindowTests(unittest.TestCase):
                          [500, 200, 200, memory.OomScoreAdjUnavailable.VALUE])
         self.assertEqual([kill.is_build for kill in kills], [True, True, False, False])
         self.assertEqual([kill.outside_build_gate for kill in kills], [False, True, False, False])
-        self.assertEqual(kills[1].cmdline, "/work/hana/target/debug/deps/hana-abc --test")
+        self.assertEqual(kills[1].cmdline, f"{target}/debug/deps/hana-abc --test")
         self.assertIs(kills[3].cmdline, memory.CmdlineUnavailable.VALUE)
 
     def test_earlyoom_unavailable_is_distinct_from_an_empty_journal_and_mac_never_reads_it(self) -> None:
@@ -250,40 +235,17 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual((self.base / "journal-args.jsonl").read_bytes(), before)
 
     def test_target_program_with_unquoted_apostrophe_arguments_is_a_build_kill(self) -> None:
-        self.index_output_roots(Path("/work/hana/target"))
+        target = cargo_output(self.base / "cargo-output")
         at = datetime.fromisoformat(START_UTC)
         self.stub_journal(early=[journal_entry(at, earlyoom_message(
-            105, adj=200, cmdline="/work/hana/target/debug/deps/test-abc --case O'Reilly"))], kernel=[])
+            105, adj=200, cmdline=f"{target}/debug/deps/test-abc --case O'Reilly"))], kernel=[])
         kills = self.earlyoom()
         if not isinstance(kills, list):
             self.fail("the fixture journal was unavailable")
         self.assertEqual(len(kills), 1)
         self.assertTrue(kills[0].is_build)
         self.assertTrue(kills[0].outside_build_gate)
-        self.assertEqual(kills[0].cmdline, "/work/hana/target/debug/deps/test-abc --case O'Reilly")
-
-    def test_kill_classification_reads_index_and_metadata_once_for_the_process(self) -> None:
-        indexed = self.base / "indexed-output"
-        self.index_output_roots(indexed)
-        _ = (self.base / "Cargo.toml").write_text("[workspace]\n")
-        outputs = CargoOutputRoots(self.base, self.base / "artifacts", self.base / "intermediates")
-        at = datetime.fromisoformat(START_UTC)
-        self.stub_journal(early=[journal_entry(at, earlyoom_message(pid, adj=200, cmdline=str(program)))
-            for pid, program in enumerate((indexed / "app", outputs.build_directory / "test",
-                                           self.base / "target/unrelated"), start=100)], kernel=[])
-        with (
-            patch.object(Path, "cwd", return_value=self.base),
-            patch.object(memory, "read_cargo_output_roots", return_value=outputs) as metadata,
-            patch.object(sqlite3, "connect", wraps=sqlite3.connect) as connections,
-        ):
-            for _ in range(2):
-                kills = self.earlyoom()
-                if not isinstance(kills, list):
-                    self.fail("the fixture journal was unavailable")
-                self.assertEqual([kill.is_build for kill in kills], [True, True, False])
-                self.assertEqual([kill.outside_build_gate for kill in kills], [True, True, False])
-            self.assertEqual(metadata.call_count, 1)
-            self.assertEqual(connections.call_count, 1)
+        self.assertEqual(kills[0].cmdline, f"{target}/debug/deps/test-abc --case O'Reilly")
 
     def test_snapshot_cli_prints_and_appends_exactly_one_record_from_fake_cgroups(self) -> None:
         builds = self.base / "builds.slice"
@@ -780,143 +742,63 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertNotIn("no new high in the window", result.stdout)
 
 
-class BuildOutputRootsTests(unittest.TestCase):
+class BuildOutputProgramTests(unittest.TestCase):
     base: Path = Path()
-    current: Path = Path()
-    index_file: Path = Path()
 
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.current = self.checkout("current")
-        self.index_file = self.base / "steps.sqlite"
-        memory.build_output_roots.cache_clear()
-        self.addCleanup(memory.build_output_roots.cache_clear)
-        create_step_index(self.index_file)
 
-    def checkout(self, name: str) -> Path:
-        path = self.base / name
-        path.mkdir()
-        _ = (path / "Cargo.toml").write_text("[workspace]\n")
-        return path
+    def test_rustc_marker_identifies_an_unrecorded_build_program(self) -> None:
+        target = cargo_output(self.base / "unrecorded-output")
+        self.assertTrue(memory.build_output_program(str(target / "debug/deps/test")))
 
-    def recorded_step(self, target: str, build: str, *, worktree: str = "", cwd: str = "",
-                      host: str = "natedev", argv: tuple[str, ...] = ("cargo", "check")) -> None:
-        record_root_attempt(self.index_file, worktree, target, build, cwd=cwd, host=host, argv=argv)
+    def test_cargo_cache_tag_with_a_build_tree_identifies_a_build_program(self) -> None:
+        target = self.base / "tagged-output"
+        (target / "debug/.fingerprint").mkdir(parents=True)
+        scratch.mark_cargo_cache(target)
+        self.assertTrue(memory.build_output_program(str(target / "debug/deps/test")))
 
-    def probe(self, side_effect: Callable[[Path], CargoOutputRoots | CargoOutputUnavailable] | Exception,
-              index_file: Path | None = None) -> tuple[frozenset[Path], MagicMock]:
-        with patch.object(memory, "read_cargo_output_roots", side_effect=side_effect) as metadata:
-            roots = memory.build_output_roots(index_file if index_file is not None else self.index_file,
-                                             self.current, "natedev")
-        return roots, metadata
+    def test_cache_tag_without_a_build_tree_is_not_a_build_program(self) -> None:
+        registry = self.base / "registry"
+        scratch.mark_cargo_cache(registry)
+        self.assertFalse(memory.build_output_program(str(registry / "tool")))
 
-    def build_roots(self, outputs: Mapping[Path, CargoOutputRoots],
-                    index_file: Path | None = None) -> tuple[frozenset[Path], MagicMock]:
-        def read(checkout: Path) -> CargoOutputRoots | CargoOutputUnavailable:
-            return outputs.get(checkout, CargoOutputUnavailable("fixture"))
+    def test_plain_folder_does_not_identify_a_build_program(self) -> None:
+        plain = self.base / "target/debug"
+        plain.mkdir(parents=True)
+        self.assertFalse(memory.build_output_program(str(plain / "app")))
 
-        return self.probe(read, index_file)
+    def test_relative_program_does_not_identify_a_build(self) -> None:
+        target = cargo_output(self.base / "target")
+        self.enterContext(contextlib.chdir(self.base))
+        self.assertFalse(memory.build_output_program(str((target / "debug/app").relative_to(self.base))))
 
-    def configure_workers(self, workers: int) -> None:
-        environment = config_environment(self.base / "config")
-        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "buildlog.conf",
-                                 f"METADATA_PROBE_WORKERS={workers}\n")
-        _ = cast(Mapping[str, str], self.enterContext(patch.dict(os.environ, environment)))
+    def test_program_symlink_uses_the_resolved_cargo_folder(self) -> None:
+        target = cargo_output(self.base / "output")
+        alias = self.base / "app"
+        alias.symlink_to(target / "debug/app")
+        self.assertTrue(memory.build_output_program(str(alias)))
 
-    def probes_meet(self, workers: int, *, timeout: float) -> frozenset[Path]:
-        recorded = self.checkout("recorded")
-        self.recorded_step("", "", worktree=str(recorded))
-        self.configure_workers(workers)
-        together = threading.Barrier(2, timeout=timeout)
+    def test_removed_cargo_folder_does_not_keep_its_build_class(self) -> None:
+        target = cargo_output(self.base / "removed-output")
+        marker = target / sweep.RUSTC_INFO
+        program = str(target / "debug/app")
+        self.assertTrue(memory.build_output_program(program))
+        marker.unlink()
+        target.rmdir()
+        self.assertFalse(memory.build_output_program(program))
 
-        def read(checkout: Path) -> CargoOutputRoots:
-            _ = together.wait()
-            return CargoOutputRoots(checkout, checkout / "target", checkout / "build")
-
-        return self.probe(read)[0]
-
-    def test_recorded_pair_resolves_paths_and_uses_one_workspace(self) -> None:
-        workspace = self.checkout("recorded")
-        outside = self.checkout("outside")
-        target = self.base / "target"
-        alias = self.base / "target-alias"
-        alias.symlink_to(target)
-        build = self.base / "build"
-        self.recorded_step(str(alias), str(build), worktree=str(workspace), cwd=str(outside))
-        roots, metadata = self.build_roots({})
-        self.assertEqual(roots, frozenset((target, build)))
-        self.assertCountEqual(metadata.call_args_list, [mock_call(self.current), mock_call(workspace)])
-
-    def test_incomplete_pairs_keep_absolute_sides_without_a_workspace(self) -> None:
-        target = self.base / "target"
-        build = self.base / "build"
-        orphan = self.base / "orphan"
-        self.recorded_step(str(target), store.UNKNOWN_IDENTITY)
-        self.recorded_step("relative-target", str(build))
-        self.recorded_step("", "relative-build")
-        self.recorded_step(store.UNKNOWN_IDENTITY, str(orphan), worktree="relative-workspace", cwd="")
-        roots, metadata = self.build_roots({})
-        self.assertEqual(roots, frozenset((target, build, orphan)))
-        metadata.assert_called_once_with(self.current)
-
-    def test_unavailable_index_keeps_current_checkout_metadata(self) -> None:
-        empty_index = self.base / "empty.sqlite"
-        sqlite3.connect(empty_index).close()
-        missing_index = self.base / "missing.sqlite"
-        outputs = CargoOutputRoots(self.current, self.current / "target", self.current / "build")
-        for index_file in (missing_index, empty_index):
-            with self.subTest(index_file=index_file):
-                roots, metadata = self.build_roots({self.current: outputs}, index_file)
-                self.assertEqual(roots, frozenset((outputs.target_directory, outputs.build_directory)))
-                metadata.assert_called_once_with(self.current)
-
-    def test_other_host_adds_neither_outputs_nor_checkout(self) -> None:
-        foreign = self.checkout("foreign")
-        target = self.base / "local-target"
-        self.recorded_step(str(target), "")
-        self.recorded_step(str(foreign / "target"), str(foreign / "build"), worktree=str(foreign), host="mac")
-        roots, metadata = self.build_roots({})
-        self.assertEqual(roots, frozenset((target,)))
-        metadata.assert_called_once_with(self.current)
-
-    def test_metadata_probes_manifests_and_keeps_only_successful_outputs(self) -> None:
-        recorded = self.checkout("recorded")
-        unavailable = self.checkout("unavailable")
-        no_manifest = self.base / "no-manifest"
-        no_manifest.mkdir()
-        self.recorded_step("", "", cwd=str(recorded))
-        self.recorded_step("", "", worktree=str(unavailable))
-        self.recorded_step("", "", worktree=str(no_manifest))
-        current_outputs = CargoOutputRoots(self.current, self.current / "target", self.current / "build")
-        recorded_outputs = CargoOutputRoots(recorded, recorded / "target", recorded / "build")
-
-        roots, metadata = self.build_roots({self.current: current_outputs, recorded: recorded_outputs})
-        self.assertEqual(roots, frozenset((current_outputs.target_directory, current_outputs.build_directory,
-                                          recorded_outputs.target_directory, recorded_outputs.build_directory)))
-        self.assertCountEqual(metadata.call_args_list, [mock_call(self.current), mock_call(recorded), mock_call(unavailable)])
-
-    def test_target_override_adds_neither_pair_nor_checkout(self) -> None:
-        overridden = self.checkout("overridden")
-        self.recorded_step(str(overridden / "target"), str(overridden / "build"), worktree=str(overridden),
-                           argv=("cargo", "check", "--target-dir", str(overridden / "target")))
-        roots, metadata = self.build_roots({})
-        self.assertEqual(roots, frozenset())
-        metadata.assert_called_once_with(self.current)
-
-    def test_metadata_probes_run_at_the_same_time(self) -> None:
-        recorded = self.base / "recorded"
-        roots = self.probes_meet(2, timeout=2)
-        self.assertEqual(roots, frozenset((self.current / "target", self.current / "build",
-                                          recorded / "target", recorded / "build")))
-
-    def test_one_configured_worker_runs_metadata_probes_in_sequence(self) -> None:
-        with self.assertRaises(threading.BrokenBarrierError):
-            _ = self.probes_meet(1, timeout=0.1)
-
-    def test_metadata_probe_exception_reaches_the_caller(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "probe failed"):
-            _ = self.probe(RuntimeError("probe failed"))
+    def test_gate_adjustment_keeps_build_and_outside_gate_rules(self) -> None:
+        self.enterContext(patch.dict(os.environ, config_environment(self.base)))
+        target = cargo_output(self.base / "output")
+        _ = write_lint_config(Path(os.environ["CONF_DIR"]), 321)
+        at = datetime.fromisoformat(START_UTC)
+        for program in (str(target / "debug/app"), "/usr/bin/python"):
+            with self.subTest(program=program):
+                kill = memory.EarlyoomKill(at, 100, "app", 321, program)
+                self.assertTrue(kill.is_build)
+                self.assertFalse(kill.outside_build_gate)
 
 
 if __name__ == "__main__":

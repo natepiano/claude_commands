@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import io
-import sys
 import unittest
 from contextlib import redirect_stdout
-from pathlib import Path
 from typing import final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
-import style_plan
+from scripts.style import style_plan
 
-import mechanical_classes
-import rules
+from scripts.style import mechanical_classes
+from scripts.style import rules
 
-from style_plan_test_support import StylePlanFixture, unit_staff_id
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final

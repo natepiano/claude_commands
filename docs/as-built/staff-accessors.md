@@ -50,10 +50,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
-| `scripts/hierarchies/measure.py` | read | active, snapshot |
-| `scripts/hierarchies/push_audit.py` | read | active, snapshot |
 | `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation |
-| `scripts/hierarchies/worker_owners.py` | read | local_snapshot |
 | `scripts/hooks/conversation_pause.py` | read | none (LiveDoc, WrappedDoc types) |
 | `scripts/hooks/conversation_pause_test_support.py` | read | none (LiveDoc type) |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
@@ -165,14 +162,12 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/outcomes.py` | read | snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
-| `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-153 accessors: 26 write, 126 read, 1 owner.
+150 accessors: 26 write, 123 read, 1 owner.
 
 ## Approved copies
 
 | Copy | Writer | Reader | Approved |
 |---|---|---|---|
-| `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/command_inputs.rs`) | the user, 2026-11-04 |
 
 No other copy of the staff facts is allowed without the user's approval. Remake this list before any staff migration.

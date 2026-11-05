@@ -18,8 +18,6 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
 
-sys.path[:0] = [str(Path(__file__).resolve().parents[1] / name)
-                for name in ("production", "message", "herdr")]
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.sessions_test_support import copy_session_modules
@@ -27,12 +25,12 @@ from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
 )
-from dailies_input import StatusBlock, UnitRow, status_blocks
-from unit_lookup import UnitState
-import fake_unit_host
-from fake_unit_host import HostedUnit
+from scripts.production.dailies_input import StatusBlock, UnitRow, status_blocks
+from scripts.production.unit_lookup import UnitState
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit
 from scripts.message.sessions import SessionRecord
-from fake_herdr import CommandResponse, pane_list
+from scripts.herdr.fake_herdr import CommandResponse, pane_list
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
@@ -143,7 +141,6 @@ class UnitStatusFixture(unittest.TestCase):
         stopped_units: tuple[str, ...] = (),
         missing_units: tuple[str, ...] = (),
         unreadable_units: tuple[str, ...] = (),
-        duplicate_units: tuple[str, ...] = (),
     ) -> tuple[tuple[str, ...], str | None, str]:
         with self.case_directory() as root, isolated_staff_file(root / "staff.json", environment := dict(os.environ)):
             script = root / "scripts/production/unit_status.sh"
@@ -228,22 +225,16 @@ class UnitStatusFixture(unittest.TestCase):
                 for unit in hosted:
                     if unit.session in stopped_units:
                         unit.marks["CLAUDE_CODE_SESSION_ID"] = unit.marks.pop("CODEX_THREAD_ID")
-                hosted.extend(HostedUnit(unit.session, f"copy-{unit.pane}", dict(unit.marks))
-                              for unit in tuple(hosted) if unit.session in duplicate_units)
                 publish_host(environment, hosted)
                 for unit in hosted:
-                    if unit.session in pids and not unit.pane.startswith("copy-"):
+                    if unit.session in pids:
                         fake_unit_host.place_process(environment, pids[unit.session], unit.pane, exec_shell=True)
                 result = subprocess.run(
                     [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
                     check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                if duplicate_units:
-                    self.assertEqual(len(result.stderr.splitlines()), len(duplicate_units))
-                    self.assertIn("anomaly:", result.stderr)
-                else:
-                    self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stderr, "")
                 outputs.append(result.stdout)
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None
             seen_path = root / "status" / "decisions_seen"

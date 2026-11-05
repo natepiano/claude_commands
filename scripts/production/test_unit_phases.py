@@ -25,7 +25,7 @@ import unit_lookup
 from scripts.herdr.herdr import HerdrPlace
 import unit_phases
 import style_units
-import style_ledger
+from scripts.style import style_ledger
 import display_cells
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id

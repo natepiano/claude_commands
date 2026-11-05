@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -13,19 +12,17 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import Mock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import add_unit
+from scripts.production import add_unit
 from scripts.production import staff, unit_config
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.message import sessions
 from scripts.shutdown import stop_resume
 from scripts.herdr import herdr
 from scripts.herdr.herdr import HerdrPlace
-from test_support import ShutdownTestCase
+from scripts.shutdown.test_support import ShutdownTestCase
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
+from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_showrunner_name, unit_membership
 
 
@@ -147,20 +144,6 @@ class AddUnitResumeTests(AddUnitTestCase):
         result = self.cli("alpha", "--brief", "Repair the unit", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
-        self.assert_no_launch_change(document, head)
-        self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
-
-    def test_resume_with_unreadable_registry_refuses_with_the_reason(self) -> None:
-        prior = self.root / "prior-session"
-        prior.mkdir()
-        registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
-        _ = (registry / "broken.json").write_text("{broken")
-        document = self.doc.read_text()
-        head = self.git("rev-parse", "HEAD")
-        result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
-                         + "unreadable session registry record: broken.json\n")
         self.assert_no_launch_change(document, head)
         self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 

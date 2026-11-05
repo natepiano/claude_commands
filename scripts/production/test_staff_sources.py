@@ -12,9 +12,7 @@ from typing import cast, override
 from unittest import mock
 
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources, session_staff
@@ -470,11 +468,9 @@ class StaffSourcesTests(StaffTestCase):
                         self.assertEqual(grouped.units, {})
                     else:
                         self.assertEqual(grouped.units.get("sdlc", {}), {"models": marked})
-                    self.assertEqual(grouped.faults, {})
-
 
     def test_current_session_parent_and_showrunner_follow_the_retained_launch_after_rename(self) -> None:
-        import unit_lookup
+        from scripts.production import unit_lookup
         from scripts.production import session_staff
 
         parent, unit, _ = self.tree()

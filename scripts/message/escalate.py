@@ -30,10 +30,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from scripts.lib.process_failure import failure_detail
 from scripts.production.showrunners import load_settings
 from scripts.production import staff
@@ -41,7 +37,7 @@ from scripts.message import send_budget, session_send
 from scripts.notify import push_texts
 from scripts.notify import push_reference
 if TYPE_CHECKING:
-    from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
+    from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
                                         codex_account, workers_home)
 else:
     from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
@@ -512,9 +508,8 @@ def deliver(held: HeldMessage, key: str) -> str:
         return "template revision required"
     rendered = push_texts.render(held.text_id, **dict(held.values))
     command = push_texts.user_send_argv(rendered, sender=JOB, key=user_key(key),
-                                      self_clearing=held.need == "blocked",
+                                      self_clearing=held.need == "blocked", send_script=SEND,
                                       question=held.reference["path"] if held.reference["kind"] == "question" else "")
-    command = session_send.send_argv(*command[2:], send_script=SEND)
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=send_budget.user_seconds(review.user_send_seconds()))
     return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"

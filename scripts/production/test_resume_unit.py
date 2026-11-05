@@ -24,7 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import resume_unit
-import add_unit
+from scripts.production import add_unit
 import retire_unit
 from scripts.message import sessions as retirement_sessions
 import unit_lookup
@@ -369,7 +369,7 @@ class ResumeUnitTests(unittest.TestCase):
             "import sys", "from unittest.mock import patch",
             f"sys.path.insert(0, {str(CHECKOUT / 'scripts/production')!r})",
             f"sys.path.insert(0, {str(CHECKOUT)!r})",
-            "import add_unit", "from scripts.production.production_doc import read_production",
+            "from scripts.production import add_unit", "from scripts.production.production_doc import read_production",
             "def launch(arguments):",
             "    doc = arguments[arguments.index('--production') + 1]",
             "    from pathlib import Path",

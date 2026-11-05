@@ -89,7 +89,7 @@ def is_style_production(doc: Path) -> bool:
 
 def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str, Path]:
     """Resolve ledgers from the staff rows, even when phase records fail."""
-    import style_ledger
+    from scripts.style import style_ledger
 
     try:
         rows = {unit_names.unit_id(row.name): row for row in unit_lookup.doc_units(doc, staff.snapshot())}

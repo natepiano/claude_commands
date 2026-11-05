@@ -14,7 +14,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 import unittest
@@ -111,8 +110,12 @@ class QueueTests(NotificationGuardedTestCase):
     def test_cli_keeps_running_grants_above_numbered_waiters(self) -> None:
         with QueueFixture() as fixture:
             reading = fixture.read()
+            measured = reading.view.running[0].measured
+            assert isinstance(measured, memory_admit.MeasuredMemory)
             grants = tuple(replace(reading.view.running[0], session_id=f"gate-{index}",
-                step="merge-gate", promise=6 * GIB, unit="queue-unit") for index in range(3))
+                step="merge-gate", promise=6 * GIB, unit="queue-unit", pid=900 + index,
+                measured=replace(measured, anonymous_source=memory_admit.ScopeSource(
+                    fixture.root / f"gate-{index}.scope", frozenset({900 + index})))) for index in range(3))
             reading = queue_read_fixture(replace(reading.view, running=grants), policy=admission_policy_fixture())
             self.labels_read.return_value = {**fixture.labels,
                 **{step.session_id: UnitLabels("gate", "builds", "wrong-unit") for step in grants}}
@@ -183,7 +186,7 @@ class QueueTests(NotificationGuardedTestCase):
         environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
         for name in ("build_queue.py",):
             with self.subTest(script=name):
-                result = subprocess.run([sys.executable, str(Path(__file__).with_name(name)), "--help"],
+                result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name(name)), "--help"],
                     env=environment, capture_output=True, text=True, timeout=30, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

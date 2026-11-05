@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
-import add_unit
+from scripts.production import add_unit
 from scripts.herdr import herdr
 from scripts.production import unit_lookup
 from scripts.message import sessions

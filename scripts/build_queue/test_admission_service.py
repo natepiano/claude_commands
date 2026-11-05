@@ -50,7 +50,7 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue import admission_code, queue_snapshot, queue_view, queue_card, queue_evidence, head_facts
 from scripts.build_queue.queue_lines import plain
 from zoneinfo import ZoneInfo
-from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, caller_admission, only_admitted
 
 
@@ -81,6 +81,33 @@ def installed_snapshot(value: object) -> object:
         if transition["kind"] == "PendingPriorityTransition":
             record["transition"] = {key: transition[key] for key in ("id", "action", "at")}
     return {key: installed_snapshot(item) for key, item in record.items()}
+
+
+class AdmissionCallerPersistenceTests(unittest.TestCase):
+    def test_serving_rejects_direct_calls_without_loop_turn(self) -> None:
+        with AdmissionFixture() as fixture, fixture.serving():
+            methods: tuple[tuple[str, Callable[[], object]], ...] = (
+                ("handle_request", lambda: fixture.server.handle_request(wire.ViewRequest())),
+                ("persist", fixture.server.persist), ("run_pass", fixture.server.run_pass))
+            for name, method in methods:
+                with self.subTest(method=name):
+                    with self.assertRaisesRegex(AssertionError, name + r".*use loop_turn\(\)"):
+                        _ = method()
+                    with fixture.loop_turn():
+                        _ = method()
+
+    def test_persistence_keeps_every_live_caller_version(self) -> None:
+        with AdmissionFixture() as fixture:
+            requests = [fixture.request(owner=fixture.fixture_owner(1000 + index, str(index)))
+                        for index in range(64)]
+            with fixture.serving(), fixture.loop_turn():
+                for request in requests:
+                    _ = fixture.server.handle_request(request)
+                fixture.server.persist()
+                expected = {f"{request.owner.pid}-{request.owner.start_time}": request.code_version
+                            for request in requests}
+                self.assertEqual(fixture.server.caller_versions, expected)
+                self.assertEqual(service.read_state(fixture.state_dir).caller_versions, expected)
 
 
 class ReadingAlertTests(unittest.TestCase):
@@ -619,7 +646,7 @@ class RoomAndSlotTests(unittest.TestCase):
 
     def test_a_younger_run_cannot_take_the_room_protected_for_the_head(self) -> None:
         with AdmissionFixture() as fixture:
-            active = fixture.request(need=6 * GIB)
+            active = fixture.request(need=6 * GIB, owner=fixture.proc.spawn(used=0))
             _ = only_admitted(fixture.server.handle_request(active))
             fixture.clock.advance(5)
             fixture.free(15 * GIB)
@@ -2253,6 +2280,8 @@ class CutoverServiceTests(unittest.TestCase):
         for free, pressure, admitted in ((14, 0, False), (15, 0, True), (40, 6, False)):
             with self.subTest(free=free, pressure=pressure), AdmissionFixture() as fixture:
                 holder = fixture.request(need=20 * GIB, owner=fixture.proc.spawn(20 * GIB))
+                write_process(fixture.proc.path, holder.owner.pid, 20 * GIB,
+                              start=holder.owner.start_time, anonymous=0)
                 _ = only_admitted(fixture.server.handle_request(holder))
                 fixture.free(free * GIB)
                 fixture.allow_next_start()

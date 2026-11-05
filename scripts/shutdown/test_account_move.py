@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import staff_sources
 import io
@@ -19,7 +17,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami.note_file import note_name
 
@@ -76,10 +73,19 @@ class AccountMoveTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(accounts.account_dir("claude1"))))
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=AssertionError("accounts must use the listing")))
         _ = self.enterContext(patch.object(inventory, "listing", side_effect=self.current_listing))
+        _ = self.enterContext(patch.object(accounts, "live_group_members", side_effect=self.group_members))
         at = datetime.now(timezone.utc)
         _ = self.enterContext(patch.object(refusals, "stored_reading", return_value=refusals.FreshReading(
             refusals.ReadingWindow(80, refusals.NoResetKnown(), at), refusals.NoWindow(), "")))
 
+
+    def group_members(self) -> dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]]:
+        groups: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]] = {"units": [], "showrunners": []}
+        for session in inventory.listing():
+            group = accounts.session_group(session)
+            if group != "ungrouped":
+                groups[group].append(accounts.LiveGroupMember(session.session_id, session.name, group, session.config_dir))
+        return groups
 
     def test_group_and_single_move_ignore_stale_shutdown_holds(self) -> None:
         for subject in ("units", "move-id"):
@@ -208,7 +214,7 @@ class AccountMoveTests(ShutdownTestCase):
         }
         before = self.disk_state()
         result = subprocess.run(
-            [sys.executable, str(accounts.SCRIPTS / "accounts" / "accounts.py"),
+            [str(accounts.SCRIPTS / "lib" / "py"), str(accounts.SCRIPTS / "accounts" / "accounts.py"),
              "move", "showrunners", "claude3", "--dry-run"],
             env=environment, capture_output=True, text=True, check=False, timeout=HANG_GUARD_SECONDS,
         )
@@ -261,8 +267,8 @@ class AccountMoveTests(ShutdownTestCase):
 
     def test_group_calls_move_once_per_off_target_member_across_source_accounts(self) -> None:
         members = [replace(self.current_listing()[0], session_id="first", kind="showrunner"),
-                   replace(self.current_listing()[0], session_id="second", kind="showrunner", login="default@example.invalid"),
-                   replace(self.current_listing()[0], session_id="already", kind="showrunner", login="target@example.invalid")]
+                   replace(self.current_listing()[0], session_id="second", kind="showrunner", login="default@example.invalid", config_dir=self.root / ".claude2"),
+                   replace(self.current_listing()[0], session_id="already", kind="showrunner", login="target@example.invalid", config_dir=self.root / ".claude3")]
         with (patch.object(inventory, "listing", return_value=members),
               patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": members}),
               patch.object(inventory, "unregistered_showrunners", return_value=[])):

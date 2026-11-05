@@ -38,10 +38,6 @@ from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
 from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, cast, final, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
@@ -1077,7 +1073,8 @@ def _write_layout(session: str, layout: SavedLayout) -> None:
 
 
 def _bind_row_tab(saved: SavedLayout, workspace: str, row_id: str,
-                  target: SavedName | None = None, index: int = 0, *, terminal: str = "") -> bool:
+                  target: SavedName | None = None, index: int = 0, *, terminal: str = "",
+                  record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> bool:
     space = next((space for space in saved["workspaces"] if space["name"] == workspace),
                  SavedSpace(name=workspace, seen=time.time(), tabs=[]))
     bindings = [(previous, position, tab) for previous in saved["workspaces"]
@@ -1087,7 +1084,14 @@ def _bind_row_tab(saved: SavedLayout, workspace: str, row_id: str,
         if len(bindings) == 1 and bindings[0][0] is space:
             return False
         target = bindings[0][2].copy() if bindings else SavedName(name=row_id, seen=time.time(), terminal_id=terminal)
-        index = len(space["tabs"])
+        membership = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
+        entries = [*space["tabs"], target]
+        titles = [row.name if (row := membership.by_member_reference(entry["name"])) is not None
+                  else entry["name"] for entry in entries]
+        classifier = UnitTabClassifier("", [], membership)
+        units = {title for title in titles if isinstance(classifier.classify(workspace, title, []), UnitTab)}
+        kept = [SavedName(name=title, seen=entry["seen"]) for title, entry in zip(titles, space["tabs"])]
+        index = tab_order(workspace, titles, kept, units).index(len(titles) - 1)
     index = next((position for previous, position, _ in bindings if previous is space), index)
     for previous, _, tab in bindings:
         previous["tabs"].remove(tab)
@@ -1563,7 +1567,8 @@ class Herdr:
                             placed = True
                             changed = self._retitle(pane, member.name, tab=True) or changed
                     bound = _bind_row_tab(saved, parent.name, member.id,
-                        terminal=json_text(matches[0].get("terminal_id", ""), "terminal id") if matches else "") or bound
+                        terminal=json_text(matches[0].get("terminal_id", ""), "terminal id") if matches else "",
+                        record=record) or bound
                 if bound:
                     _write_layout(self.session, saved)
                 if placed:

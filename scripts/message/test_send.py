@@ -27,9 +27,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 from scripts.message import send
@@ -57,7 +54,7 @@ from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, r
 from scripts.message import roster
 from scripts.message import sessions
 if TYPE_CHECKING:
-    from ..accounts import accounts
+    from scripts.accounts import accounts
 else:
     from scripts.accounts import accounts
 from scripts.shutdown.test_support import ShutdownTestCase
@@ -622,6 +619,52 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.assertIn("Authority: morty (speaks for the user)", send.agent_text(message))
             self.assertIn("Authority: morty (speaks for the user)", send.delivered_text(message, "12345678"))
             self.assertEqual(message.sender, display)
+
+    def test_claude_stamp_does_not_show_the_morty_entry_matched_by_from_name(self) -> None:
+        native = "00000000-0000-4000-8000-000000000002"
+        morty = replace(self.sender_entry(), kind="codex", name="morty",
+                        reach=roster.Messageable("codex:00000000-0000-4000-8000-000000000001"),
+                        thread=roster.CodexThread("00000000-0000-4000-8000-000000000001"),
+                        session=roster.NoClaudeSession())
+        with (mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession(native)),
+              mock.patch.object(roster, "roster", return_value=self.recipient_roster([morty], [])),
+              redirect_stderr(io.StringIO())):
+            self.assertEqual(self.send("--from", "morty", "--text", "A decision").outcome, "sent")
+        message = self.relayed[-1]
+        self.assertEqual(message.stamp, send.ClaudeSender(native))
+        self.assertEqual(message.sender, "morty")
+        self.assertNotIn("Shown sender:", send.agent_text(message))
+        self.assertNotIn("Authority:", send.agent_text(message))
+        self.assertNotIn("Shown sender: sdlc · roles · worker test", send.relay_prompt(message))
+
+    def test_shown_sender_uses_the_stamped_native_id_instead_of_the_from_name(self) -> None:
+        for identity, address in ((roster.ClaudeSession("sender"), "session:sender"),
+                                  (roster.CodexThread("sender"), "codex:sender")):
+            entry = replace(self.sender_entry(), reach=roster.Messageable(address))
+            if isinstance(identity, roster.CodexThread):
+                entry = replace(entry, kind="codex", thread=identity, session=roster.NoClaudeSession())
+            with (self.subTest(address=address),
+                  mock.patch.object(roster, "sender_identity", return_value=identity),
+                  mock.patch.object(roster, "roster", return_value=self.recipient_roster([entry], []))):
+                self.assertEqual(self.send("--from", "reply-name", "--text", address).outcome, "sent")
+            message = self.relayed[-1]
+            self.assertEqual(message.sender, "reply-name")
+            self.assertIn("Sender native id: " + address, send.agent_text(message))
+            self.assertIn("Shown sender: sdlc · roles · worker test", send.agent_text(message))
+
+    def test_shown_sender_keeps_the_from_text_without_one_native_id_match(self) -> None:
+        entry = self.sender_entry()
+        for identity, entries in ((roster.NoSession(), [replace(entry, name="unavailable")]),
+                                  (roster.NoSession(), [entry]),
+                                  (roster.ClaudeSession("missing"), [entry]),
+                                  (roster.ClaudeSession("sender"), [entry, self.sender_entry("other")])):
+            with (self.subTest(identity=identity, entries=len(entries)),
+                  mock.patch.object(roster, "sender_identity", return_value=identity),
+                  mock.patch.object(roster, "roster", return_value=self.recipient_roster(entries, []))):
+                self.fresh_repeat_history()
+                self.assertEqual(self.send("--from", "sender-address", "--text", "A result").outcome, "sent")
+            self.assertEqual(self.relayed[-1].shown_sender, "sender-address")
+            self.assertNotIn("Shown sender:", send.agent_text(self.relayed[-1]))
 
     def test_postmaster_sink_receives_the_stamp_and_configured_authority(self) -> None:
         clock = self.postmaster_clock()
@@ -1189,7 +1232,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             assignment=roster.WorkerAssignment("test", "/fixture/run", "test", "test"),
             session=roster.ClaudeSession("sender"),
         )
-        with mock.patch.object(roster, "roster", return_value=self.recipient_roster([sender], [])):
+        with mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession("sender")), \
+                mock.patch.object(roster, "roster", return_value=self.recipient_roster([sender], [])):
             result = send.send(local_options(["--to", "session:recipient", "--from", "fixed-sender-address",
                                                "--summary", "Question", "--text", "body"]))
         self.assertEqual(result.outcome, "sent")
@@ -1224,7 +1268,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_name_config_rename_changes_new_senders_but_keeps_queued_and_forwarded_display(self) -> None:
         options = local_options(["--to", "session:absent", "--from", "sender-address", "--text", "before rename"])
-        with mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.sender_entry()], [])):
+        with mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession("sender")), \
+                mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.sender_entry()], [])):
             self.assertEqual(send.send(options).outcome, "queued")
             with mock.patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")):
                 newer = local_options(["--to", "session:absent", "--from", "sender-address", "--text", "after rename"])
@@ -1248,7 +1293,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_queued_sender_display_survives_roster_changes_and_legacy_records_use_raw_sender(self) -> None:
         queued_at = datetime(2026, 10, 20, tzinfo=timezone.utc)
-        with mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.sender_entry()], [])) as read_roster:
+        with mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession("sender")), \
+                mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.sender_entry()], [])) as read_roster:
             for keyed in (False, True):
                 options = local_options([
                     "--to", "session:absent", "--from", "sender-address", "--text", "Preview\nbody",
@@ -1271,13 +1317,14 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             replay = send.pending("session:absent")
         self.assertEqual(replay.count("Shown sender: sdlc · roles · worker test"), 2)
         self.assertRegex(replay, r"(?:\A|\n\n)Queued message \d+ of 3, from sender-address at "
-                         + r"[^\n]+:\nSender native id: unavailable\nlegacy body(?:\n\n|\Z)")
+                         + r"[^\n]+:\nSender native id: session:sender\nlegacy body(?:\n\n|\Z)")
         self.assertEqual([entry["from"] for entry in self.log()], ["sender-address", "sender-address"])
 
     def test_mesh_and_daemon_payloads_show_sender_without_changing_address_thread_or_log(self) -> None:
         original = "Message from sender-address: Preview\n\nbody"
-        expected = "Message from sender-address: Preview\nSender native id: unavailable\nShown sender: sdlc · roles · worker test\n\nbody"
+        expected = "Message from sender-address: Preview\nSender native id: session:sender\nShown sender: sdlc · roles · worker test\n\nbody"
         with (
+            mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession("sender")),
             mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.sender_entry(), self.daemon_row("thread-address")], [])),
             mock.patch.object(send, "run", return_value=(0, "sent", "")) as launch,
             mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
@@ -1300,7 +1347,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_relay_fallback_preserves_shown_sender_when_session_address_becomes_socket(self) -> None:
         self.session("recipient", "Recipient")
-        with mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.sender_entry()], [])) as read_roster:
+        with mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession("sender")), \
+                mock.patch.object(roster, "roster", return_value=self.recipient_roster([self.sender_entry()], [])) as read_roster:
             self.assertEqual(send.send(local_options([
                 "--to", "session:recipient", "--from", "sender-address", "--summary", "Preview",
                 "--text", "Message from sender-address: Preview\n\nbody",
@@ -1311,7 +1359,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(relayed.sender, "sender-address")
         prompt = send.relay_prompt(relayed)
         self.assertIn("----- BEGIN MESSAGE -----\nMessage from sender-address: Preview\n"
-                      + "Sender native id: unavailable\nShown sender: sdlc · roles · worker test\n\nbody\n----- END MESSAGE -----", prompt)
+                      + "Sender native id: session:sender\nShown sender: sdlc · roles · worker test\n\nbody\n----- END MESSAGE -----", prompt)
         self.assertEqual(self.log()[0]["from"], "sender-address")
 
     def test_remote_forwarding_keeps_sending_machine_display_despite_receiver_name_collision(self) -> None:
@@ -1324,6 +1372,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             with self.subTest(display=display, matches=len(sender_rows)):
                 self.fresh_repeat_history()
                 with (
+                    mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession("sender")),
                     mock.patch.object(roster, "roster", return_value=self.recipient_roster(sender_rows, [])) as source_read,
                     mock.patch.object(send, "run", return_value=(0, "SENT: forwarded\n", "")) as ssh,
                 ):
@@ -1346,8 +1395,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
                 ):
                     self.assertEqual(send.send(received).outcome, "sent")
-                expected = ("Message from sender-address: Preview\nSender native id: unavailable\n\nbody" if display == "sender-address" else
-                            "Message from sender-address: Preview\nSender native id: unavailable\nShown sender: sdlc · roles · worker test\n\nbody")
+                expected = ("Message from sender-address: Preview\nSender native id: session:sender\n\nbody" if display == "sender-address" else
+                            "Message from sender-address: Preview\nSender native id: session:sender\nShown sender: sdlc · roles · worker test\n\nbody")
                 queue.assert_called_once_with(self.daemon_owner(), "remote-thread", expected, timeout=send.delivery_timeout())
                 logged = self.log()[-1]
                 self.assertEqual((logged["from"], logged["to"], logged["key"], logged["text"]),

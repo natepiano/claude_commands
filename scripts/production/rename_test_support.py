@@ -33,14 +33,15 @@ import merge_checkpoint
 from scripts.production.production_doc import Production, read_production
 import rename
 from scripts.production import showrunners
-import tidy_wrapped
-import unit_move
+from scripts.production import tidy_wrapped
+from scripts.production import unit_move
 import unit_names
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
+READ_HERDR_PANES = herdr.Herdr.panes
 
 
 class RenameDisplays:
@@ -95,6 +96,7 @@ class RenameDisplays:
         from scripts.herdr import herdr
 
         with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              mock.patch.object(herdr.Herdr, "panes", READ_HERDR_PANES),
               mock.patch.object(herdr.Herdr, "listed", side_effect=self.listed),
               mock.patch.object(herdr.Herdr, "run", side_effect=self.run),
               mock.patch.object(herdr.Herdr, "result", side_effect=self.result),

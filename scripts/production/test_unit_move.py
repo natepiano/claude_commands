@@ -31,8 +31,8 @@ from scripts.herdr import herdr
 
 class AddUnitResumeFolderTests(AddUnitTestCase):
     def test_resuming_a_stopped_unit_tab_retires_the_old_record_before_a_folder_move(self) -> None:
-        import add_unit
-        import unit_lookup
+        from scripts.production import add_unit
+        from scripts.production import unit_lookup
         from scripts.shutdown.test_pane_restore import FakeClient
         from datetime import datetime, timezone
 
@@ -45,10 +45,12 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
             {"CLAUDE_CONFIG_DIR": str(config)}, ["claude", "-n", "alpha", "--model", "opus"])
         client = FakeClient([{"pane_id": "w7:p1", "tab_id": "w7:t1", "workspace_id": "w7", "label": "alpha"}])
         shell_pid = 998041
-        def close(*arguments: str) -> subprocess.CompletedProcess[str]:
+        def close(*arguments: str) -> str:
+            if arguments == ("session", "list", "--json"):
+                return json.dumps({"sessions": []})
             self.assertEqual(arguments, ("pane", "close", "w7:p1"))
             FakeClient.close_tab_of(client, arguments[2])
-            return subprocess.CompletedProcess(arguments, 0, "", "")
+            return ""
 
         labeled = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(),
             herdr.HerdrPlace("agents", "w7:p1"), identity=unit_lookup.LiveSession(owner.current_session))
@@ -63,7 +65,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
 
         with (mock.patch.object(pane_record, "RECORD_DIR", records),
-              mock.patch("pane_record.RECORD_DIR", records),
+              mock.patch("scripts.shutdown.pane_record.RECORD_DIR", records),
               mock.patch.dict(os.environ, self.env)):
             pane_record.write("agents", original)
             with (mock.patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(labeled)),
@@ -86,6 +88,11 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
                             if entry["session_id"] in (owner.id, owner.current_session)]
             self.assertEqual([(entry["pane_id"], pane_record.resume_launch(entry)["cwd"]) for entry in publications],
                              [("w7:p3", str(destination))])
+
+
+def setUpModule() -> None:
+    # Session fixtures have no panes unless a test supplies pane evidence.
+    _ = unittest.enterModuleContext(mock.patch.object(herdr.Herdr, "panes", return_value=[]))
 
 
 class UnitFolderMoveTests(FolderRenameFixture):
@@ -122,6 +129,45 @@ class UnitFolderMoveTests(FolderRenameFixture):
             self.assertEqual(backend.stops, [self.owner.current_session])
             self.assertEqual(len(backend.starts), 1)
             self.assert_finished_rerun(backend)
+
+    def test_resume_in_a_new_pane_closes_the_old_terminal_and_keeps_a_reused_pane(self) -> None:
+        from scripts.herdr import herdr
+
+        restore = self.enterContext(saved_fixture(self.root))
+        for resumed_pane, close_fails in (("w1:p3", False), ("w1:p1", False), ("", False), ("w1:p3", True)):
+            restore()
+            with self.subTest(resumed_pane=resumed_pane, close_fails=close_fails):
+                backend = FolderSessionFixture(self.owner, live=True)
+                panes: list[herdr.PaneIdentity] = [
+                    {"pane_id": "w1:p1", "terminal_id": "old-terminal", "workspace_id": "w1",
+                     "session_id": self.owner.current_session},
+                    {"pane_id": "w1:p2", "terminal_id": "sibling-terminal", "workspace_id": "w1",
+                     "session_id": None},
+                ]
+
+                def start(row: staff.StaffRow, record: staff.StaffSnapshot, client: object) -> str:
+                    _ = backend.start(row, record, client)
+                    panes[0]["session_id"] = None
+                    return resumed_pane
+
+                with (backend.installed(), mock.patch.object(restart, "start_row", side_effect=start),
+                      mock.patch.object(herdr.Herdr, "panes", side_effect=lambda: panes.copy()),
+                      mock.patch.object(herdr.Herdr, "close_retained_pane",
+                                        side_effect=OSError("fixture close failed") if close_fails else None) as close):
+                    result = self.move_folder()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assert_moved(backend)
+                    self.assertEqual(backend.stops, [self.owner.current_session])
+                    self.assertEqual(len(backend.starts), 1)
+                    self.assertTrue(backend.live)
+                    self.assertEqual(close.call_args_list,
+                        [mock.call("w1:p1", terminal="old-terminal")] if resumed_pane == "w1:p3" else [])
+                    if close_fails:
+                        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                        self.assertIn("fixture close failed", result.stderr)
+                    else:
+                        self.assertEqual(result.stderr, "")
+                    self.assert_finished_rerun(backend)
 
     def test_history_mesh_and_launch_files_keep_their_bytes_and_times(self) -> None:
         files = (self.records / "agents.json", self.root / "runs/mesh_roster.json",

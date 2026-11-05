@@ -15,32 +15,77 @@ import sys
 import tempfile
 import threading
 import time
-from typing import TYPE_CHECKING, cast, override
+from types import FrameType
+from typing import cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-    from ..lib.process_start_test_support import process_reader
-else:
-    from scripts.lib import process_start as process_identity
-    from scripts.lib.process_start_test_support import process_reader
+from scripts.lib import process_start as process_identity
+from scripts.lib.git_test_support import commit_repository
+from scripts.lib.process_start_test_support import process_reader
 
 import unittest
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("mac_test", "build_targets", "build_hold", "buildlog"):
-    sys.path.insert(0, str(SCRIPTS / directory))
 
-if TYPE_CHECKING:
-    from . import mac_test, offload
-    from ..build_hold import build_hold
-    from ..build_targets import targets
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from scripts.mac_test import mac_test, offload
-    from scripts.build_hold import build_hold
-    from scripts.build_targets import targets
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.mac_test import mac_test, offload
+from scripts.build_hold import build_hold
+from scripts.build_targets import targets
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
+
+class RepositoryKeyTests(unittest.TestCase):
+    root: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "project"
+        _ = subprocess.run(["git", "init", "--quiet", str(self.root)], check=True, capture_output=True)
+
+    def git(self, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(self.root), *arguments], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_real_origin_forms_keep_the_normalized_repository_key(self) -> None:
+        expected = offload.KnownRepository("project", "https://github.com/nate/project")
+        for remote in ("git@GitHub.com:nate/project.git", "https://github.com/nate/project.git"):
+            with self.subTest(remote=remote):
+                _ = self.git("config", "remote.origin.url", remote)
+                self.assertEqual(offload.repository_identity(self.root), expected)
+
+    def test_real_repository_without_origin_keeps_the_root_commit_key(self) -> None:
+        root_commit = commit_repository(self.root, "Fixture", allow_empty=True)
+        self.assertEqual(offload.repository_identity(self.root),
+                         offload.KnownRepository("project", "git-root:" + root_commit))
+
+    def test_real_repository_without_commits_keeps_the_repository_name(self) -> None:
+        self.assertEqual(offload.repository_identity(self.root), offload.KnownRepository("project"))
+
+    def test_attempt_without_commits_or_origin_records_unknown_identity(self) -> None:
+        log_root = self.root.parent / "buildlog"
+        request = offload.OffloadRequest(self.root, "project", "empty-repository", offload.NO_RESULT_FILE, (),
+                                        target="aws")
+        with mock.patch.dict(os.environ, {
+            "BUILDLOG_DIR": str(log_root), "BUILDLOG_MEM_WAIT_SINCE": "", "BUILDLOG_MEM_WAIT_FIRST_FILE": "",
+        }):
+            offload.persist_attempt(request, offload.DeclinedMacRun("off", 0),
+                                    offload.AttemptEvidence(), time.monotonic())
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in log_root.rglob("*.jsonl") for line in path.read_text().splitlines()]
+        self.assertEqual([row["repo_identity"] for row in rows if row["kind"] == "ssh_attempt"], ["unknown"])
+
+    def test_repository_key_lookup_runs_no_memory_admit_code(self) -> None:
+        files: set[str] = set()
+
+        def collect_file(frame: FrameType, event: str, argument: object) -> None:
+            if event == "call" and argument is None:
+                files.add(frame.f_code.co_filename)
+
+        sys.setprofile(collect_file)
+        try:
+            _ = offload.repository_identity(self.root)
+        finally:
+            sys.setprofile(None)
+        self.assertNotIn("memory_admit.py", {Path(file).name for file in files})
 
 
 class RepositorySlotTests(unittest.TestCase):

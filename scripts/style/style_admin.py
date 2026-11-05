@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Deterministic style guideline admin operations."""
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import cast
 
-from style_rules import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow
+from scripts.style.style_rules import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow
 
 RUST_STYLE_DIR = NATE_STYLE_DIR / "rust"
 

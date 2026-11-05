@@ -589,7 +589,7 @@ class MessageTests(unittest.TestCase):
         _ = (self.root / "ps").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment, capture_output=True,
+        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=self.environment, capture_output=True,
                               text=True, check=False)
 
     def test_start_tells_each_role_its_version_and_starts_each_showrunners_count(self) -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import chdir, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
 import hashlib
@@ -16,20 +16,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast, override
+from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-if TYPE_CHECKING:
-    from ..aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-    from . import linux_runner, mac_test, offload, test_target_slots
-    from ..lint import sweep
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-    from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
-    from scripts.lint import sweep
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
+from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
+from scripts.lint import sweep
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class DiskReading(NamedTuple):
@@ -238,7 +232,7 @@ class LinuxShellTests(unittest.TestCase):
             if argv[:2] == [sys.executable, "-c"] and "sweep.sweep_workspace" in argv[2]:
                 if not self.use_real_sweep:
                     return subprocess.CompletedProcess(argv, 0, "", "")
-                with mock.patch.dict(os.environ, env or {}), \
+                with chdir(os.getcwd()), mock.patch.dict(os.environ, env or {}), \
                         mock.patch.object(sys, "argv", ["-c", argv[3]]), \
                         mock.patch.object(sweep, "process_uses", side_effect=private_uses), \
                         mock.patch.object(time, "time", return_value=1_793_570_400.0):

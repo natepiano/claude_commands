@@ -16,7 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from decimal import Decimal
 import time
-from typing import TYPE_CHECKING, Literal, NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
 from scripts.buildlog import ci, holds
 from scripts.buildlog import index
@@ -50,18 +50,10 @@ from scripts.buildlog.mac_outcome import (
     local_target_names,
 )
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..aws_target import measurement
-    from ..build_targets.target_config import SshTarget, is_aws_target, read_targets
-else:
-    from scripts.aws_target import measurement
-    from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
+from scripts.aws_target import measurement
+from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
 
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
@@ -1516,7 +1508,7 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
     if any(isinstance(window.moment, moments.MemoryMoment) for window in windows):
         lines += [
-            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under a resolved Cargo output root; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
+            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under a Cargo target folder; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
             "Full memory stall: stall_full_us deltas ÷ sampled elapsed microseconds, natedev's 60 s samples; resets, boot changes and gaps are unknown.",
             "Memory wait p90: nearest-rank 90th percentile of recorded mem_wait_s on natedev steps started in the window, zero waits included.",
             "Memory-kill retries/day: (sum(mem_kills) − sum(mem_kill_stopped)) ÷ window days on natedev calls started in the window; stopped calls are in brackets, per day.", "",

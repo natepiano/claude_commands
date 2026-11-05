@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
-import add_unit
+from scripts.production import add_unit
 from scripts.production import dailies_render
 import merge_checkpoint
 from scripts.production import production_doc, staff

@@ -9,7 +9,6 @@ import os
 import shlex
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -17,12 +16,12 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest import mock
 
-import add_style
-import add_unit
-import rules
-import style_ledger
-import unit_plans
-import style_rules
+from scripts.style import add_style
+from scripts.production import add_unit
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import unit_plans
+from scripts.style import style_rules
 from scripts.production.production_doc import production_field, read_production
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
@@ -36,7 +35,6 @@ import shlex
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.environ["STYLE_TEST_CHECKOUT"])
 from scripts.production.staff_test_support import fixture_showrunner_name, recorded_showrunner, showrunner_relationship
 
 arguments = sys.argv[1:]
@@ -82,8 +80,7 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(sys.argv[1]).parent))
-import add_style
+from scripts.style import add_style
 
 real_run_script = add_style._run_script
 def run_script(script, *arguments):
@@ -160,7 +157,6 @@ class AddStyleTests(unittest.TestCase):
             "TEST_PARENT_SLUG": "parent",
             "TEST_LIVE_SESSIONS": str(self.root / "live-sessions"),
             "TEST_STYLE_SYNC": str(self.root / "style_sync.py"),
-            "STYLE_TEST_CHECKOUT": str(SCRIPT.parents[2]),
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
@@ -201,7 +197,7 @@ class AddStyleTests(unittest.TestCase):
 
     def run_bootstrap(self, *arguments: str, parent: Path | None = None, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, "-c", BOOTSTRAP, str(SCRIPT), "--production", str(parent or self.parent),
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", BOOTSTRAP, str(SCRIPT), "--production", str(parent or self.parent),
              "--model", "test-model", "--effort", "high", *arguments],
             env=self.env, cwd=self.repo, capture_output=True, text=True, check=False,
         )
@@ -235,7 +231,7 @@ class AddStyleTests(unittest.TestCase):
         _ = self.git("commit", "-q", "-m", "Add workspace packages")
 
     def interrupted_bootstrap_publish(self, path: Path) -> None:
-        injection = """import atomic_file
+        injection = """from scripts.lib import atomic_file
 real_replace = atomic_file.os.replace
 def interrupted_replace(source, destination):
     if Path(destination) == Path(os.environ["TEST_STOP_FILE"]):
@@ -446,7 +442,7 @@ atomic_file.os.replace = interrupted_replace
         catalog = rules.load_rules(self.checkout)
         self.assertEqual({rule.rule_id for rule in catalog if rule.origin == "local"}, {"local:docs/style/local.md"})
         listing = subprocess.run(
-            [sys.executable, str(SCRIPT.with_name("rules.py")), "list", "--repo", str(self.checkout), "--json"],
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT.with_name("rules.py")), "list", "--repo", str(self.checkout), "--json"],
             check=True, capture_output=True, text=True, env=self.env,
         )
         rows = cast(list[rules.RuleListing], json.loads(listing.stdout))

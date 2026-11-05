@@ -9,7 +9,6 @@ import contextlib
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,7 +23,6 @@ from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import HostedUnit
 from scripts.production.unit_effort import Ready, Skipped
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, fixture_runtime_id, fixture_member
 
@@ -184,7 +182,7 @@ class UnitEffortTests(unittest.TestCase):
         fake_unit_host.write(os.environ, [unit])
         self.native_target(unit, 991001, 998060, identity)
         with mock.patch.object(unit_lookup, "every_labeled_session", return_value=unit_lookup.LabeledProductions(
-                {"show": {"native": marked}}, {})):
+                {"show": {"native": marked}})):
             code, out, err = self.run_main("high")
         self.assertEqual(code, 0, err)
         self.assertIn("native: sent", out)
@@ -215,7 +213,7 @@ class NativeDirectorEffortTests(StaffTestCase):
                 with (mock.patch.object(unit_effort, "read_place", side_effect=AssertionError("unexpected pane read")),
                       mock.patch.object(unit_effort, "send", side_effect=AssertionError("unexpected pane write"))):
                     lines = unit_effort.director_lines(
-                        unit_lookup.LabeledProductions({"show": {"unit": labeled}}, {}), "high", False)
+                        unit_lookup.LabeledProductions({"show": {"unit": labeled}}), "high", False)
                 self.assertEqual(lines, ["unit: skipped — cannot tell whether Claude runs: unreadable session"]
                                  if isinstance(state, unit_lookup.ClaudeUnknown) else ["no unit director is running"])
 
@@ -229,7 +227,7 @@ class NativeDirectorEffortTests(StaffTestCase):
         with (mock.patch.object(unit_effort, "read_place", return_value=EMPTY) as read,
               mock.patch.object(unit_effort, "send", return_value="") as send):
             self.assertEqual(unit_effort.director_lines(
-                unit_lookup.LabeledProductions({"show": {"unit": labeled}}, {}), "high", False),
+                unit_lookup.LabeledProductions({"show": {"unit": labeled}}), "high", False),
                 ["current-name: sent"])
         read.assert_called_once_with(place, ansi=True)
         send.assert_called_once_with(place, "high", target=fixture.unit.current_session)

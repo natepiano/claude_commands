@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
 
 from scripts.production import live_units
 import rules
-import style_ledger
+from scripts.style import style_ledger
 import display_cells
 from scripts.production import staff, session_staff, unit_lookup, unit_names
 from scripts.production.issues import Issue, frontmatter
