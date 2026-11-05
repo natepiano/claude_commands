@@ -534,7 +534,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - A check inside `session_send_argv`: about 20 modules build their own `send.py` path.
 - A production-named guard module: it adds guard lines to coverage records.
 
-### Phase 22 — Mirror step rows store the sent repository identity, and `show.py` loads a light repository module  · status: todo
+### Phase 22 — Mirror step rows store the sent repository identity, and `show.py` loads a light repository module  · status: done
 **Depends on:** Phase 18, Phase 23
 
 #### Work Order
