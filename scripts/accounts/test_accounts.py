@@ -124,7 +124,7 @@ class AccountsConfigurationTests(unittest.TestCase):
                 account_config = conf.read("accounts")
                 configured = account_config.values()
                 readers: dict[str, set[str]] = {}
-                sources = [*(root / "scripts/accounts").glob("*.py"), root / "scripts/whoami/note_file.py"]
+                sources = [*(root / "scripts/accounts").glob("*.py"), *(root / "scripts/whoami").glob("*.py")]
                 for source in sources:
                     if source.name.startswith("test_"):
                         continue

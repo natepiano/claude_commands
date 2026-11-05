@@ -530,3 +530,38 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Gotchas:** an early option scan must not refuse an unknown short option (`git commit -qJ`) outside Cargo; unreadable plain calls keep the old scope.
 
 **Ruled out:** reading `--trailer` values into the message (git's `=` form, amend and subject order made it unsafe); listing merge-only commits as change-review rows.
+
+### Phase 19 — The hierarchy measure command and its tests are deleted  · status: done
+
+#### As-built
+
+- The hierarchy measure command is deleted (user, 2026-11-03: "delete it and its tests"). `scripts/hierarchies/` and `config/hierarchies/` no longer exist.
+- Deleted with it: the helper modules that only it used (`log_records.py`, `worker_owners.py`, `push_audit.py`), all four test files, and `config/hierarchies/coverage.toml` and `sessions.toml`.
+- The `scripts/hierarchies` entries in `pyrightconfig.json` and `scripts/build_targets/working_set_owners.json` are removed.
+- No new code. The change removes 10991 lines.
+
+**Files:**
+- `pyrightconfig.json`, `scripts/build_targets/working_set_owners.json`.
+- `scripts/production/test_transfer_unit.py` — its fixture file is now `work.py`, not `measure.py`.
+
+**Gotchas:** the assertion guard needs a ruling for each helper function in a deleted test file, not only `::test_*`.
+
+### Phase 20 — A unit transfer tells the moved unit, and its tab takes its place in the new showrunner's tab order  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** after `transfer_unit.py apply`, the moved unit's status line shows its new production, and its herdr tab sits in its place among the new showrunner's unit-director tabs (the user's transfer enhancements, from herdr's queue, given to this unit by sdlc on 2026-11-05).
+
+**Proof before code (done by the unit director):** the status line reads the staff parent at each run (`scripts/statusline/assignment.py`: "for <parent name>"), and Claude Code runs the status-line command when the conversation changes. One message to the moved unit is a new turn, so its status line shows the new production.
+
+**Spec:**
+1. `scripts/production/transfer_unit.py` `apply`: when the staff parent changed, send the moved unit one message that names its new production. Use the existing message sender (`scripts/message/send.py`) and the same sender name an existing staff script uses. A rerun that changes nothing sends no message. Print the send result.
+2. `scripts/production/staff_move.py` `move_unit` (through `herdr.Herdr.move_row_tabs`): the moved tab goes to its place by the existing rule of `tab_order`: the showrunner tab first, then unit directors A-Z, then other tabs A-Z. Today the moved tab is bound into the saved layout, and saved order can keep it at the end. Fix that at its cause in `scripts/herdr/herdr.py`.
+3. Add no other check, guard or refusal. Do not edit `scripts/production/unit_lookup.py` (shutdown edits it now).
+
+**Acceptance gate:**
+- A test in `scripts/production/test_transfer_unit.py`: a transfer that changes the parent sends one message to the moved unit with the new production name; a rerun sends none.
+- A test in the herdr tests: a moved unit tab lands between the new showrunner's unit-director tabs by A-Z, not at the end, also when the workspace has a saved tab order.
+- The unittest modules of every changed test file pass, and basedpyright on every changed file ends `0 errors, 0 warnings, 0 notes`.
