@@ -3325,7 +3325,7 @@ def codex_conversations() -> CodexConversations:
             for session in observed:
                 _ = live.setdefault(session.thread_id, ())
     runs: set[Path] = set()
-    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
+    for root in (*unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")), unit_runs.ASTRA_RUN_ROOT):
         runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):

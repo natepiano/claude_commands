@@ -282,6 +282,18 @@ class ConversationReaderTests(StaffTestCase):
         self.assertEqual(loaded.call_args.args[0], run)
         self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
 
+    def test_astra_app_server_without_unit_run_dir_proves_its_loaded_thread_live(self) -> None:
+        run = unit_runs.ASTRA_RUN_ROOT / "test-review"
+        run.mkdir(parents=True)
+        (run / codex_mesh.SERVER_FILE).touch()
+        self.codex(rollout=False, arguments=["codex", "app-server"],
+                   environment={"CODEX_HOME": str(self.root / "account")})
+        with patch.object(codex_mesh, "loaded_threads", return_value={self.identity}) as loaded:
+            self.assertEqual(herdr.read_conversation(self.identity, "codex"), herdr.LiveConversation("codex", ()))
+        loaded.assert_called_once()
+        self.assertEqual(loaded.call_args.args[0], run)
+        self.assertGreater(cast(float, loaded.call_args.args[1]), 0)
+
     def test_failed_app_server_read_is_unknown(self) -> None:
         run = self.runs / "test-run"
         run.mkdir()
