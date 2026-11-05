@@ -16,9 +16,6 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import operation_deadline
-
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from scripts.lib.conf import ConfigRead
@@ -45,6 +42,19 @@ class NoEnvrc(NamedTuple):
 
 class Refused(NamedTuple):
     reason: str
+
+
+def _remaining_timeout(cap: float) -> float:
+    """Load deadline support only when a subprocess needs a timeout."""
+    repository_root = str(Path(__file__).resolve().parents[2])
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
+    if __package__:
+        from . import operation_deadline
+    else:
+        import operation_deadline  # pyright: ignore[reportImplicitRelativeImport]
+
+    return operation_deadline.remaining(cap)
 
 
 def _settings() -> ConfigRead:
@@ -137,10 +147,10 @@ def registered_copy(envrc: Path) -> bool:
         environment = _git_environment()
         expected = subprocess.run(
             ["git", "rev-parse", "--verify", "--end-of-options", f"{source_commit}:.envrc"],
-            cwd=source, env=environment, capture_output=True, text=True, timeout=operation_deadline.remaining(timeout), check=True)
+            cwd=source, env=environment, capture_output=True, text=True, timeout=_remaining_timeout(timeout), check=True)
         actual = subprocess.run(
             ["git", "hash-object", "--no-filters", "--", str(folder / ".envrc")],
-            cwd=source, env=environment, capture_output=True, text=True, timeout=operation_deadline.remaining(timeout), check=True)
+            cwd=source, env=environment, capture_output=True, text=True, timeout=_remaining_timeout(timeout), check=True)
         return bool(expected.stdout.strip()) and expected.stdout.strip() == actual.stdout.strip()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return False
@@ -181,7 +191,7 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         try:
             for command in commands:
                 result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
-                                        text=True, timeout=operation_deadline.remaining(timeout), check=False)
+                                        text=True, timeout=_remaining_timeout(timeout), check=False)
                 if result.returncode:
                     reason = last_line(result.stderr, f"direnv exit {result.returncode}")
                     if not trusted and any(word in result.stderr.lower() for word in ("not allowed", "blocked", "denied")):
