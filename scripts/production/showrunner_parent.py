@@ -10,6 +10,7 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.production.store_owner import showrunner_id
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff, staff_sources
@@ -20,7 +21,7 @@ def attach(child: str, parent: str, *, record: staff.StaffSnapshot | None = None
     """Store the checked desired parent; repeat calls keep the same file."""
     child, parent = showrunners.canonical_slug(child), showrunners.canonical_slug(parent)
     showrunner_tree.check_attach(child, parent, record=record)
-    path = showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE
+    path = showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child, record=record) / showrunners.PARENT_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, f"{parent}\n")
 
@@ -29,7 +30,7 @@ def detach(child: str, *, record: staff.StaffSnapshot | None = None) -> str:
     """Remove the parent file, returning its former parent or an empty string."""
     child = showrunners.canonical_slug(child)
     parent = showrunner_tree.parent_of(child, record=record)
-    (showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE).unlink(missing_ok=True)
+    (showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child, record=record) / showrunners.PARENT_FILE).unlink(missing_ok=True)
     return parent
 
 
@@ -45,7 +46,7 @@ class NoPendingParentNotice:
 
 
 def _notice_file(child: str) -> Path:
-    return showrunners.SHOWRUNNER_STATE_DIR / child / "parent_notice.json"
+    return showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child) / "parent_notice.json"
 
 
 def _pending_notice(child: str) -> PendingParentNotice | NoPendingParentNotice:
@@ -101,7 +102,7 @@ def attach_parent(child: str, parent: str = "") -> None:
         if isinstance(pending, PendingParentNotice) and pending != PendingParentNotice("attach", parent):
             raise staff.StaffRefused(f"{child}: finish its pending {pending.action} to {pending.parent} first")
         child_row, parent_row = _row(child, record), _row(parent, record)
-        path = showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE
+        path = showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(child, record=record) / showrunners.PARENT_FILE
         try:
             recorded_parent = path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:

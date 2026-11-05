@@ -333,9 +333,11 @@ class HanaInstancesTests(unittest.TestCase):
             with self.subTest(port=port, case="user"):
                 self.assertFalse(hana_instances.is_test_hana(user, config))
                 self.assertFalse(hana_instances.over_limit(replace(user, age_seconds=1_000_000), config))
-            for key in ("CLAUDECODE", "SSH_CONNECTION", "SHOWRUNNER_UNIT_ID"):
+            for key in ("CLAUDECODE", "SSH_CONNECTION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
                 with self.subTest(port=port, agent=key):
                     self.assertTrue(hana_instances.is_test_hana(replace(user, environment={**user.environment, key: "agent"}), config))
+            with self.subTest(port=port, agent="SHOWRUNNER_UNIT_ID"):
+                self.assertFalse(hana_instances.is_test_hana(replace(user, environment={"SHOWRUNNER_UNIT_ID": "agent"}), config))
             self.assertTrue(hana_instances.is_test_hana(replace(user, owner="window-unit"), config))
             self.assertTrue(hana_instances.is_test_hana(replace(user, purpose="CI icon"), config))
         unknown = replace(base, port=0, environment={})

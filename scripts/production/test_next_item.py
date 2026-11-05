@@ -397,7 +397,6 @@ class NextItemTests(unittest.TestCase):
                                + f"- **Proposals:** {issues_folder}\n")
             _ = (issues_folder / f"{slug}-item.md").write_text(
                 f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
-            _ = (outstanding / f"{slug}.json").write_text(f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
         path = self.root / "change-review" / "change-review - natedev.md"
         # The side production is a root of its own, with its own list.
         side_list = path.with_name("change-review - side.md")
@@ -415,6 +414,8 @@ class NextItemTests(unittest.TestCase):
             if existing is not None:
                 _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
             owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
+            _ = (outstanding / f"{owner.id}.json").write_text(
+                f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
             timer.mkdir(parents=True)
             _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")

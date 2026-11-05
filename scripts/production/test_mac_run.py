@@ -25,7 +25,7 @@ MAC_TEST = SCRIPT.parent.parent / "mac_test" / "mac_test.py"
 SHA = "1234567890abcdef1234567890abcdef12345678"
 # build_hold.owning_session() reads these; a Mac block admits the session they name.
 SESSION_SELECTORS = frozenset({
-    "CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
+    "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
     "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
 })
 
@@ -521,10 +521,10 @@ class MacRunTests(unittest.TestCase):
         for explicit_owner in (False, True):
             with self.subTest(explicit_owner=explicit_owner):
                 self.clear_events()
-                owner = "director's $(touch OWNER_INJECTION)" if explicit_owner else "resources director"
+                owner = "director's $(touch OWNER_INJECTION)" if explicit_owner else "019b3a40-4250-7000-8000-000000000104"
                 result = self.mac_run(extra={
                     "HANA_TEST_PURPOSE": purpose,
-                    "SHOWRUNNER_UNIT_ID": "resources director",
+                    "CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000104",
                     "HANA_TEST_OWNER": owner if explicit_owner else "",
                 })
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

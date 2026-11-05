@@ -32,7 +32,7 @@ import rca  # noqa: E402
 import review  # noqa: E402
 import send  # noqa: E402
 import sessions  # noqa: E402
-import session_staff  # noqa: E402
+from scripts.production import session_staff  # noqa: E402
 from scripts.production import showrunners, staff, fake_showrunner  # noqa: E402
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, fixture_member  # noqa: E402
 from test_showrunners import stalled_session_reader  # noqa: E402
@@ -123,8 +123,8 @@ class RcaTests(unittest.TestCase):
         # A fixed clock: a case id carries the day, so a call with no time of its own opens 261023-<n> on any day.
         _ = self.enterContext(mock.patch.object(rca, "now", return_value=OPENED))
         (self.root / "sessions").mkdir()
-        removed = (session_staff.PRODUCTION_MARK, "CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
-        environment = {key: value for key, value in os.environ.items() if key not in removed}
+        removed = ("CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
+        environment = {key: value for key, value in os.environ.items() if key not in removed and not key.startswith("SHOWRUNNER_")}
         self.enterContext(mock.patch.dict(os.environ, environment | {
             "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "NOTIFY_STATE_DIR": str(self.root / "notify")},
@@ -335,16 +335,16 @@ subprocess.run([sys.executable, '-c',
         self.live_session("marked", member.current_session)
         timers = self.root / "notifiers"
         _ = fake_showrunner.write_timer(timers, "cargo-liner", owner.current_session, "UTC", doc)
-        with (mock.patch.dict(os.environ, {session_staff.PRODUCTION_MARK: "cargo-liner"}),
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_" + "UNIT": "cargo-liner"}),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers)):
             _ = rca.open_case(HANDLER._replace(session="marked", production=""), OPENED)
         self.assertEqual([flags(argv)["--to"] for argv in self.sends()], ["natedev", "natedev", SHOWRUNNER])
         self.assertEqual(self.case("261023-3")["production"], "cargo-liner")
 
-    def test_the_mark_is_the_one_unit_lookup_reads(self) -> None:
+    def test_native_identity_uses_the_shared_member_resolver(self) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
         import unit_lookup
-        self.assertEqual(session_staff.PRODUCTION_MARK, unit_lookup.PRODUCTION_MARK)
+        self.assertIs(session_staff.member_sources, unit_lookup.member_sources)
 
     def test_a_by_hand_open_takes_the_newest_transcript_of_the_session_it_names(self) -> None:
         _ = self.transcript("-home-handler-old", "sid-handler", 1000)
