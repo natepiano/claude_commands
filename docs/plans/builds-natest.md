@@ -340,7 +340,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - coverage.py: the Nix Python does not have it (showrunner ruling 2026-11-04).
 - Parsing `-I`/`-S`/`-E` flags: the count rule covers them with no parser.
 
-### Phase 13 — The slowest modules lose the tests that only repeat other tests  · status: todo
+### Phase 13 — The slowest modules lose the tests that only repeat other tests  · status: done
 **Depends on:** Phase 12, Phase 7, Phase 14, Phase 15
 
 #### Work Order
@@ -511,4 +511,35 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the changed test modules green on a tree with origin/builds merged after report Phase 20 lands
 - a mirror step test records the identity sent from natedev
 - the cold `show.py` import time before and after item 7, measured in same-load pairs, in the checkpoint notice
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 19 — The coverage tool runs under a mocked `subprocess.Popen` and its git child test passes at high load  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `coverage_overlap.py` collects a module whose fixture replaces `subprocess.Popen` with a mock, and `test_git_child_keeps_coverage_known` passes at load 60.
+
+**Spec:** Both defects are in this unit's own Phase 15 code. The showrunner ruled the flaky test a bounded fix after Phase 13 (2026-11-04).
+
+1. Mocked Popen: `line_collector.py` checks `isinstance(process, subprocess.Popen)` at the time of the call (`stack_popen`, about line 150, and the audit hook, about line 226). A fixture that sets `subprocess.Popen` to a mock makes the second argument a non-type, and the test fails with `TypeError: isinstance() arg 2 must be a type`. Seen on `scripts/direct/test_verify_ssh_targets_routing.py` `test_held_local_target_does_not_block_linux_check` (fixture `verify_mac_offload_test_support.py` about line 980). Keep the real class at import, beside `POPEN_INIT`, and check against it.
+2. Flaky test: `test_coverage_overlap.py` `test_git_child_keeps_coverage_known` failed once at load 60 and passed on rerun; 0 of 25 repeats failed at load 54. Find the cause from the failure text. Fix the cause in the collector or the fixture; do not add a retry or a longer wait.
+
+**Files:**
+- `scripts/test_times/line_collector.py` — the Popen class kept at import
+- `scripts/test_times/coverage_overlap.py` — only if the flaky cause is there
+- `scripts/test_times/test_coverage_overlap.py` — a regression test with a mocked `subprocess.Popen`; the flaky test fix
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `line_collector.py`, `coverage_overlap.py`
+- `test` — `test_coverage_overlap.py`: a fixture module that patches `subprocess.Popen` with a mock collects without an error; the git child test under parallel load
+
+**Constraints from prior phases:**
+- Phase 15: an unknown test names its cause and is never a removal candidate. Keep every cause and its tests.
+- Phase 13: the five slowest modules gave no removal (see its As-built). Most of their tests are unknown through unverified launches of bash, git, rustc, ssh and rsync.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/test_times -p 'test_coverage_overlap.py'` green
+- `python3 scripts/test_times/coverage_overlap.py scripts/direct test_verify_ssh_targets_routing.py` runs all 13 tests with no collector error
+- the git child test passes 25 of 25 repeats at a load of 55 or more
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
