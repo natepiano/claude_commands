@@ -39,7 +39,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.mac_test import floor_claims
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from memory_test_support import config_environment, write_config_fixture
-from test_build_shape import create_step_index, record_root_attempt
+from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
 from scripts.buildlog import index as build_index
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
@@ -60,8 +60,8 @@ else:
     from scripts.production.cli_fixture import ImmutableGitSeed
     import build_hold
     import record
-    import scratch
     import store
+    import scratch
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import process_table
     import sessions
@@ -1244,6 +1244,20 @@ class FloorTests(SweepCase):
         record_root_attempt(build_index.index_path(), str(workspace), str(target), str(build),
                             cwd=str(cwd), step=step, call_id=call_id, host=host or store.host_name(),
                             argv=argv, target_folder=str(target_folder))
+
+    def test_recorded_outputs_use_the_cwd_when_the_worktree_is_unknown(self) -> None:
+        base = self.base()
+        workspace, member = base / "workspace", base / "workspace" / "member"
+        fallback = base / "fallback"
+        target, build, other = base / "target", base / "build", base / "other-target"
+        for path in (target, build, other):
+            path.mkdir()
+        self.root_row(workspace, target, build, cwd=member)
+        self.root_row("unknown", other, other, cwd=fallback)
+        _, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
+        self.assertCountEqual(outputs.workspaces, (
+            CargoOutputRoots(workspace, target, build), CargoOutputRoots(fallback, other, other),
+        ))
 
     def test_recorded_step_kinds_supply_floor_targets_without_running_cargo(self) -> None:
         base = self.base()
@@ -6321,6 +6335,32 @@ class BudgetTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "-c", "import sweep"], cwd=base, env=environment,
                                 capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_sweep_import_loads_one_copy_of_record_index_and_step_outputs(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(__file__).resolve().parents[2]
+        environment = {**os.environ, **config_environment(base / "config"),
+                       "STAFF_FILE": "/nonexistent/staff.json",
+                       "BUILD_HOLD_DIR": str(base / "holders"),
+                       "BUILD_HOLD_RELEASE_DIR": str(base / "release"),
+                       "BUILDLOG_DIR": str(base / "buildlog"),
+                       sweep.tmp_sweep.STATE_ENV: str(base / "state"),
+                       "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
+                       "PYTHONPATH": os.pathsep.join((str(root / "scripts/lint"), str(root)))}
+        for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
+            _ = environment.pop(name, None)
+        command = ("import json, sys; import sweep; "
+                   "print(json.dumps([name for name in sys.modules "
+                   "if name in ('record', 'scripts.buildlog.record', 'index', 'scripts.buildlog.index', "
+                   "'step_outputs', 'scripts.buildlog.step_outputs')]))")
+        result = subprocess.run([sys.executable, "-c", command], cwd=root, env=environment,
+                                capture_output=True, text=True, check=False,
+                                timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        loaded = cast(list[str], json.loads(result.stdout))
+        for name in ("record", "index", "step_outputs"):
+            with self.subTest(module=name):
+                self.assertEqual(len(set(loaded) & {name, "scripts.buildlog." + name}), 1, loaded)
 
     def test_config_reads_as_lint_config_sh_does(self) -> None:
         values = conf.read(Path(self.config())).values()

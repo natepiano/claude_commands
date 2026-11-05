@@ -10,30 +10,12 @@ from contextlib import closing
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from collections.abc import Sequence
 from typing import final, override
 
-from build_shape import (AbsoluteRecordedRoot, CompileCountUnknown, CompiledCrates, NoBuildShape,
-                         NoCratesCompiled, RecordedOutputPair, RecordedOutputRoots, RecordedRootsUnavailable,
-                         RelativeRecordedRoot, StepEvidence, UnknownRecordedRoot, build_shape,
-                         index_step_evidence, recorded_output_roots)
+from build_shape import (CompileCountUnknown, CompiledCrates, NoBuildShape, NoCratesCompiled,
+                         StepEvidence, build_shape, index_step_evidence)
 
-
-def create_step_index(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as connection, connection:
-        _ = connection.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
-                               + "call_id TEXT, argv TEXT, crates_compiled INTEGER, worktree TEXT, cwd TEXT, "
-                               + "target_directory TEXT, build_directory TEXT, target_dir TEXT, target_folder TEXT)")
-
-
-def record_root_attempt(path: Path, workspace: str, target: str, build: str, *, cwd: str = "",
-                        host: str = "natedev", step: str = "build", call_id: str = "attempt",
-                        argv: Sequence[str] = (), target_folder: str = "") -> None:
-    with closing(sqlite3.connect(path)) as connection, connection:
-        _ = connection.execute("INSERT INTO steps(host, step, call_id, worktree, cwd, "
-                               + "target_directory, build_directory, argv, target_folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                               (host, step, call_id, workspace, cwd, target, build, json.dumps(list(argv)), target_folder))
+from scripts.buildlog.step_outputs_test_support import create_step_index
 
 
 class BuildShapeTests(unittest.TestCase):
@@ -248,100 +230,6 @@ class IndexStepEvidenceTests(unittest.TestCase):
         self.row("literal", ["cargo", "build", "--lib"])
         self.assertEqual(index_step_evidence(special, "natedev", "build", self.cutoff, self.before),
                          {("literal", "build"): StepEvidence(build_shape(["cargo", "build", "--lib"]), CompiledCrates(3))})
-
-
-@final
-class RecordedOutputRootsTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.directory.name).resolve()
-        self.index = self.root / "steps?#.sqlite"
-
-    @override
-    def setUp(self) -> None:
-        self.addCleanup(self.directory.cleanup)
-        create_step_index(self.index)
-
-    def test_every_step_kind_and_attempt_retains_its_workspace_and_root_pair(self) -> None:
-        workspace = str(self.root / "checkout")
-        expected: list[RecordedOutputPair] = []
-        for number, step in enumerate(("build", "check", "clippy", "mend", "doc", "nextest", "test", "t")):
-            target, build = self.root / f"target-{number}", self.root / f"build-{number}"
-            record_root_attempt(self.index, workspace, str(target), str(build), step=step, call_id="same-call")
-            expected.append(RecordedOutputPair(AbsoluteRecordedRoot(target), AbsoluteRecordedRoot(build)))
-        record_root_attempt(self.index, workspace, "/wrong-host/target", "/wrong-host/build", host="other")
-        fallback = self.root / "cwd"
-        record_root_attempt(self.index, "unknown", str(fallback / "target"), str(fallback / "target"),
-                            cwd=str(fallback), call_id="")
-        before = self.index.read_bytes(), self.index.stat().st_mtime_ns
-        roots = recorded_output_roots(self.index, "natedev")
-        self.assertEqual(roots, RecordedOutputRoots({
-            AbsoluteRecordedRoot(Path(workspace)): tuple(expected),
-            AbsoluteRecordedRoot(fallback): (RecordedOutputPair(AbsoluteRecordedRoot(fallback / "target"),
-                                               AbsoluteRecordedRoot(fallback / "target")),),
-        }))
-        self.assertEqual((self.index.read_bytes(), self.index.stat().st_mtime_ns), before)
-
-    def test_target_overrides_do_not_authorize_recorded_output_pairs(self) -> None:
-        workspace, target = self.root / "workspace", self.root / "default-target"
-        valid = self.root / "valid"
-        record_root_attempt(self.index, str(valid), str(valid / "target"), str(valid / "target"))
-        arguments = (["cargo", "build", "--target-dir", str(target)],
-                     ["cargo", "build", f"--target-dir={target}"],
-                     ["cargo", "build", "--config", f'build.target-dir="{target}"'],
-                     ["cargo", "build", f'--config=build.target-dir="{target}"'])
-        for argv in arguments:
-            record_root_attempt(self.index, str(workspace), str(target), str(target), argv=argv)
-        record_root_attempt(self.index, str(workspace), str(target), str(target),
-                            target_folder=str(self.root / "different-target"))
-        self.assertEqual(recorded_output_roots(self.index, "natedev"), RecordedOutputRoots({
-            AbsoluteRecordedRoot(valid): (RecordedOutputPair(AbsoluteRecordedRoot(valid / "target"),
-                                                             AbsoluteRecordedRoot(valid / "target")),),
-        }))
-
-    def test_unknown_and_relative_roots_have_distinct_states(self) -> None:
-        workspace = str(self.root / "workspace")
-        record_root_attempt(self.index, workspace, "unknown", "relative/build")
-        record_root_attempt(self.index, "", "target", "unknown", cwd=str(self.root / "fallback"))
-        self.assertEqual(recorded_output_roots(self.index, "natedev"), RecordedOutputRoots({
-            AbsoluteRecordedRoot(Path(workspace)): (RecordedOutputPair(UnknownRecordedRoot(), RelativeRecordedRoot()),),
-            AbsoluteRecordedRoot(self.root / "fallback"): (RecordedOutputPair(RelativeRecordedRoot(), UnknownRecordedRoot()),),
-        }))
-
-    def test_unavailable_index_has_a_named_state_and_creates_no_index(self) -> None:
-        missing = self.root / "missing.sqlite"
-        self.assertIsInstance(recorded_output_roots(missing, "natedev"), RecordedRootsUnavailable)
-        self.assertFalse(missing.exists())
-        _ = self.index.write_text("broken index")
-        self.assertIsInstance(recorded_output_roots(self.index, "natedev"), RecordedRootsUnavailable)
-
-    def test_legacy_index_without_build_root_uses_the_target_root(self) -> None:
-        workspace, target = str(self.root / "workspace"), self.root / "target"
-        record_root_attempt(self.index, workspace, str(target), "unknown")
-        with closing(sqlite3.connect(self.index)) as connection, connection:
-            _ = connection.execute("ALTER TABLE steps DROP COLUMN build_directory")
-        self.assertEqual(recorded_output_roots(self.index, "natedev"), RecordedOutputRoots({
-            AbsoluteRecordedRoot(Path(workspace)): (RecordedOutputPair(AbsoluteRecordedRoot(target), AbsoluteRecordedRoot(target)),),
-        }))
-
-    def test_root_reader_keeps_the_existing_step_evidence_result(self) -> None:
-        argv = ["cargo", "nextest", "run", "--release", "-E", "package(app)"]
-        at = datetime(2026, 10, 30, 9, tzinfo=UTC)
-        with closing(sqlite3.connect(self.index)) as connection, connection:
-            for target, count in (("old-target", 2), ("new-target", 3)):
-                _ = connection.execute("INSERT INTO steps(host, step, call_id, started_at, argv, crates_compiled, "
-                                       + "worktree, target_directory, build_directory) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                       ("natedev", "nextest", "retry", at.isoformat(), json.dumps(argv), count,
-                                        str(self.root), str(self.root / target), str(self.root / (target + "-build"))))
-        before = at - timedelta(days=1)
-        after = at + timedelta(days=1)
-        expected = {("retry", "nextest"): StepEvidence(build_shape(argv), CompiledCrates(5), tuple(argv))}
-        self.assertEqual(index_step_evidence(self.index, "natedev", "nextest", before, after), expected)
-        roots = recorded_output_roots(self.index, "natedev")
-        self.assertIsInstance(roots, RecordedOutputRoots)
-        assert isinstance(roots, RecordedOutputRoots)
-        self.assertEqual(len(roots.workspaces[AbsoluteRecordedRoot(self.root)]), 2)
 
 
 if __name__ == "__main__":

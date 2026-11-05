@@ -199,25 +199,27 @@ if TYPE_CHECKING:
     from ..lib import scratch
     from ..lib.atomic_file import write_text_atomic
     from ..buildlog import index as build_index, record, store
+    from ..buildlog.step_outputs import (AbsoluteRecordedRoot, RecordedStepOutput, RecordedStepOutputs,
+                                        TargetFolderOverride, recorded_output_roots)
     from ..notify.push_texts import RenderedPush
     from ..notify import review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.copies import copies
     from scripts.lint import tmp_sweep
     import scratch
     from atomic_file import write_text_atomic
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
+    import index as build_index
     import record
     import store
-    import index as build_index
+    from step_outputs import (AbsoluteRecordedRoot, RecordedStepOutput, RecordedStepOutputs,
+                              TargetFolderOverride, recorded_output_roots)
 
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.mac_test import floor_claims
-from build_shape import AbsoluteRecordedRoot, RecordedOutputRoots, recorded_output_roots
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -376,6 +378,21 @@ def _cargo_mapping_rows(rows: object) -> tuple[CargoOutputRoots, ...]:
     return tuple(mappings)
 
 
+def _recorded_mapping_rows(rows: Iterable[RecordedStepOutput]) -> tuple[CargoOutputRoots, ...]:
+    """Keep output pairs that the recorded step can prove it built."""
+    mappings: list[CargoOutputRoots] = []
+    for row in rows:
+        target, build, folder = row.target_directory, row.build_directory, row.target_folder
+        if (row.target_folder_override is TargetFolderOverride.PRESENT
+                or (isinstance(folder, AbsoluteRecordedRoot) and folder != target)):
+            continue
+        workspace = row.worktree if isinstance(row.worktree, AbsoluteRecordedRoot) else row.cwd
+        if (isinstance(workspace, AbsoluteRecordedRoot) and isinstance(target, AbsoluteRecordedRoot)
+                and isinstance(build, AbsoluteRecordedRoot)):
+            mappings.append(CargoOutputRoots(workspace.path, target.path, build.path))
+    return tuple(mappings)
+
+
 def saved_cargo_output_roots() -> CargoOutputIndex:
     try:
         rows = cast(object, json.loads(cargo_output_cache_path().read_text()))
@@ -425,23 +442,17 @@ def discover_cargo_outputs(roots: Sequence[str], *,
     discovered = target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees)
     recorded = recorded_output_roots(build_index.index_path(), store.host_name())
     cached = saved_cargo_output_roots()
-    mappings: list[CargoOutputRoots] = []
-    if isinstance(recorded, RecordedOutputRoots):
-        for workspace, attempts in recorded.workspaces.items():
-            if not isinstance(workspace, AbsoluteRecordedRoot):
-                continue
-            for attempt in attempts:
-                target, build = attempt.target_directory, attempt.build_directory
-                if isinstance(target, AbsoluteRecordedRoot) and isinstance(build, AbsoluteRecordedRoot):
-                    mappings.append(CargoOutputRoots(workspace.path, target.path, build.path))
+    mappings: tuple[CargoOutputRoots, ...] = ()
+    if isinstance(recorded, RecordedStepOutputs):
+        mappings = _recorded_mapping_rows(recorded.rows)
     else:
         print(f"lint sweep: recorded output roots unavailable: {recorded.reason}", file=sys.stderr)
     resolve = cache(Path.resolve)
     combined = tuple(dict.fromkeys(CargoOutputRoots(*(resolve(path) for path in (
         item.workspace_root, item.target_directory, item.build_directory)))
-        for item in dict.fromkeys((*mappings, *cached.workspaces, *cached.history))))
-    mapped = {str(path) for item in combined
-              for path in (item.target_directory, item.build_directory) if path.is_dir()}
+        for item in (*mappings, *cached.workspaces, *cached.history)))
+    mapped_paths = {path for item in combined for path in (item.target_directory, item.build_directory)}
+    mapped = {str(path) for path in mapped_paths if path.is_dir()}
     added = sorted(mapped - set(discovered))
     if added:
         discovered = sorted(set(discovered) | set(target_dirs(added, lint_settings=lint_settings, known_trees=known_trees)))

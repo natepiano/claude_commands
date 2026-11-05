@@ -1706,7 +1706,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** Cargo labels for the measured folders (the measurement excludes Cargo targets); a director-recorded text approval (the approval is the user's).
 
-### Phase 64 — Recorded step outputs have one owner, distinct rows and row facts  · status: todo
+### Phase 64 — Recorded step outputs have one owner, distinct rows and row facts  · status: done
 **Depends on:** Phase 63 (both change `scripts/lint/sweep.py`); report-unit Phase 20 and its follow-up for `scripts/buildlog/memory.py` (merge `origin/builds` first).
 
 #### Work Order
@@ -1746,7 +1746,40 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - The reader's CPU time on natedev, before and after, is in the checkpoint notice. A floor-only dry run on natedev stays under 30 s.
 - Change-Review line: none — internal reader structure; sweep and memory behavior do not change.
 
-### Phase 65 — The floor takes evidence from target-folder override rows that the fixed recorder wrote  · status: todo
+### Phase 65 — Memory kill classification reads the shared step output rows and applies its own rule  · status: todo
+**Depends on:** Phase 64 (the reader moved to `scripts/buildlog/step_outputs.py`); report-unit Phase 20 and its follow-up for `scripts/buildlog/memory.py` on `origin/builds`. Do not merge report's branch; merge `origin/builds` once both are there.
+
+#### Work Order
+
+**Goal:** `memory.py` reads the recorded step rows from `step_outputs.recorded_output_roots` and applies its own classification rule to the row facts.
+
+**Measured (Phase 64, 2026-11-05):**
+- Phase 64 moved the reader from `scripts/lint/build_shape.py` to `scripts/buildlog/step_outputs.py`. It returns each distinct row once with its facts (worktree, cwd, target and build folders, target folder, override marker), not applied rules. Reader CPU time fell from 400.22 ms to 117.65 ms.
+- report-unit Phase 20 changes `memory.py` and was not on `origin/builds` at the Phase 64 checkpoint, so Phase 64 Spec 3's `memory.py` part moved here.
+
+**Spec:**
+1. Make `memory.py` call `step_outputs.recorded_output_roots` and import nothing from `build_shape` for it.
+2. Apply memory's own rule to the row facts in `memory.py`. Delete any second dedupe of the rows.
+3. Make the memory tests build their index with `scripts/buildlog/step_outputs_test_support.py`.
+
+**Constraints from prior phases:**
+- Keep memory kill classification results equal to report-unit Phase 20's results on the same fixture rows.
+- `step_outputs` returns facts only; a caller rule stays in its caller.
+
+**Files:**
+- `scripts/buildlog/memory.py` — the caller and its rule.
+- The memory tests that report-unit Phase 20 adds — tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `memory.py`.
+- `test` owns the memory tests.
+
+**Acceptance gate:**
+- Tests prove memory classification applies its own rule to the same rows as before.
+- The memory tests, `scripts/buildlog/test_step_outputs.py` and `scripts/lint/test_sweep.py` pass. Basedpyright reports `0 errors, 0 warnings, 0 notes` over the changed files.
+- Change-Review line: none — internal caller structure; memory classification does not change.
+
+### Phase 66 — The floor takes evidence from target-folder override rows that the fixed recorder wrote  · status: todo
 **Depends on:** Phase 64 (the reader and sweep's rule move there); report-unit Phase 19 (`2ae242c18`) on `origin/builds`. Do not merge report's branch; start only when `git merge-base --is-ancestor 2ae242c18 origin/builds` succeeds.
 
 #### Work Order

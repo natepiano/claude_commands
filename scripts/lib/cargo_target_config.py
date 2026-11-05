@@ -31,6 +31,17 @@ def cargo_path_argument(argv: list[str], flag: str) -> str:
     return ""
 
 
+def cargo_config_values(argv: list[str]) -> list[str]:
+    """Read each nonempty Cargo config argument in command order."""
+    values: list[str] = []
+    for index, arg in enumerate(argv):
+        value = arg.split("=", 1)[1] if arg.startswith("--config=") else (
+            argv[index + 1] if arg == "--config" and index + 1 < len(argv) else "")
+        if value:
+            values.append(value)
+    return values
+
+
 def cargo_home_folder(cwd: str, environment: Mapping[str, str]) -> str:
     """Resolve Cargo home against the command's working folder."""
     cargo_home = environment.get("CARGO_HOME")
@@ -84,14 +95,11 @@ def cargo_folder_settings(argv: list[str], cwd: str, environment: Mapping[str, s
             if environment.get(variable):
                 settings[key] = CargoFolderSetting(environment[variable], directory)
     if not strict:
-        for index, arg in enumerate(argv):
-            setting = arg.split("=", 1)[1] if arg.startswith("--config=") else (
-                argv[index + 1] if arg == "--config" and index + 1 < len(argv) else "")
-            if setting:
-                if "=" in setting:
-                    read_settings(setting, directory)
-                else:
-                    read_config(directory / setting)
+        for setting in cargo_config_values(argv):
+            if "=" in setting:
+                read_settings(setting, directory)
+            else:
+                read_config(directory / setting)
     named = cargo_path_argument(argv, "--target-dir")
     if named:
         settings["target-dir"] = CargoFolderSetting(named, directory)

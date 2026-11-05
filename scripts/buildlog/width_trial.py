@@ -15,12 +15,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import fmean, median
-from typing import Literal, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 import store
 import index as buildlog_index
+if TYPE_CHECKING:
+    from .step_outputs import indexed_argv
+else:
+    from step_outputs import indexed_argv
 from memory_admit import expected_peak, git_identity, test_threads, read_memory_config
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
@@ -97,23 +101,6 @@ def _epoch(stamp: object) -> float:
     return parsed.timestamp()
 
 
-def _argv(value: object) -> list[str]:
-    if not isinstance(value, str):
-        return []
-    try:
-        decoded = cast(object, json.loads(value))
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(decoded, list):
-        return []
-    arguments: list[str] = []
-    for item in cast(list[object], decoded):
-        if not isinstance(item, str):
-            return []
-        arguments.append(item)
-    return arguments
-
-
 def _filter_expression(argv: list[str]) -> str | None:
     for index, argument in enumerate(argv[:-1]):
         if argument == "-E":
@@ -149,7 +136,7 @@ def load_steps(index: Path, since: float, until: float, host: str) -> list[Step]
         request = _epoch(started_at) - wait
         if not since <= request < until:
             continue
-        argv = _argv(raw_argv)
+        argv = indexed_argv(raw_argv)
         duration = float(duration_s) if isinstance(duration_s, (int, float)) else None
         finished = float(finished_s) if isinstance(finished_s, (int, float)) else None
         steps.append({
@@ -354,7 +341,7 @@ def _test_timeouts(index: Path, step_ids: set[str]) -> int:
 
 
 def _uses_memory_gate(step_name: object, raw_argv: object) -> bool:
-    argv = _argv(raw_argv)
+    argv = indexed_argv(raw_argv)
     if step_name == "sweep" and any(argument.endswith("/sweep.py") for argument in argv):
         return False
     if argv and argv[0] == "taplo":
