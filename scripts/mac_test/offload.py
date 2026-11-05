@@ -909,12 +909,7 @@ def config_path() -> Path:
 
 def configured_ssh_target(target: str) -> target_config.SshTarget:
     """Resolve an SSH target before access to its coordination state."""
-    for configured in target_config.read_targets():
-        if configured.name == target and isinstance(configured, target_config.SshTarget):
-            if target in (".", "..") or Path(target).name != target:
-                raise target_config.ConfigError(f"invalid target name: {target}")
-            return configured
-    raise target_config.ConfigError(f"unknown SSH target: {target}")
+    return target_config.configured_ssh_target(target)
 
 
 def ssh_target_state_directory(target: str) -> Path:
