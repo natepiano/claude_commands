@@ -152,6 +152,74 @@
       "time": "2026-11-01T12:00:00-05:00"
     }
   },
+  "mac_idle.blocked": {
+    "research_block": {
+      "objections": [
+        {
+          "quote": "It labeled the reservation \"P15 F11 L0 run\".",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Waiting work can use the Mac after /build:mac unblock by research.",
+          "rule": "short-plain-sentences"
+        }
+      ],
+      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
+      "sha256": "f76a5c0c26fb8355fa2c0eb9b7f1d3f6e440eb58aec3dcecc1130c5200b6a015",
+      "time": "2026-10-31T12:44:06.063942-04:00"
+    },
+    "three_waiting": {
+      "objections": [
+        {
+          "quote": "It labeled the reservation \"P15 F11 L0 run\".",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Waiting work can use the Mac after /build:mac unblock by research.",
+          "rule": "short-plain-sentences"
+        }
+      ],
+      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
+      "sha256": "f76a5c0c26fb8355fa2c0eb9b7f1d3f6e440eb58aec3dcecc1130c5200b6a015",
+      "time": "2026-10-31T12:44:18.928341-04:00"
+    }
+  },
+  "mac_idle.stuck": {
+    "free_mac": {
+      "objections": [
+        {
+          "quote": "On natedev, ask the builds showrunner to get the waiting steps onto the Mac",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "To restore Mac work: the builds showrunner checks why the waiting steps do not take the Mac.",
+          "rule": "short-plain-sentences"
+        }
+      ],
+      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
+      "sha256": "6271a0b3b4f4bbccd4806e62fc445bc50e8b76133d5939d21aa7c655c3bae145",
+      "time": "2026-10-31T12:44:42.963275-04:00"
+    },
+    "idle_research_claim": {
+      "objections": [
+        {
+          "quote": "The Mac reservation lists holder \"research\" and label \"P15 F11 L0 run\".",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "To restore Mac work: release of the idle claim P15 F11 L0 run.",
+          "rule": "short-plain-sentences"
+        },
+        {
+          "quote": "3 steps wait.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
+      "sha256": "6271a0b3b4f4bbccd4806e62fc445bc50e8b76133d5939d21aa7c655c3bae145",
+      "time": "2026-10-31T12:44:32.376815-04:00"
+    }
+  },
   "nate.adhoc": {
     "long_sender": {
       "objections": [
@@ -1034,6 +1102,28 @@
       "time": "2026-10-23T09:50:57.721466-04:00"
     }
   },
+  "sweep.disk_floor": {
+    "available": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:44.139656-05:00"
+    },
+    "insufficient": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:55.296319-05:00"
+    },
+    "protected": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:33:00.403543-05:00"
+    },
+    "unavailable": {
+      "reviewer": "opus",
+      "sha256": "8745df456cd23372fd5f5fb6f107b2573fddcb8c5b0910a634e718432db40a76",
+      "time": "2026-11-05T12:32:50.001653-05:00"
+    }
+  },
   "vault.stopped": {
     "branch": {
       "reviewer": "opus",
@@ -1064,74 +1154,6 @@
       "reviewer": "opus",
       "sha256": "6da24c3fecf498c994e294d99ec8db48b3402fb8b4682fd1c50a57313cba21fc",
       "time": "2026-10-30T21:49:38.396991-04:00"
-    }
-  },
-  "mac_idle.blocked": {
-    "research_block": {
-      "objections": [
-        {
-          "quote": "It labeled the reservation \"P15 F11 L0 run\".",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "Waiting work can use the Mac after /build:mac unblock by research.",
-          "rule": "short-plain-sentences"
-        }
-      ],
-      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
-      "sha256": "f76a5c0c26fb8355fa2c0eb9b7f1d3f6e440eb58aec3dcecc1130c5200b6a015",
-      "time": "2026-10-31T12:44:06.063942-04:00"
-    },
-    "three_waiting": {
-      "objections": [
-        {
-          "quote": "It labeled the reservation \"P15 F11 L0 run\".",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "Waiting work can use the Mac after /build:mac unblock by research.",
-          "rule": "short-plain-sentences"
-        }
-      ],
-      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
-      "sha256": "f76a5c0c26fb8355fa2c0eb9b7f1d3f6e440eb58aec3dcecc1130c5200b6a015",
-      "time": "2026-10-31T12:44:18.928341-04:00"
-    }
-  },
-  "mac_idle.stuck": {
-    "free_mac": {
-      "objections": [
-        {
-          "quote": "On natedev, ask the builds showrunner to get the waiting steps onto the Mac",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "To restore Mac work: the builds showrunner checks why the waiting steps do not take the Mac.",
-          "rule": "short-plain-sentences"
-        }
-      ],
-      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
-      "sha256": "6271a0b3b4f4bbccd4806e62fc445bc50e8b76133d5939d21aa7c655c3bae145",
-      "time": "2026-10-31T12:44:42.963275-04:00"
-    },
-    "idle_research_claim": {
-      "objections": [
-        {
-          "quote": "The Mac reservation lists holder \"research\" and label \"P15 F11 L0 run\".",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "To restore Mac work: release of the idle claim P15 F11 L0 run.",
-          "rule": "short-plain-sentences"
-        },
-        {
-          "quote": "3 steps wait.",
-          "rule": "what-happened-why-what-you-do"
-        }
-      ],
-      "reviewer": "user-spec: builds showrunner ruling 2026-10-31 08:16 EDT; director fix round 1 F007 preserves the approved meaning with an optional reservation value; reviewer: opus",
-      "sha256": "6271a0b3b4f4bbccd4806e62fc445bc50e8b76133d5939d21aa7c655c3bae145",
-      "time": "2026-10-31T12:44:32.376815-04:00"
     }
   }
 }
