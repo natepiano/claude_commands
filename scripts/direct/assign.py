@@ -286,7 +286,7 @@ def recover_arguments(args: Arguments) -> None:
     record = read_roster(source, args.to)
     role = "impl" if args.role == "implement" else args.role
     session = session_staff.worker_session(record)
-    task = codex_mesh.task_role(session)
+    task = codex_mesh.task_role(session, codex_mesh.task_assignments())
     if not session or not isinstance(task, codex_mesh.AssignedWorkerRole) or task.role != role:
         refuse("recovery requires an existing worker with the recorded role")
     if not args.prompt:

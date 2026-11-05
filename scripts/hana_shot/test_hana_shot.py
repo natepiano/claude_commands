@@ -13,6 +13,7 @@ import shlex
 import shutil
 from pathlib import Path
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -336,15 +337,43 @@ class BuildLogIsolatedTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "capture_timeout_seconds=1\n")
+        settings = "capture_timeout_seconds=1\n"
+        if self._testMethodName == "test_screenshot_busy_past_the_resend_limit_fails":
+            settings += "resend_seconds=0.05\n"
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", settings)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.scratch / "config"),
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
         })))
 
 
+class FixtureServer(ThreadingHTTPServer):
+    """Wake the request loop when the fixture stops."""
+
+    def __init__(self, address: tuple[str, int], handler: type[BaseHTTPRequestHandler]) -> None:
+        super().__init__(address, handler)
+        self.stopping: threading.Event = threading.Event()
+        self.finished: threading.Event = threading.Event()
+
+    def serve(self) -> None:
+        try:
+            while not self.stopping.is_set():
+                self.handle_request()
+        finally:
+            self.finished.set()
+
+    @override
+    def shutdown(self) -> None:
+        if not self.stopping.is_set():
+            self.stopping.set()
+            with socket.create_connection(("127.0.0.1", self.server_port), timeout=TEST_HANG_GUARD_SECS):
+                pass
+        if not self.finished.wait(timeout=TEST_HANG_GUARD_SECS):
+            raise TimeoutError("The fixture server did not stop")
+
+
 class HanaShotTest(BuildLogIsolatedTest):
-    fake_listeners: list[ThreadingHTTPServer] = []
+    fake_listeners: list[FixtureServer] = []
     fake: Fake = Fake()
     port: int = 0
 
@@ -352,9 +381,9 @@ class HanaShotTest(BuildLogIsolatedTest):
     def setUp(self) -> None:
         super().setUp()
         self.fake = Fake()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(self.fake))
+        server = FixtureServer(("127.0.0.1", 0), handler_for(self.fake))
         self.fake_listeners = [server]
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.addCleanup(self.fake.release.set)
@@ -1005,9 +1034,9 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         server.server_close()
 
     def restart_fake_listener(self) -> None:
-        server = ThreadingHTTPServer(("127.0.0.1", self.port), handler_for(self.fake))
+        server = FixtureServer(("127.0.0.1", self.port), handler_for(self.fake))
         self.fake_listeners.append(server)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
 

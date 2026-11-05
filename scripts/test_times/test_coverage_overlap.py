@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import os
@@ -18,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
+from scripts.test_times.coverage_overlap import TestCoverage, select_candidates
 
 if TYPE_CHECKING:
     from scripts.test_times.coverage_overlap import CoverageReport, CoverageRow
@@ -156,7 +159,8 @@ def run_child() -> subprocess.CompletedProcess[str]:
 
 
 class CoverageOverlapTests(unittest.TestCase):
-    def run_fixture(self, sources: dict[str, str]) -> FixtureCoverage:
+    @contextmanager
+    def fixture_command(self, sources: dict[str, str]) -> Generator[tuple[subprocess.CompletedProcess[str], Path]]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             folder = root / "scripts" / "fixture"
@@ -200,9 +204,31 @@ class CoverageOverlapTests(unittest.TestCase):
                 [sys.executable, str(tooling / TOOL.name), str(folder), *patterns], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
+            yield result, output
+
+    def run_fixture(self, sources: dict[str, str]) -> FixtureCoverage:
+        with self.fixture_command(sources) as (result, output):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             report = cast("CoverageReport", json.loads(output.read_text(encoding="utf-8")))
             return FixtureCoverage(report, result.stdout)
+
+    def test_module_import_failure_reports_one_line_without_running_tests(self) -> None:
+        with self.fixture_command({
+            "scripts/fixture/test_broken.py": 'raise RuntimeError("fixture import refused")\n',
+            "scripts/fixture/test_not_run.py": '''
+import unittest
+
+class MustNotRun(unittest.TestCase):
+    def test_execution(self) -> None:
+        print("the suite ran")
+        raise AssertionError("the suite must not run")
+''',
+        }) as fixture:
+            result = fixture[0]
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr,
+                             "coverage overlap: test_broken.py does not import: RuntimeError: fixture import refused\n")
 
     def test_repeated_lines_remain_visible_after_the_first_test(self) -> None:
         fixture = self.run_fixture({"scripts/fixture/test_repeat.py": PRELUDE + '''
@@ -329,8 +355,44 @@ class Git(unittest.TestCase):
         git = fixture.row("test_a_git")
         parent = fixture.row("test_z_parent")
         self.assertEqual(git["child"], "none")
-        self.assertTrue(parent["candidate"])
-        self.assertEqual(parent["covered_by"], [git["id"]])
+        self.assertEqual(parent["child"], "none")
+        self.assertEqual((git["line_count"], parent["line_count"]), (1, 1))
+        slower, faster = sorted((git, parent), key=lambda row: (-row["seconds"], row["id"]))
+        self.assertTrue(slower["candidate"])
+        self.assertEqual(slower["covered_by"], [faster["id"]])
+        self.assertFalse(faster["candidate"])
+
+    def test_known_git_and_parent_coverage_selects_the_slower_test_in_both_orders(self) -> None:
+        lines = frozenset({("scripts/fixture/product.py", 2)})
+        for git_seconds, parent_seconds, candidate, covering in (
+            (2.0, 1.0, "git", "parent"),
+            (1.0, 2.0, "parent", "git"),
+        ):
+            with self.subTest(git_seconds=git_seconds, parent_seconds=parent_seconds):
+                tests = [TestCoverage("git", "pass", git_seconds, lines, "none"),
+                         TestCoverage("parent", "pass", parent_seconds, lines, "none")]
+                self.assertEqual(select_candidates(tests), {candidate: [covering]})
+
+    def test_mocked_popen_preserves_child_coverage(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_mocked_popen.py": PRELUDE + '''
+from unittest import mock
+
+class MockedPopen(unittest.TestCase):
+    def test_child(self) -> None:
+        launch = subprocess.Popen
+        with mock.patch.object(subprocess, "Popen", side_effect=launch):
+            git = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True)
+            self.assertTrue(git.stdout.startswith("git version "))
+            child = subprocess.run(
+                [sys.executable, "-c", "from product import right; print(right())"],
+                cwd=Path(__file__).parent, capture_output=True, text=True, check=True)
+            self.assertEqual(child.stdout.strip(), "right")
+        self.assertEqual(left(), "left")
+'''})
+        child = fixture.row("test_child")
+        self.assertEqual(child["status"], "pass")
+        self.assertEqual(child["child"], "none")
+        self.assertEqual(child["line_count"], 4)
 
     def test_shell_launch_cannot_cover_another_test(self) -> None:
         fixture = self.run_fixture({"scripts/fixture/test_shell.py": PRELUDE + '''

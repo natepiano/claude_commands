@@ -66,7 +66,7 @@ def worker_backend(record: staff.StaffSnapshot, identity: staff.StaffId
 
 def worker_family(record: staff.StaffSnapshot, reference: staff.StaffId) -> str:
     backend = record.backends.get(reference)
-    return "codex" if isinstance(backend, staff.CodexBackend) else "claude" if isinstance(backend, staff.ClaudeBackend) else ""
+    return backend.family if backend is not None else ""
 
 
 def codex_thread(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
