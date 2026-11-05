@@ -24,8 +24,10 @@ def create_step_index(path: Path) -> None:
 
 def record_root_attempt(path: Path, worktree: str, target: str, build: str, *, cwd: str = "",
                         host: str = "natedev", step: str = "build", call_id: str = "attempt",
-                        argv: Sequence[str] = (), target_folder: str = "") -> None:
+                        argv: Sequence[str] = (), target_folder: str = "", started_at: str | None = None) -> None:
     with closing(sqlite3.connect(path)) as connection, connection:
         _ = connection.execute("INSERT INTO steps(host, step, call_id, worktree, cwd, "
-                               + "target_directory, build_directory, argv, target_folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                               (host, step, call_id, worktree, cwd, target, build, json.dumps(list(argv)), target_folder))
+                               + "target_directory, build_directory, argv, target_folder, started_at, started_at_us) "
+                               + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (host, step, call_id, worktree, cwd, target, build, json.dumps(list(argv)),
+                                target_folder, started_at, index.epoch_microseconds(started_at)))

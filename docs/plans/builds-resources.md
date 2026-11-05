@@ -1658,7 +1658,7 @@ A memory promise keeps only history rows from the same side of each listed build
 **Binds later work:** report-unit Phase 25 deletes `memory.build_output_roots` and classifies a kill by `sweep.is_cargo_target` over the program's parent folders; after it lands, sweep is the only reader that applies a rule to the rows.
 **Gotchas:** a package-form import (`from scripts.buildlog import step_outputs`) at run time loads a second module copy beside the bare one.
 
-### Phase 66 — The floor takes evidence from target-folder override rows that the fixed recorder wrote  · status: todo
+### Phase 66 — The floor takes evidence from target-folder override rows that the fixed recorder wrote  · status: done
 **Depends on:** Phase 64 (the reader and sweep's rule move there); report-unit Phase 19 (`2ae242c18`) on `origin/builds`. Do not merge report's branch; start only when `git merge-base --is-ancestor 2ae242c18 origin/builds` succeeds.
 
 #### Work Order
