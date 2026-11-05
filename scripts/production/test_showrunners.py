@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import unit_membership, fixture_member, fixture_runtime_id
 
 import json
 import io
@@ -118,7 +118,7 @@ raise SystemExit(1)
             self.children.append(child)
             pid = child.pid
         for unit in self.hosted_units:
-            if name in (unit.session, unit.marks.get("SHOWRUNNER_UNIT_ID"), unit.marks.get("SHOWRUNNER_UNIT_ID", "").removesuffix("-unit")):
+            if name == unit.session or session_id == unit.marks.get("CODEX_THREAD_ID"):
                 fake_unit_host.place_process(self.environment(), pid, unit.pane)
         _ = (self.sessions / f"{pid}.json").write_text(json.dumps({
             "pid": pid, "name": name, "sessionId": session_id,
@@ -218,7 +218,7 @@ raise SystemExit(1)
 
     def unit_session(self, unit: str, pane: str) -> None:
         """Give the production `show` one marked herdr pane."""
-        marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}
+        marks: dict[str, str] = {"CODEX_THREAD_ID": unit_membership("show", unit).current_session}
         self.hosted_units.append(HostedUnit(f"label-of-{unit}", pane, marks))
         fake_unit_host.write(self.environment(), self.hosted_units)
 

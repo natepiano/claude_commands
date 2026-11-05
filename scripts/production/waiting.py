@@ -148,7 +148,7 @@ def units_from_doc(production: Production) -> tuple[Unit, ...]:
     try:
         record = staff.snapshot()
         rows = unit_lookup.doc_units(production.doc, record)
-        marked = unit_lookup.marked_units(production.slug, record=record)
+        marked = unit_lookup.labeled_sessions(production.slug, record=record)
     except (OSError, staff.StaffRefused) as error:
         raise WaitingFailure("production", f"the unit sessions could not be looked up: {error}") from error
     resolver = session_staff.RowResolver(record)
@@ -163,7 +163,7 @@ def units_from_doc(production: Production) -> tuple[Unit, ...]:
         if not isinstance(branch, session_staff.Branch):
             print(f"waiting: {name}: unavailable: {branch.reason}", file=sys.stderr)
             continue
-        found = marked.get(name)
+        found = marked.get(row.name)
         claude = found.claude if found is not None else None
         live = isinstance(claude, unit_lookup.LiveClaude)
         units.append(Unit(name, claude.name if live else "", branch.name, row.worktree.path,

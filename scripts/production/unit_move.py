@@ -305,7 +305,7 @@ class NoUnitConversation(NamedTuple):
     """No launch entry identifies this unit's conversation."""
 
 
-def unit_conversation(found: unit_lookup.MarkedUnit | None, *, session_id: str = "") -> UnitConversation | NoUnitConversation:
+def unit_conversation(found: unit_lookup.LabeledSession | None, *, session_id: str = "") -> UnitConversation | NoUnitConversation:
     """Use the live director's id, then its pane launch; retained launches survive a stop."""
     from scripts.accounts import accounts
 
@@ -332,7 +332,7 @@ class UnitPane(NamedTuple):
     shell: int
 
 
-def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPane | None:
+def unit_pane(found: unit_lookup.LabeledSession | None, _production: str) -> UnitPane | None:
     """Find the unit's exact pane; an exec-launched Claude leaves no shell to close."""
     if found is None:
         return None

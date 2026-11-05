@@ -110,12 +110,12 @@ class LifecycleFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         socket_for = showrunners.socket_for
-        marked_units = unit_lookup.marked_units
+        labeled_sessions = unit_lookup.labeled_sessions
         self.staff = StaffTestCase()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         _ = self.enterContext(mock.patch.object(showrunners, "socket_for", socket_for))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", marked_units))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", labeled_sessions))
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.root = self.fixture_root

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 import fcntl
 import io
 import json
@@ -157,7 +159,7 @@ class WaitingTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
         self.host_pids = {}
         fake_unit_host.write(os.environ, [
-            fake_unit_host.HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit})
+            labeled_host(unit, f"w{index}:p1", unit, slug="showrunner-example")
             for index, unit in enumerate((ALPHA, BETA), start=1)])
         for index, unit in enumerate((ALPHA, BETA), start=1):
             self.claude(unit, f"w{index}:p1")
@@ -244,7 +246,9 @@ class WaitingTests(unittest.TestCase):
         if pane not in self.host_pids:
             self.host_pids[pane] = fake_unit_host.live_pid(self)
         pid = self.host_pids[pane]
-        fake_unit_host.place_process(os.environ, pid, pane)
+        process = Path(os.environ["HERDR_PROC"]) / str(pid) / "environ"
+        if not process.exists():
+            fake_unit_host.place_process(os.environ, pid, pane, exec_shell=True)
         self.write(self.root / "sessions" / f"{pane.removeprefix("w").split(":")[0]}.json", json.dumps({
             "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
             "updatedAt": 1, "tmux": ""}))

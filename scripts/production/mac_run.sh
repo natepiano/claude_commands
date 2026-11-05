@@ -13,7 +13,7 @@
 # busy with a test, or coordination state unreadable.
 set -o pipefail
 purpose=${HANA_TEST_PURPOSE:-}
-owner=${HANA_TEST_OWNER:-${SHOWRUNNER_UNIT_ID:-}}
+owner=${HANA_TEST_OWNER:-${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}}
 [[ -n ${purpose//[[:space:]]/} ]] || { print -u2 'mac_run: set HANA_TEST_PURPOSE to the feature under test'; exit 2 }
 # zsh's q flag quotes labels for the generated command without evaluating them.
 purpose_arg=${(q)purpose}

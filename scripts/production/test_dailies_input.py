@@ -38,10 +38,10 @@ class RowDailiesTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         for label in ("writer", "writer-unit"):
             with self.subTest(label=label):
-                live = unit_lookup.MarkedUnit(label, unit_lookup.LiveClaude(
+                live = unit_lookup.LabeledSession(label, unit_lookup.LiveClaude(
                     "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
-                    staff_id=unit.id)
-                with mock.patch.object(unit_lookup, "marked_units", return_value={label: live}):
+                    identity=unit_lookup.LiveSession(unit.current_session))
+                with mock.patch.object(unit_lookup, "labeled_sessions", return_value={label: live}):
                     units = dailies_input.report_units(fixture.doc, fixture.slug, staff.snapshot())
                 self.assertEqual([(item.name, item.session) for item in units], [("writer-unit", "live-writer")])
                 self.assertEqual(self.staff_file.read_bytes(), before)
@@ -114,7 +114,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.production_doc(beta=True)
         self.finished_run(self.root / "beta")
         with (mock.patch.dict(os.environ, self.env),
-              mock.patch.object(unit_lookup, "marked_units", return_value={}),
+              mock.patch.object(unit_lookup, "labeled_sessions", return_value={}),
               mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
             units = dailies_input.report_units(self.doc, "example", staff.snapshot())
             reads.assert_called_once_with()

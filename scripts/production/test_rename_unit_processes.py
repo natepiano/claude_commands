@@ -85,9 +85,9 @@ class RunProcessTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(mesh_runs, "_process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", return_value=None))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", self.no_units))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "observed_staff_marks", return_value=()))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", return_value=None))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", self.no_units))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "observed_session_labels", return_value=()))
 
     def run_folder(self, name: str, worktree: Path) -> Path:
         worktree.mkdir(parents=True, exist_ok=True)

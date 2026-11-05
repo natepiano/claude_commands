@@ -192,7 +192,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
     history = (merge_branch_history(production.checkout, production.merge_branch)
                if isinstance(state, PlanLanded) else None)
     try:
-        marked = unit_lookup.marked_units(production.slug)
+        marked = unit_lookup.labeled_sessions(production.slug)
     except OSError as error:
         raise LifecycleStop("session", "failed", str(error)) from error
     for row in unit_lookup.doc_units(production.doc, staff.snapshot()):
@@ -201,7 +201,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         detail = (f"phase {last.phase} at {last.merge_hash}" if isinstance(last, MergeEntry)
                   else "no code checkpoint")
         report("last-merged", "ok", f"{name}: {detail}")
-        found = marked.get(name)
+        found = marked.get(row.name)
         report("session", "ok", f"{name}: " + (f"{found.place.session} live" if found is not None else "gone"))
 
 

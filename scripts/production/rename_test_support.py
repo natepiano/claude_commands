@@ -349,7 +349,7 @@ NEW = "new"
 # The staff fixture suppresses live discovery. These lifecycle fixtures provide
 # their own fake host and session records, which the original readers must see.
 FIXTURE_SOCKET_FOR = showrunners.socket_for
-FIXTURE_MARKED_UNITS = unit_lookup.marked_units
+FIXTURE_LABELED_SESSIONS = unit_lookup.labeled_sessions
 
 FAIL_GIT_MOVE_INDEX = '''import runpy, subprocess, sys
 from pathlib import Path
@@ -449,8 +449,8 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     _ = case.enterContext(mock.patch("progress_history.SESSION_ROOTS", roots))
     for name, attribute, reader in (
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
-        ("unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
-        ("scripts.production.unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
+        ("unit_lookup", "labeled_sessions", FIXTURE_LABELED_SESSIONS),
+        ("scripts.production.unit_lookup", "labeled_sessions", FIXTURE_LABELED_SESSIONS),
     ):
         module = sys.modules.get(name)
         if module is not None:

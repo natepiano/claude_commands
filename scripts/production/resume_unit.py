@@ -121,7 +121,7 @@ def has_transcript(unit: RetiredUnit) -> bool:
 def is_running(unit: RetiredUnit) -> bool:
     """Whether the unit's mark is on a live Claude that is the session it resumes."""
     try:
-        found = unit_lookup.marked_unit(unit.production.slug, unit.name)
+        found = unit_lookup.labeled_session(unit.production.slug, unit.name)
     except OSError as error:
         raise Refused(f"{unit.name}: cannot tell whether Claude is running: {error}") from error
     return (found is not None and isinstance(found.claude, unit_lookup.LiveClaude)
@@ -194,7 +194,7 @@ def dry_run(unit: RetiredUnit) -> int:
 
 
 def resumed_session_proven(slug: str, name: str, session_id: str, row: staff.StaffRow) -> bool:
-    marked = unit_lookup.marked_unit(slug, name)
+    marked = unit_lookup.labeled_session(slug, name)
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
         return False
     entry = pane_record.read(marked.place.session).get(marked.place.pane)

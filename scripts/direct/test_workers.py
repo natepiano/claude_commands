@@ -121,9 +121,9 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         _ = (self.session_dir / "director").write_text("old-director")
         parent = unit_membership("demo", "builders")
         member = staff.update_current_session(parent.current_session, staff.native_id(fixture_runtime_id("new-director")))
-        current = unit_lookup.MarkedUnit("builders", unit_lookup.LiveClaude("Builders", member.current_session, "/socket", 4321),
+        current = unit_lookup.LabeledSession("builders", unit_lookup.LiveClaude("Builders", member.current_session, "/socket", 4321),
                                          HerdrPlace("agents", "w1:p2"))
-        with patch.object(sessions, "live_sessions", return_value=[]), patch.object(unit_lookup, "marked_unit", return_value=current):
+        with patch.object(sessions, "live_sessions", return_value=[]), patch.object(unit_lookup, "labeled_session", return_value=current):
             found = workers.live_unit_director(self.session_dir)
         self.assertEqual(found, workers.LiveUnitDirector(member.current_session, 4321))
 

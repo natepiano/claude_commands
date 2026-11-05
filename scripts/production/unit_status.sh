@@ -1,8 +1,8 @@
 #!/usr/bin/env zsh
 # Unit status for /showrunner:produce's update schedule.
 # Usage: unit_status.sh <state-dir> <user-zone> --production <production doc>
-# The units are the live rows of the showrunner's production doc. Each is found by the mark on
-# its host session, so a block is headed by the unit id, which no rename changes.
+# The units are the live rows of the production doc.
+# Native session ids select panes. Staff ids identify saved state.
 # Each call checks every unit director: that its session and Claude are running, tick
 # health for every unit with an active run, any form or decision waiting on the user,
 # and its latest step, gate and ETA.
@@ -20,7 +20,7 @@ DIR=$1
 ZONE=$2
 REPO=${0:A:h:h:h}
 # One line per unit: its id, its place now, whether Claude runs there, its session name now.
-unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" "${production[@]}") || exit 1
+unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" --status "${production[@]}") || exit 1
 [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
 # What a gate line may call a peer: its unit id, or its session name now.
 names=()
@@ -34,23 +34,20 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from pathlib import Path
 from scripts.production import staff, unit_lookup, unit_names
-from scripts.production.showrunners import named, production_slug
+from scripts.production.showrunners import named
 arguments = sys.argv[2:]
 doc = Path(arguments[1]) if arguments[0] == "--production" else Path(named(arguments[0])["doc"])
-print(production_slug(str(doc)))
 for row in unit_lookup.doc_units(doc, staff.snapshot()):
     for label in {row.name, unit_names.unit_id(row.name)}:
         print(f"{label}\t{row.id}")
 PYTHON
 ) || exit 1
 staff_rows=("${(@f)staff_lines}")
-slug=$staff_rows[1]
 typeset -A state_keys
-for line in ${staff_rows[2,-1]}; do
+for line in $staff_rows; do
   fields=("${(@ps:\t:)line}")
   state_keys[$fields[1]]=$fields[2]
 done
-marked_lines=$("$PY" "$REPO/scripts/production/unit_lookup.py" list "$slug") || exit 1
 NOTIFIER=$REPO/scripts/message/notifier.sh
 # Run markers sit under unit/, or delegate/ for a run started before the rename.
 if [[ -n ${UNIT_ACTIVE_DIR:-${PLAN_DELEGATE_ACTIVE_DIR:-}} ]]; then
@@ -155,9 +152,9 @@ for line in $units; do
   target=$fields[2]
   echo "== $u"
   if [[ -z $target ]]; then echo 'SESSION GONE'; continue; fi
-  # Lookup columns: unit, place, label, state, Claude name, session id, socket.
-  claude_state=$(print -r -- "$marked_lines" | awk -F'\t' -v u="$u" '$1 == u { print $4 }')
-  session_id=$(print -r -- "$marked_lines" | awk -F'\t' -v u="$u" '$1 == u { print $6 }')
+  # Status columns: unit, place, state, Claude name, session id.
+  claude_state=$fields[3]
+  session_id=$fields[5]
   case $claude_state in
     unknown) echo 'CLAUDE STATE UNKNOWN' ;;
     stopped) echo 'CLAUDE NOT RUNNING' ;;
@@ -177,7 +174,8 @@ for line in $units; do
       fi
     fi
   fi
-  p=$("$PY" "$REPO/scripts/production/session_pane.py" read unit "$slug" "$u" --lines 400 --joined)
+  [[ $claude_state == unknown || $claude_state == stopped ]] && continue
+  p=$("$PY" "$REPO/scripts/production/session_pane.py" read session "$session_id" --lines 400 --joined)
   waiting_on_user "$u" "$p"
   pane=$(print -r -- "$p" | tail -150)
   print -r -- "$pane" | grep -E '^● ' | grep -vE 'says:|^● (Bash|Read|Write|Edit|Skill|Update|Search)\(' | tail -2 | cut -c1-220

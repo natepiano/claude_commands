@@ -311,7 +311,7 @@ def report_units(doc: Path, slug: str, record: staff.StaffSnapshot) -> tuple[Uni
         raise DailiesFailure("production", "no live units: every unit is retired")
     try:
         marked = {unit_names.name(name): place
-                  for name, place in unit_lookup.marked_units(slug, record=record).items()}
+                  for name, place in unit_lookup.labeled_sessions(slug, record=record).items()}
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     try:

@@ -2227,7 +2227,7 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
     log = scratch / "hana.log"
     command = [
         "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
-        f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner.strip() or os.environ.get('SHOWRUNNER_UNIT_ID', '')}",
+        f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner.strip() or os.environ.get('CODEX_THREAD_ID', '') or os.environ.get('CLAUDE_CODE_SESSION_ID', '')}",
         f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
     ]
     direnv = shutil.which("direnv")
@@ -2955,7 +2955,7 @@ def add_run_flags(parser: argparse.ArgumentParser, port_required: bool = True) -
     _ = parser.add_argument("--worktree")
     _ = parser.add_argument("--binary")
     _ = parser.add_argument("--purpose", default="", help="feature under test; required when launching Hana")
-    _ = parser.add_argument("--owner", default="", help="unit director; defaults to SHOWRUNNER_UNIT_ID")
+    _ = parser.add_argument("--owner", default="", help="unit director; defaults to the native session id")
 
 
 class ArgumentExit(SystemExit):
@@ -3015,7 +3015,7 @@ def arguments(argv: list[str], *,
     _ = launch_parser.add_argument("--worktree")
     _ = launch_parser.add_argument("--binary")
     _ = launch_parser.add_argument("--purpose", default="", help="feature under test (required)")
-    _ = launch_parser.add_argument("--owner", default="", help="unit director; defaults to SHOWRUNNER_UNIT_ID")
+    _ = launch_parser.add_argument("--owner", default="", help="unit director; defaults to the native session id")
 
     shutdown_parser = commands.add_parser("shutdown", help="stop a launched Hana and remove its scratch")
     _ = shutdown_parser.add_argument("--port", type=int, required=True)

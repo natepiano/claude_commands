@@ -9,6 +9,7 @@ from dataclasses import replace
 import io
 import json
 import os
+import socket
 import sys
 import unittest
 from pathlib import Path
@@ -29,6 +30,7 @@ from scripts.production import production_doc, staff, unit_config
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
+from scripts.lib.socket_test_support import short_socket_directory
 
 
 @final
@@ -387,14 +389,23 @@ class LifecycleTests(LifecycleFixture):
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
-        with mock.patch.dict(os.environ, self.env):
-            self.staff.register_production("example", self.doc)
-        _ = unit_membership("old-showrunner", "beta-unit")
+        beta = unit_membership("old-showrunner", "beta-unit")
         fake_unit_host.write(self.env, [
             HostedUnit("alpha", "w1:p1", {}),
-            HostedUnit("renamed-since-launch", "w2:p1", {
-                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
+            HostedUnit("renamed-since-launch", "w2:p1", {"CODEX_THREAD_ID": beta.current_session}),
         ])
+        pid = fake_unit_host.live_pid(self)
+        address = Path(self.enterContext(short_socket_directory())) / "beta.sock"
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(address))
+        self.addCleanup(listener.close)
+        records = Path(self.env["NOTIFIER_SESSIONS_DIR"])
+        records.mkdir(parents=True, exist_ok=True)
+        _ = (records / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "sessionId": beta.current_session, "name": "renamed-since-launch",
+            "messagingSocketPath": str(address), "updatedAt": 1, "tmux": "", "formerNames": [],
+        }))
+        fake_unit_host.place_process(self.env, pid, "w2:p1", exec_shell=True)
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
         self.assertIn("alpha-unit: gone", result.stdout)

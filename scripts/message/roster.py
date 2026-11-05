@@ -101,7 +101,7 @@ from scripts.message.unit_labels import (
     newest_sessions as _newest_sessions,
     registered_showrunners as _registered_showrunners,
     showrunner_ids as _showrunner_ids,
-    every_marked_unit as every_marked_unit,
+    every_labeled_session as every_labeled_session,
     production_places as _production_places,
     unit_labels_for as unit_labels_for,
     live_runs as _live_runs,
@@ -112,7 +112,7 @@ from scripts.message.unit_labels import (
 
 
 # Keep the discovery boundary for existing callers.
-_every_marked_unit = every_marked_unit
+_every_labeled_session = every_labeled_session
 
 @dataclass(frozen=True)
 class ThisMachine:

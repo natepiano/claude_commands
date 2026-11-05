@@ -635,7 +635,10 @@ def resolve_live_unit_director(
         if session["sessionId"] == parent.current_session:
             return LiveUnitDirector(session["sessionId"], session["pid"])
     if use_live_marks and isinstance(production, str) and isinstance(unit, str) and production and unit:
-        marked = unit_lookup.marked_unit(production, unit, record=record, sources=sources, running=running)
+        try:
+            marked = unit_lookup.labeled_session(production, unit, record=record, sources=sources, running=running)
+        except OSError:
+            return NoLiveUnitDirector()
         if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
             if marked.claude.session_id == parent.current_session:
                 return LiveUnitDirector(marked.claude.session_id, marked.claude.pid)
