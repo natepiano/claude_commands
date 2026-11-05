@@ -23,7 +23,7 @@ The target is live. The user approved go-live on 2026-11-03. The stacks exist in
 
 - `mac_test.state_paths(target)` is the one map from a target to its state folder. The Mac keeps `~/.local/state/mac-test`. Every other target uses `~/.local/state/build-targets/<target>/` for claims, locks, block and unreachable backoff.
 - `mac_test.configured_ssh_target(target)` checks every target, the Mac too, against `config/build_targets.conf`. It refuses an unknown or non-ssh name before any state write. `build_hold.py` accepts `target <name>` and `--target <name>`.
-- `offload.repository_identity` returns `KnownRepository(name, key)`. `name` is the source folder name. `key` is the normalized origin URL, and `path_key` encodes it for paths. `target_config.uses_legacy_mac_layout(platform)` is true only for `macos`. The Mac keeps one mirror per source folder name. Linux targets use `~/.local/state/build-target/mirror/<path_key>/<slot>`, with one warm build folder per slot.
+- `offload.repository_identity` returns `KnownRepository(name, key)`. `name` is the source folder name. `key` comes from `repository.repository_key`: the normalized origin URL, else `git-root:<root commit>`, else empty when the repository has no commits. `path_key` encodes it for paths. `target_config.uses_legacy_mac_layout(platform)` is true only for `macos`. The Mac keeps one mirror per source folder name. Linux targets use `~/.local/state/build-target/mirror/<path_key>/<slot>`, with one warm build folder per slot.
 - A claim carries a slot. `mac_test.py` allocates it under the target lock from `slots.<repo>`, then `slots`, and prefers the free slot that last ran the same worktree. Affinity grants no ownership. Claim records hold `repo_name`, `repo_key`, `slot` and `cleanup_pending`. Status 13 means cleanup must come before execution.
 - `buildlog sync` pulls from every configured SSH peer. Each peer gives back only its own host folders. `sync.hosts.<target>` in `config/build_targets.conf` is the one host-to-target map. Step records carry `target` (index schema 27). The `ssh_attempts` table (schema 28) keeps target, repository identity, queue time, departure time, slot, outcome and evidence.
 
@@ -131,9 +131,12 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 
 1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
    It resolves the natedev and Mac addresses from local Tailscale status.
+   The network rule permits only these addresses on port 22.
+   The SSH rule permits `autogroup:member` as `natepiano`; the network rule still limits access to these devices.
    It changes only `tag:build-aws` owners and destination rules.
    It prints each proposed change and uses the policy ETag to prevent concurrent overwrites.
    It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
+   HTTP refusals include the status and validation details without user fields; network refusals include the failure reason.
 2. `box-join` checks SSM and the instance's Tailscale identity.
    It starts a stopped instance through the existing guarded setup path.
    It creates a single-use, pre-approved key and revokes it after the join attempt.

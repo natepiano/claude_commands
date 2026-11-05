@@ -412,7 +412,8 @@ class MergeGateFixture(unittest.TestCase):
 
     def occupy_memory_queue(self) -> wire.Admitted:
         request = self.admission.request(need=21 * memory_admit.GIB, step="build")
-        return only_admitted(self.admission.server.handle_request(request))
+        with self.admission.loop_turn():
+            return only_admitted(self.admission.server.handle_request(request))
 
     def assert_gate_released(self) -> None:
         self.assertEqual(self.admission.server.reservations, {})

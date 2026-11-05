@@ -608,7 +608,7 @@ class UnitWatchdogTests(unittest.TestCase):
                 return self.marked()
             return unit_lookup.LabeledProductions({"fixture": {"unit": unit_lookup.LabeledSession(
                 "unit", unit_lookup.ClaudeNotRunning(), unit_lookup.Place("shared", "unit"),
-                identity=unit_lookup.LiveSession(owner["session_id"]))}}, {}, self.marked().members)
+                identity=unit_lookup.LiveSession(owner["session_id"]))}}, self.marked().members)
         with (patch.object(herdr, "_scan_herdr_processes", side_effect=[[], [fresh]]) as scans,
               patch.object(unit_lookup, "every_labeled_session", side_effect=observed),
               herdr.process_snapshot()):
@@ -625,7 +625,7 @@ class UnitWatchdogTests(unittest.TestCase):
         processes: list[herdr.HerdrProcess] = []
 
         def observed() -> unit_lookup.LabeledProductions:
-            return self.marked() if herdr.herdr_processes() else unit_lookup.LabeledProductions({}, {})
+            return self.marked() if herdr.herdr_processes() else unit_lookup.LabeledProductions({})
 
         with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)),
               patch.object(unit_lookup, "every_labeled_session", side_effect=observed),

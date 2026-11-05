@@ -143,7 +143,6 @@ class UnitStatusFixture(unittest.TestCase):
         stopped_units: tuple[str, ...] = (),
         missing_units: tuple[str, ...] = (),
         unreadable_units: tuple[str, ...] = (),
-        duplicate_units: tuple[str, ...] = (),
     ) -> tuple[tuple[str, ...], str | None, str]:
         with self.case_directory() as root, isolated_staff_file(root / "staff.json", environment := dict(os.environ)):
             script = root / "scripts/production/unit_status.sh"
@@ -228,22 +227,16 @@ class UnitStatusFixture(unittest.TestCase):
                 for unit in hosted:
                     if unit.session in stopped_units:
                         unit.marks["CLAUDE_CODE_SESSION_ID"] = unit.marks.pop("CODEX_THREAD_ID")
-                hosted.extend(HostedUnit(unit.session, f"copy-{unit.pane}", dict(unit.marks))
-                              for unit in tuple(hosted) if unit.session in duplicate_units)
                 publish_host(environment, hosted)
                 for unit in hosted:
-                    if unit.session in pids and not unit.pane.startswith("copy-"):
+                    if unit.session in pids:
                         fake_unit_host.place_process(environment, pids[unit.session], unit.pane, exec_shell=True)
                 result = subprocess.run(
                     [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
                     check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                if duplicate_units:
-                    self.assertEqual(len(result.stderr.splitlines()), len(duplicate_units))
-                    self.assertIn("anomaly:", result.stderr)
-                else:
-                    self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stderr, "")
                 outputs.append(result.stdout)
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None
             seen_path = root / "status" / "decisions_seen"

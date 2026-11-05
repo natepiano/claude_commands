@@ -336,6 +336,7 @@ class AccountsTests(unittest.TestCase):
                 self.main_dir if tool == "claude" else self.home / ".codex3", 1,
                 accounts.KnownReset(now + timedelta(days=1)))
         with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
               patch.object(accounts, "pick", side_effect=chosen),
@@ -357,7 +358,8 @@ class AccountsTests(unittest.TestCase):
         _ = self.workers_fixture()
         run = self.root / "worker-runs/run-one"
         run.mkdir(parents=True)
-        _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
+        _ = (run / "mesh_server.json").write_text(json.dumps({
+            "pid": os.getpid(), "port": 123, "codex_home": str(self.home / ".codex1")}))
         _ = (run / "mesh_roster.json").write_text(json.dumps({
             "blocked": {"status": "starting", "continuation_owed": True,
                 "continuation_reason": "destination account refused again"},
@@ -378,7 +380,8 @@ class AccountsTests(unittest.TestCase):
         for root, name in zip(roots, ("run-new", "run-old")):
             run = root / name
             run.mkdir(parents=True)
-            _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
+            _ = (run / "mesh_server.json").write_text(json.dumps({
+                "pid": os.getpid(), "port": 123, "codex_home": str(self.home / ".codex1")}))
             _ = (run / "mesh_roster.json").write_text(json.dumps({
                 "worker": {"status": "waiting_capacity", "continuation_owed": True}}))
         with patch.object(accounts, "WORKERS_RUN_ROOTS", roots):
@@ -397,7 +400,8 @@ class AccountsTests(unittest.TestCase):
             _ = (run / "mesh_roster.json").write_text(json.dumps({
                 "worker": {"continuation_owed": True, "status": "waiting_capacity"}}))
             if server is not None:
-                _ = (run / "mesh_server.json").write_text(json.dumps(server))
+                _ = (run / "mesh_server.json").write_text(json.dumps({
+                    **server, "port": 123, "codex_home": str(self.home / ".codex1")}))
         def check(pid: int, signal: int) -> None:
             self.assertEqual(signal, 0)
             if pid != 901:
@@ -464,6 +468,7 @@ class AccountsTests(unittest.TestCase):
         moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
             subject="moved-session", move_id="move-one", kind="failed", reason="still on claude1"))
         with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir))):
             summary = self.run_cli()
@@ -538,6 +543,7 @@ class AccountsTests(unittest.TestCase):
                   patch.object(staff, "local_snapshot", side_effect=failure),
                   patch.object(pane_launch, "record_directory", return_value=records),
                   patch.object(sessions, "live_sessions", return_value=[owner]),
+                  patch.object(sessions, "running_sessions", return_value=[owner]),
                   patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations((
                       inventory.ShowrunnerRegistration("runner", "runner", ""),))),
                   patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
@@ -597,7 +603,7 @@ class AccountsTests(unittest.TestCase):
                 model="", remote_control=False, flags_read=True, written_at="2026-10-01T00:00:00Z",
                 environment=marked)
             if pane != "stopped":
-                owners.append(sessions.SessionRecord(pid=12345, sessionId=identity, name=identity,
+                owners.append(sessions.SessionRecord(pid=12345 + len(owners), sessionId=identity, name=identity,
                     messagingSocketPath="/fake.sock", updatedAt=1, tmux="", formerNames=[]))
                 state = {"unit-a": "busy", "unit-b": "shell", "runner-a": "idle"}.get(pane)
                 if state is not None:
@@ -635,20 +641,25 @@ class AccountsTests(unittest.TestCase):
             inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
             inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
         ))
-        units = accounts.RoleSessionCountsDocument(busy=1, shell=1, idle=0, total=2)
+        units = accounts.RoleSessionCountsDocument(busy=1, shell=0 if evidence == "native session" else 1,
+                                                   idle=1, total=2 if evidence == "native session" else 3)
         runners_count = accounts.RoleSessionCountsDocument(busy=0, shell=0, idle=1, total=1)
         cases: tuple[tuple[str, dict[str, tuple[list[str], list[accounts.RoleSessionCountsDocument]]]], ...] = (
-            ("claude2", {"claude1": (["units"], [units]), "claude2": (["showrunners"], [runners_count])}),
-            ("claude1", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": ([], [])}),
+            ("claude2", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": (["showrunners"], [runners_count])}),
+            ("claude1", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": (["showrunners"], [runners_count])}),
         )
+        def live_directory(pid: int) -> account.ConfiguredClaudeFolder:
+            identity = next(owner["sessionId"] for owner in owners if owner["pid"] == pid)
+            return account.ConfiguredClaudeFolder(Path(launches[identity]["config_dir"]))
+
         retained_bytes = (records / "fixture.json").read_bytes()
         for runner_label, expected in cases:
             _ = accounts.set_group_account("units", "claude1", why="fixture")
             _ = accounts.set_group_account("showrunners", runner_label, why="fixture")
             with (self.subTest(runner_label=runner_label),
-                  patch.object(sessions, "live_sessions", return_value=owners),
+                  patch.object(sessions, "running_sessions", return_value=owners),
                   patch.object(pane_launch, "record_directory", return_value=records),
-                  patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude1")),
+                  patch.object(accounts, "_session_config_dir", side_effect=live_directory),
                   # Even on a client machine, counts use only the retained local record.
                   patch.object(staff, "snapshot", side_effect=AssertionError("no owner fetch")),
                   patch.object(inventory, "showrunner_registrations", return_value=runners),
@@ -664,6 +675,118 @@ class AccountsTests(unittest.TestCase):
             self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.shutdown import inventory
+        from scripts.production.staff_test_support import unit_membership
+
+        for label in ("claude2", "claude4"):
+            self.login_directory(label, label + "@example.invalid")
+        members = [unit_membership("fixture", name) for name in ("a", "b", "c", "down")]
+        _ = accounts.set_group_account("units", "claude2", why="fixture")
+        _ = accounts.set_group_account("showrunners", "claude2", why="fixture")
+        records = self.root / "private-launches"
+        records.mkdir()
+        launches = {member.current_session: pane_launch.PaneLaunch(
+            pane_id=member.name, session_id=member.id, config_dir=str(self.home / ".claude4"),
+            cwd=str(self.root), name=member.name, model="", remote_control=False,
+            environment={}, flags_read=True, written_at="2026-11-05T06:00:00Z", ended=True)
+            for member in members}
+        _ = (records / "launches.json").write_text(json.dumps(launches))
+        live = [sessions.SessionRecord(pid=900 + index, sessionId=member.current_session, name=member.name,
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=state)
+            for index, (member, state) in enumerate(zip(members, ("busy", "busy", "shell")))]
+        def live_directory(pid: int) -> account.ConfiguredClaudeFolder:
+            return account.ConfiguredClaudeFolder(self.home / (".claude2" if pid == 901 else ".claude4"))
+
+        membership = staff.local_snapshot()
+        with (patch.object(staff, "local_snapshot", return_value=membership) as staff_read,
+              patch.object(sessions, "running_sessions", return_value=[*live, live[0]]) as registry_read,
+              patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(pane_launch, "record_directory", return_value=records),
+              patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())),
+              patch.object(accounts, "_session_config_dir", side_effect=live_directory) as settings_read,
+              patch.object(accounts, "_worker_status_records", return_value=[]) as workers_read):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly(), detail=True)
+        staff_read.assert_called_once_with()
+        registry_read.assert_called_once_with()
+        workers_read.assert_called_once()
+        self.assertEqual(settings_read.call_count, 3)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        rows = {row["label"]: row for row in document["accounts"]}
+        self.assertEqual(rows["claude2"]["roles"], ["units", "showrunners"])
+        self.assertEqual(rows["claude2"]["selected_roles"], ["units", "showrunners"])
+        self.assertEqual(rows["claude2"]["role_counts"], [
+            {"busy": 1, "shell": 0, "idle": 0, "total": 1},
+            {"busy": 0, "shell": 0, "idle": 0, "total": 0}])
+        self.assertEqual(rows["claude4"]["roles"], ["units"])
+        self.assertEqual(rows["claude4"]["selected_roles"], [])
+        self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "shell": 1, "idle": 1, "total": 3}])
+        table = accounts.render_status_table(reading)
+        for text in ("units ✓ 1 (busy 1, shell 0, idle 0)", "units 3 (busy 1, shell 1, idle 1)",
+                     "showrunners ✓ 0 (busy 0, shell 0, idle 0)"):
+            self.assertIn(text, table)
+            self.assertIn(text, "\n".join(reading.detail_lines))
+
+    def test_worker_counts_require_a_recorded_port_on_a_live_server(self) -> None:
+        from scripts.agents import codex_mesh
+        from scripts.herdr import pane_launch
+        from scripts.shutdown import inventory
+
+        run = self.root / "worker-runs" / "placement"
+        run.mkdir(parents=True)
+        live_server = {"pid": 101, "port": 123, "codex_home": str(self.home / ".codex2")}
+        dead_server = {"pid": 102, "port": 456, "codex_home": str(self.home / ".codex1")}
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "running": {"status": "running", "port": 123},
+            "idle": {"status": "done", "port": 123},
+            "old": {"status": "done"},
+            "dead": {"status": "paused", "port": 456},
+            "ended": {"status": "ended", "port": 123},
+        }))
+        def server_running(server: dict[str, object]) -> bool:
+            return server["pid"] == 101
+
+        read_counts = cast(Callable[[], tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]],
+                           getattr(accounts, "_local_session_counts"))
+        with (patch.object(accounts, "WORKERS_RUN_ROOTS", (run.parent,)),
+              patch.object(codex_mesh, "run_server_records", return_value=[live_server, dead_server]) as servers,
+              patch.object(accounts, "_mesh_server_running", side_effect=server_running),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(pane_launch, "record_directory", return_value=self.root / "empty-panes"),
+              patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(()))):
+            counts, _inputs = read_counts()
+        self.assertEqual(counts, {(self.home / ".codex2", "workers"): {
+            str(run / "running"): "busy", str(run / "idle"): "idle"}})
+        servers.assert_called_once_with(run)
+
+    def test_mac_account_counts_read_the_kernel_without_a_process_for_each_member(self) -> None:
+        read_directory = cast(Callable[[int], account.ConfiguredClaudeFolder | account.NoAccountSetting |
+            account.ProcessEnvironmentUnread], getattr(accounts, "_session_config_dir"))
+        payload = ((1).to_bytes(4, sys.byteorder, signed=True)
+            + b"/fixture/claude\0\0claude\0CLAUDE_CONFIG_DIR=/fixture/.claude4\0")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(account, "kern_procargs2", return_value=payload) as kernel,
+              patch.object(subprocess, "run", side_effect=AssertionError("no process for each member"))):
+            observed = read_directory(990001)
+        self.assertEqual(observed, account.ConfiguredClaudeFolder(Path("/fixture/.claude4")))
+        kernel.assert_called_once_with(990001)
+
+    def test_peer_members_add_a_role_to_an_unselected_account(self) -> None:
+        now = datetime.now(timezone.utc)
+        row = replace(SharedStatusDocumentTests().row(), label="claude4", tool="claude", roles=(), role_counts=())
+        peer = remote.other_machine()
+        _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {
+            "claude4": {"units": {"busy": 9, "shell": 1, "idle": 20, "total": 30}}}}))
+        rows, problems = machine_role_counts((row,), now)
+        self.assertEqual(problems, ())
+        self.assertEqual(rows[0].roles, ("units",))
+        self.assertEqual(rows[0].selected_roles, ())
+        self.assertIn("units 30 (busy 9, shell 1, idle 20)", accounts.render_status_table(
+            accounts.StatusReading(rows, (), (), timezone.utc, now)))
 
     def test_stored_status_starts_a_background_counts_fetch_without_waiting_for_ssh(self) -> None:
         before = {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
@@ -686,7 +809,7 @@ class AccountsTests(unittest.TestCase):
         for here, peer in (("natedev", "mac"), ("mac", "natedev")):
             with (self.subTest(here=here), patch.object(remote, "local_machine", return_value=here),
                   patch.object(remote, "other_machine", return_value=peer),
-                  patch.object(sessions, "live_sessions", return_value=[]),
+                  patch.object(sessions, "running_sessions", return_value=[]),
                   patch.object(role_map, "ssh_role_map", side_effect=AssertionError("status waited on ssh"))):
                 published = session_counts_document({(self.home / ".claude1", "units"):
                     {"one": "busy", "two": "shell", "three": "idle", "four": "idle"}})
@@ -804,7 +927,7 @@ class AccountsTests(unittest.TestCase):
         from scripts.message import sessions
         peer = remote.other_machine()
         before = {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
-        with (patch.object(sessions, "live_sessions", return_value=[]),
+        with (patch.object(sessions, "running_sessions", return_value=[]),
               patch.object(accounts, "group_accounts", side_effect=AssertionError("role fetch")),
               patch.object(accounts, "account_statuses", side_effect=AssertionError("account read")),
               patch.object(subprocess, "run", side_effect=AssertionError("network or process probe"))):
@@ -897,7 +1020,7 @@ class AccountsTests(unittest.TestCase):
                     label = "claude1" if group == "units" else "claude3"
                     row = next(row for row in rows if row[1] == label)
                     json_row = next(row for row in json_rows if row["label"] == label)
-                    self.assertEqual(row[2], "" if missing else group)
+                    self.assertEqual(row[2], "" if missing else f"{group} ✓ 0 (busy 0, shell 0, idle 0)")
                     self.assertEqual(json_row["roles"], [] if missing else [group])
                 if not configured:
                     self.assertFalse(accounts.groups_file().exists())
@@ -3271,7 +3394,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                       patch.object(role_map, "ssh_role_map", side_effect=failure) as fetch):
                     code, output, error = self.run_cli("status", *flags)
                 self.assertEqual((code, error), (0, ""))
-                fetch.assert_called_once()
+                fetch.assert_called_once_with(("role-map-read",))
                 lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
                 problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
                 self.assertEqual(len(problems), 1)
@@ -3286,12 +3409,13 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             "groups": {}, "workers": "codex1"}}))
         for flags in ((), ("--json",)):
             with (self.subTest(flags=flags), patch.object(role_map, "is_role_map_host", return_value=False),
-                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored read fetched"))):
+                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored status reached ssh")) as fetch):
                 code, output, error = self.run_cli("status", "--stored", *flags)
             self.assertEqual((code, error), (0, ""))
             lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
             problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
             self.assertEqual(problems, [])
+            fetch.assert_not_called()
 
     def test_piped_status_replays_held_warning_before_the_final_error(self) -> None:
         def failed_read(*_args: object, **_kwargs: object) -> accounts.StatusReading:
@@ -3525,7 +3649,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 code, output, error = self.run_cli("status", "--stored", *flags)
                 self.assertEqual((code, error), (0, ""))
                 expected = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                            else output.split("\n\n", 1)[1].strip().splitlines())
+                            else output.split("\n\n", 2)[2].strip().splitlines())
                 self.assertEqual(len(expected), 2)
                 self.assertTrue(any("test wrote" in line for line in expected))
                 for later in ("read", "render"):
@@ -3866,7 +3990,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                     code, output, error = self.run_cli("status", "--stored", *flags)
                     self.assertEqual((code, error), (0, ""))
                     lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                             else output.split("\n\n", 1)[1].strip().splitlines())
+                             else output.split("\n\n", 2)[2].strip().splitlines())
                     expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>"]
                     for label in ("claude2", "claude3"):
                         roles = "units" if label == "claude2" and different else "showrunners" if different else "units, showrunners" if label == "claude2" else ""
@@ -3904,7 +4028,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                     code, output, error = self.run_cli("status", "--stored", *flags)
                 self.assertEqual((code, error), (0, ""))
                 lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
-                         else output.split("\n\n", 1)[1].strip().splitlines())
+                         else output.split("\n\n", 2)[2].strip().splitlines())
                 self.assertCountEqual(lines, expected)
 
     def test_failed_codex_save_and_render_keep_the_good_reading_diagnostic(self) -> None:
@@ -4215,7 +4339,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             ("~/.claude1", "claude1", "", *("—",) * 5),
             ("~/.claude2", "claude2", "",
              "71%", weekly_cell, "—", "—", read_cell),
-            ("~/.claude3", "claude3", "units",
+            ("~/.claude3", "claude3", "units ✓ 0 (busy 0, shell 0, idle 0)",
              "12%", weekly_cell, "—", "—", read_cell),
             ("~/.claude4", "claude4", "", *("—",) * 5),
         ])
@@ -4325,7 +4449,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
 
                 rows = self.status_rows()
 
-                self.assertEqual(rows[-2][:3], ("~/.codex", "codex2", "workers"))
+                self.assertEqual(rows[-2][:3], ("~/.codex", "codex2", "workers ✓ 0 (busy 0, idle 0)"))
                 self.assertEqual(rows[-2][3:], (
                     f"{100 - weekly_used:.0f}%", later.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
                     *credit_cells, read.astimezone(zone).strftime("%H:%M %Z"),
@@ -4980,9 +5104,59 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual((code, error), (0, ""))
         lines = output.splitlines()
         index = next(index for index, line in enumerate(lines) if "| claude2 " in line)
-        self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units")
+        self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units ✓ 0 (busy 0, shell 0, idle 0)")
         self.assertEqual([cell.strip() for cell in lines[index + 1].strip("|").split("|")],
-                         ["", "", "showrunners", "", "", "", "", ""])
+                         ["", "", "showrunners ✓ 0 (busy 0, shell 0, idle 0)", "", "", "", "", ""])
+
+    def test_board_shows_upcoming_moves_between_the_table_and_problems(self) -> None:
+        _ = next_moves.add_next_move("units", 1, "claude4")
+        _ = next_moves.add_next_move("showrunners", 1, "claude3", fallback_targets=("claude2",))
+        _ = next_moves.add_next_move("workers", 1, "codex2")
+        expected = next_moves.list_next_moves()
+        before = next_moves.next_moves_file().read_bytes()
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        with patch.object(accounts, "_read_status", return_value=reading):
+            code, output, error = self.run_cli()
+        self.assertEqual((code, error), (0, ""))
+        table, upcoming, problems = output.rstrip().split("\n\n", 2)
+        self.assertTrue(table.startswith("| Folder"))
+        self.assertEqual(upcoming + "\n\n" + problems,
+                         "Upcoming moves:\n" + expected + "\n\nFixture problem.")
+        with patch.object(accounts, "_read_status", return_value=reading):
+            code, document, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(document)["upcoming_moves"], ["Upcoming moves:", *expected.splitlines()])
+        self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+
+    def test_board_shows_none_when_no_upcoming_moves_exist(self) -> None:
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        with patch.object(accounts, "_read_status", return_value=reading):
+            code, output, error = self.run_cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(output.endswith("\n\nUpcoming moves: none\n\nFixture problem.\n"))
+        with patch.object(accounts, "_read_status", return_value=reading):
+            code, document, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(document)["upcoming_moves"], ["Upcoming moves: none"])
+        self.assertFalse(next_moves.next_moves_file().exists())
+
+    def test_board_uses_upcoming_moves_from_the_role_map_without_another_fetch(self) -> None:
+        reading = accounts.StatusReading((), ("Fixture problem.",), (), timezone.utc, datetime.now(timezone.utc))
+        for lines in (("Upcoming moves:", "showrunners 1: at 1% → claude3, else claude2"),
+                      ("Upcoming moves: none",), ()):
+            for arguments in ((), ("status", "--stored", "--json")):
+                with (self.subTest(lines=lines, arguments=arguments),
+                      patch.object(accounts, "_read_status", return_value=reading),
+                      patch.object(role_map, "is_role_map_host", return_value=False),
+                      patch.object(role_map, "read_role_map", return_value=role_map.RoleMap({}, "codex1", upcoming_moves=lines)),
+                      patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected second fetch")) as fetch):
+                    code, output, error = self.run_cli(*arguments)
+                self.assertEqual((code, error), (0, ""))
+                fetch.assert_not_called()
+                if arguments:
+                    output = "\n".join(cast(accounts.StatusDocument, json.loads(output))["upcoming_moves"])
+                expected = lines or ("Upcoming moves: unavailable; natedev unreachable",)
+                self.assertIn("\n".join(expected), output)
 
     def json_status_fixture(self) -> tuple[datetime, datetime]:
         self.login_directory("claude2", "main@example.invalid")
@@ -5068,7 +5242,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 code, output, error = self.run_cli(*arguments)
                 self.assertEqual((code, error), (0, ""))
                 notes = (cast(list[str], json.loads(output)["problems"]) if "--json" in arguments
-                         else output.split("\n\n", 1)[1].strip().splitlines())
+                         else output.split("\n\n", 2)[2].strip().splitlines())
                 for line in expected:
                     self.assertEqual(notes.count(line), 1)
                 self.assertFalse(any(note.startswith(("* claude2:", "* claude3:", "* codex1:")) for note in notes))
@@ -5081,9 +5255,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status", "--json")
         self.assertEqual((code, error), (0, ""))
         document = cast(dict[str, object], json.loads(output))
-        self.assertEqual(set(document), {"accounts", "problems", "session_inputs"})
+        self.assertEqual(set(document), {"accounts", "problems", "session_inputs", "upcoming_moves"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "role_counts", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "selected_roles", "role_counts", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -5099,7 +5273,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual([tuple(row[field] for field in fields) for row in rows], expected)
         self.assertEqual([row["read_ok"] for row in rows], [False, True, True, False, True, False, True])
         self.assertEqual([row["credits_in_use"] for row in rows], [False, False, False, False, True, False, False])
-        notes = table.split("\n\n", 1)[1].strip().splitlines()
+        notes = table.split("\n\n", 2)[2].strip().splitlines()
         self.assertIn("accounts.py setup codex2", "\n".join(notes))
         self.assertEqual(document["problems"], [note.removeprefix("* ") for note in notes])
         self.assertTrue(any(note.startswith("* ") for note in notes))
@@ -5411,7 +5585,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         rows = self.status_rows()[1:]
 
         self.assertEqual([row[:3] for row in rows], [
-            ("~/.codex", "codex1", "workers"),
+            ("~/.codex", "codex1", "workers ✓ 0 (busy 0, idle 0)"),
             ("~/.codex2", "codex2", "spare"),
             ("~/.codex4", "~/.codex4", "spare"),
             ("~/.codex10", "~/.codex10", "spare"),
@@ -5471,7 +5645,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         with patch.dict(os.environ, {"CODEX_HOME": str(selected)}):
             rows = self.status_rows()[1:]
-        self.assertEqual([row[2] for row in rows], ["spare", "workers"])
+        self.assertEqual([row[2] for row in rows], ["spare", "workers ✓ 0 (busy 0, idle 0)"])
         self.assertEqual([row[0] for row in rows], ["~/.codex", "~/.codex1"])
 
     def test_status_reads_each_stale_codex_home_and_saves_both_readings(self) -> None:
@@ -6541,7 +6715,7 @@ _ = sys.stdin.read()
         self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         with patch.dict(os.environ, {"CODEX_HOME": str(default)}):
             rows = self.status_rows()[1:]
-        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers")])
+        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers ✓ 0 (busy 0, idle 0)")])
         self.assertEqual(agent_accounts.workers_home(), target)
 
     def test_table_keeps_workers_selection_when_a_live_read_changes_the_role(self) -> None:
@@ -6555,7 +6729,7 @@ _ = sys.stdin.read()
                 source=agent_accounts.CodexHomeSource(home))
         self.codex_reads.side_effect = read
         rows = self.status_rows()[1:]
-        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers")])
+        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers ✓ 0 (busy 0, idle 0)")])
         self.assertEqual(agent_accounts.workers_home(), default)
         self.assertNotEqual(target, default)
 
@@ -7620,8 +7794,8 @@ class PickerTests(unittest.TestCase):
                 self.assertEqual(accounts.main(["status"]), 0)
         rows = [[cell.strip() for cell in line.strip("|").split("|")]
                 for line in output.getvalue().splitlines() if line.startswith("| ~/.claude")]
-        self.assertEqual([row[1] for row in rows if row[2] == "units"], ["claude3"])
-        self.assertEqual([row[1] for row in rows if row[2] == "showrunners"], ["claude1"])
+        self.assertEqual([row[1] for row in rows if row[2].startswith("units ✓")], ["claude3"])
+        self.assertEqual([row[1] for row in rows if row[2].startswith("showrunners ✓")], ["claude1"])
 
     def test_unit_role_reads_group_and_ignores_legacy_saved_unit_key(self) -> None:
         _ = self.groups(units="claude3")
@@ -7714,7 +7888,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
         first_role = replace(row, roles=("units",), role_counts=row.role_counts[:1])
         single = accounts.render_status_table(self.reading(first_role))
         self.assertEqual(cells[0], tuple(cell.strip() for cell in single.splitlines()[2].strip("|").split("|")))
-        self.assertEqual(cells[1], ("", "", "showrunners", "", "", "", "", ""))
+        self.assertEqual(cells[1], ("", "", "showrunners 2 (busy 1, shell 0, idle 1)", "", "", "", "", ""))
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         self.assertEqual(len(document["accounts"]), 1)
         self.assertEqual(document["accounts"][0]["roles"], ["units", "showrunners"])
@@ -7806,17 +7980,17 @@ class SharedStatusDocumentTests(unittest.TestCase):
                     self.assertIs(document["use_credits"], enabled)
                     self.assertIsNone(document["credits"])
 
-    def test_new_json_signals_leave_the_existing_text_table_exactly_unchanged(self) -> None:
+    def test_json_signals_and_text_table_show_the_same_zero_worker_counts(self) -> None:
         reading = self.reading(self.row())
         self.assertEqual(accounts.render_status_table(reading), (
-            '| Folder    | Label   | Role    | Weekly left | Weekly resets       | On credits | Credits left | Read      |\n'
-            '| --------- | ------- | ------- | ----------- | ------------------- | ---------- | ------------ | --------- |\n'
-            '| ~/.codex1 | fixture | workers | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT |\n'
+            '| Folder    | Label   | Role                       | Weekly left | Weekly resets       | On credits | Credits left | Read      |\n'
+            '| --------- | ------- | -------------------------- | ----------- | ------------------- | ---------- | ------------ | --------- |\n'
+            '| ~/.codex1 | fixture | workers 0 (busy 0, idle 0) | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT |\n'
             '\n'
             '* Fixture problem.'
         ))
         self.assertEqual(self.document(self.row()), {
-            "label": "fixture", "tool": "codex", "roles": ["workers"], "role_counts": [{"busy": 0, "shell": None, "idle": 0, "total": 0}],
+            "label": "fixture", "tool": "codex", "roles": ["workers"], "selected_roles": [], "role_counts": [{"busy": 0, "shell": None, "idle": 0, "total": 0}],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {},
@@ -7969,7 +8143,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         ))
         self.assertCountEqual(reading.notes, expected)
         terminal = accounts.render_status_table(reading).splitlines()
-        self.assertCountEqual(terminal[terminal.index("") + 1:], expected)
+        self.assertCountEqual(terminal[terminal.index("") + 1:], [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(list[str], json.loads(accounts.render_status_json(reading))["problems"]),
             [line.removeprefix("* ") for line in expected])
 
@@ -8098,7 +8272,8 @@ class StatusProblemCauseTests(unittest.TestCase):
             lines = list(reading.notes)
             observed.append(sorted(lines))
             self.assertCountEqual(lines, expected)
-            self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].splitlines(), expected)
+            self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].splitlines(),
+                                  [*reading.upcoming_moves, "", *expected])
             self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
         self.assertEqual(observed[0], observed[1])
 
@@ -8149,7 +8324,7 @@ class StatusProblemCauseTests(unittest.TestCase):
                         if outcome == agent_accounts.UsageReadOutcome.ERROR else
                         "the usage service did not accept this login; start a session on it to check it"))
                 terminal = accounts.render_status_table(reading).splitlines()
-                self.assertCountEqual(terminal[terminal.index("") + 1:], expected)
+                self.assertCountEqual(terminal[terminal.index("") + 1:], [*reading.upcoming_moves, "", *expected])
                 document = cast(dict[str, object], json.loads(accounts.render_status_json(reading)))
                 self.assertCountEqual(cast(list[str], document["problems"]),
                     [line.removeprefix("* ") for line in expected])
@@ -8239,7 +8414,8 @@ class StatusProblemCauseTests(unittest.TestCase):
                                      for line in lines))
                 expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
                             "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
-                self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+                self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                                      [*reading.upcoming_moves, "", *expected])
                 self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_startup_failure_stays_visible_when_another_home_reads_the_same_login(self) -> None:
@@ -8325,7 +8501,8 @@ class StatusProblemCauseTests(unittest.TestCase):
         self.assertFalse(any("account note" in line for line in lines))
         expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
                     "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
-        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                              [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_codex_startup_cause_keeps_reading_and_setup_in_one_line(self) -> None:
@@ -8379,7 +8556,8 @@ class StatusProblemCauseTests(unittest.TestCase):
             "codex1: test sign-in is stored; a test wrote ~/.codex1/auth.json at 2026-10-29 01:15 UTC; delete ~/.codex1/auth.json",
             "codex1: login is stored in two homes; ~/.codex and ~/.codex1 store codex1's login; two homes on one login break token refresh; keep each login in one home",
         ]
-        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(),
+                              [*reading.upcoming_moves, "", *expected])
         self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
 
     def test_real_domains_keep_account_repairs_through_status(self) -> None:

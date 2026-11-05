@@ -470,8 +470,6 @@ class StaffSourcesTests(StaffTestCase):
                         self.assertEqual(grouped.units, {})
                     else:
                         self.assertEqual(grouped.units.get("sdlc", {}), {"models": marked})
-                    self.assertEqual(grouped.faults, {})
-
 
     def test_current_session_parent_and_showrunner_follow_the_retained_launch_after_rename(self) -> None:
         import unit_lookup

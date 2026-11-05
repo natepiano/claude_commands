@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
-from io import StringIO
+from email.message import Message
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import tempfile
 import unittest
 from typing import cast, final, override
 from unittest import mock
+from urllib.error import HTTPError, URLError
 
 from scripts.aws_target import admin_secrets, box, deploy
 from scripts.aws_target.ledger import mapping
@@ -164,6 +166,48 @@ class FakeMonotonicClock:
 
 
 @final
+class TailnetRequestTests(unittest.TestCase):
+    def test_http_json_error_reports_validation_details_without_user_fields(self) -> None:
+        content = json.dumps({'message': 'policy rejected', 'data': [
+            {'user': 'x@example.com', 'errors': ['invalid SSH source', 'invalid rule']},
+            {'user': 'other@example.com', 'errors': ['another error', 4]},
+        ]}).encode()
+        error = HTTPError('https://api.tailscale.com', 400, 'Bad Request', Message(), BytesIO(content))
+        with mock.patch.object(box, 'urlopen', side_effect=error), \
+             mock.patch.object(error, 'read', wraps=error.read) as read, \
+             self.assertRaises(box.BoxRefused) as failure:
+            _ = box.tailnet_request('POST', 'tailnet/-/acl', b'private request', {'Authorization': 'private token'}, 1)
+        read.assert_called_once_with()
+        self.assertEqual(str(failure.exception),
+                         'Tailscale POST tailnet/-/acl: HTTP 400: policy rejected; invalid SSH source; invalid rule; another error')
+        self.assertNotIn('x@example.com', str(failure.exception))
+        self.assertNotIn('other@example.com', str(failure.exception))
+        self.assertNotIn('private', str(failure.exception))
+
+    def test_http_text_error_collapses_whitespace_and_limits_the_body(self) -> None:
+        content = ('  invalid\n  policy\t' + 'x' * 600).encode()
+        error = HTTPError('https://api.tailscale.com', 502, 'Bad Gateway', Message(), BytesIO(content))
+        with mock.patch.object(box, 'urlopen', side_effect=error), self.assertRaises(box.BoxRefused) as failure:
+            _ = box.tailnet_request('POST', 'tailnet/-/acl', b'', {}, 1)
+        self.assertEqual(str(failure.exception),
+                         'Tailscale POST tailnet/-/acl: HTTP 502: ' + ('invalid policy ' + 'x' * 600)[:500])
+
+    def test_http_empty_error_reports_the_reason_phrase(self) -> None:
+        error = HTTPError('https://api.tailscale.com', 503, 'Service Unavailable', Message(), BytesIO())
+        with mock.patch.object(box, 'urlopen', side_effect=error), self.assertRaises(box.BoxRefused) as failure:
+            _ = box.tailnet_request('GET', 'tailnet/-/acl', b'', {}, 1)
+        self.assertEqual(str(failure.exception), 'Tailscale GET tailnet/-/acl: HTTP 503: Service Unavailable')
+
+    def test_request_failure_reports_the_network_or_value_reason(self) -> None:
+        for error in (URLError('timed out'), TimeoutError('timed out'), ValueError('invalid URL')):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch.object(box, 'urlopen', side_effect=error), self.assertRaises(box.BoxRefused) as failure:
+                _ = box.tailnet_request('GET', 'tailnet/-/acl', b'', {}, 1)
+            reason = 'invalid URL' if isinstance(error, ValueError) else 'timed out'
+            self.assertEqual(str(failure.exception), f'Tailscale GET tailnet/-/acl: request failed: {reason}')
+
+
+@final
 class BoxTests(unittest.TestCase):
     def __init__(self, methodName: str = 'runTest') -> None:
         super().__init__(methodName)
@@ -299,6 +343,12 @@ class BoxTests(unittest.TestCase):
         with redirect_stdout(output):
             self.subject.policy()
         self.assertIn('tag:build-aws', output.getvalue())
+        ssh_rules = [{'action': 'accept', 'src': ['autogroup:member'], 'dst': ['tag:build-aws'], 'users': ['natepiano']}]
+        network_rule = {'action': 'accept', 'src': ['100.64.0.1', '100.64.0.2'], 'dst': ['tag:build-aws:22']}
+        self.assertEqual(self.tailnet.policy['ssh'], ssh_rules)
+        self.assertEqual(cast(list[object], self.tailnet.policy['acls'])[1], network_rule)
+        self.assertIn('replace ssh rules for tag:build-aws: ' + json.dumps(ssh_rules, sort_keys=True), output.getvalue())
+        self.assertIn('replace acls rules for tag:build-aws: ' + json.dumps([network_rule], sort_keys=True), output.getvalue())
         self.assertEqual(cast(list[object], self.tailnet.policy['acls'])[0], unrelated)
         self.assertEqual(mapping(self.tailnet.policy['tagOwners'])['tag:other'], ['autogroup:admin'])
         self.assertTrue(self.subject.policy_present())

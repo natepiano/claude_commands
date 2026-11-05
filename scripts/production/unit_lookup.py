@@ -2,7 +2,7 @@
 """Find recorded production units and join their herdr panes by staff identity.
 
 Current names, places and messaging sockets come from herdr and live session
-records. Run state comes from /unit:direct records. Duplicate processes are refused.
+records. Run state comes from /unit:direct records.
 """
 from __future__ import annotations
 
@@ -546,7 +546,7 @@ def every_labeled_session(*, record: staff.StaffSnapshot | None = None,
 
 def labeled_sessions(slug: str, *, record: staff.StaffSnapshot | None = None,
                  sources: MemberSources | None = None) -> dict[str, LabeledSession]:
-    """Return unit states. Duplicate processes have an unknown state."""
+    """Return the selected process state for each unit."""
     slug = _lookup_slug(slug, record=record)
     found = every_labeled_session(record=record, sources=sources)
     return found.status_units(slug)
@@ -555,7 +555,7 @@ def labeled_sessions(slug: str, *, record: staff.StaffSnapshot | None = None,
 def labeled_session(slug: str, name: str, *, record: staff.StaffSnapshot | None = None,
                 sources: MemberSources | None = None,
                 running: Sequence[SessionRecord] | None = None) -> LabeledSession | None:
-    """Return one unit session. Unreadable herdr or duplicate processes raise OSError."""
+    """Return one unit of the production. Unreadable herdr raises OSError."""
     slug = _lookup_slug(slug, record=record)
     record = record if record is not None else staff.snapshot()
     sources = sources if sources is not None else member_sources(record=record)
@@ -567,8 +567,6 @@ def labeled_session(slug: str, name: str, *, record: staff.StaffSnapshot | None 
         found = retained_session_labels(marked, selected.row, slug, record=record, sources=sources)
     else:
         found = group_labeled_sessions(marked, record=record, sources=sources)
-    if fault := found.faults.get(slug, {}).get(label):
-        raise OSError(fault)
     return found.units.get(slug, {}).get(label)
 
 

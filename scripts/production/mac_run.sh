@@ -19,41 +19,41 @@ owner=${HANA_TEST_OWNER:-${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}}
 purpose_arg=${(q)purpose}
 owner_arg=${(q)owner}
 lib=${0:A:h}/../lib
-config_value() { python3 "$lib/conf.py" get "$1" "$2"; }
+source "$lib/conf.sh"
 repo=$1 sha=$2
-hold=${3:-$(config_value production mac_run_hold_seconds)} || exit 2
-host=$(config_value production mac_run_host) || exit 2
+hold=${3:-$(conf_value production mac_run_hold_seconds)} || exit 2
+host=$(conf_value production mac_run_host) || exit 2
 # Each run owns a scratch task; EXIT ends it after the test processes finish.
 clone=""
 clone_arg=""
 clone_task=""
-port=$(config_value production mac_run_port) || exit 2
-log=$(config_value production mac_run_log) || exit 2
-launch=$(config_value production mac_run_launch) || exit 2
-status_file=$(config_value production mac_run_status) || exit 2
+port=$(conf_value production mac_run_port) || exit 2
+log=$(conf_value production mac_run_log) || exit 2
+launch=$(conf_value production mac_run_launch) || exit 2
+status_file=$(conf_value production mac_run_status) || exit 2
 bundle=""
-example_hold=$(config_value production mac_run_example_seconds) || exit 2
+example_hold=$(conf_value production mac_run_example_seconds) || exit 2
 # Each entry names a crate, an example, and its optional feature.
-example_settings=$(config_value production mac_run_examples) || exit 2
+example_settings=$(conf_value production mac_run_examples) || exit 2
 examples=("${(@s:;:)example_settings}")
-connect_seconds=$(config_value mac_test connect_timeout_s) || exit 2
+connect_seconds=$(conf_value mac_test connect_timeout_s) || exit 2
 # SSH requires a whole timeout; retain the configured minimum.
 integer connect_whole=$connect_seconds
 connect_seconds=$(( connect_whole + (connect_seconds > connect_whole) ))
-claim_seconds=$(config_value production mac_run_claim_seconds) || exit 2
-deployment_target=$(config_value production mac_run_deployment_target) || exit 2
-status_grace=$(config_value production mac_run_status_grace_seconds) || exit 2
-poll_seconds=$(config_value production mac_run_poll_seconds) || exit 2
-log_lines=$(config_value production mac_run_log_lines) || exit 2
-example_log_lines=$(config_value production mac_run_example_log_lines) || exit 2
-remote_bundle=$(config_value production mac_run_bundle) || exit 2
-example_log_prefix=$(config_value production mac_run_example_log_prefix) || exit 2
+claim_seconds=$(conf_value production mac_run_claim_seconds) || exit 2
+deployment_target=$(conf_value production mac_run_deployment_target) || exit 2
+status_grace=$(conf_value production mac_run_status_grace_seconds) || exit 2
+poll_seconds=$(conf_value production mac_run_poll_seconds) || exit 2
+log_lines=$(conf_value production mac_run_log_lines) || exit 2
+example_log_lines=$(conf_value production mac_run_example_log_lines) || exit 2
+remote_bundle=$(conf_value production mac_run_bundle) || exit 2
+example_log_prefix=$(conf_value production mac_run_example_log_prefix) || exit 2
 # Quote each configured path before it enters a remote shell command.
 log_arg=${(q)log}
 launch_arg=${(q)launch}
 status_arg=${(q)status_file}
 bundle_arg=${(q)remote_bundle}
-source_repo=$(config_value production mac_run_source) || exit 2
+source_repo=$(conf_value production mac_run_source) || exit 2
 source_arg=${(q)source_repo}
 [[ $source_repo != \~/* ]] || source_arg="\$HOME/${(q)${source_repo#\~/}}"
 
