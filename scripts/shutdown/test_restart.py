@@ -104,10 +104,10 @@ class SessionLaunchTests(ShutdownTestCase):
               patch("restart.sessions.config_dirs", return_value=[config]),
               patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
               redirect_stderr(output)):
-            kind, environment, arguments = restart.session_launch(identity)
+            kind, environment, arguments = restart.session_launch(identity, "current-name")
         self.assertEqual(kind, "claude")
         self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
-        self.assertEqual(arguments, ["--resume", identity])
+        self.assertEqual(arguments, ["--resume", identity, "--name", "current-name"])
         self.assertEqual(output.getvalue(), "")
 
     def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
@@ -118,13 +118,79 @@ class SessionLaunchTests(ShutdownTestCase):
         with (patch.object(pane_record, "RECORD_DIR", root / "panes"),
               patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"})):
             pane_record.write("agents", entry)
-            kind, environment, arguments = restart.session_launch("saved")
+            kind, environment, arguments = restart.session_launch("saved", "current-name")
         self.assertEqual(kind, "claude")
         self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
         parsed = pane_record.parse_claude_arguments(["claude", *arguments])
         self.assertEqual(parsed.plugin_directories, tuple(directories))
         self.assertEqual(parsed.values["--resume"], "saved")
         self.assertEqual(arguments.count("--plugin-dir"), 2)
+
+
+class RecordedResumeTests(ShutdownTestCase):
+    folder: Path = Path("/tmp/recorded-resume")
+
+    def entry(self, kind: Literal["claude", "codex"], model: str) -> pane_record.PaneLaunch:
+        return {"kind": kind, "pane_id": "w1:p1", "session_id": "recorded-id",
+                "config_dir": "/account", "cwd": str(self.folder), "name": "recorded-name",
+                "model": model, "remote_control": True, "environment": {}, "flags_read": True,
+                "plugin_directories": ["/plugins/first", "/plugins/second plugin"], "written_at": "fixture"}
+
+    def resumed_arguments(self, entry: pane_record.PaneLaunch) -> list[str]:
+        row = staff.StaffRow(staff.StaffId("row"), "agent", "current-name", staff.StaffRoot(),
+                            current_session=staff.StaffId("current-id"),
+                            worktree=staff.PresentWorktree("natedev", self.folder))
+        with (patch.object(pane_record, "launch_for_session", return_value=entry),
+              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.NewTab("saved", row.name)),
+              patch.object(herdr.Herdr, "panes", return_value=[]),
+              patch.object(herdr.Herdr, "remember_row_tab"),
+              patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(self.folder, {})),
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p1", herdr.PromptSubmissionNotRequired())) as launch):
+            self.assertEqual(restart.start_row(row, staff.StaffSnapshot((row,)), herdr.Herdr("agents")), "w1:p1")
+        return cast(list[str], launch.call_args.args[4])
+
+    def test_codex_resume_keeps_the_recorded_model_and_omits_an_empty_model(self) -> None:
+        for model in ("", "codex-model"):
+            with self.subTest(model=model):
+                arguments = self.resumed_arguments(self.entry("codex", model))
+                expected = ["-c", 'projects={"/tmp/recorded-resume"={trust_level="trusted"}}', "resume", "current-id"]
+                if model:
+                    expected.extend(("--model", model))
+                self.assertEqual(arguments, expected)
+
+    def test_claude_resume_keeps_model_plugins_and_one_current_name(self) -> None:
+        for recorded_name in ("recorded-name", ""):
+            with self.subTest(recorded_name=recorded_name):
+                entry = self.entry("claude", "claude-model")
+                entry["name"] = recorded_name
+                arguments = self.resumed_arguments(entry)
+                expected = ["--resume", "current-id", "-n", "current-name", "--remote-control", "current-name"]
+                expected.extend(("--model", "claude-model", "--plugin-dir", "/plugins/first",
+                                 "--plugin-dir", "/plugins/second plugin", "--settings", '{"disableAgentView": true}'))
+                self.assertEqual(arguments, expected)
+                names = [arguments[index + 1] for index, value in enumerate(arguments) if value in ("-n", "--name")]
+                self.assertEqual(names, ["current-name"])
+
+    def test_resume_uses_requested_identity_without_changing_the_record(self) -> None:
+        for kind in ("claude", "codex"):
+            with (self.subTest(kind=kind),
+                  patch.object(pane_record, "launch_for_session", return_value=(entry := self.entry(kind, "saved-model"))),
+                  patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"})):
+                _kind, _environment, arguments = restart.session_launch("requested-id", "requested-name")
+                self.assertEqual(arguments[:2], ["resume" if kind == "codex" else "--resume", "requested-id"])
+                self.assertIn("--model", arguments)
+                self.assertEqual(arguments[arguments.index("--model") + 1], "saved-model")
+                self.assertEqual(entry["session_id"], "recorded-id")
+                self.assertEqual(entry["name"], "recorded-name")
+                if kind == "claude":
+                    self.assertEqual(arguments[arguments.index("-n") + 1], "requested-name")
+                    self.assertEqual(arguments[arguments.index("--remote-control") + 1], "requested-name")
+                else:
+                    self.assertNotIn("-n", arguments)
+                    self.assertNotIn("--name", arguments)
 
 
 class RestartTests(ShutdownTestCase):
@@ -193,8 +259,8 @@ class RestartTests(ShutdownTestCase):
         return self.records_for(self.running)
 
     @staticmethod
-    def session_launch(identity: str) -> tuple[Literal["claude"], dict[str, str], list[str]]:
-        return "claude", {}, ["--resume", identity]
+    def session_launch(identity: str, name: str) -> tuple[Literal["claude"], dict[str, str], list[str]]:
+        return "claude", {}, ["--resume", identity, "--name", name]
 
     def layout_result(self, *arguments: str) -> dict[str, object]:
         if arguments == ("workspace", "list"):
@@ -364,8 +430,9 @@ class RestartTests(ShutdownTestCase):
                     self.running.discard(str(self.rows[pid - 990100].current_session))
                     signalled.append(pid)
 
-                def launch_arguments(identity: str) -> tuple[str, dict[str, str], list[str]]:
-                    return kind, {}, ["resume" if kind == "codex" else "--resume", identity]
+                def launch_arguments(identity: str, name: str) -> tuple[str, dict[str, str], list[str]]:
+                    arguments = ["resume", identity] if kind == "codex" else ["--resume", identity, "--name", name]
+                    return kind, {}, arguments
 
                 def launched(_session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                              _prepared: herdr.PreparedAgentEnvironment, launch_kind: str, arguments: list[str],
@@ -416,7 +483,7 @@ class RestartTests(ShutdownTestCase):
                   patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude4", target)) as selection,
                   patch.object(restart, "named_account_environment", return_value=environment) as account,
                   patch.object(restart, "session_launch", return_value=("claude", {"CLAUDE_CONFIG_DIR": str(source)},
-                      ["--resume", str(self.rows[0].current_session)])),
+                      ["--resume", str(self.rows[0].current_session), "--name", self.rows[0].name])),
                   patch("scripts.accounts.accounts.trust_sources", return_value=[("claude3", source / ".claude.json")]) as sources,
                   patch.object(herdr, "heal_claude_trust", return_value=herdr.TrustCopied(self.root,
                       target / ".claude.json", "claude3")) as trust,

@@ -85,24 +85,25 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
         return False
 
 
-def session_launch(identity: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     try:
         entry = pane_record.launch_for_session(identity)
     except (OSError, ValueError) as error:
         print(f"{identity}: launch record anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
         entry = None
     if entry is not None:
+        projected = entry.copy()
+        projected["session_id"] = identity
+        projected["name"] = name
+        arguments = pane_record.resume_arguments(projected)
         kind = pane_launch.agent_kind(entry)
         if kind == "codex":
             home = entry["environment"].get("CODEX_HOME", entry["config_dir"])
-            return kind, {"CODEX_HOME": home}, ["resume", identity]
-        arguments = ["--resume", identity]
-        for directory in entry.get("plugin_directories", []):
-            arguments.extend(("--plugin-dir", directory))
+            return kind, {"CODEX_HOME": home}, arguments
         return kind, named_account_environment(Path(entry["config_dir"])), arguments
     for directory in sessions.config_dirs():
         if any((directory / "projects").glob(f"*/{identity}.jsonl")):
-            return "claude", named_account_environment(directory), ["--resume", identity]
+            return "claude", named_account_environment(directory), ["--resume", identity, "--name", name]
     homes = list(Path.home().glob(".codex*"))
     if home := os.environ.get("CODEX_HOME"):
         homes.insert(0, Path(home))
@@ -125,7 +126,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         import remote
         if machine != remote.local_machine():
             raise ValueError(f"{row.name}: session is on {machine}")
-        kind, environment, arguments = session_launch(str(row.current_session))
+        kind, environment, arguments = session_launch(str(row.current_session), row.name)
         if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
             from scripts.accounts import accounts
 
@@ -160,8 +161,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             return ""
         if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
             herdr.conversation_note(current)
-        if kind == "claude":
-            arguments.extend(["--name", row.name])
         operation_deadline.check()
         result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
             trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),

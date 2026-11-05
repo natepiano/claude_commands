@@ -76,8 +76,22 @@ class ConversationReaderTests(StaffTestCase):
         self.codex(rollout=False)
         with patch.object(herdr, "_process_display_name", return_value="test-tab"):
             observed = herdr.read_conversation(self.launched, "codex")
-        self.assertEqual(observed, herdr.UnknownConversation("test-tab (Codex thread unknown)"))
+        self.assertEqual(observed, herdr.UnknownConversation(
+            f"{self.launched} is not proved live or stopped: 1 processes unknown, first: test-tab (Codex thread unknown)"))
         self.assertEqual(herdr.native_process(998071, "codex").identity, herdr.LaunchArgument(self.launched))
+
+    def test_unknown_other_process_names_the_target_first(self) -> None:
+        unknown = ["morty (Codex thread unknown)\nprivate detail", "other (Codex thread unknown)", "pid 42 (Codex thread unknown)"]
+        with patch.object(herdr, "_codex_conversations", return_value=({}, unknown)):
+            observed = herdr.read_conversation(self.identity, "codex")
+        self.assertIsInstance(observed, herdr.UnknownConversation)
+        assert isinstance(observed, herdr.UnknownConversation)
+        self.assertEqual(observed.reason, f"{self.identity} is not proved live or stopped: "
+                         + "3 processes unknown, first: morty (Codex thread unknown) private detail")
+        self.assertEqual(len(observed.reason.splitlines()), 1)
+        with redirect_stderr(io.StringIO()) as output:
+            herdr.conversation_note(observed)
+        self.assertEqual(output.getvalue().count(self.identity), 1)
 
     def test_complete_read_proves_stopped_for_both_runtimes(self) -> None:
         for kind in ("claude", "codex", ""):

@@ -3357,7 +3357,8 @@ def read_conversation(identity: str, kind: str = "") -> LiveConversation | Stopp
             return LiveConversation("codex", live[identity])
         unknown.extend(incomplete)
     if unknown:
-        return UnknownConversation(unknown[0])
+        first = " ".join(unknown[0].splitlines())
+        return UnknownConversation(f"{identity} is not proved live or stopped: {len(unknown)} processes unknown, first: {first}")
     return StoppedConversation()
 
 

@@ -1329,7 +1329,10 @@ class StopResumeTests(unittest.TestCase):
     def test_absent_and_unknown_sessions_are_distinct_and_unsignalled(self) -> None:
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
         self.live.return_value = sessions.SessionLivenessUnknown("registry unreadable")
-        self.assertEqual(stop_resume.stop("alpha"), stop_resume.StopFailed("019b3a40-4250-7000-8000-000000000102", "019b3a40-4250-7000-8000-000000000102 (Claude session unknown: registry unreadable)"))
+        identity = "019b3a40-4250-7000-8000-000000000102"
+        reason = f"{identity} is not proved live or stopped: 1 processes unknown, first: "\
+            + f"{identity} (Claude session unknown: registry unreadable)"
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.StopFailed(identity, reason))
         self.assertEqual(stop_resume.stop("elsewhere"), stop_resume.SessionNotFound("elsewhere"))
         self.assertEqual(stop_resume.resume("elsewhere", why="maintenance"), stop_resume.ResumeFailed("elsewhere", "unknown name"))
         self.kill.assert_not_called()
@@ -1640,7 +1643,10 @@ class StopResumeTests(unittest.TestCase):
         self.start.reset_mock()
         self.launched.clear()
         self.live.return_value = sessions.SessionLivenessUnknown("identity unreadable")
-        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.StopFailed("019b3a40-4250-7000-8000-000000000102", "019b3a40-4250-7000-8000-000000000102 (Claude session unknown: identity unreadable)"))
+        identity = "019b3a40-4250-7000-8000-000000000102"
+        reason = f"{identity} is not proved live or stopped: 1 processes unknown, first: "\
+            + f"{identity} (Claude session unknown: identity unreadable)"
+        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.StopFailed(identity, reason))
         self.start.assert_not_called()
         self.kill.assert_not_called()
 
