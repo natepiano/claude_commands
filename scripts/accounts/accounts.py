@@ -4970,9 +4970,14 @@ def _machine_role_counts(
         roles = tuple(dict.fromkeys((*row.roles, *(role for counts in machines.values() for role in counts))))
         if any(role != "spare" for role in roles):
             roles = tuple(role for role in roles if role != "spare")
-        local_by_role = dict(zip(row.roles, row.role_counts))
-        counted.append(replace(row, roles=roles, role_counts=tuple(local_by_role.get(role,
-            _role_session_counts((), row.tool)) for role in roles), role_counts_by_machine=machines))
+        combined: list[RoleSessionCounts | NoRoleCount] = []
+        for role in roles:
+            counts = [machine[role] for machine in machines.values() if role in machine]
+            combined.append(NoRoleCount() if role == "spare" else RoleSessionCounts(
+                busy=sum(count["busy"] for count in counts),
+                shell=sum(count["shell"] or 0 for count in counts) if row.tool == "claude" else UnknownShellCount(),
+                idle=sum(count["idle"] for count in counts)))
+        counted.append(replace(row, roles=roles, role_counts=tuple(combined), role_counts_by_machine=machines))
     return tuple(counted), (() if available else (f"{peer} unavailable: counts are {local} only",))
 
 
@@ -4981,17 +4986,12 @@ def _role_count_text(row: StatusRow, role: str) -> str:
     selected = " ✓" if role in row.selected_roles else ""
     if role == "spare":
         return role
-    if row.role_counts_by_machine:
-        counts = [machine[role] for machine in row.role_counts_by_machine.values() if role in machine]
-        busy, idle, total = (sum(count[key] for count in counts) for key in ("busy", "idle", "total"))
-        shell = sum(count["shell"] or 0 for count in counts) if row.tool == "claude" else None
-    else:
-        index = row.roles.index(role)
-        count = row.role_counts[index] if index < len(row.role_counts) else NoRoleCount()
-        if not isinstance(count, RoleSessionCounts):
-            return role + selected
-        busy, idle, total = count.busy, count.idle, count.total
-        shell = count.shell if isinstance(count.shell, int) else None
+    index = row.roles.index(role)
+    count = row.role_counts[index] if index < len(row.role_counts) else NoRoleCount()
+    if not isinstance(count, RoleSessionCounts):
+        return role + selected
+    busy, idle, total = count.busy, count.idle, count.total
+    shell = count.shell if isinstance(count.shell, int) else None
     activity = f"busy {busy}, " + (f"shell {shell}, " if shell is not None else "") + f"idle {idle}"
     return f"{role}{selected} {total} ({activity})"
 

@@ -75,7 +75,21 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 `status --json` prints `{"accounts": [...], "upcoming_moves": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the problem lines below the normal table.
 `upcoming_moves` contains the rendered upcoming move lines, including the heading.
 
-Each account has `label`, `tool` (`claude` or `codex`), `roles`, `selected_roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles include observed members and selected roles with zero members. `selected_roles` identifies the selected account independently. Codex roles are `workers` or `spare`. Each `role_counts` entry counts local members for the role at the same index, as `{busy, shell, idle, total}`: a Claude session takes its session-record state; a stopped member uses `shell`, and a Codex worker is busy while its turn runs or starts, else idle, with a null `shell`. `spare` has a null entry. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
+Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`.
+`tool` is `claude` or `codex`.
+Roles include observed members and selected roles with zero members.
+`selected_roles` identifies the selected account independently.
+Codex roles are `workers` or `spare`.
+Each `role_counts` entry combines available machine counts for the role at the same index, as `{busy, shell, idle, total}`.
+Claude sessions use their session-record state; stopped members use `shell`.
+Codex workers are busy while their turns run or start; otherwise, they are idle.
+Codex shell counts are null.
+A role with no reported members has zero counts; `spare` has a null entry.
+Missing readings are null.
+Reset and read times are ISO 8601 UTC strings.
+Credits are a number, `"unlimited"`, or null.
+Claude has null credits and `use_credits: false`.
+Codex `use_credits` is true unless its note says `use_credits: off`.
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
@@ -123,8 +137,9 @@ A later successful fetch restores the combined counts on the next board tick.
 Each JSON account has `role_counts_by_machine`, keyed by machine and then role.
 Each role value contains `busy`, `shell`, `idle`, and `total`.
 The JSON omits unavailable machines from this field.
-The existing `role_counts` field retains local counts in role order.
-The board sums `role_counts_by_machine`; older data without this field uses `role_counts`.
+Python combines the available machine counts once in `role_counts`, in role order.
+The board and text table read `role_counts` without combining machine records again.
+Claude shell counts include each available machine; Codex shell counts stay null.
 The JSON has no session identities or account directories.
 
 The JSON `session_inputs` lists the files and directories that the board watches, including the peer cache.
