@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,6 +23,10 @@ from code_kind import is_test_code  # noqa: E402
 
 import gpu_xid
 import push_texts
+if TYPE_CHECKING:
+    from ..message import session_send
+else:
+    from scripts.message import session_send
 from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
@@ -170,6 +174,19 @@ class PushTextTests(unittest.TestCase):
         push = push_texts.render_entry(entry, entry.examples[0].values)
         argv = push_texts.user_send_argv(push, question="/tmp/question-layout.md")
         self.assertEqual(argv[argv.index("--question") + 1], "/tmp/question-layout.md")
+
+    def test_user_commands_use_the_current_sender_and_preserve_an_explicit_override(self) -> None:
+        entry = self.entry()
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        with tempfile.TemporaryDirectory() as folder:
+            current, override = Path(folder) / "current.py", Path(folder) / "override.py"
+            with mock.patch.object(session_send, "SEND_SCRIPT", current):
+                default = push_texts.user_send_argv(push)
+                explicit = push_texts.user_send_argv(push, send_script=override)
+                retired = push_texts.user_retire_argv("sender", "held")
+        self.assertEqual(default[:2], [sys.executable, str(current)])
+        self.assertEqual(explicit, [sys.executable, str(override), *default[2:]])
+        self.assertEqual(retired, [sys.executable, str(current), "retire", "--to", "user", "--from", "sender", "--key", "held"])
 
     def test_decision_choices_builds_the_approved_rows_and_keeps_structured_values(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
