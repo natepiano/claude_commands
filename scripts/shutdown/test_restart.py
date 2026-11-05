@@ -22,7 +22,7 @@ import sessions
 import restart
 import shutdown
 from unit_staff_test_support import unit_host
-from scripts.production import staff, fake_unit_host
+from scripts.production import fake_unit_host, session_staff, staff
 from scripts.accounts import accounts
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from test_support import ShutdownTestCase, registry_confirmation
@@ -438,14 +438,14 @@ class RestartTests(ShutdownTestCase):
                                             environment, herdr.NO_ENVIRONMENT_REMOVALS)
             self.assertEqual(pane, "w1:p0")
 
-    def test_start_row_trusts_the_codex_folder(self) -> None:
+    def test_start_row_opens_and_trusts_the_codex_folder(self) -> None:
         self.running.clear()
         row = self.rows[0]
         with (patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", row.current_session])),
               patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                   "w1:p0", herdr.PromptSubmissionNotRequired())) as launch):
             _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"))
-        self.assertEqual(launch.call_args.args[4], ["-c",
+        self.assertEqual(launch.call_args.args[4], ["-C", str(self.root), "-c",
             'projects={' + json.dumps(str(self.root)) + '={trust_level="trusted"}}', "resume", row.current_session])
 
     def test_account_trust_reports_anomalies_and_returns_the_result(self) -> None:
@@ -490,8 +490,8 @@ class RestartTests(ShutdownTestCase):
                 unused.assert_not_called()
             self.assertEqual(shutdown_record.record_path().read_bytes(), before)
             self.assertEqual((self.stops, self.launches), ([], []))
-            self.assertEqual(restart.row_folder(self.rows[2], staff.StaffSnapshot(self.rows)), ("natedev", self.root))
-            self.assertEqual(restart.row_folder(replace(self.rows[2], worktree=staff.PresentWorktree("natedev", self.root / "own")),
+            self.assertEqual(shutdown_record.row_folder(self.rows[2], staff.StaffSnapshot(self.rows)), ("natedev", self.root))
+            self.assertEqual(shutdown_record.row_folder(replace(self.rows[2], worktree=staff.PresentWorktree("natedev", self.root / "own")),
                 staff.StaffSnapshot(self.rows)), ("natedev", self.root / "own"))
 
     def test_restart_lock_refusal_leaves_the_record_unchanged(self) -> None:
@@ -518,8 +518,9 @@ class RestartTests(ShutdownTestCase):
         self.running.clear()
         other = "another-failed-row"
 
-        def start(_row: staff.StaffRow, _record: staff.StaffSnapshot, _client: herdr.Herdr, *, present: bool) -> None:
-            _ = present
+        def start(_row: staff.StaffRow, _record: staff.StaffSnapshot, _client: herdr.Herdr, *,
+                  present: bool, resolver: session_staff.RowResolver) -> None:
+            _ = present, resolver
             shutdown_record.update(started=[], pending=[other])
 
         shutdown_record.save([str(self.rows[0].id), str(self.rows[1].id)])
@@ -590,6 +591,103 @@ class RestartTests(ShutdownTestCase):
         self.assertTrue(output.getvalue().startswith("saved 0 rows for restart at "))
         self.assertEqual(errors.getvalue(), "restart: save anomaly: staff unavailable\n")
 
+    def test_restart_fixed_reference_uses_current_native_id_name_and_folder(self) -> None:
+        native_id = str(self.rows[0].current_session)
+        shutdown_record.save([str(self.rows[0].id)])
+        folder = self.root / "renamed-folder"
+        folder.mkdir()
+        self.rows = (replace(self.rows[0], name="renamed-unit",
+            worktree=staff.PresentWorktree("natedev", folder)), *self.rows[1:])
+        record = staff.StaffSnapshot(self.rows)
+        self.running.clear()
+        prepared = herdr.PreparedAgentEnvironment(folder, {})
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(herdr, "prepare_session_environment", return_value=prepared) as prepare,
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p0", herdr.PromptSubmissionNotRequired())) as launch):
+            self.assertEqual(restart.restart(), 0)
+        prepare.assert_called_once()
+        self.assertEqual(prepare.call_args.args[:2], (native_id, str(folder)))
+        self.assertEqual(prepare.call_args.args[3], herdr.NO_ENVIRONMENT_REMOVALS)
+        self.assertEqual(launch.call_args.args[3:5],
+                         ("claude", ["--resume", native_id, "--name", "renamed-unit"]))
+        self.assertEqual(launch.call_args.kwargs["agent"], "renamed-unit")
+        self.assertEqual(shutdown_record.read(), [])
+
+    def test_restart_failure_keeps_only_the_failed_fixed_reference(self) -> None:
+        identities = [str(row.id) for row in self.rows]
+        shutdown_record.save(identities)
+        self.running.clear()
+        launch = self.launch
+
+        def fail_first(name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                       prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                       opening: herdr.NoOpeningPrompt, timeout: int, *, agent: str = "",
+                       reported_unknown: str = "") -> herdr.AgentLaunched:
+            if agent == self.rows[0].name:
+                raise herdr.HerdrFailure("fixture launch failed")
+            return launch(name, destination, prepared, kind, arguments, opening, timeout, agent=agent,
+                          reported_unknown=reported_unknown)
+
+        with (patch.object(herdr, "launch_prepared_agent", side_effect=fail_first),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(shutdown_record.read(), [identities[0]])
+        self.assertEqual(errors.getvalue(), "unit-0: restart anomaly: fixture launch failed\n")
+        self.assertEqual([name for name, _ in self.launches], [row.name for row in self.rows[1:]])
+
+    def test_restart_staff_read_error_preserves_fixed_references(self) -> None:
+        shutdown_record.save([str(self.rows[0].id)])
+        before = shutdown_record.record_path().read_bytes()
+        with (patch.object(staff, "initial_snapshot", side_effect=OSError("staff unavailable")),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(shutdown_record.record_path().read_bytes(), before)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("staff unavailable", errors.getvalue())
+        self.assertEqual(self.launches, [])
+
+    def test_restart_skips_a_saved_name_after_another_row_reuses_it(self) -> None:
+        shutdown_record.save([str(self.rows[0].id), "missing-unit"])
+        self.running.clear()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(shutdown_record.read(), ["missing-unit"])
+        self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
+        path = shutdown_record.record_path()
+        before = (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
+        self.rows = (self.rows[0], replace(self.rows[1], name="missing-unit"), *self.rows[2:])
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)),
+              redirect_stderr(errors)):
+            self.assertEqual(restart.restart(), 0)
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns), before)
+        self.assertEqual(errors.getvalue().splitlines(),
+            ["missing-unit: restart anomaly: in the restart record, no fixed staff id"] * 3)
+        self.assertEqual(self.stops, [])
+
+    def test_restart_saved_conversation_reference_does_not_select_a_member(self) -> None:
+        reference = str(self.rows[0].current_session)
+        shutdown_record.save([reference])
+        path = shutdown_record.record_path()
+        before = (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
+        self.running.clear()
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(self.launches, [])
+        self.assertEqual(errors.getvalue(),
+            f"{reference}: restart anomaly: in the restart record, no fixed staff id\n")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns), before)
+
+    def test_restart_command_still_resolves_a_name_without_selecting_saved_entries(self) -> None:
+        shutdown_record.save([str(self.rows[1].id), "missing-unit"])
+        self.running.clear()
+        self.assertEqual(restart.restart(only=(self.rows[0].name,)), 0)
+        self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
+        self.assertEqual(shutdown_record.read(), [str(self.rows[1].id), "missing-unit"])
+
     def test_bare_dry_run_reports_record_time_and_missing_rows(self) -> None:
         shutdown_record.save(["row-0", "gone"])
         saved_at = time.strftime("%H:%M", time.localtime(shutdown_record.record_path().stat().st_mtime))
@@ -598,7 +696,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(output.getvalue().splitlines(), [f"restart record: 2 rows saved at {saved_at}",
             "unit-1: live, not in the restart record", "unit-2: live, not in the restart record",
             "unit-0: row-0, unit, workspace live, tab 1 (unit-0)"])
-        self.assertEqual(errors.getvalue(), "gone: in the restart record, no staff row\n")
+        self.assertEqual(errors.getvalue(), "gone: restart anomaly: in the restart record, no fixed staff id\n")
         self.assertEqual(shutdown_record.read(), ["row-0", "gone"])
 
     def test_layout_error_keeps_the_live_rows_and_other_tab_saves(self) -> None:
