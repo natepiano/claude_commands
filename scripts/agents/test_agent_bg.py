@@ -16,6 +16,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
+from scripts.lib.process_group import send_process_group
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
@@ -219,7 +220,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                         output, errors = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
                     finally:
                         if launcher.poll() is None:
-                            os.killpg(launcher.pid, signal.SIGKILL)
+                            send_process_group(launcher.pid, signal.SIGKILL)
                             _ = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(launcher.returncode, 143 if cancel else 0, output + errors)
                 record = cast(dict[str, dict[str, object]], json.loads((self.fixture.run_dir / "mesh_roster.json").read_text()))
