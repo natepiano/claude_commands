@@ -1597,7 +1597,7 @@ Give cargo-handler on the Mac a read-only copy of the staff record (the user sai
 9. Name the cost you add to each write in your summary.
 Files: scripts/production/staff.py (only the write path and a new copy function) and scripts/production/test_staff.py (or a new scripts/production/test_staff_mac_copy.py). Report to the unit director; it sends the hash to sdlc.
 
-### Phase 4t — A test keeps the staff accessor list complete  · status: todo
+### Phase 4t — A test keeps the staff accessor list complete  · status: done
 
 **Depends on:** sdlc's `docs/as-built/staff-accessors.md` (in the tree since sdlc 4441fbcfe).
 
@@ -1608,7 +1608,7 @@ Files: scripts/production/staff.py (only the write path and a new copy function)
 **Spec:**
 1. A file reads or writes the staff record when it imports the `staff` module (`import staff`, `from staff import`, `from scripts.production import staff`, `from scripts.production.staff import`), names the record path (`.local/state/staff/staff.json`, or `staff.json` under the staff state folder), or runs `staff.py` as a command. Grep the tree and make the rule match what is there. The summary names each form found and each form counted.
 2. Scan tracked files under `scripts/`, `commands/` and `docs/` that are code or commands (`.py`, `.sh`, command `.md`). Follow the doc's own rule for test files ("Tests are left out"); the doc lists `*_test_support.py` files that name the record path, so match the doc. One pass, no subprocess per file.
-3. The doc lists each accessor as a repo-relative path in backticks. The test reads every backticked path in the doc. It fails with one line per missing file, naming the file and the line that accesses the record. It also fails on a listed path that no longer exists.
+3. The doc lists each accessor as a repo-relative path in backticks. The test reads the backticked repo-relative paths in the `File` column of the doc's tables. It fails with one line per missing file, naming the file and the line that accesses the record. It also fails on a listed path that no longer exists.
 4. A file the doc misses today is added to the doc in this phase, so the test passes at the checkpoint.
 5. Prove the test with a temporary doc copy that misses one file: it fails and names that file.
 
@@ -1689,6 +1689,60 @@ The restart deadline (F007) moved to shutdown-unit Phase 4l.
 - `scripts/hana_instances/test_hana_instances.py` — native agent markers (item 7).
 - `docs/as-built/hana-test-windows.md` — owner and marker text (item 7).
 - `scripts/herdr/test_herdr.py` — whole `scripts/lib` copy (item 8).
+
+### Phase 4z — A launcher and its agent child are one identity  · status: done
+
+**Depends on:** 4e (native runtime ids select rows).
+
+#### Work Order
+
+**Goal:** a pane whose launcher process and its own `claude` or `codex` child carry the same native runtime id counts as one identity, not two (sdlc, 2026-11-05).
+
+**Spec:**
+1. Today `session_staff._group_labeled_sessions` (about line 710) prints "multiple processes claim its runtime identity" for every live unit after the claude4 move. Each pair is one pane: the python3 launcher and its own agent child (example: style pid 157578 python3 and pid 159573 claude in one pane).
+2. The same fault puts each unit into `status_units` as `ClaudeUnknown`. This is a wrong result, not only noise.
+3. A process and its descendants in one pane that carry one native runtime id are one identity. Keep the agent process (the descendant) as the selected holder.
+4. Report "multiple processes claim its runtime identity" only for separate process trees: two panes, or two processes in one pane where neither is an ancestor of the other.
+5. Fix it where the duplicate starts. `unit_lookup.py` (about lines 470-530) already drops a shell that is an ancestor of a Claude process with the same identity (`inherited`, through `herdr.linux_process_parent` and the darwin parent map). Make that one rule cover any launcher process and any agent child, Claude or Codex. Do not add a second ancestry walk.
+6. Unavailable ancestry keeps today's result (the duplicate stays reported).
+7. Tests: a launcher and child pair in one pane gives one identity and no anomaly, for Claude and for Codex. Two separate trees with one id still give the anomaly.
+
+**Files:**
+- `scripts/production/unit_lookup.py` — the one ancestry rule.
+- `scripts/production/session_staff.py` — only if the grouping needs a change.
+- `scripts/production/test_unit_lookup.py` — the regression tests.
+
+**Workers:** `1 writer` — one slot owns all three files.
+
+**State:** none.
+
+**Acceptance gate:** the new tests fail without the change and pass with it; the production and shutdown suites pass; basedpyright 0/0 on the changed files; the source change is net negative or zero in source lines.
+
+### Phase 5b — The saved layout binds rows from the native process scan  · status: todo
+
+**Depends on:** 4e (native runtime ids select rows).
+
+#### Work Order
+
+**Goal:** `Herdr.record_layout` takes each tab's staff rows from the native process scan, never from herdr's `agent_session` mark, so a stale mark never binds a row to a tab (sdlc, 2026-11-05: a stale mark that binds a row is a wrong result).
+
+**Spec:**
+1. Today `record_layout` (herdr.py about line 1399) reads `pane["agent_session"]` and binds the row whose current session equals that value. herdr keeps the mark after the agent exits or changes, so a stale mark can bind a row to the wrong tab, and the saved restart place is wrong.
+2. Use the existing scan `Herdr._row_panes(record, panes)` (about line 1491). It reads native pane processes and returns the proved panes for each row and whether every pane was known. Do not add a second scan.
+3. Bind each row to the tab of each pane `_row_panes` proved for it. A pane whose evidence is unknown binds nothing; its row keeps its saved place (no row is dropped from the saved layout because of unknown evidence).
+4. A pane with an `agent_session` mark and no proved native process binds nothing.
+5. Cost: one `pane process-info` call per pane on each save. State it in the checkpoint message.
+6. Tests in `test_herdr.py`: a stale `agent_session` mark with a different live native session binds the native row; a mark with no native process binds nothing; unknown pane evidence keeps the saved place.
+
+**Files:**
+- `scripts/herdr/herdr.py` — `record_layout` uses `_row_panes`.
+- `scripts/herdr/test_herdr.py` — the regression tests; update fakes that set only `agent_session` to give native process info.
+
+**Workers:** `1 writer` — one slot owns both files.
+
+**State:** none.
+
+**Acceptance gate:** the new tests fail without the change and pass with it; the herdr, shutdown and production suites pass; basedpyright 0/0 on the changed files; the source change is net negative in source lines.
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: moved: shutdown-unit (sdlc, 2026-11-04)
 
