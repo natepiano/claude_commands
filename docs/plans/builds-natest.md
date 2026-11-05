@@ -10,6 +10,13 @@
 
 From the user (via natedev): Mission: find the longest-running ~/.claude tests and make them faster. Keep a descending sort of test times; when it makes the longest one shorter, it takes the next one. Build tools that instantly show the history of ~/.claude test suite times and of individual test times. Use parallelism, removal of trivial tests, shared code and good engineering practice. It must also send architectural change proposals back. It organizes its work in phases so /unit:direct works, and keeps its own phase backlog: the user wants the standard process engaged.
 
+## Standing work
+
+1. At each phase start, read the merge gate's slowdown warnings; natest-unit owns them. A warned module goes to `builds-natest-next.md`.
+2. At each phase end, re-sort with `show.py top`. Before the last todo phase starts, add a speed phase for the top live module that no phase holds.
+3. `builds-natest-next.md` lists each module with a reported floor. A floored module is a target again only when its gate median rises 20% above its floor.
+4. When no live module has a median over 60 s, the plan holds and tells the showrunner; it does not close.
+
 ## Delegation Context
 
 - **Project:** `~/.claude` — the scripts, commands and config that run the user's productions. This plan records test times and makes the slowest test modules faster.
@@ -56,16 +63,16 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 - **Speed method** (every speed phase):
   0. Targets: at dispatch, the director takes the top live rows of `test_times top` that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal.
-  1. Baseline: before the edit, run the module alone three times with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` and keep the median `wall_s` and `cpu_s`. Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
+  1. Baseline: before the edit, run the module three times with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` and keep the median `wall_s` and `cpu_s`. These runs find the cost (step 2); they are not the before number of the gain (step 5). Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
   2. Find the cost from the JSON: the slowest tests, and `wall_s - tests_s` (import and module or class fixtures). Name the expensive operations before any edit; do not apply a cut the module already has.
   3. Cut it, in this order:
-     - Remove trivial tests (Invariants above).
+     - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s).
+     - Remove trivial tests (Invariants above). Run `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` on the module. Compare each candidate's assertions with its covering tests; a candidate whose result a covering test also checks is a trivial test.
      - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does.
      - Call code in-process in place of a subprocess when the test does not check the process boundary; keep one process test for each boundary.
-     - Remove fixed waits and polling loops in the tests; wait on an event, a file or a pipe instead.
-     - Split a module whose tests are independent into two or more files, so the gate runs them at the same time. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time. Every file of the group is in acceptance.
+     - Split a module whose tests are independent into two or more files, so the gate runs them at the same time. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time. Every file of the group is in acceptance. Time the group with one `module_run.py` process per file, all started at once (as `pairs.sh` does), from the first start to the last end. The gate runs at most half the CPU count of modules at once (`DEFAULT_MAX_RUNNING_JOBS` in `merge_gate.py`); a group with more files than that gains less in the gate.
   4. A change to a shared support file (for example `scripts/lint/memory_test_support.py`) is allowed only when every module that imports it stays green; name those importers in the final gate run.
-  5. After the edit, measure three runs again, the same way, into `<module>-after-<n>-<sha>.json`. Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
+  5. After the edit, measure the gain in same-load pairs: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. A floor names its cost breakdown and the one operation that limits it. A proposal names its owner, its revisit condition, and whether its gain is measured or estimated. The pair tool prints the before and after medians as a table when it ends. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
 
 ## Phases
 
@@ -174,7 +181,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 #### As-built
 
-- The SSH target tests are five `test_verify_ssh_targets*.py` files that share `verify_ssh_targets_test_support.py`. The module runner runs them in parallel. Group wall time is 62-71 s (median), from 327.1 s; CPU is 181-188 s, from 205.5 s.
+- The SSH target tests are five `test_verify_ssh_targets*.py` files that share `verify_ssh_targets_test_support.py`. Each file runs in its own `module_run.py` process, all at the same time (the runner itself is serial). Group wall time is 62-71 s (median), from 327.1 s; CPU is 181-188 s, from 205.5 s.
 - The assign launcher tests are four `test_assign_launcher*.py` files (`test_assign_launcher.py`, `_identity`, `_reuse`, `_review`) that share `assign_launcher_test_support.py`. Most tests call the launcher in-process; `test_unreadable_staff_starts_no_worker` runs it as a separate process, because the progress recorder writes its refusal to the process stderr.
 - The merge gate test-times fixture writes `build_admission.conf` and `build_folders.conf` into its private config folder.
 - The build log index is at `SCHEMA_VERSION = 31`. A database at an older schema rebuilds, and the rebuild reads gate history from the start of each log, also before the saved offset.
@@ -190,73 +197,47 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - A split of a file that other units edit makes later upstream merges need hand ports: merge origin/builds before each split and keep the split window short.
 - The index schema number must stay above the builds branch's number; a clash makes one side skip its rebuild.
 
-### Phase 6 — The simplify-lens and assign-launcher modules run faster  · status: todo
+### Phase 6 — The simplify-lens and assign-launcher modules run faster  · status: done
 **Depends on:** Phase 5
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_simplify_lens.py` (median 132 s, 61 s CPU) runs in at most half its baseline wall time, and the assign launcher group records its session once per class (F025), with no CPU increase and no lost coverage.
-
-**Spec:** apply the speed method (Delegation Context). Each writer owns one module group.
-- `agents/test_codex_mesh.py` left this phase: codex-mesh retires, so the builds showrunner stopped new mesh test work (2026-11-04). Do not edit it.
-- `direct/test_simplify_lens.py`: `scripts/direct/wait_for_test_state.py` already waits on folder events and process descriptors (37). Find the cost from the timings.
-- F025: each assign launcher test runs the recorder setup from the start (about 150 git starts a run). Record the session once per class and copy it per test. Do it in `assign_launcher_test_support.py`; do not edit `test_codex_mesh.py`.
-- F025 isolation: the parent fixture makes a new root and server for each test, and the recorder state holds absolute history and project paths (`progress_history.py:1358`). Restore the session, history and project together for each test, with private paths and a fresh server identity. Add a test that proves a recorder write in one test cannot reach the class seed or another test.
-- Type: `AssignLauncherFixture.launch()` and `successful()` take `script: Path | None` (`assign_launcher_test_support.py:119`, `:139`); absence means in-process and presence means a separate process. Replace it with named execution choices (for example `InProcessAssignment | LauncherScript`). Keep the existing process tests.
-- Measure CPU with the sequential method from phase 5: run the before and after trees one after the other on an idle host, never side by side.
+- `test_simplify_lens.py` seeds one git repository per class and copies it for each test. `setUp()` still records `start-run` and `start-phase simplify` for each test, except the ad hoc test, where the assignment makes the phase. Same-load pairs: 204 s to 118 s wall, CPU 117 s to 94 s.
+- `assign_launcher_test_support.py` defines `AssignmentExecution = InProcessAssignment | LauncherScript`; `AssignLauncherFixture.launch()` and `successful()` take `execution`. The process tests stay.
+- The assign launcher group records its session for each test, as before.
 
 **Files:**
-- `scripts/direct/test_simplify_lens.py` — speed edits
-- `scripts/direct/wait_for_test_state.py` — read; edit only under speed method step 4
-- `scripts/direct/assign_launcher_test_support.py` — F025 per-class recording
-- `scripts/direct/test_assign_launcher*.py` — fixture use only
+- `scripts/direct/test_simplify_lens.py` — per-class git seed
+- `scripts/direct/assign_launcher_test_support.py` — named execution choices
+- `scripts/direct/test_assign_launcher.py`, `_identity`, `_reuse`, `_review` — use the execution choices
+- `scripts/agents/test_heartbeat.py` — checks the wait helper
 
-**Workers:** 2 writers — one module group each; there is no new test to write before the code
-- `impl` — `scripts/direct/assign_launcher_test_support.py`, `scripts/direct/test_assign_launcher*.py`
-- `test` opens as impl — `scripts/direct/test_simplify_lens.py`; hub: `scripts/direct/wait_for_test_state.py`
+**Gotchas:**
+- The simplify-lens floor is one real review-launcher run per test (3-6 s); `test_report_validation` takes 25 s for 8 launches.
+- On natedev, before and after batches at different times compare host load, not code; measure with same-load pairs.
 
-**State:** none
+**Ruled out:**
+- A per-class recorder seed for the assign launcher tests (F025): it gained about 4%, so simple wins (showrunner ruling).
 
-**Constraints from prior phases:**
-- Phase 5: the assign launcher tests are four files (`test_assign_launcher.py`, `_identity`, `_reuse`, `_review`) with one support module, `assign_launcher_test_support.py`. Each still imports `scripts.agents.test_codex_mesh` as a fixture, so the gate run includes it.
-- Phase 5: the SSH target tests are five files with `verify_ssh_targets_test_support.py`; they are not in this phase.
+### Phase 7 — The fast-track module and the next live slow module run in half their time  · status: done
+**Depends on:** none
 
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_simplify_lens.py'` and `-p 'test_assign_launcher*.py'` green
-- `python3 -m unittest discover -s scripts/lib` green
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
-- Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
-- The checkpoint gate is green
+#### As-built
 
-### Phase 7 — The fast-track module and the next live slow module run in half their time  · status: todo
-**Depends on:** none (its two modules share no file with Phase 6; each baseline is its own gate median and an idle-host run, so Phase 6 need not land first)
-
-#### Work Order
-
-**Goal:** `production/test_fast_track.py` (median 296 s of its last 5 gate runs, 188 s CPU) and `style/test_crate_run.py` (median 178 s, 63 s CPU; the slowest live module of `test_times top` that no phase owns, 2026-11-04) each run in at most half their baseline wall time, with no CPU increase and no lost coverage.
-
-**Spec:** apply the speed method (Delegation Context) to each module. Each writer owns one module. `MergeCheckpointFixture.setUpClass` (`scripts/production/merge_checkpoint_test_support.py:262`) already builds one seed for each class and copies it for each test. Find the cost from the timings.
+- `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary, and starts Git directly where no interruption fixture is needed. Same-load pairs (load 40-73): 304 s to 193 s wall, 202 s to 110 s CPU. Half was not reached; the floor is 55 tests at about 3.5 s each of real Git work. The architecture proposal (one injected Git runner in `fast_track.py`) went to the showrunner.
+- The Git hang guard script forks a watcher that moves to its own process group and stops the Git group through `send_process_group`, loaded by path (the script runs with `-S`).
+- `cli_fixture.py` adds the `@process_boundary` mark and `process_boundary_for_case()`. The fixtures that kept one named test as a process now read the mark from the test method.
 
 **Files:**
-- `scripts/production/test_fast_track.py` — speed edits
-- `scripts/style/test_crate_run.py` — speed edits (the second module)
-- `scripts/production/merge_checkpoint_test_support.py` — read; edit only under speed method step 4
+- `scripts/production/test_fast_track.py` — speed edits and the hang guard
+- `scripts/production/cli_fixture.py` — the process-boundary mark
+- `scripts/production/merge_checkpoint_test_support.py`, `rename_test_support.py`, `scripts/direct/findings_test_support.py`, `scripts/bevy_upgrade/cli_test_support.py`, `scripts/style/style_plan_test_support.py` — read the mark; one importer test of each marks its process case
 
-**Workers:** 2 writers — one module each; there is no new test to write before the code
-- `impl` — `scripts/production/test_fast_track.py`; hub: `scripts/production/merge_checkpoint_test_support.py`
-- `test` opens as impl — `scripts/style/test_crate_run.py`
+**Gotchas:**
+- `lib/test_process_group.py` also scans script text held in strings: a group signal there goes through `send_process_group`, from a process outside the target group.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 5: the speed phases run one after another, so each baseline is measured on the tree the last one left.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_fast_track.py'` and the second module green
-- `python3 -m unittest discover -s scripts/lib` green
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
-- Each module's (or group's) after median `wall_s` is at most half its before median, or the phase report names the measured floor and the proposal sent; its `cpu_s` median is not higher
-- The checkpoint gate is green, with the importers of each changed support file in it
+**Ruled out:**
+- A per-class seed for `test_crate_run.py`: no gain under the same load (128 s to 126 s).
 
 ### Phase 8 — The test history tool starts without the merge gate module  · status: done
 
@@ -317,35 +298,169 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - Cost indexes outside the hash: a changed cost index is a schema change and gets its own file.
 
-### Phase 11 — Shared test fixtures skip repeated setup  · status: todo
+### Phase 11 — Shared test fixtures skip repeated setup  · status: done
 **Depends on:** Phase 6
+
+#### As-built
+
+- No change shipped. Same-load pairs (3 rounds) showed no gain: `test_simplify_lens` 93.2 to 92.7 s wall, `test_nix_env` 3.0 to 2.8 s, `test_nix_env_launches` 4.7 to 4.7 s, `test_review_launcher` 32.2 to 32.5 s.
+
+**Gotchas:**
+- The `lib/py` interpreter probe is not a measurable share of these modules. Their cost is git work and subprocess starts.
+
+**Ruled out:**
+- Fixture micro-cuts (an interpreter cache seed, a per-class config copy): the gain is noise, and a trimmed config copy needs a hand-kept file list that breaks a future caller.
+
+### Phase 12 — A tool lists the tests that only repeat other tests  · status: done
+**Depends on:** none
+
+**Result:** `coverage_overlap.py` on `test_fast_track.py`: 25 of 55 tests known, 9 candidates, 191 s with the collector on (189 s module time). The 30 unknown tests name their cause (a git wrapper script on the test PATH, or Python children with no set). Thread attribution, setup-child liveness and a failed exec moved to Phase 15; Phase 13 waits for it.
+
+#### As-built
+
+- `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file> [<file> ...]` runs the modules through `unittest` with `sys.monitoring` `LINE` events under its own tool id, one `(path, line)` set for each test. `COVERAGE_OUT=<path>` writes the JSON (tree sha, interpreter, and for each test: id, status, seconds, line count, `child`, covering ids). The table prints through `terminal_cells.print_table` and `seconds`.
+- Candidates are decided slowest first against the kept set; two tests that cover each other give one candidate. Unknown tests are never candidates and cover nothing.
+- `line_collector.py` holds the `LINE` collector, the path filter and the launch record (audit hook), used by the parent and by each child. `start_child()` owns the child setup. `ActiveTest.finish_processes()` drops a `Popen` with no pid, records exited and pending launches, and releases the `Popen` objects; `stop_test` and `write_child_report` both call it. A thread-local argument identity skips the duplicate `posix_spawn` event.
+- `coverage_child/sitecustomize.py` loads `line_collector.start_child()` when `NATEST_COVERAGE_TEST` is set, then always loads the next `sitecustomize` (the Nix `NIX_PYTHONPATH` one).
+- The child rule is a count: `unknown: <n> python children, <m> reported` when a Python child wrote no set (this covers `-I`, `-S`, `-E`), `unknown: unverified launch <program>` for a shell, `env` or a non-Python `#!` script. `COVERAGE_LEAF_PROGRAMS` (`git`) launches are verified. A launch that fails to start is no launch.
+- The path filter drops test code (`scripts.lib.code_kind.is_test_code`), the runner classes (the files of `CoverageResult.__mro__`) and the collector.
+- `module_run.timed_outcomes(result)` is the one outcome rule for `test_times` and the collector. `print_table` and `seconds` moved from `show.py` to `scripts/lib/terminal_cells.py`.
+- On `test_fast_track.py`: 25 of 55 known, 9 candidates, 191 s with the collector on (189 s module time). 28 of the unknown tests cite `unverified launch git`: the module puts a non-Python `#!` git wrapper on PATH.
+
+**Files:**
+- `scripts/test_times/coverage_overlap.py`, `line_collector.py`, `coverage_child/sitecustomize.py` — the tool
+- `scripts/test_times/module_run.py`, `show.py`, `scripts/lib/terminal_cells.py` — the shared outcome rule and table
+- `scripts/test_times/test_coverage_overlap.py` — 22 tests, 4 s
+
+**Gotchas:**
+- A commit during a simplify review changes git status, and the review fails. Commit nothing while a reviewer runs.
+- Each review round found new attribution edges. Thread attribution, setup-child liveness and a failed exec moved to Phase 15 at repair round 3 (hard landing, after an Astra review).
+
+**Ruled out:**
+- coverage.py: the Nix Python does not have it (showrunner ruling 2026-11-04).
+- Parsing `-I`/`-S`/`-E` flags: the count rule covers them with no parser.
+
+### Phase 13 — The slowest modules lose the tests that only repeat other tests  · status: todo
+**Depends on:** Phase 12, Phase 7, Phase 14, Phase 15
 
 #### Work Order
 
-**Goal:** a test with a fresh HOME skips the `lib/py` interpreter probe, and `NixFixture` stops copying the whole `config` folder for each test.
+**Goal:** the top 10 live modules of `test_times top` (no claimed or retired module) keep every checked behavior and lose each test that only repeats another.
 
 **Spec:**
 
-1. Add one shared helper in `scripts/lib/py_floor_test_support.py` that sets `XDG_CACHE_HOME` to a folder for the test and writes the interpreter cache file there with `cache_file_name()` (`:26`). `recorder_fixture.launcher_environment` (`scripts/direct/recorder_fixture.py:198-208`) and `test_simplify_lens.py` use it; the copy in `recorder_fixture.py` goes. Estimate: 20-40 ms for each test that makes a fresh HOME.
-2. `NixFixture.setUp` (`scripts/lib/nix_env_test_support.py:50`) copies the `config` folder (55 files, 288 KB) once per class, or copies only the files the tests read. Each test keeps its own writable copy of any file it changes.
-3. Measure each changed importer module before and after with `scripts/test_times/module_run.py`, three runs each.
+1. At dispatch, the director takes the 10 modules from `test_times top` (the Phase 14 ranking) and splits them between writers by folder. First drop each floored module in `builds-natest-next.md` whose gate median is not 20% above its floor (Standing work item 3). When fewer than 10 modules qualify, take fewer.
+2. For each module, run `coverage_overlap.py`. For each candidate, compare its assertions with the covering tests. Remove it only when a covering test checks the same result; otherwise keep it and give the reason in the summary.
+3. Measure the gain with same-load pairs (Speed method step 5).
+4. Report each removed test, its covering test, and the time saved; and each kept candidate with its reason.
 
 **Files:**
-- `scripts/lib/py_floor_test_support.py`, `scripts/lib/nix_env_test_support.py` — helpers
-- `scripts/direct/recorder_fixture.py`, `scripts/direct/test_simplify_lens.py` — callers
-- every module that imports `nix_env_test_support.py` — run in the gate
+- `scripts/test_times/coverage_overlap.py` — read only; the director names the 10 test modules at dispatch and adds them here
 
-**Workers:** 2 writers — one helper each
-- `impl` — `py_floor_test_support.py`, `recorder_fixture.py`, `test_simplify_lens.py`
-- `test` opens as impl — `nix_env_test_support.py`
+**Workers:** 2 writers — modules split by folder; no hub file.
 
 **State:** none
 
 **Constraints from prior phases:**
-- Phase 6: `test_simplify_lens.py` seeds one git repository per class. `setUp()` still records `start-run` and `start-phase simplify` for each test, except the ad hoc test, where the assignment makes the phase.
-- Ledger routes: Phase 6 F018, F019. Phase 6 F017 (the `assign.py` exec call) belongs to sdlc devtools, not this phase.
+- Phase 12: `coverage_overlap.py` and its `child: unknown` rule.
 
 **Acceptance gate:**
-- every importer of the two helpers green in the checkpoint gate run
+- every changed module green in the checkpoint gate run
+- each removal names a covering test that checks the same result
+- the pair medians show each changed module's wall and CPU time not higher than before
+
+### Phase 14 — `test_times top` ranks only valid runs  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `show.py top` counts a module row only when its status is 0, its run is not aborted, its run's checkout is `TOP_CHECKOUT`, and it started within `TOP_MAX_AGE_DAYS`. It keeps the host and `restart = ''` filters. One line under the table names each live module (`discover_test_modules`) that has no counted row. `top` prints in 0.2 s on the live index.
+- Each gate run record stores `slow_test_s` and `tests_run`. `gate_record.module_runs(executions, slow_test_s)` takes the threshold; `merge_gate.record_gate_run` reads `gate_record.slow_test_s()` once, inside its `try`, and passes it in. The build log index has both columns in `gate_runs`; an old record reads them as null.
+- `show.py suites` prints `tests run`. A test row that is not kept reads `not kept (faster than <slow_test_s> s or did not run)`: a record does not list the tests that ran.
+
+**Files:**
+- `scripts/test_times/show.py`, `config/test_times.conf` — ranking filters, the unmeasured line, `TOP_CHECKOUT`, `TOP_MAX_AGE_DAYS`, and `COVERAGE_LEAF_PROGRAMS` for Phase 12
+- `scripts/test_times/gate_record.py`, `scripts/buildlog/index.py`, `scripts/production/merge_gate.py` (owner: sdlc devtools-unit) — the two run fields
+- `scripts/test_times/test_show.py`, `test_gate_record.py`, `gate_record_test_support.py`, `scripts/buildlog/test_gate_index.py`, `test_index.py` — tests
+
+**Gotchas:**
+- A file in the `files` list of two open phases blocks the edit hook. Give each file to one phase when the plan is written.
+
+### Phase 15 — The coverage tool checks which children and threads are alive at each test boundary  · status: todo
+**Depends on:** Phase 12
+
+#### Work Order
+
+**Goal:** `coverage_overlap.py` gives no test the lines of a thread or child it does not own, and a failed `exec` keeps collection on.
+
+**Spec:** Phase 12 review round 3 found these attribution edges (F003, F004, F005, F008). The hard-landing rule moved them here. Phase 13 waits for this phase: an assertion check does not show which test owns a line. The Astra review of 2026-11-04 (`/tmp/claude/astra/20261105T013927Z-2009698/review.md`) adds the details under each item.
+
+1. Liveness: at each test start and stop, the collector polls each child it holds a `Popen` for. A child of a test alive at its stop makes that test unknown (cause `child outlived its test`), and also each later test that starts while the child is alive. A Python child from setup (`setUpClass`, module setup) alive at a test's start makes that test unknown (cause `shared child`), with or without a set. A child that exited before a test started has no effect on that test. A child with no `Popen` in the parent uses its set's exit time, or no exit time when it wrote no set. A leaf or unverified launch from setup has no effect (risk: a background process from setup that serves later tests).
+   - The audit hook keeps setup `Popen` references with their launch kind and owner; today it keeps only setup launch records. The missing-set check stays separate from liveness: a Python child that exited with no set still makes its test unknown.
+   - A launch with no `Popen` and no set is unknown for each test from its start to the end of the run.
+   - A launch whose `Popen` constructor raised after a fork is no launch. Phase 12 drops only a `Popen` with no pid; record constructor success explicitly, never from an exit code. Test a missing program with `cwd` set.
+2. Threads: a thread alive at a test's start that runs a measured line during the test makes the test unknown (cause `shared thread`). A thread that a test starts and that is alive at its stop makes the test unknown (cause `thread outlived its test`).
+   - `line()` returns `DISABLE`, so a second thread on the same line gives no event. Keep LINE events on while thread attribution is needed. Exclude the runner thread. Compare thread objects, not reusable idents. Reject a shared thread's line before it goes into the set. Test a line that the runner runs before a shared thread runs it.
+   - A child launched from a thread other than the runner thread belongs to no test. Each test that runs while that child is alive is unknown (cause `shared thread`). The audit hook reads the launching thread. Test a setup thread that starts a Python child during a later test.
+3. Exec: separate the set write from the collector stop. A later snapshot replaces an earlier one only for the same collector instance and test. A successful exec keeps the pre-exec set as its own report. Mark a snapshot apart from a completed report. Keep the fork-exec test; add a failed exec and a case with no final report.
+
+**Files:**
+- `scripts/test_times/line_collector.py`, `scripts/test_times/coverage_overlap.py` — the liveness poll, the thread check, the exec report
+- `scripts/test_times/test_coverage_overlap.py` — tests
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `line_collector.py`, `coverage_overlap.py`
+- `test` — `test_coverage_overlap.py`, from the Spec: a setup Python child with no set that is alive at a test's start makes that test unknown (`shared child`); a child that outlives its test and exits before the next test starts leaves the next test known; a thread from an earlier test that runs a measured line makes both tests unknown, and the later test's set has no line of that thread; a failed `os.execv` that the test catches leaves collection on
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 12: `line_collector.py` records launches through an audit hook and holds each `Popen`; `coverage_overlap.child_causes` turns launches and child sets into causes.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/test_times -p 'test_coverage_overlap.py'` green
+- on `test_fast_track.py`, the known count is not lower than after Phase 12, or each newly unknown test names a cause from this Spec
+- on `test_fast_track.py`, the collector run takes less than two times the `module_run.py` run at the same load (LINE events stay on, so measure it again)
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
-- each changed importer's after median `cpu_s` is not higher than its before median
+
+### Phase 16 — `/test_times top` ranks the slow tests of the calling session's repository  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** In a hana session, `/test_times top` with no arguments ranks hana's slowest nextest tests. In a ~/.claude session it shows today's module view.
+
+**Spec:** The user approved this on 2026-11-04 through the builds showrunner. First consumer: hana's fastest unit (tool-based-ui production), Phase 5c.
+
+The recording exists: `buildlog/parse.test_results` keeps each nextest test that failed, was retried, took over `SLOW_TEST_S` (1.0 s) or was reported SLOW. `buildlog/index.py` puts these rows in the `tests` table, with `step_id`, `host`, `binary`, `test`, `status`, `duration_s`. On 2026-11-04 the index held 1.29 M hana rows from natedev and 294 k Mac rows. Each `steps` row has `repo_identity` (the origin URL key, from `record.recorded_repository_key`).
+
+1. Scope: `show.py top` with no `--repo` finds the repository of the working directory. It uses `buildlog.record.recorded_repository_key` (no copy). When the identity is the ~/.claude repository, `top` shows today's gate module view. Otherwise `top` ranks the nextest tests of steps with that `repo_identity`, on the current host, within `TOP_MAX_AGE_DAYS`.
+2. Rank: one row per `binary` and `test`: the median `duration_s` of its passed runs, the count of runs kept, the count of failed and timed-out runs, and the last run time. Sort by median, descending. A test with only failed runs ranks after the others by its last time. The heading names the repository, the host and the threshold.
+3. Mac rows: a Mac nextest step records `repo_identity` `unknown` (its mirror has no origin). The index gives a Mac step the `repo_identity` of the natedev call it served: `steps.call_id` joins `calls.id`, and `calls` gives `repo_path`; take the identity from the natedev step or `ssh_attempts` row of the same call. Do this at index time, once per row, not in `show.py`.
+4. Speed: `top` for hana answers in under 0.5 s on a warm index. Today a join over `tests` and `steps` takes 1.6 s. Add the column or index the query needs in `index.py`. Measure before and after. Importing `record` adds about 20 ms to `show.py`; when it adds more, report it, so a light module can hold the key function.
+5. Config: `config/test_times.conf` gets `NEXTEST_SLOW_TEST_S=1.0` (the recording threshold) with a basis line. `parse.py` reads it at use, in place of its constant. A new key needs no go; a changed or deleted key goes to the showrunner for the user.
+6. Cost: measure the time that `test_results` and the `tests` insert add to one hana nextest step (a log of about 2,000 tests). Write it in the As-built.
+7. Docs: `commands/test_times.md` says what `top` shows in each kind of repository.
+
+**Files:**
+- `scripts/test_times/show.py`, `scripts/test_times/test_show.py` — the scope and the ranking
+- `scripts/buildlog/index.py`, `scripts/buildlog/test_index.py` — the Mac identity and the query index
+- `config/test_times.conf` — `NEXTEST_SLOW_TEST_S`
+- `scripts/buildlog/parse.py` — the threshold read (report-unit's file; see the showrunner answer)
+- `commands/test_times.md` — the doc line
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `show.py`, `index.py`, `parse.py`, `config/test_times.conf`, `commands/test_times.md`
+- `test` — `test_show.py`, `test_index.py`, from the Spec: a fixture index with steps of two repositories ranks only the calling repository; a ~/.claude working directory keeps the module view; a Mac step whose call came from a hana natedev call ranks under hana; a test with only failed runs ranks last
+
+**State:** `steps.repo_identity` for Mac rows changes from `unknown` to the served call's identity. The `tests` table gains what the query needs. A schema change makes a new index file (Phase 10), so the first command after the merge rebuilds the index.
+
+**Constraints from prior phases:**
+- Phase 10: each schema keeps its own index file.
+- Phase 14: `top` ranks gate modules by the median of valid runs; `TOP_RUNS`, `TOP_CHECKOUT` and `TOP_MAX_AGE_DAYS` are in `config/test_times.conf`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/test_times -p 'test_show.py'` green
+- `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'` green
+- in a hana worktree, `python3 ~/.claude/scripts/test_times/show.py top` lists hana nextest tests, in under 0.5 s warm
+- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
