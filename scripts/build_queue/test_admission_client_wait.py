@@ -129,7 +129,8 @@ class AdmissionClientWaitTests(unittest.TestCase):
             with self.subTest(program=program):
                 request = replace(self.admission.request(), profile=gate.ProgramProfile(
                     program, "repo", "tree", gate.FixedCapSizing(6 * gate.GIB)))
-                reply = self.admission.server.handle_request(request)[0]
+                with self.admission.loop_turn():
+                    reply = self.admission.server.handle_request(request)[0]
                 assert isinstance(reply, wire.Wait)
                 output = io.StringIO()
                 with redirect_stderr(output):

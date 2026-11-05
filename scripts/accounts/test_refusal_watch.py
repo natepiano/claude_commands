@@ -2427,16 +2427,23 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual({command.session_id for command in self.moves.calls}, {"one", "two"})
 
     def test_status_names_off_account_group_member_as_moving(self) -> None:
-        _ = self.groups(units="claude3")
-        _ = self.owner("unit", host="unit")
-        output, error = io.StringIO(), io.StringIO()
+        from scripts.production.staff_test_support import fixture_member
         from scripts.message import sessions as status_sessions
-        with patch.object(status_sessions, "live_sessions", return_value=self.live), redirect_stdout(output), redirect_stderr(error):
+
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"STAFF_FILE": str(self.home / "staff.json")})))
+        parent = fixture_member("showrunner", name="fixture")
+        member = fixture_member("unit", name="unit", parent=parent.id)
+        _ = self.groups(units="claude3")
+        _ = self.owner(member.current_session, host="unit")
+        self.live[-1]["name"] = "owner unit"
+        output, error = io.StringIO(), io.StringIO()
+        with (patch.object(status_sessions, "live_sessions", return_value=self.live),
+              patch.object(status_sessions, "running_sessions", return_value=self.live),
+              redirect_stdout(output), redirect_stderr(error)):
             code = accounts.main(["--detail"])
         self.assertEqual((code, error.getvalue()), (0, ""))
         line = next(line for line in output.getvalue().splitlines() if "owner unit" in line)
-        self.assertIn("moving", line)
-        self.assertIn("claude3", line)
+        self.assertIn("moving to claude3", line)
 
     def test_dry_run_detects_refusal_on_each_host_and_changes_nothing(self) -> None:
         _ = self.groups(showrunners="claude1")
