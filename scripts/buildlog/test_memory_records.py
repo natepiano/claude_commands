@@ -81,19 +81,6 @@ class MemoryRecordTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
-    def test_build_program_matches_resolved_roots_not_target_name(self) -> None:
-        import memory
-        from cargo_output import CargoOutputRoots
-
-        roots = CargoOutputRoots(self.base, self.base / "artifacts", self.base / "intermediates")
-        _ = (self.base / "Cargo.toml").write_text("[workspace]\n")
-        with mock.patch.object(Path, "cwd", return_value=self.base), \
-             mock.patch.object(memory, "read_cargo_output_roots", return_value=roots):
-            self.assertTrue(memory.build_output_program(str(roots.build_directory / "debug/deps/test")))
-            self.assertTrue(memory.build_output_program(str(roots.target_directory / "release/app")))
-            self.assertFalse(memory.build_output_program(str(self.base / "target/debug/unrelated")))
-            self.assertFalse(memory.build_output_program(str(self.base / "intermediates-other/test")))
-
     def test_sample_distinguishes_service_process_empty_and_absent_slice(self) -> None:
         proc = self.base / "proc"
         proc.mkdir()

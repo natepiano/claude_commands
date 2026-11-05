@@ -9,18 +9,17 @@ import sqlite3
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 import index
 import cgroup_capture
 from cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
 import store
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
@@ -30,7 +29,6 @@ from scripts.build_queue.queue_evidence import room_text
 from scripts.lint import memory_admit as gate
 
 import conf
-from cargo_output import CargoOutputRoots, read_cargo_output_roots
 
 GIB = 2**30
 SNAPSHOT_DISTANCE_S = 120
@@ -85,45 +83,14 @@ def cmdline_program(cmdline: str) -> str:
     return cmdline.partition(" ")[0]
 
 
-@lru_cache(maxsize=1)
-def build_output_roots(index_file: Path, current_checkout: Path, host: str) -> frozenset[Path]:
-    """Keep the active ledger's Cargo roots for this process."""
-    if TYPE_CHECKING:
-        from . import step_outputs
-    else:
-        import step_outputs
-
-    roots: set[Path] = set()
-    checkouts: set[Path] = {current_checkout}
-    recorded = step_outputs.recorded_output_roots(index_file, host)
-    if isinstance(recorded, step_outputs.RecordedStepOutputs):
-        for row in recorded.rows:
-            target, folder = row.target_directory, row.target_folder
-            if (row.target_folder_override is step_outputs.TargetFolderOverride.PRESENT
-                    or (isinstance(folder, step_outputs.AbsoluteRecordedRoot) and folder != target)):
-                continue
-            roots.update(root.path.resolve() for root in (target, row.build_directory)
-                         if isinstance(root, step_outputs.AbsoluteRecordedRoot))
-            workspace = row.worktree if isinstance(row.worktree, step_outputs.AbsoluteRecordedRoot) else row.cwd
-            if isinstance(workspace, step_outputs.AbsoluteRecordedRoot):
-                checkouts.add(workspace.path)
-    workers = conf.read("buildlog").whole("METADATA_PROBE_WORKERS")
-    manifests = [checkout for checkout in checkouts if (checkout / "Cargo.toml").is_file()]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for outputs in executor.map(read_cargo_output_roots, manifests):
-            if isinstance(outputs, CargoOutputRoots):
-                roots.update((outputs.target_directory, outputs.build_directory))
-    return frozenset(roots)
-
-
 def build_output_program(program: str) -> bool:
-    """Match an executable against Cargo's resolved output roots."""
+    """Check the resolved program's parent folders for Cargo output."""
     executable = Path(program)
     if not executable.is_absolute():
         return False
-    roots = build_output_roots(index.index_path(), Path.cwd(), store.host_name())
-    resolved = executable.resolve()
-    return any(resolved.is_relative_to(root) for root in roots)
+    import sweep
+
+    return any(sweep.is_cargo_target(str(parent)) for parent in executable.resolve().parents)
 
 
 @dataclass(frozen=True)
@@ -134,16 +101,18 @@ class EarlyoomKill:
     oom_score_adj: int | OomScoreAdjUnavailable = OomScoreAdjUnavailable.VALUE
     cmdline: str | CmdlineUnavailable = CmdlineUnavailable.VALUE
 
+    def _target_program(self) -> bool:
+        return isinstance(self.cmdline, str) and build_output_program(cmdline_program(self.cmdline))
+
     @property
     def outside_build_gate(self) -> bool:
-        if self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj") or not isinstance(self.cmdline, str):
-            return False
-        return build_output_program(cmdline_program(self.cmdline))
+        gated = self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
+        return not gated and self._target_program()
 
     @property
     def is_build(self) -> bool:
-        return (self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
-                or isinstance(self.cmdline, str) and build_output_program(cmdline_program(self.cmdline)))
+        gated = self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
+        return gated or self._target_program()
 
 
 def service_state(value: int | None) -> ServiceState:

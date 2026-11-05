@@ -1397,7 +1397,7 @@ A memory promise keeps only history rows from the same side of each listed build
 
 #### As-built
 
-- A program under a Cargo output root is a build kill (`EarlyoomKill.is_build`, `outside_build_gate`, `scripts/buildlog/memory.py`). The roots are read once for each process (`build_output_roots`, cached), not once for each kill.
+- A program under a Cargo target folder is a build kill (`EarlyoomKill.is_build`, `outside_build_gate`, `scripts/buildlog/memory.py`). Each kill checks the program's resolved parent folders with `sweep.is_cargo_target`; no roots are cached and no `cargo metadata` probe runs.
 - Each verify run's example tests count only the example scan's `cargo metadata` reads; `tree_watch`'s tree-key read is named apart.
 - A SIGTERM from the ssh runner writes one `InterruptedTargetRun` event with its generation and remote output; a step that a hold stopped still goes the hold path (`scripts/direct/verify.sh`).
 - The branch's admission reader accepts the snapshot shapes that the installed service writes (`installed_snapshot_record`, `scripts/lint/memory_admit.py`). It refuses a `BehindHead` record that carries both `head_since` and `joined_at` (ValueError).
