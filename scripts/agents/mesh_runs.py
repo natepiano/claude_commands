@@ -585,11 +585,11 @@ def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
             "--slice=builds.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
-def _run(command: list[str], cwd: str, environment: dict[str, str], log: Path) -> int:
+def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
     """Run the command with its output appended to the log, forward signals to it, and return its status."""
     try:
         with log.open("ab") as output:
-            child = subprocess.Popen(command, cwd=cwd or None, env=environment,
+            child = subprocess.Popen(command, env=environment,
                                      stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
     except OSError as exc:
         with log.open("a", encoding="utf-8") as output:
@@ -622,10 +622,9 @@ def command_supervise(args: argparse.Namespace) -> int:
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
     prefix = scope_prefix(marker, environment)
-    cwd = str(session_staff.worker_directory(staff.local_snapshot(), staff.StaffId(record["staff_id"])))
-    exit_code = _run(prefix + record["command"], cwd, environment, log)
+    exit_code = _run(prefix + record["command"], environment, log)
     if prefix and not marker.exists():
-        exit_code = _run(record["command"], cwd, environment, log)
+        exit_code = _run(record["command"], environment, log)
     marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.
