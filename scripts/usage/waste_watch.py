@@ -184,7 +184,10 @@ def registered_showrunners(*, resolver: session_staff.RowResolver | None = None)
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
         record = resolver.record
         problems: list[str] = []
-        runners = unit_labels.registered_showrunners(problems, membership=record, resolver=resolver)
+        diagnostics = unit_labels.StaffDiagnostics(problems)
+        runners = unit_labels.registered_showrunners(diagnostics, membership=record, resolver=resolver)
+        for warning in diagnostics.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
         found = tuple(Showrunner(runner["slug"], f"uds:{runner['socket']}" if runner["socket"] else "",
                                 usage_report.document_units(Path(runner["doc"]), resolver=resolver))
                       for runner in runners)

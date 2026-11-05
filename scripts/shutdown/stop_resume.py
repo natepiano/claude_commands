@@ -73,10 +73,10 @@ def _tab_of(session: str) -> herdr.TabSession | SessionNotFound:
         if entry is not None and entry["session_id"] != identity and (
                 session == entry["session_id"] or session == label):
             if identity:
-                live = sessions.session_liveness(identity)
-                if isinstance(live, sessions.SessionLivenessUnknown):
-                    raise OSError(live.reason)
-                if isinstance(live, sessions.LiveSessionProcess):
+                live = herdr.read_conversation(identity)
+                if isinstance(live, herdr.UnknownConversation):
+                    herdr.conversation_note(live)
+                if isinstance(live, herdr.LiveConversation):
                     continue  # A saved entry cannot displace another running conversation.
             identity = entry["session_id"]
         tabs.append(herdr.TabSession(pane["pane_id"], label, pane["workspace_id"], identity))
@@ -194,39 +194,23 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
                 identity = tab.session_id
             else:
                 return SessionNotFound(session)
-        kind = "claude"
-        live = sessions.session_liveness(identity)
-        if isinstance(live, sessions.SessionNotLive):
-            client = herdr.Herdr(herdr.shared_session())
-            for pane in sorted(client.panes(), key=lambda pane: pane["session_id"] != identity):
-                if pane["session_id"] and pane["session_id"] != identity:
-                    continue
-                try:
-                    if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
-                        continue
-                    launch = client.codex_launch(pane["pane_id"], ["resume", identity])
-                    pid = launch.get("pid")
-                    if not pid or launch["session_id"] != identity:
-                        continue
-                    if not pane["session_id"] and herdr.codex_rollout_thread(pid) != identity:
-                        continue
-                except (OSError, ValueError, herdr.HerdrFailure):
-                    if pane["session_id"] == identity:
-                        raise
-                    continue
-                live, kind = sessions.LiveSessionProcess(pid), "codex"
-                break
-        if isinstance(live, sessions.SessionNotLive):
+        observed = herdr.read_conversation(identity)
+        if isinstance(observed, herdr.StoppedConversation):
             return NotRunning(identity)
-        if isinstance(live, sessions.SessionLivenessUnknown):
-            return StopFailed(identity, live.reason)
+        if isinstance(observed, herdr.UnknownConversation):
+            herdr.conversation_note(observed)
+            return StopFailed(identity, observed.reason)
+        if len(observed.pids) != 1:
+            return StopFailed(identity, "conversation has no unique signal target; no signal sent")
+        live = sessions.LiveSessionProcess(observed.pids[0])
+        kind = observed.kind
         proved = herdr.native_process(live.pid, kind)
-        if proved.identity != identity:
+        if proved.current_identity != identity:
             return StopFailed(identity, "process runs another conversation; no signal sent")
         started = proved.started
         if not _same_process(live.pid, started):
             return NotRunning(identity)
-        if herdr.native_process(live.pid, kind) != proved:
+        if not herdr.check_native_target(live.pid, kind, proved):
             return StopFailed(identity, "process identity changed; no signal sent")
         _signal_process(live.pid, signal.SIGTERM)
         deadline = monotonic() + STOP_GRACE_SECONDS
@@ -240,8 +224,10 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         if _same_process(live.pid, started):
             last_signal = "SIGTERM"
             try:
-                if herdr.native_process(live.pid, kind) != proved:
+                if not herdr.check_native_target(live.pid, kind, proved):
                     return StopFailed(identity, "process identity changed; no signal sent")
+            except ProcessLookupError:
+                return Stopped(identity, live.pid)
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: stop identity anomaly after SIGTERM: {error}; waiting for exit", file=sys.stderr)
             else:
@@ -292,8 +278,6 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     launched_at = datetime.now(timezone.utc)
-    if not isinstance(client.pane_activity(tab.pane_id), herdr.PaneAtShell):
-        raise herdr.HerdrFailure(f"{entry['session_id']}: target pane has live work")
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
     live = sessions.session_liveness(entry["session_id"])
@@ -451,6 +435,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
 
+        if to is None and row is not None and row.kind in ("unit", "showrunner") and pane_launch.agent_kind(entry) == "claude":
+            to = accounts.role_account(row.kind).label
         source = Path(entry["config_dir"])
         source_label = accounts.claude_config_label(source)
         target_dir = (accounts.account_dir(to) if to is not None else
@@ -720,6 +706,19 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                         outcomes.append(ResumePending(identity, target, resumed.reason))
                 except Exception as error:
                     outcomes.append(ResumePending(identity, target, str(error)))
+            record = staff.initial_snapshot()
+            for index, (session, outcome) in enumerate(zip(selected, outcomes)):
+                identity = outcome.name if isinstance(outcome, SessionNotFound) else outcome.session_id
+                running = _running_on_account(identity, "")
+                if isinstance(running, ClaudeUp) and running.account == target:
+                    continue
+                member = record.by_member_reference(identity)
+                name = member.name if member is not None else session
+                line = (f"{name}: not running on {target} after the move; resume it with: "
+                        + f"accounts.py move {identity} {target}")
+                print(line, file=sys.stderr)
+                if isinstance(outcome, ClaudeUp):
+                    outcomes[index] = ResumePending(identity, target, line)
             return outcomes
 
 

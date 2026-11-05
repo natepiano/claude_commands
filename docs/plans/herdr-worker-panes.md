@@ -58,7 +58,7 @@ Written by herdr-unit on 2026-10-29 for the sdlc showrunner, from the user's req
   - `scripts/herdr/worker_panes.py` — `start_or_resume`, `close`, `observe` (new in Phase 7), `dispatch` (Phase 8); `observe` is the one join of worker rows and herdr panes (`OpenWorker | StoppedWorker | ClosedWorker | UncertainWorker`)
   - `scripts/herdr/side_pane.py` — the pane beside a caller outside the staff hierarchy, for ask-a-friend and for such a caller's Astra role (new in Phase 12)
   - `scripts/agents/detached_runs.py` — detached runs that type their result into the worker pane (renamed from `mesh_runs.py` in Phase 9)
-  - `scripts/direct/launch.py` — the one launcher behind `implement.sh`, `review.sh` and `assign.sh` (new in Phase 19)
+  - `scripts/direct/assign.sh` — the one door that starts a worker (decision 11); Phase 19 merges `implement.sh` and `review.sh` into it
   - `scripts/lib/unit_runs.py` — run folders; `worker_transport(run)` and the run pin (added in Phase 8; they and the run `workers` log reader go in Phase 18)
   - `config/direct.conf` — `WORKER_TRANSPORT` (`mesh` in Phase 8, `herdr` in Phase 15, deleted in Phase 18); `WORKER_SPLIT_RATIO` (Phase 7), read at each split through `tunables.number`
   - `commands/unit/direct.md` — the unit director instructions (transport-aware text in Phase 8, pane text in Phase 14)
@@ -104,7 +104,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 8. **No launcher compaction, and no "Continue where you stopped." retry.** Interactive Codex and Claude compact by themselves.
 9. **Codex stays a worker kind.** herdr starts `--kind codex` and `--kind claude` agents. The default worker kind per role stays where it is set today.
 10. **`herdr.py` stays the one herdr client.** Launch into a split pane or into an existing pane at its shell, layout changes and the typed agent state `AgentStatus` are new `herdr.py` primitives (Phase 6). `Herdr.panes()` stays the one pane-list parser, with many callers. `worker_panes.py` composes them and holds only `start_or_resume`, `dispatch`, `close` and `observe`. `observe` is the one join of worker rows and herdr panes that every worker display reads (Phases 7, 13): it joins on complete pane evidence and the stable `terminal_id`, and gives `OpenWorker`, `StoppedWorker`, `ClosedWorker` or `UncertainWorker`. Its `_layout` is a private helper. One-line agent calls (`herdr agent send-keys <id> esc` to interrupt, `herdr agent read`, a message's `herdr agent prompt`) run directly and are not wrapped.
-11. **The three launcher commands stay; their shared work moves to one place.** `implement.sh`, `review.sh` and `assign.sh` keep their arguments and their recorder, status-file and board work. Start, dispatch, wait and receipt live once in `worker_panes.py dispatch`. Phase 19 merges the launchers when they are thin.
+11. **One door starts a worker: `assign.sh`, run as a background shell of the director's own session (user rule 2026-11-04 10:45: "it should be impossible to start a worker in more than one way"; sdlc ruling).** devtools-unit makes `implement.sh`, `review.sh` and the `codex_mesh.py` start, follow, reopen, fork, adopt, prime and resume subcommands refuse unless `assign.sh` called them, and refuses detached starts, with a guard test. Worker panes (Phases 7, 8, 19) change what is behind `assign.sh`; they never add a second door. Start, dispatch, wait and receipt live once in `worker_panes.py dispatch`, which only `assign.sh` calls. Edits to the `scripts/direct` launchers go through devtools-unit first.
 12. **The transport switch lives in `config/direct.conf`, with an end date.** `WORKER_TRANSPORT` is migration state, not a model default, so it stays out of `models.conf`. The cleanup phase deletes it, no later than 7 days after the default switch.
 13. **The right pane shows the worker's short name (user, 2026-10-30).** For example `impl1`, with no production or unit name.
 14. **The staff row is the one name (sdlc showrunner, 2026-10-30).** A unit's name changes only through `/showrunner:rename_unit` (sdlc, changed 2026-10-30). The hook cannot stop Claude Code's `/rename`, so on a mismatch it keeps the tab on the row's name and prints one line with the rename_unit command. Every launch and every restore of a member takes its name from its row (Phase 4). A showrunner's name is also its workspace's, which `Herdr.retitle` does not rename, so `/showrunner:rename` (`rename.py`) is the one way to rename a showrunner. A worker's name is set once (decision 13).
@@ -613,7 +613,9 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 - The live fill starts at each existing staff row. A timer selects a showrunner's live merge checkout and doc. A unit takes its location from that doc's Units row or its proved live session folder when the row is stale. The fill refuses unequal existing fields, lists unfilled rows with reasons, continues complete rows, and resumes a stopped row-to-file publication. A finished rerun changes nothing. Failed timer evidence keeps its durable owner id, including nested showrunners.
 - The stored showrunner doc is the one retired source. Scratch copies, other worktrees and branch-tip copies cannot override it. Missing owners and historical facts stay listed. New retired rows belong to Phase 3h; this phase has no pending writer assignment.
 
-### Phase 3k — `.unit.toml` writers emit taplo-formatted text  · status: todo
+### Phase 3k — `.unit.toml` writers emit taplo-formatted text  · status: done (models-unit 3ed6b4e3c on sdlc; live proof by style-unit)
+
+**Evidence (style-unit, 2026-11-04):** `taplo fmt --check` passes on 49 of 49 `.unit.toml` files; a `staff_sources` dry-run prints unchanged on natedev and on the Mac.
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).
 
@@ -965,7 +967,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate:** the search finds nothing that tells an agent to use the old source; `grep -rn 'unit marks' commands docs/direct` finds nothing; the Codex mirrors regenerate clean; the command-file tests (`scripts/claude_to_codex` suite) pass; full gate green.
 
-### Phase 3x — Small stores keyed by staff id  · status: todo
+### Phase 3x — Small stores keyed by staff id  · status: moved: devtools-unit (sdlc, 2026-11-04)
 
 **Owner:** devtools-unit; its stall part goes to messaging-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1060,11 +1062,11 @@ Make no unproved write and create no second row.
 **Shared rename files:** this writer owns the rename-file changes for 3x, 3z, and 4a, including their tests and fixtures.
 Each change lands inside its store's landing, with the migration and rewriter removal.
 
-### Phase 3z — Shutdown and style stores keyed by staff id  · status: todo
+### Phase 3z — Shutdown and style stores keyed by staff id  · status: done
 
 **Owner:** shutdown-unit and style-unit (sdlc split, 2026-11-02 08:23).
 
-**Depends on:** 3s; records stage of the rename track. Shared rename files have one owner. `restart.py` has one writer at a time, in this order: 4n reconciliation, Phase 4, 3z.
+**Depends on:** 3s; records stage of the rename track. Shared rename files have one owner. `restart.py` has one writer at a time: 4n and Phase 4 are done, so 3z writes it.
 
 #### Work Order
 
@@ -1145,7 +1147,7 @@ Make no unproved write and create no second row.
 
 **Ruled out:** continuing on the same thread after a stale turn — `thread/resume` hangs the fixtures, and the old relaunch flows already start a fresh thread.
 
-### Phase 4 — Member names come from the staff row  · status: todo
+### Phase 4 — Member names come from the staff row  · status: done (models-unit, main 530258351)
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1193,7 +1195,7 @@ Require two equal reads one second apart; save both snapshots and named byte/tim
 Compare operation-owned staff fields and check for probe ids or scratch paths in live staff.
 Record live hashes; an unrelated hash change alone does not prove a probe write.
 
-### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: todo
+### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: moved: devtools-unit (sdlc, 2026-11-04)
 
 **Owner:** devtools-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1259,11 +1261,11 @@ Make no unproved write and create no second row.
 
 **Ruled out:** a pane found by herdr's `agent_session` value; it can be stale.
 
-### Phase 4b — `production_tree.py` deleted  · status: todo
+### Phase 4b — `production_tree.py` deleted  · status: done
 
 **Scope (sdlc, 2026-11-03):** only the `production_tree.py` deletion stays here. The Owns and Hub deletions moved to Phase 4c, which devtools-unit owns.
 
-**Depends on:** the handler unit's reader switch (Phase 3n item 6). On 2026-11-04 `~/.config/cargo-handler/config.toml:19` still runs `production_tree.py --json`.
+**Depends on:** the handler unit's reader switch (cargo-liner Phase 57c; Phase 3n item 6). On 2026-11-04 `~/.config/cargo-handler/config.toml:19` still runs `production_tree.py --json`. 4b is only the `production_tree.py` deletion and is off the rename track: it lands when 57c lands (sdlc, 2026-11-04).
 
 #### Work Order
 
@@ -1284,7 +1286,7 @@ Make no unproved write and create no second row.
 
 **Acceptance gate:** no executable reference remains: `grep -rnE 'import production_tree|from production_tree|production_tree\.py' scripts commands docs/direct docs/as-built ~/.config/cargo-handler` finds nothing (a local variable named `production_tree` is not a reference); the real handler pane still shows the hierarchy; the suites pass; full gate green. No rerun test: a delete.
 
-### Phase 4o — The Production plan header and the Gates table deleted  · status: todo
+### Phase 4o — The Production plan header and the Gates table deleted  · status: moved: devtools-unit (sdlc, 2026-11-04)
 
 **Depends on:** 4c (the Hub files and Owns deletions in the same `merge_checkpoint.py`; moved from 4b, review 2026-11-04); 3w (the text); 3y (the rename tools read the row); devtools-unit's cuts of `rename_unit.py` and `transfer_unit.py` (4v, then rename and transfer), merged first. Lands before 4g, which assumes both are gone.
 
@@ -1313,7 +1315,9 @@ Make no unproved write and create no second row.
 
 **Acceptance gate:** `grep -rnE '\*\*Production:\*\*|gate_names|## Gates' scripts commands docs/direct docs/production_format.md` finds nothing; a unit director in a real production finds its showrunner from the row; a real merge checkpoint runs with the staged-file, shrink and as-built checks; the suites pass; full gate green. No rerun test: a delete.
 
-### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: todo
+### Phase 4m — Port audit: every unit's port is in its `.unit.toml`  · status: done (models-unit 42a7ef32d on sdlc; live proof by style-unit)
+
+**Evidence (style-unit, 2026-11-04):** the audit reads 13 AppPort, 54 NoAppPort and 1 ConfigMissing rows and writes nothing. 4d deleted the audit after this run. Tables: /tmp/claude/scratch/style-unit-ports-evidence/.
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1351,11 +1355,11 @@ Make no unproved write and create no second row.
 Interrupt the guarded repair before and after publication; reruns preserve retirement facts and responsibilities.
 Test unchanged reruns and refusal when the recorded old value differs.
 
-### Phase 4c — Units table deleted  · status: moved: devtools-unit owns it (sdlc, 2026-11-03)
+### Phase 4c — Units table deleted  · status: moved: devtools-unit owns it as its 4u, "Units tables are gone" (sdlc, 2026-11-03; merge expected 2026-11-04)
 
 **Hand-off (sdlc, 2026-11-03):** the work order is `phases/4c/work_order_for_devtools.md` in the herdr run folder. Rulings: the Port audit copies each cell into `.unit.toml`, then deletes the cell; the row order is the `staff.json` row order; historical members with no staff row drop; the Owns and Hub deletions move here from Phase 4b.
 
-**Depends on:** 4b's Owns and Hub deletions; 4m (the Port audit); 3h's native-id and location completeness proof.
+**Depends on:** 4m (the Port audit); 3h's native-id and location completeness proof.
 
 **WRAPPED (devtools-unit 4i, via sdlc, 2026-11-02):** `production_units.py:27` holds `WRAPPED`, and `tidy_wrapped.py`, `staff_sources.py` and `staff_test_support.py` import it. When 4c rebuilds or deletes `production_units.py`, move `WRAPPED` to one leaf module and switch all three importers in the same commit. The leaf module must not import `update_registration` or `tidy_wrapped`, because that makes an import cycle.
 
@@ -1383,7 +1387,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 **State:** audit/removal handoff; the Units table leaves every production doc, one commit per merge branch.
 
-**Constraints from prior phases:** Phases 3t-3w switched every reader; Phase 4b removed Owns.
+**Constraints from prior phases:** Phases 3t-3w switched every reader; the Owns and Hub deletions moved here from 4b (review 2026-11-04).
 - Phase 3u (2026-11-02): `board_json.py`, `phase_table.py` and `measure.py` still import `unit_table.Refusal`, `unit_table.cell_value` and `unit_table_cells.open_step` / `run_events`. They read no membership. Move them with `Refusal` before the table module goes.
 - Phase 3h review (2026-11-01): Port's home is `UnitConfig.port: AppPort | NoAppPort` in `.unit.toml` (`unit_config.py:42`), which `add_unit.configuration_for` and the fill already write and retire parks. Before the table goes, audit every Port cell into that field (a value that differs is listed for sdlc, never filled) and switch the remaining Port readers through 3s; test active and retired reads, rename and transfer with no table and no new store.
 - Phase 3h review (2026-11-01): keep the audited-source hashes, interrupted-commit recovery and the handoff to 4d; acceptance tells unproved retained-member facts from historical members that never had a row.
@@ -1393,7 +1397,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 **Acceptance gate (handoff):** stop after the audit, after the first branch removal and after its commit before recording completion. Each retry equals one clean run, never audits an already removed table, and refuses a changed unaudited doc. The checker row/config-only regression remains green. A completed rerun changes no byte.
 
-### Phase 4d — Showrunner doc fields, parent files and the seed importer deleted  · status: todo
+### Phase 4d — Showrunner doc fields, parent files and the seed importer deleted  · status: moved: devtools-unit (sdlc, 2026-11-04)
 
 **Depends on:** 4c (its last fill audit); 3x; 3n (backend record); 4a (timer conversion); 3h's native-id and location completeness proof.
 
@@ -1436,7 +1440,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 ### Phase 4e — Legacy pane marks deleted; native runtime ids select rows  · status: todo
 
-**Depends on:** 3v and every reader of the marks; Phase 4; 4d (fallback removal); 3h's native-id and location completeness proof.
+**Depends on:** 3v and every reader of the marks; 4d (fallback removal); 3h's native-id and location completeness proof.
 
 #### Work Order
 
@@ -1517,7 +1521,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 **Gotchas:** Unknown processes produce notes named by herdr tab, then session, then pid. Unknown process evidence never causes refusal; refusal requires proof that the target is live. Startup process evidence can omit argv. Claude can repeat the trust prompt for a throwaway folder. Trust handling checks the exact scratch folder. Rerun comparisons require two equal settled launch reads. Concurrent staff writes prevent a hash comparison alone from proving a probe write.
 
-### Phase 4i — Questions are their own type  · status: todo
+### Phase 4i — Questions are their own type  · status: done (devtools-unit, main eb762177b)
 
 **Owner:** devtools-unit (sdlc split, 2026-11-02 08:23).
 
@@ -1577,14 +1581,14 @@ Test unchanged reruns and refusal when the recorded old value differs.
 
 ### Phase 4g — Rename rebuilt on the row  · status: todo
 
-**Depends on:** 4b, 4o, 4c, 4d, 4e, 4h, 4i, and the records stage (3x, 3y, 3z, 4a). Last step of the rename track. No pane phase waits for it. Hash 3f8339f5 stays unmerged; reuse only its tab retitle, kept-pane resume and finished-journal rerun.
+**Depends on:** 4o, 4c, 4d, 4e, 4h, 4i, and the records stage (3x, 3y, 3z, 4a). Last step of the rename track. No pane phase waits for it. Hash 3f8339f5 stays unmerged; reuse only its tab retitle, kept-pane resume and finished-journal rerun.
 
 #### Work Order
 
 **Goal:** a unit rename changes the row's name and the live tab and session name; a showrunner rename changes the row and the workspace name; moving a unit's folder and branch is one further optional step. The rename sweep and most of the rename code go.
 
 **Spec:**
-1. **Unit rename** (`rename_unit.py`): `staff.rename` of the row, `Herdr.retitle` of the tab and pane, and the session name at the next launch (Phase 4). No store, doc, prose or Units cell is rewritten: they hold the staff id. Hub files, Gates and plan headers are deleted before this phase (4b, 4d), so nothing lists them (`EDITED_COLUMNS` :82 and `_plan_text` :497 go). Same-name rename is the repair path: it changes only the parts that differ and prints `unchanged` when all match.
+1. **Unit rename** (`rename_unit.py`): `staff.rename` of the row, `Herdr.retitle` of the tab and pane, and the session name at the next launch (Phase 4). No store, doc, prose or Units cell is rewritten: they hold the staff id. Hub files, Gates and plan headers are deleted before this phase (4c, 4o), so nothing lists them (`EDITED_COLUMNS` :82 and `_plan_text` :497 go). Same-name rename is the repair path: it changes only the parts that differ and prints `unchanged` when all match.
 2. **Folder and branch move** (`rename_unit.py --move-worktree --to-folder <path> --to-branch <name>`), rebuilt on staff and process evidence (sdlc, 2026-11-04):
    Require both arguments. Use the current devtools `unit_move.move_folder` operation (phase 4h): stop the session found by `current_session`, `git worktree move`, `staff.set_worktree`, then `restart.start_row`.
    Run `git branch -m` while the session is stopped. A rerun reads the folder and the branch from git and the row; no move journal, launch-record `cwd`, retained launch kind or `PendingFolderStartup` exists.
@@ -1592,8 +1596,8 @@ Test unchanged reruns and refusal when the recorded old value differs.
    Each interrupted step finishes on rerun; a finished move prints `unchanged`.
    The only refusals are the 5 in `staff-lifecycle.md` section 4 (target folder exists, same-row concurrent operation, a second copy of a running session, uncommitted work deleted, a signal to a non-target process). Section 3 item 5: the move is optional and runs only on `--move-worktree`.
 3. **Showrunner rename** (`rename.py`): `staff.rename` and the workspace and tab names; timers and stores already hold the id. A rename to the name the row already holds still repairs a live session name, tab or workspace that differs from the row (sdlc, 2026-11-01, from the user on C48: the fps row's session runs as `performance`; the user runs `rename fps fps`, not a unit). It prints `unchanged` only when the row, session name, tab and workspace all agree. The same rule holds for a unit rename. Moving the doc file and merge branch is the same optional further step, with `--to-doc <path>` and `--to-branch <name>` journaled first and `staff.set_doc` after the move.
-5. **Tunables.** `rename_unit.py`'s `LIVE_WAIT_SECONDS` (:86, with its `RENAME_UNIT_LIVE_WAIT` environment override, which goes), `RUN_STOP_WAIT_SECONDS` (:89), `POLL_SECONDS` (:90) and the 900 s subprocess timeout (:671) move to `config/production.conf`, read at use through `tunables`, each as `min(configured limit, remaining deadline)` with a changed-config test.
-4. **Delete** `unit_rename_sweep.py` and its test, the `verify` sweep of `rename_unit.py`, `rename_state.py`'s rewriters, `rename_outside.py` and every move step left in `rename.py` and `rename_unit.py`; the rename journal keeps only the steps above.
+4. **Tunables.** `rename_unit.py`'s `LIVE_WAIT_SECONDS` (:86, with its `RENAME_UNIT_LIVE_WAIT` environment override, which goes), `RUN_STOP_WAIT_SECONDS` (:89), `POLL_SECONDS` (:90) and the 900 s subprocess timeout (:671) move to `config/production.conf`, read at use through `tunables`, each as `min(configured limit, remaining deadline)` with a changed-config test.
+5. **Delete** `unit_rename_sweep.py` and its test, the `verify` sweep of `rename_unit.py`, `rename_state.py`'s rewriters, `rename_outside.py` and every move step left in `rename.py` and `rename_unit.py`; the rename journal keeps only the steps above.
 
 **Files:**
 - `scripts/production/rename_unit.py`, `scripts/production/rename.py`, `scripts/production/rename_state.py`, `scripts/production/rename_outside.py`, `scripts/production/rename_checkout.py`, `scripts/production/unit_move.py`, `commands/showrunner/rename_unit.md`, `commands/showrunner/rename.md`, `commands/unit/rename.md` — the rename and its text.
@@ -1602,11 +1606,17 @@ Test unchanged reruns and refusal when the recorded old value differs.
 - `scripts/production/test_rename_unit.py`, `scripts/production/test_rename.py`, `scripts/production/test_rename_state.py`, `scripts/production/test_rename_checkout.py`, `scripts/production/test_unit_move.py` — their tests.
 - `scripts/production/rename_test_support.py`, `scripts/production/rename_unit_test_support.py`, `scripts/production/rename_rerun_test_support.py` — fixtures.
 - `scripts/production/staff.py`, `scripts/production/test_staff.py` — `staff.rename` for workers (Phase 3h review).
-- `scripts/production/resume_unit.py`, `scripts/production/nightly_review.py` — transcript lookup by session id.
+- `scripts/production/resume_unit.py`, `scripts/nightly_review/nightly_review.py` — transcript lookup by session id (`resume_unit.py` already finds it by session id; check only).
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files; hub: `scripts/production/rename_unit.py`.
-- `test` — the tests and fixtures.
+- `rename` — the non-test files; hub: `scripts/production/rename_unit.py`. The 3y rewriter removals in these files go to `rewriters` (one worker per item, user 2026-11-04); each writer posts its functions before it edits a shared rename file.
+- `renametest` — the tests and fixtures.
+
+**Steps by input (sdlc, 2026-11-04: build each step when its inputs land; land 4g right after its last input):**
+- Step A, no unlanded input, starts at once: Spec item 3's worker rule (`staff.rename` stops refusing workers; tab label through `retitle_row`), the transcript check, and the same-name repair rule (unit and showrunner) on the current row and `Herdr.retitle`.
+- Step B, with 3y on the same files and writer: Spec item 2 (folder and branch move on `unit_move.move_folder`) and item 4 (tunables).
+- Step C, after 3x, 3y, 3z and 4a: Spec item 5 deletions of the rewriters and the sweep.
+- Step D, after 4c, 4o, 4d and 4e: `EDITED_COLUMNS`, `_plan_text` and every mark or doc-field edit go. Then the acceptance gate and the landing.
 
 **State:** row names, tab and workspace names; on `--move-worktree`, the folder and branch.
 
@@ -1628,6 +1638,70 @@ Before the rerun snapshot, require the resumed pid, its process that runs `curre
 Require two equal reads one second apart; save both snapshots and named byte/time differences with text diffs.
 Compare operation-owned staff fields and check for probe ids or scratch paths in live staff.
 Record live hashes; an unrelated hash change alone does not prove a probe write.
+
+### Phase 4s — natedev copies the staff record to the Mac after each write  · status: done
+
+**Depends on:** none; sdlc asked for it on 2026-11-04 (the user said yes).
+
+**Work Order:**
+
+Give cargo-handler on the Mac a read-only copy of the staff record (the user said yes, via sdlc, 2026-11-04).
+1. In scripts/production/staff.py, after each successful staff write on natedev, copy the record file to the Mac at the same path (`~/.local/state/staff/staff.json`).
+2. The copy on the Mac is replaced by atomic rename: write a temporary file in the same folder, then `mv` it over the record. A reader never sees a partial file.
+3. natedev stays the only writer. The Mac staff.py keeps forwarding every write to natedev, as now. Do not change Mac reads.
+4. Copy only when this process writes the default record on natedev (`OWNER_MACHINE`, no STAFF_FILE override). A test or private STAFF_FILE never copies.
+5. A staff write never waits for the network and never fails because of the copy. A failed copy prints exactly one anomaly line (for example `staff: Mac copy failed: <reason>`) and the write still succeeds.
+6. The newest record wins: two writes close together must never leave the older file on the Mac. Read the file to send at send time, under one lock, or give an equal guarantee.
+7. Find the Mac host the way the code already does (scripts/shutdown/remote.py, `remote.other_machine()` and its peers). Do not hard-code a host name; if a tunable is needed, read it from config at use.
+8. Add tests: the copy runs after a default-record write on natedev; it does not run with STAFF_FILE or on the Mac; a failed copy prints one line and the write succeeds; the remote command replaces by atomic rename; newest-wins. Use a fake ssh/runner, never a real ssh.
+9. Name the cost you add to each write in your summary.
+Files: scripts/production/staff.py (only the write path and a new copy function) and scripts/production/test_staff.py (or a new scripts/production/test_staff_mac_copy.py). Report to the unit director; it sends the hash to sdlc.
+
+### Phase 4t — A test keeps the staff accessor list complete  · status: todo
+
+**Depends on:** sdlc's docs/as-built/staff-accessors.md for its final run; the test is built first.
+
+**Work Order:**
+
+Write a test that fails when docs/as-built/staff-accessors.md misses a file that reads or writes the staff record (sdlc, 2026-11-04).
+1. sdlc commits docs/as-built/staff-accessors.md soon. It is not in the tree yet. Build the test now against the rules below; the unit director merges the doc when it lands and tells you.
+2. A file reads or writes the staff record when it imports the `staff` module (`import staff`, `from staff import`, `from scripts.production import staff`, `from scripts.production.staff import`), or names the record path `.local/state/staff/staff.json` or `staff.json` under the staff state folder, or runs `staff.py` as a command. Look at the tree with grep and make the rule match what you find; say in your summary which forms you found and which you count.
+3. Scan tracked files under scripts/, commands/ and docs/ that are code or commands (.py, .sh, .md commands). Skip test files and test support only if the doc's rule says so; otherwise count them. Keep the scan fast: one pass, no subprocess per file.
+4. The doc lists each accessor as a repo-relative path in backticks. The test reads every backticked path in the doc. It fails with one line per missing file, naming the file and the line that accesses the staff record. It also fails on a listed path that no longer exists.
+5. Until the doc lands, the test skips with the message `staff-accessors.md not in tree yet` — never passes silently. Remove this skip once the doc is merged (the unit director tells you).
+6. Prove the test with a temporary doc copy that misses one file: it must fail and name that file.
+Files: scripts/production/test_staff_accessors.py (new). Edit nothing else.
+
+### Phase 4u — The input gate accepts a bridge_status turn  · status: done
+
+**Depends on:** none; accounts-unit finding, 2026-11-04.
+
+**Work Order:**
+
+Fix the input readiness gate (accounts-unit finding, 2026-11-04).
+1. scripts/herdr/herdr.py `prompt_input_state` (about line 1975-1990) calls a session ready when herdr reports `interactive_ready`, or when the transcript holds a `system` turn with the text "/remote-control is active".
+2. A resumed transcript now holds a `bridge_status` system turn instead of that text. A live session then fails the gate with "destination never became ready for input".
+3. Look at real transcripts read-only to learn the exact shape of a `bridge_status` turn: grep only the `type` and `subtype` fields; print no message text and no user content. Transcripts are under ~/.claude*/projects/*/*.jsonl.
+4. Make the gate also accept that `bridge_status` turn. Keep one predicate for "Remote Control is on in this transcript"; do not add a second copy of the rule.
+5. Search for the same "/remote-control is active" transcript or pane rule in other files (scripts/production/add_unit.py, scripts/shutdown/remote_control.py). Do not edit files outside herdr.py and its test; list each other site and whether it has the same defect in your summary, so the unit director can send it to the owner.
+6. Add a regression test in scripts/herdr/test_herdr.py that fails without the fix: a transcript with only a `bridge_status` turn reads as ready.
+herdr.py is shared with 3v and 4e writers: post the function you take on the board before you edit it.
+Files: scripts/herdr/herdr.py (`prompt_input_state` and a small helper beside it) and scripts/herdr/test_herdr.py.
+
+### Phase 4y — Rename edges after Step B  · status: todo
+
+**Depends on:** 4g Step B (rename_unit.py on the row, journal in unit_move.py).
+
+**Work Order:**
+
+Close the Step B review edges routed at repair round 10 (4g review, 2026-11-04). The rename rule stays as sdlc set it.
+1. Recovery identity (F009): `unit_move._recoverable_folder` returns success only when the journal's source, destination and Git admin path all match. Keep the branch checks. A test puts another linked worktree of the same repository on the requested branch at the destination and expects no adoption.
+2. Same name (F017): a row already named `port` with request `port-unit → port` and no journal writes nothing and moves nothing (rule 1).
+3. Output (F018): the printed line follows the operation result. A finished pending move prints `done`; a rerun with nothing to do prints only `unchanged`.
+4. Pending kinds (F019): a folder-only move and a pending rename are distinct journal variants, not `FolderMove.name == ""`.
+5. Order (F020): set the displays before the folder and branch move (rule 2).
+Files: scripts/production/rename_unit.py, scripts/production/unit_move.py and their tests.
+The restart deadline (F007) moved to shutdown-unit Phase 4l.
 
 ### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: todo
 
@@ -2383,13 +2457,13 @@ Test continuation after unknown evidence, named stderr notes, and refusal for a 
 
 #### Work Order
 
-**Goal:** one launcher, `scripts/direct/launch.py`, holds the work of `implement.sh`, `review.sh` and `assign.sh`/`assign.py`, and its repository callers use that one command; the old launcher names are deleted.
+**Goal:** `assign.sh`, the one door (decision 11), holds the work of `implement.sh` and `review.sh`, and every repository caller uses it; the inner launcher names are deleted. No new launcher name is added. Agree each `scripts/direct` launcher edit with devtools-unit first.
 
-**Spec:** Merge `implement.sh`, `review.sh` and `assign.sh`/`assign.py` into one launcher, `scripts/direct/launch.py`, switching every caller and then deleting the old files. A compatibility entry point stays only for a named caller outside this repository; record that caller and its owner before making an exception. Generated Codex mirrors switch with their source commands and are not an independent compatibility requirement. After Phase 18 each launcher holds only its arguments, its recorder, status-file and board work, and its call to `worker.py`; `launch.py` holds that work once.
+**Spec:** Merge `implement.sh` and `review.sh` into `assign.sh`/`assign.py`, the one door, switching every caller and then deleting the old files. A compatibility entry point stays only for a named caller outside this repository; record that caller and its owner before making an exception. Generated Codex mirrors switch with their source commands and are not an independent compatibility requirement. After Phase 18 each launcher holds only its arguments, its recorder, status-file and board work, and its call to `worker.py`; `launch.py` holds that work once.
 
 **Files:**
-- `scripts/direct/implement.sh`, `scripts/direct/review.sh`, `scripts/direct/assign.sh`, `scripts/direct/assign.py` — deleted after their callers switch.
-- `scripts/direct/launch.py` — new: the one launcher.
+- `scripts/direct/implement.sh`, `scripts/direct/review.sh` — deleted after their callers switch.
+- `scripts/direct/assign.sh`, `scripts/direct/assign.py` — the one door; they take the merged work.
 - `commands/unit/direct.md`, `commands/plan/phase_review.md`, `commands/showrunner/produce.md`, `scripts/shutdown/stop_resume.py`, `scripts/shutdown/inventory.py`, `scripts/agents/detached_runs.py`, `scripts/direct/progress_history.py`, `scripts/lib/unit_runs.py` — switch old launcher callers and text. Regenerate the command mirrors through `scripts/claude_to_codex/sync.py`.
 - `scripts/shutdown/test_stop_resume.py`, `scripts/shutdown/test_inventory.py`, `scripts/direct/test_progress_history.py`, `scripts/lib/test_unit_runs.py`, `scripts/agents/test_detached_runs.py` — caller regressions.
 - `scripts/direct/test_implement_launcher.py`, `scripts/direct/test_review_launcher.py`, `scripts/direct/test_assign_launcher.py` — the launcher tests.

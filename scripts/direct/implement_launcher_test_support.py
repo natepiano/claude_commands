@@ -238,7 +238,7 @@ if behavior == 'gone':
     (root / 'worker_state').write_text('gone\\n')
 if behavior == 'unreadable_once':
     (root / 'unreadable_listing_once').write_text('yes\\n')
-print('DELIVERED')
+print('SENT: fixture')
 """
 
 
@@ -531,7 +531,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         _ = write_registry(registry, base_text=CLAUDE_REGISTRY)
         sessions = self.root / "sessions"
         sessions.mkdir()
-        projects = self.root / "projects" / "fixture"
+        projects = self.root / ".claude" / "projects" / "fixture"
         projects.mkdir(parents=True)
         session_id = "abc12345-2222-4333-8444-555555555555"
         _ = (sessions / f"{os.getpid()}.json").write_text(json.dumps({
@@ -546,7 +546,9 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         )
         from scripts.production import staff
         from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
-        with isolated_staff_file(self.root / "staff.json", {}):
+        with isolated_staff_file(self.root / "staff.json", {
+            "CLAUDE_CONFIG_DIR": str(projects.parent.parent),
+        }):
             worker = fixture_worker("fixture-impl", staff.native_id(self.staff_parent), runtime_id=session_id)
         _ = (session_dir / "impl_worker_impl.json").write_text(json.dumps({
             "staff_id": worker.id, "slot": "impl", "model": "opus",
@@ -569,7 +571,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             "CLAUDE_BIN": str(self.root / "claude-bin"),
             "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "CLAUDE_PROJECTS_DIR": str(self.root / "projects"),
+            "CLAUDE_PROJECTS_DIR": str(transcript.parent.parent),
             "STUB_CLAUDE_ROOT": str(self.root),
             "STUB_TRANSCRIPT": str(transcript),
             "STUB_SUMMARY": str(session_dir / "impl_summary_impl.txt"),

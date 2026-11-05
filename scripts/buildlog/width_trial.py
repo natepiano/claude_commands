@@ -20,6 +20,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 import store
+import index as buildlog_index
 from memory_admit import expected_peak, git_identity, test_threads, read_memory_config
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
@@ -446,7 +447,7 @@ def _clock(epoch: float) -> str:
 
 def report(since: float, until: float, host: str = "natedev", root: Path | None = None) -> str:
     root = root if root is not None else store.root()
-    index = root / store.INDEX_NAME
+    index = buildlog_index.index_path_in(root)
     steps = load_steps(index, since, until, host)
     arms: dict[int | None, list[Step]] = defaultdict(list)
     for step in steps:

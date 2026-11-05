@@ -80,11 +80,10 @@ class AstraRolesTests(StaffTestCase):
         design_id = "00000000-0000-4000-8000-000000000066"
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
             str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
-            design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
+            design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", "lasting-astra-designer", design_roles.RoleNeedsRecovery(staff.StaffId("99340615-2159-5777-b1c8-71572890df55"), "server gone")),
              design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
-        with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(self.parent.current_session)):
+        with mock.patch.dict(os.environ, self.environment):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             mesh = design_roles.mesh_directory(design_id)
             mesh.mkdir(parents=True)

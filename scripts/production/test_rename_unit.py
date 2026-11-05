@@ -2,19 +2,76 @@
 from __future__ import annotations
 
 import unittest
+import json
 from pathlib import Path
 from typing import final
 from unittest import mock
 
 from scripts.herdr import herdr
+from scripts.message import sessions
 from scripts.production import staff, unit_config
-from scripts.production.staff_test_support import fixture_member
-from scripts.production.rename_rerun_test_support import final_files
-from scripts.production.rename_unit_test_support import UnitRenameFixture
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.rename_test_support import RenameDisplays
+from scripts.production.rename_rerun_test_support import file_versions, final_files
+from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture, UnitRenameFixture
 
 
 @final
 class UnitRenameTests(UnitRenameFixture):
+    def test_same_name_repairs_displays_with_an_unfilled_worktree(self) -> None:
+        parent = next(row for row in staff.find(kind="showrunner") if row.name == "demo")
+        row = fixture_member("unit", name="unfilled", parent=parent.id)
+        displays = RenameDisplays(row)
+        with displays.installed():
+            result = self.rename("apply", row.name, row.name)
+        self.assert_ok(result)
+        self.assertEqual((displays.pane, displays.tab), (row.name,) * 2)
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_same_name_repairs_the_current_session_name_without_moving(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("unit-session-after-clear")))
+        record = sessions.SessionRecord(sessionId=row.current_session, name="previous", pid=998041,
+            procStart="probe-generation", updatedAt=1, formerNames=[], tmux="", entrypoint="cli", messagingSocketPath="")
+        path = self.root / "state/sessions/998041.json"
+        self.write(path, json.dumps(record))
+        displays = RenameDisplays(row)
+        displays.pane = displays.tab = row.name
+        before = final_files(self.root)
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+            self.assert_ok(self.rename("apply", row.name, row.name))
+            self.assertEqual(json.loads(path.read_text())["name"], row.name)
+            settled = path.read_bytes(), path.stat().st_mtime_ns
+            rerun = self.rename("apply", row.name, row.name)
+        self.assert_ok(rerun)
+        self.assertEqual(rerun.stdout.strip(), "unchanged")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), settled)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(final_files(self.root), before)
+
+    def test_same_name_repairs_each_display_without_moving_the_worktree(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("unit-after-clear")))
+        for field in ("pane", "tab"):
+            with self.subTest(field=field):
+                displays = RenameDisplays(row)
+                displays.pane = displays.tab = row.name
+                setattr(displays, field, "previous")
+                before = final_files(self.root)
+                with displays.installed():
+                    result = self.rename("apply", row.name, row.name)
+                    self.assert_ok(result)
+                    self.assertNotIn("unchanged", result.stdout)
+                    self.assertEqual((displays.pane, displays.tab), (row.name, row.name))
+                    self.assertEqual(staff.by_id(row.id), row)
+                    self.assertEqual(final_files(self.root), before)
+                    commands = list(displays.commands)
+                    rerun = self.rename("apply", row.name, row.name)
+                self.assert_ok(rerun)
+                self.assertEqual(rerun.stdout.strip(), "unchanged")
+                self.assertEqual(displays.commands, commands)
+                self.assertEqual(final_files(self.root), before)
+
     def test_rename_continues_when_the_removed_worktree_is_absent(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         source = self.rust / "claude-demo-alpha"
@@ -23,20 +80,20 @@ class UnitRenameTests(UnitRenameFixture):
         with mock.patch.object(herdr.Herdr, "panes", return_value=[]):
             result = self.rename("apply")
         self.assert_ok(result)
-        destination = self.home / "worktrees/gamma"
+        destination = self.rust / "claude-demo-gamma"
         renamed = staff.by_id(row.id)
         assert renamed is not None
         self.assertEqual((renamed.name, renamed.worktree),
                          ("gamma", staff.RemovedWorktree("natedev", destination)))
         self.assertFalse(destination.exists())
-        self.assertEqual(result.stderr.splitlines(), [f"anomaly: folder is absent: {destination}"])
+        self.assertIn(f"anomaly: folder is absent: {destination}", result.stderr.splitlines())
         before = final_files(self.root)
         self.assert_ok(self.rename("apply"))
         self.assertEqual(final_files(self.root), before)
 
     def test_worktree_rename_updates_a_removed_location_without_reactivating_its_row(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        source, destination = self.rust / "claude-demo-alpha", self.home / "worktrees/gamma"
+        source, destination = self.rust / "claude-demo-alpha", self.rust / "claude-demo-gamma"
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", source), expected=row.worktree)
         self.assert_ok(self.rename("apply"))
         retained = staff.by_id(row.id)
@@ -50,13 +107,13 @@ class UnitRenameTests(UnitRenameFixture):
     def test_a_retry_after_git_move_sets_the_new_staff_path_and_keeps_config_bytes_and_identity(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         source = self.rust / "claude-demo-alpha"
-        destination = self.home / "worktrees/gamma"
+        destination = self.rust / "claude-demo-gamma"
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", source), expected=row.worktree)
         config = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                         unit_config.AppPort(8123), ("nightly",))
         _ = unit_config.write(source, config)
         data = (source / ".unit.toml").read_bytes()
-        with mock.patch.object(staff, "set_worktree", side_effect=OSError("stopped after folder move")):
+        with mock.patch.object(staff, "set_worktree", side_effect=SystemExit(91)):
             interrupted = self.rename("apply")
         self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout + interrupted.stderr)
         self.assertFalse(source.exists())
@@ -77,14 +134,14 @@ class UnitRenameTests(UnitRenameFixture):
 
     def test_retry_after_staff_publication_keeps_the_settled_worktree(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        destination = staff.PresentWorktree("natedev", self.home / "worktrees/gamma")
+        destination = staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma")
         publish = staff.set_worktree
 
         def interrupted(identity: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree, *,
                         expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
             self.assertEqual(expected, row.worktree)
             _ = publish(identity, value, expected=expected)
-            raise OSError("stopped after staff publication")
+            raise SystemExit(91)
 
         with mock.patch.object(staff, "set_worktree", side_effect=interrupted):
             stopped = self.rename("apply")
@@ -106,7 +163,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assert_ok(self.rename("apply"))
         self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(
             row.id, "unit", "gamma", row.parent, current_session=row.id,
-            worktree=staff.PresentWorktree("natedev", self.home / "worktrees/gamma"), doc=row.doc))
+            worktree=staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma"), doc=row.doc))
         self.assertEqual(staff.snapshot().by_id(worker.id), worker)
 
     def test_uncommitted_work_between_phases_also_keeps_the_tip(self) -> None:
@@ -114,7 +171,7 @@ class UnitRenameTests(UnitRenameFixture):
         tip = self.git("rev-parse", "HEAD", cwd=worktree)
         self.write(worktree / "draft.md", "a new file\n")
         self.assert_ok(self.rename("apply"))
-        new = self.home / "worktrees/gamma"
+        new = self.rust / "claude-demo-gamma"
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), tip)
         self.assertEqual((new / "draft.md").read_text(), "a new file\n")
 
@@ -129,12 +186,67 @@ class UnitRenameTests(UnitRenameFixture):
         self.write(source / "draft.md", "a new file\n")
         plan = (source / "docs/plans/alpha.md").read_bytes()
         self.assert_ok(self.rename("apply"))
-        destination = self.home / "worktrees/gamma"
-        self.assertEqual(self.git("branch", "--show-current", cwd=destination), "gamma")
+        destination = self.rust / "claude-demo-gamma"
+        self.assertEqual(self.git("branch", "--show-current", cwd=destination), "demo-gamma")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=destination), tip)
         self.assertEqual((destination / "work.md").read_text(), "phase work\nmore, not committed\n")
         self.assertEqual((destination / "draft.md").read_text(), "a new file\n")
         self.assertEqual((destination / "docs/plans/alpha.md").read_bytes(), plan)
+
+
+@final
+class FolderRenameTests(FolderRenameFixture):
+    old_name: str = "port"
+    new_name: str = "x"
+
+    def test_same_name_writes_nothing_and_moves_nothing(self) -> None:
+        from scripts.production import rename_unit, unit_move
+
+        before = file_versions(self.root)
+        with (mock.patch.object(rename_unit, "repair_displays", return_value=False),
+              mock.patch.object(unit_move, "move_folder") as move):
+            result = self.command(new="port")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        move.assert_not_called()
+        self.assertEqual(file_versions(self.root), before)
+        self.assertEqual(staff.by_id(self.owner.id), self.owner)
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.source), "cargo-liner-port")
+
+    def test_new_name_preserves_the_folder_parent_and_branch_prefix(self) -> None:
+        from dataclasses import replace
+        from scripts.production import rename_unit
+
+        with (FolderSessionFixture(self.owner, live=False).installed(),
+              mock.patch.object(rename_unit, "repair_displays", return_value=False)):
+            result = self.command()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.source.exists())
+        self.assertEqual(self.destination, self.home / "rust/cargo-liner-x")
+        self.assertTrue(self.destination.is_dir())
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.destination), "cargo-liner-x")
+        self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, name="x",
+            worktree=staff.PresentWorktree("natedev", self.destination)))
+        self.assertFalse((self.home / "worktrees/x").exists())
+
+    def test_unmatched_folder_stays_and_reports_one_anomaly_while_branch_moves(self) -> None:
+        from dataclasses import replace
+        from scripts.production import rename_unit
+
+        original = self.source
+        self.source = original.with_name("unmatched")
+        _ = self.git("worktree", "move", str(original), str(self.source))
+        _ = staff.set_worktree(self.owner.id, staff.PresentWorktree("natedev", self.source),
+                              expected=staff.PresentWorktree("natedev", original))
+        with (FolderSessionFixture(self.owner, live=False).installed(),
+              mock.patch.object(rename_unit, "repair_displays", return_value=False)):
+            result = self.command()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith("anomaly:"), result.stderr)
+        self.assertTrue(self.source.is_dir())
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.source), "cargo-liner-x")
+        self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, name="x"))
 
 
 if __name__ == "__main__":

@@ -287,7 +287,7 @@ class SessionPaneTests(unittest.TestCase):
             commands.append(arguments)
             if arguments == ("pane", "list"):
                 return json.dumps({"result": {"panes": [{
-                    "pane_id": place.pane, "workspace_id": "w1", "agent_session": {"value": replacement}}]}})
+                    "pane_id": place.pane, "terminal_id": "selected-terminal", "workspace_id": "w1", "agent_session": {"value": replacement}}]}})
             if arguments == ("pane", "process-info", "--pane", place.pane):
                 return json.dumps({"result": {"process_info": {
                     "shell_pid": 998041, "foreground_process_group_id": 998042,
@@ -296,7 +296,7 @@ class SessionPaneTests(unittest.TestCase):
 
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (998042, "claude"))
-            return herdr.NativeAgentProcess(replacement, "replacement-generation", {})
+            return herdr.NativeAgentProcess(herdr.RolloutThread(replacement), "replacement-generation", {})
 
         with (mock.patch.object(session_pane, "Herdr", return_value=client),
               mock.patch.object(client, "run", side_effect=transport),
@@ -329,7 +329,7 @@ class SessionPaneTests(unittest.TestCase):
             commands.append(arguments)
             if arguments == ("pane", "list"):
                 return json.dumps({"result": {"panes": [{
-                    "pane_id": place.pane, "workspace_id": "w1", "agent_session": {"value": observed}}]}})
+                    "pane_id": place.pane, "terminal_id": "selected-terminal", "workspace_id": "w1", "agent_session": {"value": observed}}]}})
             if arguments == ("pane", "process-info", "--pane", place.pane):
                 return json.dumps({"result": {"process_info": {
                     "shell_pid": 998041, "foreground_process_group_id": 998042,
@@ -338,7 +338,7 @@ class SessionPaneTests(unittest.TestCase):
 
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (998042, "claude"))
-            return herdr.NativeAgentProcess(observed, "private-generation", {})
+            return herdr.NativeAgentProcess(herdr.RolloutThread(observed), "private-generation", {})
 
         def send(verb: str, target: str) -> None:
             if verb == "type":

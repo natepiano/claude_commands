@@ -1040,6 +1040,68 @@ def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
     if pending:
         document["pending_retire"] = sorted(pending)
     atomic_file.write_text_atomic(_file(), json.dumps(document, indent=2, sort_keys=True) + "\n")
+    _copy_to_mac()
+
+
+def _copy_to_mac(*, detached: bool = True) -> None:
+    """Send the latest default record under one lock, outside the writing process."""
+    try:
+        if "STAFF_FILE" in os.environ or remote.local_machine() != OWNER_MACHINE:
+            return
+        if detached:
+            code = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r}); "
+                    "from scripts.production import staff; staff._copy_to_mac(detached=False)")
+            # A retained stderr pipe would make captured CLI callers wait for SSH.
+            with _default_file().with_name("mac-copy.log").open("a", encoding="utf-8") as errors:
+                _ = subprocess.Popen(
+                    [sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True,
+                )
+            return
+        import signal
+
+        path = _default_file()
+        # Keep this lock through SSH so an older send cannot follow a newer send.
+        with path.with_name("mac-copy.lock").open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            text = path.read_text(encoding="utf-8")
+            command = '''set -e
+directory="$HOME/.local/state/staff"
+mkdir -p "$directory"
+temporary=$(mktemp "$directory/staff.json.mac-copy.XXXXXXXX")
+trap 'rm -f "$temporary"' EXIT
+cat > "$temporary"
+mv -f "$temporary" "$directory/staff.json"
+'''
+            def stop(_number: int, _frame: object) -> None:
+                raise InterruptedError("copier terminated")
+
+            # Defer SIGTERM until the SSH child has a cleanup handler.
+            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            previous_handler = signal.signal(signal.SIGTERM, stop)
+            try:
+                with subprocess.Popen(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                     "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                     remote.other_machine(), command],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ) as process:
+                    try:
+                        _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+                        _, errors = process.communicate(input=text, timeout=remote.STANDARD_TIME_LIMIT["seconds"])
+                    except BaseException:
+                        _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+                        process.terminate()
+                        _ = process.wait()
+                        raise
+                    if process.returncode:
+                        reason = " ".join(errors.split()) or f"ssh exited {process.returncode}"
+                        raise OSError(reason)
+            finally:
+                _ = signal.signal(signal.SIGTERM, previous_handler)
+                _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
@@ -1061,6 +1123,9 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
                         for location in _location_paths(row):
                             if _under_test_root(location):
                                 raise StaffRefused(f"test-root path cannot enter the real staff record: {location}")
+                        # The fixture backend uses UUID version 5; native backends use versions 4 and 7.
+                        if any(identity[14:15] == "5" for identity in (row.id, row.current_session)):
+                            raise StaffRefused("fixture runtime id cannot enter the real staff record")
             proposed.sort(key=lambda row: row.id)
             if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
@@ -1243,17 +1308,27 @@ def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
 
 def rename(staff_id: StaffId, new_name: str) -> StaffRow:
     if not is_owner():
-        return _remote_row(["rename", staff_id, f"--name={new_name}"])
+        renamed = _remote_row(["rename", staff_id, f"--name={new_name}"])
+    else:
+        def edit(rows: list[StaffRow]) -> StaffRow:
+            row = _required(rows, staff_id)
+            renamed = replace(row, name=new_name)
+            rows[rows.index(row)] = renamed
+            return renamed
 
-    def edit(rows: list[StaffRow]) -> StaffRow:
-        row = _required(rows, staff_id)
-        if row.kind == "worker":
-            raise StaffRefused("a worker name is set once")
-        renamed = replace(row, name=new_name)
-        rows[rows.index(row)] = renamed
-        return renamed
+        renamed = _transaction(edit)
+    if renamed.kind == "worker":
+        herdr = import_module("scripts.herdr.herdr")
+        client = cast(Callable[[str], object], herdr.Herdr)
+        shared_session = cast(Callable[[], str], herdr.shared_session)
+        display_failure = cast(type[Exception], herdr.HerdrFailure)
 
-    return _transaction(edit)
+        try:
+            retitle = cast(Callable[[str], bool], getattr(client(shared_session()), "retitle_row"))
+            _ = retitle(renamed.id)
+        except (OSError, ValueError, display_failure) as error:
+            print(f"anomaly: worker display: {error}", file=sys.stderr)
+    return renamed
 
 
 def move(staff_id: StaffId, new_parent: ReportsTo | StaffRoot) -> StaffRow:

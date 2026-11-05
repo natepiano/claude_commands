@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
-import importlib
 import json
 import os
 import shlex
@@ -18,7 +17,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import build_hold
 from hold_applies import BUILDING_CARGO_VERBS, cargo_verb
@@ -31,15 +30,10 @@ else:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
 
-
-class BuildLogWriter(Protocol):
-    def host_name(self) -> str: ...
-    def root(self) -> Path: ...
-    def utc_iso(self, epoch: float) -> str: ...
-    def append_line(self, path: Path, record: object) -> None: ...
-
-
-store = cast(BuildLogWriter, cast(object, importlib.import_module("store")))
+if TYPE_CHECKING:
+    from ..buildlog import store
+else:
+    import store
 
 
 @dataclass(frozen=True)

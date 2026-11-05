@@ -199,7 +199,7 @@ The builder's output, which the renderer consumes:
 | `length` | `gantt`, `simple`, `page` or `elaborate`, from the argument. |
 | `zone` | `ZONE`, as an IANA name. |
 | `next_run` | The next scheduled run, `HH:MM` in `ZONE`, after any restart. Leave it out when no schedule runs. |
-| `counts` | The builder's, from `~/.claude/config/dailies.conf`: each `label` with its `count`, or `not_found: true` when its file is missing. Leave it to the builder; a production with no lines there has none. |
+| `counts` | The builder reads `~/.claude/config/dailies.conf` with the fixed showrunner staff id. Each entry has `label` and `count`, or `not_found: true`. A production without configured counts has no counts line. |
 | `children` | The builder's, when productions report to this one: each one's `name`, its saved `report`, `open` (due items for the user in its list and the lists below it), `unreadable` (lists that could not be read) and `expand`. Leave it to the builder. |
 | `reports_to` | The builder's, when this showrunner is under a root: the root's production. Leave it to the builder. |
 | `doc` | The builder's: the production doc, whose changes to review, efficiency and proposals the footer's counts line reads when the report renders. Leave it to the builder. |
@@ -253,9 +253,9 @@ unless it names another plan's document. User, 2026-10-02.
 ### What the renderer writes
 
 - **First line:** the length and the time in `ZONE`: `**Dailies (Simple)**, 19:05 AST`.
-- **Counts:** the production's own counts from `dailies.conf`, on one line just above the chart in every
-  length, `gantt` included: `counts: nightly queue 8 · proposals 3`. A count whose file is missing reads
-  `not found`. None configured, no line. User, 2026-10-10.
+- **Counts:** The builder selects `dailies.conf` keys by the fixed showrunner staff id.
+  Every length shows the counts above the chart: `counts: nightly queue 8 · proposals 3`.
+  A missing source shows `not found`. A production without configured counts has no counts line. User, 2026-10-10.
 - **`gantt`:** the first line, the counts line, the chart and the last lines, and above the chart only two other things. A subject
   that needs the user keeps its full section. A unit that changed since the last report gets one line for each
   change: `- <unit>: now on <phase>`, `- <unit>: checkpoint not merged, because ...` or `checkpoint no longer

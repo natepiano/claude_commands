@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import io
 import os
 import shutil
@@ -31,9 +33,9 @@ import mechanical_classes
 import rules
 import style_ledger
 import style_rules
-from scripts.production import unit_config
+from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
 REAL_RUN = subprocess.run
@@ -122,14 +124,21 @@ class StylePlanFixture(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
+            "HERDR_BIN": "/nonexistent/herdr",
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
             fake_fmt.STATE: str(self.root / "fmt"),
             "PATH": str(self.root / "bin") + os.pathsep + os.environ.get("PATH", ""),
         })))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
-        owner = recorded_showrunner("sample-style", self.doc)
+        owner = recorded_showrunner("sample-style", self.doc, "sample")
         _ = fixture_unit_location(owner, "names-unit", self.unit)
+        members = staff.initial_snapshot().find(kind="unit", parent=owner.id)
+        for name in ("judging", "modules", "types", "values", "judge-values"):
+            if not any(row.name == name for row in members):
+                _ = fixture_member("unit", name=name, parent=owner.id,
+                    runtime_id=fixture_runtime_id("planner-owner:" + name),
+                    worktree=staff.RemovedWorktree("natedev", self.root / ("unused-" + name)))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
         _ = self.enterContext(mock.patch.object(berth_board, "read_board", return_value=self.board()))
         _ = self.enterContext(mock.patch.object(style_proposals, "renumber"))
@@ -267,7 +276,7 @@ class StylePlanFixture(unittest.TestCase):
         self.finish_judging()
         ledger = self.ledger()
         board = self.board(*blocked)
-        busy = style_plan.busy_files(self.repo, self.doc, ledger, family + "-unit", board)
+        busy = style_plan.busy_files(self.repo, self.doc, ledger, ticket_owner_id(family + "-unit"), board)
         return style_plan.candidate_tickets(self.repo, ledger, busy, family, base=self.base(family))
 
     def base(self, family: rules.Family = "names") -> style_plan.UnitBase:
@@ -281,7 +290,7 @@ class StylePlanFixture(unittest.TestCase):
         plan.parent.mkdir(parents=True)
         _ = plan.write_text(self.plan_header())
         self.unit_plan_config(worktree, "modules-unit.md")
-        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "modules-unit", worktree)
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc, "sample"), "modules-unit", worktree)
         return plan
 
     def unit_takes_tip(self) -> None:
@@ -328,7 +337,7 @@ class StylePlanFixture(unittest.TestCase):
         plan.parent.mkdir(parents=True)
         _ = plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
         self.unit_plan_config(types, "types-unit.md")
-        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc), "types-unit", types)
+        _ = fixture_unit_location(recorded_showrunner("sample-style", self.doc, "sample"), "types-unit", types)
         return plan
 
     def names_files(self) -> set[str]:
@@ -411,7 +420,8 @@ class StylePlanFixture(unittest.TestCase):
 
     def seed_sync_wait(self) -> None:
         with closing(sqlite3.connect(self.ledger().database)) as connection:
-            _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES ('names-unit','2026-01-01T00:00:00+00:00','seed-wait')")
+            _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES (?,'2026-01-01T00:00:00+00:00','seed-wait')",
+                (str(next(row.id for row in staff.initial_snapshot().find(kind="unit") if row.name == "names")),))
             connection.commit()
 
     def approved_decision(self, rule: str, files: tuple[str, ...], kind: style_ledger.FindingKind,
@@ -447,9 +457,9 @@ class StylePlanFixture(unittest.TestCase):
         """An assigned crate-alpha ticket with its base saved for package verification."""
         rule = self.rule("read")
         self.sync()
-        ticket_id = "names-unit-1"
+        ticket_id = "1"
         with self.ledger() as ledger:
-            ledger.ticket_add(ticket_id, "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+            ledger.ticket_add(ticket_id, ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
             ledger.ticket_assign(ticket_id, "demo-style-names")
             _ = ledger.ticket_base(ticket_id)
         return ticket_id
@@ -460,13 +470,13 @@ class StylePlanFixture(unittest.TestCase):
         self.sync()
         issues = (self.approved_decision(rule, (self.sources[0],), "type", name="a-primary"),
                   self.approved_decision(rule, (self.sources[1],), "type", name="b-secondary"))
-        ticket_id = "names-unit-1"
+        ticket_id = "1"
         with self.ledger() as ledger:
             findings = tuple(finding for issue in issues for finding in ledger.proposal_findings(issue))
             for issue in issues:
                 identities = ", ".join(finding.finding_id for finding in ledger.proposal_findings(issue))
                 _ = issue.write_text(issue.read_text().replace("\n---\n", f"\nstyle_findings: [{identities}]\n---\n", 1))
-            ledger.ticket_add(ticket_id, "names-unit", "proposal", "names", "crates/alpha", list(self.sources[:2]),
+            ledger.ticket_add(ticket_id, ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", list(self.sources[:2]),
                               [rule], proposal=str(issues[0]), proposals=issues,
                               finding_ids=tuple(finding.finding_id for finding in findings))
             ledger.ticket_assign(ticket_id, "demo-style-names")
@@ -487,8 +497,14 @@ class StylePlanFixture(unittest.TestCase):
         issue = folder / (family + ".md")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         ledger = self.ledger()
-        judge = f"judge-{family}-1"
-        ledger.ticket_add(judge, f"judge-{family}", "read", family, "crates/alpha", [path], [rule])
+        owner = next(row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == "sample-style")
+        judge_owner = fixture_member("unit", name=f"judge-{family}", parent=owner.id)
+        if isinstance(judge_owner.worktree, staff.WorktreeUnfilled):
+            judge_owner = staff.set_worktree(judge_owner.id,
+                staff.RemovedWorktree("natedev", self.root / ("judge-" + family)),
+                expected=judge_owner.worktree)
+        judge = ledger.next_ticket_id()
+        ledger.ticket_add(judge, str(judge_owner.id), "read", family, "crates/alpha", [path], [rule])
         ledger.ticket_assign(judge, "style/main")
         _ = ledger.ticket_base(judge)
         for index in range(count):
@@ -509,18 +525,18 @@ class StylePlanFixture(unittest.TestCase):
         """
         issue = self.approved_decision(rule, (), "type")
         ledger = self.ledger()
-        ledger.ticket_add("modules-unit-1", "modules-unit", "read", "names", "crates/alpha", sorted({site[0] for site in sites}), [rule])
-        ledger.ticket_assign("modules-unit-1", "style/main")
-        _ = ledger.ticket_base("modules-unit-1")
+        ledger.ticket_add("3001", ticket_owner_id("modules-unit"), "read", "names", "crates/alpha", sorted({site[0] for site in sites}), [rule])
+        ledger.ticket_assign("3001", "style/main")
+        _ = ledger.ticket_base("3001")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         if clean_before_holding:
             for path in sorted({site[0] for site in sites}):
-                self.record(rule, path, self.tip, "modules-unit-1")
-        findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, blob, "modules-unit-1")
+                self.record(rule, path, self.tip, "3001")
+        findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, blob, "3001")
                          for path, line, text in sites)
         for finding in findings:
             ledger.file_held(finding.finding_id, issue)
-        self.pending_judge_tickets |= {"modules-unit-1"}
+        self.pending_judge_tickets |= {"3001"}
         return issue, findings
 
     def commit_files(self, files: dict[str, str | bytes]) -> None:
@@ -584,7 +600,7 @@ class StylePlanFixture(unittest.TestCase):
         output = self.refill_decisions()
         # The merge made the finding's cell stale, so the refill gives its file to a ticket that judges it again.
         ledger = self.ledger()
-        reading = ledger.ticket_open("names-unit")[0]
+        reading = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
         self.assertEqual(reading["kind"], "read")
         self.assertIn(site, reading["files"])
         ledger.ticket_drop(reading["id"])
@@ -593,15 +609,16 @@ class StylePlanFixture(unittest.TestCase):
     def rejudge(self, finding: style_ledger.HeldFinding, *, holds: bool) -> None:
         """A later read ticket judges the finding's changed file, and holds its change again or records it clean."""
         ledger = self.ledger()
-        ledger.ticket_add("modules-unit-2", "modules-unit", "read", "names", "crates/alpha", [finding.path], [finding.rule])
-        ledger.ticket_assign("modules-unit-2", "style/main")
-        _ = ledger.ticket_base("modules-unit-2")
+        ticket = ledger.next_ticket_id()
+        ledger.ticket_add(ticket, ticket_owner_id("modules-unit"), "read", "names", "crates/alpha", [finding.path], [finding.rule])
+        ledger.ticket_assign(ticket, "style/main")
+        _ = ledger.ticket_base(ticket)
         if holds:
             _ = ledger.hold(finding.rule, finding.path, finding.line, finding.text, finding.kind, finding.before,
-                            finding.after, finding.rule_blob, "modules-unit-2")
+                            finding.after, finding.rule_blob, ticket)
         else:
-            self.record(finding.rule, finding.path, self.tip, "modules-unit-2")
-        ledger.ticket_drop("modules-unit-2")
+            self.record(finding.rule, finding.path, self.tip, ticket)
+        ledger.ticket_drop(ticket)
 
     def refill_closing(self) -> tuple[int, str, str, int]:
         """Run refill with only the real close command, so a decision it closes is closed on disk.
@@ -675,8 +692,9 @@ class StylePlanFixture(unittest.TestCase):
         issue = self.root / "reference-approval.md"
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
-            judging = ledger.next_ticket_id("judging")
-            ledger.ticket_add(judging, "judging", "read", "names", ".", [self.sources[0]], [rule])
+            ticket = ledger.next_ticket_id()
+            judging = ledger.next_ticket_id()
+            ledger.ticket_add(judging, ticket_owner_id("judging"), "read", "names", ".", [self.sources[0]], [rule])
             ledger.ticket_assign(judging, "main")
             _ = ledger.ticket_base(judging)
             ids: list[str] = []
@@ -688,7 +706,7 @@ class StylePlanFixture(unittest.TestCase):
             ledger.ticket_drop(judging)
             _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                                  + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha",
+            ledger.ticket_add(ticket, ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha",
                               [self.sources[0]], [rule], proposal=str(issue), finding_ids=tuple(ids))
         # The gate passes only when the finding file declares each checkable rename's new name.
         declared: dict[str, list[str]] = {}
@@ -699,7 +717,7 @@ class StylePlanFixture(unittest.TestCase):
         if declared:
             self.write(self.sources[0], "".join(f"enum {parent} {{ {', '.join(names)} }}\n"
                                                 for parent, names in declared.items()))
-        return "names-unit-1"
+        return ticket
 
     def approved_binding_ticket(self, source: str, pairs: tuple[tuple[int, str, str], ...],
                                 save_base: bool = False) -> tuple[str, tuple[str, ...]]:
@@ -709,8 +727,9 @@ class StylePlanFixture(unittest.TestCase):
         issue = self.root / "binding-approval.md"
         ledger = self.ledger()
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
-        judging = ledger.next_ticket_id("judging")
-        ledger.ticket_add(judging, "judging", "read", "names", ".", [self.sources[0]], [rule])
+        ticket = ledger.next_ticket_id()
+        judging = ledger.next_ticket_id()
+        ledger.ticket_add(judging, ticket_owner_id("judging"), "read", "names", ".", [self.sources[0]], [rule])
         ledger.ticket_assign(judging, "main")
         _ = ledger.ticket_base(judging)
         ids: list[str] = []
@@ -722,8 +741,7 @@ class StylePlanFixture(unittest.TestCase):
         ledger.ticket_drop(judging)
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-        ticket = "names-unit-1"
-        ledger.ticket_add(ticket, "names-unit", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+        ledger.ticket_add(ticket, ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
                           proposal=str(issue), finding_ids=tuple(ids))
         if save_base:
             ledger.ticket_assign(ticket, "main")
@@ -734,7 +752,7 @@ class StylePlanFixture(unittest.TestCase):
         """Write the phase of the queued approved ticket at a synced tip, where the ledger finds the cells that record takes."""
         self.sync()
         ledger = self.ledger()
-        ticket = ledger.queued_tickets("names-unit")[0]
+        ticket = ledger.queued_tickets(ticket_owner_id("names-unit"))[0]
         ledger.ticket_assign(ticket["id"], "demo-style-names")
         style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
 
@@ -791,10 +809,10 @@ class StylePlanFixture(unittest.TestCase):
                 ledger.file_held(finding.finding_id, issue)
             _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                                  + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [old], [rule],
+            ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [old], [rule],
                               proposal=str(issue), finding_ids=tuple(finding.finding_id for finding in findings))
         _ = self.git("mv", old, "crates/alpha/src/ledger/mutation_lock.rs")
-        return "names-unit-1"
+        return "1"
 
     def renamed_ledger(self, handle: str = LEDGER_HANDLE, error: str = "LockError") -> None:
         """The edits a file rename makes outside the file, ordered as rustfmt orders them, with LockError named error."""
@@ -846,7 +864,7 @@ class StylePlanFixture(unittest.TestCase):
         _ = self.rule("read")
         self.sync()
         self.assertEqual(self.run_next()[0], 0)
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
         for rule in ticket["rules"]:
             for path in ticket["files"]:
                 self.record(rule, path, self.tip, ticket["id"])
@@ -877,15 +895,15 @@ class StylePlanFixture(unittest.TestCase):
         rule = self.rule("read")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [rule])
-        ledger.ticket_assign("names-unit-1", "demo-style-names")
-        _ = ledger.ticket_base("names-unit-1")
+        ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_assign("1", "demo-style-names")
+        _ = ledger.ticket_base("1")
         _ = (self.unit / self.sources[0]).write_text("pub fn checkpoint_work() {}\n")
         _ = self.git("add", self.sources[0], cwd=self.unit)
         _ = self.git("commit", "-qm", "Waiting ticket", cwd=self.unit)
         checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
-        self.record(rule, self.sources[0], checkpoint, "names-unit-1")
-        ledger.ticket_checkpoint("names-unit-1", checkpoint)
+        self.record(rule, self.sources[0], checkpoint, "1")
+        ledger.ticket_checkpoint("1", checkpoint)
         return ledger, rule, checkpoint
 
 

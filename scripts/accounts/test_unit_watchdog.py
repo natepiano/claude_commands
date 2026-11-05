@@ -30,7 +30,8 @@ GIT: str = shutil.which("git") or "git"
 
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
-from scripts.production import showrunners, staff
+from scripts.production import fake_unit_host, showrunners, staff
+from scripts.message import sessions as reader_sessions
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, recorded_unit
 from scripts.shutdown import stop_resume
@@ -300,6 +301,15 @@ class UnitWatchdogTests(unittest.TestCase):
 
     @contextmanager
     def stop_process_leaves(self) -> Generator[None]:
+        proc = self.home / "stop-proc"
+        for owner in self.units.values():
+            fake_unit_host.process({"HERDR_PROC": str(proc)}, owner["pid"], 1, ["claude"], {}, cwd=self.home)
+
+        def reader_liveness(identity: str) -> reader_sessions.LiveSessionProcess | reader_sessions.SessionNotLive:
+            observed = self.session_liveness(identity)
+            return (reader_sessions.LiveSessionProcess(observed.pid) if isinstance(observed, sessions.LiveSessionProcess)
+                    else reader_sessions.SessionNotLive())
+
         def tab(identity: str) -> herdr.TabSession:
             return herdr.TabSession(identity, self.units[identity]["name"], "fixture", identity)
 
@@ -315,9 +325,13 @@ class UnitWatchdogTests(unittest.TestCase):
         def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual(kind, "claude")
             owner = next(entry for entry in self.fixture.live if entry["pid"] == pid)
-            return herdr.NativeAgentProcess(owner["sessionId"], "fixture-start", {})
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread(owner["sessionId"]), "fixture-start", {})
 
-        with (patch.object(herdr, "shared_session", return_value="shared"),
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(herdr, "_codex_conversations", return_value=({}, [])),
+              patch.object(reader_sessions, "session_liveness", side_effect=reader_liveness),
+              patch.object(herdr, "shared_session", return_value="shared"),
               patch.object(herdr, "native_process", side_effect=native_process),
               patch.object(pane_record, "seed", return_value=0),
               patch.object(stop_resume, "_tab_of", side_effect=tab),
@@ -355,6 +369,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
         owner = self.add_unit("alpha")
+        self.assertEqual(accounts.group_accounts().get("units"), "claude2")
         member = unit_membership("fixture", "alpha")
         record = staff.StaffSnapshot(tuple(
             replace(row, id=staff.StaffId(owner["session_id"]),
@@ -363,7 +378,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
         def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
-            self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude4"))
+            self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude2"))
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
                            "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["config_dir"]}
             payload = json.dumps({"session_id": "alpha", "cwd": owner["cwd"]})
@@ -378,7 +393,7 @@ class UnitWatchdogTests(unittest.TestCase):
             self.revive("alpha", label)
             return sessions.LiveSessionProcess(owner["pid"])
 
-        config = accounts.account_dir("claude4")
+        config = accounts.account_dir("claude2")
         with self.stop_process_leaves():
             self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("alpha", owner["pid"]))
             self.assertTrue(pane_record.read("shared")["alpha"].get("ended", False))
@@ -400,7 +415,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.die("alpha")
         for minute in (0, 2, 4):
             _ = self.pass_at(minute)
-        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude2", "--only", "alpha"]])
         self.assertEqual({entry["sessionId"] for entry in self.fixture.live}, {"alpha"})
 
     def test_crashed_unit_without_any_record_resumes_in_its_tab_on_the_launch_account(self) -> None:

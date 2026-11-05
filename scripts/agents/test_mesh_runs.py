@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Literal, NamedTuple, cast, override
 from unittest.mock import ANY, MagicMock, patch
 
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
@@ -64,6 +65,7 @@ class MeshRunsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.stack = contextlib.ExitStack()
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
@@ -186,7 +188,7 @@ class MeshRunsTests(unittest.TestCase):
         worker = self.record_worker(WORKER, THREAD_ONE)
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
             str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
-            design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
+            design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", "unused", design_roles.RoleNotOpened()),
              design_roles.RoleInstance("reviewer", WORKER, design_roles.RoleOpen(worker.id))))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
@@ -668,7 +670,8 @@ sys.exit(1)
         self.assertEqual(self.pending(), {}, "another worker's launcher ends nothing of this one")
         codex_mesh._end_dead_runs(session, WORKER)  # pyright: ignore[reportPrivateUsage]
         self.assertIn("FAIL (no exit status)", cast(list[str], self.pending()["messages"])[0])
-        self.assertFalse(codex_mesh._close_messages_if_empty(session, WORKER, thread))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(codex_mesh._close_messages_if_empty(  # pyright: ignore[reportPrivateUsage]
+            session, WORKER, codex_mesh.RosterActiveLauncher(thread, (os.getpid(),))))
 
     def test_a_supervisor_for_a_different_record_is_not_trusted(self) -> None:
         path = self.live_run(["echo", "x"])
@@ -901,15 +904,18 @@ sys.exit(1)
     def test_live_run_keeps_the_launcher_attached_until_the_result_is_held(self) -> None:
         session, thread = str(self.session), THREAD_ONE
         path = self.record([sys.executable, "-c", "pass"])
-        self.assertFalse(codex_mesh._close_messages_if_empty(session, WORKER, thread))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(codex_mesh._close_messages_if_empty(  # pyright: ignore[reportPrivateUsage]
+            session, WORKER, codex_mesh.RosterActiveLauncher(thread, (os.getpid(),))))
         self.assertTrue(codex_mesh._waiting_on_detached_run(session, WORKER))  # pyright: ignore[reportPrivateUsage]
         _ = self.supervise(path)
         self.assertFalse(codex_mesh._detached_run_live(session, WORKER))  # pyright: ignore[reportPrivateUsage]
         # The held result now opens the next turn: the launcher refuses to close on it.
-        self.assertFalse(codex_mesh._close_messages_if_empty(session, WORKER, thread))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(codex_mesh._close_messages_if_empty(  # pyright: ignore[reportPrivateUsage]
+            session, WORKER, codex_mesh.RosterActiveLauncher(thread, (os.getpid(),))))
         self.assertFalse(codex_mesh._waiting_on_detached_run(session, WORKER))  # pyright: ignore[reportPrivateUsage]
-        (session_staff.worker_inbox_path(str(self.session), WORKER)).unlink()
-        self.assertTrue(codex_mesh._close_messages_if_empty(session, WORKER, thread))  # pyright: ignore[reportPrivateUsage]
+        session_staff.worker_inbox_path(session, WORKER).unlink()
+        self.assertTrue(codex_mesh._close_messages_if_empty(  # pyright: ignore[reportPrivateUsage]
+            session, WORKER, codex_mesh.RosterActiveLauncher(thread, (os.getpid(),))))
 
     def test_a_record_without_a_pid_counts_as_live_only_at_first(self) -> None:
         path = self.record(["true"])

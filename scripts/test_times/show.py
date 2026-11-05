@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 if TYPE_CHECKING:
-    from ..buildlog import index, store
+    from ..buildlog import index as index, store
 else:
     import index
     import store
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.lib.terminal_cells import pad_right, terminal_width
 from scripts.lib.user_zone import user_zone
-from scripts.production.merge_gate import discover_test_modules, test_module_name
+from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
@@ -326,11 +327,28 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
     return request
 
 
-def main(argv: list[str] | None = None) -> int:
-    request = arguments(sys.argv[1:] if argv is None else argv)
+def open_report_index() -> sqlite3.Connection:
+    """Update the index and check the report tables before returning the connection."""
     _ = index.update()
     connection = index.read_only()
     try:
+        connection.execute(f"SELECT 1 FROM {', '.join(index.GATE_TABLES)} LIMIT 0").close()
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def main(argv: list[str] | None = None) -> int:
+    request = arguments(sys.argv[1:] if argv is None else argv)
+    try:
+        connection = open_report_index()
+    except sqlite3.OperationalError as error:
+        if not str(error).startswith("no such table: gate_"):
+            raise
+        print(f"test times unavailable: {error}; run `buildlog reindex`", file=sys.stderr)
+        return 1
+    with closing(connection):
         host = store.host_name()
         match request.command:
             case "top":
@@ -343,8 +361,6 @@ def main(argv: list[str] | None = None) -> int:
                 module(connection, host, request.subject, request.runs)
             case "test":
                 test(connection, host, request.subject, request.runs)
-    finally:
-        connection.close()
     return 0
 
 

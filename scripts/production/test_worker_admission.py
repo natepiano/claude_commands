@@ -285,6 +285,7 @@ class FamilyHandoffTests(StaffTestCase):
 
     def test_default_switch_request_reuses_the_published_destination_after_fresh_admission(self) -> None:
         host = fake_unit_host.environment(self.root)
+        Path(host["HERDR_PROC"]).mkdir(exist_ok=True)
         _ = Path(host["FAKE_HERDR_RESPONSES"]).write_text(json.dumps({
             "default": {"code": 0, "stdout": json.dumps({"result": {"panes": []}})},
             "--session default session list --json": {"code": 0, "stdout": json.dumps({"sessions": []})},

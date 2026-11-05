@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ledger_test_support import ticket_owner_id
+
 import io
 import sys
 import unittest
@@ -62,8 +64,8 @@ class StylePlanTests(StylePlanFixture):
         self.record(structure, self.sources[1], self.tip)
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
-        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
+        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
         self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]),
                          ("read", [read], [self.sources[1]]))
         self.assertIn(f"- `{self.sources[1]}` — lines 1-1\n", self.plan.read_text())
@@ -76,8 +78,8 @@ class StylePlanTests(StylePlanFixture):
         self.record(structure, self.sources[1], self.tip)
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
-        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
+        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
         self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]),
                          ("listed", [listed], [self.sources[1]]))
         self.assertEqual([(site["path"], site["line"]) for site in ticket["sites"]], [(self.sources[1], 1)])
@@ -92,8 +94,8 @@ class StylePlanTests(StylePlanFixture):
         pending = {(cell.rule, cell.path) for cell in self.ledger().cells(crate="crates/alpha") if cell.state == "open"}
         self.assertLessEqual({(manifest, "crates/alpha"), (structure, self.sources[1])}, pending)
 
-        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
-        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
+        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
         self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]), ("read", [read], [self.sources[0]]))
 
     def test_names_reads_blocking_structure_when_its_only_unblocked_file_is_busy(self) -> None:
@@ -105,8 +107,8 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])):
-            self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
-        ticket, = self.ledger().ticket_open("names-unit")
+            self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
+        ticket, = self.ledger().ticket_open(ticket_owner_id("names-unit"))
         self.assertEqual((ticket["kind"], ticket["files"]),
                          ("structure", ["crates/alpha/Cargo.toml", self.sources[1]]))
 
@@ -129,8 +131,8 @@ class StylePlanTests(StylePlanFixture):
         self.record(structure, self.sources[1], self.tip)
         self.record(read, self.sources[1], self.tip)
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
-        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
-        ticket, = self.ledger().ticket_open("names-unit")
+        self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
+        ticket, = self.ledger().ticket_open(ticket_owner_id("names-unit"))
         self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
                          ("structure", "modules", [self.sources[0]]))
         self.assertEqual(self.sync_wait_rows(), [])
@@ -143,8 +145,8 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[1])):
-            self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
-        ticket, = self.ledger().ticket_open("names-unit")
+            self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
+        ticket, = self.ledger().ticket_open(ticket_owner_id("names-unit"))
         self.assertEqual((ticket["kind"], ticket["files"]), ("structure", [self.sources[0]]))
 
     def test_modules_still_selects_only_pending_structure_files_when_names_can_refill(self) -> None:
@@ -158,7 +160,7 @@ class StylePlanTests(StylePlanFixture):
             ("structure", "crates/alpha", (self.sources[0],), ((structure, self.sources[0]),)),
         ])
 
-        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
         self.assertEqual(self.candidates("modules"), before)
 
     def test_structure_first_unblocks_more_other_family_cells_before_staler_crates(self) -> None:
@@ -259,8 +261,8 @@ class StylePlanTests(StylePlanFixture):
         with redirect_stdout(output):
             code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(self.root / "modules")])
 
-        self.assertEqual((code, output.getvalue()), (0, "phase written: modules-unit-1\n"))
-        ticket = self.ledger().ticket_open("modules-unit")[0]
+        self.assertEqual((code, output.getvalue()), (0, "phase written: 1\n"))
+        ticket = self.ledger().ticket_open(ticket_owner_id("modules-unit"))[0]
         self.assertEqual((ticket["kind"], ticket["crate"], ticket["files"]),
                          ("structure", "crates/alpha", list(self.sources[:2])))
 

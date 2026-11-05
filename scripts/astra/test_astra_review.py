@@ -112,7 +112,7 @@ class AstraReviewTests(StaffTestCase):
         design_id = "00000000-0000-4000-8000-000000000016"
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
                                   str(self.root), str(self.document), "proposal", "2026-10-21T12:00:00+00:00",
-                                  design_roles.UnitHolder("demo", "proposal-unit"), design_roles.DesignUnbound(),
+                                  design_roles.DesignUnbound(),
                                   (design_roles.RoleInstance("designer", "demo-proposal-astra-designer", design_roles.RoleNotOpened()),
                                    design_roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", design_roles.RoleOpen(worker.id))))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
@@ -138,7 +138,6 @@ class AstraReviewTests(StaffTestCase):
 
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
                 patch.object(staff, "runtime_id", return_value="fixture-holder"), \
-                patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
                 patch.object(design_roles, "resolve_model", return_value=("fixture-model", "xhigh")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=dispatch), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("held review started a fresh exec")), \
@@ -164,7 +163,6 @@ class AstraReviewTests(StaffTestCase):
     def test_busy_held_reviewer_is_reported_without_a_fresh_thread_or_prompt(self) -> None:
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
                 patch.object(staff, "runtime_id", return_value="fixture-holder"), \
-                patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=AssertionError("busy role dispatched")), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("busy role used fresh exec")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:

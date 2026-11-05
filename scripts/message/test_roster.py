@@ -29,7 +29,7 @@ from scripts.production import staff
 from scripts.usage import agents_log
 from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, unit_membership, showrunner_relationship, showrunner_launch,
-    fixture_worker, fixture_runtime_id, fixture_session, fixture_roster, recorded_unit,
+    fixture_worker, fixture_runtime_id, fixture_session, fixture_roster, recorded_unit, fixture_member, recorded_showrunner,
 )
 from scripts.astra import design_roles
 from scripts.astra.design_role_test_support import designer_fixture
@@ -408,6 +408,103 @@ class RosterTests(unittest.TestCase):
             ),
         ]
 
+    def test_docless_staff_row_warns_once_and_keeps_the_good_unit(self) -> None:
+        bad = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
+        membership = staff.snapshot()
+        self.assertEqual(membership, staff.initial_snapshot())
+        self.assertEqual(membership.inputs, (str(self.root / "staff.json"),))
+        self.assertIsInstance(membership.by_id(bad.id), staff.StaffRow)
+        self.assertIsInstance(bad.doc, staff.DocUnfilled)
+        status, output, errors = self._run_main("--here", "--json")
+        report = cast(dict[str, object], json.loads("\n".join(output)))
+        self.assertEqual(status, 0)
+        self.assertEqual(report["problems"], [])
+        self.assertEqual(report["warnings"], ["bad: the production document is not recorded"])
+        self.assertEqual(errors, ["could not read: warning: bad: the production document is not recorded"])
+        self.assertIn("director", [entry["name"] for entry in cast(list[dict[str, object]], report["entries"])])
+        self.assertNotIn("free-claude", [entry["name"] for entry in cast(list[dict[str, object]], report["entries"])])
+
+    def test_docless_staff_row_does_not_block_a_peer_name(self) -> None:
+        _ = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
+        membership = staff.snapshot()
+        result = roster.roster(os.environ, roster.ThisMachine())
+        template = next(entry for entry in result.entries if entry.name == "director")
+        peer_entry = replace(template, name="peer-only", reach=roster.Messageable("session:peer-id"),
+                             session=roster.ClaudeSession("peer-id"))
+        with mock.patch.object(roster, "peer_roster", return_value=roster.Roster([peer_entry], [])) as peer:
+            found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
+        self.assertIsInstance(found, send.RecipientMatches)
+        assert isinstance(found, send.RecipientMatches)
+        self.assertEqual(found.entries, [peer_entry])
+        self.assertIsInstance(found.destination, send.NamedMachine)
+        peer.assert_called_once()
+        with mock.patch.object(roster, "peer_roster", return_value=roster.Roster([], [])):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = send.resolve_recipient("bad", send.LocalThenPeer(), result, membership=membership)
+
+    def test_docless_staff_warning_allows_peer_delivery_and_refuses_its_own_recipient(self) -> None:
+        bad = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
+        membership = staff.snapshot()
+        self.assertEqual(membership.inputs, (str(self.root / "staff.json"),))
+        self.assertEqual(membership.by_id(bad.id), bad)
+        observed = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual(observed.problems, [])
+        self.assertTrue(any(entry.name == "director" for entry in observed.entries))
+        template = next(entry for entry in observed.entries if entry.name == "director")
+        peer_entry = replace(template, name="peer-only", reach=roster.Messageable("session:peer-id"),
+                             session=roster.ClaudeSession("peer-id"))
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch.object(roster, "peer_roster", return_value=roster.Roster([peer_entry], [])) as peer,
+              mock.patch.object(send, "STATE", self.root / "send-state"),
+              mock.patch.object(send, "remote", return_value=send.Result("sent", "fixture peer")) as deliver,
+              mock.patch.object(send, "relay", side_effect=AssertionError("no local relay")),
+              mock.patch.object(send, "user", side_effect=AssertionError("no user push")),
+              redirect_stdout(output), redirect_stderr(errors)):
+            status = send.main(["--to", "peer-only", "--from", "fixture-reviewer", "--text", "fixture text"])
+            self.assertEqual(status, 0, output.getvalue() + errors.getvalue())
+            self.assertEqual(output.getvalue(), "SENT: fixture peer\n")
+            self.assertEqual(errors.getvalue(), "")
+            peer.assert_called_once()
+            deliver.assert_called_once()
+            message = cast(send.Message, deliver.call_args.args[0])
+            self.assertEqual((message.to, message.text), ("session:peer-id", "fixture text"))
+            with self.assertRaises(SystemExit) as refused:
+                _ = send.send(send.parse(["--to", "bad", "--from", "fixture-reviewer", "--text", "fixture text"]))
+            self.assertEqual(refused.exception.code, 2)
+            self.assertIn("bad: the production document is not recorded", errors.getvalue())
+            peer.assert_called_once()
+            deliver.assert_called_once()
+
+    def test_document_read_failure_still_blocks_unproven_peer_fallback(self) -> None:
+        _ = fixture_member("showrunner", name="unreadable", doc=staff.LiveDoc(
+            roster.remote.local_machine(), self.root / "missing-production.md"))
+        membership = staff.snapshot()
+        result = roster.roster(os.environ, roster.ThisMachine())
+        self.assertTrue(any("missing-production.md" in problem for problem in result.problems))
+        with mock.patch.object(roster, "peer_roster") as peer:
+            found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
+        self.assertIsInstance(found, send.LocalRosterIncomplete)
+        peer.assert_not_called()
+        self.assertTrue(any(entry.name == "director" for entry in result.entries))
+
+    def test_invalid_staff_parent_remains_a_staff_read_failure(self) -> None:
+        membership = staff.snapshot()
+        unit = next(row for row in membership.rows if row.kind == "unit")
+        for parent in (staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit.id):
+            with self.subTest(parent=parent):
+                rows = [replace(row, parent=staff.ReportsTo(parent)) if row.id == unit.id else row for row in membership.rows]
+                _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
+                with self.assertRaises(staff.StaffUnreadable):
+                    _ = staff.snapshot()
+                observed = roster.roster(os.environ, roster.ThisMachine())
+                self.assertTrue(any("requires a showrunner parent" in problem for problem in observed.problems))
+                self.assertEqual(observed.warnings, [])
+                with (mock.patch.object(roster, "peer_roster") as peer,
+                      redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused):
+                    _ = send.send(send.parse(["--to", "peer-only", "--from", "fixture-reviewer", "--text", "fixture text"]))
+                self.assertEqual(refused.exception.code, 2)
+                peer.assert_not_called()
+
     def test_unit_worker_keeps_its_director_run_messaging_address(self) -> None:
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             result = roster.roster(os.environ, roster.ThisMachine())
@@ -639,11 +736,11 @@ class RosterTests(unittest.TestCase):
         )
 
     def test_durable_role_roster_uses_holder_reach_after_its_run_folder_is_gone(self) -> None:
-        member = designer_fixture(design_roles.UnitHolder("alpha", "unit-one"),
+        member = designer_fixture(unit_membership("alpha", "unit-one").id,
                                   "lasting-astra-designer", self.root / "codex-home")
         design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000046", "fixture-host", 2),
             "fixture-repo", str(self.root / "checkout"), str(self.root / "checkout/design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("alpha", "unit-one"), design_roles.DesignUnbound(),
+            "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", "lasting-astra-designer", design_roles.RoleOpen(member.id)),
              design_roles.RoleInstance("reviewer", "lasting-reviewer-alias", design_roles.RoleNotOpened())))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
@@ -651,8 +748,7 @@ class RosterTests(unittest.TestCase):
         mesh.mkdir(parents=True)
         _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-astra-designer": {
             "staff_id": member.id, "status": "done"}}))
-        with mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("17e44ec4-3e24-5ae1-b10d-5cf30de9455b")):
-            found = self._entries()
+        found = self._entries()
         entry = found["lasting-astra-designer"]
         self.assertEqual(entry.thread, roster.CodexThread(member.current_session))
         self.assertEqual(entry.role, "astra-designer")
@@ -1055,8 +1151,8 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(decoded.reach, roster.Messageable("worker:run/fixed-address"))
 
 
-    def test_bad_durable_binding_warns_once_and_a_named_peer_still_receives_the_send(self) -> None:
-        bad = write_empty_binding_record(self.root, design_roles.UnitHolder('other', 'other-unit'))
+    def test_bad_durable_binding_leaves_a_named_peer_send_quiet(self) -> None:
+        _ = write_empty_binding_record(self.root)
         peer = self._entry('natedev', 'freestanding', 'session:peer-session')
         os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
         output, errors = io.StringIO(), io.StringIO()
@@ -1074,15 +1170,14 @@ class RosterTests(unittest.TestCase):
             code = send.main(['--to', 'natedev', '--from', 'fixture-reviewer', '--text', 'owner update'])
         self.assertEqual(code, 0, output.getvalue() + errors.getvalue())
         self.assertEqual(output.getvalue(), 'SENT: fixture peer\n')
-        self.assertEqual(errors.getvalue().splitlines(), [
-            f'send.py: roster: warning: durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
+        self.assertEqual(errors.getvalue(), "")
         self.assertEqual(deliver.call_count, 1)
         forwarded = cast(send.Message, deliver.call_args.args[0])
         self.assertEqual(forwarded.to, 'session:peer-session')
         self.assertEqual(forwarded.text, 'owner update')
 
     def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:
-        bad = write_empty_binding_record(self.root, design_roles.UnitHolder('other', 'other-unit'))
+        bad = write_empty_binding_record(self.root)
         code, output, errors = self._run_main('--json')
         self.assertEqual(code, 0, errors)
         report = cast(dict[str, object], json.loads('\n'.join(output)))
@@ -1094,26 +1189,42 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(decoded.warnings, result.warnings)
         self.assertEqual(decoded.problems, [])
 
-    def test_mesh_titles_use_held_design_holder_and_fall_back_when_it_is_unreadable(self) -> None:
+    def test_mesh_titles_use_worker_parents_and_fall_back_when_the_design_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"
-        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
-            "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("sdlc", "roles-unit"), design_roles.DesignUnbound(),
-            (design_roles.RoleInstance("designer", "design-address", design_roles.RoleNotOpened()),
-             design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleNotOpened())))
+        unit = unit_membership("sdlc", "roles-unit")
+        runner = showrunner_relationship("sdlc")
         mesh = str(design_roles.mesh_directory(design_id))
-        for holder, prefix in ((design_roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
-                               (design_roles.ShowrunnerHolder("sdlc"), "sdlc")):
-            design_roles._save(replace(design, holder=holder))  # pyright: ignore[reportPrivateUsage]
+        for parent, prefix in ((unit, "sdlc · roles"), (runner, "sdlc")):
+            designer = fixture_worker("design-address", parent.id)
+            reviewer = fixture_worker("review-address", parent.id)
+            design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
+                "fixture-repo", str(self.root), str(self.root / "design.md"), "design",
+                "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
+                (design_roles.RoleInstance("designer", "design-address", design_roles.RoleOpen(designer.current_session)),
+                 design_roles.RoleInstance("reviewer", "review-address", design_roles.RoleOpen(reviewer.current_session))))
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
             for held_role, name, job in (("designer", "design-address", "designer"),
                                          ("reviewer", "review-address", "design reviewer")):
-                with self.subTest(holder=holder, role=held_role):
+                with self.subTest(parent=parent, role=held_role):
                     shown = roster.mesh_shown_name(mesh, name, {"held_design_id": design_id, "held_role": held_role})
                     self.assertEqual(shown.render(), f"{prefix} · {job}")
                     self.assertEqual(shown.address, name)
         _ = (design_roles.design_directory(design_id) / "design.json").write_text("broken JSON")
         self.assertEqual(roster.mesh_shown_name(mesh, "review-address", {
             "held_design_id": design_id, "held_role": "reviewer"}).render(), "review-address")
+
+    def test_docless_row_keeps_repeated_mesh_title_reads_silent(self) -> None:
+        owner = fixture_member("showrunner", name="docless")
+        run = self.root / "unplaced-run"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": owner.name}))
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            for _ in range(2):
+                self.assertEqual(roster.mesh_shown_name(
+                    str(run), "unplaced-worker", {"role": "impl"}).render(),
+                    "unplaced-worker")
+        self.assertEqual(errors.getvalue(), "")
 
     def test_mesh_worker_slots_keep_full_launch_identity_in_roster_and_titles(self) -> None:
         self._write_mesh(self.director_run, {
@@ -2381,6 +2492,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
         }))
         doc = self.root / "production.md"
         _ = doc.write_text("# builds\n")
+        _ = recorded_showrunner("builds", doc)
         timer = notifier / "showrunner-builds"
         timer.mkdir()
         _ = (timer / "conf").write_text(f"TARGET=session:{self.runner_id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")

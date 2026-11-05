@@ -1,8 +1,8 @@
-"""Cargo build shapes and their read-only join to older admission peaks.
+"""Cargo shapes, compile counts and test arguments from the read-only index join.
 
-A shape separates profile, feature selection and target selection. It does not
-claim that a cached build and a full compile have the same peak; that split is
-separate from this key. Rows without valid argv or a call id prove no shape.
+Shape and compile evidence remain independent. The join keeps test arguments
+for readers that must recover missing selection fields in anonymous peaks.
+Rows without valid arguments prove no shape.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import cast
+
+TEST_STEPS = ("nextest", "test", "t")
 
 
 @dataclass(frozen=True)
@@ -86,38 +88,101 @@ def build_shape(argv: Sequence[str]) -> BuildShape:
     return BuildShape(profile, tuple(sorted(features)), tuple(sorted(targets)) or ("all",))
 
 
-def index_shapes(index_path: Path, host: str, step: str,
-                 cutoff: datetime, before: datetime) -> dict[tuple[str, str], BuildShape]:
-    """Join (call id, step) to shape in [cutoff, before), by index start time.
+@dataclass(frozen=True)
+class CompiledCrates:
+    count: int
 
-    A call id follows one invocation across checkout folders. No index sync
-    runs. A missing or old index supplies no join and is never
-    created. The caller must still check a peak row's own repository and time.
+
+@dataclass(frozen=True)
+class NoCratesCompiled:
+    """The known attempts compiled no crates."""
+
+
+@dataclass(frozen=True)
+class CompileCountUnknown:
+    """The index has no usable compile count."""
+
+
+def combine_compile_counts(first: CompiledCrates | NoCratesCompiled | CompileCountUnknown,
+                           second: CompiledCrates | NoCratesCompiled | CompileCountUnknown
+                           ) -> CompiledCrates | NoCratesCompiled | CompileCountUnknown:
+    """Keep positive counts and preserve uncertainty across attempts."""
+    if isinstance(first, CompiledCrates) or isinstance(second, CompiledCrates):
+        return CompiledCrates((first.count if isinstance(first, CompiledCrates) else 0)
+                              + (second.count if isinstance(second, CompiledCrates) else 0))
+    if isinstance(first, CompileCountUnknown) or isinstance(second, CompileCountUnknown):
+        return CompileCountUnknown()
+    return NoCratesCompiled()
+
+
+@dataclass(frozen=True)
+class StepEvidence:
+    shape: BuildShape | NoBuildShape
+    compilation: CompiledCrates | NoCratesCompiled | CompileCountUnknown
+    arguments: tuple[str, ...] = ()
+
+
+def index_step_evidence(index_path: Path, host: str, step: str,
+                        cutoff: datetime, before: datetime) -> dict[tuple[str, str], StepEvidence]:
+    """Read shape, compile evidence and test arguments for each call and step.
+
+    The caller filters peaks by repository and completion time.
+    Missing columns preserve the facts that the index can supply.
+    This join does not parse test selections.
     """
-    shapes: dict[tuple[str, str], BuildShape] = {}
+    evidence: dict[tuple[str, str], StepEvidence] = {}
+    test_step = step in TEST_STEPS
     try:
         with closing(sqlite3.connect(index_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            columns = {row[1] for row in cast(list[tuple[object, ...]],
+                       connection.execute("PRAGMA table_info(steps)").fetchall())}
+            argv_column = "argv" if "argv" in columns else "NULL"
+            count_column = "crates_compiled" if "crates_compiled" in columns else "NULL"
             rows = cast(list[tuple[object, ...]], connection.execute(
-                "SELECT call_id, step, argv, started_at FROM steps WHERE host=? AND step=?",
-                (host, step),
+                f"SELECT call_id, step, {argv_column}, started_at, {count_column} "
+                + "FROM steps WHERE host=? AND step=?", (host, step),
             ).fetchall())
-        for call_id, name, raw_argv, started_at in rows:
-            if not isinstance(call_id, str) or not call_id or not isinstance(raw_argv, str):
+        for call_id, name, raw_argv, started_at, count in rows:
+            if not isinstance(call_id, str) or not call_id or not isinstance(name, str):
                 continue
-            if not isinstance(name, str) or not isinstance(started_at, str):
-                continue
+            dated = False
             try:
-                if not cutoff <= datetime.fromisoformat(started_at) < before:
-                    continue
-                decoded = cast(object, json.loads(raw_argv))
-                if not isinstance(decoded, list) or not decoded:
-                    continue
-                words = cast(list[object], decoded)
-                if not all(isinstance(word, str) for word in words):
-                    continue
-                shapes[call_id, name] = build_shape(cast(list[str], words))
+                if isinstance(started_at, str):
+                    if not cutoff <= datetime.fromisoformat(started_at) < before:
+                        continue
+                    dated = True
             except (ValueError, TypeError):
-                continue
+                pass
+            compilation: CompiledCrates | NoCratesCompiled | CompileCountUnknown = CompileCountUnknown()
+            if dated and isinstance(count, int) and not isinstance(count, bool):
+                if count > 0:
+                    compilation = CompiledCrates(count)
+                elif count == 0:
+                    compilation = NoCratesCompiled()
+            shape: BuildShape | NoBuildShape = NoBuildShape()
+            arguments: tuple[str, ...] = ()
+            try:
+                decoded = cast(object, json.loads(raw_argv)) if isinstance(raw_argv, str) else None
+                if isinstance(decoded, list) and decoded:
+                    words = cast(list[object], decoded)
+                    for word in words:
+                        if not isinstance(word, str):
+                            break
+                    else:
+                        decoded_arguments = cast(list[str], words)
+                        if test_step:
+                            arguments = tuple(decoded_arguments)
+                        shape = build_shape(decoded_arguments)
+            except (ValueError, TypeError):
+                pass
+            previous = evidence.get((call_id, name))
+            if previous is not None:
+                compilation = combine_compile_counts(previous.compilation, compilation)
+                if isinstance(shape, NoBuildShape):
+                    shape = previous.shape
+                if not arguments:
+                    arguments = previous.arguments
+            evidence[call_id, name] = StepEvidence(shape, compilation, arguments)
     except (OSError, sqlite3.Error):
         pass
-    return shapes
+    return evidence

@@ -148,11 +148,12 @@ def _required(record: Mapping[str, object], key: str) -> str:
 
 def _read(path: Path) -> dict[str, object]:
     """Read worker evidence; other record kinds use read_json_object instead."""
-    return worker_lifecycle.read_worker_state(path)
+    records = worker_lifecycle.read_worker_state(path)
+    return worker_admission.resolve_roster(path.parent, records) if path.name == ROSTER else records
 
 
 def _read_roster(run: Path) -> dict[str, object]:
-    return session_staff.read_worker_roster(run / ROSTER)
+    return worker_admission.resolve_roster(run, session_staff.read_worker_roster(run / ROSTER))
 
 
 def _atomic(path: Path, data: Mapping[str, object]) -> None:

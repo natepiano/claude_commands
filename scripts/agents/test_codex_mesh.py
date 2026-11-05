@@ -65,7 +65,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import BinaryIO, Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, call, patch
 
-from scripts.agents import codex_mesh, worker_lifecycle
+from scripts.agents import codex_mesh, mesh_runs, worker_lifecycle
 from scripts.direct import assign, plan_history, progress_history, worker_state, workers as unit_workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import atomic_file, nix_env
@@ -1722,7 +1722,8 @@ class MeshCommandFixture(unittest.TestCase):
         return result, errors.getvalue()
 
     def run_follow(
-        self, message: str = "Repair the open finding", role: str = "impl", lens: str = ""
+        self, message: str = "Repair the open finding", role: str = "impl", lens: str = "",
+        *, claim_pid: int = 0,
     ) -> tuple[int, str]:
         message_file = self.session_dir / "follow-up.txt"
         _ = message_file.write_text(message, encoding="utf-8")
@@ -1730,6 +1731,7 @@ class MeshCommandFixture(unittest.TestCase):
         args.to = "worker"
         args.role = role
         args.lens = lens or None
+        args.claim_pid = claim_pid
         args.message_file = str(message_file)
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             result = codex_mesh.command_follow(args)
@@ -1925,21 +1927,20 @@ class MeshCommandFixture(unittest.TestCase):
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session})))
         _ = fixture_worker("worker", owner.id, runtime_id=str(lifecycle.staff_id),
                        backend=staff.CodexBackend(Path(os.environ["CODEX_HOME"])))
-        self.write_pool_roster({"worker": {"thread_id": lifecycle.thread_id, "status": "done", "role": "astra-reviewer"}})
+        self.write_pool_roster({"worker": {"thread_id": session_staff.worker_session({"staff_id": lifecycle.staff_id}), "status": "done", "role": "astra-reviewer"}})
         prompt = self.session_dir / "authorized.md"
         design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000026", "fixture-host", 3),
             "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
-            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
+            "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
             (design_roles.RoleInstance("designer", "unused-designer", design_roles.RoleNotOpened()),
              design_roles.RoleInstance("reviewer", "worker", lifecycle, str(prompt))))
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         _ = prompt.write_text("Current authorized reviewer instructions.")
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
             "held_design_id": design.placement.design_id, "held_role": "reviewer", "port": self.server.port,
-            "authorized_generation": 3, "authorized_holder": os.environ["CODEX_THREAD_ID"], "authorized_prompt": str(prompt),
+            "authorized_generation": 3, "authorized_prompt": str(prompt),
             "access_policy": {"kind": "ReadOnlyReviewer"}}})
         agents_log.append(THREAD_ID, "review", None, datetime.now(timezone.utc))
-        _ = self.patches.enter_context(patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(os.environ["CODEX_THREAD_ID"])))
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": os.environ["CODEX_THREAD_ID"],
                                                                "DESIGN_ROLES_HOST": "fixture-host"})))
         return design
@@ -2459,10 +2460,9 @@ with staff.row_operation(sys.argv[1]):
                 with contextlib.redirect_stderr(io.StringIO()) as errors:
                     code = codex_mesh.command_follow(args)
                 self.assertEqual(code, 0, errors.getvalue())
-        self.assertIsInstance(held.holder, design_roles.UnitHolder)
-        assert isinstance(held.holder, design_roles.UnitHolder)
+        self.assertFalse(hasattr(held, "holder"))
         rows = staff.find(kind="worker")
-        parent = next(row for row in staff.find(kind="unit") if row.name == unit_names.name(held.holder.unit_name))
+        parent = next(row for row in staff.find(kind="unit") if row.name == unit_names.name("design-unit"))
         self.assertEqual([(row.name, row.parent) for row in rows], [("worker", staff.ReportsTo(parent.id))])
 
 @final
@@ -3755,7 +3755,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         context_path = self.session_dir / "design_context.json"
         context = {"design_id": design.placement.design_id, "generation": design.placement.generation,
-                   "holder_session": os.environ["CODEX_THREAD_ID"], "cwd": design.repository,
+                   "cwd": design.repository,
                    "binding": {"kind": "DesignBoundToPhase", **dataclasses.asdict(binding)}}
         _ = context_path.write_text(json.dumps(context))
         server_path = self.session_dir / codex_mesh.SERVER_FILE
@@ -3795,6 +3795,17 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         from scripts.production.staff_test_support import unit_membership
         owner = unit_membership("demo", "design-unit")
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session})))
+        _ = fixture_worker("worker", owner.id, runtime_id=THREAD_ID)
+        children: set[int] = set()
+        signal_process = codex_mesh._signal_process  # pyright: ignore[reportPrivateUsage]
+
+        def signal_child(pid: object, signum: int, *, group: bool = False) -> None:
+            if signum:
+                self.assertIn(pid, children, "only this fixture's children can receive signals")
+                self.assertFalse(group)
+            signal_process(pid, signum, group=group)
+
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_signal_process", signal_child))
         fixture_root = self.session_dir
         for stop_route in ("idle-stop", "sweep"):
             with self.subTest(stop_route=stop_route):
@@ -3810,7 +3821,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                                                   str(fixture_root), ("design.md",))
                 design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 3),
                     "fixture-repo", str(fixture_root), str(fixture_root / "design.md"), "design",
-                    "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), binding,
+                    "2026-10-21T12:00:00+00:00", binding,
                     (design_roles.RoleInstance("designer", "worker", design_roles.RoleOpen(staff.native_id(THREAD_ID)), str(prompt)),
                      design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
                 self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "astra-designer"}})
@@ -3823,9 +3834,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                           "launch_sandbox": "danger-full-access"}
                 self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl",
                     "held_design_id": design_id, "held_role": "designer", "access_policy": policy,
-                    "authorized_generation": 3, "authorized_holder": os.environ["CODEX_THREAD_ID"],
+                    "authorized_generation": 3,
                     "authorized_prompt": str(prompt), "port": self.server.port}})
-                context = {"design_id": design_id, "generation": 3, "holder_session": os.environ["CODEX_THREAD_ID"],
+                context = {"design_id": design_id, "generation": 3,
                            "cwd": design.repository, "binding": {"kind": "DesignBoundToPhase",
                                                                    **dataclasses.asdict(binding)}}
                 _ = (self.session_dir / "design_context.json").write_text(json.dumps(context))
@@ -3836,6 +3847,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 process = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL)
+                children.add(process.pid)
                 # Reap this child as soon as the real stop code signals it, so kill(0) sees it gone.
                 reaper = threading.Thread(target=process.wait, daemon=True)
                 reaper.start()
@@ -3883,7 +3895,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                         self.server.close()
                         self.server = StubAppServer(self.respond)
                         started.append(codex_mesh._server_environment(session_dir, home))  # pyright: ignore[reportPrivateUsage]
-                        _ = server_path.write_text(json.dumps({"pid": os.getpid(), "port": self.server.port,
+                        _ = server_path.write_text(json.dumps({"pid": 87654, "port": self.server.port,
                             "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
                             "design_context": context}))
                         return self.server.port
@@ -3892,10 +3904,15 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     args.to = "worker"
                     args.message_file = str(prompt)
                     args.summary_file = str(reply)
+                    pid_alive = codex_mesh._pid_alive  # pyright: ignore[reportPrivateUsage]
+
+                    def fixture_pid_alive(pid: int) -> bool:
+                        return pid == 87654 or pid_alive(pid)
+
                     with (
                         patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": os.environ["CODEX_THREAD_ID"], "DESIGN_ROLES_HOST": "fixture-host"}),
-                        patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(os.environ["CODEX_THREAD_ID"])),
                         patch.object(codex_mesh, "_start_server", start_fixture_server),
+                        patch.object(codex_mesh, "_pid_alive", side_effect=fixture_pid_alive),
                         contextlib.redirect_stderr(io.StringIO()) as errors,
                     ):
                         self.assertEqual(codex_mesh.command_follow(args), 0, errors.getvalue())
@@ -4164,7 +4181,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         mesh.mkdir(parents=True)
         _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps(published_worker_records({"worker": self.worker_record()})))
         _ = (mesh / codex_mesh.SERVER_FILE).write_bytes((self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
-        design_roles._mesh_context(design, design_roles.HolderReach(os.environ["CODEX_THREAD_ID"]))  # pyright: ignore[reportPrivateUsage]
+        design_roles._mesh_context(design)  # pyright: ignore[reportPrivateUsage]
         self.queued = [{"id": "queued-one", "input": [{"type": "text", "text": "Keep idle account-move text."}]}]
         stopped: list[int] = []
 
@@ -4185,11 +4202,74 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(cleanup[0].holders, ())
         switches = [result for result in outcomes if result.folder != self.session_dir]
         self.assertEqual([switch.folder for switch in switches], [mesh])
-        self.assertEqual(switches[0].holders, (os.environ["CODEX_THREAD_ID"],))
+        parent = design_roles.worker_parent(design, "reviewer", staff.snapshot())
+        self.assertEqual(switches[0].holders, (parent.current_session,))
         self.assertEqual(stopped, [os.getpid()])
         self.assertEqual(self.methods("turn/start"), [])
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(cast(dict[str, dict[str, object]], json.loads((mesh / codex_mesh.ROSTER_FILE).read_text()))["worker"]["staff_id"], THREAD_ID)
+
+    def test_durable_account_moves_report_missing_parents_and_continue_all_runs(self) -> None:
+        original = self.held_reviewer_record(design_roles.RoleOpen(staff.native_id(THREAD_ID)))
+        first = dataclasses.replace(original, roles=(
+            design_roles.RoleInstance("designer", "missing-designer",
+                                      design_roles.RoleOpen(staff.native_id(fixture_runtime_id("missing-designer")))),
+            original.roles[1]))
+        second = dataclasses.replace(original,
+            placement=dataclasses.replace(original.placement, design_id="00000000-0000-4000-8000-000000000027"),
+            roles=(design_roles.RoleInstance("designer", "missing-second-designer",
+                                            design_roles.RoleOpen(staff.native_id(fixture_runtime_id("missing-second-designer")))),
+                   design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
+        folders: list[Path] = []
+        for index, design in enumerate((first, second)):
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            mesh = design_roles.mesh_directory(design.placement.design_id)
+            mesh.mkdir(parents=True)
+            design_roles._mesh_context(design)  # pyright: ignore[reportPrivateUsage]
+            records = {role.name: {
+                "thread_id": session_staff.worker_session({"staff_id": role.lifecycle.staff_id}), "status": "done",
+                "held_design_id": design.placement.design_id, "held_role": role.role,
+            } for role in design.roles if isinstance(role.lifecycle, design_roles.RoleOpen)}
+            _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps(records))
+            _ = (mesh / codex_mesh.SERVER_FILE).write_text(json.dumps({
+                "pid": 990026 + index, "port": 4001 + index,
+                "codex_home": str(Path(os.environ["CODEX_HOME"]))}))
+            folders.append(mesh)
+        parent = design_roles.worker_parent(first, "reviewer", staff.snapshot())
+        errors = io.StringIO()
+        with (patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir / "empty-runs",)),
+              patch.object(codex_mesh, "_pid_alive", return_value=True),
+              patch.object(codex_mesh, "_collect_exited_child"),
+              patch.object(codex_mesh, "_switch_run_workers",
+                           return_value=(codex_mesh.SwitchingWorker("worker", False),)) as switch,
+              patch.object(codex_mesh, "_finish_run_moves", wraps=codex_mesh._finish_run_moves) as finish,  # pyright: ignore[reportPrivateUsage]
+              patch.object(codex_mesh, "_stop_unused", return_value=True) as stop,
+              patch.object(codex_mesh, "_notify_holder"),
+              patch.object(codex_mesh, "_log_server"),
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(errors)):
+            outcomes = sign_in_moves(self.session_dir)
+        switches = [entry for entry in outcomes if entry.folder in folders]
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"codex_mesh: design {design.placement.design_id}: designer: role worker parent is unavailable"
+            for design in (first, second)])
+        self.assertEqual([entry.args[0] for entry in switch.call_args_list], folders)
+        self.assertEqual([set(cast(codex_mesh.BulkWorkers, entry.kwargs["operation"]).records)
+                          for entry in switch.call_args_list],
+                         [{"missing-designer", "worker"}, {"missing-second-designer"}])
+        self.assertEqual([entry.folder for entry in switches], folders)
+        self.assertEqual([entry.holders for entry in switches], [(parent.current_session,), ()])
+        self.assertEqual([entry.workers for entry in switches],
+                         [(codex_mesh.SwitchingWorker("worker", False),)] * 2)
+        finish.assert_called_once()
+        self.assertEqual(stop.call_count, 3)
+        self.assertEqual({(call.args[1], call.args[2]) for call in stop.call_args_list},
+                         {(os.getpid(), self.server.port), (990026, 4001), (990027, 4002)})
+        for index, mesh in enumerate(folders):
+            record = codex_mesh._read_json_object(mesh / codex_mesh.SERVER_FILE)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(record, {"previous_servers": [{
+                "pid": 990026 + index, "port": 4001 + index,
+                "codex_home": str(Path(os.environ["CODEX_HOME"]))}]})
 
     def test_old_launcher_normal_end_preserves_the_replacement_roster(self) -> None:
         replacement = self.replacement_record()
@@ -5488,7 +5568,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_reopen_refuses_missing_thread_or_live_launcher_without_mutation(self) -> None:
         for fields in ({"launcher_pid": os.getpid(), "thread_id": THREAD_ID},
-                       {"launcher_pid": 99999999}):
+                       {"launcher_pid": 99999999, "staff_id": fixture_runtime_id("missing-worker")}):
             with self.subTest(fields=fields):
                 self.write_pool_roster({"worker": {"status": "ended", **fields}})
                 marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
@@ -5813,11 +5893,12 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(set(self.roster()), {"template", "reviewer"})
 
     def test_prime_held_titles_use_the_design_holder_before_the_mesh_record_exists(self) -> None:
-        from scripts.production.staff_test_support import production_membership
+        from scripts.production.staff_test_support import production_membership, showrunner_relationship
         parent = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert parent is not None
         _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.home), expected=parent.worktree)
         production_membership("sdlc", "roles-unit")
+        (self.session_dir / plan_history.STATE_FILENAME).unlink()
         owner = unit_membership("sdlc", "roles-unit")
         _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", self.session_dir), expected=owner.worktree)
         showrunner = staff.local_snapshot().parent_of(owner)
@@ -5827,11 +5908,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         _ = staff.set_doc(showrunner.id, staff.LiveDoc("natedev", doc))
         private_staff = Path(os.environ["STAFF_FILE"])
         initial_staff = private_staff.read_bytes()
-        for index, (holder, prefix) in enumerate((
-                (design_roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
-                (design_roles.ShowrunnerHolder("sdlc"), "sdlc"))):
+        for index, prefix in enumerate(("sdlc · roles", "sdlc")):
             for role, job in (("designer", "designer"), ("reviewer", "design reviewer")):
-                with self.subTest(holder=holder, role=role):
+                with self.subTest(prefix=prefix, role=role):
                     _ = private_staff.write_bytes(initial_staff)
                     design_id = f"00000000-0000-4000-8000-00000000009{index}"
                     directory = design_roles.design_directory(design_id)
@@ -5839,7 +5918,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     claim.unlink(missing_ok=True)
                     design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
                         "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
-                        "2026-10-21T12:00:00+00:00", holder, design_roles.DesignUnbound(),
+                        "2026-10-21T12:00:00+00:00", design_roles.DesignUnbound(),
                         (design_roles.RoleInstance("designer", "template" if role == "designer" else "other-designer",
                                             design_roles.RoleNotOpened("claim")),
                          design_roles.RoleInstance("reviewer", "template" if role == "reviewer" else "other-reviewer",
@@ -5847,8 +5926,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
                     self.write_pool_roster({})
                     self.server.requests.clear()
-                    with patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(os.environ["CODEX_THREAD_ID"])), \
-                            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": os.environ["CODEX_THREAD_ID"]}):
+                    parent = unit_membership("sdlc", "roles-unit") if index == 0 else showrunner_relationship("sdlc")
+                    with patch.dict(os.environ, {"CODEX_THREAD_ID": parent.current_session,
+                                                 "CLAUDE_CODE_SESSION_ID": parent.current_session}):
                         result, output, errors = self.run_mesh(self.prime_cli(
                             "--held-design", design_id, "--held-role", role))
                     self.assertEqual((result, output, errors), (0, f"{THREAD_ID}\n", ""))
@@ -10531,8 +10611,14 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         more.assert_not_called()
 
     def test_hold_closes_inbox_and_keeps_matching_messages_under_one_lock(self) -> None:
+        self.assert_hold_closes_inbox(codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getpid(),)))
+
+    def test_parent_claim_closes_inbox_and_preserves_matching_messages(self) -> None:
+        self.assert_hold_closes_inbox(codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getppid(), os.getpid())))
+
+    def assert_hold_closes_inbox(self, launcher: codex_mesh.RosterActiveLauncher) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
-            "launcher_pid": os.getpid(), "port": self.server.port}})
+            "launcher_pid": launcher.launcher_pids[0], "port": self.server.port}})
         pending = session_staff.worker_inbox_path(str(self.session_dir), "worker")
         for messages, kept in (
             (["first message", "second message"], 2),
@@ -10543,13 +10629,31 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     "messages": messages, "accepting_messages": True,
                 }))
                 with patch.object(codex_mesh, "_pending_file", wraps=codex_mesh._pending_file) as lock, patch.object(codex_mesh, "_write_pending", wraps=codex_mesh._write_pending) as write:  # pyright: ignore[reportPrivateUsage]
-                    count = codex_mesh._close_messages_and_keep_pending(str(self.session_dir), "worker", THREAD_ID)  # pyright: ignore[reportPrivateUsage]
+                    count = codex_mesh._close_messages_and_keep_pending(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), "worker", launcher)
                 self.assertEqual(count, kept)
                 lock.assert_called_once_with(str(self.session_dir), "worker")
                 write.assert_called_once()
                 self.assertEqual(cast(dict[str, object], json.loads(pending.read_text())), {
                     "messages": messages if kept else [], "accepting_messages": False,
                 })
+
+    def test_inbox_closing_helpers_refuse_another_launchers_record(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
+            "launcher_pid": os.getpid(), "port": self.server.port}})
+        pending = session_staff.worker_inbox_path(str(self.session_dir), "worker")
+        _ = pending.write_text(json.dumps({
+            "messages": ["owner's message"], "accepting_messages": True,
+        }))
+        before = pending.read_bytes()
+        launcher = codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getppid(),))
+        with patch.object(codex_mesh, "_pending_file", wraps=codex_mesh._pending_file) as lock:  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(codex_mesh._close_messages_if_empty(  # pyright: ignore[reportPrivateUsage]
+                str(self.session_dir), "worker", launcher))
+            self.assertEqual(codex_mesh._close_messages_and_keep_pending(  # pyright: ignore[reportPrivateUsage]
+                str(self.session_dir), "worker", launcher), 0)
+        lock.assert_not_called()
+        self.assertEqual(pending.read_bytes(), before)
 
     def test_completed_start_holds_two_messages_with_plural_wording_and_finishes_done(self) -> None:
         messages = ("first peer message", "second peer message")
@@ -12475,12 +12579,38 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assertTrue(run.exists(), "run discovery removed a lookup record")
 
     def test_last_detached_run_result_turn_is_watched_not_interrupted(self) -> None:
+        self.assert_last_detached_run_result_turn_is_watched(claim_pid=0)
+
+    def test_implement_and_assign_parent_claims_keep_the_last_run_result_attached(self) -> None:
+        # Both launchers reserve their PID before a separate follower starts.
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE) as launcher:
+            try:
+                self.assert_last_detached_run_result_turn_is_watched(claim_pid=launcher.pid)
+            finally:
+                _ = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def assert_last_detached_run_result_turn_is_watched(self, *, claim_pid: int) -> None:
         self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.assertEqual(self.run_start(), (0, ""))
+        if claim_pid:
+            self.assertNotEqual(claim_pid, os.getpid())
+            code, _output, errors = self.run_mesh([
+                "can-follow", "--to", "worker", "--claim-pid", str(claim_pid), "--role", "impl",
+            ])
+            self.assertEqual((code, errors), (0, ""))
         self.outcomes = ["completed", "listed_before_notices"]
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "last.json"
         run.parent.mkdir()
         atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        result = self.session_dir / "detached-result.txt"
+        _ = result.write_text("detached run result")
+        record = mesh_runs.RunRecord(
+            run_id=run.stem, status="running", session_dir=str(self.session_dir), worker="worker",
+            staff_id=self.inbox_staff_id(THREAD_ID), label="last detached run", command=["fixture"],
+            log=str(self.session_dir / "detached.log"), started_at=time.time(), pid=os.getpid(),
+            director_dir=str(self.session_dir), done_message_file=str(result),
+        )
         held_on_run = threading.Event()
         polled_result_turn = threading.Event()
         steps: list[codex_mesh.StreamStep | codex_mesh.FailedWithThread] = []
@@ -12507,24 +12637,28 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
         with (patch.object(codex_mesh, "_waiting_on_detached_run", note_wait),
               patch.object(codex_mesh, "_on_quiet_poll", note_result_turn_poll),
+              patch.object(mesh_runs, "send_to_director", side_effect=AssertionError("result left its launcher")),
               ThreadPoolExecutor(max_workers=1) as executor):
-            future = executor.submit(self.run_follow)
+            future = executor.submit(self.run_follow, claim_pid=claim_pid)
+            future.add_done_callback(lambda _future: held_on_run.set())
             try:
                 LauncherHangGuard("launcher never waited on the live run").event(held_on_run)
+                self.assertFalse(future.done(), "follower left while its detached run was live")
+                self.assertEqual(self.worker_record()["status"], "running")
+                self.assertEqual(self.worker_record()["launcher_pid"], claim_pid or os.getpid())
                 self.server.hold_turn_completion = True
                 self.server.answer_requests_during_held_turn = True
                 self.server.held_turn_completes_successfully = True
-                held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
-                                               without_launcher=False)
-                # Match mesh_runs.command_supervise: hold the result while the
-                # run still owns the inbox, then publish its finished record.
+                held = mesh_runs.deliver(record, 0)
+                # Deliver the result before the run releases the inbox.
                 atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
-                self.assertIsInstance(held, codex_mesh.HeldForLauncher)
+                self.assertEqual(held, f"held for worker's attached launcher on thread {THREAD_ID}")
                 LauncherHangGuard("the held result opened no turn").event(self.server.held_turn_ready)
                 LauncherHangGuard("no lifecycle check ran on the result turn").event(polled_result_turn)
                 self.assertNotIn(codex_mesh.StreamStep.FINISH, steps)
                 self.assertFalse(future.done(), "launcher left the result turn before its completion")
             finally:
+                atomic_file.write_text_atomic(run, json.dumps({"worker": "worker", "status": "finished"}))
                 self.server.release_held_turn.set()
             code, errors = LauncherHangGuard('test_last_detached_run_result_turn_is_watched_not_interrupted').result(future)
         self.assertEqual((code, errors), (0, ""))
@@ -13625,7 +13759,7 @@ class DetachedRunWatchTests(StaffTestCase):
                 _ = record.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
                 if decision == "close":
                     self.assertFalse(codex_mesh._close_messages_if_empty(  # pyright: ignore[reportPrivateUsage]
-                        str(session), "worker", THREAD_ID, watch))
+                        str(session), "worker", codex_mesh.RosterActiveLauncher(THREAD_ID, (os.getpid(),)), watch))
                 elif decision == "wait":
                     self.assertTrue(codex_mesh._waiting_on_detached_run(  # pyright: ignore[reportPrivateUsage]
                         str(session), "worker", watch))
@@ -17430,7 +17564,7 @@ class DevShellServerTests(unittest.TestCase):
 
     def test_held_design_identity_is_also_applied_after_the_dev_shell(self) -> None:
         context: dict[str, object] = {
-            "holder_session": "design-holder", "design_id": "design-one", "generation": 7,
+            "design_id": "design-one", "generation": 7,
             "binding": {"kind": "DesignBoundToPhase", "run_directory": str(self.session_dir)},
         }
         with patch.object(codex_mesh, "_design_context", return_value=context), patch.object(design_roles, "refresh_census"):
@@ -17438,7 +17572,7 @@ class DevShellServerTests(unittest.TestCase):
         command = cast(list[str], self.launch.call_args.args[0])
         self.assertEqual(command[0], "codex")
         environment = cast(dict[str, str], self.launch.call_args.kwargs["env"])
-        self.assertEqual(environment["CLAUDE_CODE_SESSION_ID"], "design-holder")
+        self.assertNotIn("CLAUDE_CODE_SESSION_ID", environment)
         self.assertEqual(environment["HELD_DESIGN_ID"], "design-one")
         self.assertEqual(environment["DESIGN_BINDING_GENERATION"], "7")
         self.assertEqual(environment["IN_NIX_SHELL"], "impure")
@@ -17481,6 +17615,60 @@ class DevShellServerTests(unittest.TestCase):
         self.launch.assert_called_once()
         log = (self.session_dir / codex_mesh.SERVER_LOG).read_text()
         self.assertEqual(log.count(reason), 1)
+
+
+class LegacyRosterTests(unittest.TestCase):
+    """Resolve old roster entries through the run's unit and worker name."""
+
+    session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    owner: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
+    worker: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
+    entry: dict[str, object]  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        private_worker_staff(self)
+        self.session_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.owner = unit_membership("legacy-production", "legacy-unit")
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "production": "legacy-production", "unit": self.owner.name,
+        }))
+        self.worker = fixture_worker("legacy-worker", self.owner.id,
+                                     backend=staff.CodexBackend(self.session_dir))
+        self.entry = {
+            "access_policy": {"kind": "WorkerLaunchPolicy"}, "context_tokens": 42,
+            "continuation_owed": False, "effort": "high", "model": "gpt-6",
+            "revision": 3, "status": "done", "task": "Repair the roster.",
+            "thread_id": fixture_runtime_id("obsolete-thread"), "turn_effort": "high",
+            "turn_model": "gpt-6", "unit_ledger": "ledger.json",
+        }
+
+    def write_roster(self, entries: dict[str, object]) -> None:
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(entries))
+
+    def test_follow_and_write_upgrade_the_worker_reference(self) -> None:
+        self.write_roster({self.worker.name: self.entry})
+        state = codex_mesh._lookup_state(str(self.session_dir), self.worker.name)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(state, codex_mesh.FollowableThread(self.worker.current_session, "done"))
+        direct = unit_workers._read_roster(self.session_dir)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(cast(dict[str, object], direct[self.worker.name])["staff_id"], self.worker.id)
+        self.assertTrue(codex_mesh._update_roster(str(self.session_dir), self.worker.name, {  # pyright: ignore[reportPrivateUsage]
+            "thread_id": self.worker.current_session, "status": "done",
+        }))
+        stored = cast(dict[str, dict[str, object]], json.loads((self.session_dir / codex_mesh.ROSTER_FILE).read_text()))
+        self.assertEqual(stored[self.worker.name]["staff_id"], self.worker.id)
+        self.assertNotIn("thread_id", stored[self.worker.name])
+
+    def test_an_unmatched_worker_keeps_the_missing_thread_result(self) -> None:
+        other = unit_membership("legacy-production", "other-unit")
+        _ = fixture_worker("unmatched-worker", other.id, backend=staff.CodexBackend(self.session_dir))
+        self.write_roster({self.worker.name: self.entry, "unmatched-worker": dict(self.entry)})
+        state = codex_mesh._lookup_state(str(self.session_dir), "unmatched-worker")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(state, codex_mesh.InvalidThread("missing thread id"))
+        with worker_lifecycle.locked_state(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
+            records = codex_mesh._load_roster_for_write(handle)  # pyright: ignore[reportPrivateUsage]
+            self.assertNotIn("staff_id", cast(dict[str, object], records["unmatched-worker"]))
+            self.assertEqual(cast(dict[str, object], records[self.worker.name])["staff_id"], self.worker.id)
 
 
 class ServerRecordTests(unittest.TestCase):

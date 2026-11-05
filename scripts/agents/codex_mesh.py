@@ -92,6 +92,7 @@ from scripts.lib.agent_scope import agent_scope_prefix
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
 from scripts.lib import build_folders, nix_env, process_group, unit_runs
+from scripts.lib.unit_runs import SERVER_FILE as SERVER_FILE
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import staff, worker_admission, session_staff
 from scripts.production.worker_admission import WorkerStartAllowed
@@ -115,6 +116,10 @@ if TYPE_CHECKING:
 class UnitWorkerLedgerLocation(Protocol):
     @property
     def path(self) -> Path: ...
+
+
+class MeshTitleRenderer(Protocol):
+    def mesh_title(self, session_dir: str, name: str, record: Mapping[str, object]) -> str: ...
 
 
 class UnitWorkerRegistry(Protocol):
@@ -268,7 +273,6 @@ def _serving_request(
                                   thread_id=_as_str(params.get("threadId")), stopped=stopped)
         raise ServingRequestFailure(detail, serving, proven) from error
 
-SERVER_FILE = "mesh_server.json"
 DEV_SHELL_FILE = "mesh_dev_shell.json"
 FAILED_DEV_SHELL_FILE = "mesh_failed_dev_shell.json"
 SERVER_START_FILE = "mesh_server_start.json"
@@ -464,7 +468,6 @@ class WorkerTaskRecord(TypedDict):
     access_policy: NotRequired[dict[str, object]]
     authorized_prompt: NotRequired[str]
     authorized_generation: NotRequired[int]
-    authorized_holder: NotRequired[str]
     unit_ledger: NotRequired[str]
 
 
@@ -1395,7 +1398,8 @@ def _session_path(session_dir: str, filename: str) -> Path:
 def _read_json_object(path: Path) -> dict[str, object]:
     if path.name == ROSTER_FILE or path.name.endswith(".pending.json"):
         with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as state:
-            return state.read_object()
+            records = state.read_object()
+        return worker_admission.resolve_roster(path.parent, records) if path.name == ROSTER_FILE else records
     return worker_lifecycle.read_worker_state(path)
 
 
@@ -1560,8 +1564,7 @@ def _store_reviewer_policy(entry: dict[str, object], *, new_reviewer: bool = Fal
 
 
 def _load_roster_for_write(handle: worker_lifecycle.WorkerStateFile) -> dict[str, object]:
-    records = handle.read_object()
-    return records
+    return worker_admission.resolve_roster(handle.path.parent, handle.read_object())
 
 
 def _write_roster_record(handle: worker_lifecycle.WorkerStateFile, roster: dict[str, object], name: str,
@@ -1732,13 +1735,10 @@ def _validate_held_claim(name: str, entry: dict[str, object], thread_id: str) ->
     from scripts.astra import design_roles
     design = design_roles.read_design(design_id)
     role = next((role for role in design.roles if role.name == name), None)
-    reach = design_roles.resolve_holder(design.holder)
     generation = design.placement.generation
     if (role is None or isinstance(role.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded, design_roles.RoleNeedsRecovery))
-            or role.lifecycle.thread_id != thread_id or not isinstance(reach, design_roles.HolderReach)
-            or reach.session_id != staff.runtime_id()
+            or role.lifecycle.thread_id != thread_id
             or entry.get("authorized_generation") != generation
-            or entry.get("authorized_holder") != reach.session_id
             or not entry.get("authorized_prompt")
             or role.assignment_claim != entry.get("authorized_prompt")
             or (design_roles.design_directory(design_id) / "transition.json").exists()):
@@ -2253,13 +2253,13 @@ FRESH_DETACHED_RUN_SCAN = FreshDetachedRunScan()
 
 
 def _close_messages_if_empty(
-    session_dir: str, name: str, thread_id: str,
+    session_dir: str, name: str, launcher: RosterActiveLauncher,
     runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
 ) -> bool:
     """Exclude senders while claiming an empty inbox and closing its launcher."""
     with worker_lifecycle.lock_worker(session_dir, name):
         entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        if not RosterActiveLauncher(thread_id, (os.getpid(),)).owns(entry):
+        if not launcher.owns(entry):
             return True
         with _pending_file(session_dir, name) as handle:
             current = _run_watch(session_dir, name, runs).current()
@@ -2269,11 +2269,11 @@ def _close_messages_if_empty(
             return True
 
 
-def _close_messages_and_keep_pending(session_dir: str, name: str, thread_id: str) -> int:
+def _close_messages_and_keep_pending(session_dir: str, name: str, launcher: RosterActiveLauncher) -> int:
     """Close the launcher's inbox while keeping its parked messages for the next launch."""
     with worker_lifecycle.lock_worker(session_dir, name):
         entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        if not RosterActiveLauncher(thread_id, (os.getpid(),)).owns(entry):
+        if not launcher.owns(entry):
             return 0
         with _pending_file(session_dir, name) as handle:
             messages = _pending_messages(handle)
@@ -2734,12 +2734,9 @@ def _design_context(session_dir: str) -> dict[str, object]:
     from scripts.astra import design_roles
     context = _read_json_object(path)
     design = design_roles.read_design(_as_str(context.get("design_id")))
-    reach = design_roles.resolve_holder(design.holder)
-    if not isinstance(reach, design_roles.HolderReach):
-        raise SystemExit("RoleNeedsRecovery: holder session is unavailable")
-    context.update({"generation": design.placement.generation, "holder_session": reach.session_id,
+    context = {"design_id": design.placement.design_id, "generation": design.placement.generation,
                     "binding": {"kind": type(design.binding).__name__, **asdict(design.binding)},
-                    "cwd": design.repository})
+                    "cwd": design.repository}
     return _as_dict(_loads(json.dumps(context)))
 
 
@@ -3027,7 +3024,6 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
         for key in tuple(environment):
             if key.startswith(("UNIT_", "PLAN_DELEGATE_")) or key in ("CLAUDE_CODE_SESSION_ID", "HELD_DESIGN_ID", "DESIGN_BINDING_GENERATION"):
                 del environment[key]
-        environment["CLAUDE_CODE_SESSION_ID"] = _as_str(context.get("holder_session"))
         environment["HELD_DESIGN_ID"] = _as_str(context.get("design_id"))
         environment["DESIGN_BINDING_GENERATION"] = str(context.get("generation"))
         binding = _as_dict(context.get("binding"))
@@ -4756,7 +4752,7 @@ def _hold_messages_for_next_launch(stream: TurnStream, log: TextIO, reason: str)
     """Close the thread to messages and keep the held ones for the next launch."""
     if stream.end_marker.exists():
         return
-    kept = _close_messages_and_keep_pending(stream.session_dir, stream.name, stream.thread_id)
+    kept = _close_messages_and_keep_pending(stream.session_dir, stream.name, _stream_launcher(stream))
     if kept:
         messages = "1 message" if kept == 1 else f"{kept} messages"
         held = f"{messages} held for the next launch"
@@ -4820,7 +4816,7 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithTh
                 if stream.client.has_pending_frames:
                     stream.state_change_owed = True
                     return StreamStep.NEXT_FRAME
-                if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+                if _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
                     return StreamStep.FINISH
         _keep_resident_on_selected_server(stream, log)
     return StreamStep.NEXT_FRAME
@@ -4855,7 +4851,7 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
             return StreamStep.NEXT_FRAME
         if isinstance(moved, MovedWorker) and _adopt_moved_worker(stream, moved):
             return StreamStep.NEXT_FRAME
-        if not _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+        if not _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
             return StreamStep.NEXT_FRAME
     if quota_owed:
         return StreamStep.NEXT_FRAME
@@ -5326,7 +5322,7 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
         stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
     _end_dead_runs(stream.session_dir, stream.name, stream.runs)
-    if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id, stream.runs):
+    if _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
         return StreamStep.FINISH
     # The turn ended on a run still going: stay attached until its result is held.
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.runs):
@@ -8681,6 +8677,7 @@ def command_signin_changed(args: argparse.Namespace) -> int:
         at = datetime.fromtimestamp(changed).astimezone(user_zone()).strftime("%H:%M %Z")
         runs: list[WorkersRunMove | EndedWorkersRun] = []
         from scripts.astra import design_roles
+        design_staff: staff.StaffSnapshot | None = None
         folders = sorted({path.parent for root in roots for path in root.glob(f"*/{SERVER_FILE}")}
                          | set(design_roles.durable_meshes()))
         for folder in folders:
@@ -8690,7 +8687,19 @@ def command_signin_changed(args: argparse.Namespace) -> int:
                 context = _design_context(str(folder))
                 holder_sessions: list[str] = list(_marker_sessions(roots, folder))
                 if context:
-                    holder_sessions.append(_as_str(context.get("holder_session")))
+                    design = design_roles.read_design(_as_str(context.get("design_id")))
+                    if design_staff is None:
+                        design_staff = staff.snapshot()
+                    for role in design.roles:
+                        if isinstance(role.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
+                            continue
+                        try:
+                            parent = design_roles.worker_parent(design, role.role, design_staff)
+                        except design_roles.RoleRefused as error:
+                            print(f"codex_mesh: design {design.placement.design_id}: {role.role}: {error}",
+                                  file=sys.stderr)
+                            continue
+                        holder_sessions.append(parent.current_session)
                 holders = tuple(dict.fromkeys(holder_sessions))
                 live = bool(context) or _run_is_live(folder, holders)
                 outgoing: dict[int, int] = {}
@@ -9117,15 +9126,22 @@ def _failure_account_detail(error: BaseException, serving: CodexServingState) ->
 
 def _admit_worker(name: str, session_dir: str, *, held_design: str = "", held_role: str = "",
                   role: str = "impl") -> WorkerStartAllowed:
-    """Held roles belong to their recorded design holder, never the caller's session."""
+    """Use the staff parent of an existing worker, or admit a new worker."""
     recorded = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     role = held_role or _as_str(recorded.get("held_role")) or role
     held = held_design or _as_str(recorded.get("held_design_id"))
-    if held:
+    if held and recorded.get("staff_id"):
         from scripts.astra import design_roles
-        holder = design_roles.read_design(held).holder
-        return worker_admission.admit(name, Path(session_dir), role=role, production=holder.production_slug,
-                                        unit=holder.unit_name if isinstance(holder, design_roles.UnitHolder) else "")
+        design = design_roles.read_design(held)
+        instance = next((value for value in design.roles if value.name == name), None)
+        if instance is None:
+            raise ValueError("design worker is unavailable")
+        membership = staff.snapshot()
+        owner = design_roles.worker_parent(design, instance.role, membership)
+        row = membership.by_id(staff.StaffId(str(recorded["staff_id"])))
+        if row is None or row.parent != staff.ReportsTo(owner.id):
+            raise ValueError("design worker membership is unavailable")
+        return WorkerStartAllowed(row.name, owner.id, Path(session_dir), worker_admission.ExistingWorkerSlot(row))
     return worker_admission.admit(name, Path(session_dir), role=role)
 
 
@@ -9159,11 +9175,9 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowe
                 from scripts.astra import design_roles
                 design = design_roles.read_design(held_design)
                 instance = next((value for value in design.roles if value.name == name and value.role == held_role), None)
-                reach = design_roles.resolve_holder(design.holder)
                 if (instance is None or not isinstance(instance.lifecycle, design_roles.RoleNotOpened)
-                        or not instance.lifecycle.claim or not isinstance(reach, design_roles.HolderReach)
-                        or reach.session_id != staff.runtime_id()):
-                    raise SystemExit("held thread creation lacks its holder's reserved claim")
+                        or not instance.lifecycle.claim):
+                    raise SystemExit("held thread creation lacks its reserved claim")
                 claim = design_roles.design_directory(held_design) / f"{held_role}.creation-claimed"
                 with claim.open("x", encoding="utf-8") as handle:
                     _ = handle.write(instance.lifecycle.claim)
@@ -9193,9 +9207,14 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowe
             _ = lifecycle.enter_context(worker_lifecycle.lock_worker(session_dir, name))
             thread_id = published.row.current_session
             name = published.row.name
-            # The held design's holder names the thread before its mesh record exists.
-            title = unit_workers.shown_name(Path(session_dir), name, role="review",
-                                            held_design_id=held_design, held_role=held_role)
+            if held_design:
+                roster = cast(MeshTitleRenderer, cast(object, importlib.import_module("scripts.message.roster")))
+                title = roster.mesh_title(session_dir, name, {
+                    "held_design_id": held_design, "held_role": held_role,
+                    "staff_id": str(published.row.id),
+                })
+            else:
+                title = unit_workers.shown_name(Path(session_dir), name, role="review")
             _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": title}), "thread/name/set")
             record: FollowableRecord = {
                 "staff_id": published.row.id,

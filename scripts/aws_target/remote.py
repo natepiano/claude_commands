@@ -240,7 +240,7 @@ class RemoteAgent:
         self.boot = boot
 
     def tick(self) -> str:
-        settings = read_control_settings(self.settings_path)
+        settings = read_control_settings(self.settings_path, remote_identity=True)
         if not settings.enabled:
             return 'off'
         now = int(self.clock())
@@ -318,7 +318,7 @@ def main() -> int:
         parser.error('--settings is required for tick or serve')
     if args.command == 'tick' and args.directory == Path():
         parser.error('--directory is required for tick')
-    directory = args.directory.expanduser() if args.directory != Path() else Path.home() / read_control_settings(args.settings).remote_state_directory
+    directory = args.directory.expanduser() if args.directory != Path() else Path.home() / read_control_settings(args.settings, remote_identity=True).remote_state_directory
     agent = RemoteAgent(args.settings, directory)
     if args.command == 'serve':
         service_loop(args.settings, 'interruption_poll_s', agent.tick)

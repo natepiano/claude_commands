@@ -199,7 +199,9 @@ def gates_root() -> Path:
 def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
     timeout = load_config().git_timeout_seconds
     try:
-        result = subprocess.run(["git", "-C", str(repo), *arguments], input=data,
+        # Git children inherit the busy lock. Keep automatic maintenance synchronous.
+        result = subprocess.run(["git", "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
+                                 "-C", str(repo), *arguments], input=data,
                                 capture_output=True, timeout=timeout, pass_fds=COMMAND_LOCKS.get())
     except subprocess.TimeoutExpired as error:
         raise CopyError(f"git {' '.join(arguments)} in {repo}: timed out after {timeout:g} seconds") from error
@@ -353,6 +355,33 @@ def initialize(tree: Path, source: Path, owner: str, repo: str, base: str) -> No
     initialize_git(tree, source)
 
 
+def source_origin(source: Path) -> tuple[str, str]:
+    """Return the upstream URL and the source refs that represent it."""
+    if "origin" in git(source, "remote").decode().splitlines():
+        return git(source, "remote", "get-url", "origin").decode().strip(), "refs/remotes/origin"
+    return str(source), "refs/heads"
+
+
+def resolved_remote_url(repo: Path, url: str) -> str:
+    """Resolve a local remote path from its repository."""
+    if re.match(r"^[^/]+:", url):
+        return url
+    return str((repo / Path(url).expanduser()).resolve())
+
+
+def refresh_remotes(tree: Path, source: Path) -> None:
+    """Keep upstream refs and saved local branches in separate remotes."""
+    url, refs = source_origin(source)
+    for remote, remote_url, source_refs in (("origin", url, refs), ("source", str(source), "refs/heads")):
+        mapping = f"+{source_refs}/*:refs/remotes/{remote}/*"
+        _ = git(tree, "config", "--replace-all", f"remote.{remote}.url", remote_url)
+        _ = git(tree, "config", "--replace-all", f"remote.{remote}.fetch",
+                f"+refs/heads/*:refs/remotes/{remote}/*")
+        # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
+        _ = git(tree, "update-ref", "--no-deref", "-d", f"refs/remotes/{remote}/HEAD")
+        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), mapping)
+
+
 def initialize_git(tree: Path, source: Path) -> None:
     """Create private Git metadata while the caller holds the busy mark."""
     if not (tree / ".git").exists():
@@ -367,8 +396,9 @@ def initialize_git(tree: Path, source: Path) -> None:
     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
         raise CopyError(f"{tree}: standing checkout must own its .git directory")
     actual = git(tree, "rev-parse", "--absolute-git-dir").decode().strip()
-    if actual != str(tree / ".git"):
+    if Path(actual).resolve() != (tree / ".git").resolve():
         raise CopyError(f"{tree}: Git directory is {actual}, expected {tree / '.git'}")
+    refresh_remotes(tree, source)
     exclude = tree / ".git/info/exclude"
     text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
     entries = [entry for entry in (f"/{GATE_RECORD}", f"/{scratch.BUSY}", "/target/")
@@ -421,7 +451,7 @@ def apply_changes(tree: Path, worktree: Path, base: str) -> None:
                 raise CopyError(f"{relative}: path conflicts with gate metadata")
             original, destination = worktree / relative, tree / relative
             mode = original.lstat().st_mode
-            if not destination.parent.resolve().is_relative_to(tree):
+            if not destination.parent.resolve().is_relative_to(tree.resolve()):
                 raise CopyError(f"{relative}: path escapes the gate checkout")
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.is_symlink():
@@ -447,11 +477,8 @@ def merge_changes(tree: Path, source: Path, revision: str) -> None:
     try:
         if revision.startswith("origin/"):
             branch = revision.removeprefix("origin/")
-            origin = git(source, "remote", "get-url", "origin").decode().strip()
-            # Git treats a colon before the first slash as a URL or scp-style
-            # remote. Local paths must retain the source's resolution context.
-            if not re.match(r"^[^/]+:", origin):
-                origin = str((source / Path(origin).expanduser()).resolve())
+            origin, _ = source_origin(source)
+            origin = resolved_remote_url(source, origin)
             _ = git(source, "check-ref-format", f"refs/heads/{branch}")
             _ = git(tree, "fetch", "-q", "--", origin,
                     f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
@@ -554,7 +581,9 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                 if not isinstance(record, copy_record.NotRegistered):
                     raise CopyError(f"{tree}: unreadable legacy workspace")
                 origin = git(tree, "remote", "get-url", "origin").decode().strip()
-                if Path(origin).resolve() != source:
+                upstream, _ = source_origin(source)
+                resolved_origin = resolved_remote_url(tree, origin)
+                if resolved_origin not in (resolved_remote_url(source, upstream), str(source)):
                     raise CopyError(f"{tree}: legacy workspace source differs")
                 _ = git(tree, "merge-base", "--is-ancestor", base, "HEAD")
                 if git(tree, "symbolic-ref", "HEAD").decode().strip() != f"refs/heads/{branch}":
@@ -579,6 +608,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                     register(str(record.fields["copy_commit"]))
                 else:
                     scratch.renew(tree)
+                refresh_remotes(tree, source)
             else:
                 initialize_git(tree, source)
                 _ = git(tree, "checkout", "-q", "-B", branch, base)
@@ -590,8 +620,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
             finally:
                 caller_error = sys.exception()
                 try:
-                    _ = git(tree, "fetch", "-q", "--prune", "--", str(source),
-                            "+refs/heads/*:refs/remotes/origin/*")
+                    refresh_remotes(tree, source)
                     mark_target(tree)
                     register(commit_at(tree, "HEAD"))
                 except (OSError, scratch.ScratchError, CopyError) as error:
@@ -659,6 +688,7 @@ def standing(owner: str, repo: str | Path, commit: str, *, apply_uncommitted: st
             finally:
                 caller_error = sys.exception()
                 try:
+                    refresh_remotes(tree, source)
                     mark_target(tree)
                     write_record(tree, owner, name, source, commit_at(tree, "HEAD"))
                 except (OSError, scratch.ScratchError, CopyError) as error:
@@ -753,7 +783,8 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
             raise CopyError(f"{tree}: borrowed objects form a cycle; repair the copy records")
         visiting.add(tree)
         for child, record in found:
-            if record.fields.get("borrows_from") == str(tree / ".git"):
+            borrowed = record.fields.get("borrows_from")
+            if isinstance(borrowed, str) and borrowed and Path(borrowed).resolve() == (tree / ".git").resolve():
                 visit(child)
         visiting.remove(tree)
         visited.add(tree)
