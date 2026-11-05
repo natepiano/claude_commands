@@ -484,7 +484,7 @@ Acceptance: one page request through queue's feed calls both providers for 7 day
 - Probing fewer checkouts from recorded pairs or saved roots — the roots go wrong after a Cargo config change.
 - A test that a fractional worker count is refused — it tests only the conf library, which `scripts/lib/test_conf.py` covers.
 
-### Phase 24 — Mac offload reads the repository key without loading memory_admit  · status: todo
+### Phase 24 — Mac offload reads the repository key without loading memory_admit  · status: done
 **Depends on:** queue 10z on builds (done, b7ad7675c).
 
 #### Work Order

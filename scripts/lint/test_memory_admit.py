@@ -1491,6 +1491,19 @@ class RepositoryHistoryTests(unittest.TestCase):
         self.assertEqual(identity.key, "https://example.org/owner/project")
         normalize.assert_called_once_with("git@example.org:owner/project.git", str(directory))
 
+    def test_real_remote_forms_keep_the_repository_key_and_legacy_name(self) -> None:
+        for folder, remote in (("one/project", "git@Example.org:owner/project.git"),
+                               ("two/project", "https://example.org/owner/project.git")):
+            with self.subTest(remote=remote):
+                directory = self.checkout(folder, remote)
+                self.assertEqual(self.identity(directory),
+                                 gate.RepositoryIdentity("https://example.org/owner/project", "project", "project"))
+
+    def test_real_repository_without_origin_keeps_the_root_commit_key_and_checkout_name(self) -> None:
+        directory = self.checkout("project")
+        root_commit = subprocess.check_output(["git", "-C", str(directory), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(self.identity(directory), gate.RepositoryIdentity("git-root:" + root_commit, "project"))
+
     def test_same_repository_shares_peaks_across_folders_and_remote_forms(self) -> None:
         first = self.identity(self.checkout("one/repo", "git@example.org:nate/first.git"))
         second = self.identity(self.checkout("two/different", "https://user@example.org/nate/first/"))
