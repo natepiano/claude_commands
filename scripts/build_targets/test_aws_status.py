@@ -18,13 +18,13 @@ import mac_test
 import offload
 
 if TYPE_CHECKING:
-    from ..aws_target import aws_target, ledger
+    from ..aws_target import aws_target, ledger, config as aws_config
     from ..aws_target.control_test_support import AwsReplies
     from ..aws_target.measurement_test_support import MeasurementFixture, NOW, REPOSITORY, private_history, read_only_evidence
     from ..message import roster
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.aws_target import aws_target, ledger
+    from scripts.aws_target import aws_target, ledger, config as aws_config
     from scripts.aws_target.control_test_support import AwsReplies
     from scripts.aws_target.measurement_test_support import MeasurementFixture, NOW, REPOSITORY, private_history, read_only_evidence
     from scripts.message import roster
@@ -80,6 +80,19 @@ class AwsStatusTests(MeasurementFixture):
             self.assertTrue(invalid_key, errors.getvalue())
             self.assertIn(invalid_key, errors.getvalue())
         return output.getvalue()
+
+    def test_incomplete_down_shows_retained_storage_and_keeps_counting_it(self) -> None:
+        _ = (self.state / 'down.json').write_text(json.dumps({'volume': 'vol-retained', 'budget': 'retained-budget'}))
+        book = self.book()
+        resources = tuple(ledger.PricedResource(name, Decimal(value)) for name, value in (
+            ('retained_storage_usd_per_month', '40'), ('gp3_iops_usd_per_month', '15'), ('gp3_throughput_usd_per_month', '15')))
+        book.record_inventory(ledger.ResourceInventory(NOW, resources, 'retained volume during removal'))
+        output = self.render()
+        self.assertIn('down incomplete: vol-retained, retained-budget; storage $2.26/day; run deploy.py down --approve-destroy', output)
+        before = ledger.costs_from_evidence(book.read_snapshot(), aws_config.read_settings(self.settings), NOW, current_window=False)
+        after = ledger.costs_from_evidence(book.read_snapshot(), aws_config.read_settings(self.settings), NOW + 3600, current_window=False)
+        self.assertGreater(after.monthly.usd, before.monthly.usd)
+        self.assertEqual(book.read_snapshot().inventories[-1].resources, resources)
 
     def test_corrupt_report_files_do_not_make_status_unreadable(self) -> None:
         charges = self.state / "charges"
@@ -151,6 +164,8 @@ class AwsStatusTests(MeasurementFixture):
         self.assertEqual(block.read_text(), '{"holder": 42}')
 
     def test_repeated_pending_ticks_preserve_the_original_start_time_in_status(self) -> None:
+        _ = (self.state / "deployment.json").write_text(json.dumps({
+            "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
         replies = AwsReplies()
         now = NOW + 1
         controller = aws_target.Controller(self.settings, self.state, self.root / "admission",

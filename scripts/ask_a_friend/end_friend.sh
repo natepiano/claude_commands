@@ -16,28 +16,12 @@ if [[ ! -f "${AGENT_FILE}" ]]; then
   exit 0
 fi
 FRIEND="$(cat "${SESSION_DIR}/friend_name")"
-FAMILY="$("$PY" - "$SCRIPT_DIR/../.." "$SESSION_DIR" "$FRIEND" <<'PYMEMBER'
-import sys
-from pathlib import Path
-from contextlib import redirect_stdout
-sys.path.insert(0, sys.argv[1])
-from scripts.production import staff, worker_admission
-from scripts.shutdown import stop_resume
-row = worker_admission.member(Path(sys.argv[2]), sys.argv[3])
-if row is None:
-    print("gone")
-elif isinstance(staff.local_snapshot().backends.get(row.id), staff.CodexBackend):
-    print("codex")
-else:
-    with redirect_stdout(sys.stderr):
-        result = stop_resume.stop(row.id)
-    if isinstance(result, stop_resume.StopFailed):
-        raise SystemExit(result.reason)
-    print("claude")
-PYMEMBER
-)"
+MEMBER="$("$PY" "$SCRIPT_DIR/../production/worker_fill.py" member \
+  --run "$SESSION_DIR" --name "$FRIEND" --allow-absent)"
+read -r FAMILY NATIVE_ID REFERENCE <<< "$MEMBER"
 case "$FAMILY" in
-  claude|gone) ;;
+  gone) ;;
+  claude) "$PY" "$SCRIPT_DIR/../shutdown/shutdown.py" stop "$REFERENCE" ;;
   codex)
     "$PY" "${MESH}" end --session-dir "${SESSION_DIR}" --to "${FRIEND}" || true
     # Let the resident launcher record its end before the server stops.
@@ -48,7 +32,7 @@ case "$FAMILY" in
         break
       fi
     done
-    "$PY" "${MESH}" stop --session-dir "${SESSION_DIR}" || true
+    "$PY" "${MESH}" stop --session-dir "${SESSION_DIR}"
     ;;
   *)
     echo "end_friend.sh: unknown family '${FAMILY}' in ${AGENT_FILE}" >&2

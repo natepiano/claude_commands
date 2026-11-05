@@ -396,7 +396,7 @@ def initialize_git(tree: Path, source: Path) -> None:
     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
         raise CopyError(f"{tree}: standing checkout must own its .git directory")
     actual = git(tree, "rev-parse", "--absolute-git-dir").decode().strip()
-    if actual != str(tree / ".git"):
+    if Path(actual).resolve() != (tree / ".git").resolve():
         raise CopyError(f"{tree}: Git directory is {actual}, expected {tree / '.git'}")
     refresh_remotes(tree, source)
     exclude = tree / ".git/info/exclude"
@@ -451,7 +451,7 @@ def apply_changes(tree: Path, worktree: Path, base: str) -> None:
                 raise CopyError(f"{relative}: path conflicts with gate metadata")
             original, destination = worktree / relative, tree / relative
             mode = original.lstat().st_mode
-            if not destination.parent.resolve().is_relative_to(tree):
+            if not destination.parent.resolve().is_relative_to(tree.resolve()):
                 raise CopyError(f"{relative}: path escapes the gate checkout")
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.is_symlink():
@@ -783,7 +783,8 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
             raise CopyError(f"{tree}: borrowed objects form a cycle; repair the copy records")
         visiting.add(tree)
         for child, record in found:
-            if record.fields.get("borrows_from") == str(tree / ".git"):
+            borrowed = record.fields.get("borrows_from")
+            if isinstance(borrowed, str) and borrowed and Path(borrowed).resolve() == (tree / ".git").resolve():
                 visit(child)
         visiting.remove(tree)
         visited.add(tree)

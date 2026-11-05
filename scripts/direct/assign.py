@@ -372,7 +372,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         record = read_roster(dispatch.run, dispatch.worker)
         if not record:
             refuse(f"{dispatch.worker}: worker is missing")
-        identity_path = worker_record_path(dispatch.run, dispatch.worker, dispatch.worker, role=dispatch.role)
+        identity_path = worker_record_path(dispatch.run, dispatch.worker, dispatch.worker)
         identity = read_object(identity_path)
         slot = text(identity.get("slot")) or dispatch.worker
         model = text(identity.get("model")) or dispatch.model
@@ -485,7 +485,7 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
     """Completed work wins; otherwise ownership loss precedes refusal or failure."""
     if dispatch.args.early_ready:
         lens_suffix = f"_{dispatch.args.lens}" if dispatch.args.lens else ""
-        _ = (status.parent / f"review_status{lens_suffix}").write_text("reviewed\n" if completed else "error\n")
+        _ = (status.parent / f"{dispatch.worker}_status{lens_suffix}").write_text("reviewed\n" if completed else "error\n")
     if not completed and code == 0:
         print("assign.sh: Stage 2 was not submitted by this launcher; review incomplete", file=sys.stderr)
         code = 1
@@ -508,26 +508,25 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
 
 
 def execute(dispatch: Dispatch, paths: list[str]) -> int:
+    try:
+        dispatch.claim = claim_worker(dispatch)
+    except SystemExit as error:
+        return error.code if isinstance(error.code, int) else 2
     shown = workers.shown_name(dispatch.run, dispatch.worker)
     args = dispatch.args
     phase_dir = phase_reservation.phase_directory(dispatch.run, dispatch.phase)
     phase_dir.mkdir(parents=True, exist_ok=True)
     suffix = "" if dispatch.role != "review" else f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}"
-    status = phase_dir / f"{dispatch.role}_status{suffix}"
-    summary = phase_dir / f"{dispatch.role}_summary{suffix}.txt"
-    log = phase_dir / f"{dispatch.role}_agent{suffix}.log"
-    reply = phase_dir / f"{dispatch.role}_reply{suffix}.txt"
+    status = phase_dir / f"{dispatch.worker}_status{suffix}"
+    summary = phase_dir / f"{dispatch.worker}_summary{suffix}.txt"
+    log = phase_dir / f"{dispatch.worker}_agent{suffix}.log"
+    reply = phase_dir / f"{dispatch.worker}_reply{suffix}.txt"
     _ = summary.write_text("")
     _ = status.write_text("running\n")
     if args.early_ready:
         lens_suffix = f"_{args.lens}" if args.lens else ""
-        _ = (phase_dir / f"review_status{lens_suffix}").write_text("reviewing\n")
-        _ = (phase_dir / f"review_pid{lens_suffix}").write_text(f"{os.getpid()}\n")
-    try:
-        dispatch.claim = claim_worker(dispatch)
-    except SystemExit as error:
-        code = error.code if isinstance(error.code, int) else 2
-        return settle_dispatch(dispatch, code, False, shown, status, summary, reply)
+        _ = (phase_dir / f"{dispatch.worker}_status{lens_suffix}").write_text("reviewing\n")
+        _ = (phase_dir / f"{dispatch.worker}_pid{lens_suffix}").write_text(f"{os.getpid()}\n")
     dispatch.model, dispatch.effort = dispatch.claim.model, dispatch.claim.effort
     shown = workers.shown_name(dispatch.run, dispatch.worker)
     with (phase_dir / "dispatch.lock").open("a+") as lock:

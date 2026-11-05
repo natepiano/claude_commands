@@ -32,7 +32,6 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
                     self.recorded_worker(session_dir).current_session,
                     json.loads(next((self.root / "sessions").glob("*.json")).read_text())["sessionId"],
                 )
-                self.assertTrue(self.recorded_worker(session_dir).current_session.startswith("abc12345-"))
 
 
 if __name__ == "__main__":

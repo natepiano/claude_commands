@@ -123,7 +123,9 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 
 `production_check.sh <doc>` reads the doc's `Status: PRODUCTION — <word>` line: `running` 0, `wrapped` 2, anything else (or no such line, or no file) 1. For a running production it first runs `log_backup.py <doc>`, which keeps dated copies of the production's LOG (LOG backups in `docs/as-built/showrunner-automation.md`). A failed copy prints to stderr and does not change the exit code.
 
-`direct_run.py check <claude_session_id> <session_dir>` exits 2 when the marker `/tmp/claude/unit/active/<id>` (or `/tmp/claude/delegate/active/<id>` for a run started before the folder rename) is missing or names another directory (the run ended, or a new run in the same session replaced it); 0 when `running_work()` finds work in flight; 1 when the unit is idle; 3 on a usage error. Work in flight is an `impl_status` or `impl_status_*` file reading `implementing`, a `review_status*` file reading `reviewing`, or a `progress_history_state.json` activity with status `active`. That last one covers `verify.sh final` and UX review, which open activities.
+`direct_run.py check <claude_session_id> <session_dir>` exits 2 when the marker `/tmp/claude/unit/active/<id>` (or `/tmp/claude/delegate/active/<id>` for a run started before the folder rename) is missing or names another directory (the run ended, or a new run in the same session replaced it); 0 when `running_work()` finds work in flight; 1 when the unit is idle; 3 on a usage error. Work in flight includes a worker's `*_status*` file with `running`, `implementing`, or `reviewing`.
+The reader checks the run directory and each phase directory.
+It also checks `progress_history_state.json` for an active activity.
 
 ### Hold and restarting the clock
 
