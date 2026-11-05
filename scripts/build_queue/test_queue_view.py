@@ -76,6 +76,31 @@ class QueueViewTests(QueueFixtureTests):
         self.assertNotIn("⊘", rows[0])
         self.assertIn("↑", rows[1])
 
+    def test_merge_gate_rows_show_the_counted_anonymous_use_beside_the_keep_aside(self) -> None:
+        inputs = self.fixture.inputs(policy=admission_policy_fixture())
+        source = gate.ProcessSource((gate.ProcessAnonymousUse(900, gate.AnonymousRunUse(4 * gate.GIB)),))
+        original = inputs.running[0]
+        parent = replace(original, session_id="id-parent-holder", session_name="parent-holder", unit="parent-holder", pid=900, promise=2 * gate.GIB,
+            measured=gate.MeasuredMemory(7 * gate.GIB, anonymous=gate.AnonymousRunUse(4 * gate.GIB),
+                                         anonymous_source=source), step="merge-gate")
+        child = replace(parent, session_id="id-child-holder", session_name="child-holder", unit="child-holder", promise=6 * gate.GIB)
+        base = inputs.reservations[0]
+        rows = (dict(base, need=2 * gate.GIB, reservation_id="z-parent"),
+                dict(base, need=6 * gate.GIB, reservation_id="a-child"))
+        reading = gate.queue_read_from(replace(inputs, running=(parent, child), reservations=rows),
+                                       gate.AdmissionLimits(3 * gate.GIB), admission_policy_fixture())
+        room = reading.explanation.room
+        assert isinstance(room, gate.MemoryRoom)
+        holds = {hold.owner: hold for hold in room.runs}
+        self.assertEqual(holds["a-child"].use, gate.AnonymousRunUse(4 * gate.GIB))
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        text = plain(queue_view.render_view(model, 200))
+        for name, owner in (("parent-holder", "z-parent"), ("child-holder", "a-child")):
+            row, = [line for line in text.splitlines() if name in line]
+            hold = holds[owner]
+            assert isinstance(hold.use, gate.AnonymousRunUse)
+            self.assertIn(f"{hold.bytes / gate.GIB:.1f} / {hold.use.bytes / gate.GIB:.1f}", row)
+
     def service_model(self, fixture: AdmissionFixture) -> queue_view.QueueModel:
         reply, = fixture.server.handle_request(wire.ViewRequest())
         assert isinstance(reply, wire.ViewReply)

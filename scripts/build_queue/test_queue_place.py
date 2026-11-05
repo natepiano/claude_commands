@@ -365,6 +365,46 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_scope_sampler_uses_the_shared_anonymous_reader_and_skips_unavailable_use(self) -> None:
+        from scripts.lint.memory_test_support import admission_configuration_fixture
+
+        class SingleScopeSample(queue.QueuePlace):
+            def sample_once(self) -> None:
+                stopped = threading.Event()
+                stopped.set()
+                self._sample(queue.ScopedProgram(), stopped)
+
+        with tempfile.TemporaryDirectory(prefix="scope-sample-test-") as directory:
+            root = Path(directory)
+            scope = root / "program.scope"
+            scope.mkdir()
+            _ = (scope / "memory.current").write_text(str(11 * GIB))
+            _ = (scope / "memory.swap.current").write_text(str(2 * GIB))
+            sidecar = root / "program.cgroup"
+            _ = sidecar.write_text(str(scope) + "\n")
+            for available in (True, False):
+                with self.subTest(anonymous_available=available):
+                    contents = f"file {7 * GIB}\ninactive_file {GIB}\n"
+                    if available:
+                        contents += f"anon {3 * GIB}\n"
+                    _ = (scope / "memory.stat").write_text(contents)
+                    samples = root / str(available)
+                    samples.mkdir()
+                    place = SingleScopeSample(samples / "program", sidecar,
+                                              configuration=admission_configuration_fixture())
+                    with mock.patch.object(gate, "slice_working_set", wraps=gate.slice_working_set) as reader, \
+                         mock.patch.object(place, "observe", wraps=place.observe) as observe:
+                        place.sample_once()
+                    reader.assert_called_once_with(scope)
+                    if available:
+                        observe.assert_called_once_with(3 * GIB, 3 * GIB)
+                        self.assertEqual(place.peak_bytes, 3 * GIB)
+                        self.assertEqual(int(place.path.with_suffix(".max").read_text()), 3 * GIB)
+                    else:
+                        observe.assert_not_called()
+                        self.assertEqual(place.peak_bytes, 0)
+                        self.assertEqual(list(samples.iterdir()), [])
+
     def test_program_admission_carries_the_unit_override(self) -> None:
         with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {gate.BUILDLOG_UNIT: "queue-unit"}):
             with queue.queue_place("rust-analyzer", fixture.root):
@@ -451,12 +491,12 @@ class QueuePlaceTests(unittest.TestCase):
                     self.assertEqual(child.stdout.readline(), b"ready\n")
                     self.assertLess(time.monotonic() - started, 2)
                     scope = Path(place.sidecar.read_text().strip())
-                    self.assertIn(child.pid, queue.scope_members(scope))
+                    self.assertIn(child.pid, gate.scope_members(scope))
                     self.assertFalse(fixture.admission.server.reservations)
                     place.observe(2 * GIB, 2 * GIB)
                     self.assertEqual(place.peak_bytes, 2 * GIB)
             self.assertIsNotNone(child.poll())
-            self.assertEqual(queue.scope_members(scope), set())
+            self.assertEqual(gate.scope_members(scope), set())
             self.assertEqual(fixture.history(), [])
 
     def test_probe_history_does_not_size_server(self) -> None:
@@ -510,10 +550,10 @@ class QueuePlaceTests(unittest.TestCase):
                     child = fixture.start_blocked(place)
                     sidecar = place.sidecar
                     scope = Path(sidecar.read_text().strip())
-                    self.assertIn(child.pid, queue.scope_members(scope))
+                    self.assertIn(child.pid, gate.scope_members(scope))
                     write_memory_config(fixture.config, program_stop_seconds="invalid")
             self.assertIsNotNone(child.poll())
-            self.assertEqual(queue.scope_members(scope), set())
+            self.assertEqual(gate.scope_members(scope), set())
             fixture.assert_cleaned(self)
             self.assertFalse(sidecar.exists())
 
