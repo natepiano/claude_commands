@@ -624,6 +624,14 @@ Slice lines use the snapshots nearest each edge within `SNAPSHOT_DISTANCE_S` (12
 
 ### Mac sync pause (`scripts/buildlog/sync.py`)
 
+The hourly task exchanges records with every configured SSH peer.
+After a completed Linux offload run, natedev releases the slot claim before it calls `sync_target(target)`.
+This exchange contacts only that target and preserves its configured host paths, including `aws-build/`.
+It skips a paused sync and never waits for the sync lock.
+It uses the configured connection, reach, and rsync timeouts.
+A failed exchange prints one line and preserves the step result for the caller.
+The hourly task can retry the exchange.
+
 `buildlog sync pause <why>` writes `<root>/sync_paused.json` `{since, why}`; `resume` removes it. `sync()` holds an flock on `<root>/sync.lock` for its whole run; paused, it contacts nothing, prints `buildlog sync: paused since <time> (<why>); buildlog sync resume ends it`, returns 0 and leaves `sync.json` alone. `pause` takes the same lock (printing `buildlog sync: waiting for the running sync to finish`), so once it returns nothing contacts the Mac. `hourly` still polls CI while paused. `read_pause -> SyncPaused(since, why) | SyncRunning()`; `read_status -> SyncStatus(at, peer, ok, last_good: LastSynced | NeverSynced) | NeverSynced`. The reach check runs `mkdir -p <REMOTE_ROOT>; echo "rc=$?"` and judges the printed `rc=`; nonzero or missing (`reported rc=<n>` / `no rc= line in command output`) writes `sync.json` `ok: false` and exits 1. ssh exit 255 is a peer that did not answer (one line, exit 0). `rsync` keeps its exit-status checks.
 
 ### Build hold (`scripts/build_hold/build_hold.py`, `commands/build/hold.md`)

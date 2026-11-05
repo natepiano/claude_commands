@@ -29,8 +29,13 @@ else:
 import offload
 if TYPE_CHECKING:
     from ..build_targets import target_config
+    from ..buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
 else:
     import target_config
+    import sync as buildlog_sync
+    import health as buildlog_health
+    import record as buildlog_record
+    import store as buildlog_store
 import conf
 from offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
 
@@ -86,6 +91,63 @@ class RunnerCompletionTests(unittest.TestCase):
                                           offload.NO_RESULT_FILE, target="aws")
         self.assertEqual(status, 75)
         self.assertEqual(output.getvalue(), "mac_test: the aws instance was interrupted (generation generation-one)\n")
+
+
+class CompletedRunSyncTests(unittest.TestCase):
+    def test_finished_runs_exchange_after_release_and_preserve_results(self) -> None:
+        for target in ("aws", "mac"):
+            for status in (0, 42):
+                for fails in (False, True):
+                    with self.subTest(target=target, status=status, fails=fails), tempfile.TemporaryDirectory() as directory:
+                        self.check_finished_run(Path(directory), target, status, fails)
+
+    def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
+        configured = target_config.SshTarget(target, "linux" if target == "aws" else "macos", root / "target.conf")
+        config = offload.OffloadConfig(True, offload.SshConnectionSettings("aws-build", 1, 1), 1, 1, 1, "1", {})
+        request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), target=target)
+        controller = offload.ProcessController()
+        output = io.StringIO()
+
+        def release(_controller: offload.ProcessController, _target: str) -> None:
+            self.assertEqual(exchange.call_count, 0)
+
+        def exchange_records(*_args: object) -> int:
+            released.assert_called_once_with(controller, target)
+            if fails:
+                raise OSError("fixture exchange failure")
+            return 0
+
+        with (
+            mock.patch.object(offload, "configured_ssh_target", return_value=configured),
+            mock.patch.object(offload, "expected_instance_generation", return_value=""),
+            mock.patch.object(offload, "expected_linux_parity", return_value={}),
+            mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
+            mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
+            mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "aws-build")),
+            mock.patch.object(offload, "remote_test_command", return_value="fixture step"),
+            mock.patch.object(controller, "stream_mac_run", return_value=offload.ReportedMacStatus(status, offload.CleanupKept())),
+            mock.patch.object(offload, "release_claim", side_effect=release) as released,
+            mock.patch.object(time, "monotonic", return_value=5),
+            mock.patch.object(buildlog_store, "root", return_value=root),
+            mock.patch.object(buildlog_store, "host_name", return_value="natedev"),
+            mock.patch.object(buildlog_sync, "configured_peers", return_value=(buildlog_sync.SyncPeer("aws", "aws-build"),)),
+            mock.patch.object(buildlog_record, "target_hosts", return_value=("aws-build",)),
+            mock.patch.object(buildlog_record, "sync_config", return_value={
+                "sync.connect_timeout_s": "3", "sync.reach_timeout_s": "7", "sync.rsync_timeout_s": "11"}),
+            mock.patch.object(buildlog_health, "write_snapshot"),
+            mock.patch.object(buildlog_sync, "sync_peer", side_effect=exchange_records) as exchange,
+            mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")),
+            mock.patch.object(subprocess, "Popen", side_effect=AssertionError("No child process expected")),
+            redirect_stdout(output),
+        ):
+            result = offload.claimed_run(controller, config, request, offload.KnownRepository("hana"), 1)
+        expected = offload.PassedOnMac(4) if status == 0 else offload.FailedOnMac(status, 4)
+        self.assertEqual(result, expected)
+        released.assert_called_once_with(controller, target)
+        if target == "aws":
+            self.assertEqual(exchange.call_args.args[0], buildlog_sync.SyncPeer("aws", "aws-build"))
+            self.assertEqual(exchange.call_args.args[-2:], (7, 11))
+            self.assertEqual(output.getvalue().count("exchange failed"), int(fails))
 
 
 class OffloadSettingsTests(unittest.TestCase):

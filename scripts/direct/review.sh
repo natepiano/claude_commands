@@ -445,7 +445,7 @@ with worker_claim_lock(root):
         "slot": slot,
         "model": model,
     }
-    worker_record_path(root, name, slot, role="review").write_text(json.dumps(identity))
+    worker_record_path(root, name, slot).write_text(json.dumps(identity))
 PY
 }
 
