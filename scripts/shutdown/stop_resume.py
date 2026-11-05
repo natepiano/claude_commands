@@ -66,23 +66,32 @@ STAY_SECONDS = 10.0
 
 
 def _tab_of(session: str) -> herdr.TabSession | SessionNotFound:
-    """Find an existing pane, retaining its saved conversation when herdr's id is stale."""
+    """Find the pane through the current conversation or its fixed row id."""
+    from scripts.production import staff
+
     client = herdr.Herdr(herdr.shared_session())
     entries = pane_record.read(client.session)
+    references = {session}
+    try:
+        row = staff.initial_snapshot().by_current_session(session)
+        if row is not None:
+            references.add(row.id)
+    except (OSError, ValueError) as error:
+        print(f"{session}: staff anomaly: {error}", file=sys.stderr)
     tabs: list[herdr.TabSession] = []
     for pane in client.panes():
         identity = pane["session_id"]
         entry = entries.get(pane["pane_id"])
         label = pane.get("label") or ""
-        if entry is not None and entry["session_id"] != identity and (
-                session == entry["session_id"] or session == label):
-            if identity:
+        if entry is not None and (entry["session_id"] in references or session == label):
+            saved_identity = session if entry["session_id"] in references else entry["session_id"]
+            if identity and identity != saved_identity:
                 live = herdr.read_conversation(identity)
                 if isinstance(live, herdr.UnknownConversation):
                     herdr.conversation_note(live)
                 if isinstance(live, herdr.LiveConversation):
                     continue  # A saved entry cannot displace another running conversation.
-            identity = entry["session_id"]
+            identity = saved_identity
         tabs.append(herdr.TabSession(pane["pane_id"], label, pane["workspace_id"], identity))
     matches = [tab for tab in tabs if tab.session_id == session] or [tab for tab in tabs if tab.label == session]
     if len(matches) > 1:

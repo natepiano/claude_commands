@@ -43,6 +43,16 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_tab_lookup_keeps_the_conversation_tab_when_staff_is_unreadable(self) -> None:
+        identity = self.entry["session_id"]
+        for error in (OSError("staff unreadable"), ValueError("staff invalid")):
+            with (self.subTest(error=error),
+                  patch.object(staff, "initial_snapshot", side_effect=error),
+                  redirect_stderr(io.StringIO()) as output):
+                tab = stop_resume._tab_of(identity)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(tab, herdr.TabSession("w1:p2", "alpha", "w1", identity))
+            self.assertEqual(output.getvalue().splitlines(), [f"{identity}: staff anomaly: {error}"])
+
     def test_resume_uses_the_group_account_unless_the_target_is_explicit(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         for kind in ("unit", "showrunner", "agent"):
@@ -219,7 +229,7 @@ class StopResumeTests(unittest.TestCase):
             with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))) as read:
                 result = stop_resume.resume(reference)
             self.assertIsInstance(result, stop_resume.ClaudeUp)
-            self.assertEqual(read.call_count, 2)
+            self.assertEqual(read.call_count, 3)
             self.assertIn("resumed by name", self.client.prompts[0][1].text)
             self.assertTrue(self.client.prompts[0][1].text.startswith('<system-reminder source="script">'))
             self.assertNotIn("the herdr server restarted", self.client.prompts[0][1].text)
@@ -288,7 +298,7 @@ class StopResumeTests(unittest.TestCase):
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)) as read:
             self.assertEqual(stop_resume.resume("acc"), stop_resume.ResumeFailed(
                 "acc", "unknown name; candidates: accounts, team-accounts"))
-        self.assertEqual(read.call_count, 2)
+        self.assertEqual(read.call_count, 3)
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)):
             self.assertEqual(stop_resume.resume("absent"), stop_resume.ResumeFailed("absent", "unknown name"))
         self.start.assert_not_called()
@@ -346,6 +356,23 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], "row-name")
         self.assertEqual(self.entry["name"], "alpha")
+
+    def test_resume_reuses_the_open_shell_with_the_fixed_row_id(self) -> None:
+        fixed = staff.StaffId(self.entry["session_id"])
+        current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
+        row = staff.StaffRow(fixed, "agent", "row-name", staff.StaffRoot(), current_session=current)
+        self.client.rows[0]["agent_session"] = {"kind": "none"}
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(self.client, "open_tab") as opened):
+            result = stop_resume._resume_once(str(current), why="recovery",  # pyright: ignore[reportPrivateUsage]
+                                             names=LaunchNames(staff.StaffSnapshot((row,))))
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual((result.session_id, result.pane_id), (current, self.entry["pane_id"]))
+        command = self._typed(self.start.call_args.args)
+        self.assertEqual(command[2], self.entry["pane_id"])
+        self.assertEqual(command[command.index("--resume") + 1], current)
+        opened.assert_not_called()
 
     def test_pane_command_unsets_conductor_variables_and_removes_saved_values(self) -> None:
         conductor = {"HERDR_TAB_ID": "w1:t9", "STAFF_ID": "conductor", "STAFF_OPERATION_FD": "81",
@@ -585,7 +612,7 @@ class StopResumeTests(unittest.TestCase):
             result = stop_resume.resume(str(fixed), why="recovery")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         self.assertEqual(opened, ["row-name"])
-        self.assertEqual(snapshot.call_count, 2)
+        self.assertEqual(snapshot.call_count, 3)
         command = self._typed(self.start.call_args.args)
         self.assertEqual(command[command.index("-n") + 1], "row-name")
         self.assertEqual(command[command.index("--resume") + 1], current)
@@ -603,7 +630,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.rows[0]["label"], "row-name")
         command = self._typed(self.start.call_args.args)
         self.assertEqual(command[command.index("-n") + 1], "row-name")
-        self.assertEqual(snapshot.call_count, 2)
+        self.assertEqual(snapshot.call_count, 3)
 
     def test_recovery_reconciles_titles_and_preserves_unnamed_titles(self) -> None:
         from scripts.production import session_staff

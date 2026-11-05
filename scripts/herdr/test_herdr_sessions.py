@@ -757,7 +757,7 @@ class StandaloneLaunchTests(unittest.TestCase):
             return herdr.NativeAgentProcess(herdr.RolloutThread("recorded-id"), "fixture-start", {})
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=native_process))
         self.responses["--session agents agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+            "result": {"agent": {"agent_status": "idle"}}}))
         self.responses["--session agents pane read w1:p1 --source visible --format ansi"] = CommandResponse(
             code=0, stdout="────────\n❯ \n────────")
         # This fixture turn is written by the fake command, after launch, not before it.
