@@ -290,9 +290,10 @@ class AutoSilenceTests(unittest.TestCase):
             self.assertEqual(event["silence_id"], start["silence_id"])
             return self.sender(argv)
 
-        for _ in range(2):
-            self.assertEqual(auto_silence.active(lambda: self.now, sender, self.runner,
-                self.deliver, UserTypedPrompt("typed")), 0)
+        with redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                self.assertEqual(auto_silence.active(lambda: self.now, sender, self.runner,
+                    self.deliver, UserTypedPrompt("typed")), 0)
         self.assertEqual(self.posted, ["Build done"])
         self.assertEqual(sum(event["event"] == "end" for event in self.events()), 1)
         self.assertIn("sender=typed-session", self.push_values(-1)[1])

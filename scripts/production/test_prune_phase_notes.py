@@ -16,8 +16,8 @@ from scripts.production.staff_test_support import isolated_staff_file, recorded_
 SCRIPT = Path(__file__).with_name("prune_phase_notes.py")
 
 
-def note(unit: str, production: str = "example") -> str:
-    return f"---\nphase_table: true\nproduction: {production}\nunit: {unit}\n---\n\n# {unit}\n"
+def note(unit: staff.StaffRow) -> str:
+    return f"---\nphase_table: true\nunit: {unit.id}\n---\n\n# {unit.name}\n"
 
 
 class PrunePhaseNotesTests(unittest.TestCase):
@@ -59,6 +59,9 @@ class PrunePhaseNotesTests(unittest.TestCase):
         self.timer(slug, doc)
         unit = unit_membership(slug, "alpha-unit")
         _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha), expected=unit.worktree)
+        retired = unit_membership(slug, "beta-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / f"{slug}-beta"),
+                               expected=retired.worktree)
         return doc
 
     def timer(self, slug: str, doc: Path) -> None:
@@ -72,7 +75,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
     def planted(self, unit: str, production: str = "example") -> Path:
         path = self.vault / "natedev" / f"{unit}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(note(unit, production), encoding="utf-8")
+        _ = path.write_text(note(unit_membership(production, unit)), encoding="utf-8")
         return path
 
     def run_script(self) -> subprocess.CompletedProcess[str]:
@@ -86,7 +89,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
         # Another production's note for the same unit name is that production's to prune.
         other = self.vault / "elsewhere" / "beta-unit.md"
         other.parent.mkdir(parents=True)
-        _ = other.write_text(note("beta-unit", "other"), encoding="utf-8")
+        _ = other.write_text(note(unit_membership("other", "beta-unit")), encoding="utf-8")
 
         result = self.run_script()
 

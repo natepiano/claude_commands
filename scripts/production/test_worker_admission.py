@@ -14,7 +14,8 @@ from typing import Literal
 from unittest import mock
 
 from scripts.agents import worker_lifecycle
-from scripts.production import fake_unit_host, session_staff, staff, worker_admission
+from scripts.lib import unit_runs
+from scripts.production import fake_unit_host, session_staff, staff, worker_admission, showrunners
 from scripts.production.staff_test_support import (
     CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_session, fixture_worker, transcript_fixture,
 )
@@ -22,7 +23,16 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import stop_resume
 
 
-class WorkerAdmissionTests(StaffTestCase):
+class RecordedDirectorAdmissionTests(StaffTestCase):
+    def test_run_without_owner_staff_id_resolves_its_known_unit(self) -> None:
+        production, unit, _ = self.tree()
+        run = self.root / "run-without-owner"
+        run.mkdir()
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+            "production": production.name, "unit": unit.name,
+        }))
+        self.assertEqual(worker_admission.parent(staff.snapshot(), run=run), unit)
+
     def test_worker_caller_resolves_its_fixed_parent_after_session_replacement(self) -> None:
         _, unit, worker = self.tree()
         current = staff.native_id(fixture_runtime_id("dispatching-worker-current-session"))
@@ -31,6 +41,66 @@ class WorkerAdmissionTests(StaffTestCase):
         found = worker_admission.parent(staff.snapshot(), staff_id=current)
         self.assertEqual(found, unit)
         self.assertEqual(self.staff_file.read_bytes(), before)
+
+
+class WorkerAdmissionTests(StaffTestCase):
+    def test_rename_journal_cannot_select_a_holder_by_name_alone(self) -> None:
+        owner, _, _ = self.tree()
+        state = self.root / "showrunner-state"
+        journal = state / "new" / "rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old", "new": owner.name}))
+        with mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state):
+            found = session_staff.MemberSources({}, ()).member(
+                session_staff.ShowrunnerMember("old"), staff.snapshot(),
+            )
+        self.assertIsInstance(found, session_staff.NoSuchMember)
+
+    def test_valid_worker_roles_are_retained_by_read_only_start_permission(self) -> None:
+        _, unit, _ = self.tree()
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        for supplied in staff.WORKER_ROLES:
+            with (self.subTest(role=supplied),
+                  mock.patch.dict(os.environ, {"UNIT_TEAM_ROLE": supplied}),
+                  mock.patch.object(staff, "runtime_id", return_value=unit.current_session)):
+                allowed = worker_admission.admit("new-worker", self.root)
+                self.assertEqual((allowed.name, allowed.parent, allowed.slot),
+                                 ("new-worker", unit.id, worker_admission.NewWorkerSlot()))
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_start_permission_creates_no_row_and_publication_uses_the_returned_thread(self) -> None:
+        _, unit, _ = self.tree()
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        with mock.patch.object(staff, "runtime_id", return_value=unit.id):
+            allowed = worker_admission.admit("test", self.root)
+        self.assertIsInstance(allowed, worker_admission.WorkerStartAllowed)
+        self.assertEqual((allowed.name, allowed.parent, allowed.slot),
+                         ("test", unit.id, worker_admission.NewWorkerSlot()))
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        self.assertEqual(staff.find(kind="worker", parent=unit.id), [self.tree()[2]])
+        thread = fixture_runtime_id("returned-test-thread")
+        published = worker_admission.publish(allowed, thread)
+        self.assertIsInstance(published, worker_admission.PublishedWorker)
+        self.assertEqual((published.row.id, published.row.name, published.row.parent), (thread, "test", staff.ReportsTo(unit.id)))
+        self.assertEqual(staff.by_id(staff.StaffId(thread)), published.row)
+        after = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(worker_admission.publish(allowed, thread), published)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), after)
+
+    def test_codex_unit_admits_under_its_fixed_parent_id_after_thread_replacement(self) -> None:
+        _, unit, _ = self.tree()
+        current = staff.native_id(fixture_runtime_id("codex-unit-replaced-thread"))
+        changed = staff.update_current_session(unit.current_session, current)
+        before = self.staff_file.read_bytes()
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": current}):
+            allowed = worker_admission.admit("test", self.root)
+        self.assertEqual(allowed.parent, unit.id)
+        self.assertEqual(staff.by_id(unit.id), changed)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        worker = worker_admission.publish(allowed, fixture_runtime_id("worker-of-codex-unit"))
+        self.assertEqual(worker.row.parent, staff.ReportsTo(unit.id))
+        self.assertEqual(staff.by_current_session(current), changed)
+        self.assertIsNone(staff.by_current_session(unit.id))
 
     def test_permission_is_read_only_and_publication_uses_the_fixed_parent(self) -> None:
         _, unit, existing = self.tree()
@@ -378,6 +448,37 @@ class FamilyHandoffTests(StaffTestCase):
                                  else worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
                 self.assertEqual(dispatched, [] if deferred else [published.current_session] * 2)
                 self.assertEqual(cleaned, [])
+
+    def test_a_published_switch_retries_dispatch_with_the_original_extract(self) -> None:
+        allowed, source, _ = self.source("claude")
+        assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
+        old = allowed.slot.row
+        identity = fixture_runtime_id("dispatch-retry")
+        starts: list[str] = []
+        attempts: list[worker_admission.FamilyHandoff] = []
+
+        def start(handoff: worker_admission.FamilyHandoff) -> str:
+            self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
+            fixture_session(identity, staff.CodexBackend(self.root / "destination"))
+            starts.append(identity)
+            return identity
+
+        def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
+            self.assertEqual(staff.by_id(old.id), published.row)
+            attempts.append(published.handoff)
+            if len(attempts) == 1:
+                raise OSError("dispatch interrupted")
+            return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
+
+        with mock.patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)):
+            with self.assertRaisesRegex(OSError, "dispatch interrupted"):
+                _ = worker_admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=starts.append)
+            _ = worker_admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=starts.append)
+        self.assertEqual(starts, [identity])
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        assert isinstance(attempts[1], worker_admission.TranscriptHandoff)
+        self.assertEqual(attempts[1].source, source)
 
     def test_failed_creation_or_publication_dispatches_nothing_and_preserves_current_session(self) -> None:
         for failure in ("creation", "publication"):

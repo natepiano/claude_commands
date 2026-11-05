@@ -843,13 +843,13 @@ def _rows(value: object) -> list[StaffRow]:
 def _load(*, initial: bool = False) -> StaffSnapshot:
     try:
         text = _file().read_text(encoding="utf-8")
+        value = _decode(text)
     except FileNotFoundError as error:
         if initial:
             return StaffSnapshot(())
         raise StaffAbsent(f"cannot read staff record: {error}") from error
     except (OSError, UnicodeError) as error:
-        raise StaffUnreadable(f"cannot read staff record: {error}") from error
-    value = _decode(text)
+        raise StaffUnreadable(f"cannot read staff record {_file()}: {error}") from error
     if not isinstance(value, dict):
         raise StaffUnreadable("staff record must be an object")
     fields = cast(dict[str, object], value)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
+from scripts.direct.assign_launcher_test_support import backend_fixture_command
 
 import json
 import os
@@ -110,7 +111,12 @@ if "NESTED_LAUNCH" not in os.environ:
     Path(os.environ["MODELS_CONFIG_FILE"]).write_text(os.environ["NEXT_REGISTRY"])
     command = ["bash", os.environ["AGENT_EXEC"], "sample.task", "readonly", os.getcwd(),
                os.environ["PROMPT"], os.environ["NESTED_OUTPUT"], os.environ["NESTED_LOG"]]
-    result = subprocess.run(command, env={**os.environ, "NESTED_LAUNCH": "1"}, capture_output=True, text=True)
+    sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+    from scripts.direct.assign_launcher_test_support import backend_fixture_command
+    command, environment = backend_fixture_command(
+        Path(os.environ["NESTED_LOG"]).parent / "nested-assign-parent", command,
+        {**os.environ, "NESTED_LAUNCH": "1"})
+    result = subprocess.run(command, env=environment, capture_output=True, text=True)
     sys.stderr.write(result.stderr)
     raise SystemExit(result.returncode)
 ''')
@@ -118,9 +124,12 @@ if "NESTED_LAUNCH" not in os.environ:
             environment = models_registry.launch_configuration(os.environ).environment(
                 models_registry.edit_base(os.environ).environment(self.env))
         environment.update(NEXT_REGISTRY=changed, AGENT_EXEC=str(SCRIPTS / "agents/agent_exec.sh"),
-            PROMPT=str(prompt), NESTED_OUTPUT=str(self.root / "nested-output"), NESTED_LOG=str(self.root / "nested-log"))
-        result = subprocess.run(["bash", environment["AGENT_EXEC"], "sample.task", "readonly", str(self.work),
-            str(prompt), str(self.root / "output"), str(self.root / "log")], env=environment,
+            PROMPT=str(prompt), NESTED_OUTPUT=str(self.root / "nested-output"), NESTED_LOG=str(self.root / "nested-log"),
+            FIXTURE_CHECKOUT=str(SCRIPTS.parent))
+        command, environment = backend_fixture_command(self.root / "assign-parent",
+            ["bash", environment["AGENT_EXEC"], "sample.task", "readonly", str(self.work),
+             str(prompt), str(self.root / "output"), str(self.root / "log")], environment)
+        result = subprocess.run(command, env=environment,
             cwd=self.work, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr + (self.root / "log").read_text())
         launches = [cast(dict[str, object], json.loads(line)) for line in self.launched.read_text().splitlines()]
@@ -239,9 +248,11 @@ class ClaudeLauncherTests(unittest.TestCase):
         with patch.dict(os.environ, self.environment):
             environment = models_registry.launch_configuration(os.environ).environment(
                 models_registry.edit_base(os.environ).environment(self.environment))
-        result = subprocess.run(["bash", str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
-            str(self.home), str(prompt), str(self.home / "output"), str(self.home / "log")],
-            env={**environment, "TEST_AGENT_ENV": str(recorded)}, cwd=self.home,
+        command, environment = backend_fixture_command(self.home / "assign-parent",
+            ["bash", str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
+             str(self.home), str(prompt), str(self.home / "output"), str(self.home / "log")],
+            {**environment, "TEST_AGENT_ENV": str(recorded)})
+        result = subprocess.run(command, env=environment, cwd=self.home,
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         agent_environment = cast(dict[str, str], json.loads(recorded.read_text()))
@@ -263,7 +274,8 @@ class ClaudeLauncherTests(unittest.TestCase):
                     command = ["bash", str(SCRIPTS / "cli_agent/cli_agent.sh")]
                     log = self.home / "launch.log"
                     if launcher == "exec":
-                        command = ["bash", str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
+                        command = ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
+                                   str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
                                    str(self.home), str(prompt), str(self.home / "result"), str(log)]
                     result = subprocess.run(command, capture_output=True, text=True, check=True,
                                             env=environment, cwd=self.home)
@@ -283,7 +295,8 @@ class ClaudeLauncherTests(unittest.TestCase):
             with self.subTest(launcher=launcher):
                 log = self.home / "legacy.log"
                 command = (["bash", str(SCRIPTS / "cli_agent/cli_agent.sh")] if launcher == "cli" else
-                           ["bash", str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
+                           ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
+                                   str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
                             str(self.home), str(prompt), str(self.home / "result"), str(log)])
                 result = subprocess.run(command, capture_output=True, text=True, check=True,
                                         env=self.environment, cwd=self.home)
@@ -318,9 +331,13 @@ class ClaudeLauncherTests(unittest.TestCase):
                 _ = environment.pop("CLAUDE_CONFIG_DIR", None)
                 if caller:
                     environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
-                result = subprocess.run(["bash", str(SCRIPTS / "agents/agent_bg.sh"), "--run", str(private / "run"), "fixture-worker", str(self.home),
-                                         str(prompt), str(self.home / "summary"), str(self.home / "log")],
-                                        capture_output=True, text=True, check=True, env=environment, cwd=self.home)
+                command, environment = backend_fixture_command(
+                    private / "assign-parent",
+                    ["bash", str(SCRIPTS / "agents/agent_bg.sh"), "--run", str(private / "run"),
+                     "fixture-worker", str(self.home), str(prompt), str(self.home / "summary"), str(self.home / "log")],
+                    environment)
+                result = subprocess.run(command, capture_output=True, text=True, check=True,
+                                        env=environment, cwd=self.home)
                 self.assertIn("launched fixture-worker", result.stdout)
                 self.assertEqual(json.loads(captured.read_text()), {
                     "CLAUDE_CONFIG_DIR": str(accounts.account_dir(expected)),

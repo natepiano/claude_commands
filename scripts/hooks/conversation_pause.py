@@ -904,8 +904,15 @@ def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
 
 
 def _review_slugs(record: PauseRecord) -> frozenset[str]:
-    return frozenset(name.removeprefix("showrunner-")
-                     for name in record.instances if name.startswith("showrunner-"))
+    from scripts.production import showrunners, staff
+
+    slugs: set[str] = set()
+    for name in record.instances:
+        if name.startswith("showrunner-"):
+            owner = showrunners.owner_for(name.removeprefix("showrunner-"))
+            if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+                slugs.add(showrunners.production_slug(str(owner.doc.path)))
+    return frozenset(slugs)
 
 
 def _timer_paused(instance: Path) -> bool:

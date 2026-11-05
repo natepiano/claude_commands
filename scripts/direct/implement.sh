@@ -5,6 +5,7 @@
 # The shared board and heartbeat describe each worker during its pass.
 
 set -euo pipefail
+"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -105,7 +106,7 @@ if ! agents_resolve "${TASK}"; then
   exit 1
 fi
 
-# One claim lock covers identity, live-state checks, and the launcher claim.
+# Lock identity checks and claim writes. Compact after the claim releases the lock.
 worker_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
   "${AGENT_FAMILY}" "${AGENT_MODEL}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
@@ -197,37 +198,6 @@ with worker_claim_lock(root):
         if family == "codex":
             if entry.get("held_design_id"):
                 fail(f"{name}: held roles resume through design_roles.py")
-            context_tokens = entry.get("context_tokens")
-            if isinstance(context_tokens, int) and context_tokens > compact_above:
-                compact = subprocess.run(
-                    [sys.executable, mesh_script, "compact", "--session-dir", root_text,
-                     "--to", name],
-                    capture_output=True, text=True,
-                )
-                if compact.returncode == 0:
-                    line = compact.stdout.strip() or f"compacted {name}"
-                    post(f"launcher: {line}")
-                else:
-                    detail = (compact.stderr.strip() or compact.stdout.strip()
-                              or f"exit {compact.returncode}").splitlines()[-1]
-                    if compact.returncode == 3:
-                        post(f"launcher: {name} still has a live turn after compaction: {detail}; "
-                             "follow-up not sent")
-                        fail(f"{name} still has a live turn after compaction; end the worker "
-                             f"(codex_mesh.py end --to {name}) and start a fresh one")
-                    if compact.returncode == 4:
-                        post(f"launcher: {detail}; follow-up not sent")
-                        fail(f"{name}: roster changed during compaction; follow-up not sent; "
-                             f"inspect the worker and use codex_mesh.py reopen --to {name} if idle")
-                    post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
-            check = subprocess.run(
-                [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
-                 "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
-                 "--role", pass_kind],
-                capture_output=True, text=True,
-            )
-            if check.returncode != 0:
-                fail(check.stderr.strip() or f"{name} is busy or not followable")
         else:
             claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
             try:
@@ -263,6 +233,41 @@ with worker_claim_lock(root):
             claim["turn_id"] = turn_id
             claim_file.write_text(json.dumps(claim))
             print(turn_id)
+if action == "claim" and family == "codex":
+    context_tokens = entry.get("context_tokens")
+    if isinstance(context_tokens, int) and context_tokens > compact_above:
+        compact = subprocess.run(
+            [sys.executable, mesh_script, "compact", "--session-dir", root_text,
+             "--to", name],
+            capture_output=True, text=True,
+        )
+        if compact.returncode == 0:
+            line = compact.stdout.strip() or f"compacted {name}"
+            post(f"launcher: {line}")
+        else:
+            detail = (compact.stderr.strip() or compact.stdout.strip()
+                      or f"exit {compact.returncode}").splitlines()[-1]
+            # Exit 3 indicates a live turn after compaction.
+            if compact.returncode == 3:
+                post(f"launcher: {name} still has a live turn after compaction: {detail}; "
+                     "follow-up not sent")
+                fail(f"{name} still has a live turn after compaction; end the worker "
+                     f"(codex_mesh.py end --to {name}) and start a fresh one")
+            if compact.returncode == 4:
+                post(f"launcher: {detail}; follow-up not sent")
+                fail(f"{name}: roster changed during compaction; follow-up not sent; "
+                     f"inspect the worker and use codex_mesh.py reopen --to {name} if idle")
+            post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
+    with worker_claim_lock(root):
+        check = subprocess.run(
+            [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
+             "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
+             "--role", pass_kind],
+            capture_output=True, text=True,
+        )
+        if check.returncode != 0:
+            fail(check.stderr.strip() or f"{name} is busy or not followable")
+
 PY
 }
 
@@ -276,8 +281,8 @@ fi
 
 if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
-  AGENT_MODEL="$(worker_record claim)"
   trap 'worker_record release' EXIT
+  AGENT_MODEL="$(worker_record claim)"
 fi
 
 # Claim the phase files before its worker can edit them.

@@ -32,8 +32,8 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Pr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
-from scripts.direct import plan_history
 from scripts.direct.worker_state import ROSTER_LIVE
+from scripts.direct import assign_gate, plan_history
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 from scripts.agents import worker_lifecycle
 from scripts.lib.agent_scope import agent_scope_prefix
@@ -1757,6 +1757,8 @@ def _claim_follow_locked(
     with worker_lifecycle.locked_state(path) as handle:
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
+        if entry.get("adopted_to"):
+            return False
         if not _validate_held_claim(name, entry, thread_id):
             return False
         current = _roster_thread(entry)
@@ -2267,6 +2269,28 @@ class CurrentDetachedRuns:
     dead: bool
 
 
+def worker_run_history(session_dir: str, name: str) -> tuple[str, ...]:
+    """Return the runs that contain the worker's staff identity."""
+    roster = worker_lifecycle.read_worker_state(_session_path(session_dir, ROSTER_FILE))
+    entry = _as_dict(roster.get(name))
+    reference = _as_str(entry.get("staff_id"))
+    runs = [session_dir]
+    ledger_path = _as_str(entry.get("unit_ledger"))
+    if reference and ledger_path:
+        ledger = worker_lifecycle.read_worker_state(Path(ledger_path))
+        worker = _as_dict(_as_dict(ledger.get("workers")).get(reference))
+        for events in (worker.get("events"), _as_dict(ledger.get("history")).get(reference)):
+            if isinstance(events, list):
+                for event in cast(list[object], events):
+                    run = _as_str(_as_dict(event).get("run"))
+                    if run:
+                        runs.append(run)
+    source = _as_str(entry.get("adopted_from"))
+    if source:
+        runs.append(source)
+    return tuple(dict.fromkeys(runs))
+
+
 @dataclass
 class DetachedRunWatch:
     """One launcher's run liveness, retaining immutable finished record names."""
@@ -2284,13 +2308,14 @@ class DetachedRunWatch:
         self.next_check = now + DETACHED_RUN_CHECK_SECS
         live = dead = False
         wall_now = time.time()
-        paths = _session_path(self.session_dir, DETACHED_RUNS_DIR).glob("*.json")
+        paths = (path for run in worker_run_history(self.session_dir, self.name)
+                 for path in _session_path(run, DETACHED_RUNS_DIR).glob("*.json"))
         for path in paths:
-            if path.name in self.finished:
+            if str(path) in self.finished:
                 continue
             record = _read_json_object(path)
             if record.get("status") == "finished":
-                self.finished.add(path.name)
+                self.finished.add(str(path))
                 continue
             if record.get("worker") != self.name or record.get("status") != "running":
                 continue
@@ -3671,7 +3696,7 @@ def command_start(args: argparse.Namespace) -> int:
             if reason:
                 print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
                 return 2
-            port, fresh_server = ensure_server(session_dir, cwd=str(session_staff.worker_directory(membership_record, staff_admission.parent)))
+            port, fresh_server = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or str(session_staff.worker_directory(membership_record, staff_admission.parent)))
         outcome = _run_worker(args, port, started_here=fresh_server,
                               admission=WorkerAdmission(admission, membership), staff_admission=staff_admission)
     if isinstance(outcome, WorkerLaunchRefused):
@@ -3687,7 +3712,7 @@ def command_start(args: argparse.Namespace) -> int:
         print(f"codex_mesh: {name}: {note}; retrying on a new one", file=sys.stderr)
         with contextlib.ExitStack() as admission:
             membership = admission.enter_context(worker_lifecycle.lock_membership(session_dir))
-            port, _fresh = ensure_server(session_dir, cwd=str(session_staff.worker_directory(membership_record, staff_admission.parent)))
+            port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or str(session_staff.worker_directory(membership_record, staff_admission.parent)))
             outcome = _run_worker(args, port, started_here=_fresh,
                                   admission=WorkerAdmission(admission, membership), staff_admission=staff_admission)
         tested = True
@@ -4143,7 +4168,7 @@ def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = Fal
 def _thread_start_params(args: argparse.Namespace, cwd: Path) -> dict[str, object]:
     """The `thread/start` request for one worker."""
     params: dict[str, object] = {
-        "cwd": str(cwd),
+        "cwd": _as_str(_attr(args, "cwd")) or str(cwd),
         "approvalPolicy": "never",
         # The SandboxMode string, not a SandboxPolicy object: the server rejects
         # {"type": "dangerFullAccess"} with "unknown variant `type`".
@@ -5267,9 +5292,8 @@ def _after_turn_end(stream: TurnStream, log: TextIO, turn_outcome: TurnOutcome) 
 
 def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
     """Finish a one-turn launcher unless more work is coming to its thread."""
-    # A run may have started since the last safety scan. Discover it before
-    # claiming an empty inbox; finished records are still never reopened.
-    _ = stream.runs.current()
+    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.runs):
+        return StreamStep.NEXT_FRAME
     # A finished turn may have a peer turn opening behind it.
     if (_more_work_coming(stream.client, stream.thread_id, stream.deadline)
             or stream.client.has_pending_frames):
@@ -5277,12 +5301,8 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
         # Finish only after every notice it buffered has had its turn.
         stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
-    _end_dead_runs(stream.session_dir, stream.name, stream.runs)
     if _close_messages_if_empty(stream.session_dir, stream.name, _stream_launcher(stream), stream.runs):
         return StreamStep.FINISH
-    # The turn ended on a run still going: stay attached until its result is held.
-    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.runs):
-        return StreamStep.NEXT_FRAME
     moved = _move_worker(stream)
     if isinstance(moved, WorkerWaitingForRoom):
         return _wait_for_room(stream, log, moved)
@@ -6094,8 +6114,7 @@ def _start_turn(
             for path in cast("list[object]", images) if isinstance(path, str)
         )
     params: dict[str, object] = {"threadId": thread_id, "input": inputs}
-    cwd = _as_str(_attr(args, "turn_cwd")) or _as_str(plan_history.staff_directory(
-        {"owner_session": thread_id}, staff.snapshot()).get("working_dir"))
+    cwd = _as_str(_attr(args, "turn_cwd")) or _as_str(_attr(args, "cwd"))
     if cwd:
         params["cwd"] = cwd
     # Every turn names its policy: the app-server keeps a thread's last turn policy, so a
@@ -6800,18 +6819,19 @@ class UnrecordedWorkerThread:
 
 
 def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
-                     effort: str = "", configuration: models_registry.LaunchModelConfiguration) -> dict[str, object]:
+                     effort: str = "", cwd: str = "",
+                     configuration: models_registry.LaunchModelConfiguration) -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
     try:
         admitted = worker_admission.admit(name, Path(session_dir))
     except ValueError as error:
         raise unit_workers.WorkerUnavailable(str(error)) from error
     with worker_admission.worker_operation(admitted):
-        return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort, configuration=configuration)
+        return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort, cwd=cwd, configuration=configuration)
 
 
 def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllowed, *,
-                          model: str, effort: str,
+                          model: str, effort: str, cwd: str,
                           configuration: models_registry.LaunchModelConfiguration) -> dict[str, object]:
     name = admitted.name
     with worker_lifecycle.membership_operation(session_dir):
@@ -6829,7 +6849,7 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllo
             if family != "codex":
                 raise unit_workers.WorkerUnavailable("new persistent worker requires a Codex assignment")
             membership_record = staff.local_snapshot()
-            cwd = str(session_staff.worker_directory(membership_record, admitted.parent))
+            cwd = cwd or str(session_staff.worker_directory(membership_record, admitted.parent))
             home = workers_home()
             port, fresh = ensure_server(session_dir, home, cwd=cwd)
             client = Client(port, name)
@@ -6880,13 +6900,25 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllo
         return opened
 
 
+def adopt_unit_worker(source: Path, destination: Path, name: str) -> str:
+    """Transfer worker routes through the unit ledger."""
+    adopt = cast(Callable[[Path, Path, str], str],
+                 importlib.import_module("scripts.hierarchies.worker_adoption").adopt_unit_worker)
+    try:
+        return adopt(source, destination, name)
+    except staff.StaffRefused as error:
+        raise unit_workers.WorkerUnavailable(str(error)) from error
+
+
 def command_adopt(args: argparse.Namespace) -> int:
-    source = _as_str(_attr(args, "from_run"))
-    destination = _as_str(_attr(args, "session_dir"))
+    source = Path(_as_str(_attr(args, "from_run")))
+    destination = Path(_as_str(_attr(args, "session_dir")))
     name = _as_str(_attr(args, "name"))
-    record = _lookup(source, name)
-    parent = worker_admission.admit(name, Path(destination))
-    _ = staff.move(staff.StaffId(_as_str(record.get("staff_id"))), staff.ReportsTo(parent.parent))
+    try:
+        _ = adopt_unit_worker(source, destination, name)
+    except unit_workers.WorkerUnavailable as error:
+        print(f"codex_mesh: {error}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -8781,19 +8813,13 @@ class WorkersRunMove:
     workers: tuple[SwitchingWorker | InterruptedWorkerMove, ...]
 
 
-def _account_move_command(session_dir: str, name: str) -> str:
-    return shlex.join([sys.executable, str(Path(__file__).resolve()), "resume-account-move",
+def _account_move_command(session_dir: str, name: str, assignments: agents_log.RoleLog) -> str:
+    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    assignment = task_role(session_staff.worker_session(record), assignments)
+    role = assignment.role if isinstance(assignment, AssignedWorkerRole) else ""
+    return shlex.join(["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
+                       "--role", "implement" if role == "impl" else role, "--operation", "resume-account-move",
                        "--session-dir", session_dir, "--to", name])
-
-
-def _resume_account_move_detached(session_dir: str, name: str) -> None:
-    """Give an interrupted worker without a launcher its own continuation watcher."""
-    with _session_path(session_dir, f"{name}.account-move-launcher.log").open("ab") as log:
-        _ = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "resume-account-move",
-             "--session-dir", session_dir, "--to", name],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
-        )
 
 
 def command_resume_account_move(args: argparse.Namespace) -> int:
@@ -8875,7 +8901,7 @@ def _wait_account_move_resumes(
     """Await every dispatched move against one deadline, without serial worker waits."""
     pending = {(move.session_dir, move.name): move for move in moves}
     outcomes: dict[tuple[str, str], WorkerSwitchOutcome] = {}
-    detached: set[tuple[str, str]] = set()
+    assignments = task_assignments()
     deadline = time.monotonic() + ACCOUNT_MOVE_RESUME_TIMEOUT_SECS
     while pending:
         for key, move in tuple(pending.items()):
@@ -8885,22 +8911,23 @@ def _wait_account_move_resumes(
                     if result.get("resumed") is True:
                         outcomes[key] = WorkerMoveResumed()
                     elif reason := _as_str(result.get("error")):
-                        outcomes[key] = WorkerMoveFailed(reason, _account_move_command(*key))
+                        outcomes[key] = WorkerMoveFailed(reason, _account_move_command(*key, assignments))
                 if key in outcomes:
                     del pending[key]
                     continue
-                if key not in detached and (move.launcher_pid <= 0 or not _pid_alive(move.launcher_pid)):
-                    _resume_account_move_detached(*key)
-                    detached.add(key)
+                if move.launcher_pid <= 0 or not _pid_alive(move.launcher_pid):
+                    outcomes[key] = WorkerMoveFailed("the director must resume this worker through assign.sh",
+                                                     _account_move_command(*key, assignments))
+                    del pending[key]
             except (ConnectionError, OSError, SystemExit) as error:
-                outcomes[key] = WorkerMoveFailed(f"resume failed: {error}", _account_move_command(*key))
+                outcomes[key] = WorkerMoveFailed(f"resume failed: {error}", _account_move_command(*key, assignments))
                 del pending[key]
         if not pending:
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             for key in pending:
-                outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key))
+                outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key, assignments))
             break
         # The last poll ends at the deadline: summed 0.05 s steps can fall one rounding short of it.
         time.sleep(min(0.05, remaining))
@@ -8980,7 +9007,7 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             raise RuntimeError("account move requires its passed bulk ownership")
         current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         if current != entry or current.get("status") != "running":
-            return SwitchingWorker(name, False, WorkerMoveFailed("worker ownership changed before account move", _account_move_command(session_dir, name)))
+            return SwitchingWorker(name, False, WorkerMoveFailed("worker ownership changed before account move", _account_move_command(session_dir, name, task_assignments())))
         thread_id = _as_str(session_staff.worker_session(entry))
         marker: AccountMoveMarker | NoAccountMove = NoAccountMove()
         client: Client | None = None
@@ -9024,7 +9051,7 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             if isinstance(marker, AccountMoveMarker):
                 with contextlib.suppress(OSError):
                     _fail_account_move(session_dir, name, marker, reason)
-            return SwitchingWorker(name, True, WorkerMoveFailed(reason, _account_move_command(session_dir, name)))
+            return SwitchingWorker(name, True, WorkerMoveFailed(reason, _account_move_command(session_dir, name, task_assignments())))
         finally:
             if client is not None:
                 client.close()
@@ -9137,7 +9164,7 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowe
             cwd = session_staff.worker_directory(membership_record, admitted.parent)
             params: dict[str, object] = {
                 "developerInstructions": instructions,
-                "cwd": str(cwd),
+                "cwd": _as_str(_attr(args, "cwd")) or str(cwd),
                 "sandbox": _as_str(_attr(args, "sandbox")) or READ_ONLY_SANDBOX,
                 "approvalPolicy": "never",
             }
@@ -9449,6 +9476,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--effort", default="")
     _ = start.add_argument("--service-tier", default="")
     _ = start.add_argument("--task", default="")
+    _ = start.add_argument("--cwd", default="")
     _ = start.add_argument("--sandbox", choices=SANDBOX_MODES, default=WORKER_SANDBOX)
     _ = start.add_argument("--timeout", type=float, default=86400.0)
     _ = start.add_argument(
@@ -9492,6 +9520,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = prime.add_argument("--effort", default="")
     _ = prime.add_argument("--service-tier", default="")
     _ = prime.add_argument("--task", default="")
+    _ = prime.add_argument("--cwd", default="")
     _ = prime.add_argument("--sandbox", choices=SANDBOX_MODES, default=READ_ONLY_SANDBOX)
     _ = prime.add_argument("--held-design", default="")
     _ = prime.add_argument("--held-role", default="")
@@ -9629,4 +9658,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in {"start", "follow", "reopen", "fork", "adopt", "prime", "resume-account-move"}:
+        assign_gate.require_assign()
     sys.exit(main())

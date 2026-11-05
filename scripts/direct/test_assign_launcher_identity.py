@@ -7,7 +7,7 @@ from typing import cast, final
 from scripts.agents import test_codex_mesh as mesh_fixture
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct import workers
-from scripts.direct.assign_launcher_test_support import ASSIGN, read_object
+from scripts.direct.assign_launcher_test_support import read_object
 from scripts.direct import assign_launcher_test_support as launcher_fixture
 
 
@@ -44,7 +44,8 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
     def test_unit_reviews_reuse_their_reviewer_across_passes(self) -> None:
         self.commit_project()
         for pass_number in ("1", "2"):
-            option, name = ("--slot", "review") if pass_number == "1" else ("--to", "project-review")
+            option = "--new-worker" if pass_number == "1" else "--to"
+            name = "project-review"
             self.review_launcher(option, name, pass_number)
             turns_started = self.methods("turn/start")
             self.assertEqual(len(turns_started), int(pass_number))
@@ -141,7 +142,8 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
         record.update({"status": "running", "launcher_pid": os.getpid(), "turn_id": "busy-turn"})
         self.write_pool_roster({name: record})
         started = [event for event in self.events() if event.get("event_type") == "pass_started"]
-        result = self.launch("implement", "--to", name, execution=launcher_fixture.LauncherScript(ASSIGN))
+        result = self.launch("implement", "--to", name,
+                             execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)
         self.assertEqual(len([event for event in self.events() if event.get("event_type") == "pass_started"]),

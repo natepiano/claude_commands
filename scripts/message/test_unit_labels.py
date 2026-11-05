@@ -116,11 +116,11 @@ class FileOnlyLabelTests(unittest.TestCase):
                                           worktree=staff.PresentWorktree("natedev", root / name)))
             snapshot = staff.StaffSnapshot(tuple(rows))
 
-            def timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.Timer:
+            def timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.TimerRegistration:
                 del record
                 if row.name == "broken-owner":
                     raise OSError("fixture timer cannot be read")
-                return showrunners.Timer("healthy-alias", f"session:{row.current_session}", root / "healthy.md", "UTC")
+                return showrunners.TimerRegistration("healthy-alias", f"session:{row.current_session}", "UTC")
 
             with (mock.patch.object(showrunners, "timer_for", side_effect=timer),
                   mock.patch.object(remote, "local_machine", return_value="natedev")):

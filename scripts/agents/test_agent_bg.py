@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 from scripts.lib import models_registry
 from scripts.lib.test_models_registry import write_registry
+from scripts.direct.assign_launcher_test_support import backend_fixture_command
+from scripts.lib.process_group import send_process_group
 from scripts.message import sessions
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
@@ -68,7 +70,7 @@ Path(os.environ["FIXTURE_SENT"]).write_text(json.dumps({"arguments": sys.argv[1:
 if os.environ.get("FIXTURE_GATE"):
     with socket.socket(socket.AF_UNIX) as gate:
         gate.connect(os.environ["FIXTURE_GATE"])
-        gate.sendall(str(os.getpid()).encode())
+        gate.sendall(str(os.getppid()).encode())
         gate.recv(1)
 print("SENT: fixture")
 '''
@@ -146,8 +148,10 @@ class NativeClaudeWorkerTests(StaffTestCase):
 
     def launch(self, **environment: str) -> subprocess.CompletedProcess[str]:
         self.fixture.sent.unlink(missing_ok=True)
-        return subprocess.run(self.command(),
-                              cwd=self.fixture.work, env={**self.fixture.environment, **environment}, capture_output=True, text=True,
+        command, launch_environment = backend_fixture_command(
+            self.root / "assign-parent", self.command(),
+            {**self.fixture.environment, **environment})
+        return subprocess.run(command, cwd=self.fixture.work, env=launch_environment, capture_output=True, text=True,
                               check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def backend_calls(self) -> list[dict[str, object]]:
@@ -181,25 +185,28 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 address = gate.bind_socket()
                 gate.listen()
                 gate.settimeout(TEST_HANG_GUARD_SECS)
-                with subprocess.Popen(self.command(), cwd=self.fixture.work, text=True,
-                        env={**self.fixture.environment, "FIXTURE_GATE": str(address), "AGENT_BG_DETACH": "0",
+                command, environment = backend_fixture_command(
+                    self.root / "assign-parent", self.command(),
+                    {**self.fixture.environment, "FIXTURE_GATE": str(address), "AGENT_BG_DETACH": "0",
                              "CODEX_HOME": str(backend.codex_home), "FIXTURE_STOPPED": str(stopped),
                              "UNIT_RUN_DIR": str(parent), "PLAN_DELEGATE_BOARD_DIR": str(parent),
-                             "PYTHONPATH": os.pathsep.join((str(modules), str(CHECKOUT)))},
+                             "PYTHONPATH": os.pathsep.join((str(modules), str(CHECKOUT)))})
+                with subprocess.Popen(command, cwd=self.fixture.work, text=True, env=environment,
+                        start_new_session=True,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE) as launcher:
                     try:
                         with gate.accept()[0] as delivery:
                             delivery.settimeout(TEST_HANG_GUARD_SECS)
-                            _ = delivery.recv(32)
+                            launcher_pid = int(delivery.recv(32))
                             coordinator = 0
                             pipes: set[str] = set()
                             if self.inspect_linux_processes:
-                                children = Path(f"/proc/{launcher.pid}/task/{launcher.pid}/children").read_text().split()
+                                children = Path(f"/proc/{launcher_pid}/task/{launcher_pid}/children").read_text().split()
                                 coordinator = next(int(pid) for pid in children
                                     if b"coordinate-claude" in Path(f"/proc/{pid}/cmdline").read_bytes())
                                 pipes = {os.readlink(f"/proc/{coordinator}/fd/{fd}") for fd in (0, 1)}
                             if cancel:
-                                launcher.send_signal(signal.SIGTERM)
+                                os.kill(launcher_pid, signal.SIGTERM)
                             delivery.sendall(b"1")
                         if not cancel:
                             for status in (b"busy", b"idle", b"idle"):
@@ -208,12 +215,14 @@ class NativeClaudeWorkerTests(StaffTestCase):
                                     _ = turn.recv(512)
                                     if self.inspect_linux_processes:
                                         self.assertFalse(Path(f"/proc/{coordinator}").exists())
-                                        descriptors = {os.readlink(path) for path in Path(f"/proc/{launcher.pid}/fd").iterdir()}
+                                        descriptors = {os.readlink(path) for path in Path(f"/proc/{launcher_pid}/fd").iterdir()}
                                         self.assertTrue(pipes.isdisjoint(descriptors), descriptors)
                                     turn.sendall(status)
                         output, errors = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
                     finally:
-                        launcher.kill()
+                        if launcher.poll() is None:
+                            send_process_group(launcher.pid, signal.SIGKILL)
+                            _ = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(launcher.returncode, 143 if cancel else 0, output + errors)
                 record = cast(dict[str, dict[str, object]], json.loads((self.fixture.run_dir / "mesh_roster.json").read_text()))
                 self.assertEqual(record["fresh-impl"]["dispatch_state"], "sending" if cancel else "accepted")

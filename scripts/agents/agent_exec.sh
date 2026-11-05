@@ -160,5 +160,6 @@ agents_exec_main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    "${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
     agents_exec_main "$@"
 fi

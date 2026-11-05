@@ -304,6 +304,8 @@ class RosterTests(unittest.TestCase):
 
         self.director_run = self.runs / "director-run"
         self.director_run.mkdir()
+        _ = (self.director_run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: unit.id}),
+                                                               encoding="utf-8")
         _ = (self.runs / "active" / "17e44ec4-3e24-5ae1-b10d-5cf30de9455b").write_text(
             str(self.director_run) + "\n", encoding="utf-8",
         )

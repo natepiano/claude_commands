@@ -4,6 +4,7 @@
 # Staff supplies its current identity for later messages and cleanup.
 
 set -euo pipefail
+"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 unset STAFF_ID
 
 ATTACH=0
