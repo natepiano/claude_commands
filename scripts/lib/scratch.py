@@ -893,7 +893,11 @@ def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfi
     for path in candidates:
         record = task_of(path, scratch_settings=scratch_settings) if not path.is_symlink() else copy_record.NotRegistered()
         if isinstance(record, copy_record.Registered):
-            found.append(Folder(path, record.task, folder_record(path).stat().st_mtime))
+            try:
+                modified = folder_record(path).stat().st_mtime
+            except FileNotFoundError:
+                continue
+            found.append(Folder(path, record.task, modified))
     return found
 
 

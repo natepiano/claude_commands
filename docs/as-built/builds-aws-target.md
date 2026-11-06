@@ -276,11 +276,15 @@ The controller activation and routing proof remain separate plan stages.
    The controller and the sender read the same record before the legacy `offload` value.
    The stage enables and starts `aws-target.service` with `systemctl --user`.
    It requires the reviewed AWS registry rows and edits no tracked file.
-3. `routing-proof` runs `verify.sh test aws-routing-proof --target aws --no-cache` in `scripts/aws_target/proof_crate`.
+3. `routing-proof` runs `verify.sh test aws-routing-proof --target aws --no-cache` in a scratch Git repository.
+   The folder uses task `gate:aws-routing-proof`.
+   The next `up` removes a folder left by a dead run.
+   `scripts/aws_target/routing_proof.py` supplies the crate files.
    The crate has its own workspace, no Rust dependencies, and one test that runs the compiler.
    The runner requires `flake.nix` and `flake.lock`, so the crate supplies a small locked shell.
    The `default` shell retains the host tools on PATH.
-   The stage uses the existing `DOC_REPO_TOP` source override to copy only the crate.
+   Git identifies the temporary folder as the source root.
+   The stage deletes the folder after the command ends.
    The crate needs no other source repository.
    The normal queue retains admission, spending, and version checks.
    The stage requires a new successful pinned buildlog step with `target=aws` and `host=aws-build`.

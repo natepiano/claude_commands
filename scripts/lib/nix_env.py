@@ -157,6 +157,23 @@ def registered_copy(envrc: Path) -> bool:
         return False
 
 
+def generated_source(root: Path) -> bool:
+    """Accept a scratch record that marks files written by our code."""
+    try:
+        folder = root.resolve(strict=True)
+        repository_root = str(Path(__file__).resolve().parents[2])
+        if repository_root not in sys.path:
+            sys.path.insert(0, repository_root)
+        from scripts.lib import copy_record
+
+        if folder.parent != copy_record.root().resolve():
+            return False
+        record = copy_record.read_record(folder / copy_record.RECORD)
+        return isinstance(record, copy_record.Registered) and record.fields.get("generated_source") is True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def trusted_envrc(envrc: Path) -> bool:
     """Approval belongs to the file's resolved location, never a symlink alias."""
     try:

@@ -562,6 +562,25 @@ print(scratch.target('gate:proof', 'tree', False))
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["ended_task"], "gate:copy")
 
+    def test_folders_omits_a_sibling_removed_after_its_record_was_read(self) -> None:
+        vanished = scratch.new("gate:vanished", "proof")
+        remaining = scratch.new("gate:remaining", "proof")
+        task_of = scratch.task_of
+
+        def remove_after_read(path: Path, *, scratch_settings: conf.ConfigRead,
+        ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
+            record = task_of(path, scratch_settings=scratch_settings)
+            if path == vanished:
+                (path / copy_record.RECORD).unlink()
+                path.rmdir()
+            return record
+
+        with mock.patch.object(scratch, "task_of", side_effect=remove_after_read):
+            paths = [folder.path for folder in scratch.folders()]
+        self.assertNotIn(vanished, paths)
+        self.assertIn(remaining, paths)
+        self.assertFalse(vanished.exists())
+
     def test_end_rechecks_task_after_a_hand_over_between_snapshot_and_lock(self) -> None:
         path = self.copy(task="gate:old")
         snapshot = scratch.folders()

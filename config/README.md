@@ -667,7 +667,9 @@ The helper prints policy changes and preserves unrelated rules.
 
 `idle_stop_margin_s=120` allows two extra minutes for the box to finish its idle stop.
 The range is 0 through 600 seconds.
-The routing proof uses `scripts/aws_target/proof_crate` in this repository.
+The routing proof writes its crate from `scripts/aws_target/routing_proof.py` into a Git repository in a scratch folder.
+The folder uses task `gate:aws-routing-proof`.
+The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.

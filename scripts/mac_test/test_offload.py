@@ -28,9 +28,11 @@ else:
 
 import offload
 if TYPE_CHECKING:
+    from ..lib import copy_record, nix_env, scratch
     from ..build_targets import target_config
     from ..buildlog import sync as buildlog_sync, health as buildlog_health, record as buildlog_record, store as buildlog_store
 else:
+    from scripts.lib import copy_record, nix_env, scratch
     import target_config
     import sync as buildlog_sync
     import health as buildlog_health
@@ -41,6 +43,21 @@ from offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMA
 
 RUN_SUBPROCESS = subprocess.run
 START_SUBPROCESS = subprocess.Popen
+
+
+class GeneratedSourceTests(unittest.TestCase):
+    def test_no_envrc_source_requires_generated_source_outside_trusted_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, \
+             mock.patch.dict(os.environ, {'SCRATCH_ROOT': str(Path(temporary) / 'scratch')}):
+            folder = scratch.new('gate:offload-generated-source', 'proof')
+            self.assertIsNone(nix_env.nearest_envrc(folder))
+            self.assertFalse(offload.trusted_linux_source(folder))
+            _ = scratch.update_record(folder, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': True})
+            self.assertTrue(offload.trusted_linux_source(folder))
+            _ = (folder / '.envrc').write_text('use flake\n')
+            with mock.patch.object(nix_env, 'ensure', return_value=nix_env.Refused('not approved')):
+                self.assertFalse(offload.trusted_linux_source(folder))
 
 
 class LintVerbTests(unittest.TestCase):

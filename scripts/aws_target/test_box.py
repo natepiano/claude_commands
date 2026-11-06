@@ -7,6 +7,9 @@ from email.message import Message
 from io import BytesIO, StringIO
 import json
 import os
+import shutil
+import shlex
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -15,17 +18,17 @@ from typing import cast, final, override
 from unittest import mock
 from urllib.error import HTTPError, URLError
 
-from scripts.aws_target import admin_secrets, box, deploy
+from scripts.aws_target import admin_secrets, box, deploy, routing_proof
 from scripts.aws_target.ledger import mapping
 from scripts.aws_target.aws_target import AwsUnavailable
 from scripts.build_targets import target_config
 from scripts.mac_test import mac_test, offload
-from scripts.lib import conf
+from scripts.lib import conf, copy_record, scratch
 
 SYSTEM = '/nix/store/' + 'a' * 32 + '-nixos-system-aws-build'
 IMAGE_TAGS = [{'Key': box.IMAGE_OWNER_TAG, 'Value': 'true'}]
 
-FAKE = r'''import json, os, pathlib, shlex, sys
+FAKE = r'''import json, os, pathlib, shlex, subprocess, sys
 root = pathlib.Path(os.environ['BOX_FIXTURE'])
 path = root / 'live.json'
 s = json.loads(path.read_text())
@@ -118,12 +121,22 @@ elif name == 'systemctl':
     elif 'is-enabled' in args: print('enabled' if s.get('controller') else 'disabled')
     elif 'is-active' in args: print('active' if s.get('controller') else 'inactive')
 elif name in ('rustc', 'cargo'):
-    versions([name, *args])
+    if name == 'cargo' and args[:1] == ['metadata']:
+        output({'workspace_root': str(pathlib.Path.cwd()), 'target_directory': str(pathlib.Path.cwd() / 'target')})
+    else:
+        versions([name, *args])
 elif name == 'bash':
     words = shlex.split(args[-1])
     source = pathlib.Path(words[words.index('cd') + 1])
-    assert source.name == 'proof_crate' and (source / 'Cargo.toml').is_file()
-    assert 'DOC_REPO_TOP=' + str(source) in words
+    assert source.parent == pathlib.Path(os.environ['SCRATCH_ROOT'])
+    record = json.loads((source / '.scratch.json').read_text())
+    assert record['task'] == 'gate:aws-routing-proof'
+    assert record['generated_source'] is True
+    s.setdefault('proof_tasks', []).append(record['task']); save()
+    assert 'name = "aws-routing-proof"' in (source / 'Cargo.toml').read_text()
+    assert not any(word.startswith('DOC_REPO_TOP=') for word in words)
+    assert subprocess.check_output([os.environ['BOX_REAL_GIT'], '-C', str(source), 'status', '--porcelain']) == b''
+    assert subprocess.check_output([os.environ['BOX_REAL_GIT'], '-C', str(source), 'show', 'HEAD:Cargo.toml']) == (source / 'Cargo.toml').read_bytes()
     assert words[words.index('test') + 1] == 'aws-routing-proof'
     if s.get('proof_failure'): sys.exit(1)
     if not s.get('missing_record'):
@@ -135,6 +148,8 @@ elif name == 'tailscale':
             'Peer': {'mac': {'HostName': "Nate's MacBook Pro 2023", 'DNSName': 'nates-macbook-pro-2023.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.2']},
                      'box': {'ID': 'node-box', 'TailscaleIPs': ['100.64.0.3'], 'sshHostKeys': s.get('host_keys', [])}}})
 elif name == 'git':
+    if 'core.hooksPath=/dev/null' in args:
+        sys.exit(subprocess.call([os.environ['BOX_REAL_GIT'], *args]))
     if 'branch' in args: print('main')
     elif s.get('dirty'): print(' M hosts/aws-build.nix')
 elif name == 'nix':
@@ -297,7 +312,8 @@ class BoxTests(unittest.TestCase):
             _ = path.write_text(f'#!{sys.executable}\n' + FAKE)
             path.chmod(0o700)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root),
-                                      'HOME': str(self.root / 'home'),
+                                      'SCRATCH_ROOT': str(self.root / 'scratch'), 'SCRATCH_HOLDS': str(self.root / 'holds.json'),
+                                      'HOME': str(self.root / 'home'), 'BOX_REAL_GIT': shutil.which('git') or 'git',
                                       'BUILDLOG_DIR': str(self.root / 'buildlog'), 'PATH': str(bin_path) + os.pathsep + os.environ['PATH']})))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.directory)))
         _ = cast(object, self.enterContext(mock.patch('target_config.ssh_target_state_directory', return_value=self.directory)))
@@ -914,12 +930,40 @@ class BoxTests(unittest.TestCase):
         self.assertTrue(target_config.aws_routing_enabled(conf.read(self.settings)))
         self.assertTrue(offload.read_config(self.settings).enabled)
 
+    def test_written_routing_crate_has_a_clean_committed_repository(self) -> None:
+        task = 'gate:aws-routing-proof-test'
+        directory = scratch.new(task, 'routing-proof')
+        try:
+            _ = scratch.update_record(directory, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': True})
+            self.assertTrue((directory / copy_record.RECORD).exists())
+            routing_proof.write_crate(directory)
+            git = [os.environ['BOX_REAL_GIT'], '-C', str(directory), '-c', 'core.hooksPath=/dev/null',
+                   '-c', 'commit.gpgsign=false', '-c', 'user.name=AWS Routing Proof',
+                   '-c', 'user.email=aws-routing-proof@example.invalid']
+            _ = subprocess.run([*git, 'init', '--initial-branch=main'], capture_output=True, text=True, check=True)
+            scratch.exclude_copy_metadata(directory)
+            for command in (['add', '.'], ['commit', '-m', 'Create the routing proof crate']):
+                _ = subprocess.run([*git, *command], capture_output=True, text=True, check=True)
+            status = subprocess.run([*git, 'status', '--porcelain'], capture_output=True, text=True, check=True)
+            self.assertEqual(status.stdout, '')
+            for name, content in routing_proof.FILES.items():
+                committed = subprocess.run([*git, 'show', 'HEAD:' + name], capture_output=True, text=True, check=True)
+                self.assertEqual(committed.stdout, content)
+            self.assertEqual(set(routing_proof.FILES),
+                             {'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.gitignore', 'src/lib.rs'})
+        finally:
+            _ = scratch.end(task)
+        self.assertFalse(directory.exists())
+
     def test_routing_proof_requires_a_new_successful_aws_step_and_resumes(self) -> None:
         self.subject.activate()
         self.assertFalse(self.subject.routing_proof_present())
         self.change(proof_failure=True)
         with self.assertRaises(box.BoxRefused):
             self.subject.routing_proof()
+        failed_source = Path(shlex.split(next(c[-1] for c in self.commands() if c[0] == 'bash'))[1])
+        self.assertFalse(failed_source.exists())
         self.change(proof_failure=False, missing_record=True)
         with self.assertRaisesRegex(box.BoxRefused, 'no new successful'):
             self.subject.routing_proof()
@@ -931,8 +975,46 @@ class BoxTests(unittest.TestCase):
         self.assertEqual(len(self.commands()), commands)
         command = next(c[-1] for c in self.commands() if c[0] == 'bash')
         self.assertIn('test aws-routing-proof --target aws --no-cache', command)
-        self.assertIn(str(Path(box.__file__).resolve().parent / 'proof_crate'), command)
+        source = Path(shlex.split(command)[1])
+        self.assertEqual(source.parent, Path(os.environ['SCRATCH_ROOT']))
+        self.assertFalse(source.exists())
         self.assertNotIn('cargo-liner', command)
+        sources = [Path(shlex.split(c[-1])[1]) for c in self.commands() if c[0] == 'bash']
+        self.assertEqual(len(set(sources)), 3)
+        tasks = cast(list[str], self.live()['proof_tasks'])
+        self.assertEqual(tasks, ['gate:aws-routing-proof'] * 3)
+        self.assertTrue(all(not path.exists() for path in sources))
+
+    def test_routing_proof_saves_success_before_cleanup_failure(self) -> None:
+        self.subject.activate()
+        with mock.patch.object(scratch, 'end', side_effect=[[], OSError('cleanup failed')]) as end:
+            with self.assertRaisesRegex(OSError, 'cleanup failed'):
+                self.subject.routing_proof()
+            self.assertEqual(end.call_count, 2)
+        self.assertTrue(self.subject.routing_proof_present())
+        commands = self.commands()
+        self.assertEqual(sum(command[0] == 'bash' for command in commands), 1)
+        self.subject.routing_proof()
+        self.assertEqual(self.commands(), commands)
+
+    def test_routing_proof_removes_a_dead_runs_repository_before_the_next_run(self) -> None:
+        task = 'gate:aws-routing-proof'
+        leftover = scratch.new(task, 'routing-proof')
+        routing_proof.write_crate(leftover)
+        git = [os.environ['BOX_REAL_GIT'], '-C', str(leftover), '-c', 'core.hooksPath=/dev/null',
+               '-c', 'commit.gpgsign=false', '-c', 'user.name=AWS Routing Proof',
+               '-c', 'user.email=aws-routing-proof@example.invalid']
+        for arguments in (['init', '--initial-branch=main'], ['add', '.'], ['commit', '-m', 'Create the routing proof crate']):
+            _ = subprocess.run([*git, *arguments], check=True, capture_output=True, text=True)
+        self.subject.activate()
+        self.subject.routing_proof()
+        self.assertTrue(self.subject.routing_proof_present())
+        self.assertFalse(leftover.exists())
+        self.assertEqual(self.live()['proof_tasks'], [task])
+        sources = [Path(shlex.split(command[-1])[1]) for command in self.commands() if command[0] == 'bash']
+        self.assertEqual(len(sources), 1)
+        self.assertNotEqual(sources[0], leftover)
+        self.assertFalse(sources[0].exists())
 
     def test_stopped_setup_rechecks_changed_system_and_local_versions(self) -> None:
         self.change(joined=True)

@@ -1257,7 +1257,7 @@ def trusted_linux_source(root: Path) -> bool:
         if nix_env.trusted_envrc(envrc):
             return True
         return isinstance(nix_env.ensure(root), nix_env.Loaded)
-    return nix_env.trusted_root(root) or nix_env.registered_worktree(root)
+    return nix_env.trusted_root(root) or nix_env.registered_worktree(root) or nix_env.generated_source(root)
 
 
 class PublicToolParity(TypedDict):

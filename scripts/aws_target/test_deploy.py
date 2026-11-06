@@ -397,6 +397,8 @@ class DeploymentTests(CostFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             'PATH': f'{bin_path}{os.pathsep}{os.environ["PATH"]}', 'DEPLOY_FIXTURE': str(self.root),
             'AWS_SHARED_CREDENTIALS_FILE': str(self.credentials),
+            'BOX_REAL_GIT': shutil.which('git') or 'git',
+            'SCRATCH_ROOT': str(self.root / 'scratch'), 'SCRATCH_HOLDS': str(self.root / 'holds.json'),
         })))
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         self.set_clock(self.now)

@@ -535,7 +535,10 @@ Run `python3 scripts/aws_target/deploy.py up --approve-resources` at your termin
 2. The activation stage writes `~/.local/state/build-targets/aws/routing.json` and enables `aws-target.service`.
    The reviewed registry already contains `targets=mac,natedev,aws`, `kind.aws=ssh`, `platform.aws=linux`, and `settings.aws=aws_target.conf`.
    The command refuses missing rows and edits no tracked file.
-3. The routing proof runs `verify.sh test aws-routing-proof --target aws --no-cache` in `scripts/aws_target/proof_crate`.
+3. The routing proof runs `verify.sh test aws-routing-proof --target aws --no-cache` in a scratch Git repository.
+   The folder uses task `gate:aws-routing-proof`.
+   The next `up` removes a folder left by a dead run.
+   `scripts/aws_target/routing_proof.py` supplies the crate files.
    The normal queue keeps spending, admission, and per-run tool checks.
    The crate has no Rust dependencies and uses its own locked `default` shell with the host tools.
    The stage needs no other source repository.

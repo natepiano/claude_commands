@@ -18,12 +18,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from scripts.aws_target import admin_secrets, ledger
+from scripts.aws_target import admin_secrets, ledger, routing_proof
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
 from scripts.aws_target.config import deployment_outputs, deployment_record, read_deployment_settings, read_settings
 from scripts.build_targets import target_config
 from scripts.buildlog import store
-from scripts.lib import conf
+from scripts.lib import conf, copy_record, scratch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import linux_runner, offload, mac_test
 
@@ -816,22 +816,36 @@ class BoxSetup:
             return
         if not self.activation_present():
             raise BoxRefused('routing proof requires active routing')
-        directory = Path(__file__).resolve().parent / 'proof_crate'
-        package = 'aws-routing-proof'
+        package = routing_proof.PACKAGE
         before = {path: store.read_last_whole_row_end(path) for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')}
         verify = Path(__file__).resolve().parents[1] / 'direct/verify.sh'
-        # The existing source override limits the copy to this nested workspace.
-        command = 'cd ' + shlex.quote(str(directory)) + ' && exec ' + shlex.join(
-            ['env', 'UNIT_DETACHED_RUN=1', 'DOC_REPO_TOP=' + str(directory),
-             str(verify), 'test', package, '--target', 'aws', '--no-cache'])
-        _ = self._run(['bash', '-c', command])
-        for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl'):
-            for row in store.locked_rows(path, before.get(path, 0)):
-                if (row.get('kind') == 'step' and row.get('target') == 'aws' and row.get('host') == 'aws-build'
-                        and row.get('package') == package and row.get('status') == 0 and row.get('pinned') is True):
-                    self._save_proof('routing-proof', record_id=row.get('id'), record_file=str(path))
-                    return
-        raise BoxRefused('routing proof has no new successful pinned AWS buildlog step')
+        task = 'gate:aws-routing-proof'
+        _ = scratch.end(task)
+        directory = scratch.new(task, 'routing-proof')
+        try:
+            _ = scratch.update_record(directory, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}),
+                'generated_source': True})
+            git = ['git', '-C', str(directory), '-c', 'core.hooksPath=/dev/null',
+                   '-c', 'commit.gpgsign=false', '-c', 'user.name=AWS Routing Proof',
+                   '-c', 'user.email=aws-routing-proof@example.invalid']
+            _ = self._run([*git, 'init', '--initial-branch=main'])
+            scratch.exclude_copy_metadata(directory)
+            routing_proof.write_crate(directory)
+            _ = self._run([*git, 'add', '.'])
+            _ = self._run([*git, 'commit', '-m', 'Create the routing proof crate'])
+            command = 'cd ' + shlex.quote(str(directory)) + ' && exec ' + shlex.join(
+                ['env', 'UNIT_DETACHED_RUN=1', str(verify), 'test', package, '--target', 'aws', '--no-cache'])
+            _ = self._run(['bash', '-c', command])
+            for path in store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl'):
+                for row in store.locked_rows(path, before.get(path, 0)):
+                    if (row.get('kind') == 'step' and row.get('target') == 'aws' and row.get('host') == 'aws-build'
+                            and row.get('package') == package and row.get('status') == 0 and row.get('pinned') is True):
+                        self._save_proof('routing-proof', record_id=row.get('id'), record_file=str(path))
+                        return
+            raise BoxRefused('routing proof has no new successful pinned AWS buildlog step')
+        finally:
+            _ = scratch.end(task)
 
 
 def re_store_path(value: str) -> bool:

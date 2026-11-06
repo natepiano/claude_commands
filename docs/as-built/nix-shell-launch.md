@@ -44,6 +44,8 @@ Older clones without `source_commit` and folders outside the configured copy loc
 Importing it does not reach scratch or herdr.
 The helper imports it only when it checks a copy.
 
+A direct child of the scratch root without `.envrc` passes Linux source trust when its readable registered record has `generated_source: true`.
+
 This rule checks only `.envrc`. Files it loads, including `flake.nix`, are not
 checked and may differ from the source commit.
 

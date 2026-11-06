@@ -53,7 +53,9 @@ Each stage checks the live state first. It acts only when the state is not compl
 8. **Checks.** Confirm SSM, the `/home` mount on the expected data volume, the remote lifecycle service, and plain `rustc`, `cargo nextest` and `cargo mend` versions on both hosts.
 9. **Idle stop.** Confirm the box stops itself within `idle_stop_minutes` plus a margin, through EC2.
 10. **Activation.** Turn on routing to AWS from state outside the repository, then start `aws-target.service`. The registry rows land in the tracked config by a reviewed commit, with the user's approval of each value.
-11. **Routing proof.** Run the in-repository `scripts/aws_target/proof_crate` through the normal pinned queue. Confirm `target=aws` in its record.
+11. **Routing proof.** Write the crate from `scripts/aws_target/routing_proof.py` into a scratch Git repository.
+   The folder uses task `gate:aws-routing-proof`.
+   The next `up` removes a folder left by a dead run. Run it through the normal pinned queue. Confirm `target=aws` in its record.
 
 ## Phases
 
