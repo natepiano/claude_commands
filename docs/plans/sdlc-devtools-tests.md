@@ -1120,7 +1120,7 @@ Source: sdlc [209c11a3]. Importing `scripts.production.staff` takes 38.9 ms of a
 
 **As built:** `staff.py` defers each import that only some paths use into its functions; `_Arguments` stays with the command line. The same-load median fell from 29.4 ms to 18.9 ms. The remainder is `dataclasses` with `inspect` and the module's own code. No command or behavior changed.
 
-### Phase 3x — Small stores keyed by staff id  · status: todo
+### Phase 3x — Small stores keyed by staff id  · status: done (1575a1629)
 
 Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Reduced by the Phase 3t architect review (2026-11-05): the store migration code already shipped (`change_review.py:1118`, `phase_table.py:1939`, `board_json.py:462`), with tests for interruption, reruns and ownership changes, and proposal readers already resolve staff ids. Store 3 (saved tab titles) is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files and removes each store's rewriter there.
 
@@ -1151,6 +1151,8 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Red
 **Constraints from prior phases:** keep the Phase 3s resolver. Phase 4p resolves relative question folders through `update_registration.question_folder`. Unreadable ownership is not confirmed absence. Staff rows hold canonical unit names from `unit_names.name`. Add no store registry, identity alias or live-rekey journal. Read-only consumers report the bad row and keep the other rows.
 
 **Acceptance gate:** the search in item 1 finds no reader that takes a name as a stored key, or the notice names each match and its owner. A real `/change_review` shows a moved unit's open row under its new production. The shared-folder regression passes. basedpyright `0 errors, 0 warnings, 0 notes` on changed files and their callers. Each changed module's suite passes. The full gate passes.
+
+**As built:** the change review cell, the phase note `unit:`, the board cache and the proposal `unit:` field hold staff ids, and `change_routing` routes an open row from its staff id. `change_review.py migrate-owners` moved 222 rows on natedev. The Mac run waits on the user's Mac step. After its final read shows staff ids in all open rows, delete the `by_id` condition and `migrate_owners`.
 
 ### Phase 3t — Production tools read the row and `.unit.toml`  · status: done
 
@@ -1293,3 +1295,36 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 2. After the reader switch, cleanup still refuses while the production has a timer, the footer reminder and question counts stay the same, and a deferred question still expires on time.
 3. Every running showrunner's timer fires once on the landed tree; dailies and the status line show it. sdlc's migration output is cited in the notice.
 4. Keep the lookup, requested-checkpoint, and partial-report tests. basedpyright `0 errors, 0 warnings, 0 notes`. The full gate passes.
+
+### Phase 8f — A run whose only worker dies at launch ends itself  · status: todo
+
+Source: sdlc [6d2745c7], [68b227b5]. Only `end_session.sh` removes a run's marker, and only a director's run summary or a hand calls it. When a launch fails, `assign.py` records `blocked` and exits. A session that then goes on without the run leaves the marker open. The evidence is run 6a628840: launcher up 08:34:14, worker down 08:34:17, marker still open days later. This phase covers that case only. Hierarchies removes the other cases after its Phase 24.
+
+**Depends on:** 3z
+
+#### Work Order
+
+**Goal:** when a launch fails and the run has no other worker, the start path ends the run through its normal end path. The director's next launch starts a new run. No new refusal.
+
+**Spec:**
+1. **The condition.** In `scripts/direct/assign.py` `main`, after a launch returns nonzero, end the run when all of these hold: the launch started its worker command; the worker command exited nonzero by itself (a signal to the launcher raises `SystemExit` and never reaches this step); no pass in the run's recorder state has status `completed`; the run has no worker other than this one; and `unit_runs.held` for this session names this run and no other. The last condition exists because `end_session.sh` ends every run the session directs.
+2. **Herdr.** `execute_herdr` meets the first condition only for a `worker.py assign` exit that says no worker started. Exits 3 to 8 keep a retained, busy or unknown worker, so they leave the run alone.
+3. **The action.** Run the normal end path that `docs/direct/launch_implementation.md` step 7 names: `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`. Both children run through the existing `call` helper with `check=False`. A failed child prints its error and does not change the launcher's exit code. Print one line on stderr that says the run ended and why. Keep the phase reservation: the reservation contract releases it only at a checkpoint.
+4. **Both families.** `scripts/direct/end_session.sh` reads only `CLAUDE_CODE_SESSION_ID`, but a Codex director's marker is named by `staff.runtime_id()`. Make `end_session.sh` find the Codex id the same way, so the end path works for both.
+5. **The exit code stays.** The launcher returns the code of the failed launch. A launch that does not meet the condition behaves as it does now.
+6. **Retry.** A launch after the end with no `--session-dir` starts a new run through `prepare_run`. A launch that names the ended run folder with `--session-dir` still works as it does today.
+7. **Docs.** `docs/direct/launch_implementation.md` step 7 and `docs/as-built/long-lived-workers.md` state this path. `commands/unit/direct.md` <WorkerLaunchFailure/> states that a retry after this end starts a new run.
+
+**Acceptance:** a real-path test starts `assign.py` with a worker command that exits 2 in a run with no other worker. The marker is gone, the recorder state has its finish, and the exit code is 2. A test for each failed condition shows the marker stays: a completed pass, a second worker, a second held run, a herdr exit 7. A test shows a Codex director's marker goes.
+
+**Files:**
+- `scripts/direct/assign.py` — the condition and the action.
+- `scripts/direct/end_session.sh` — the Codex session id.
+- `scripts/direct/test_assign_launcher.py` — the tests, with the overrides `UNIT_ACTIVE_DIR` and `UNIT_RUN_ROOT`.
+- `docs/direct/launch_implementation.md`, `commands/unit/direct.md`, `docs/as-built/long-lived-workers.md` — the docs.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `scripts/direct/assign.py`, `scripts/direct/end_session.sh` and the three docs.
+- `test` — `scripts/direct/test_assign_launcher.py`.
+
+**State:** none. The phase writes no new lasting record. It runs two existing commands.
