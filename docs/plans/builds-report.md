@@ -537,10 +537,11 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 **Goal:** One build page. `buildlog costs` no longer exists. `buildlog charts` publishes no page of its own: it prints the tailnet link of queue's shared build page, or prints the reason and exits non-zero when no link is available.
 
 **Spec:**
-- Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 270) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
+- Remove the `costs` command from `scripts/buildlog/cli.py` (usage line 7 and the branch at line 271) and `costs.main`, `costs.render_costs`, `costs.phase_line`, `FOOTER`, `OUTPUT_LINE_LIMIT` and `MAX_RANKED_ROWS` when no other caller remains (LSP `findReferences`). Keep `read_costs`, `aggregate_costs`, `collect_costs` and the types: `charts` reads them.
 - Move the `FOOTER` definitions into `docs/as-built/buildlog-memory-stalls.md` as plain sentences, in Simplified Technical English.
 - `charts.main` keeps its arguments (`--days 7|30`, `--no-open`). It stops writing `latest.html` and stops calling `present_page`'s publish path. It asks queue 10m's page command for the page's tailnet link (10m names it; read its as-built before the Work Order is used) and prints it, or opens it when a local display exists and `--no-open` is absent. With no link, it prints `buildlog charts: <reason>` to stderr and exits 1.
 - Delete `render_html`, `publish`, `PAGE` and `chart_data` when no caller remains.
+- A test that calls `chart_data` and also proves a calculation keeps that proof. Change it to read the typed `ChartSet`, for example `test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket` in `test_charts.py`. Delete only assertions about removed output.
 - Replace each `buildlog costs` instruction in the three as-built docs below with `buildlog charts`.
 
 **Files:**
@@ -548,14 +549,14 @@ From the builds showrunner (not the user), 2026-11-05: after queue 10m, delete `
 - `scripts/buildlog/cli.py` — no `costs` command.
 - `scripts/buildlog/costs.py` — no text output.
 - `scripts/buildlog/charts.py` — `main` prints the shared page link; page code removed.
-- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py` — tests for removed output go; new link tests.
+- `scripts/buildlog/test_costs.py`, `scripts/buildlog/test_charts.py` — assertions about removed output go; calculation assertions stay on the typed data; new link tests.
 - `docs/as-built/buildlog-memory-stalls.md` — Definitions.
 
 **Workers:** 1 writer — `rowcpu` owns all files; nothing splits.
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's.
+**Constraints from prior phases:** Phase 15's `page_data` stays; queue's feed calls it. Phase 22 made `buildlog charts` publish its own page and print its tailnet link; this phase replaces that page with queue's. Phase 33: every import in `scripts/buildlog` uses the repo root (`from scripts.buildlog import y`), a patch string names the root form (`mock.patch("scripts.buildlog.charts.x")`), and a library module adds no `sys.path` line.
 
 **Acceptance gate:**
 - A test proves `buildlog charts` prints the shared page's tailnet link and writes no page file.
@@ -576,9 +577,9 @@ Director decision: a record with no pair is unknown for both columns, old record
 **Goal:** A step row has a real Cargo output pair or `unknown` for both folders. The index never builds the pair from `target_dir`.
 
 **Spec:**
-- `scripts/buildlog/index.py` `add_step` (about line 834): `target_directory` and `build_directory` come only from the record. When the record lacks either one, store `store.UNKNOWN_IDENTITY` in both. Keep `target_dir`, `target_folder` and `build_history_group` as they are: they read `target_dir`, not the pair.
-- Column text (about line 164): `target_directory` — "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` — "resolved Cargo intermediate root; unknown when the record has no output pair".
-- The existing index must not keep made-up pairs. Confirm that the changed column text (or a `SCHEMA_VERSION` bump) makes `index.update()` rebuild every step row. Report the rebuild time on the live index.
+- `scripts/buildlog/index.py` `add_step` (about line 820): `target_directory` and `build_directory` come only from the record. When the record lacks either one, store `store.UNKNOWN_IDENTITY` in both. Keep `target_dir`, `target_folder` and `build_history_group` as they are: they read `target_dir`, not the pair.
+- Column text (about line 155): `target_directory` — "resolved Cargo artifact root; unknown when the record has no output pair"; `build_directory` — "resolved Cargo intermediate root; unknown when the record has no output pair".
+- The existing index must not keep made-up pairs. Add one to `SCHEMA_VERSION`, so that `index.update()` rebuilds every step row. A change to column text alone does not do this, because `schema_statements()` leaves out the descriptions. Report the rebuild time on the live index.
 - Readers after resources' Phases 64 and 66: `scripts/buildlog/step_outputs.py` `recorded_output_roots` returns one `RecordedStepOutput` for each distinct row, and `scripts/lint/sweep.py` `_recorded_mapping_rows()` skips a target-folder mismatch and takes an override row only when its newest start is after `TARGET_OVERRIDE_RECORDER_CUT`. Find every other reader of the two columns with LSP `findReferences` and `grep -rn "target_directory\|build_directory" scripts --include=*.py`; name each one in the summary with how it reads `unknown`. Do not edit another unit's file; report a reader that misreads `unknown`.
 
 **Files:**
@@ -589,11 +590,12 @@ Director decision: a record with no pair is unknown for both columns, old record
 
 **State:** none.
 
-**Constraints from prior phases:** Do not edit `scripts/buildlog/store.py` until queue 10q merges; this phase reads only `store.UNKNOWN_IDENTITY`. Do not edit `scripts/buildlog/step_outputs.py`, `scripts/lint/build_shape.py` or `scripts/lint/sweep.py` (resources-unit). Merge builds before dispatch so resources' Phase 66 reader is in the tree. Resources' Phase 66 binds later work: keep both guards in `_recorded_mapping_rows()` and its cut tests unchanged.
+**Constraints from prior phases:** This phase reads only `store.UNKNOWN_IDENTITY` from `scripts/buildlog/store.py`. Phase 33: every import in `scripts/buildlog` uses the repo root (`from scripts.buildlog import y`), a patch string names the root form, and a library module adds no `sys.path` line. The merge of resources' hash conflicts with Phase 33 in import lines; resolve each one in these forms. Do not edit `scripts/buildlog/step_outputs.py`, `scripts/lint/build_shape.py` or `scripts/lint/sweep.py` (resources-unit). Merge builds before dispatch so resources' Phase 66 reader is in the tree. Resources' Phase 66 binds later work: keep both guards in `_recorded_mapping_rows()` and its cut tests unchanged.
 
 **Acceptance gate:**
 - `test_index` `test_output_roots_survive_indexing_and_legacy_steps_stay_readable` changes its `legacy` row to `(unknown, unknown)` (approved by this phase's goal) and adds a row with `target_dir` set to an absolute folder, an override `argv`, and no pair: it indexes as `(unknown, unknown)`.
 - A test through `step_outputs.recorded_output_roots` and `sweep._recorded_mapping_rows()` on an index built by `index.update()` proves that no row adds a `(folder, folder)` pair. It has two rows with no pair: an override row whose start is after `TARGET_OVERRIDE_RECORDER_CUT`, and a plain Cargo row with an absolute `target_dir`. Without the `add_step` change, the test fails on each row.
+- A test builds an index at the old `SCHEMA_VERSION` with an inferred `(folder, folder)` pair, runs `index.update()`, and proves that the step row now reads `(unknown, unknown)`.
 - `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk`, `test_step_outputs`, `scripts.lint.test_sweep` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
 - `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py`: 0 errors, 0 warnings, 0 notes.
 
@@ -725,70 +727,30 @@ A good vault sync closes the question that its outage filed, through the public 
 - A `sys.path` line in `costs.py` and `vault_pull.py`: each adds one more copy of that line.
 
 ### Phase 33 — scripts/buildlog imports from the repo root  · status: done
-**Depends on:** none
 
-From the builds showrunner (not the user), 2026-11-05: "change to Phase 33. Do not add a path module for scripts/buildlog. The repo already has one way: about 880 files import from the repo root (from scripts.x import y). Move scripts/buildlog to that way and delete its sys.path lines. A new per-folder path module is a second way. If a buildlog script that runs by path cannot find the repo root, use what the other repo-root scripts use, not a new module."
+#### As-built
 
-From the builds showrunner (not the user), 2026-11-05: "call accepted: the 23 outside callers move in Phase 33 (one owner switches all callers). I tell the owners now. Keep the outside edits to import lines only."
-
-Decided by the director: the outside importers move in this phase. A bare `import record` beside a repo-root `scripts.buildlog.record` loads two copies in one process, and one owner switches all callers. Only `store` had protection against two copies, so that code goes away with its last bare caller.
-
-From the builds showrunner (not the user), 2026-11-05: "accepted. Move every bare importer of scripts/notify modules to the repo-root form, import lines and strings only." The review found that a bare `push_texts` lost its required action text once `catalog()` loaded the root `push_catalog`. So the phase also moves every bare importer of `scripts/notify` modules, and the Files list below grows by those importers. `sessions` and `unit_runs` stay bare: about 36 other files import them bare, and the phase adds no new module pair.
-
-#### Work Order
-
-**Goal:** All of `scripts/buildlog` and every outside importer of its modules use the repository's one import form, `from scripts.x import y`. The per-folder `sys.path` lines and the two-name store code go away. Behavior does not change.
-
-**Spec:**
-- Each module and test module in `scripts/buildlog` imports a sibling as `from scripts.buildlog import y` or `from scripts.buildlog.y import z`. It imports from another script folder as `from scripts.lib.y import z`, in the same way. Collapse each `if __package__:` branch and each `TYPE_CHECKING` split that exists only for the import form into one plain import. A real type-only import stays under `TYPE_CHECKING`, in the repo-root form.
-- Delete every `sys.path.insert` and `sys.path.append` line in `scripts/buildlog`, also the ones inside functions and the loop in `holds.py`.
-- A buildlog module that runs by path keeps one line, before its first project import. It is the line the other repo-root scripts use: `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))`. These modules have a `__main__` block or a by-path runner: `cli.py`, `record.py`, `mac_idle.py`, `step_context.py`, `health.py`, `port_lint.py`, `width_trial.py`. Check each by-path runner in `scripts/buildlog/buildlog`, `scripts/lint/invoke.sh`, `scripts/lint/port-lint`, `scripts/buildlog/sync.py`, `scripts/hana_shot/hana_shot.py` and `scripts/direct/verify.sh`. Library modules and test modules have no path line. Tests run from the repo root.
-- The 23 outside files in the Files field change their bare imports of buildlog modules to the same form, and their `if __package__:` branches collapse. Delete an outside path line whose only use is to find `scripts/buildlog`. An outside module that a by-path entry reaches with no repo root on the path gets the same one line. Other path lines in those files stay.
-- String forms follow the imports: `mock.patch("record.x")` becomes `mock.patch("scripts.buildlog.record.x")`, and `sys.modules["record"]` the same. Code strings that a test runs in a subprocess import through the repo root. Keep what each test proves. The same applies to patches of an outside module that a buildlog module now imports by its repo-root name.
-- No process may load a module with state under both a bare name and its repo-root name where a caller depends on one copy. Where the move makes that happen, move the bare importer as well, and name it in the summary.
-- With no bare caller left, delete the two-name store code: `_register_module_aliases` in `store.py`, `scripts/buildlog/__init__.py`, and `test_store_identity.py`, whose subject is that code.
-- New test module `scripts/buildlog/test_repo_root_imports.py`. It runs each by-path module in the list by its path, in a subprocess with `PYTHONPATH` removed. The working folder is a temporary folder that holds an unrelated `scripts/__init__.py` which raises when imported. In one table with `subTest`, each module must exit without an import error. Use a no-op argument for each one, so that no record is written.
-- Remove each `# noqa: E402` that the deletions leave with no purpose.
-- Add no path module, no new guard and no compatibility layer.
+All of `scripts/buildlog` and every outside importer of its modules use the repository's one import form. Behavior does not change.
+- A module or test module imports a sibling as `from scripts.buildlog import y` or `from scripts.buildlog.y import z`, and another script folder as `from scripts.lib.y import z`.
+- A library module or test module has no `sys.path` line. Seven modules that run by path keep one line before the first project import, `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))`: `cli.py`, `record.py`, `mac_idle.py`, `step_context.py`, `health.py`, `port_lint.py`, `width_trial.py`.
+- A patch string names the root form: `mock.patch("scripts.buildlog.record.x")`. A code string that a test runs in a subprocess imports through the repo root.
+- Outside `scripts/notify`, no file imports a `scripts/notify` module by a bare name.
+- `_register_module_aliases`, `scripts/buildlog/__init__.py` and `test_store_identity.py` do not exist.
 
 **Files:**
-- `scripts/buildlog/` — every module and test module changes as the Spec says; `__init__.py` and `test_store_identity.py` go away.
-- `scripts/buildlog/test_repo_root_imports.py` — new; the by-path test.
-- `scripts/aws_target/measurement_test_support.py` — bare buildlog imports move to the repo-root form.
-- `scripts/aws_target/test_measurement.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_hold/hold_enforcer.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_queue/admission_client.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_queue/admission_service.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_queue/admission_test_support.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_queue/test_admission_service.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_queue/test_queue_evidence.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_queue/test_queue_place.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_targets/targets.py` — bare buildlog imports move to the repo-root form.
-- `scripts/build_targets/test_build_targets.py` — bare buildlog imports move to the repo-root form.
-- `scripts/lint/memory_admit.py` — bare buildlog imports move to the repo-root form.
-- `scripts/lint/sweep.py` — bare buildlog imports move to the repo-root form.
-- `scripts/lint/test_invoke_scope.py` — bare buildlog imports move to the repo-root form.
-- `scripts/lint/test_memory_admit.py` — bare buildlog imports move to the repo-root form.
-- `scripts/lint/test_sweep.py` — bare buildlog imports move to the repo-root form.
-- `scripts/mac_test/offload.py` — bare buildlog imports move to the repo-root form.
-- `scripts/mac_test/offload_test_support.py` — bare buildlog imports move to the repo-root form.
-- `scripts/mac_test/test_offload.py` — bare buildlog imports move to the repo-root form.
-- `scripts/mac_test/test_offload_lifecycle.py` — bare buildlog imports move to the repo-root form.
-- `scripts/mac_test/test_target_state.py` — bare buildlog imports move to the repo-root form.
-- `scripts/test_times/show.py` — bare buildlog imports move to the repo-root form.
-- `scripts/test_times/test_show.py` — bare buildlog imports move to the repo-root form.
-- `docs/as-built/build-followups.md` — the `disk.py` path line. The director owns this doc.
-- `docs/as-built/build-targets.md` — the rule on shared module names, for the buildlog folder. The director owns this doc.
+- `scripts/buildlog/` — every module and test module, in the root form.
+- `scripts/buildlog/test_repo_root_imports.py` — `test_entry_scripts_import_without_pythonpath` runs each by-path module with `PYTHONPATH` removed and an unrelated `scripts` package in the working folder; `test_entry_scripts_load_each_shared_module_once` checks that a shared module loads under one name.
+- `scripts/aws_target/`, `scripts/build_hold/`, `scripts/build_queue/`, `scripts/build_targets/`, `scripts/lint/`, `scripts/mac_test/`, `scripts/test_times/` — outside importers of buildlog modules.
+- `docs/as-built/build-followups.md`, `docs/as-built/build-targets.md` — the path line of `disk.py` and the rule on shared module names.
 
-**Workers:** 1 writer — `rowcpu` owns all code files. The import form and its tests must change together, so nothing splits.
+**Binds later work:** A buildlog import, patch string or test code string uses the root form. A library module adds no `sys.path` line.
 
-**State:** none.
+**Gotchas:**
+- A caller suite list misses test strings in modules outside the list; the merge gate finds them.
+- The type check of the gate passes `--pythonpath` with a pinned venv, so that `bpy` and `PIL` resolve. Bare `basedpyright` differs from it.
+- `merge_gate.py --tests-only` runs no type check unless `--type-dirs` names folders.
+- Another unit can add a bare import of a buildlog module until it merges this phase.
 
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-- `scripts/buildlog/test_repo_root_imports.py` runs each by-path module, with `PYTHONPATH` removed and an unrelated `scripts` package in the working folder, and each exits without an import error.
-- `grep -nE 'sys\.path\.(insert|append)' scripts/buildlog/*.py` finds only the one root line in each by-path module, and code strings and fixtures in tests.
-- No file in `scripts` outside `scripts/buildlog` imports a buildlog module by its bare name, except a same-named sibling in its own folder.
-- The caller suites pass with no assertion weakened. The merge gate passes in full.
-- `basedpyright` on all changed files: 0 errors, 0 warnings, 0 notes.
+**Ruled out:**
+- A path module for `scripts/buildlog`: the repo already has one way, and a per-folder module is a second way.
+- Moving `sessions` and `unit_runs` in this phase: other files import them bare in large numbers.
