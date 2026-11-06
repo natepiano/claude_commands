@@ -56,7 +56,7 @@ class PaneRecordTests(unittest.TestCase):
             "PATH": "", "HOME": str(self.root),
             "HERDR_PANE_RECORD_DIR": str(self.records), "HERDR_ENV": "1", "HERDR_SESSION": "agents",
             "CLAUDE_CONFIG_DIR": str(self.root / ".claude3"), "ENABLE_TOOL_SEARCH": "true",
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit",
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha",
             "CLAUDE_CODE_OAUTH_TOKEN": "secret", "UNRELATED": "x",
         }
 
@@ -254,7 +254,7 @@ class PaneRecordTests(unittest.TestCase):
         source = self.root / "staff-source"
         source.mkdir()
         entry = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/fixture", {
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit",
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha",
             "STAFF_ID": "019b3a40-4250-7000-8000-000000000102"}, ["claude"])
         evidence = source / "agents.json"
         _ = evidence.write_text(json.dumps({"w1:p2": entry}))
@@ -276,7 +276,7 @@ class PaneRecordTests(unittest.TestCase):
     def test_unmarked_write_does_not_recover_a_previous_launchs_staff_identity(self) -> None:
         marked = pane_record.launch("old", "conversation", "/fixture", {
             "STAFF_ID": "019b3a40-4250-7000-8000-000000000102", "SHOWRUNNER_UNIT": "demo",
-            "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+            "SHOWRUNNER_UNIT_ID": "alpha"}, ["claude"])
         with mock.patch.object(pane_record, "RECORD_DIR", self.records):
             pane_record.write("agents", marked)
             for pane in ("new", "old"):
@@ -436,10 +436,10 @@ class PaneRecordTests(unittest.TestCase):
         environment = {"HERDR_PANE_RECORD_DIR": str(self.records)}
         with (mock.patch.dict(os.environ, environment),
               isolated_staff_file(self.root / "staff.json", environment)):
-            owner = unit_membership("demo", "alpha-unit")
+            owner = unit_membership("demo", "alpha")
             owner = staff.update_current_session(owner.current_session, staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
             old = pane_record.launch("old", "019b3a40-4250-7000-8000-000000000102", "/old", {
-                ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude"])
+                ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"}, ["claude"])
             old["written_at"] = "2026-10-30T00:00:00+00:00"
             new = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/new", {"ENABLE_TOOL_SEARCH": "true"}, ["claude"])
             retained: dict[str, object] = dict(new)
@@ -450,7 +450,7 @@ class PaneRecordTests(unittest.TestCase):
             self.records.mkdir(parents=True, exist_ok=True)
             path = self.records / "agents.json"
             _ = path.write_text(json.dumps({"old": old, "new": retained}))
-            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, new)))
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources((old, new)))
             with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
                   mock.patch.object(sessions, "running_sessions", return_value=[])):
                 self.assertEqual(len(session_staff.repair_marks()), 1)
@@ -468,10 +468,10 @@ class PaneRecordTests(unittest.TestCase):
         environment = {"PATH": os.defpath, **source_environment(self.root / "sources"),
                        "HERDR_PANE_RECORD_DIR": str(self.records), "HOME": str(self.root), "HERDR_SESSION": "agents"}
         with isolated_staff_file(self.root / "staff.json", environment):
-            owner = unit_membership("demo", "alpha-unit")
+            owner = unit_membership("demo", "alpha")
             owner = staff.update_current_session(owner.current_session, staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
         old = pane_record.launch("old", "019b3a40-4250-7000-8000-000000000102", "/fixture", {
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude"])
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"}, ["claude"])
         old["written_at"] = "2026-10-30T00:00:00+00:00"
         new = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {}, ["claude"])
         self.records.mkdir(parents=True)
@@ -500,15 +500,15 @@ class PaneRecordTests(unittest.TestCase):
         environment = {"HERDR_PANE_RECORD_DIR": str(self.records)}
         with (mock.patch.dict(os.environ, environment),
               isolated_staff_file(self.root / "staff.json", environment)):
-            owner = unit_membership("demo", "alpha-unit")
+            owner = unit_membership("demo", "alpha")
             owner = staff.update_current_session(owner.current_session, staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
             old = pane_record.launch("old", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", {
-                ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude"])
+                ('' + 'SHOWRUNNER_' + 'UNIT'): "demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"}, ["claude"])
             old["written_at"] = "2026-10-30T00:00:00+00:00"
             damaged = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", {}, ["claude"])
             self.records.mkdir(parents=True)
             _ = (self.records / "agents.json").write_text(json.dumps({"old": old, "w1:p2": damaged}))
-            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, damaged)))
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources((old, damaged)))
             with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
                   mock.patch.object(sessions, "running_sessions", return_value=[])):
                 self.assertEqual(len(session_staff.repair_marks()), 1)
@@ -525,27 +525,23 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
     def test_restored_unit_id_comes_from_the_staff_row(self) -> None:
-        from scripts.production import staff, session_staff, showrunners
+        from scripts.production import staff, session_staff
 
         parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
         owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", staff.ReportsTo(parent.id), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
-        source = showrunners.ShowrunnerSource(
-            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), "# Production — demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {"CLAUDE_CODE_SESSION_ID": owner.current_session}, ["claude"])
         membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
-            session_staff.MemberSources({"demo": source}, ()))
+            session_staff.MemberSources(()))
         self.assertEqual(membership.environment(entry), {"CLAUDE_CODE_SESSION_ID": owner.current_session})
 
     def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
-        from scripts.production import staff, session_staff, showrunners
+        from scripts.production import staff, session_staff
 
         owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
-        source = showrunners.ShowrunnerSource(
-            showrunners.Timer("demo", "session:019b3a40-4250-7000-8000-000000000102", self.root / "demo.md", "UTC"), "# demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "former", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo-unit"}, ["claude"])
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "former", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo"}, ["claude"])
         membership = session_staff.LaunchMembership(staff.StaffSnapshot((owner,)),
-            session_staff.MemberSources({"demo": source}, ()))
+            session_staff.MemberSources(()))
         repaired = membership.environment(entry)
         self.assertEqual(repaired, {"CLAUDE_CODE_SESSION_ID": owner.current_session})
         entry["environment"] = {**entry["environment"], **repaired}
@@ -568,9 +564,9 @@ TOKEN = "sk-ant-oat01-do-not-keep"
 # environment, then the kernel's own `key=value` strings.
 MAC_RECORD = (
     (5).to_bytes(4, sys.byteorder) + b"/opt/claude/bin/claude\0\0\0\0"
-    + b"claude\0--name\0alpha-unit\0--model\0opus\0"
+    + b"claude\0--name\0alpha\0--model\0opus\0"
     + b"CLAUDE_CONFIG_DIR=/Users/n/.claude3\0CLAUDE_CODE_OAUTH_TOKEN=" + TOKEN.encode()
-    + (b'\x00' + b'SHOWRUNNER_' + b'UNIT_ID=alpha-unit\x00ENABLE_TOOL_SEARCH=true\x00HOME=/Users/n\x00\x00')
+    + (b'\x00' + b'SHOWRUNNER_' + b'UNIT_ID=alpha\x00ENABLE_TOOL_SEARCH=true\x00HOME=/Users/n\x00\x00')
     + b"executable_path=/opt/claude/bin/claude\0\0\0"
 )
 
@@ -592,7 +588,7 @@ class MacRecordTests(unittest.TestCase):
             arguments = pane_record.claude_arguments(200)
             environment = pane_record._process_environment(100)  # pyright: ignore[reportPrivateUsage]
         entry = pane_record.launch("w1:p1", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", environment, arguments)
-        self.assertEqual((entry["name"], entry["model"], entry["flags_read"]), ("alpha-unit", "opus", True))
+        self.assertEqual((entry["name"], entry["model"], entry["flags_read"]), ("alpha", "opus", True))
         self.assertEqual(entry["config_dir"], "/Users/n/.claude3")
         self.assertNotIn(TOKEN, json.dumps(environment) + json.dumps(entry))
 

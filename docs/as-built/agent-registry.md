@@ -1,7 +1,7 @@
 # Agent Registry — one place for family, agent, and effort assignments
 
 Codex code reviews use the unit's persistent `review` and `review2` workers through `assign.sh --role review`.
-The [simplify lens](simplify-lens.md) uses a fresh Claude review.
+The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Pool maintenance paths do not dispatch new reviews.
 
 ## What it is
@@ -323,7 +323,7 @@ A thin dispatcher over the resolver:
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the worker wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |
 | `scripts/agents/test_models_config.sh`, `test_agent_exec.sh`, `test_sync_codex_catalog.sh` | Self-contained fixture-conf suites (`mktemp -d`, temp `MODELS_CONFIG_FILE`, print a "…passed" line, nonzero on failure). |
-| `scripts/direct/implement.sh` / `review.sh` | Launch phase work and record status, model, effort, logs, and progress. The implementation launcher requires a pass kind and worker slot. Review artifacts use pass and lens suffixes. Codex reviews use persistent read-only workers. The [simplify lens](simplify-lens.md) defines the fresh Claude launch and its lock, files, and result checks. |
+| `scripts/direct/implement.sh` / `review.sh` | Launch phase work and record status, model, effort, logs, and progress. The implementation launcher requires a pass kind and worker slot. Review artifacts use pass and lens suffixes. Codex reviews use persistent read-only workers. The [daily simplify run](simplify-lens.md) defines its separate launcher, files, and result checks. |
 | `scripts/direct/board.sh` | The phase team's coordination substrate: an append-only `board.log` plus `mkdir`-atomic tokens under `locks/`, shared by every member writing into one session directory. Commands are `post` / `read` / `acquire` / `release` / `renew` / `role` / `roles` / `locks`. A file rather than messages because one append *is* the broadcast to every peer and the wrapper, where N-1 addressed sends can each half-fail; because it outlives the turn that wrote it, so a member resumed hours later reads the whole history; and because a message channel cannot make anything mutually exclusive, which the `mkdir` tokens can. Post kinds are a closed set (`register`, `claim`, `release`, `status`, `blocked`, `handoff`, `done`) so a peer can scan for what concerns it — `ask` and `answer` are deliberately absent, since a question to a peer is a message (`SendMessage`, or `codex_mesh.py` for a codex member) and two ways to ask one question means one of them goes unread; `read --since N` numbers every line before filtering, so a cursor counts board positions and stays valid across different filters. `role` is the only writer of `handoff`, and those lines are how `progress_history.py` learns which role each slot holds now. |
 | `scripts/direct/progress_history.py` | Cross-agent append-only unit-run event recorder and aggregator. Durable per-run JSONL lives under `~/.local/state/unit-history/runs/` (`unit_runs.history_root()`); live state remains in the session directory. `start-run` alone resolves and records the project clock from the supplied plan, matching worktree/branch history, or the run start. `progress` prints a short report (clocks table, phase heading, ETA line, worker lines, stage line, wall clock); the clocks table has separate project and phase rows, independent unchanged timers and unambiguous `HH:MM:SS` durations. `progress --tables` adds the round table. The legacy layout prints the clocks table only under `--tables`. It calibrates phase estimates from completed-phase history and records every stated ETA (`eta`, an `eta_stated` event per promise). `progress` requires `--cap-stage` on dual-layout calls and clamps the calibrated percentage to that stage's ceiling; `start-phase --work-order-file` records Work Order size metrics. |
 | `scripts/direct/findings.py` | Stores stable finding ids and phase-instance ledgers. States include `open`, `fixed_pending_review`, `accepted`, `routed`, `held_for_decision`, and `decided`. The first repair round gates blockers and minors; later rounds gate blockers. Nits never gate. `dispatch --covers` refuses a partial batch. Held items and decisions follow the [simplify lens](simplify-lens.md#findings-and-decisions). |
@@ -438,14 +438,14 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   included: that costs a server restart and a notice, never work. Running it
   twice for one change moves nothing the second time. On the Mac the old server
   is stopped by `end_session.sh`, as above.
-- A codex worker's launcher ends with its last turn, while its thread persists.
-  A `send` to a finished codex peer holds the message for its current roster
-  thread. Only the unit director's `implement.sh --to <worker>` or
-  `review.sh --to <worker>` (`codex_mesh.py follow`) starts its next turn,
-  which receives the held messages first and its dispatch prompt last
-  (a held design role is the exception: `implement.sh --to` refuses it, and only `design_roles.py resume` gives it a turn) —
-  `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this, and the register
-  line's `reach=` field is what tells a peer which of the two it is addressing.
+- A Codex worker's launcher ends with its last turn. Its thread stays open.
+  `send` holds messages for that thread.
+  Only the unit director starts its next turn through `assign.sh --role <role> --to <worker>`.
+  The turn receives held messages before its dispatch prompt.
+  A held design role receives turns through `design_roles.py resume`.
+  Claude workers keep `implement.sh`.
+  `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this rule.
+  The register line's `reach=` field identifies the recipient.
 - `/unit:direct` is itself implemented by `scripts/direct/*`, so any rename or signature change to those launchers must land together with the `commands/unit/direct.md` call-site edits in one change.
 - `commands/unit/direct.md` holds the whole `/unit:direct` workflow, and it is a regular file. Call-site edits go in `direct.md`.
 - The `[worker.*]` header still names `/plan:worker`, an older name for `/unit:direct`; it is a comment only. Changes to it belong in the shared registry.
@@ -478,13 +478,12 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **`codex queue --thread` exits 0 for a thread with no live session.** The
   acknowledgement says nothing about delivery — do not use it as a reachability
   test.
-- **A finished codex worker holds messages for its next dispatch.** Its thread
-  persists, and `send` holds messages until the unit director starts its next
-  turn through `implement.sh --to` or `review.sh --to`. That turn receives them
-  first, and its dispatch prompt last. A thread started `--resident` (ask_a_friend's friend) stays
-  `running` across turns, prints each reply as it lands, and ends only on
-  `codex_mesh.py end`. `send` still refuses ended, missing and
-  capacity-exhausted workers.
+- **A finished Codex worker holds messages for its next dispatch.** Its thread stays open.
+  `send` holds messages until the unit director starts a turn through `assign.sh --role <role> --to <worker>`.
+  That turn receives held messages before its dispatch prompt.
+  A resident thread stays `running` across turns and prints each reply.
+  `codex_mesh.py end` ends a resident thread.
+  `send` refuses ended, missing, and capacity-exhausted workers.
 - **`systemError` is not terminal.** The thread stays loaded, and `turn/start` has no status gate, so a resume turn on the same thread is valid. A status outside the protocol's four reads `ThreadStateUnknown`: relaunching a `done` or `capacity_exhausted` entry exits 2, `end` exits 1, and inside the capacity loop the worker ends `failed` with `thread <id>: thread/read failed: unrecognized status <status>`.
 - **Capacity numbers.** The waits run 30, 60, 120, 240, 300, 300 and 150 s, so a spent budget reads `7 retries over 20 min`. The budget counts the measured sleep (`max(wait, elapsed)`), so a late wake spends it, and it counts only waits, not the time refused turns took, so a spell runs longer than 20 min of wall time.
 - **Stub app-server.** In `scripts/agents/test_codex_mesh.py` the stub answers `systemError` after an errored turn (`turn/failed`, or `turn/completed` carrying `error`) until the next `turn/start`, and an explicit `thread_statuses` entry wins. A stub that answered `idle` after a refused turn would hide the crash this guards against. `completed_then_capacity` and `capacity_with_peer` drive the budget-reset tests, and `test_failed_worker_relaunches_when_old_thread_has_unknown_status` uses `retired`, a status the protocol does not define. Workers run the live `~/.claude` copy of `codex_mesh.py`, so a change protects running workers only once it is there.

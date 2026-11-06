@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.astra import astra_roles  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.production import staff
 
@@ -97,45 +96,15 @@ def tail(text: str) -> str:
 
 
 def _managed_review(review: Path, log: Path) -> int:
-    """Publish an idle worker before dispatch through the shared app-server path."""
-    from contextlib import redirect_stderr, redirect_stdout
-    from scripts.agents import codex_mesh
-
+    """Run one managed review through assign.sh."""
     run = log.parent
-    name = f"astra-reviewer{os.getpid()}"
-    opened = False
-    held = ""
-    result = 1
-    with log.open("w", encoding="utf-8") as output, redirect_stdout(output), redirect_stderr(output):
-        try:
-            result = codex_mesh.main([
-                "prime", "--session-dir", str(run), "--name", name,
-                "--role", "astra-reviewer", "--instructions-file", str(run / "prompt.md"),
-                "--model", MODEL, "--effort", REASONING,
-                "--sandbox", "read-only",
-            ])
-            if result:
-                return result
-            opened = True
-            role = astra_roles.hold("reviewer", session_dir=run, worker=name)
-            held = role["staff_id"] if role is not None else ""
-            result = codex_mesh.main([
-                "follow", "--session-dir", str(run), "--to", name, "--role", "review",
-                "--message-file", str(run / "prompt.md"), "--summary-file", str(review),
-                "--log-file", str(run / "turn.log"), "--model", MODEL, "--effort", REASONING,
-                "--cwd", str(Path.cwd()), "--read-only",
-            ])
-        except (OSError, ValueError) as error:
-            print(f"astra_review: reviewer role unavailable: {error}", file=sys.stderr)
-            result = 1
-        finally:
-            if opened:
-                ended = codex_mesh.main(["end", "--session-dir", str(run), "--to", name])
-                if ended:
-                    result = 1
-                elif held:
-                    astra_roles.release(held)
-    return result
+    with log.open("w", encoding="utf-8") as output:
+        return subprocess.run([
+            "bash", str(SCRIPTS / "direct/assign.sh"), "--role", "review", "--operation", "astra-review",
+            "--new-worker", f"astra-reviewer{os.getpid()}", "--session-dir", str(run), "--cwd", str(Path.cwd()),
+            "--prompt", str(run / "prompt.md"), "--summary", str(review), "--log", str(run / "turn.log"),
+            "--model", MODEL, "--effort", REASONING,
+        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False).returncode
 
 
 def run_review(label: str, review: Path, prompt: str, log: Path) -> int:

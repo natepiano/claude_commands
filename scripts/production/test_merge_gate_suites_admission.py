@@ -16,6 +16,7 @@ from typing import cast, final, override
 from contextlib import redirect_stdout, redirect_stderr
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.lib import build_folders
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply, snapshot_with_head_cause
@@ -38,13 +39,13 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         access = os.access
 
         def writable(path: str | os.PathLike[str], mode: int) -> bool:
-            return False if Path(path) == Path("/dev/shm") else access(path, mode)
+            return False if Path(path) == build_folders.tmpfs_temporary_parent() else access(path, mode)
 
         with mock.patch.dict(os.environ, self.environment), \
              mock.patch.object(os, "access", side_effect=writable), \
              mock.patch.object(merge_gate, "gate_reservation") as admission:
             with self.assertRaisesRegex(GateRefused,
-                                        "requires writable tmpfs at /dev/shm"):
+                                        f"requires writable tmpfs at {build_folders.tmpfs_temporary_parent()}"):
                 _ = merge_gate.run_suites(self.checkout)
             admission.assert_not_called()
         self.assert_gate_released()

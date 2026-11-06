@@ -2943,8 +2943,8 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             inventory = import_module("inventory")
         live_ids = {member.session_id for member in members}
         notices += tuple(
-            f"{runner.slug}: no session runs under the id its update timer names; "
-            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.doc)}"
+            f"{runner.name}: no session runs under the id its update timer names; "
+            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.name)}"
             for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",

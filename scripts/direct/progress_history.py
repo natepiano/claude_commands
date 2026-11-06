@@ -6,15 +6,17 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import re
 import statistics
 import subprocess
 import sys
+import time
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Generator, Iterable, Mapping
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,11 +31,13 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import atomic_file, models_registry, unit_runs  # noqa: E402
+from scripts.lib import models_registry, unit_runs
+from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production import production_doc, session_staff, showrunners, staff, unit_config  # noqa: E402
+from scripts.production import session_staff, staff, unit_config  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
+from scripts.usage import agents_log  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -304,13 +308,12 @@ PASS_OWNER_ENV = "UNIT_PASS_OWNER"
 PASS_OWNER_TOKEN = "launcher"
 
 PASS_OWNERSHIP_RULE = (
-    "Pass lifecycle belongs to the launcher. implement.sh and review.sh already "
-    "record pass_started and pass_finished around the worker they wait on, so a "
-    "hand-written call forges a pass that never ran. findings.py gate counts "
-    "passes to decide whether a phase is converging, and forged passes stop a run "
-    "for a condition that never happened. Launch the work through implement.sh or "
-    "review.sh. The single exception is a launcher the unit director killed: close "
-    "its still-open pass with 'finish-pass --status canceled --orphaned-launcher'."
+    "Pass lifecycle belongs to the launchers. assign.sh and the implement.sh or "
+    "review.sh it runs record pass_started and pass_finished. findings.py gate "
+    "counts these passes for convergence. Manual pass records can falsely stop "
+    "a run. Launch the work through assign.sh. Exception: if the unit director "
+    "killed a launcher, close its open pass with "
+    "'finish-pass --status canceled --orphaned-launcher'."
 )
 
 
@@ -438,10 +441,9 @@ def _set_owner(state: dict[str, object], production: str, unit: str) -> None:
         return
     record = staff.initial_snapshot()
     parents = {row.id for row in record.find(kind="showrunner")
-               if row.name == production or (isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
-                   and row.doc.path.name.removesuffix("-production.md") == production)}
+               if row.name == production}
     matches = [row for row in record.find(kind="unit")
-               if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents and row.name.removesuffix("-unit") == unit.removesuffix("-unit")]
+               if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents and row.name == unit]
     if len(matches) != 1:
         raise ValueError(f"{production}/{unit}: no unique unit staff row")
     state[unit_runs.OWNER_FIELD] = matches[0].id
@@ -493,7 +495,7 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     if state.get(unit_runs.OWNER_FIELD) and state.get("status") == "active":
         for key in ("production", "unit", "branch"):
             _ = stored.pop(key, None)
-    atomic_file.write_text_atomic(
+    write_text_atomic(
         _state_path(session_dir), json.dumps(stored, indent=2, sort_keys=True) + "\n",
     )
 
@@ -1058,6 +1060,74 @@ def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
     }
 
 
+class DispatchDetailNotRecorded(Enum):
+    """The dispatch has no unique value for this detail."""
+
+    UNRECORDED = "unrecorded"
+
+
+@dataclass(frozen=True)
+class RecordedDispatch:
+    role: str
+    phase_id: str | DispatchDetailNotRecorded
+    lens: str | DispatchDetailNotRecorded
+    paths: str | DispatchDetailNotRecorded
+    instance_id: str | DispatchDetailNotRecorded = DispatchDetailNotRecorded.UNRECORDED
+    status: str | DispatchDetailNotRecorded = DispatchDetailNotRecorded.UNRECORDED
+
+
+@dataclass(frozen=True)
+class NoDispatchRecorded:
+    """The worker has no recorded dispatch."""
+
+
+def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
+    """Read the newest finished dispatch across the staff parent's runs."""
+    try:
+        membership = staff.local_snapshot()
+        worker = membership.by_id(worker_id)
+    except staff.StaffUnreadable:
+        return NoDispatchRecorded()
+    if worker is None or worker.kind != "worker":
+        return NoDispatchRecorded()
+    parent = membership.parent_of(worker)
+    records: list[tuple[Path, dict[str, object]]] = []
+    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
+        for path in root.glob(f"*/{unit_runs.STATE_FILE}"):
+            try:
+                state = _json_object(path.read_text(encoding="utf-8")) or {}
+                if unit_runs.run_owner(state, membership) != parent:
+                    continue
+            except (OSError, UnicodeError):
+                continue
+            passes = [*_pass_slots(state).values(), *(
+                {**event, "instance_id": event.get("pass_instance_id"), "kind": event.get("pass_kind"),
+                 "started_at": event.get("pass_started_at"), "finished_at": event.get("timestamp_epoch"),
+                 "phase": {"id": event.get("phase_id")}}
+                for event in _run_events(state) if event.get("event_type") == "pass_finished")]
+            records.extend((path.parent, record) for record in passes
+                           if _string(record.get("status")) in {"completed", "error", "canceled", "interrupted"}
+                           and (record.get("worker_id") == worker_id if record.get("worker_id")
+                                else record.get("worker_name") == worker.name))
+    task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                              worker.current_session, datetime.now(UTC))
+    run, latest = max(records, key=lambda item: _number(item[1].get("finished_at"), _number(item[1].get("started_at"))),
+                      default=(Path(), dict[str, object]()))
+    role = _string(latest.get("kind")) or (task.role if isinstance(task, agents_log.Assignment) else "")
+    if not role:
+        return NoDispatchRecorded()
+    phases = {_string((_object_dict(item[1].get("phase")) or {}).get("id")).strip() for item in records}
+    missing = DispatchDetailNotRecorded.UNRECORDED
+    phase = next(iter(phases)) if len(phases) == 1 and "" not in phases else missing
+    lens = _string(latest.get("lens")) or (
+        task.lens if isinstance(task, agents_log.Assignment) and task.role == "review" and role == "review" else "")
+    paths = _string(latest.get("paths")) or (
+        str(phase_reservation.phase_directory(run, phase) / phase_reservation.FILES_FILE)
+        if isinstance(phase, str) and role != "review" else missing)
+    return RecordedDispatch(role, phase, lens or missing, paths,
+                            _string(latest.get("instance_id")) or missing, _string(latest.get("status")) or missing)
+
+
 def _pass_phase_instance(record: dict[str, object]) -> str:
     """The instance id of the phase a pass was opened in; empty for a pass older than the stamp."""
     phase = _object_dict(record.get("phase"))
@@ -1242,6 +1312,7 @@ def _event(
                 "called_agent": current_pass.get("called_agent", {}),
                 "called_task": _string(current_pass.get("called_task")),
                 "worker_name": _string(current_pass.get("worker_name")),
+                "worker_id": _string(current_pass.get("worker_id")),
                 "launcher_command": current_pass.get("launcher_command", []),
             }
         )
@@ -1465,6 +1536,7 @@ def _start_phase(args: argparse.Namespace) -> None:
                       or _optional_epoch(args, "started_at", "--started-at", now)
                       == _number(open_phase.get("started_at")))
         if same_title and same_start:
+            _finish_phase_start(session_dir, state, open_phase)
             return
         worktree = phase_reservation.phase_worktree(phase_dir)
         root = phase_reservation.repository_root(Path.cwd())
@@ -1526,7 +1598,6 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["last_percent"] = None
     state["percent_started_at"] = None
     state["pending_calibration"] = None
-    _write_state(session_dir, state)
     event = _event(state, "phase_started", started_at)
     source = _phase_source_identity(state)
     event.update(production=_phase_metadata_fields(source.production),
@@ -1538,7 +1609,22 @@ def _start_phase(args: argparse.Namespace) -> None:
         event["recorded_at"] = _iso_time(now)
         event["backfilled"] = True
     event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
-    _append_event(state, event)
+    phase["start_event"] = event
+    _write_state(session_dir, state)
+    _finish_phase_start(session_dir, state, phase)
+
+
+def _finish_phase_start(session_dir: Path, state: dict[str, object], phase: dict[str, object]) -> None:
+    """Publish a saved phase start once, including after a stopped state write."""
+    if not any(event.get("event_type") == "phase_started"
+               and event.get("phase_instance_id") == phase.get("instance_id") for event in _run_events(state)):
+        event = _object_dict(phase.get("start_event"))
+        if event is None:
+            event = _event(state, "phase_started", _number(phase.get("started_at")), phase_record=phase)
+        _append_event(state, event)
+    if "start_event" in phase:
+        del phase["start_event"]
+        _write_state(session_dir, state)
     _refresh_phase_table(session_dir)
 
 
@@ -1742,6 +1828,9 @@ def _start_pass(args: argparse.Namespace) -> None:
         "instance_id": str(uuid.uuid4()),
         "activity": _arg_string(args, "activity"),
         "started_at": now,
+        "called_task": _arg_string(args, "called_task"),
+        "worker_name": _optional_arg(args, "worker_name"),
+        "worker_id": _optional_arg(args, "worker_id"),
         "launcher_command": launcher_command,
         "called_agent": called_agent,
         "team_slot": team_slot,
@@ -1777,14 +1866,14 @@ def _launcher_arguments(text: str) -> list[str]:
 
 
 def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
-                   worker_name: str, launcher_command: list[str], prompt: Path, kind: str, lens: str,
+                   worker_name: str, worker_id: staff.StaffId, launcher_command: list[str], prompt: Path, kind: str, lens: str,
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "") -> str:
     """Record a published worker's dispatch and return its durable pass id."""
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
     args = argparse.Namespace(
         session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role,
-        worker_name=worker_name, launcher_command=json.dumps(launcher_command) if launcher_command else "",
+        worker_name=worker_name, worker_id=worker_id, launcher_command=json.dumps(launcher_command) if launcher_command else "",
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family="unknown", called_model="unknown", called_effort="unset",
         fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens, dispatch_owned=True,
@@ -1891,9 +1980,8 @@ def _arm_review(args: argparse.Namespace) -> None:
         raise SystemExit(f"Phase {phase_id} is not open" if phase_id else "Start a phase before arming an early review")
     if _reporting_pass(state) is None:
         raise SystemExit(
-            "An early review is the reviewer that overlaps a running dispatch, so "
-            + "a pass must be open. With none open the review is not early -- "
-            + "launch it through review.sh and let it record its own pass."
+            "An early review overlaps a running dispatch, so a pass must be open. "
+            + "Without an open pass, launch it through assign.sh and let it record its own pass."
         )
     now = plan_history.now_epoch()
     called_task = _arg_string(args, "called_task", "direct.review") or "direct.review"
@@ -1964,11 +2052,12 @@ def _disarm_review(args: argparse.Namespace) -> None:
     )
 
 
-def _load_events() -> tuple[list[dict[str, object]], int]:
+def _load_events(event_types: Collection[str] = ()) -> tuple[list[dict[str, object]], int]:
     events: list[dict[str, object]] = []
     record = staff.initial_snapshot()
     ignored = 0
     runs_dir = plan_history.history_root() / "runs"
+    wanted = re.compile(r'"event_type"\s*:\s*"(?:' + "|".join(map(re.escape, event_types)) + r')"')
     if not runs_dir.exists():
         return events, ignored
     for path in sorted(runs_dir.glob("*.jsonl")):
@@ -1981,12 +2070,22 @@ def _load_events() -> tuple[list[dict[str, object]], int]:
             ignored += 1
             continue
         for line in lines:
+            if event_types and not wanted.search(line):
+                continue
             event = _json_object(line)
             if event is None or _integer(event.get("schema_version")) != SCHEMA_VERSION:
                 ignored += 1
                 continue
-            events.append(plan_history.staff_directory(event, record))
+            if not event_types or event.get("event_type") in event_types:
+                events.append(plan_history.staff_directory(event, record))
     return events, ignored
+
+
+def events_for_worktrees(worktrees: tuple[Path, ...], event_types: frozenset[str]) -> list[dict[str, object]]:
+    """Read selected records once for the units' current staff worktrees."""
+    directories = {str(worktree.resolve()) for worktree in worktrees}
+    return sorted((event for event in _load_events(event_types)[0] if event.get("working_dir") in directories),
+                  key=lambda event: _number(event.get("timestamp_epoch")))
 
 
 def _agent_fields(event: dict[str, object], key: str) -> tuple[str, str]:
@@ -3843,8 +3942,6 @@ def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[
         roster = worker_lifecycle.read_worker_state(session_dir / "mesh_roster.json")
     except worker_lifecycle.WorkerStateUnreadable:
         return [{**window, "worker": "unavailable"} for window in windows]
-    from scripts.agents.codex_mesh import recorded_turn_settings
-
     slots: dict[str, str] = {}
     for path in session_dir.glob("impl_worker_*.json"):
         try:
@@ -3855,7 +3952,7 @@ def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[
     models: dict[str, str] = {}
     for name, value in roster.items():
         record = _object_dict(value) or {}
-        settings = recorded_turn_settings(record)
+        settings = worker_lifecycle.recorded_turn_settings(record)
         if settings.model:
             slot = slots.get(name) or _string(record.get("slot")) or name
             models[slot] = _agent_display(settings.model, settings.effort)
@@ -5207,12 +5304,11 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
                 except (OSError, UnicodeError) as error:
                     return ProductionNotRecorded(f"phase plan cannot be read: {error}")
             return ProductionNotRecorded("the run has no matching unit staff row")
-        parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
+        parent = record.parent_of(row)
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
-        timer = showrunners.timer_for(parent, record)
-        slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
-        return ProductionUnitIdentity(slug, row.name) if state.get(unit_runs.OWNER_FIELD) else ProductionUnitIdentity(production or slug, unit or row.name)
+        return (ProductionUnitIdentity(parent.name, row.name) if state.get(unit_runs.OWNER_FIELD)
+                else ProductionUnitIdentity(production or parent.name, unit or row.name))
     except (OSError, ValueError) as error:
         return ProductionNotRecorded(str(error))
 
@@ -5289,21 +5385,6 @@ def _phase_repository(working_dir: str) -> RecordedPhaseMetadata | PhaseMetadata
     return PhaseMetadataNotRecorded("repository common directory is unavailable")
 
 
-def _phase_production_name(production: str, working_dir: str) -> RecordedPhaseMetadata | PhaseMetadataNotRecorded:
-    reference = production.strip("`")
-    if "/" not in reference and Path(reference).suffix.lower() != ".md":
-        return _recorded_phase_metadata(production, "phase plan header names no production")
-    document = Path(working_dir).expanduser() / Path(reference).expanduser()
-    try:
-        lines = document.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as error:
-        return PhaseMetadataNotRecorded(f"production document cannot be read: {error}")
-    name = production_doc.production_name(lines)
-    if isinstance(name, production_doc.ProductionNameNotRecorded):
-        return PhaseMetadataNotRecorded(name.reason)
-    return _recorded_phase_metadata(name.value, "production document heading names no production")
-
-
 def _phase_plan_names(state: Mapping[str, object]) -> tuple[
     RecordedPhaseMetadata | PhaseMetadataNotRecorded, RecordedPhaseMetadata | PhaseMetadataNotRecorded
 ]:
@@ -5323,8 +5404,6 @@ def _phase_source_identity(state: Mapping[str, object]) -> PhaseSourceIdentity:
             production = plan_production
         if isinstance(unit, PhaseMetadataNotRecorded):
             unit = plan_unit
-    if isinstance(production, RecordedPhaseMetadata):
-        production = _phase_production_name(production.value, _string(state.get("working_dir")))
     return PhaseSourceIdentity(production, unit, _phase_repository(_string(state.get("working_dir"))))
 
 
@@ -5445,6 +5524,8 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
                   "owner_session": owner, "wait_started_at": _iso_time(now),
                   "wait_started_epoch": now, "wait_end": {"state": "Open"},
                   "holder": _holder_fields(holder)})
+    if declaration := _optional_arg(args, "declaration_id"):
+        event["declaration_id"] = declaration
     if hasattr(args, "expected_supplier"):
         event["expected_supplier"] = cast(object, args.expected_supplier)
     if isinstance(resolution, ResolvedWorkerPass):
@@ -5653,9 +5734,7 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         production = identity.removeprefix("showrunner:")
         records = {item["sessionId"]: item for item in sessions.live_sessions()}
         for row in staff.active(resolver.record, "showrunner"):
-            timer = showrunners.timer_for(row, resolver.record)
-            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name
-            if slug == production and row.current_session in records:
+            if row.name == production and row.current_session in records:
                 return NamedSupplier("uds:" + records[row.current_session]["messagingSocketPath"])
         return NoNamedSupplier("showrunner has no current address")
     if identity.startswith(("uds:/", "codex:")):
@@ -5833,6 +5912,15 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
     return VerifiedSupplierMessage(forward[2], SupplierMessageRoute.POSTMASTER_REPLY)
 
 
+def _turn_waits_for_marker(marker: dict[str, object], waits: dict[str, dict[str, object]]) -> list[dict[str, object]]:
+    """Find the declared wait even when its marker lacks the event's wait id."""
+    declaration = _string(marker.get("declaration_id"))
+    if declaration:
+        return [wait for wait in waits.values() if wait.get("declaration_id") == declaration]
+    previous = waits.get(_string(marker.get("wait_id")))
+    return [previous] if previous is not None else []
+
+
 def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) -> bool:
     """Start a director's declared user/supplier wait once, before the stop."""
     if os.environ.get(PROBE_ENV) == "1":
@@ -5862,17 +5950,33 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
             marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
         except FileNotFoundError:
             marker = {}
-        previous = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
-        if previous is not None and previous.get("event_type") == "wait_started":
-            if (previous.get("owner_session") == owner_session and previous.get("wait_kind") == kind
-                    and previous.get("expected_supplier") == supplier_fields):
+        phase = _object_dict(state.get("phase")) or {}
+        identity: dict[str, object] = {"owner_session": owner_session, "wait_kind": kind,
+                                       "expected_supplier": supplier_fields,
+                                       "phase_instance_id": _string(phase.get("instance_id"))}
+        waits = _waits_by_id(_run_events(state))
+        same_declaration = all(marker.get(key) == value for key, value in identity.items())
+        declaration = _string(marker.get("declaration_id")) if same_declaration else ""
+        matching = _turn_waits_for_marker(marker, waits) if declaration else []
+        recovered = next((wait for wait in matching if wait.get("event_type") == "wait_started"), None)
+        previous = waits.get(_string(marker.get("wait_id")))
+        if recovered is None and not marker.get("declaration_id") and previous is not None:
+            if previous.get("event_type") == "wait_started" and all(previous.get(key) == value for key, value in identity.items()):
                 return True
+        if recovered is not None:
+            write_text_atomic(marker_path, json.dumps({**marker, "wait_id": recovered["wait_id"]}) + "\n")
+            return True
+        if previous is not None and previous.get("event_type") == "wait_started":
             _end_wait(state, previous, plan_history.now_epoch(), unclosed=True)
+        if not declaration or matching:
+            declaration = str(uuid.uuid4())
+        marker = {**identity, "declaration_id": declaration}
+        write_text_atomic(marker_path, json.dumps(marker) + "\n")
         args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
-                                  owner_session=owner_session, unit="", expected_supplier=supplier_fields)
+                                  owner_session=owner_session, unit="", expected_supplier=supplier_fields,
+                                  declaration_id=declaration)
         wait_id = _record_wait(state, args)
-        _ = marker_path.write_text(json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n",
-                                   encoding="utf-8")
+        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": wait_id}) + "\n")
     return True
 
 
@@ -5890,9 +5994,11 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         if marker.get("owner_session") != owner_session:
             return
         state = _read_state(session_dir)
-        wait = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
-        if wait is None or wait.get("event_type") != "wait_started":
+        waits = [wait for wait in _turn_waits_for_marker(marker, _waits_by_id(_run_events(state)))
+                 if wait.get("event_type") == "wait_started"]
+        if not waits:
             return
+        wait = waits[0]
         supplier = _object_dict(wait.get("expected_supplier")) or {}
         message = (_supplier_message(_string(supplier.get("address")), prompt, owner_session)
                    if source == "PEER" and supplier.get("state") == "NamedSupplier"
@@ -5904,7 +6010,7 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         relay = from_supplier and body.lstrip().startswith("From the user (via the showrunner):")
         if not ((user_wait and (source == "TYPED" or relay)) or (not user_wait and from_supplier)):
             return
-        _finish_wait(argparse.Namespace(session_dir=str(session_dir), wait_id=_string(marker.get("wait_id"))))
+        _finish_wait(argparse.Namespace(session_dir=str(session_dir), wait_id=_string(wait.get("wait_id"))))
         marker_path.unlink()
 
 
@@ -6060,8 +6166,6 @@ def _read_waits(args: argparse.Namespace) -> None:
         for field in ("production", "repository"):
             if field in event:
                 metadata = _recorded_phase_metadata(event[field], f"phase has no {field}")
-                if field == "production" and isinstance(metadata, RecordedPhaseMetadata):
-                    metadata = _phase_production_name(metadata.value, _string(event.get("working_dir")))
                 phase[field] = _phase_metadata_fields(metadata)
         if own_missing:
             phase.update(reason="wait emission has a missing record", wait_missing_n=len(own_missing),
@@ -6262,7 +6366,33 @@ class RecordedCodeFindings:
 
 
 CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
-SEPARATE_TRIAL_LENSES = ("ux", "simplify")
+SEPARATE_TRIAL_LENSES = ("ux",)
+
+
+def write_review_turn(session_dir: Path, metadata: Mapping[str, object], *,
+                      reviewer: str, thread_id: str, lens: str, pass_number: int,
+                      started_at: int, status: str, raised: int, details: Mapping[str, object]) -> None:
+    """Store one review result without replacing another result from the same second."""
+    record: dict[str, object] = {
+        "arm": "own", "unit": metadata.get("unit", ""), "phase": metadata.get("phase", ""),
+        "phase_instance_id": metadata.get("phase_instance_id", ""),
+        "history_file": metadata.get("history_file", ""),
+        "reviewer": reviewer, "thread_id": thread_id, "lens": lens,
+        "kind": "ux" if lens == "ux" else "broad" if pass_number == 1 and lens else "closure",
+        "pass": pass_number, "started_at": started_at, "finished_at": time.time(),
+        "status": status, "raised": raised, **details,
+    }
+    root = plan_history.history_root() / "review_turns" / session_dir.name
+    root.mkdir(parents=True, exist_ok=True)
+    for sequence in itertools.count():
+        try:
+            output = (root / f"{started_at}-{os.getpid()}-{sequence}.json").open("x", encoding="utf-8")
+        except FileExistsError:
+            continue
+        with output:
+            json.dump(record, output, ensure_ascii=False)
+            _ = output.write("\n")
+        return
 
 
 def _phase_review_records(session_dir: Path, instance_id: str) -> Iterable[dict[str, object]]:
@@ -6301,10 +6431,9 @@ def _review_trial(args: argparse.Namespace) -> None:
     A named phase selects its open instance or its latest completed instance.
     An unnamed command selects the current phase, including a completed phase.
     Only events and review records for that instance count.
-    Completed reviews supply the code and simplify counts.
-    Without completed reviews, each count uses the findings that the director opened.
-    Review-worker minutes count finished review passes except `direct.simplify`, plus UX review activities.
-    Simplify minutes count its review records, including failed runs.
+    Completed reviews supply the code count.
+    Without completed reviews, the count uses the findings that the director opened.
+    Review-worker minutes count finished review passes and UX review activities.
     UX check minutes count `UX review` activities.
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
     Each time rounds to the nearest whole minute.
@@ -6338,7 +6467,6 @@ def _review_trial(args: argparse.Namespace) -> None:
     code_findings = 0
     review_seconds = 0
     ux_check_seconds = 0
-    simplify_findings = 0
     ux_finding_ids: set[str] = set()
     dispatched: list[dict[str, object]] = []
     fix_passes: list[dict[str, object]] = []
@@ -6351,15 +6479,12 @@ def _review_trial(args: argparse.Namespace) -> None:
             if "ux" in lenses:
                 ux_findings += 1
                 ux_finding_ids.add(_string(event.get("finding_id")))
-            if "simplify" in lenses:
-                simplify_findings += 1
             if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
                 code_findings += 1
         elif event_type == "finding_batch_dispatched":
             dispatched.append(event)
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
-            if _string(event.get("called_task")) != "direct.simplify":
-                review_seconds += _integer(event.get("pass_elapsed_seconds"))
+            review_seconds += _integer(event.get("pass_elapsed_seconds"))
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":
             fix_passes.append(event)
         elif (
@@ -6385,22 +6510,11 @@ def _review_trial(args: argparse.Namespace) -> None:
     raised = _raised_findings(filter(_is_code_review, records))
     if isinstance(raised, RecordedCodeFindings):
         code_findings = raised.count
-    # Count the Claude run separately, including runs that report an error.
-    simplify_records = [record for record in records if _string(record.get("lens")) == "simplify"]
-    simplify_raised = _raised_findings(simplify_records)
-    simplify_seconds = sum(
-        max(0, int(_number(record.get("finished_at")) - _number(record.get("started_at"))))
-        for record in simplify_records
-    )
-    if isinstance(simplify_raised, RecordedCodeFindings):
-        simplify_findings = simplify_raised.count
-    simplify_line = (f", simplify {simplify_findings} findings, simplify minutes {(simplify_seconds + 30) // 60}"
-                     if simplify_records or simplify_findings else "")
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
-        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}" + simplify_line
+        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
     )
 
 
@@ -6569,6 +6683,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_pass.add_argument("--activity", required=True)
     _ = start_pass.add_argument("--called-task", required=True)
     _ = start_pass.add_argument("--worker-name", default="", help="the worker this pass was launched to")
+    _ = start_pass.add_argument("--worker-id", default="", help="the worker's staff id")
     _ = start_pass.add_argument("--called-family", required=True)
     _ = start_pass.add_argument("--called-model", required=True)
     _ = start_pass.add_argument("--called-effort", default="unset")

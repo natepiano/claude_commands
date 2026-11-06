@@ -814,7 +814,7 @@ class RestartTests(ShutdownTestCase):
         shutdown_record.save([str(self.rows[0].id)])
         folder = self.root / "renamed-folder"
         folder.mkdir()
-        self.rows = (replace(self.rows[0], name="renamed-unit",
+        self.rows = (replace(self.rows[0], name="renamed",
             worktree=staff.PresentWorktree("natedev", folder)), *self.rows[1:])
         record = staff.StaffSnapshot(self.rows)
         self.running.clear()
@@ -828,8 +828,8 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(prepare.call_args.args[:2], (native_id, str(folder)))
         self.assertEqual(prepare.call_args.args[3], herdr.NO_ENVIRONMENT_REMOVALS)
         self.assertEqual(launch.call_args.args[3:5],
-                         ("claude", ["--resume", native_id, "--name", "renamed-unit"]))
-        self.assertEqual(launch.call_args.kwargs["agent"], "renamed-unit")
+                         ("claude", ["--resume", native_id, "--name", "renamed"]))
+        self.assertEqual(launch.call_args.kwargs["agent"], "renamed")
         self.assertEqual(shutdown_record.read(), [])
 
     def test_restart_failure_keeps_only_the_failed_fixed_reference(self) -> None:
@@ -866,16 +866,16 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(self.launches, [])
 
     def test_restart_skips_a_saved_name_after_another_row_reuses_it(self) -> None:
-        shutdown_record.save([str(self.rows[0].id), "missing-unit"])
+        shutdown_record.save([str(self.rows[0].id), "missing"])
         self.running.clear()
         errors = io.StringIO()
         with redirect_stderr(errors):
             self.assertEqual(restart.restart(), 0)
-        self.assertEqual(shutdown_record.read(), ["missing-unit"])
+        self.assertEqual(shutdown_record.read(), ["missing"])
         self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
         path = shutdown_record.record_path()
         before = (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
-        self.rows = (self.rows[0], replace(self.rows[1], name="missing-unit"), *self.rows[2:])
+        self.rows = (self.rows[0], replace(self.rows[1], name="missing"), *self.rows[2:])
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)),
               redirect_stderr(errors)):
             self.assertEqual(restart.restart(), 0)
@@ -883,7 +883,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns), before)
         self.assertEqual(errors.getvalue().splitlines(),
-            ["missing-unit: restart anomaly: in the restart record, no fixed staff id"] * 3)
+            ["missing: restart anomaly: in the restart record, no fixed staff id"] * 3)
         self.assertEqual(self.stops, [])
 
     def test_restart_saved_conversation_reference_does_not_select_a_member(self) -> None:
@@ -900,11 +900,11 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns), before)
 
     def test_restart_command_still_resolves_a_name_without_selecting_saved_entries(self) -> None:
-        shutdown_record.save([str(self.rows[1].id), "missing-unit"])
+        shutdown_record.save([str(self.rows[1].id), "missing"])
         self.running.clear()
         self.assertEqual(restart.restart(only=(self.rows[0].name,)), 0)
         self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
-        self.assertEqual(shutdown_record.read(), [str(self.rows[1].id), "missing-unit"])
+        self.assertEqual(shutdown_record.read(), [str(self.rows[1].id), "missing"])
 
     def test_bare_dry_run_reports_record_time_and_missing_rows(self) -> None:
         shutdown_record.save(["row-0", "gone"])
@@ -938,7 +938,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(self.running, {str(row.current_session) for row in self.rows})
 
     def test_inventory_keeps_sessions_with_unknown_staff_folders(self) -> None:
-        for session in (unit("unknown-unit"), worker_session("unknown-worker", owner=None)):
+        for session in (unit("unknown"), worker_session("unknown-worker", owner=None)):
             for record in (staff.StaffSnapshot(()), staff.StaffSnapshot((
                     replace(self.rows[0], current_session=staff.StaffId(session["session_id"]),
                             worktree=staff.WORKTREE_UNFILLED),))):

@@ -332,9 +332,9 @@ class RestoreStaffNamesTests(StaffTestCase):
     def saved_batch(self) -> tuple[Path, FakeClient]:
         parent, unit, worker = self.tree()
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("unit-after-clear")))
-        unit = staff.rename(unit.id, "renamed-unit")
+        unit = staff.rename(unit.id, "renamed")
         worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("worker-after-clear")))
-        _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("decoy-unit"))
+        _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("decoy"))
         missing = fixture_runtime_id("missing-row")
         directory = self.root / "saved-panes"
         config = self.root / "account"
@@ -409,7 +409,7 @@ class RestoreStaffNamesTests(StaffTestCase):
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
               mock.patch.object(sessions, "running_sessions", return_value=[]),
-              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=True), 0)
         commands = self.ssh_commands()
@@ -418,7 +418,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         self.assertEqual(output.getvalue().count("no staff row"), 1)
         self.assertIn(fixture_runtime_id("missing-row"), output.getvalue())
         self.assertEqual(output.getvalue().count(": resume "), 3)
-        self.assertIn("w1:p1 renamed-unit: resume", output.getvalue())
+        self.assertIn("w1:p1 renamed: resume", output.getvalue())
         self.assertIn("w1:p2 impl1: resume", output.getvalue())
         self.assertIn("w1:p3 models: resume", output.getvalue())
         self.assertEqual(client.started, [])
@@ -519,16 +519,16 @@ class RestoreStaffNamesTests(StaffTestCase):
               mock.patch.object(client, "native_session", side_effect=native),
               mock.patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
               mock.patch.object(sessions, "running_sessions", return_value=[]),
-              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(len(pane_record.read("agents")), 3)
         self.assertEqual(len(self.ssh_commands()), 7)
         self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
         self.assertEqual(order.call_count, 3)
-        self.assertEqual(started, ["renamed-unit", "impl1", "models"])
+        self.assertEqual(started, ["renamed", "impl1", "models"])
         self.assertEqual(sorted(title for _, titles in client.layout() for title in titles),
-                         ["impl1", "models", "renamed-unit"])
+                         ["impl1", "models", "renamed"])
 
 
 class CodexPaneRestoreTests(FolderMoveFixture):

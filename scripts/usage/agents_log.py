@@ -22,6 +22,7 @@ Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worke
 Lens = Literal["adversary", "contract", "craft", "ux", "rerun", "simplify"]
 ROLES: tuple[Role, ...] = ("showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent")
 LENSES = cast(tuple[Lens, ...], get_args(Lens))
+PHASE_REVIEW_LENSES = tuple(lens for lens in LENSES if lens != "simplify")
 
 
 @dataclass(frozen=True)
