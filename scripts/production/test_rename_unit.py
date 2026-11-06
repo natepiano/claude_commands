@@ -57,7 +57,7 @@ class UnitRenameTests(UnitRenameFixture):
         before = final_files(self.root)
         result = self.invoke(["apply", "duplicate", "renamed"])
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("duplicate: several rows match; use slug/name or the staff id", result.stderr)
+        self.assertIn("duplicate: several rows match; use showrunner/name or the staff id", result.stderr)
         self.assertEqual(final_files(self.root), before)
 
     def test_same_name_repairs_displays_with_an_unfilled_worktree(self) -> None:
@@ -317,7 +317,9 @@ class FolderRenameTests(FolderRenameFixture):
         displays.pane = displays.tab = self.owner.name
         labels = displays.pane, displays.tab, displays.workspace
         before = file_versions(self.root)
-        arguments = ["apply", "folder-production/port-unit", "port"]
+        parent = staff.snapshot().parent_of(self.owner)
+        assert parent is not None
+        arguments = ["apply", f"{parent.name}/port-unit", "port"]
         with (FolderSessionFixture(self.owner, live=False).installed(), displays.installed(),
               mock.patch.object(unit_move, "move_folder", wraps=unit_move.move_folder) as move):
             result = invoke_cli(rename, lambda: rename.main(arguments), arguments,

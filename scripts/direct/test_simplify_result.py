@@ -25,7 +25,7 @@ class SimplifyResultTests(unittest.TestCase):
 
     def test_report_validation_accepts_real_review_headings_and_preambles(self) -> None:
         for report in (
-            "**Simplify review: aws-unit, phase 8**\n\nScope: ...\n\n1. **`scripts/aws_target/remote.py:216`**",
+            "**Simplify review: aws, phase 8**\n\nScope: ...\n\n1. **`scripts/aws_target/remote.py:216`**",
             "# Simplify review: phase 101y\n\nI found 16 in-phase items...\n\n### In-phase\n\n1. **minor** · ...",
             "Verification is done. I am writing the report now.\n\n1. **`scripts/review_links/change_browser.py:35-38`** — `in-phase`",
             "# Review\n\nPass\n\nAgent results",

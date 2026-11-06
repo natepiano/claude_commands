@@ -32,7 +32,7 @@ above it, and by default not those of the showrunners below it, which show
 their own. So each showrunner's review is complete for its level (user,
 2026-10-27). `all-below` adds every production below it, at any depth. The
 user runs `/next` in the showrunner whose work they want. Run it in the
-showrunner session, or pass that production's doc.
+showrunner session, or pass the showrunner name.
 
 ## Order
 
@@ -55,12 +55,13 @@ current until it has its answer, also when a more urgent item arrives.
 
 ## Show
 
-Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show
-[--kind <kind>] [--order oldest|newest] [--all-below]`. Outside the showrunner session add
-`--production <doc>`, for every kind. It prints the item's kind on the first line, then the
-item, or a line that nothing waits. Judge the item against current events
-first. Print its verdict line, then present the item by its kind's section
-below.
+1. Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show [--kind <kind>] [--order oldest|newest] [--all-below]`.
+2. Add `--production <showrunner name>` outside the showrunner session, for every kind.
+3. Judge the item against current events.
+4. Print its verdict line.
+5. Present the item under its kind's section below.
+
+The command prints the item's kind, then the item or a message that no item waits.
 
 ## Current events
 
@@ -138,18 +139,18 @@ approved change; commit and push only when the user says so.
 ## question
 
 The current open question. Mark: `update_registration.py mark-important
---production PRODUCTION_DOC --item "<its text>"`. Ask it in full: what is asked,
+--production <showrunner name> --item "<its text>"`. Ask it in full: what is asked,
 why, and the answer choices. Act on the user's answer as `/showrunner:produce` →
 Throughout says, and remove the item through its Open-questions list.
 
 An item shown with `asked by <unit>` was filed with `/unit:question` or
 `/showrunner:question`. When the user answers it, run `update_registration.py
-answer --production PRODUCTION_DOC --item "<its text>"`. It removes the item and
+answer --production <showrunner name> --item "<its text>"`. It removes the item and
 prints whom the answer goes to:
 
 - `relay: to <unit>`: send the unit the answer, beginning
   `From the user (via the showrunner): `, with the question's one-line text.
-- `relay: to the showrunner of <slug>, for <unit>`: the item is a production
+- `relay: to the showrunner of <showrunner name>, for <unit>`: the item is a production
   below this one (`all-below`). Send the answer to that production's
   showrunner, beginning `From the user (via <your name>): `, naming the unit
   and the item. That showrunner relays it to its unit.

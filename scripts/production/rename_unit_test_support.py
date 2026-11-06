@@ -74,11 +74,11 @@ class UnitRenameFixture(StaffTestCase):
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")},
-                           locations={(SLUG, "alpha-unit"): self.rust / "claude-demo-alpha",
-                                      (SLUG, "mul_add-unit"): self.rust / "claude-demo-mul-add"},
-                           plans={(SLUG, "alpha-unit"): Path("docs/plans/alpha.md"),
-                                  (SLUG, "mul_add-unit"): Path("docs/plans/mul-add.md")})
+        bind_staff_fixture(self, self.env, {SLUG: ("alpha", "mul_add")},
+                           locations={(SLUG, "alpha"): self.rust / "claude-demo-alpha",
+                                      (SLUG, "mul_add"): self.rust / "claude-demo-mul-add"},
+                           plans={(SLUG, "alpha"): Path("docs/plans/alpha.md"),
+                                  (SLUG, "mul_add"): Path("docs/plans/mul-add.md")})
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.home / ".local/state/herdr-panes"))
         _ = self.enterContext(mock.patch.object(pane_record, "PROC", self.root / "proc"))
 
@@ -136,8 +136,8 @@ class UnitRenameFixture(StaffTestCase):
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.doc, self.production_doc())
         self.write(self.checkout / "docs/plans/alpha.md",
-                   "# alpha\n\n> **Production:** demo (alpha-unit)\n\nalpha-unit history stays in prose.\n")
-        self.write(self.checkout / "docs/plans/mul-add.md", "# mul_add\n\n> **Production:** demo (mul_add-unit)\n")
+                   "# alpha\n\n> **Production:** demo (alpha)\n\nalpha history stays in prose.\n")
+        self.write(self.checkout / "docs/plans/mul-add.md", "# mul_add\n\n> **Production:** demo (mul_add)\n")
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fixture")
         _ = self.git("push", "-u", "origin", SLUG)
@@ -160,11 +160,11 @@ class UnitRenameFixture(StaffTestCase):
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Log:** `production.log`",
             f"- **Proposals:** `{self.root / 'issues'}`", "",
             "## Hub files", "", "| File | Owner unit | Other units that touch it |", "| --- | --- | --- |",
-            "| `docs/alpha-unit.md` | alpha-unit | beta-unit (after alpha-unit Phase 2) |",
+            "| `docs/alpha-unit.md` | alpha | beta (after alpha Phase 2) |",
             "", "## Gates", "", "| Gate | Waiting | Waits on | Clears when |", "| --- | --- | --- | --- |",
-            "| alpha-unit gate | beta-unit | alpha-unit Phase 2 | alpha-unit merges |",
-            "| old gate | alpha-unit | beta-unit | cleared 10-01 when alpha-unit merged |",
-            "", "## Production rules", "", "History mentions alpha-unit and stays.", "",
+            "| alpha gate | beta | alpha Phase 2 | alpha merges |",
+            "| old gate | alpha | beta | cleared 10-01 when alpha merged |",
+            "", "## Production rules", "", "History mentions alpha and stays.", "",
         ])
 
     def seed_state(self) -> None:
@@ -176,16 +176,16 @@ class UnitRenameFixture(StaffTestCase):
             {"event_type": "phase_started", "phase_instance_id": "p1", "phase_id": "1"},
             {"event_type": "phase_finished", "phase_instance_id": "p1", "phase_id": "1"})) + "\n")
         self.write(self.root / "sessions/s1/progress_history_state.json", json.dumps({
-            "history_file": str(run), "production": SLUG, "unit": "alpha-unit", "worktree": old.name, "branch": "demo-alpha",
+            "history_file": str(run), "production": SLUG, "unit": "alpha", "worktree": old.name, "branch": "demo-alpha",
             "plan_doc": f"{old}/docs/plans/alpha.md"}))
         for name, plan in (("mine", "docs/plans/alpha.md"), ("other-production", "docs/plans/elsewhere.md")):
             self.write(self.root / f"issues/{name}.md", "\n".join([
-                "---", "status: open", "tags: [proposal]", "unit: alpha-unit", f"plan: {plan}",
+                "---", "status: open", "tags: [proposal]", "unit: alpha", f"plan: {plan}",
                 "date_modified: 2026-10-01", "---", "", "A proposal.", ""]))
         for folder, production in (("demo-sr", "demo"), ("other-sr", "other")):
             self.write(self.root / f"vault/showrunners/{folder}/alpha-unit.md", "\n".join([
-                "---", "phase_table: true", f"production: {production}", "unit: alpha-unit", "---", "",
-                "# alpha-unit", ""]))
+                "---", "phase_table: true", f"production: {production}", "unit: alpha", "---", "",
+                "# alpha", ""]))
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -249,10 +249,10 @@ class UnitRenameFixture(StaffTestCase):
         _ = unit_config.write(worktree, unit_config.UnitConfig(
             unit_config.PlanFile(plan), unit_config.NoAppPort(), ()))
         for directory in (self.checkout, worktree):
-            self.write(directory / plan, "# Names\n\n> **Production:** demo (names-unit)\n"
-                       + "> **Standing:** style_plan.py\n\nnames-unit history stays.\n")
+            self.write(directory / plan, "# Names\n\n> **Production:** demo (names)\n"
+                       + "> **Standing:** style_plan.py\n\nnames history stays.\n")
         self.write(self.root / "issues/style.md", "---\nstatus: open\ntags: [proposal, style]\n"
-                   + "proposed_by: demo\nunit: names-unit\ndecision: approved\n"
+                   + "proposed_by: demo\nunit: names\ndecision: approved\n"
                    + "date_modified: 2026-10-01\n---\nA style proposal.\n")
         self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "state/style")
         database = self.root / "state/style" / self.checkout.name / "ledger.sqlite"
@@ -264,8 +264,8 @@ class UnitRenameFixture(StaffTestCase):
                 "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,"
                 + "branch,checkpoint,created_at,updated_at) VALUES (?,?,'read','names','','.','[]','[]','[]','{}',?,"
                 + "'demo-names','','2026-10-01','2026-10-01')",
-                [("names-unit-1", "names-unit", "merged"), ("names-unit-2", "names-unit", "assigned"),
-                 ("names-unit-3", "names-unit", "queued")],
+                [("names-unit-1", "names", "merged"), ("names-unit-2", "names", "assigned"),
+                 ("names-unit-3", "names", "queued")],
             )
         return worktree, plan, database
 

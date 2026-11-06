@@ -42,7 +42,7 @@ class ScheduledDailies:
 
 @dataclass(frozen=True)
 class Production:
-    slug: str
+    name: str
     doc: Path
     zone: str
     schedule: ScheduledDailies | NoDailiesSchedule
@@ -57,18 +57,18 @@ def key_values(path: Path) -> dict[str, str]:
     return values
 
 
-def outstanding_path(slug: str, *, identities: QuestionStaff | None = None) -> Path:
+def outstanding_path(name: str, *, identities: QuestionStaff | None = None) -> Path:
     from update_registration import outstanding_file
 
-    return outstanding_file(slug, identities=identities)
+    return outstanding_file(name, identities=identities)
 
 
 def state_root() -> Path:
     return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 
 
-def review_pause_path(slug: str) -> Path:
-    return state_root() / "review-paused" / f"{slug}.json"
+def review_pause_path(name: str) -> Path:
+    return state_root() / "review-paused" / f"{name}.json"
 
 
 def targeted_instances(session_id: str) -> list[Path]:
@@ -92,8 +92,8 @@ def targeted_instances(session_id: str) -> list[Path]:
 
 def production_doc(instance_dir: Path) -> Path | None:
     """Read the timer owner's document from staff."""
-    checked = showrunners.checked_doc(instance_dir)
-    return checked.path if isinstance(checked, showrunners.CheckedDoc) else None
+    owner = showrunners.owner_for(key_values(instance_dir / "conf")["TARGET"].removeprefix("session:"))
+    return owner.doc.path if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else None
 
 
 def read_production(instance_dir: Path) -> Production | None:
@@ -113,7 +113,7 @@ def read_production(instance_dir: Path) -> Production | None:
             state = {}
         schedule = (ScheduledDailies(int(state["NEXT_DUE"])) if state.get("ENABLED") == "1"
                     else NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
-        return Production(showrunners.production_slug(str(doc)), doc, zone, schedule)
+        return Production(showrunners.owner_for(key_values(instance_dir / "conf")["TARGET"].removeprefix("session:")).name, doc, zone, schedule)
     except (OSError, ValueError, ZoneInfoNotFoundError, KeyError):
         return None
 
@@ -130,7 +130,7 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
         print(f"questions: unavailable — {error}", file=sys.stderr)
         return None
     count = 0
-    for production in {production.slug: production for production in productions}.values():
+    for production in {production.name: production for production in productions}.values():
         try:
             owner = identities.owner(production.doc)
         except RegistrationFailure as error:
@@ -150,7 +150,7 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
     return count
 
 
-def deferred_until(slugs: list[str], zone: str, *, identities: QuestionStaff | None = None) -> datetime | None:
+def deferred_until(names: list[str], zone: str, *, identities: QuestionStaff | None = None) -> datetime | None:
     """Return the first deferred time from readable stores and report unavailable stores."""
     sys.path.insert(0, str(DAILIES.parent))
     from update_registration import RegistrationFailure, read_open_items
@@ -163,9 +163,9 @@ def deferred_until(slugs: list[str], zone: str, *, identities: QuestionStaff | N
         return None
     now = datetime.now(ZoneInfo(zone)).replace(tzinfo=None)
     afters: list[datetime] = []
-    for slug in slugs:
+    for name in names:
         try:
-            items = read_open_items(outstanding_path(slug, identities=identities), identities=identities)
+            items = read_open_items(outstanding_path(name, identities=identities), identities=identities)
         except (InputError, OSError, ValueError, RegistrationFailure, staff.StaffRefused) as error:
             print(f"questions: unavailable — {error}", file=sys.stderr)
             continue

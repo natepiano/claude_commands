@@ -6,10 +6,10 @@
 The shared `rename.repair_displays` selects the row's current native session.
 It keeps panes that run another session.
 
-The command accepts a staff id, `slug/name`, or a bare name.
+The command accepts a staff id, `showrunner/name`, or a bare name.
 A bare name first selects the calling showrunner or its own units.
 If none matches, the command searches all showrunner and unit rows.
-Several matches require a staff id or `slug/name`.
+Several matches require a staff id or `showrunner/name`.
 A same-name request repairs differing names.
 It prints `unchanged` only when the row and all available names agree.
 An unavailable display produces one anomaly line and a successful exit.
@@ -42,7 +42,6 @@ The command creates no commit and makes no push.
 
 Timers and stores keep their staff ids during a rename.
 The command edits no document fields, plan headers, prose, marks, or history.
-The Phase 3y migrations retain their former-name readers for old records.
 Unit renames change matching folder and branch suffixes; see `unit-rename.md`.
 Folder-only moves use `unit_move.py move-folder --unit <staff id> --to <path>`.
 

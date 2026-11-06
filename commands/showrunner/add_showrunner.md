@@ -1,11 +1,11 @@
 ---
 description: Start a child production showrunner.
-argument-hint: "<production doc> [resume <session id> <dir> [account <label>|config-dir <dir>]] [check]"
+argument-hint: "<showrunner name> [--doc <path>] [resume <session id> <dir> [account <label>|config-dir <dir>]] [check]"
 ---
 
 # Add showrunner
 
-**Usage:** `/showrunner:add_showrunner <production doc>`, with `resume <session
+**Usage:** `/showrunner:add_showrunner <showrunner name> [--doc <path>]`, with `resume <session
 id> <dir>` to bring back a lower showrunner whose session ended, or `check` to
 see whether it would start.
 
@@ -21,21 +21,24 @@ With the user's 2026-10-13 move to herdr, an L1 showrunner uses
 Run, with the sandbox off:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_showrunner.py" --production <PRODUCTION_DOC> --model <your model id> --effort <your effort level> [--resume <session id> --cwd <dir> [--account <label>|--config-dir <dir>]] [--check]
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_showrunner.py" --production <showrunner name> [--doc <path>] --model <your model id> --effort <your effort level> [--resume <session id> --cwd <dir> [--account <label>|--config-dir <dir>]] [--check]
 ```
+
+Pass `--doc <path>` only when the showrunner has no staff row yet.
+A resume or a rerun reads the doc from the existing row.
 
 Pass your own model id and effort level, so the lower showrunner runs as you
 do. Your system prompt names your model's exact id. When you cannot tell your
 effort level, ask the user which to use. Show the script's output. If it exits
 nonzero, show its message and stop.
-On launch it prints `started <slug>: herdr session attach agents, workspace <slug>, tab <slug>`: every
+On launch it prints `started <showrunner name>: herdr session attach agents, workspace <showrunner name>, tab <showrunner name>`: every
 Claude session is a tab of the one herdr session, `agents`.
 
 What it does:
 
-- It starts `claude` in its own herdr session named for the production's
-  slug (the doc's file name without `-production.md`), in that production's
-  showrunner checkout, with `/showrunner:produce <doc>`. With `resume` it
+- It starts `claude` with the showrunner staff name in the production's showrunner checkout.
+  It reads the doc from `--doc` for creation, or from the staff row for an existing showrunner.
+  It runs `/showrunner:produce <doc>`. With `resume` it
   resumes that session in `<dir>`, the directory it ran in, with
   `/showrunner:produce <doc> resume`.
 - New and resumed sessions start on the configured showrunners account. An
@@ -68,14 +71,13 @@ It refuses, and starts nothing, when:
   answers a trust prompt (live check, 2026-10-13: a child sat on it for the whole wait).
 
 If the session starts and no showrunner appears in time, the command says so,
-exits 1 and leaves the session running. Look at it in its tab (the line above names it); once it has its update timer, run `/showrunner:attach <slug>`.
+exits 1 and leaves the session running. Look at it in its tab (the line above names it); once it has its update timer, run `/showrunner:attach <showrunner name>`.
 
 If Claude opens but is not ready, such as at a dialog, the command prints its
 screen, sends no prompt, exits 3 and leaves the session open. Look at it in its tab.
 
 The user reaches the lower showrunner in its tab of `agents` or by
-Remote Control under the same name. `/showrunner:rename` does not rename a
-running session: its herdr tab and Remote Control name keep the slug it
-started with until it is started or resumed again, which uses the new slug. What each side does once attached is in
+Remote Control under the same name. `/showrunner:rename` changes the staff name and the live session names.
+What each side does once attached is in
 `/showrunner:produce` → Nested showrunners. To take it out of the tree, use
-`/showrunner:attach detach <slug>`; wrapping its production does the same.
+`/showrunner:attach detach <showrunner name>`; wrapping its production does the same.

@@ -155,7 +155,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
 
     def test_supplier_wait_only_finishes_on_its_current_address(self) -> None:
         for final_line, sender, address in (
-            ("blocked: waiting on the showrunner to merge", "showrunner:wait-production", "/fixture/showrunner/socket"),
+            ("blocked: waiting on the showrunner to merge", "showrunner:expected-showrunner", "/fixture/showrunner/socket"),
             ("blocked: waiting on claude-build-followups-other", "claude-build-followups-other", "socket-1"),
             ("blocked: waiting on session:peer-1", "session:peer-1", "socket-1"),
         ):

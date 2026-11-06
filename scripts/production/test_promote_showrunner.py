@@ -32,7 +32,7 @@ import unit_effort
 import unit_lookup
 import herdr
 import sessions
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import Production, Refusal, read_new_production, read_production
 from scripts.accounts import accounts
 from scripts.herdr import herdr as trust_reader, worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
@@ -86,7 +86,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_promotion_closes_retained_shells_only_after_every_stop_proves_success(self) -> None:
         unit = self.staff_unit()
         retained = fixture_member("worker", name="impl", parent=unit.id)
-        promotion = promote_showrunner.checked("demo", self.child_doc)
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
         for stopped_director, unresolved, close_result in ((False, [], True), (True, [], True), (False, [], False),
                 (False, [], OSError("worker close failed")), (False, ["impl: not proved stopped"], True)):
             world = PaneWorld()
@@ -138,7 +138,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_promotion_keeps_a_worker_program_and_a_shell_in_another_tab(self) -> None:
         unit = self.staff_unit()
         retained = fixture_member("worker", name="impl", parent=unit.id)
-        promotion = promote_showrunner.checked("demo", self.child_doc)
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
         world = PaneWorld()
         world.add(unit, PANE, live=False)
         world.add(retained, "w7:p2")
@@ -154,7 +154,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(set(world.locations), {PANE, "w7:p2", "w7:p3"})
 
     def test_promotion_continues_after_a_failed_confirmed_close(self) -> None:
-        promotion = promote_showrunner.checked("demo", self.child_doc)
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
         with (mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=False),
               redirect_stderr(io.StringIO()) as errors):
             self.assertTrue(promote_showrunner.stop(promotion))
@@ -162,7 +162,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertIn("anomaly:", errors.getvalue())
 
     def test_promotion_continues_after_a_failed_pane_read(self) -> None:
-        promotion = promote_showrunner.checked("demo", self.child_doc)
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
         with (mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]),
               mock.patch.object(herdr.Herdr, "panes", side_effect=herdr.HerdrFailure("unreadable")),
               mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close,
@@ -224,18 +224,16 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
         })))
         _ = self.staff.production("parent")
-        _ = self.staff.production("child")
         parent = repo(self.root / "parent")
         self.parent_doc = parent / "parent-production.md"
         _ = self.parent_doc.write_text(doc_text(parent))
         _ = (parent / "log.md").write_text("log\n")
         commit_all(parent)
         self.worktree = repo(self.root / "demo")
-        self.child_doc = self.worktree / "child-production.md"
+        self.child_doc = self.worktree / "future-production.md"
         _ = self.child_doc.write_text(doc_text(self.worktree))
         commit_all(self.worktree)
         self.staff.register_production("parent", self.parent_doc)
-        self.staff.register_production("child", self.child_doc)
         parent_row = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", self.parent_doc))
         _ = fixture_member("unit", name="demo", parent=parent_row.id, runtime_id=SESSION,
                            worktree=staff.PresentWorktree("natedev", self.worktree))
@@ -244,7 +242,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         other = fixture_member("unit", name="other", parent=parent_row.id)
         _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", self.root / "other"), expected=other.worktree)
         self.staff.pane("fixture:parent/demo-unit", session_id=SESSION, environment={
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "parent", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo-unit"})
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "parent", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo"})
         session_records = self.root / "sessions"
         session_records.mkdir()
         _ = (session_records / f"{PID}.json").write_text(json.dumps({"pid": PID, "sessionId": SESSION, "name": "demo",
@@ -257,8 +255,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
         })))
-        self.marked = {"demo-unit": unit_lookup.LabeledSession(
-            "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID), herdr.HerdrPlace("demo", PANE))}
+        self.marked = {"demo": unit_lookup.LabeledSession(
+            "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID), herdr.HerdrPlace("demo", PANE))}
         self.unit_account = accounts.NamedAccount("claude2", self.root / ".claude2")
         (self.root / ".claude").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
@@ -279,9 +277,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
         def pane_result(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
             del client, deadline
             if arguments[:2] == ("pane", "list"):
-                if "demo-unit" not in self.marked:
+                if "demo" not in self.marked:
                     return {"panes": []}
-                place = self.marked["demo-unit"].place
+                place = self.marked["demo"].place
                 assert isinstance(place, herdr.HerdrPlace)
                 return {"panes": [{"pane_id": place.pane, "terminal_id": "unit-terminal",
                                    "workspace_id": place.pane.split(":")[0], "tab_id": "w7:t1"}]}
@@ -295,7 +293,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True))
         for module, name, stand_in in (
-                (showrunners, "production_of", self.production_of), (unit_lookup, "labeled_session", self.labeled_session),
+                (showrunners, "own_name", self.own_name), (unit_lookup, "labeled_session", self.labeled_session),
                 (stop_resume, "stop", self.stop_member), (stop_resume, "stop_unit_workers", mock.Mock(return_value=[])),
                 (worker, "restore", mock.Mock(return_value=worker.ExitCode.OK)), (add_showrunner, "checked", self.child_checked),
                 (add_showrunner, "main", self.start), (accounts, "role_account", self.role_account),
@@ -312,13 +310,13 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}))
         return accounts.NamedAccount("claude3", directory)
 
-    def production_of(self, _session: str) -> Path | None:
-        return self.parent_doc if self.runs_production else None
+    def own_name(self) -> str:
+        return "parent" if self.runs_production else ""
 
     def verdict(self, _capture: str) -> unit_effort.Ready | unit_effort.Skipped:
         return self.pane
 
-    def labeled_session(self, _slug: str, name: str) -> unit_lookup.LabeledSession | None:
+    def labeled_session(self, _production_name: str, name: str) -> unit_lookup.LabeledSession | None:
         return self.marked.get(name)
 
     def role_account(self, _role: str) -> accounts.ClaudeLaunchAccount:
@@ -344,7 +342,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def run_main(self, *extra: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = promote_showrunner.main(["demo", "--production", str(self.child_doc),
+            code = promote_showrunner.main(["demo", "--production", "child", "--doc", str(self.child_doc),
                                             "--model", "opus", "--effort", "high", *extra])
         return code, out.getvalue(), err.getvalue()
 
@@ -355,7 +353,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         parent = fixture_member("showrunner", name="parent")
         unit = fixture_member("unit", name="demo", parent=parent.id, runtime_id=SESSION)
         self.staff.pane("w7:p1", session_id=SESSION, environment={
-            "CLAUDE_CODE_SESSION_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "parent", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo-unit"})
+            "CLAUDE_CODE_SESSION_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "parent", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo"})
         return unit
 
     def assert_native_promotion(self, unit: staff.StaffRow) -> None:
@@ -428,12 +426,12 @@ class PromoteShowrunnerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 _ = self.run_main()
         self.marked.clear()
-        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+        pending = promote_showrunner.promotion_record(read_production("parent"), "demo")
         self.assertTrue(pending.exists())
         self.events.clear()
         code, out, err = self.run_main()
         self.assertEqual(code, 0, (out, err))
-        self.assertIn("demo-unit is now the showrunner of child", out)
+        self.assertIn("demo is now the showrunner of child", out)
         start = next(event for event in self.events if event.startswith("start "))
         self.assertIn(f"--resume {SESSION}", start)
         self.assertIn(f"--cwd {self.worktree}", start)
@@ -473,7 +471,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stopped before timer"):
                 _ = self.run_main()
         started.assert_called_once()
-        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+        pending = promote_showrunner.promotion_record(read_production("parent"), "demo")
         self.assertTrue(pending.exists())
         place = herdr.HerdrPlace("agents", "w8:p1")
         with (mock.patch.object(showrunners, "current_name", return_value=""),
@@ -483,7 +481,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(herdr, "submitted_prompt", return_value=submitted),
               mock.patch.object(herdr.Herdr, "submit_opening_prompt") as prompt,
               mock.patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
-              mock.patch.object(showrunners, "timer_slugs", return_value={"parent", "child"}),
+              mock.patch.object(showrunners, "timer_names", return_value={"parent", "child"}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
               mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery(("sent child", "sent parent"))),
               mock.patch.object(add_showrunner, "main") as restart):
@@ -503,7 +501,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.marked.clear()
             return showrunners.main(["attach", "child", "parent"])
 
-        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+        pending = promote_showrunner.promotion_record(read_production("parent"), "demo")
 
         def send_notices(texts: dict[str, str], key: str) -> showrunners.NoticeDelivery:
             self.assertTrue(pending.exists())
@@ -511,7 +509,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.assertEqual(key, "showrunner-tree:child")
             return showrunners.NoticeDelivery(("sent child", "sent parent"))
 
-        with (mock.patch.object(showrunners, "timer_slugs", return_value={"parent", "child"}),
+        with (mock.patch.object(showrunners, "timer_names", return_value={"parent", "child"}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
             with (mock.patch.object(add_showrunner, "main", side_effect=start_and_attach),
                   mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("stopped before notices"))):
@@ -553,10 +551,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
         cases = {
             "this session runs no production": no_production,
-            "demo-unit has no live session under parent": lambda: self.marked.clear(),
-            "demo-unit is mid-turn": mid_turn,
-            "demo-unit's pane: a form, prompt or menu is open": form,
-            "demo-unit has a /unit:direct run open": run_open,
+            "demo has no live session under parent": lambda: self.marked.clear(),
+            "demo is mid-turn": mid_turn,
+            "demo's pane: a form, prompt or menu is open": form,
+            "demo has a /unit:direct run open": run_open,
             "has uncommitted work; it checkpoints first": lambda: (self.worktree / "draft.py").write_text("x"),
             f"child already has a running showrunner (ending {add_showrunner.EndingUnitTab(PANE)})": child_taken,
         }
@@ -581,11 +579,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assert_nothing_stopped()
 
     def test_a_retired_or_unlisted_unit_is_refused(self) -> None:
-        for unit, cause in (("ghost", "ghost-unit has no staff row under parent"), ("other", "other-unit is retired")):
+        for unit, cause in (("ghost", "ghost has no staff row under parent"), ("other", "other is retired")):
             with self.subTest(unit=unit):
                 err = io.StringIO()
                 with redirect_stdout(io.StringIO()), redirect_stderr(err):
-                    code = promote_showrunner.main([unit, "--production", str(self.child_doc),
+                    code = promote_showrunner.main([unit, "--production", "child", "--doc", str(self.child_doc),
                                                     "--model", "opus", "--effort", "high"])
                 self.assertEqual(code, 2)
                 self.assertIn(cause, err.getvalue())
@@ -593,7 +591,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_check_stops_nothing(self) -> None:
         code, out, err = self.run_main("--check")
         self.assertEqual(code, 0, err)
-        self.assertIn("check: ok — would stop demo-unit (herdr demo), resume it as the showrunner of child", out)
+        self.assertIn("check: ok — would stop demo (herdr demo), resume it as the showrunner of child", out)
         self.assert_nothing_stopped()
 
     def test_the_unit_is_gone_before_it_restarts(self) -> None:
@@ -604,7 +602,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertLess(ended_at, started_at)
         self.assertIn(f"--resume {SESSION} --cwd {self.worktree}", self.events[started_at])
         self.assertIn("--model opus --effort high", self.events[started_at])
-        self.assertIn("demo-unit is now the showrunner of child", out)
+        self.assertIn("demo is now the showrunner of child", out)
 
     def test_unready_showrunner_names_the_owed_prompt(self) -> None:
         """cbc14765, 2026-10-20: the session opened, its prompt was refused, and the row stayed a live unit."""
@@ -613,7 +611,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             code, out, err = self.run_main()
         self.assertEqual((code, err), (1, ""))
         restore.assert_not_called()
-        self.assertIn("demo-unit is open as the session child, but its showrunner prompt is not proven to have run.", out)
+        self.assertIn("demo is open as the session child, but its showrunner prompt is not proven to have run.", out)
         self.assertIn("herdr session attach agents, workspace child, tab child", out)
         self.assertIn(f"/showrunner:produce {self.child_doc} resume", out)
         self.assertNotIn("add_unit.py", out)
@@ -637,7 +635,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.started = 1
         code, out, err = self.run_main()
         self.assertEqual((code, err), (1, ""))
-        self.assertIn("demo-unit is now the showrunner of child", out)
+        self.assertIn("demo is now the showrunner of child", out)
         self.assertNotIn("add_unit.py", out)
 
     def test_promotion_refuses_unconfigured_showrunners_before_stopping_unit(self) -> None:
@@ -727,8 +725,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertFalse(any(event.startswith("start") for event in self.events))
 
     def native_unit(self) -> None:
-        self.marked["demo-unit"] = unit_lookup.LabeledSession(
-            "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
+        self.marked["demo"] = unit_lookup.LabeledSession(
+            "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("native", "w1:p1"))
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -763,8 +761,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
 
     def test_another_herdr_unit_does_not_exempt_the_childs_live_destination(self) -> None:
-        self.marked["demo-unit"] = unit_lookup.LabeledSession(
-            "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
+        self.marked["demo"] = unit_lookup.LabeledSession(
+            "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("demo", PANE))
         with mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT), \
                 mock.patch.object(showrunner_tree, "descendants_of", return_value=[]), \
@@ -780,8 +778,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertFalse(any(event.startswith("stop member ") for event in self.events))
 
     def test_promotion_check_exempts_its_own_tab_in_the_shared_session(self) -> None:
-        self.marked["demo-unit"] = unit_lookup.LabeledSession(
-            "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
+        self.marked["demo"] = unit_lookup.LabeledSession(
+            "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("agents", PANE))
         with (mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT),
               mock.patch.object(showrunner_tree, "descendants_of", return_value=[]),
@@ -801,14 +799,14 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.started = 2
         code, out, _err = self.run_main()
         self.assertEqual(code, 1)
-        self.assertIn("demo-unit is stopped and did not start as a showrunner.", out)
+        self.assertIn("demo is stopped and did not start as a showrunner.", out)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py --production "
-                      + f"{self.parent_doc} demo --plan docs/demo.md --resume {SESSION} --cwd {self.worktree}", out)
+                      + f"parent demo --plan docs/demo.md --resume {SESSION} --cwd {self.worktree}", out)
 
     def child_with_open_tabs(self, panes: list[herdr.PaneIdentity]) -> Production:
         child_doc = self.worktree / "builds-production.md"
         _ = child_doc.write_text(doc_text(self.worktree))
-        child = read_production(child_doc)
+        child = read_new_production(child_doc, "child")
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(child.checkout): {"hasTrustDialogAccepted": True}}}))
         _ = self.enterContext(mock.patch.object(add_showrunner, "running", return_value=False))
@@ -822,22 +820,22 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
     def test_the_childs_check_lets_the_units_own_tab_carry_its_name(self) -> None:
         ending_place = herdr.HerdrPlace("agents", PANE)
-        child = self.child_with_open_tabs([pane_identity(ending_place.pane, "builds")])
+        child = self.child_with_open_tabs([pane_identity(ending_place.pane, "child")])
         ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(ending_place.pane),
                          config_dir=self.unit_account.dir)
 
     def test_the_childs_check_refuses_another_same_named_tab_beside_the_ending_unit(self) -> None:
         child = self.child_with_open_tabs([
-            pane_identity(PANE, "builds"),
-            pane_identity("w8:p2", "builds"),
+            pane_identity(PANE, "child"),
+            pane_identity("w8:p2", "child"),
         ])
-        with self.assertRaisesRegex(Refusal, "^a tab named builds is already open in herdr session agents$"):
+        with self.assertRaisesRegex(Refusal, "^a tab named child is already open in herdr session agents$"):
             ORIGINAL_CHECKED(child, "parent", ending=add_showrunner.EndingUnitTab(PANE),
                              config_dir=self.unit_account.dir)
 
     def test_the_childs_check_is_for_the_units_worktree_which_must_be_trusted(self) -> None:
-        self.marked["demo-unit"] = unit_lookup.LabeledSession(
-            "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
+        self.marked["demo"] = unit_lookup.LabeledSession(
+            "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
             herdr.HerdrPlace("agents", PANE))
         code, _out, err = self.run_main("--check")
         self.assertEqual(code, 0, err)
@@ -845,7 +843,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                       + f"starting in {self.worktree}", self.events)
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(self.root.resolve()): {"hasTrustDialogAccepted": True}}}))
-        child = read_production(self.child_doc)
+        child = read_new_production(self.child_doc, "child")
         with (mock.patch.dict(os.environ, {"ADD_SHOWRUNNER_CLAUDE_JSON": str(config)}),
               mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
               mock.patch.object(add_showrunner, "herdr_tab_open", mock.Mock(return_value=False)),

@@ -441,9 +441,9 @@ class RestoreStaffNamesTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
         _ = self.enterContext(mock.patch.object(FakeClient, "run_in_pane"))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("unit-after-clear")))
-        unit = staff.rename(unit.id, "renamed-unit")
+        unit = staff.rename(unit.id, "renamed")
         worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("worker-after-clear")))
-        _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("decoy-unit"))
+        _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("decoy"))
         missing = fixture_runtime_id("missing-row")
         directory = self.root / "saved-panes"
         config = self.root / ".claude3"
@@ -536,7 +536,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         self.assertEqual(output.getvalue().count("no staff row"), 1)
         self.assertIn(fixture_runtime_id("missing-row"), output.getvalue())
         self.assertEqual(output.getvalue().count(": resume "), 3)
-        self.assertIn("w1:p1 renamed-unit: resume", output.getvalue())
+        self.assertIn("w1:p1 renamed: resume", output.getvalue())
         self.assertIn("w1:p2 impl1: resume", output.getvalue())
         self.assertIn("w1:p3 models: resume", output.getvalue())
         self.assertEqual(client.started, [])
@@ -650,9 +650,9 @@ class RestoreStaffNamesTests(StaffTestCase):
         self.assertEqual(len(self.ssh_commands()), 6)
         self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
         self.assertEqual(order.call_count, 3)
-        self.assertEqual(started, ["renamed-unit", "impl1", "models"])
+        self.assertEqual(started, ["renamed", "impl1", "models"])
         self.assertEqual(sorted(title for _, titles in client.layout() for title in titles),
-                         ["impl1", "models", "renamed-unit"])
+                         ["impl1", "models", "renamed"])
 
 
 class CodexPaneRestoreTests(FolderMoveFixture):

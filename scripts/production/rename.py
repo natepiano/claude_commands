@@ -76,7 +76,7 @@ def _member(old: str, new: str, record: staff.StaffSnapshot) -> staff.StaffRow:
             matches = [row for row in scope if row.name == reference or
                        row.kind == "unit" and row.name == reference.removesuffix("-unit")]
             if len(matches) > 1:
-                raise staff.StaffRefused(f"{old}: several rows match; use slug/name or the staff id")
+                raise staff.StaffRefused(f"{old}: several rows match; use showrunner/name or the staff id")
             if matches:
                 return matches[0]
     raise staff.StaffRefused(f"{old}: no showrunner or unit staff row")

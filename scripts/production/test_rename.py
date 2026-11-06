@@ -319,7 +319,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
 
     def test_unit_reference_cannot_move_an_existing_showrunners_document(self) -> None:
         row = self.production_row()
-        unit = fixture_member("unit", name="requested-unit", parent=row.id)
+        unit = fixture_member("unit", name="requested", parent=row.id)
         before = self.file_versions()
         result = self.run_command("apply", unit.id, row.name,
             "--to-doc", str(self.new_doc), "--to-branch", NEW)

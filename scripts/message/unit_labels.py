@@ -100,7 +100,7 @@ class UnitLabels:
 def make_labels(name: str, showrunner: ShowrunnerRelationship,
                  director: DirectorRelationship) -> UnitLabels:
     production = " ".join(production_of(showrunner).split())
-    unit = short_unit(" ".join(unit_of(director).split()))
+    unit = " ".join(unit_of(director).split())
     return UnitLabels(" ".join(name.split()), production or "—", unit or "—")
 
 
@@ -112,11 +112,6 @@ def production_of(showrunner: ShowrunnerRelationship) -> str:
 
 def unit_of(director: DirectorRelationship) -> str:
     return director.unit if isinstance(director, (DirectsUnit, UnderDirector, UnitWithoutRunningDirector)) else ""
-
-
-def short_unit(unit: str) -> str:
-    """The shown unit name: the unit id without its "-unit" suffix."""
-    return unit.removesuffix("-unit")
 
 
 @dataclass(frozen=True)
@@ -256,7 +251,7 @@ def registered_showrunners(
             continue
         live = sessions_by_id.get(row.current_session)
         registered.append(showrunners.Showrunner(
-            slug=timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name,
+            name=row.name,
             session=live["name"] if live is not None else "",
             socket=live["messagingSocketPath"] if live is not None else "",
             doc=str(doc.path),
@@ -317,15 +312,15 @@ def production_places(
             diagnostics.document(row, doc)
             continue
         try:
-            timer = showrunners.timer_for(parent, record)
+            _ = showrunners.timer_for(parent, record)
         except (OSError, ValueError) as error:
             problem(diagnostics.problems, parent.name, error)
             continue
-        slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
+        name = parent.name
         owner = by_id.get(parent.current_session)
         relationship: UnderShowrunner | ProductionWithoutRunningShowrunner = (
-            UnderShowrunner(slug, owner["name"], f"session:{parent.current_session}")
-            if owner is not None else ProductionWithoutRunningShowrunner(slug))
+            UnderShowrunner(name, owner["name"], f"session:{parent.current_session}")
+            if owner is not None else ProductionWithoutRunningShowrunner(name))
         places[identity] = ProductionPlace(relationship, DirectsUnit(row.name))
     return places
 
@@ -357,7 +352,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
             showrunner: ShowrunnerRelationship = NoShowrunner()
             director: DirectorRelationship = NoDirector()
             if session_id in runners:
-                showrunner = RunsProduction(runners[session_id]["slug"])
+                showrunner = RunsProduction(runners[session_id]["name"])
             elif session_id in places:
                 showrunner = places[session_id].showrunner
                 director = places[session_id].director

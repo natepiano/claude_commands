@@ -18,7 +18,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production.staff_test_support import unit_membership, StaffTestCase, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster
+from scripts.production.staff_test_support import unit_membership, recorded_showrunner, StaffTestCase, fixture_worker, fixture_runtime_id, fixture_session, fixture_roster
 from scripts.production import staff
 from scripts.usage import agents_log
 from test_support import ShutdownTestCase, linux_process_fixture
@@ -102,7 +102,7 @@ class InventoryImportTests(unittest.TestCase):
     def test_package_inventory_imports_without_shutdown_on_search_path(self) -> None:
         root = Path(__file__).resolve().parents[2]
         result = subprocess.run(
-            [sys.executable, "-I", "-c", """
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-I", "-c", """
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
@@ -190,6 +190,17 @@ class InventoryTests(ShutdownTestCase):
         self.assertEqual(seats["busy"], inventory.PausedSeat(run_dir=str(run), seat="busy", role="review", staff_id="75863a97-cb41-5754-bb95-d7e89deccf43", turn_live=True, launcher_command=command))
         self.assertEqual(seats["idle"], inventory.PausedSeat(run_dir=str(run), seat="idle", role="impl", staff_id="fe371221-a140-5ddf-8753-e906f9ce3519", turn_live=False, launcher_command=[]))
         self.assertEqual(seats["orphan"]["launcher_command"], [])
+
+        for launcher in ("assign.sh", "assign.py"):
+            with self.subTest(launcher=launcher):
+                command = ["bash" if launcher.endswith(".sh") else "python3",
+                           f"/config/scripts/direct/{launcher}", "--role", "review", "--to", "busy",
+                           "--session-dir", str(run), "--cwd", "/checkout with spaces",
+                           "--prompt", "/old/prompt.md", "--phase", "1", "--lens", "contract", "--pass", "2"]
+                self.herdr_process(811, 812, command, {})
+                with patch.object(inventory, "_pid_alive", side_effect=launcher_alive):
+                    seats = {seat["seat"]: seat for seat in inventory.codex_seats([run])}
+                self.assertEqual(seats["busy"]["launcher_command"], command)
 
     def test_codex_seats_leaves_out_a_run_its_director_left_after_an_earlier_stop_offered_it(self) -> None:
         def run_with(name: str, statuses: dict[str, str], *, board_at: int, offered_at: int | None) -> Path:
@@ -352,17 +363,33 @@ class InventoryTests(ShutdownTestCase):
                     self.assertEqual(light.doc, str(self.root / "build-followups-production.md"))
                     self.assertNotIn("doc", session["host"])
 
+    def test_registration_reads_the_folder_owner_document_from_one_staff_snapshot(self) -> None:
+        doc = self.root / "document-name-differs.md"
+        _ = doc.write_text("# Production\n", encoding="utf-8")
+        owner = recorded_showrunner("staff-name", doc)
+        other = recorded_showrunner("other-owner", self.root / "other-document.md")
+        folder = self.notifier / f"showrunner-{owner.id}"
+        folder.mkdir()
+        _ = (folder / "conf").write_text(
+            f"TARGET=session:{owner.id}\nCHECK=zsh /opt/production_check.sh {other.id}\n", encoding="utf-8")
+        with patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            registrations = inventory.showrunner_registrations()
+        found = next(item for item in registrations.entries if item.name == owner.name)
+        self.assertEqual(found.doc, str(doc))
+        self.assertEqual(reads.call_count, 1)
+
     def test_listing_and_absent_target_check_share_timer_reads_without_resolving_sockets(self) -> None:
-        stale = self.notifier / "showrunner-stale"
-        stale.mkdir()
         stale_doc = self.root / "stale-production.md"
+        owner = recorded_showrunner("stale", stale_doc)
+        stale = self.notifier / f"showrunner-{owner.id}"
+        stale.mkdir()
         _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         _ = (stale / "conf").write_text(
-            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {owner.id}\n",
             encoding="utf-8")
         with (patch.object(showrunners, "socket_for", side_effect=AssertionError("listing probed a messaging socket")),
               patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("listing resolved showrunner messaging")),
-              patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as checked):
+              patch.object(inventory, "_conf", wraps=getattr(inventory, "_conf")) as checked):
             registrations = inventory.showrunner_registrations()
             listed = inventory.listing(registrations=registrations)
             missing = inventory.unregistered_showrunners(listed, registrations=registrations)
@@ -373,7 +400,7 @@ class InventoryTests(ShutdownTestCase):
         unit = next(item for item in listed if item.session_id == UNIT_ID)
         self.assertEqual((unit.kind, unit.production, unit.doc),
             ("unit", "build-followups", director.doc))
-        self.assertEqual([(runner["slug"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
+        self.assertEqual([(runner["name"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
 
     def test_forty_session_listing_and_large_transcript_read_budget(self) -> None:
         for path in self.records.glob("*.json"):
@@ -435,7 +462,7 @@ class InventoryTests(ShutdownTestCase):
         self.home = self.root / "home"
         self.notes = self.root / "agents"
         self.records = self.root / "sessions"
-        self.notifier = self.root / "notifier"
+        self.notifier = Path(os.environ["NOTIFIER_STATE_DIR"])
         self.history = self.root / "history"
         self.runs = self.root / "runs"
         self.checkout = self.root / "checkout"
@@ -468,7 +495,6 @@ class InventoryTests(ShutdownTestCase):
             "USAGE_STATE_DIR": str(self.root / "usage"),
             "AGENT_NOTES_DIR": str(self.notes),
             "NOTIFIER_SESSIONS_DIR": str(self.records),
-            "NOTIFIER_STATE_DIR": str(self.notifier),
             "UNIT_HISTORY_DIR": str(self.history),
             "SHUTDOWN_RUN_ROOT": str(self.runs),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
@@ -485,9 +511,6 @@ class InventoryTests(ShutdownTestCase):
         del patch_dict_context
         _home_context: object = self.enterContext(
             patch.object(Path, "home", return_value=self.home)
-        )
-        _notifier_context: object = self.enterContext(
-            patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier)
         )
         _live_context: object = self.enterContext(
             patch.object(sessions, "live_session", return_value=True)
@@ -636,14 +659,14 @@ class InventoryTests(ShutdownTestCase):
 
     def build_git_checkout(self) -> None:
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "shutdown-unit", cwd=self.checkout)
+        _ = self.git("init", "-b", "shutdown", cwd=self.checkout)
         _ = self.git("config", "user.name", "Shutdown Test")
         _ = self.git("config", "user.email", "shutdown@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
         _ = (self.checkout / "dirty.txt").write_text("base\n", encoding="utf-8")
         _ = self.git("add", "dirty.txt")
         _ = self.git("commit", "-m", "base")
-        _ = self.git("push", "-u", "origin", "shutdown-unit")
+        _ = self.git("push", "-u", "origin", "shutdown")
         for number in (1, 2):
             _ = (self.checkout / f"ahead-{number}.txt").write_text(
                 f"ahead {number}\n", encoding="utf-8"
@@ -746,7 +769,7 @@ elif "comm=" in joined:
         self.write_session(
             UNIT_PID,
             UNIT_ID,
-            "shutdown-unit",
+            "shutdown",
             self.checkout,
             tmux="old-label:@1.%4",
             updated_at=50,
@@ -771,7 +794,7 @@ elif "comm=" in joined:
         self.write_session(UNKNOWN_PID, UNKNOWN_ID, "hidden-account", plain, updated_at=10)
 
     def make_production_state(self) -> None:
-        member = unit_membership("build-followups", "shutdown-unit")
+        member = unit_membership("build-followups", "shutdown")
         _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.checkout), expected=member.worktree)
         assert isinstance(member.parent, staff.ReportsTo)
         parent = staff.by_id(member.parent.id)
@@ -780,13 +803,14 @@ elif "comm=" in joined:
         _ = staff.update_current_session(member.current_session, staff.StaffId(UNIT_ID))
         production_doc = self.root / "build-followups-production.md"
         _ = production_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
-        showrunner = self.notifier / "showrunner-build-followups"
+        _ = staff.set_doc(parent.id, staff.LiveDoc("natedev", production_doc))
+        showrunner = self.notifier / f"showrunner-{parent.id}"
         showrunner.mkdir()
         _ = (showrunner / "conf").write_text(
             "\n".join(
                 (
                     f"TARGET=session:{DIRECTOR_ID}",
-                    f"CHECK=zsh /opt/production_check.sh {production_doc}",
+                    f"CHECK=zsh /opt/production_check.sh {parent.id}",
                     "",
                 )
             ),
@@ -803,7 +827,7 @@ elif "comm=" in joined:
         self.herdr_process(72_001, 1, ["/fixture/herdr", "--session", "unit-renamed", "server"], {})
         self.herdr_process(UNIT_PID, 72_001, ["/bin/claude"], {
             "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+            "SHOWRUNNER_UNIT_ID": "shutdown",
         })
         for name, started_at, plan in (
             ("newer", 20, "docs/shutdown-plan.md"),
@@ -815,7 +839,7 @@ elif "comm=" in joined:
                 "main_agent": {"session_id": UNIT_ID},
                 "working_dir": str(self.checkout),
                 "plan_doc": plan,
-                "branch": "shutdown-unit",
+                "branch": "shutdown",
             }
             _ = (self.history / "runs" / f"{name}.jsonl").write_text(
                 json.dumps(event) + "\n", encoding="utf-8"
@@ -888,7 +912,9 @@ elif "comm=" in joined:
         self.assertEqual(
             director["model"], {"kind": "model", "name": "director-model"}
         )
-        self.assertEqual(director["timers"], ["showrunner-build-followups"])
+        owner = staff.snapshot().by_current_session(DIRECTOR_ID)
+        assert owner is not None
+        self.assertEqual(director["timers"], [f"showrunner-{owner.id}"])
         self.assertEqual(director["host"]["kind"], "ghostty")
         self.assertEqual(
             director["host"].get("desktop"),
@@ -931,7 +957,7 @@ elif "comm=" in joined:
             {
                 "kind": "git",
                 "path": str(self.checkout),
-                "head": {"kind": "branch", "name": "shutdown-unit"},
+                "head": {"kind": "branch", "name": "shutdown"},
                 "upstream": {"kind": "tracking", "ahead": 2},
                 "dirty": ["dirty.txt"],
             },
@@ -1006,7 +1032,7 @@ elif "comm=" in joined:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "unit-herdr", "server"], {})
         self.herdr_process(UNIT_PID, 71_001, ["/bin/claude"], {
             "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+            "SHOWRUNNER_UNIT_ID": "shutdown",
         })
         found = inventory.inventory(TARGET_LOGIN)
         unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
@@ -1089,15 +1115,16 @@ elif "comm=" in joined:
         self.assertEqual(director["codex_servers"][0]["busy_workers"], ["busy-codex"])
 
     def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
-        before = {runner["slug"] for runner in inventory.unregistered_showrunners()}
-        stale = self.notifier / "showrunner-stale"
-        stale.mkdir()
+        before = {runner["name"] for runner in inventory.unregistered_showrunners()}
         stale_doc = self.root / "stale-production.md"
+        owner = recorded_showrunner("stale", stale_doc)
+        stale = self.notifier / f"showrunner-{owner.id}"
+        stale.mkdir()
         _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         _ = (stale / "conf").write_text(
-            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {owner.id}\n",
             encoding="utf-8")
-        self.assertEqual({runner["slug"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
+        self.assertEqual({runner["name"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
 
     def test_incomplete_showrunner_timer_leaves_session_top_level(self) -> None:
         invalid_showrunner = self.notifier / "showrunner-incomplete"

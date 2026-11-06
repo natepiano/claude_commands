@@ -96,7 +96,7 @@ class ProcessStartTests(unittest.TestCase):
             self.assertFalse(step_record.consume_stopped_build("mac", Path(directory) / "consumed"))
 
     def test_reader_does_not_load_argument_or_dataclass_machinery(self) -> None:
-        result = subprocess.run([sys.executable, "-S", "-c",
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-S", "-c",
             "import sys; from scripts.lib import process_start; "
             + "assert not set(sys.modules).intersection({\"argparse\", \"dataclasses\", \"inspect\"})"],
             capture_output=True, text=True, check=False, timeout=5)
