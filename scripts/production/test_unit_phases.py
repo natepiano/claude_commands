@@ -218,7 +218,8 @@ class UnitPhasesTests(unittest.TestCase):
                                                                ("claude", "unplaced-claude")))]
         output, errors = io.StringIO(), io.StringIO()
         sender = Mock(return_value=subprocess.CompletedProcess(
-            ["send.py"], send_code, "", "fixture send failed" if send_code else ""))
+            ["send.py"], send_code, "fixture delivery detail" if send_code else "",
+            "fixture send failed\nfixture failure detail" if send_code else ""))
         with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
               patch.object(unit_lookup, "observed_session_labels", return_value=tuple(observed)),
               patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())),
@@ -247,6 +248,11 @@ class UnitPhasesTests(unittest.TestCase):
             self.assertIn(line, message)
         extra = [line for line in lines[table_end + 1:] if line.strip() and line not in anomalies]
         self.assertEqual(len(extra), 1 if send_code else 0, output.getvalue())
+        if send_code:
+            self.assertEqual(extra, [
+                "anomaly: could not send unit anomalies to fixture-director: "
+                + "stderr: fixture send failed fixture failure detail stdout: fixture delivery detail"
+            ])
         self.assertEqual(staff.by_id(member.id), member)
 
     def test_table_without_anomalies_sends_no_message(self) -> None:

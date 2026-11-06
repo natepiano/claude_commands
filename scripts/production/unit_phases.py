@@ -22,6 +22,7 @@ from scripts.production import showrunners, staff, unit_lookup, session_staff, s
 from scripts.production.production_doc import Refusal, production_field, read_production
 from scripts.shutdown import remote
 from scripts.lib import conf
+from scripts.lib.process_failure import failure_detail
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
@@ -119,8 +120,8 @@ def send_anomalies(lines: tuple[str, ...]) -> None:
                                "--from", "unit_phases.py", "--text", "\n".join(lines)],
                               capture_output=True, text=True, check=False)
         if done.returncode:
-            detail = " ".join((done.stderr.strip() or done.stdout.strip()).splitlines())
-            print(f"anomaly: could not send unit anomalies to {target}: {detail or done.returncode}")
+            detail = " ".join(failure_detail(done).splitlines())
+            print(f"anomaly: could not send unit anomalies to {target}: {detail}")
     except (OSError, conf.Unusable) as error:
         print(f"anomaly: could not send unit anomalies: {' '.join(str(error).splitlines())}")
 
