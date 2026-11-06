@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote, stop_resume
-from scripts.herdr import worker_panes
 from scripts.agents import worker_lifecycle
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
@@ -208,17 +207,20 @@ def stop(promotion: Promotion) -> bool:
         place = promotion.marked.place
         client = herdr.Herdr(place.session)
         try:
-            states = worker_panes.observe(row.id, staff.snapshot()) if row is not None else []
+            panes = client.panes()
+            tabs = {pane.get("tab_id", "") for pane in panes if pane["pane_id"] == place.pane}
+            workers: set[str] = {worker.name for worker in record.find(kind="worker", parent=row.id)} if row is not None else set()
+            shells = [pane for pane in panes if pane.get("tab_id", "") in tabs and pane.get("label") in workers]
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             print(f"anomaly: {promotion.unit}: {' '.join(str(error).splitlines())}", file=sys.stderr)
-            states = []
-        for state in states:
-            if isinstance(state, worker_panes.StoppedWorker):
-                try:
-                    if not client.close_tab_confirmed(state.pane, terminal=state.terminal):
-                        print(f"anomaly: {state.row.name}: old worker shell close failed", file=sys.stderr)
-                except (OSError, ValueError, herdr.HerdrFailure) as error:
-                    print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+            shells = []
+        for pane in shells:
+            try:
+                if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell) and not client.close_tab_confirmed(
+                        pane["pane_id"], terminal=pane.get("terminal_id", "")):
+                    print(f"anomaly: {pane.get('label')}: old worker shell close failed", file=sys.stderr)
+            except (OSError, ValueError, herdr.HerdrFailure) as error:
+                print(f"anomaly: {pane.get('label')}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         try:
             if not client.close_tab_confirmed(place.pane, target=promotion.claude.session_id):
                 print(f"anomaly: {promotion.unit}: old director tab close failed", file=sys.stderr)

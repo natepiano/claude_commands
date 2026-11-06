@@ -125,6 +125,50 @@ class StopResumeTests(unittest.TestCase):
             result = stop_resume.stop(row.id)
         self.assertIsInstance(result, stop_resume.StopFailed)
 
+    def test_stopped_codex_worker_needs_no_launch_or_signal_on_a_repeated_stop(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                             current_session=staff.StaffId(identity))
+        self.client.rows[0]["agent_session"] = None
+        atomic_file.write_text_atomic(pane_record.record_path("agents"), "{}\n")
+        observed = worker_panes.StoppedWorker(row, "w1:p2", "w1:p2-terminal")
+        results: list[StopResult] = []
+        stop = stop_resume.stop
+        def finish(session: str, *, deadline: float) -> StopResult:
+            result = stop(session, deadline=deadline)
+            results.append(result)
+            return result
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(worker_panes, "observe", return_value=[observed]),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ("sdlc (Codex thread unknown)",))),
+              patch.object(stop_resume, "stop", side_effect=finish),
+              patch.object(stop_resume, "_stop", wraps=stop_resume._stop) as native_stop,  # pyright: ignore[reportPrivateUsage]
+              patch.object(stop_resume, "_worker_stopped", wraps=stop_resume._worker_stopped) as proof,  # pyright: ignore[reportPrivateUsage]
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertIsNone(pane_record.publication_for_session(identity))
+            self.assertTrue(restart.stop_row(row, self.client))
+        self.assertEqual(results, [stop_resume.NotRunning(identity)])
+        native_stop.assert_not_called()
+        self.assertEqual(proof.call_count, 1)
+        self.kill.assert_not_called()
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_closed_worker_still_signals_its_live_native_conversation(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                             current_session=staff.StaffId(identity))
+        self.client.rows.clear()
+        self.entry["kind"] = "codex"
+        pane_record.write("agents", self.entry)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(worker_panes, "observe", return_value=[worker_panes.ClosedWorker(row)]),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (123,)}, ())),
+              patch.object(stop_resume, "_stop", wraps=stop_resume._stop) as native_stop):  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(restart.stop_row(row, self.client))
+        native_stop.assert_called_once_with(identity)
+        self.kill.assert_called_once_with(123, signal.SIGTERM)
+
     def test_closed_worker_needs_no_retained_shell_proof(self) -> None:
         row = staff.StaffRow(staff.StaffId("closed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
                              current_session=staff.StaffId("native-worker"))
@@ -1017,6 +1061,15 @@ class StopResumeTests(unittest.TestCase):
     def test_stop_requests_prompt_cancellation_before_returning_without_sending(self) -> None:
         log = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
+        self.assert_prompt_cancellation_requested(log)
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                             current_session=staff.StaffId(self.entry["session_id"]))
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(worker_panes, "observe", return_value=[worker_panes.StoppedWorker(row, "w1:p2", "w1:p2-terminal")]),
+              patch.object(stop_resume, "_stop", side_effect=AssertionError("a proved shell needs no native stop")),
+              patch.object(stop_resume, "_retire_prompt", wraps=stop_resume._retire_prompt) as retire):  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(stop_resume.stop(row.id), stop_resume.NotRunning(self.entry["session_id"]))
+        retire.assert_called_once_with(self.entry["session_id"])
         self.assert_prompt_cancellation_requested(log)
 
     def test_move_requests_prompt_cancellation_before_resuming_without_sending(self) -> None:

@@ -196,10 +196,12 @@ def _stop_recorded(session: str) -> StopResult:
                   ) if pane_worker and row is not None and isinstance(row.parent, staff.ReportsTo) else None
     if isinstance(before, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
         return StopFailed(str(before.row.current_session), before.reason)
-    _record_launches([session])
-    result = _stop(session)
-    if before is not None and isinstance(result, (Stopped, NotRunning)):
-        if not _worker_stopped(before):
+    if isinstance(before, worker_panes.StoppedWorker) and _worker_stopped(before):
+        result: StopResult = NotRunning(str(before.row.current_session))
+    else:
+        _record_launches([session])
+        result = _stop(session)
+        if before is not None and isinstance(result, (Stopped, NotRunning)) and not _worker_stopped(before):
             return StopFailed(str(before.row.current_session), "worker stop has no fresh shell proof on the same terminal")
     if isinstance(result, (Stopped, NotRunning)):
         _retire_prompt(result.session_id)
