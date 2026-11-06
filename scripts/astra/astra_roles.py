@@ -21,7 +21,6 @@ from scripts.lib import process_start
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
 from scripts.herdr import worker_panes
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.usage import agents_log
 
 AstraRole = Literal["designer", "reviewer"]
