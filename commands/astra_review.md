@@ -22,17 +22,23 @@ changes no file.
 2. Run the review as one command, with `dangerouslyDisableSandbox: true` (it
    reads `~/.codex*` and reaches the network):
    `~/.claude/scripts/lib/py ~/.claude/scripts/astra/astra_review.py [--run-directory <dir> --phase <id>] "<path>" <focus>`
-   A held document uses its sole reviewer in the same thread. Busy or unavailable
-   means report that state; do not start another reviewer. Without a held design,
-   the script keeps its one-turn read-only review.
+   A held document uses its sole reviewer pane under the unit or showrunner.
+   The held role uses `worker.py` with the explicit `astra-reviewer` role and keeps its native conversation.
+   Report a busy or unavailable reviewer; do not start a replacement.
+   Without a held document, a unit or showrunner review starts through `assign.sh --role review --operation astra-review`.
+   The launcher uses the review run's transport pin.
+   If worker end fails, its staff row remains visible in `worker.py list`.
+   The exec hold ends with the launcher process.
+   A review outside the staff hierarchy keeps its one-turn `codex exec` path.
    - **Claude:** run it with `run_in_background: true`, tell the caller in one
      line that the astra review is running, then end the turn or do other work.
      The task notification is the wait. Never poll it, sleep or read its output
      before then. A review at xhigh can take many minutes.
-   - **Codex mesh worker:** start it with
+   - **Pane or mesh worker:** start it with
      `~/.claude/scripts/lib/py ~/.claude/scripts/agents/mesh_runs.py start --label "astra review" -- <the command>`
-     and end your turn; the result is your next message. Exit 3 means you are
-     not a mesh worker: run the command attached in one call instead.
+     End your turn; the result arrives as your next message.
+     This detached-run command serves pane runs and existing mesh-pinned runs.
+     Exit 3 means the caller is not a worker; run attached in one call only for that exit.
      A live twin takes priority over `config/mesh_runs.conf` `LIVE_RUN_LIMIT`.
      Exit 4 refuses a new run at that limit and names the live runs.
      Wait for a run's result, or put more files in one run. Never run attached after exit 4.

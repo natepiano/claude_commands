@@ -134,7 +134,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         verify = mac_idle.SCRIPTS / "direct/verify.sh"
         source = verify.read_text()
         functions: list[str] = []
-        for name in ("step_state", "step_writes_tree", "finish_step_token", "run", "run_step"):
+        for name in ("publish_step_state", "step_state", "step_writes_tree", "finish_step_token", "run", "run_step"):
             start = source.index(f"\n{name}() {{") + 1
             end = source.index("\n}\n", start) + 2
             functions.append(source[start:end])
@@ -142,17 +142,24 @@ class MacIdleTests(NotificationGuardedTestCase):
 set -uo pipefail
 STEP_RECORD_ACTIVE=1; STEP_RUNS_ON=mac_allowed; CMD=lint
 TOKEN_USED=0; TOKEN_HELD=0; TOKEN_WAITED=0; LINT_LEFT_QUEUE_STATUS=75
-STEP_RECORD_ARGS=(write --call-id "$BUILDLOG_CALL_ID" --pid 123 --repo "$TEST_REPO"
-    --kind lint --runs-on mac_allowed --state waiting_hold)
+STEP_RECORD_PATH=$TEST_RECORD
+STEP_STATE_PATH=${TEST_RECORD%.json}.state
+STEP_RECORD_TEXT=$(< "$STEP_RECORD_PATH")
 buildlog_step_compiles() { return 0; }
 route_compiling_step() {
     STEP_RAN_ON_MAC=0
     step_state waiting_hold
     cp "$TEST_RECORD" "$TEST_REPO/$stage.route"
+    if [[ -f "$STEP_STATE_PATH" ]]; then
+        cp "$STEP_STATE_PATH" "$TEST_REPO/$stage.route.state"
+    fi
 }
 run_once() {
     step_state waiting_hold
     cp "$TEST_RECORD" "$TEST_REPO/$stage.memory"
+    if [[ -f "$STEP_STATE_PATH" ]]; then
+        cp "$STEP_STATE_PATH" "$TEST_REPO/$stage.memory.state"
+    fi
     return 0
 }
 for stage in mend fmt fix judgment; do
@@ -177,6 +184,12 @@ done
                 with self.subTest(stage=stage, wait=wait):
                     snapshot = Path(self.call.repo) / f"{stage}.{wait}"
                     _ = step_record.record_path(self.call.call_id).write_bytes(snapshot.read_bytes())
+                    state_snapshot = Path(str(snapshot) + ".state")
+                    state = step_record.state_path(self.call.call_id)
+                    if state_snapshot.exists():
+                        _ = state.write_bytes(state_snapshot.read_bytes())
+                    else:
+                        state.unlink(missing_ok=True)
                     record = step_record.read(self.call.call_id)
                     self.assertIsInstance(record, step_record.StepRecord)
                     assert isinstance(record, step_record.StepRecord)
@@ -365,7 +378,7 @@ done
         self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["since"], 1180)
 
     def test_busy_mac_with_no_steps_never_scans_all_processes(self) -> None:
-        step_record.remove(self.call.call_id)
+        step_record.record_path(self.call.call_id).unlink(missing_ok=True)
         _ = self.claim(working=True)
         with mock.patch.object(mac_idle, "processes", side_effect=AssertionError("unneeded proc scan")):
             mac_idle.watch_once(self.paths, 1180, 100)
@@ -647,7 +660,7 @@ done
             mac_idle.watch_once(self.paths, 1180, 100)
             self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 1)
             self.assertEqual(mac_idle.main(["cleared", "--since", "999"]), 0)
-            step_record.remove(self.call.call_id)
+            step_record.record_path(self.call.call_id).unlink(missing_ok=True)
             mac_idle.watch_once(self.paths, 1180, 100)
             self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
         with mock.patch.object(time, "time", return_value=1481):
@@ -779,7 +792,7 @@ done
         self.assertTrue(damaged.exists())
 
     def test_verify_argv_and_retry_registration_without_a_step_record_do_not_trigger_repairs(self) -> None:
-        step_record.remove(self.call.call_id)
+        step_record.record_path(self.call.call_id).unlink(missing_ok=True)
         with mock.patch.object(mac_idle, "notify_showrunner") as send:
             self.two_passes()
         send.assert_not_called()

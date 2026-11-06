@@ -95,6 +95,28 @@ def wait_for_notice_readiness(path: Path, runner: subprocess.Popen[bytes]) -> No
             raise AssertionError(f"delivery descendants reported invalid readiness: {received!r}")
 
 
+def wait_for_notice_exit(pid: int) -> None:
+    """Wait for death without sending a signal or changing the process state."""
+    try:
+        with LauncherHangGuard("delivery descendant exit").protect():
+            if sys.platform == "linux":
+                descriptor = os.pidfd_open(pid)
+                try:
+                    _ = select.select([descriptor], [], [])
+                finally:
+                    os.close(descriptor)
+            else:
+                queue = select.kqueue()
+                try:
+                    event = select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                          flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
+                    _ = queue.control([event], 1)
+                finally:
+                    queue.close()
+    except ProcessLookupError:
+        pass  # The process exited before the event subscription.
+
+
 @dataclass
 class NoticeDrainClock:
     """Advance admission time only after a notice attempt completes."""

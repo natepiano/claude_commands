@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from importlib import import_module
 import fcntl
@@ -27,7 +27,8 @@ from urllib.parse import quote
 
 
 from scripts.mac_test import cargo_manifest
-from scripts.build_hold import override_guard
+from scripts.build_hold import build_hold, override_guard
+from scripts.copies import copies
 from scripts.lint import sweep
 from scripts.lib import conf
 from scripts.buildlog import treekey
@@ -415,6 +416,8 @@ class OffloadRequest:
     call_id: str
     result: ResultDestination
     nextest_words: tuple[str, ...]
+    owner: str
+    holder_session: str
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
     copy: bool = False
     verb: MacVerb = "nextest"
@@ -424,6 +427,7 @@ class OffloadRequest:
     admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
     environment: tuple[tuple[str, str], ...] = ()
     fetch: FetchFolder | NoFetch = NO_FETCH
+    repository_scope: copies.RepositoryScope = copies.ALL_REPOSITORIES
 
     @property
     def source_root(self) -> Path:
@@ -1127,11 +1131,9 @@ def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1
     if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    mirror = shlex.quote(remote_mirror(repository, target, slot))
     return "\n".join(
         (
-            f'mkdir -p "$HOME"/{mirror} || exit 1',
-            f'printf "mac-test mirror\\n" > "$HOME"/{mirror}/.mac-test-mirror || exit 1',
+            copies.mirror_probe_setup(remote_mirror(repository, target, slot)),
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
             "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
             + '"$free_gib" "$(hostname -s)"',
@@ -1157,7 +1159,7 @@ def parse_probe(output: str) -> ProbeResult:
     return ProbeSnapshot(free_gib, hostname)
 
 
-def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
+def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = ()) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
     selection = ["--target", request.target] if request.target else []
     handoff = (["--from-pid", str(request.admission.owner_pid)]
@@ -1177,6 +1179,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]
         *copy_words,
         *selection,
         *handoff,
+        *[word for slot in leased_slots for word in ("--leased-slot", str(slot))],
     ]
 
 
@@ -1496,34 +1499,19 @@ def copy_tree(
     ignored = () if isinstance(request.source, StagedDocSnapshot) else ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
         return False
-    mirror = remote_mirror(repository, request.target, request.slot)
-    receiver = []
-    if not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform):
-        # The first copy needs the repository and slot directories before rsync starts.
-        receiver = [f"--rsync-path=mkdir -p -- {shlex.quote(mirror)} && exec rsync"]
+    mirror = request_mirror(config, request, repository)
     try:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", prefix="mac-test-exclude-", delete=False
         ) as exclude_file:
             exclude_path = Path(exclude_file.name)
             try:
-                _ = exclude_file.write("/.git\n/target/\n/.mac-test-mirror\n")
+                _ = exclude_file.write("/.git\n/target/\n")
                 for path in ignored:
                     _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
                 exclude_file.flush()
-                result = controller.capture_copy(
-                    [
-                        "rsync",
-                        "-rlpc",
-                        "--delete",
-                        *receiver,
-                        f"--exclude-from={exclude_path}",
-                        "-e",
-                        shlex.join(["ssh", *ssh_options(config.connection)]),
-                        f"{request.source_root}/",
-                        f"{config.host}:{shlex.quote(mirror)}/",
-                    ]
-                )
+                result = controller.capture_copy(copies.remote_rsync(
+                    request.source_root, mirror, exclude_path, ssh_options(config.connection)))
                 return isinstance(result, CommandOutput) and result.status == 0
             finally:
                 exclude_path.unlink(missing_ok=True)
@@ -1883,11 +1871,12 @@ def check_taken_over_claim(
 
 
 def claim_for_run(
-    controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository
+    controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository,
+    leased_slots: tuple[int, ...] = (),
 ) -> MacClaimAnswer:
     attempt = LocalClaimAttempt()
     try:
-        controller.complete_claim(claim_arguments(request, config), attempt)
+        controller.complete_claim(claim_arguments(request, config, leased_slots), attempt)
         if isinstance(attempt.interruption, OffloadInterrupted):
             raise attempt.interruption
         return attempt.answer
@@ -1993,11 +1982,13 @@ def claimed_run(
         if linux:
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
+        copies.register_remote(request_mirror(config, request, repository))
         release_allowed = False
         remote_status = controller.stream_mac_run(
             [
                 *ssh_prefix(config),
-                remote_test_command(config, request, repository, copied.tree_key),
+                copies.remote_use_command(request_mirror(config, request, repository),
+                                          remote_test_command(config, request, repository, copied.tree_key)),
             ]
         )
         if isinstance(remote_status, InterruptedTargetStatus) and (not generation or remote_status.generation != generation):
@@ -2171,7 +2162,38 @@ def run_offload(
         except (OSError, UnicodeError, ValueError):
             return declined("repo", started)
 
-    claim = claim_for_run(controller, config, request, repository)
+    try:
+        with ExitStack() as admission_leases:
+            slots = (target_config.slot_capacity(config.values, repository.name,
+                     missing=target_config.MissingSlotCapacity.SINGLE_SLOT) if linux else 1)
+            leases: dict[int, ExitStack] = {}
+            for slot in range(1, slots + 1):
+                lease = ExitStack()
+                try:
+                    lease.enter_context(copies.remote_lease(request_mirror(config, replace(request, slot=slot), repository)))
+                except copies.BusyRemoteMirror:
+                    continue
+                leases[slot] = admission_leases.enter_context(lease)
+            return leased_offload(controller, config, request, repository, started, linux, leases)
+    except copies.CopyError as error:
+        return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
+
+
+def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> copies.RemoteMirror:
+    scope = request.repository_scope
+    if isinstance(scope, copies.AllRepositories):
+        scope = copies.SelectedRepository(repository.name)
+    return copies.RemoteMirror(request.owner, scope, config.host,
+                               remote_mirror(repository, request.target, request.slot),
+                               request.holder_session)
+
+
+def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
+                   repository: KnownRepository, started: float, linux: bool,
+                   leases: dict[int, ExitStack]) -> MacOffloadResult:
+    if not leases:
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    claim = claim_for_run(controller, config, request, repository, tuple(leases))
     # A transferred reservation can be adopted only once.
     request = replace(request, admission=UnclaimedMacRun())
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
@@ -2185,7 +2207,7 @@ def run_offload(
         if isinstance(checked, LeftoversRemain):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         release_claim(controller, request.target)
-        claim = claim_for_run(controller, config, request, repository)
+        claim = claim_for_run(controller, config, request, repository, tuple(leases))
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
@@ -2197,7 +2219,14 @@ def run_offload(
         if claim.reason == "busy":
             return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
         return declined(claim.reason, started)
-    result = claimed_run(controller, config, replace(request, slot=claim.slot), repository, started)
+    if claim.slot not in leases:
+        release_claim(controller, request.target)
+        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    for slot, lease in leases.items():
+        if slot != claim.slot:
+            lease.close()
+    selected = replace(request, slot=claim.slot)
+    result = claimed_run(controller, config, selected, repository, started)
     if linux and isinstance(result, PassedOnMac):
         return PassedOnTarget(result.seconds)
     if linux and isinstance(result, FailedOnMac):
@@ -2254,6 +2283,14 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def holder_session() -> str:
+    """Use the unit owner session before the shell session."""
+    owner = build_hold.owning_session()
+    if isinstance(owner, build_hold.OwningSession):
+        return owner.session_id
+    return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"
+
+
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
     words = arguments.nextest_words
     if words[:1] == ["--"]:
@@ -2266,6 +2303,8 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
     return OffloadRequest(
         repo_root=Path(arguments.repo_root).resolve(),
         source=StagedDocSnapshot(Path(arguments.source_root).resolve()) if arguments.source_root else RepositoryWorkingTree(),
+        owner=copies.source_owner(Path(arguments.repo_root)),
+        holder_session=holder_session(),
         package=arguments.package,
         call_id=arguments.call_id,
         result=result_destination(arguments.result),

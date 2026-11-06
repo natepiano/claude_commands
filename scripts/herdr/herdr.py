@@ -3223,7 +3223,10 @@ def _open_codex_rollouts(pid: int) -> dict[Path, str]:
         return {path: str(path) for path in darwin_open_files(pid) if path.name.startswith("rollout-")}
     files: dict[Path, str] = {}
     for descriptor in (_proc_root() / str(pid) / "fd").iterdir():
-        target = os.readlink(descriptor)
+        try:
+            target = os.readlink(descriptor)
+        except FileNotFoundError:
+            continue
         if Path(target.removesuffix(" (deleted)")).name.startswith("rollout-"):
             files[descriptor] = target
     return files
@@ -3232,31 +3235,45 @@ def _open_codex_rollouts(pid: int) -> dict[Path, str]:
 def codex_rollout_threads(pid: int) -> set[str]:
     """Read every thread from stable open rollouts of one process."""
     started = _process_birth(pid)
-    files = _open_codex_rollouts(pid)
-    identities: set[str] = set()
-    for path in files:
-        before = path.stat()
-        with path.open(encoding="utf-8") as stream:
-            value = cast(object, json.loads(stream.readline()))
-        after = path.stat()
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-            raise ValueError(f"pid {pid}: current Codex rollout changed")
-        if not isinstance(value, dict):
-            raise ValueError(f"pid {pid}: current Codex rollout is unreadable")
-        meta = cast(dict[str, object], value)
-        payload = meta.get("payload")
-        if meta.get("type") != "session_meta" or not isinstance(payload, dict):
-            raise ValueError(f"pid {pid}: current Codex rollout has no session metadata")
-        identity = cast(dict[str, object], payload).get("id")
-        if not isinstance(identity, str):
-            raise ValueError(f"pid {pid}: current Codex rollout has no identity")
+    deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
+    while True:
+        files = _open_codex_rollouts(pid)
+        identities: set[str] = set()
         try:
-            identities.add(staff.native_id(identity))
-        except staff.StaffRefused as error:
-            raise ValueError(f"pid {pid}: current Codex rollout identity is invalid") from error
-    if _open_codex_rollouts(pid) != files or _process_birth(pid) != started:
-        raise ValueError(f"pid {pid}: current Codex rollout or process changed")
+            for path in files:
+                before = path.stat()
+                with path.open(encoding="utf-8") as stream:
+                    value = cast(object, json.loads(stream.readline()))
+                after = path.stat()
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                    raise ValueError(f"pid {pid}: current Codex rollout changed")
+                if not isinstance(value, dict):
+                    raise ValueError(f"pid {pid}: current Codex rollout is unreadable")
+                meta = cast(dict[str, object], value)
+                payload = meta.get("payload")
+                if meta.get("type") != "session_meta" or not isinstance(payload, dict):
+                    raise ValueError(f"pid {pid}: current Codex rollout has no session metadata")
+                identity = cast(dict[str, object], payload).get("id")
+                if not isinstance(identity, str):
+                    raise ValueError(f"pid {pid}: current Codex rollout has no identity")
+                try:
+                    identities.add(staff.native_id(identity))
+                except staff.StaffRefused as error:
+                    raise ValueError(f"pid {pid}: current Codex rollout identity is invalid") from error
+        except FileNotFoundError:
+            if _process_birth(pid) != started:
+                raise ValueError(f"pid {pid}: current Codex rollout or process changed")
+            if time.monotonic() >= deadline:
+                raise
+            continue
+        current = _open_codex_rollouts(pid)
+        if _process_birth(pid) != started:
+            raise ValueError(f"pid {pid}: current Codex rollout or process changed")
+        if current == files:
+            break
+        if not current.items() < files.items() or time.monotonic() >= deadline:
+            raise ValueError(f"pid {pid}: current Codex rollout or process changed")
     if not files:
         raise NoOpenCodexRollout(f"pid {pid}: current Codex rollout is unavailable")
     return identities

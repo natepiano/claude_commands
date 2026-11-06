@@ -518,7 +518,7 @@ class EligibleCommandTests(IsolatedBuildTargetTest):
                                                     "--package", "hana", *local]), redirect_stdout(output):
                     self.assertEqual(build_targets.main(), 0)
                 disposition = "eligible" if reason == "-" else "excluded"
-                self.assertEqual(output.getvalue(), f"natedev\teligible\t-\t-\nmac\t{disposition}\t{reason}\t{self.settings}\n")
+                self.assertEqual(output.getvalue(), f"natedev\teligible\t-\t-\t-\nmac\t{disposition}\t{reason}\t{self.settings}\tmacos\n")
 
 
 class StepKindEligibilityTests(IsolatedBuildTargetTest):
@@ -589,19 +589,19 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
             + "kind.other=ssh\nplatform.other=macos\nsettings.other=other.conf\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         self.assertEqual(self.kind_output("check"),
-                         "mac_allowed\nnatedev\teligible\t-\t-\n"
-                         + f"other\texcluded\toff\t{other_settings}\nmac\teligible\t-\t{self.settings}\n")
+                         "mac_allowed\nnatedev\teligible\t-\t-\t-\n"
+                         + f"other\texcluded\toff\t{other_settings}\tmacos\nmac\teligible\t-\t{self.settings}\tmacos\n")
         self.assertEqual(self.kind_output("build"),
-                         "natedev_only makes natedev artifacts\nnatedev\teligible\t-\t-\n"
-                         + f"other\texcluded\tmakes natedev artifacts\t{other_settings}\n"
-                         + f"mac\texcluded\tmakes natedev artifacts\t{self.settings}\n")
+                         "natedev_only makes natedev artifacts\nnatedev\teligible\t-\t-\t-\n"
+                         + f"other\texcluded\tmakes natedev artifacts\t{other_settings}\tmacos\n"
+                         + f"mac\texcluded\tmakes natedev artifacts\t{self.settings}\tmacos\n")
 
     def test_local_only_configuration_keeps_artifact_and_gate_reasons(self) -> None:
         _ = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         for kind, reason in (("build", "makes natedev artifacts"), ("example", "makes natedev artifacts"),
                              ("final", "full gate runs on natedev")):
             with self.subTest(kind=kind):
-                self.assertEqual(self.kind_output(kind), f"natedev_only {reason}\nnatedev\teligible\t-\t-\n")
+                self.assertEqual(self.kind_output(kind), f"natedev_only {reason}\nnatedev\teligible\t-\t-\t-\n")
 
     def test_kind_answers_allow_portable_judgments_and_keep_artifacts_local(self) -> None:
         for kind in ("check", "doc", "lint", "test"):
@@ -637,8 +637,8 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
             ):
                 decision = "natedev_only disk" if reason == "disk" else "mac_allowed"
                 self.assertEqual(self.kind_output("test", "portable"),
-                                 decision + "\nmac\texcluded\t" + reason + f"\t{self.settings}\n"
-                                 + "natedev\teligible\t-\t-\n")
+                                 decision + "\nmac\texcluded\t" + reason + f"\t{self.settings}\tmacos\n"
+                                 + "natedev\teligible\t-\t-\t-\n")
 
     def test_disk_decision_preserves_evidence_in_every_target_order(self) -> None:
         mac = targets.SshTarget("mac", "macos", self.settings)

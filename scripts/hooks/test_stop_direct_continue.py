@@ -111,7 +111,8 @@ class DirectorStopTests(unittest.TestCase):
         with director_stop_fixture() as fixture:
             for status in ("completed", "failed", "cancelled"):
                 with self.subTest(status=status):
-                    self.assert_blocked(fixture.call(background_tasks=[{"status": status}]))
+                    self.assert_blocked(fixture.call(
+                        background_tasks=[{"status": status}], last_assistant_message=status))
 
     def test_unreported_background_tasks_do_not_allow_a_full_context_stop(self) -> None:
         with director_stop_fixture() as fixture:
@@ -170,10 +171,20 @@ class DirectorStopTests(unittest.TestCase):
             self.assertTrue((fixture.run / "turn_wait.json").is_file())
             self.assertIn('"WaitingForSupplier"', (fixture.root / "history/run.jsonl").read_text())
 
-    def test_continuation_above_the_threshold_wakes_again(self) -> None:
+    def test_same_final_line_above_the_threshold_does_not_wake_again(self) -> None:
         with director_stop_fixture() as fixture:
-            self.assert_blocked(fixture.call())
-            self.assert_blocked(fixture.call(stop_hook_active=True))
+            status = "holding: waiting on the showrunner's restart order"
+            self.assert_blocked(fixture.call(last_assistant_message=f"First turn.\n— {status}"))
+            self.assert_allowed(fixture.call(last_assistant_message=f"Second turn.\n  — {status}  \n"))
+            self.assertEqual((fixture.run / "compaction_wake_line").read_text(encoding="utf-8"), status)
+
+    def test_continuation_with_a_different_final_line_above_the_threshold_wakes_again(self) -> None:
+        with director_stop_fixture() as fixture:
+            self.assert_blocked(fixture.call(last_assistant_message="The first action is complete."))
+            status = "The next action is complete."
+            self.assert_blocked(fixture.call(stop_hook_active=True, last_assistant_message=status))
+            self.assertEqual((fixture.run / "compaction_wake_line").read_text(encoding="utf-8"), status)
+            self.assert_allowed(fixture.call(stop_hook_active=True, last_assistant_message=status))
 
     def test_holding_status_without_pause_above_the_threshold_wakes(self) -> None:
         with director_stop_fixture() as fixture:
