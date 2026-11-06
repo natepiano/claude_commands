@@ -303,6 +303,7 @@ done
                     target = "log" if after_sender_record else "run"
                     with mock.patch.object(send, target, side_effect=stop), self.assertRaises(Stopped):
                         mac_idle.watch_once(self.paths, 1600, 100)
+                    fixture.end_owner()
                     self.assertEqual(fixture.count(), 1 if after_sender_record else 0)
                     self.assertIs(mac_idle.read_record(self.paths.state / "alert.json")[mark], False)
                     current = 1600 + settings.repeat_minutes * 120

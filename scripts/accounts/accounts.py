@@ -1713,15 +1713,6 @@ def prepare_claude_launch(label: str, *, resume: bool) -> PreparedAccount:
     return prepared
 
 
-def claude_account_with_room(now: datetime) -> NamedAccount:
-    """Select and prepare a Claude account with quota."""
-    selected = pick("claude", now)
-    if isinstance(selected, NoAccountWithRoom):
-        raise AccountsError(no_room_line("claude", selected))
-    _ = prepare_claude_launch(selected.label, resume=False)
-    return NamedAccount(selected.label, selected.dir)
-
-
 def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
                              target: str = "", config_dir: str = "", source_fallback: bool = False) -> ClaudeLaunchAccount:
     """Use the group account, except for a moved unit restored on its source."""
@@ -2921,8 +2912,8 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             inventory = import_module("scripts.shutdown.inventory")
         live_ids = {member.session_id for member in members}
         notices += tuple(
-            f"{runner.slug}: no session runs under the id its update timer names; "
-            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.doc)}"
+            f"{runner.name}: no session runs under the id its update timer names; "
+            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.name)}"
             for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
@@ -4964,9 +4955,14 @@ def _machine_role_counts(
         roles = tuple(dict.fromkeys((*row.roles, *(role for counts in machines.values() for role in counts))))
         if any(role != "spare" for role in roles):
             roles = tuple(role for role in roles if role != "spare")
-        local_by_role = dict(zip(row.roles, row.role_counts))
-        counted.append(replace(row, roles=roles, role_counts=tuple(local_by_role.get(role,
-            _role_session_counts((), row.tool)) for role in roles), role_counts_by_machine=machines))
+        combined: list[RoleSessionCounts | NoRoleCount] = []
+        for role in roles:
+            counts = [machine[role] for machine in machines.values() if role in machine]
+            combined.append(NoRoleCount() if role == "spare" else RoleSessionCounts(
+                busy=sum(count["busy"] for count in counts),
+                shell=sum(count["shell"] or 0 for count in counts) if row.tool == "claude" else UnknownShellCount(),
+                idle=sum(count["idle"] for count in counts)))
+        counted.append(replace(row, roles=roles, role_counts=tuple(combined), role_counts_by_machine=machines))
     return tuple(counted), (() if available else (f"{peer} unavailable: counts are {local} only",))
 
 
@@ -4975,17 +4971,12 @@ def _role_count_text(row: StatusRow, role: str) -> str:
     selected = " ✓" if role in row.selected_roles else ""
     if role == "spare":
         return role
-    if row.role_counts_by_machine:
-        counts = [machine[role] for machine in row.role_counts_by_machine.values() if role in machine]
-        busy, idle, total = (sum(count[key] for count in counts) for key in ("busy", "idle", "total"))
-        shell = sum(count["shell"] or 0 for count in counts) if row.tool == "claude" else None
-    else:
-        index = row.roles.index(role)
-        count = row.role_counts[index] if index < len(row.role_counts) else NoRoleCount()
-        if not isinstance(count, RoleSessionCounts):
-            return role + selected
-        busy, idle, total = count.busy, count.idle, count.total
-        shell = count.shell if isinstance(count.shell, int) else None
+    index = row.roles.index(role)
+    count = row.role_counts[index] if index < len(row.role_counts) else NoRoleCount()
+    if not isinstance(count, RoleSessionCounts):
+        return role + selected
+    busy, idle, total = count.busy, count.idle, count.total
+    shell = count.shell if isinstance(count.shell, int) else None
     activity = f"busy {busy}, " + (f"shell {shell}, " if shell is not None else "") + f"idle {idle}"
     return f"{role}{selected} {total} ({activity})"
 

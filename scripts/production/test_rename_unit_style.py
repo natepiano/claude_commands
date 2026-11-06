@@ -21,10 +21,10 @@ class UnitRenameStyleTests(UnitRenameFixture):
         with mock.patch.dict(os.environ, self.env):
             _ = recorded_showrunner("parent", parent)
             owner = recorded_showrunner(SLUG, self.doc, parent="parent")
-            _ = fixture_unit_location(owner, "names-unit", worktree)
+            _ = fixture_unit_location(owner, "names", worktree)
             with style_ledger.Ledger(self.checkout, database) as ledger:
                 holders = unit_files.unit_file_holders(self.checkout, self.doc, ledger)
-        self.assertIn("staff-held.txt", holders["names-unit"])
+        self.assertIn("staff-held.txt", holders["names"])
 
 
 if __name__ == "__main__":

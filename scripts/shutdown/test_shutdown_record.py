@@ -33,10 +33,10 @@ class ShutdownRecordTests(ShutdownTestCase):
 
     def test_migration_resumes_after_first_file_and_finished_rerun_changes_nothing(self) -> None:
         owner = fixture_member("showrunner", name="record-owner")
-        unit = fixture_member("unit", name="old-unit", parent=owner.id)
+        unit = fixture_member("unit", name="old", parent=owner.id)
         unit = staff.update_current_session(unit.current_session,
             staff.native_id(fixture_runtime_id("record-unit-current")))
-        shutdown_record.save(["old-unit", str(owner.current_session), str(unit.current_session)])
+        shutdown_record.save(["old", str(owner.current_session), str(unit.current_session)])
         staff_before = staff.snapshot().rows
 
         changed = shutdown_record.migrate(stop_after_first=True)
@@ -52,27 +52,27 @@ class ShutdownRecordTests(ShutdownTestCase):
 
     def test_migration_converts_known_entries_and_preserves_missing_entries_on_rerun(self) -> None:
         owner = fixture_member("showrunner", name="record-owner")
-        unit = fixture_member("unit", name="known-unit", parent=owner.id)
-        shutdown_record.save([unit.name, "missing-unit"])
+        unit = fixture_member("unit", name="known", parent=owner.id)
+        shutdown_record.save([unit.name, "missing"])
         path = shutdown_record.record_path()
         staff_before = staff.snapshot().rows
         errors = io.StringIO()
 
         with redirect_stderr(errors):
             self.assertEqual(shutdown_record.migrate(), (str(path),))
-        self.assertEqual(shutdown_record.read(), [str(unit.id), "missing-unit"])
+        self.assertEqual(shutdown_record.read(), [str(unit.id), "missing"])
         before = (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
         with redirect_stderr(errors):
             self.assertEqual(shutdown_record.migrate(), ())
             self.assertEqual(shutdown_record.migrate(), ())
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns), before)
         self.assertEqual(errors.getvalue().splitlines(),
-            ["missing-unit: migration anomaly: staff ownership is unavailable"] * 3)
+            ["missing: migration anomaly: staff ownership is unavailable"] * 3)
         self.assertEqual(staff.snapshot().rows, staff_before)
 
     def test_migration_resolves_ownership_again_after_clear_without_a_second_row(self) -> None:
         owner = fixture_member("showrunner", name="record-owner")
-        unit = fixture_member("unit", name="clear-unit", parent=owner.id)
+        unit = fixture_member("unit", name="clear", parent=owner.id)
         shutdown_record.save([unit.name])
         before = staff.snapshot()
         cleared = replace(unit, current_session=staff.native_id(fixture_runtime_id("cleared-session")))

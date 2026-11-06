@@ -40,7 +40,7 @@ class StylePlanTests(StylePlanFixture):
         self.tip = merged
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         # The synced change to other.rs makes its crate-scope cell stale too.
         self.assertEqual((ticket["files"], ticket["base"]), (list(self.sources[:2]), merged))
         self.record(read, self.sources[0], merged, ticket="1")
@@ -74,7 +74,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.sync_wait_rows(), [])
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["rules"], ticket["base"]), (list(self.sources[:2]), [read], self.tip))
 
     def test_refill_names_a_style_branch_missing_on_origin(self) -> None:
@@ -192,11 +192,11 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.cell_state(structure, self.sources[0]), "stale")
         self.assertEqual(self.candidates("modules"), ())
 
-        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo),
+        self.assertEqual(style_plan.next_phase("modules", plan, self.repo),
                          style_plan.MergeStyleBranchFirst(2, unit_tip, "refs/heads/style/main"))
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.root / "modules")
-        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten("1"))
-        ticket = self.ledger().ticket_open(ticket_owner_id("modules-unit"))[0]
+        self.assertEqual(style_plan.next_phase("modules", plan, self.repo), style_plan.PhaseWritten("1"))
+        ticket = self.ledger().ticket_open(ticket_owner_id("modules"))[0]
         self.assertEqual((ticket["kind"], ticket["files"], ticket["base"]), ("structure", list(self.sources[:2]), self.tip))
 
 if __name__ == "__main__":

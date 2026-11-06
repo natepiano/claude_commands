@@ -14,16 +14,12 @@ from dataclasses import dataclass, field, replace
 from datetime import date as CalendarDate
 from pathlib import Path
 from threading import RLock
-from typing import Final, cast
+from typing import cast
 
 from scripts.lib import atomic_file, git_exclude
 from scripts.production.staff import StaffId
 from scripts.production import staff
 from scripts.production.production_doc import cell_value
-
-
-# The responsibility of a unit that takes the paths the berth board leaves free; the board is its scope guard.
-BOARD_FREE: Final = "board-free"
 
 
 class ConfigRefused(ValueError):

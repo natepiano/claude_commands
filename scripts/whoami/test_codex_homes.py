@@ -178,7 +178,7 @@ class CodexHomesTests(unittest.TestCase):
         return Report("Codex", email=f"{home.name}@example.invalid", source=CodexHomeSource(home))
 
     def test_shared_user_zone_uses_production_or_the_users_zone_setting(self) -> None:
-        runner = showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="Asia/Tokyo", doc="")
+        runner = showrunners.Showrunner(session="fixture", socket="", name="fixture", zone="Asia/Tokyo", doc="")
         with patch.object(showrunners, "registered_showrunners", return_value=[runner]):
             self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Asia/Tokyo"))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):

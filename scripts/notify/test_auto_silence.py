@@ -70,8 +70,8 @@ class AutoSilenceTests(unittest.TestCase):
             self.assertEqual(cause, "you were stopped and resumed")
             return resume_message("the herdr server restarted")
 
-        for name, identity in (("devtools-unit", "33c5eac0-86d3-4b40-907c-8b24fc8831bd"),
-                               ("models-unit", "acae33e1-1a40-4d4e-af62-1697c067c1fc")):
+        for name, identity in (("devtools", "33c5eac0-86d3-4b40-907c-8b24fc8831bd"),
+                               ("models", "acae33e1-1a40-4d4e-af62-1697c067c1fc")):
             with self.subTest(session=name):
                 entry = pane_record.launch("w1:p1", identity, "/fixture", {}, ["claude"])
                 environment = {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"}
@@ -290,9 +290,10 @@ class AutoSilenceTests(unittest.TestCase):
             self.assertEqual(event["silence_id"], start["silence_id"])
             return self.sender(argv)
 
-        for _ in range(2):
-            self.assertEqual(auto_silence.active(lambda: self.now, sender, self.runner,
-                self.deliver, UserTypedPrompt("typed")), 0)
+        with redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                self.assertEqual(auto_silence.active(lambda: self.now, sender, self.runner,
+                    self.deliver, UserTypedPrompt("typed")), 0)
         self.assertEqual(self.posted, ["Build done"])
         self.assertEqual(sum(event["event"] == "end" for event in self.events()), 1)
         self.assertIn("sender=typed-session", self.push_values(-1)[1])

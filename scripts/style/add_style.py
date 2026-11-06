@@ -15,12 +15,12 @@ from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
 from scripts.herdr import herdr
-from scripts.production.production_doc import Production, Refusal, production_field, read_production
+from scripts.production.production_doc import Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
 
 from scripts.style import rules
 from scripts.style import style_ledger
@@ -64,7 +64,7 @@ def _pilot_units(arguments: list[str], repository: Path) -> AllStyleUnits | Pilo
     seen: set[str] = set()
     for argument in arguments:
         unit, separator, selected = argument.partition("=")
-        family = rules.style_family(f"{unit}-unit" if unit in FAMILIES else unit)
+        family = rules.style_family(unit)
         if isinstance(family, rules.NotStyleUnit):
             raise Refusal(f"unknown pilot unit {unit!r}")
         if family in seen:
@@ -81,7 +81,7 @@ def _pilot_units(arguments: list[str], repository: Path) -> AllStyleUnits | Pilo
 @dataclass(frozen=True)
 class StandingStyleProduction:
     repository: Path
-    slug: str
+    name: str
     checkout: Path
     doc: Path
     branch_point: str
@@ -90,22 +90,22 @@ class StandingStyleProduction:
 @dataclass(frozen=True)
 class NoStyleProduction:
     repository: Path
-    slug: str
+    name: str
 
     @property
     def checkout(self) -> Path:
-        return self.repository.parent / self.slug
+        return self.repository.parent / self.name
 
     @property
     def doc(self) -> Path:
-        return self.checkout / "docs" / f"{self.slug}-production.md"
+        return self.checkout / "docs" / f"{self.name}-production.md"
 
 
 @dataclass(frozen=True)
 class StyleProduction:
     parent: Production
     repository: Path
-    slug: str
+    name: str
     branch_point: str
     branch_tip: str
     merge_branch: str
@@ -116,7 +116,8 @@ class StyleProduction:
 
     @property
     def log(self) -> Path:
-        return Path("docs") / f"{self.slug}-log.md"
+        return (Path(production_field(self.doc.read_text().splitlines(), "Log")) if self.doc.is_file()
+                else Path("docs") / f"{self.name}-log.md")
 
 
 def _git(repo: Path, *arguments: str) -> str:
@@ -129,27 +130,34 @@ def _git(repo: Path, *arguments: str) -> str:
 def standing_style_production(repo_dir: Path) -> StandingStyleProduction | NoStyleProduction:
     """Locate the repository's standing production without changing any state."""
     repository = Path(_git(repo_dir, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
-    slug = f"{repository.name}-style"
-    absent = NoStyleProduction(repository, slug)
-    checkout, doc = absent.checkout, absent.doc
-    if not doc.is_file():
-        return absent
-    branch_point = production_field(doc.read_text().splitlines(), "Branch point").removeprefix("refs/heads/")
-    return StandingStyleProduction(repository, slug, checkout, doc, branch_point)
+    trees = tuple(Path(line.removeprefix("worktree ")) for line in
+                  _git(repository, "worktree", "list", "--porcelain").splitlines() if line.startswith("worktree "))
+    for row in staff.snapshot().find(kind="showrunner"):
+        if not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) or not row.doc.path.is_file():
+            continue
+        doc = row.doc.path
+        checkout = next((tree for tree in trees if doc.is_relative_to(tree)), None)
+        if checkout is None:
+            continue
+        lines = doc.read_text().splitlines()
+        if optional_field(lines, "Kind") == FieldPresent("style"):
+            branch_point = production_field(lines, "Branch point").removeprefix("refs/heads/")
+            return StandingStyleProduction(repository, row.name, checkout, doc, branch_point)
+    return NoStyleProduction(repository, f"{repository.name}-style")
 
 
-def _request(doc: Path) -> StyleProduction:
-    parent = read_production(doc)
+def _request(name: str) -> StyleProduction:
+    parent = read_production(name)
     lines = parent.doc.read_text().splitlines()
     proposals = production_field(lines, "Proposals")
     declared_repo = Path(production_field(lines, "Repository")).expanduser().resolve()
     standing = standing_style_production(declared_repo)
-    repository, slug = standing.repository, standing.slug
+    repository, name = standing.repository, standing.name
     branch_point = parent.merge_branch.removeprefix("refs/heads/")
     _ = _git(repository, "check-ref-format", f"refs/heads/{branch_point}")
     branch_tip = _git(repository, "rev-parse", "--verify", f"refs/heads/{branch_point}^{{commit}}")
     return StyleProduction(
-        parent, repository, slug, branch_point, branch_tip,
+        parent, repository, name, branch_point, branch_tip,
         "style/" + branch_point.replace("/", "-"), standing.checkout,
         standing.doc, proposals,
         tuple(line for line in lines if line.startswith("- **Merge tests:** ")),
@@ -159,16 +167,16 @@ def _request(doc: Path) -> StyleProduction:
 def _check_existing(style: StyleProduction) -> bool:
     standing = standing_style_production(style.repository)
     if isinstance(standing, StandingStyleProduction):
-        existing = read_production(standing.doc)
+        existing = read_production(standing.name)
         lines = existing.doc.read_text().splitlines()
         branch_point = standing.branch_point
         if branch_point != style.branch_point:
             raise StyleBranchPointTaken(
-                f"{style.repository.name} already has style production {style.slug} on branch point {branch_point}; "
+                f"{style.repository.name} already has style production {style.name} on branch point {branch_point}; "
                 + "one branch point per repository",
             )
         if production_field(lines, "Kind") != "style" or existing.merge_branch != style.merge_branch:
-            raise Refusal(f"{style.doc}: does not describe {style.slug} on {style.merge_branch}")
+            raise Refusal(f"{style.doc}: does not describe {style.name} on {style.merge_branch}")
     if (style.checkout / ".git").exists():
         common = _git(style.checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
         if common != _git(style.repository, "rev-parse", "--path-format=absolute", "--git-common-dir"):
@@ -177,12 +185,12 @@ def _check_existing(style: StyleProduction) -> bool:
             raise Refusal(f"{style.checkout}: must be on {style.merge_branch}")
     elif style.checkout.exists() and any(style.checkout.iterdir()):
         raise Refusal(f"{style.checkout}: is not an empty directory or a style worktree")
-    return style.doc.exists() and style.slug in showrunners.timer_slugs()
+    return style.doc.exists() and style.name in showrunners.timer_names()
 
 
 def _production_text(style: StyleProduction) -> str:
     return "\n".join([
-        f"# Production — {style.slug}", "",
+        f"# Production — {style.name}", "",
         "> **Status: PRODUCTION — running.** Standing style coverage and mechanical fixes.", "",
         "## Production Context", "",
         f"- **Repository:** {style.repository}",
@@ -193,16 +201,13 @@ def _production_text(style: StyleProduction) -> str:
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
-        "## Units", "", "| Unit | Owns |", "| --- | --- |",
-        *(f"| {style.slug}-{family}-unit | none — board-free |" for family in FAMILIES), "",
     ])
 
 
 def _plan_text(style: StyleProduction, family: rules.Family, catalog: tuple[rules.Rule, ...]) -> str:
     family_rules = [f"  - `{rule.rule_id}` — tier {rule.tier}" for rule in catalog if rule.family == family]
     return "\n".join([
-        f"# {style.slug} — {family}", "",
-        f"> **Production: {style.slug}** — unit `{style.slug}-{family}-unit`; production doc `{style.doc}`",
+        f"# {style.name} — {family}", "",
         "> **Standing:** style_plan.py", "", "## Delegation Context", "",
         f"- **Project:** {style.repository.name} — standing {family} style coverage",
         f"- **Repository:** {style.repository}",
@@ -232,14 +237,14 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
     selected = {unit.family: unit for unit in pilot.units}
     launched = {
         family for family in FAMILIES
-        if (style.repository.parent / f"{style.slug}-{family}").exists()
+        if (style.repository.parent / f"{style.name}-{family}").exists()
     }
-    units = ", ".join(f"{style.slug}-{family}-unit" for family in FAMILIES if family in launched or family in selected)
+    units = ", ".join(f"{style.name}-{family}" for family in FAMILIES if family in launched or family in selected)
     _set_fields(style, {"Pilot units": units})
     for family in FAMILIES:
         if family in launched:
             continue
-        path = style.checkout / PLAN_DIRECTORY / f"{style.slug}-{family}-unit.md"
+        path = style.checkout / PLAN_DIRECTORY / f"{style.name}-{family}-unit.md"
         original = path.read_text()
         plan = original.splitlines(keepends=True)
         context = plan.index("## Delegation Context\n") + 1
@@ -257,13 +262,13 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
             write_text_atomic(path, text)
 
 
-def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, slug: str) -> tuple[str, ...]:
+def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, name: str) -> tuple[str, ...]:
     if isinstance(pilot, AllStyleUnits):
-        units = ", ".join(f"{slug}-{family}-unit" for family in FAMILIES)
+        units = ", ".join(f"{name}-{family}" for family in FAMILIES)
         return (*steps[:4], steps[4] + f"; units {units}", *steps[5:])
-    units = "; ".join(f"{slug}-{unit.family}-unit" for unit in pilot.units)
+    units = "; ".join(f"{name}-{unit.family}" for unit in pilot.units)
     scopes = "; ".join(
-        f"{slug}-{unit.family}-unit: {', '.join(unit.packages) if unit.packages else 'all crates'}"
+        f"{name}-{unit.family}: {', '.join(unit.packages) if unit.packages else 'all crates'}"
         for unit in pilot.units
     )
     return (*steps[:3], steps[3] + f"; pilot units {units}",
@@ -283,27 +288,27 @@ def _run_script(script: Path, *arguments: str) -> None:
 
 
 def _open_session_guidance(style: StyleProduction, reason: str) -> str:
-    attach = herdr.attach_hint(showrunners.herdr_space(style.slug, str(style.doc)), style.slug)
+    attach = herdr.attach_hint(style.name, style.name)
     return (
-        f"{style.slug} was left open by add_showrunner.py ({reason}); look at it with {attach}; "
+        f"{style.name} was left open by add_showrunner.py ({reason}); look at it with {attach}; "
         + "once it has its update timer, rerun add_style, which attaches it; "
         + "if it never gets one, end that session and rerun"
     )
 
 
 def _attach_parent(style: StyleProduction) -> None:
-    current_parent = showrunner_tree.parent_of(style.slug)
-    if current_parent != style.parent.slug:
+    current_parent = showrunner_tree.parent_of(style.name)
+    if current_parent != style.parent.name:
         if current_parent:
-            _run_script(SHOWRUNNERS, "detach", style.slug)
-        _run_script(SHOWRUNNERS, "attach", style.slug, style.parent.slug)
+            _run_script(SHOWRUNNERS, "detach", style.name)
+        _run_script(SHOWRUNNERS, "attach", style.name, style.parent.name)
 
 
 def _attach(style: StyleProduction) -> None:
     _attach_parent(style)
     _update_destination(style)
     _run_script(SCRIPTS / "style/style_sync.py", "resume", "--repo", str(style.checkout),
-                "--slug", style.slug, "--branch-point", style.branch_point,
+                "--production", style.name, "--branch-point", style.branch_point,
                 "--style-branch", style.merge_branch)
 
 
@@ -331,13 +336,13 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
     if existing:
         return (
             f"read {style.parent.doc}; repository {style.repository}; Proposals {style.proposals}",
-            f"attach standing {style.slug} under {style.parent.slug}; branch point {style.branch_point}",
-            *((f"skipped: {style.slug} already exists",) * 4),
+            f"attach standing {style.name} under {style.parent.name}; branch point {style.branch_point}",
+            *((f"skipped: {style.name} already exists",) * 4),
             "update Proposals, run style_sync.py resume; synced tip unchanged",
         )
     return (
         f"read {style.parent.doc}; repository {style.repository}; Proposals {style.proposals}",
-        f"find standing {style.slug} under {style.parent.slug}; branch point {style.branch_point}",
+        f"find standing {style.name} under {style.parent.name}; branch point {style.branch_point}",
         f"ensure {style.merge_branch} from {style.branch_tip} and worktree {style.checkout}",
         (f"set Proposals in existing production doc {style.doc}"
          if style.doc.exists() else f"write missing production doc {style.doc}"),
@@ -349,31 +354,31 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--production", required=True, type=Path)
+    _ = parser.add_argument("--production", required=True)
     _ = parser.add_argument("--model", required=True)
     _ = parser.add_argument("--effort", required=True)
     _ = parser.add_argument("--check", action="store_true")
     _ = parser.add_argument("--pilot", action="append", default=[], metavar="UNIT[=CRATE,...]")
     args = parser.parse_args(argv)
     try:
-        style = _request(cast(Path, args.production))
+        style = _request(cast(str, args.production))
         existing = _check_existing(style)
         pilot_arguments = cast(list[str], args.pilot)
         if existing and pilot_arguments:
-            raise Refusal(f"--pilot applies only while creating {style.slug}")
+            raise Refusal(f"--pilot applies only while creating {style.name}")
         pilot = _pilot_units(pilot_arguments, style.repository)
         catalog = rules.load_rules(style.repository)
         if cast(bool, args.check):
             steps = _steps(style, existing)
             if not existing:
-                steps = _pilot_steps(steps, pilot, style.slug)
+                steps = _pilot_steps(steps, pilot, style.name)
             for number, step in enumerate(steps, 1):
                 print(f"{number}. {step}")
             return 0
         if existing:
             _attach(style)
             return 0
-        if style.slug not in showrunners.timer_slugs() and herdr_tab_open(style.slug, NoEndingTab()):
+        if style.name not in showrunners.timer_names() and herdr_tab_open(style.name, NoEndingTab()):
             raise Refusal(_open_session_guidance(style, "live session without an update timer"))
         if not (style.checkout / ".git").exists():
             present = subprocess.run(
@@ -388,15 +393,21 @@ def main(argv: list[str]) -> int:
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         for family in FAMILIES:
-            _write_missing(style.checkout / PLAN_DIRECTORY / f"{style.slug}-{family}-unit.md", _plan_text(style, family, catalog))
+            _write_missing(style.checkout / PLAN_DIRECTORY / f"{style.name}-{family}-unit.md", _plan_text(style, family, catalog))
         if isinstance(pilot, PilotUnits):
             _configure_pilot(style, pilot)
         _exclude(style)
         style_tip = _git(style.repository, "rev-parse", "--verify", f"refs/heads/{style.merge_branch}^{{commit}}")
         with style_ledger.open_ledger(style.checkout) as ledger:
             ledger.ensure_synced_tip(style_tip, style.merge_branch)
+        if isinstance(standing_style_production(style.repository), NoStyleProduction):
+            production = read_new_production(style.doc, style.name)
+            doc_options = ["--doc", str(production.doc)]
+        else:
+            production = read_production(style.name)
+            doc_options = []
         result = subprocess.run([
-            str(SCRIPTS / "lib/py"), str(LAUNCHER), "--production", str(style.doc),
+            str(SCRIPTS / "lib/py"), str(LAUNCHER), "--production", production.name, *doc_options,
             "--model", cast(str, args.model), "--effort", cast(str, args.effort),
         ], check=False)
         if result.returncode in (1, 3):

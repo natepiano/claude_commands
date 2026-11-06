@@ -219,11 +219,11 @@ class RosterTests(unittest.TestCase):
         }), encoding="utf-8")
 
     def _write_showrunner_timer(self) -> None:
-        instance = self.notifier / "showrunner-alpha"
+        instance = self.notifier / f"showrunner-{showrunner_relationship('alpha').id}"
         instance.mkdir()
         _ = (instance / "conf").write_text(
             "TARGET=session:acd50bad-5afa-5d3d-b155-3766b7d113e0\n"
-            + f"CHECK=zsh /scripts/production_check.sh {self.production_doc}\n",
+            + f"CHECK=zsh /scripts/production_check.sh {showrunner_relationship('alpha').id}\n",
             encoding="utf-8",
         )
 
@@ -622,7 +622,7 @@ class RosterTests(unittest.TestCase):
         _ = staff.set_doc(receiving.id, staff.LiveDoc("natedev", doc))
         timer = self.notifier / "showrunner-receiving"
         timer.mkdir()
-        _ = (timer / "conf").write_text(f"TARGET=session:522e6367-86e1-5829-ada8-2c71b5c28c97\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+        _ = (timer / "conf").write_text(f"TARGET=session:522e6367-86e1-5829-ada8-2c71b5c28c97\nCHECK=zsh /scripts/production_check.sh {receiving.id}\n")
         self._write_session(str(os.getppid()), "receiving-runner", "522e6367-86e1-5829-ada8-2c71b5c28c97", self.home / "receiving",
                             pid=os.getppid())
         director = self._entries()["director"]
@@ -642,7 +642,7 @@ class RosterTests(unittest.TestCase):
         before = self._entries()
         wanted = ["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0"]
         labels = roster.unit_labels_for(wanted, self.environment)
-        old = unit_membership("alpha", "retired-unit")
+        old = unit_membership("alpha", "retired")
         _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=old.worktree)
         historical = showrunner_relationship("wrapped")
         _ = staff.set_doc(historical.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
@@ -660,10 +660,7 @@ class RosterTests(unittest.TestCase):
         owner = showrunner_relationship("alpha")
         owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.production_doc))
         showrunner_launch(owner, "acd50bad-5afa-5d3d-b155-3766b7d113e0", self.environment)
-        _ = (self.notifier / "showrunner-alpha").rename(self.notifier / "showrunner-builds")
-        _ = self.production_doc.write_text(
-            "## Production Context\n\n- **Formerly:** `alpha`\n\n" + self.production_doc.read_text(),
-        )
+        _ = staff.rename(owner.id, "builds")
         full = roster.unit_labels(self._entries().values())
         fast = roster.unit_labels_for(["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], self.environment)
         self.assertEqual(full["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("director", "builds", "unit-one"))
@@ -1004,6 +1001,13 @@ class RosterTests(unittest.TestCase):
             roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
 
+    def test_a_roster_build_reads_the_role_log_once(self) -> None:
+        with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
+            entries = self._entries()
+
+        self.assertGreater(sum(entry.role == "worker" for entry in entries.values()), 1)
+        self.assertEqual(read.call_count, 1)
+
     def test_mesh_assignment_states_come_from_records_and_not_names(self) -> None:
         self._write_mesh(self.director_run, {
             "arbitrary": {"thread_id": "c11994bc-45da-585c-bb8c-b9aa62be4800", "status": "done", "role": "impl"},
@@ -1031,7 +1035,7 @@ class RosterTests(unittest.TestCase):
     def test_display_rename_keeps_record_keys_and_adds_a_structured_job(self) -> None:
         entry = replace(self._entry("identity-impl", "worker", "worker:run/identity-impl"),
                         showrunner=roster.ProductionWithoutRunningShowrunner("sdlc"),
-                        director=roster.UnderDirector("roles-unit", "director", "session:director"),
+                        director=roster.UnderDirector("roles", "director", "session:director"),
                         assignment=roster.WorkerAssignment("impl", "/fixture/run", "impl", "impl"))
         snapshot = roster.RosterSnapshot(roster.Roster([entry], [])).encode()
         with mock.patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")), \
@@ -1049,7 +1053,7 @@ class RosterTests(unittest.TestCase):
 
     def test_rendering_and_serializing_multiple_jobs_share_one_configuration_read(self) -> None:
         job = roster.ShownJob("worker", roster.JobSlot("impl"))
-        shown = roster.ShownName(roster.ProductionPart("sdlc"), roster.UnitPart("roles-unit"), job, "worker:run/identity")
+        shown = roster.ShownName(roster.ProductionPart("sdlc"), roster.UnitPart("roles"), job, "worker:run/identity")
         with mock.patch.object(names, "load_names", return_value=fixture_names(worker="builder")) as load:
             for attempt in range(3):
                 with self.subTest(attempt=attempt):
@@ -1087,7 +1091,7 @@ class RosterTests(unittest.TestCase):
     def test_invalid_name_configuration_renders_the_address_and_reports_once(self) -> None:
         entry = replace(self._entry("identity", "unit director", "session:identity"),
                         showrunner=roster.ProductionWithoutRunningShowrunner("sdlc"),
-                        director=roster.DirectsUnit("roles-unit"))
+                        director=roster.DirectsUnit("roles"))
         error = names.InvalidNames("/fixture/names.toml", "invalid fixture table")
         output = io.StringIO()
         with mock.patch.object(names, "runtime_names", wraps=names.runtime_names), \
@@ -1101,7 +1105,7 @@ class RosterTests(unittest.TestCase):
     def test_shown_names_keep_organizational_role_assignment_and_slot_distinct(self) -> None:
         base = replace(self._entry("unrelated-name", "worker", "worker:run/arbitrary"),
                        showrunner=roster.UnderShowrunner("sdlc", "runner", "session:runner"),
-                       director=roster.UnderDirector("roles-unit", "director", "session:director"))
+                       director=roster.UnderDirector("roles", "director", "session:director"))
         for role, slot, expected in (("impl", "impl", "worker impl"), ("test", "test", "worker test"),
                                      ("review", "review", "code reviewer review"),
                                      ("review", "review2", "code reviewer review2")):
@@ -1111,7 +1115,7 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(roster.shown_name(entry).render(), f"sdlc · roles · {expected}")
                 self.assertEqual(entry.role, "worker")
                 self.assertEqual(entry.reach, roster.Messageable("worker:run/arbitrary"))
-        director = replace(base, role="unit director", director=roster.DirectsUnit("roles-unit"),
+        director = replace(base, role="unit director", director=roster.DirectsUnit("roles"),
                            assignment=roster.NotAWorker())
         self.assertEqual(roster.shown_name(director).render(), "sdlc · roles · unit director")
         runner = replace(director, role="showrunner", showrunner=roster.RunsProduction("sdlc"))
@@ -1122,7 +1126,7 @@ class RosterTests(unittest.TestCase):
                         assignment=roster.WorkerAssignment("test", "/run", "test", "test"))
         self.assertEqual(roster.shown_name(entry).render(), "worker test")
         self.assertEqual(roster.shown_name(replace(entry, director=roster.UnderDirector(
-            "roles-unit", "director", "session:director"))).render(), "roles · worker test")
+            "roles", "director", "session:director"))).render(), "roles · worker test")
         self.assertEqual(roster.shown_name(replace(entry, showrunner=roster.ProductionWithoutRunningShowrunner(
             "sdlc"))).render(), "sdlc · worker test")
         free = replace(entry, role="freestanding", assignment=roster.NotAWorker())
@@ -1133,10 +1137,10 @@ class RosterTests(unittest.TestCase):
     def test_unit_rename_and_transfer_change_only_shown_location(self) -> None:
         original = replace(self._entry("fixed-address", "worker", "worker:run/fixed-address", kind="codex"),
                            showrunner=roster.UnderShowrunner("sdlc", "runner", "session:runner"),
-                           director=roster.UnderDirector("roles-unit", "director", "session:director"),
+                           director=roster.UnderDirector("roles", "director", "session:director"),
                            assignment=roster.WorkerAssignment("impl", "/run", "impl", "impl"),
                            thread=roster.CodexThread("fixed-thread"))
-        renamed = replace(original, director=roster.UnderDirector("records-unit", "director", "session:director"))
+        renamed = replace(original, director=roster.UnderDirector("records", "director", "session:director"))
         transferred = replace(renamed, showrunner=roster.UnderShowrunner("tools", "next", "session:next"))
         for entry, expected in ((original, "sdlc · roles · worker impl"),
                                 (renamed, "sdlc · records · worker impl"),
@@ -1189,7 +1193,7 @@ class RosterTests(unittest.TestCase):
 
     def test_mesh_titles_use_worker_parents_and_fall_back_when_the_design_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"
-        unit = unit_membership("sdlc", "roles-unit")
+        unit = unit_membership("sdlc", "roles")
         runner = showrunner_relationship("sdlc")
         mesh = str(design_roles.mesh_directory(design_id))
         for parent, prefix in ((unit, "sdlc · roles"), (runner, "sdlc")):
@@ -1284,7 +1288,7 @@ class RosterTests(unittest.TestCase):
         mesh = str(self.root / "held-design")
         base = replace(self._entry("unrelated-name", "worker", "worker:held/arbitrary", kind="codex"),
                        showrunner=roster.ProductionWithoutRunningShowrunner("sdlc"),
-                       director=roster.UnderDirector("roles-unit", "director", "session:director"))
+                       director=roster.UnderDirector("roles", "director", "session:director"))
         entries = [
             replace(base, role="astra-designer", name="design-address",
                     assignment=roster.HeldDesignRole("designer", mesh),
@@ -2446,7 +2450,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
         _ = self.enterContext(environment_patch)
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        unit = unit_membership("builds", "report-unit")
+        unit = unit_membership("builds", "report")
         self.director_id = unit.id
         assert isinstance(unit.parent, staff.ReportsTo)
         self.runner_id = unit.parent.id
@@ -2462,7 +2466,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
             }))
         self.process(991099, 0, ["herdr", "--session", "native", "server"])
         self.process(os.getppid(), 991099, ["claude"],
-                     ('HERDR_PANE_ID=w1:p1\x00' + 'SHOWRUNNER_' + 'UNIT=builds\x00' + 'SHOWRUNNER_' + 'UNIT_ID=report-unit\x00'))
+                     ('HERDR_PANE_ID=w1:p1\x00' + 'SHOWRUNNER_' + 'UNIT=builds\x00' + 'SHOWRUNNER_' + 'UNIT_ID=report\x00'))
         self.process(os.getpid(), 0, ["claude"])
         herdr_listener(self.root / "proc", 991099, "native", os.environ)
         _ = (self.root / "herdr.json").write_text(json.dumps({
@@ -2477,7 +2481,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
         _ = recorded_showrunner("builds", doc)
         timer = notifier / "showrunner-builds"
         timer.mkdir()
-        _ = (timer / "conf").write_text(f"TARGET=session:{self.runner_id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+        _ = (timer / "conf").write_text(f"TARGET=session:{self.runner_id}\nCHECK=zsh /scripts/production_check.sh builds\n")
         run = self.runs / "run-00"
         self.mesh(run, {"report-test2": {"thread_id": self.thread, "status": "running"}})
         _ = (self.runs / "active" / self.director_id).write_text(str(run) + "\n")
@@ -2512,7 +2516,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
             name = f"report-test-{number}"
             self.mesh(run, {name: {"thread_id": thread, "status": "done"}})
             (run / "heartbeat.log").touch()
-            _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "builds", "unit": "report-unit"}))
+            _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "builds", "unit": "report"}))
             wanted.append(thread)
             expected[thread] = roster.UnitLabels(name, "builds", "report")
         started = time.perf_counter()
@@ -2541,7 +2545,7 @@ class UnitLabelsTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        production_membership("cargo-liner-style", "cargo-liner-style-types-unit")
+        production_membership("cargo-liner-style", "cargo-liner-style-types")
 
     def test_folder_name_joins_showrunner_and_unit(self) -> None:
         self.assertEqual(roster.UnitLabels("director", "hana", "lfo").folder_name(), "hana-lfo")
@@ -2576,9 +2580,9 @@ class UnitLabelsTests(unittest.TestCase):
     def test_labels_use_production_and_unit_short_names_not_session_names(self) -> None:
         runner = roster.UnderShowrunner("builds", "builds-showrunner", "session:runner-id")
         entries = [
-            self.entry("director-id", "report-director", showrunner=runner, director=roster.DirectsUnit("report-unit")),
+            self.entry("director-id", "report-director", showrunner=runner, director=roster.DirectsUnit("report")),
             self.entry("worker-thread", "report-test2", showrunner=runner,
-                       director=roster.UnderDirector("report-unit", "report-director", "session:director-id"),
+                       director=roster.UnderDirector("report", "report-director", "session:director-id"),
                        codex=True),
             self.entry("runner-id", "builds-showrunner", showrunner=roster.RunsProduction("builds")),
             self.entry("unmatched-id", "scratch"),
@@ -2598,7 +2602,7 @@ class UnitLabelsTests(unittest.TestCase):
     def test_labels_and_shown_name_agree_on_production_and_unit(self) -> None:
         entry = self.entry("director-id", "report-director",
                            showrunner=roster.UnderShowrunner("builds", "builds-showrunner", ""),
-                           director=roster.DirectsUnit("report-unit"))
+                           director=roster.DirectsUnit("report"))
         shown = roster.shown_name(entry)
         labels = roster.unit_labels([entry])["director-id"]
         self.assertEqual(shown.production, roster.ProductionPart(labels.showrunner))
@@ -2609,9 +2613,9 @@ class UnitLabelsTests(unittest.TestCase):
         runner = roster.UnderShowrunner("cargo-liner-style", "cargo-liner", "session:liner")
         entries = [
             self.entry("style-director", "types-director", showrunner=runner,
-                       director=roster.DirectsUnit("cargo-liner-style-types-unit")),
+                       director=roster.DirectsUnit("cargo-liner-style-types")),
             self.entry("style-worker", "types-review", showrunner=runner,
-                       director=roster.UnderDirector("cargo-liner-style-types-unit", "types-director",
+                       director=roster.UnderDirector("cargo-liner-style-types", "types-director",
                                                      "session:style-director"),
                        codex=True),
         ]
@@ -2624,13 +2628,13 @@ class UnitLabelsTests(unittest.TestCase):
 
     def test_labels_collapse_whitespace_without_changing_the_registered_name(self) -> None:
         entry = self.entry("id", "report\n test2", showrunner=roster.UnderShowrunner(" builds\t", "runner", ""),
-                           director=roster.UnderDirector(" report-unit\n", "director", ""), codex=True)
+                           director=roster.UnderDirector(" report\n", "director", ""), codex=True)
         self.assertEqual(roster.unit_labels([entry]), {"id": roster.UnitLabels("report test2", "builds", "report")})
 
     def test_fast_lookup_uses_only_fixture_sessions_registry_and_staff_marks(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        unit = unit_membership("cargo-liner-style", "cargo-liner-style-types-unit")
+        unit = unit_membership("cargo-liner-style", "cargo-liner-style-types")
         assert isinstance(unit.parent, staff.ReportsTo)
         worker = fixture_worker("types-review", unit.id)
         doc = root / "production.md"
@@ -2648,7 +2652,7 @@ class UnitLabelsTests(unittest.TestCase):
             process = root / "proc" / str(record["pid"])
             process.mkdir(parents=True)
             environment_by_identity: dict[str, str] = {
-                unit.id: ('' + 'SHOWRUNNER_' + 'UNIT=cargo-liner-style\x00' + 'SHOWRUNNER_' + 'UNIT_ID=cargo-liner-style-types-unit\x00'),
+                unit.id: ('' + 'SHOWRUNNER_' + 'UNIT=cargo-liner-style\x00' + 'SHOWRUNNER_' + 'UNIT_ID=cargo-liner-style-types\x00'),
                 worker.id: f"CLAUDE_CODE_SESSION_ID={unit.id}\0",
             }
             marks = environment_by_identity.get(record["sessionId"], "")
@@ -2658,14 +2662,14 @@ class UnitLabelsTests(unittest.TestCase):
         for record in records:
             _ = (registry / f"{record['pid']}.json").write_text(json.dumps(record))
         registered: list[showrunners.Showrunner] = [{
-            "session": "cargo-liner", "socket": f"/fixture/{unit.parent.id}.sock", "slug": "cargo-liner-style",
+            "session": "cargo-liner", "socket": f"/fixture/{unit.parent.id}.sock", "name": "cargo-liner-style",
             "zone": "America/New_York", "doc": str(doc),
         }]
         environment = {"HERDR_PROC": str(root / "proc"), "NOTIFIER_SESSIONS_DIR": str(root / "sessions")}
         notifier = root / "notifier"
         (notifier / "showrunner-cargo-liner-style").mkdir(parents=True)
         _ = (notifier / "showrunner-cargo-liner-style/conf").write_text(
-            f"TARGET=session:{unit.parent.id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+            f"TARGET=session:{unit.parent.id}\nCHECK=zsh /scripts/production_check.sh {unit.parent.id}\n")
         with mock.patch.object(unit_labels, "newest_sessions", return_value=records), \
              mock.patch.object(sessions, "sessions_dir", return_value=registry), \
              mock.patch.object(sessions, "running_session", return_value=True), \

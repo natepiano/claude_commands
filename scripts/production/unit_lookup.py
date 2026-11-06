@@ -17,18 +17,16 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
-
-MESSAGE = Path(__file__).resolve().parent.parent / "message"
 from scripts.herdr import herdr  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.herdr.herdr import HerdrPlace  # noqa: E402
 from scripts.message.sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
-from scripts.production import staff, showrunners, session_staff, unit_config  # noqa: E402
+from scripts.production import staff, session_staff, unit_config  # noqa: E402
 from scripts.production.session_labels import StaffLabels
 from scripts.shutdown import remote
 from scripts.lib import unit_runs  # noqa: E402
 
-USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
+USAGE = "usage: unit_lookup.py list <production name> | pane <production name> <unit>"
 
 
 from scripts.production.session_staff import (
@@ -54,7 +52,6 @@ from scripts.production.session_staff import (
     place_text as place_text,
     holder_text as holder_text,
     LabeledProductions as LabeledProductions,
-    lookup_slug as _lookup_slug,
     production_members as production_members,
     group_labeled_sessions as group_labeled_sessions,
     retained_session_labels,
@@ -73,17 +70,6 @@ def doc_owner(doc: Path, record: staff.StaffSnapshot) -> staff.StaffRow:
 def doc_units(doc: Path, record: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
     """The production's unit rows in staff.json row order; a retired row has a RemovedWorktree."""
     return tuple(record.find(kind="unit", parent=doc_owner(doc, record).id))
-
-
-def production_slug_for_document(doc: Path, record: staff.StaffSnapshot, sources: MemberSources) -> str:
-    """Resolve a production through its registered document and fixed owner."""
-    owner = doc_owner(doc, record)
-    slugs = [slug for slug, row in sources.showrunner_members(record).items() if row.id == owner.id]
-    if len(slugs) == 1:
-        return slugs[0]
-    if not slugs and record.by_path(owner.name) == owner:
-        return owner.name
-    raise staff.StaffUnreadable(f"{doc}: no unique registered production")
 
 
 def local_worktree(selected: MemberFound | NoSuchMember) -> staff.PresentWorktree | staff.RemovedWorktree:
@@ -111,12 +97,12 @@ class UnitMetadata:
     problems: tuple[UnitProblem, ...]
 
 
-def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
-                  slug: str | None = None) -> UnitMetadata:
+def unit_metadata(record: staff.StaffSnapshot, *,
+                  name: str | None = None) -> UnitMetadata:
     """Return unit facts and problems without writing diagnostics."""
-    productions = production_members(record, sources)
-    rows = (tuple(row for children in productions.values() for row in children) if slug is None
-            else productions.get(sources.canonical_slug(slug), ()))
+    productions = production_members(record)
+    rows = (tuple(row for children in productions.values() for row in children) if name is None
+            else productions.get(name, ()))
     resolver = session_staff.RowResolver(record, rows=rows)
     metadata: dict[staff.StaffId, dict[str, str]] = {}
     issues: list[UnitProblem] = []
@@ -149,8 +135,6 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
                     cells["Plan"] = "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
                 if isinstance(config.port, unit_config.AppPort):
                     cells["Port"] = str(config.port.number)
-                if config.responsibilities:
-                    cells["Owns"] = ", ".join(config.responsibilities)
             else:
                 reason = config.reason if not isinstance(config, session_staff.NoUnitConfig) else "no unit configuration"
                 cells["Plan"] = "unavailable: " + reason
@@ -169,7 +153,7 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
 class UnitProduction:
     """The current parent and its source document, resolved from the staff edge."""
 
-    slug: str
+    name: str
     doc: str
 
 
@@ -182,15 +166,12 @@ def unit_row(unit: str, record: staff.StaffSnapshot, *,
     return found.row
 
 
-def row_production(row: staff.StaffRow, record: staff.StaffSnapshot,
-                   sources: MemberSources) -> UnitProduction:
+def row_production(row: staff.StaffRow, record: staff.StaffSnapshot) -> UnitProduction:
     """Resolve a unit's current parent from the caller's owner snapshot."""
-    doc = session_staff.RowResolver(record).production_doc(row)
-    if isinstance(doc, session_staff.ProductionDoc):
-        slugs = [slug for slug, parent in sources.showrunner_members(record).items() if staff.ReportsTo(parent.id) == row.parent]
-        slug = slugs[0] if len(slugs) == 1 else showrunners.production_slug(str(doc.path))
-        return UnitProduction(slug, str(doc.path))
-    raise staff.StaffUnreadable(f"{row.name}: {doc.reason}")
+    parent = record.parent_of(row)
+    if parent is not None and parent.kind == "showrunner" and isinstance(parent.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        return UnitProduction(parent.name, str(parent.doc.path))
+    raise staff.StaffUnreadable(f"{row.name}: no showrunner parent document")
 
 
 @dataclass(frozen=True)
@@ -215,10 +196,10 @@ def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
 
 def unit_parent(unit: str,
                 reference: session_staff.StoredReference | session_staff.LiveSession | session_staff.ByName = session_staff.BY_NAME, *,
-                record: staff.StaffSnapshot, sources: MemberSources) -> UnitProduction:
+                record: staff.StaffSnapshot) -> UnitProduction:
     """Resolve identity and its current parent without another owner read."""
     row = unit_row(unit, record, reference=reference)
-    return row_production(row, record, sources)
+    return row_production(row, record)
 
 
 class UnitState(Enum):
@@ -525,7 +506,7 @@ def observed_session_labels(*, record: staff.StaffSnapshot | None = None, runnin
     """Read native process identities for stop and cleanup checks."""
     try:
         record = record if record is not None else staff.snapshot()
-        processes = herdr.herdr_processes(membership=StaffLabels(record, {}, {}))
+        processes = herdr.herdr_processes(membership=StaffLabels(record))
         claudes, unread = _claudes(processes, running=running)
         return tuple(_herdr_labeled(claudes, unread, processes))
     except herdr.HerdrFailure as error:
@@ -540,46 +521,44 @@ def every_labeled_session(*, record: staff.StaffSnapshot | None = None,
     return group_labeled_sessions(observed_session_labels(record=record, running=running), record=record, sources=sources)
 
 
-def labeled_sessions(slug: str, *, record: staff.StaffSnapshot | None = None,
+def labeled_sessions(production_name: str, *, record: staff.StaffSnapshot | None = None,
                  sources: MemberSources | None = None) -> dict[str, LabeledSession]:
     """Return the selected process state for each unit."""
-    slug = _lookup_slug(slug, record=record)
     found = every_labeled_session(record=record, sources=sources)
-    return found.status_units(slug)
+    return found.status_units(production_name)
 
 
-def labeled_session(slug: str, name: str, *, record: staff.StaffSnapshot | None = None,
+def labeled_session(production_name: str, name: str, *, record: staff.StaffSnapshot | None = None,
                 sources: MemberSources | None = None,
                 running: Sequence[SessionRecord] | None = None) -> LabeledSession | None:
     """Return one unit of the production. Unreadable herdr raises OSError."""
-    slug = _lookup_slug(slug, record=record)
     record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources(record=record)
-    selected = sources.member(UnitMember(slug, name), record)
+    sources = sources if sources is not None else member_sources()
+    selected = sources.member(UnitMember(production_name, name), record)
     label = selected.row.name if isinstance(selected, MemberFound) else name
     marked = observed_session_labels(record=record, running=running)
     if isinstance(selected, MemberFound):
         # A retained row still needs pane liveness checks when cleanup is retried.
-        found = retained_session_labels(marked, selected.row, slug, record=record, sources=sources)
+        found = retained_session_labels(marked, selected.row, production_name, record=record, sources=sources)
     else:
         found = group_labeled_sessions(marked, record=record, sources=sources)
-    return found.units.get(slug, {}).get(label)
+    return found.units.get(production_name, {}).get(label)
 
 
 def main(arguments: list[str]) -> int:
     """Exit 0 found or done, 1 no such unit session, 2 usage, 3 cannot tell or could not do it."""
     try:
         match arguments:
-            case ["list", slug]:
-                for unit in labeled_sessions(slug).values():
+            case ["list", production_name]:
+                for unit in labeled_sessions(production_name).values():
                     claude = unit.claude
                     told = ((claude.name, claude.session_id, claude.socket) if isinstance(claude, LiveClaude)
                             else ("", "", ""))
                     running = ("live" if isinstance(claude, LiveClaude)
                                else "unknown" if isinstance(claude, ClaudeUnknown) else "stopped")
                     print("\t".join((unit.unit, place_text(unit.place), unit.place.session, running, *told)))
-            case ["pane", slug, name]:
-                found = labeled_session(slug, name)
+            case ["pane", production_name, name]:
+                found = labeled_session(production_name, name)
                 if found is None:
                     return 1
                 print(place_text(found.place))

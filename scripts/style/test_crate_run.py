@@ -153,7 +153,7 @@ class CrateRunTests(CargoProjectTests):
         _ = self.authority.ticket_base("1001")
         for index, path in enumerate(paths):
             proposal = self.root / ("decision.md" if shared_proposal else f"decision-{index}.md")
-            _ = proposal.write_text("---\nunit: approved-unit\nplan: approved-plan\n---\nApproved rename\n")
+            _ = proposal.write_text("---\nunit: approved\nplan: approved-plan\n---\nApproved rename\n")
             source = (self.repo / path).read_text()
             finding = self.authority.hold(self.definition.rule_id, path, 2, source.splitlines()[1],
                                           "rename", "old", "number", self.definition.blob, "1001")

@@ -128,11 +128,11 @@ class RemoteControlTests(ShutdownTestCase):
 
         with isolated_staff_file(self.root / "staff.json", {}):
             parent = showrunner_relationship("current")
-            row = fixture_member("unit", name="current-unit", parent=parent.id)
+            row = fixture_member("unit", name="current", parent=parent.id)
             for field in ("sessionId", "session_id"):
                 launch: dict[str, object] = {
                     field: row.current_session, "name": "Working tab",
-                    "environment": {"SHOWRUNNER_UNIT_ID": "old-unit", "SHOWRUNNER_UNIT": "old"},
+                    "environment": {"SHOWRUNNER_UNIT_ID": "old", "SHOWRUNNER_UNIT": "old"},
                 }
                 self.assertEqual(remote_control.remote_control_who(launch), "current unit")
                 self.assertEqual(remote_control.remote_control_who({"session": launch}), "current unit")
@@ -144,7 +144,7 @@ class RemoteControlTests(ShutdownTestCase):
         with isolated_staff_file(self.root / "staff.json", {}):
             launch: dict[str, object] = {
                 "session_id": "conversation", "name": "Working tab",
-                "environment": {"SHOWRUNNER_UNIT_ID": "old-unit", "SHOWRUNNER_UNIT": "old"},
+                "environment": {"SHOWRUNNER_UNIT_ID": "old", "SHOWRUNNER_UNIT": "old"},
             }
             self.assertEqual(remote_control.remote_control_who(launch), "Working tab")
 

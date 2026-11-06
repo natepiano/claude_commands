@@ -73,7 +73,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(unit_files.unit_worktrees(doc), ())
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn('held-unit', errors.getvalue())
+        self.assertIn('held', errors.getvalue())
         self.assertIn('No such file', errors.getvalue())
 
     def test_file_holders_follow_the_staff_parent_without_a_parent_document_field(self) -> None:
@@ -83,7 +83,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         parent = recorded_showrunner('parent', parent_doc)
         child = recorded_showrunner('child', child_doc)
         _ = staff.move(child.id, staff.ReportsTo(parent.id))
-        folder = self.root / 'parent-unit'
+        folder = self.root / 'parent'
         _ = recorded_unit('parent', 'held', folder, parent_doc)
         _ = subprocess.run(['git', '-C', str(folder), 'branch', 'main'], check=True)
         _ = (folder / 'held.py').write_text('private change\n')
@@ -91,7 +91,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
               mock.patch.object(staff, 'snapshot', wraps=staff.snapshot) as snapshot):
             holders = unit_files.unit_file_holders(folder, child_doc, ledger)
         snapshot.assert_called_once_with()
-        self.assertIn('held.py', holders['held-unit'])
+        self.assertIn('held.py', holders['held'])
         self.assertNotIn('Parent production', child_doc.read_text())
 
     def test_unreadable_parent_document_keeps_tickets_and_dirty_files_busy(self) -> None:
@@ -100,7 +100,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
             _ = doc.write_text('# Production\n- **Merge branch:** main\n')
         _ = recorded_showrunner('parent', parent_doc)
         _ = recorded_showrunner('child', child_doc, 'parent')
-        folder = self.root / 'parent-unit'
+        folder = self.root / 'parent'
         held = recorded_unit('parent', 'held', folder, parent_doc)
         _ = subprocess.run(['git', '-C', str(folder), 'branch', 'main'], check=True)
         _ = (folder / 'held.py').write_text('private change\n')
@@ -110,9 +110,9 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
               redirect_stderr(io.StringIO()) as errors):
             holders = unit_files.unit_file_holders(folder, child_doc, ledger)
         tickets.assert_called_once_with(str(held.id))
-        self.assertEqual(holders['held-unit'], frozenset({'held.py', 'ticket.py', '.unit.toml'}))
+        self.assertEqual(holders['held'], frozenset({'held.py', 'ticket.py', '.unit.toml'}))
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn('style: held-unit:', errors.getvalue())
+        self.assertIn('style: held:', errors.getvalue())
         self.assertIn('No such file', errors.getvalue())
 
     def test_detached_head_keeps_dirty_files_busy_and_other_units_continue(self) -> None:
@@ -126,7 +126,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         _ = (folder / 'detached.py').write_text('private change\n')
         _ = (other / 'other.py').write_text('another change\n')
         rows = unit_files.unit_worktrees(doc)
-        self.assertEqual(next(row.branch for row in rows if row.unit == 'detached-unit'), 'HEAD')
+        self.assertEqual(next(row.branch for row in rows if row.unit == 'detached'), 'HEAD')
         with (style_ledger.open_ledger(folder) as ledger,
               unit_files.report_unit_problems_once(),
               redirect_stderr(io.StringIO()) as errors):
@@ -136,10 +136,10 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
               unit_files.report_unit_problems_once(),
               redirect_stderr(io.StringIO()) as next_errors):
             self.assertEqual(unit_files.unit_file_holders(folder, doc, ledger), holders)
-        self.assertEqual(holders['detached-unit'], frozenset({'detached.py', '.unit.toml'}))
-        self.assertEqual(holders['other-unit'], frozenset({'other.py', '.unit.toml'}))
+        self.assertEqual(holders['detached'], frozenset({'detached.py', '.unit.toml'}))
+        self.assertEqual(holders['other'], frozenset({'other.py', '.unit.toml'}))
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn('style: detached-unit:', errors.getvalue())
+        self.assertIn('style: detached:', errors.getvalue())
         self.assertEqual(next_errors.getvalue(), errors.getvalue())
 
     def test_unreadable_worktree_keeps_open_tickets_busy(self) -> None:
@@ -152,7 +152,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
               redirect_stderr(io.StringIO()) as errors):
             holders = unit_files.unit_file_holders(self.source_root, doc, ledger)
         tickets.assert_called_once_with(str(standby.id))
-        self.assertEqual(holders, {'standby-unit': frozenset({'ticket.py'})})
+        self.assertEqual(holders, {'standby': frozenset({'ticket.py'})})
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn('staff worktree is unfilled', errors.getvalue())
 
@@ -182,10 +182,10 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         errors = io.StringIO()
         with redirect_stderr(errors):
             result = unit_files.unit_worktrees(doc)
-        self.assertEqual(result, (unit_files.UnitWorktree(live.id, 'live-unit', 'live-branch', live_folder, 'main'),))
+        self.assertEqual(result, (unit_files.UnitWorktree(live.id, 'live', 'live-branch', live_folder, 'main'),))
         messages = errors.getvalue().splitlines()
         self.assertEqual(len(messages), 1)
-        self.assertIn('standby-unit', messages[0])
+        self.assertIn('standby', messages[0])
         self.assertIn('staff worktree is unfilled', messages[0])
     def test_unreadable_branch_reports_one_line_and_keeps_other_rows(self) -> None:
         doc = self.source_root / 'style-production.md'
@@ -195,7 +195,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
                                 return_value=session_staff.BranchUnreadable('first line\nsecond line')),
               redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(unit_files.unit_worktrees(doc), ())
-        self.assertEqual(errors.getvalue(), 'style: held-unit: first line second line\n')
+        self.assertEqual(errors.getvalue(), 'style: held: first line second line\n')
 
 
 if __name__ == '__main__':

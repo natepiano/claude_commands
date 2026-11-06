@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Print every proposal still open for the user as one Markdown table.
 
-Usage: proposals_table.py [--production <production doc>] [--next]
+Usage: proposals_table.py [--production <production name>] [--next]
 
 Without `--production`, the doc is the one held by the update timer of the calling session
 (`CLAUDE_CODE_SESSION_ID`). Three sources, in this order:
@@ -386,16 +386,18 @@ def next_proposal(doc: Path) -> str:
 def main(arguments: list[str]) -> int:
     one = "--next" in arguments
     match [argument for argument in arguments if argument != "--next"]:
-        case ["--production", doc_text]:
-            doc: Path | None = Path(doc_text)
+        case ["--production", name]:
+            row = showrunners.owner_for(name)
+            if isinstance(row.doc, staff.DocUnfilled): raise Refusal(f"{row.name}: no production document")
+            doc: Path | None = row.doc.path
         case []:
             doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
             if doc is None:
-                print("proposals_table: this session is no production's showrunner; pass --production <doc>",
+                print("proposals_table: this session is no production's showrunner; pass --production <name>",
                       file=sys.stderr)
                 return 1
         case _:
-            print("usage: proposals_table.py [--production <production doc>] [--next]", file=sys.stderr)
+            print("usage: proposals_table.py [--production <production name>] [--next]", file=sys.stderr)
             return 2
     if one:
         print(next_proposal(doc.expanduser().resolve()))

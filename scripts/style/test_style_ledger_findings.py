@@ -2212,13 +2212,13 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         _ = path.write_bytes(original)
         blob = self.blob(partial)
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [partial, partial + "#uncovered"])
         _ = path.write_text(path.read_text() + "Changed after ticket creation\n")
 
         with style_ledger.open_ledger(self.repo) as ledger:
             # A repeated add must preserve the old ticket, including its pinned bytes.
-            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [partial, partial + "#uncovered"])
             texts = ledger.pinned_rule_texts("1")
 

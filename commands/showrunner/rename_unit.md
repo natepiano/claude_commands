@@ -8,7 +8,7 @@ argument-hint: "<old> <new>"
 Run the command from the owning showrunner session:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/production/rename_unit.py <plan|apply|verify> <slug> <old> <new>
+~/.claude/scripts/lib/py ~/.claude/scripts/production/rename_unit.py <plan|apply|verify> <showrunner name> <old> <new>
 ```
 
 The command reads the unit from its staff row.

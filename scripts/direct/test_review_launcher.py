@@ -29,6 +29,7 @@ from scripts.direct.wait_for_test_state import wait_until
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
 
+
     @override
     def environment(self) -> dict[str, str]:
         environment = super().environment()
@@ -41,11 +42,11 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         with isolated_staff_file(self.root / "staff.json", {}):
             owner = staff.local_snapshot().by_member_reference(self.staff_parent)
             assert owner is not None
-            _ = staff.rename(owner.id, "alpha-unit")
+            _ = staff.rename(owner.id, "alpha")
         _ = (self.working_dir / "fast-fix.txt").write_text(f"already pushed fast fix {name}\n")
         for arguments in (["add", "fast-fix.txt"],
                           ["-c", "user.name=Review Test", "-c", "user.email=review@example.invalid",
-                           "commit", "-m", "fast-track(alpha-unit): repair the sample"]):
+                           "commit", "-m", "fast-track(alpha): repair the sample"]):
             _ = subprocess.run(["git", *arguments], cwd=self.working_dir, check=True, capture_output=True,
                                timeout=TEST_HANG_GUARD_SECS)
         tip = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.working_dir,
@@ -53,7 +54,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         environment = self.environment()
         directory = Path(environment["FAST_TRACK_STATE_DIR"])
         directory.mkdir(exist_ok=True)
-        row = {"unit": "alpha-unit", "commit": tip, "why": "repair the sample",
+        row = {"unit": "alpha", "commit": tip, "why": "repair the sample",
                "patch_sha256": hashlib.sha256(b"sample fix").hexdigest(),
                "time": "2026-10-31T12:00:00+00:00", "review": "pending"}
         _ = (directory / "records.jsonl").write_text(json.dumps(row) + "\n")
@@ -167,7 +168,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         interpreter = binaries / "python3"
         calls = self.root / "python-calls"
         _ = interpreter.write_text(
-            '#!/bin/bash\nprintf "%s\\n" "$2" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
         )
         interpreter.chmod(0o755)
         environment = self.environment()
@@ -181,7 +182,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         commands = calls.read_text().splitlines()
         self.assertEqual(len(commands), 3)
         self.assertIn("sys.version_info", commands[0])
-        self.assertEqual(commands[1:], ["print('ready')"] * 2)
+        self.assertEqual(commands[1:], ["-P -c print('ready')"] * 2)
         self.assertEqual((self.root / "cold-cache" / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
     def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:

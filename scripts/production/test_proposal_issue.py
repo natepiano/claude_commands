@@ -9,7 +9,6 @@ import io
 import threading
 import time
 import os
-import sys
 import tempfile
 import unittest
 from collections.abc import Generator
@@ -18,9 +17,7 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.production import proposal_issue
 from scripts.production.issues import Issue
@@ -73,7 +70,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime)}))
         members: tuple[tuple[str, staff.Kind], ...] = (
             ("hana", "showrunner"), ("build-report", "unit"), ("u", "unit"),
-            ("names-unit", "unit"), ("style", "showrunner"), ("sample-style", "showrunner"))
+            ("names", "unit"), ("style", "showrunner"), ("sample-style", "showrunner"))
         rows = tuple(staff.StaffRow(staff.StaffId(fixture_runtime_id(name)), kind,
                                     unit_names.name(name) if kind == "unit" else name,
                                     staff.ReportsTo(staff.StaffId(fixture_runtime_id("hana"))) if kind == "unit" else staff.StaffRoot(),
@@ -84,7 +81,7 @@ class ProposalIssueTests(unittest.TestCase):
 
     def test_unit_staff_reference_accepts_the_short_name_and_unit_id(self) -> None:
         row = next(member for member in staff.snapshot().rows if member.name == "names")
-        for reference in ("names-unit", "names", row.id):
+        for reference in ("names", "names", row.id):
             with self.subTest(reference=reference):
                 self.assertEqual(proposal_issue.staff_reference(reference, "unit"), row)
         with self.assertRaises(proposal_issue.Refusal):
@@ -92,7 +89,7 @@ class ProposalIssueTests(unittest.TestCase):
 
     def test_proposal_unit_reads_the_unit_id_from_staff(self) -> None:
         row = next(member for member in staff.snapshot().rows if member.name == "names")
-        self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {"unit": [row.id]})), "names-unit")
+        self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {"unit": [row.id]})), "names")
         self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {})), "")
 
     def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
@@ -179,7 +176,7 @@ class ProposalIssueTests(unittest.TestCase):
                 folder.mkdir()
                 issue = folder / "proposal.md"
                 original = (f'---\n{area}date_modified: "[[2000-01-01]]"\nstatus: {status}\n'
-                            + 'unit: "names-unit"\nplan: "unit.md"\n' + metadata
+                            + 'unit: "names"\nplan: "unit.md"\n' + metadata
                             + 'tags: ["issue", "proposal", "style"]\n---\nUser notes stay.\n')
                 _ = issue.write_text(original)
                 code, out, err = self.run_cli("area-style", str(folder))
@@ -317,7 +314,7 @@ class ProposalIssueTests(unittest.TestCase):
         issue = self.root / "decision.md"
         original = (b'---\r\nstyle_rule: "global:rust/names.md"\r\nstyle_crate: "alpha"\r\n'
                     b'style_rule_blob: "abc"\r\nproposal_id: "P47"\r\nstyle_count: "9"\r\n'
-                    b'unit: "names-unit"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
+                    b'unit: "names"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
         link = os.link
         stamps: list[int] = []
 
@@ -368,7 +365,7 @@ class ProposalIssueTests(unittest.TestCase):
         issue = self.root / "decision.md"
         original = (b'---\r\nstyle_rule: "global:rust/names.md"\r\nstyle_crate: "alpha"\r\n'
                     b'style_rule_blob: "abc"\r\nproposal_id: "P47"\r\nstyle_count: "9"\r\n'
-                    b'unit: "names-unit"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
+                    b'unit: "names"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
 
         @contextlib.contextmanager
         def competing_create(folder: Path) -> Generator[None]:
@@ -449,13 +446,13 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(issue.read_bytes(), original)
 
     def test_refresh_updates_generated_examples_and_count_preserving_answer_and_notes(self) -> None:
-        original = ISSUE.replace("---\n# body", 'unit: "names-unit"\nstyle_count: "1"\n---\n# body')
+        original = ISSUE.replace("---\n# body", 'unit: "names"\nstyle_count: "1"\n---\n# body')
         original += "\n" + proposal_issue.decision_body("# Old examples\n") + "\nUser notes stay.\n"
         _ = self.issue.write_text(original)
         body = "# New examples\nFindings: 4\n"
         today = datetime.now(user_zone()).date()
         self.assertIn("body", proposal_issue.refresh_decision(self.issue, 4, body, "ranking", today))
-        self.assertIn('unit: "names-unit"', self.text())
+        self.assertIn('unit: "names"', self.text())
         self.assertIn('style_count: "4"', self.text())
         self.assertIn("# body\n\nstatus: open stays in the body", self.text())
         self.assertIn("User notes stay.", self.text())
@@ -466,7 +463,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(self.issue.stat().st_mtime_ns, stamp)
 
     def test_reopen_removes_every_close_field_and_keeps_the_answer(self) -> None:
-        _ = proposal_issue.edit(self.issue, {"unit": "names-unit", "plan": "unit.md", "stage": "active"}, date(2026, 10, 15))
+        _ = proposal_issue.edit(self.issue, {"unit": "names", "plan": "unit.md", "stage": "active"}, date(2026, 10, 15))
         from scripts.production.issues import frontmatter
         def fields() -> dict[str, list[str]]:
             return {key: value for key, value in frontmatter(self.issue).items() if key != "date_modified"}
@@ -486,7 +483,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.decision_issue()
         today = datetime.now(user_zone()).date()
         original = proposal_issue.write_issue
-        approval = threading.Thread(target=proposal_issue.edit, args=(self.issue, {"unit": "names-unit", "plan": "p"}, today))
+        approval = threading.Thread(target=proposal_issue.edit, args=(self.issue, {"unit": "names", "plan": "p"}, today))
         def write_after_the_approval_starts(path: Path, text: str) -> None:
             if not approval.is_alive() and "# New examples" in text:
                 approval.start()
@@ -495,7 +492,7 @@ class ProposalIssueTests(unittest.TestCase):
         with mock.patch.object(proposal_issue, "write_issue", side_effect=write_after_the_approval_starts):
             _ = proposal_issue.refresh_decision(self.issue, 2, "# New examples\n", "effort two", today)
             approval.join()
-        self.assertIn('unit: "names-unit"', self.text())
+        self.assertIn('unit: "names"', self.text())
         self.assertIn("# New examples", self.text())
         self.assertIn('style_count: "2"', self.text())
 
@@ -507,7 +504,7 @@ class ProposalIssueTests(unittest.TestCase):
         def approved_at_backlog() -> None:
             self.decision_issue()
             _ = self.issue.write_text(self.text().replace("tags:\n- issue\n- proposal\n", "tags: [issue, proposal]\n"))
-            _ = proposal_issue.edit(self.issue, {"unit": "names-unit", "plan": "unit.md"}, date(2026, 10, 15))
+            _ = proposal_issue.edit(self.issue, {"unit": "names", "plan": "unit.md"}, date(2026, 10, 15))
         def approved_by_showrunner() -> None:
             approved_at_backlog()
             _ = proposal_issue.edit(self.issue, {"approved_by": "showrunner", "approved_in": fixture_runtime_id("hana")}, date(2026, 10, 15))
@@ -574,7 +571,7 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertIn(message, error)
                 self.assertFalse(issue.exists())
-        self.assertEqual(self.run_cli(*arguments, '{"unit": "names-unit"}')[0], 0)
+        self.assertEqual(self.run_cli(*arguments, '{"unit": "names"}')[0], 0)
         from scripts.production.issues import frontmatter
         self.assertEqual(proposal_issue.staff_name(frontmatter(issue)["unit"][0]), "names")
         self.assertNotIn("plan", frontmatter(issue))
@@ -585,7 +582,7 @@ class ProposalIssueTests(unittest.TestCase):
         body = self.root / "body.md"
         _ = body.write_text("# Examples\n")
         from scripts.production.issues import frontmatter
-        for name, fields, stage in (("approved", '{"unit": "names-unit", "stage": "backlog"}', "active"),
+        for name, fields, stage in (("approved", '{"unit": "names", "stage": "backlog"}', "active"),
                                     ("unanswered", '{"stage": "backlog"}', "backlog"),
                                     ("waiting", '{"stage": "waiting"}', "waiting"),
                                     ("no fields", "{}", "backlog")):
@@ -718,7 +715,7 @@ class ProposalIssueTests(unittest.TestCase):
 
     def test_reopen_of_an_approved_proposal_closed_at_backlog_puts_it_in_progress(self) -> None:
         from scripts.production.issues import frontmatter
-        for name, fields, stage, changed in (("approved", {"unit": "names-unit", "plan": "unit.md"}, "active",
+        for name, fields, stage, changed in (("approved", {"unit": "names", "plan": "unit.md"}, "active",
                                               "reason, status, stage, date_modified"),
                                              ("unanswered", {}, "backlog", "reason, status, date_modified")):
             with self.subTest(name=name):
@@ -739,7 +736,7 @@ class ProposalIssueTests(unittest.TestCase):
 
     def test_proposal_progress_reads_an_approval_or_an_active_stage_as_in_progress(self) -> None:
         from scripts.production.issues import Issue
-        approval = {"unit": ["names-unit"], "plan": ["unit.md"]}
+        approval = {"unit": ["names"], "plan": ["unit.md"]}
         for name, fields, expected in (
                 ("approved at backlog", {**approval, "stage": ["backlog"]}, proposal_issue.InProgress()),
                 ("approved at waiting", {**approval, "stage": ["waiting"]}, proposal_issue.InProgress()),
@@ -755,7 +752,7 @@ class ProposalIssueTests(unittest.TestCase):
         """One folder of issues: one open approved proposal at backlog, and each kind move-approved leaves alone."""
         folder = self.root / "issues"
         folder.mkdir()
-        approval = 'plan: "unit.md"\nunit: "names-unit"\n'
+        approval = 'plan: "unit.md"\nunit: "names"\n'
         for name, answer, stage, status, tags in (
                 ("approved", approval, "backlog", "open", "[issue, proposal]"),
                 ("unanswered", 'plan: ""\n', "backlog", "open", "[issue, proposal]"),
@@ -799,7 +796,7 @@ class ProposalIssueTests(unittest.TestCase):
     def test_move_approved_dry_run_refuses_the_files_the_real_run_refuses_and_both_go_on(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
-        approved = (ISSUE.replace('plan: ""\n', 'plan: "unit.md"\nunit: "names-unit"\n')
+        approved = (ISSUE.replace('plan: ""\n', 'plan: "unit.md"\nunit: "names"\n')
                     .replace("tags:\n- issue\n- proposal\n", "tags: [issue, proposal]\n"))
         for name, text in (("a-good", approved), ("b-bad", approved.replace("---\n", "--- \n", 1)), ("c-good", approved)):
             _ = (folder / f"{name}.md").write_text(text, encoding="utf-8")

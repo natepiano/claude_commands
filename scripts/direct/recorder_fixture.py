@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lib.process_group import send_process_group
 from scripts.lib import test_hang_guard
@@ -12,7 +12,6 @@ from pathlib import Path
 import os
 import signal
 import shutil
-import sys
 import subprocess
 import tempfile
 import unittest
@@ -35,7 +34,7 @@ def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
     import json
     with isolated_staff_file(root / "staff.json", environment):
         owner = fixture_member("showrunner", name="wait-owner")
-        parent = fixture_member("unit", name="wait-unit", parent=owner.id,
+        parent = fixture_member("unit", name="wait", parent=owner.id,
                                 runtime_id=fixture_runtime_id("fixture-director"),
                                 worktree=staff.PresentWorktree("natedev", root))
         roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
@@ -186,9 +185,7 @@ def launcher_environment(root: Path) -> dict[str, str]:
                        TEST_LEGACY_LAUNCH="1", MODELS_CONFIG_FILE=str(root / ".claude/config/models.conf"),
                        UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
-    cache = root / "cache/claude" / cache_file_name()
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    _ = cache.write_text(sys.executable + "\n")
+    seed_interpreter_cache(root / "cache")
     for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
         _ = environment.pop(name, None)
     return environment

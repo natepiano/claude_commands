@@ -119,9 +119,10 @@ def registered_copy(envrc: Path) -> bool:
         folder = envrc.parent.resolve(strict=True)
         from scripts.lib import copy_record
 
-        if envrc.name != ".envrc" or copy_record.copy_folder(folder) != folder:
+        record_path = copy_record.record_path(folder)
+        if envrc.name != ".envrc" or record_path is None:
             return False
-        record = copy_record.read_record(folder / copy_record.RECORD)
+        record = copy_record.read_record(record_path)
         if not isinstance(record, copy_record.Registered):
             return False
         source_path = record.fields.get("source_path")

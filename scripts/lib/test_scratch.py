@@ -55,9 +55,9 @@ class ScratchTests(unittest.TestCase):
             return self.base / "registered-plans" / f"{unit}.md"
 
         _ = self.enterContext(mock.patch.object(scratch, "registered_plan", side_effect=registered_plan))
-        _ = self.unit_plan("maker-unit", "### Phase 21 — Make a copy · status: todo\n")
+        _ = self.unit_plan("maker", "### Phase 21 — Make a copy · status: todo\n")
         _ = self.unit_plan("next-unit", "### Phase 22 — Use a copy · status: todo\n")
-        _ = self.unit_plan("builds-unit", "### Phase 7 — Check a build · status: todo\n")
+        _ = self.unit_plan("builds", "### Phase 7 — Check a build · status: todo\n")
 
     def unit_plan(self, unit: str, text: str) -> Path:
         plan = self.base / "registered-plans" / f"{unit}.md"
@@ -80,7 +80,7 @@ class ScratchTests(unittest.TestCase):
         return path
 
     def register(self, path: Path, task: str, **details: str) -> None:
-        scratch.register_copy(path, task=task, owner_unit="maker-unit", source_path=str(path),
+        scratch.register_copy(path, task=task, owner_unit="maker", source_path=str(path),
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="none",
                               seed_source="", borrows_from="", **details)
 
@@ -191,7 +191,7 @@ class ScratchTests(unittest.TestCase):
                                        {"source.txt": "style source\n"})
         started = time.time()
         with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
-            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style", seed.checkout, "HEAD") as checkout:
                 target = checkout / "target"
             # Supply build output, but let copies supply every cache marker.
             fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
@@ -254,7 +254,7 @@ def load(name, *args, **kwargs):
 builtins.__import__ = load
 print(scratch.target('gate:proof', 'tree', False))
 """
-        result = subprocess.run([sys.executable, "-c", probe], text=True, capture_output=True, timeout=10)
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", probe], text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(result.stdout.strip()).parent, copy_record.root())
         self.assertRegex(Path(result.stdout.strip()).name, r"^gate-proof-tree-[a-z0-9]{6}$")
@@ -290,7 +290,7 @@ print(scratch.target('gate:proof', 'tree', False))
     def test_copy_record_is_atomic_and_excludes_only_its_two_metadata_files(self) -> None:
         path = self.copy()
         self.git(path, "init", "-q")
-        scratch.register_copy(path, task="gate:copy", owner_unit="maker-unit", source_path="/source",
+        scratch.register_copy(path, task="gate:copy", owner_unit="maker", source_path="/source",
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="seed",
                               seed_source="/seed", borrows_from="/source/.git", land_target="origin/builds")
         fields = cast(dict[str, object], json.loads((path / copy_record.RECORD).read_text()))
@@ -298,7 +298,7 @@ print(scratch.target('gate:proof', 'tree', False))
                          "seed_source", "borrows_from", "owner_unit", "task", "land_target")},
                          {"source_path": "/source", "source_commit": "a" * 40, "copy_commit": "b" * 40,
                           "target_mode": "seed", "seed_source": "/seed", "borrows_from": "/source/.git",
-                          "owner_unit": "maker-unit", "task": "gate:copy", "land_target": "origin/builds"})
+                          "owner_unit": "maker", "task": "gate:copy", "land_target": "origin/builds"})
         _ = (path / ".claude-busy").touch()
         self.assertIsNone(scratch.repo_problem(path))
         _ = (path / "ordinary").write_text("keep me")
@@ -315,25 +315,25 @@ print(scratch.target('gate:proof', 'tree', False))
         run = self.base / "run"
         run.mkdir()
         progress = run / "progress_history_state.json"
-        path = self.copy(task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
+        path = self.copy(task="phase:maker/21", run_dir=str(run), phase_id="21")
         for state in ({"phase": {"id": "21", "status": "active"}},
                       {"phase": {"id": "22", "status": "active"},
                        "open_phases": [{"id": "21", "status": "active"}]}):
             _ = progress.write_text(json.dumps(state))
             self.assertIsInstance(scratch.lifetime(path), scratch.Live)
-            self.assertEqual(scratch.end("phase:maker-unit/21"), [])
+            self.assertEqual(scratch.end("phase:maker/21"), [])
         _ = progress.write_text("bad")
         unknown = scratch.lifetime(path)
         self.assertIsInstance(unknown, scratch.Unknown)
-        self.assertEqual(scratch.end("phase:maker-unit/21"), [])
+        self.assertEqual(scratch.end("phase:maker/21"), [])
         _ = progress.write_text(json.dumps({"phase": {"id": "21", "status": "finished"}}))
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
-        self.assertEqual(scratch.end("phase:maker-unit/21"), [path])
+        self.assertEqual(scratch.end("phase:maker/21"), [path])
 
     def test_an_existing_unknown_phase_task_can_update_and_end(self) -> None:
         path = self.base / "scratch" / "legacy-phase"
         path.mkdir(parents=True)
-        task = "phase:maker-unit/ci-icon"
+        task = "phase:maker/ci-icon"
         scratch.write_record(path, task, 100.0)
 
         scratch.renew(path, now=200.0)
@@ -355,11 +355,11 @@ print(scratch.target('gate:proof', 'tree', False))
                 _ = (loose / "work").write_text("keep this work")
                 with self.assertRaises(scratch.ScratchError) as refusal:
                     if operation == "new":
-                        _ = scratch.new("phase:maker-unit/ci-icon")
+                        _ = scratch.new("phase:maker/ci-icon")
                     elif operation == "adopt":
-                        _ = scratch.adopt(loose, "phase:maker-unit/ci-icon")
+                        _ = scratch.adopt(loose, "phase:maker/ci-icon")
                     else:
-                        scratch.hand_over(path, "maker-unit", "phase:maker-unit/ci-icon")
+                        scratch.hand_over(path, "maker", "phase:maker/ci-icon")
                 message = str(refusal.exception)
                 for form in ("ci-icon", "phase", "gate:<id>", "--until <when>"):
                     self.assertIn(form, message)
@@ -368,7 +368,7 @@ print(scratch.target('gate:proof', 'tree', False))
                 self.assertFalse((self.base / "scratch").exists())
 
     def test_real_phase_ids_come_from_the_registered_plan(self) -> None:
-        _ = self.unit_plan("maker-unit", (
+        _ = self.unit_plan("maker", (
             "### Phase 21 — Finished work (abcdef12)\n\n"
             "### Phase 21 Review\n\n"
             "### Phase 22a — Split work · status: todo\n"))
@@ -380,7 +380,7 @@ print(scratch.target('gate:proof', 'tree', False))
         self.addCleanup(os.chdir, old_cwd)
         for phase in ("21", "22a"):
             with self.subTest(phase=phase):
-                task = f"phase:maker-unit/{phase}"
+                task = f"phase:maker/{phase}"
                 path = scratch.new(task)
                 self.assertTrue(path.is_dir())
                 record = scratch.task_of(path)
@@ -388,13 +388,13 @@ print(scratch.target('gate:proof', 'tree', False))
                 self.assertEqual(record.task, task)
                 self.assertEqual(record.fields["phase_id"], phase)
         with self.assertRaises(scratch.ScratchError):
-            _ = scratch.new("phase:maker-unit/99")
+            _ = scratch.new("phase:maker/99")
 
     def test_phase_creation_without_a_readable_registered_plan_names_the_cause(self) -> None:
-        plan = self.unit_plan("maker-unit", "### Phase 21 — Work · status: todo\n")
+        plan = self.unit_plan("maker", "### Phase 21 — Work · status: todo\n")
         for cause in ("unknown unit", "missing plan", "invalid encoding"):
             with self.subTest(cause=cause):
-                unit = "unregistered-unit" if cause == "unknown unit" else "maker-unit"
+                unit = "unregistered" if cause == "unknown unit" else "maker"
                 if cause == "missing plan":
                     plan.unlink()
                 elif cause == "invalid encoding":
@@ -412,7 +412,7 @@ print(scratch.target('gate:proof', 'tree', False))
         path = self.copy()
         program = ("import os,sys; from pathlib import Path; from scripts.lib import scratch; "
                    "os.replace=lambda *args: os._exit(71); scratch.hand_over(Path(sys.argv[1]), 'next-unit', 'gate:next-unit')")
-        stopped = subprocess.run([sys.executable, "-c", program, str(path)], check=False, capture_output=True)
+        stopped = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, str(path)], check=False, capture_output=True)
         self.assertEqual(stopped.returncode, 71, stopped.stderr)
         scratch.hand_over(path, "next-unit", "gate:next-unit")
         record = scratch.task_of(path)
@@ -423,7 +423,7 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertIsNone(scratch.repo_problem(path))
 
     def test_landed_lifetime_requires_target_ancestry_and_saved_work(self) -> None:
-        path = self.copy(task="landed:maker-unit/work", land_target="origin/main")
+        path = self.copy(task="landed:maker/work", land_target="origin/main")
         self.git(path, "init", "-q")
         self.git(path, "commit", "-qm", "base", "--allow-empty")
         self.git(path, "remote", "add", "origin", str(self.base / "origin"))
@@ -442,13 +442,13 @@ print(scratch.target('gate:proof', 'tree', False))
         run = self.base / "run"
         run.mkdir()
         progress = run / "progress_history_state.json"
-        path = self.copy(task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
+        path = self.copy(task="phase:maker/21", run_dir=str(run), phase_id="21")
         _ = progress.write_text(json.dumps({"phase": {"id": "21", "status": "finished"}}))
         with mock.patch.object(scratch, "remove", side_effect=OSError("injected removal stop")):
             with self.assertRaises(OSError):
-                _ = scratch.end("phase:maker-unit/21")
+                _ = scratch.end("phase:maker/21")
         _ = progress.write_text(json.dumps({"phase": {"id": "22", "status": "active"}, "open_phases": []}))
-        self.assertEqual(scratch.end("phase:maker-unit/21"), [path])
+        self.assertEqual(scratch.end("phase:maker/21"), [path])
 
     def test_hand_over_keeps_parent_path_and_child_alternates_then_child_goes_first(self) -> None:
         parent = self.copy("parent")
@@ -456,7 +456,7 @@ print(scratch.target('gate:proof', 'tree', False))
         self.git(parent, "commit", "-qm", "base", "--allow-empty")
         child = parent.parent / "child"
         self.git(parent, "clone", "--shared", str(parent), str(child))
-        scratch.register_copy(child, task="gate:child", owner_unit="child-unit", source_path=str(parent),
+        scratch.register_copy(child, task="gate:child", owner_unit="child", source_path=str(parent),
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="none",
                               seed_source="", borrows_from=str(parent / ".git"))
         alternate = child / ".git/objects/info/alternates"
@@ -535,7 +535,7 @@ print(scratch.target('gate:proof', 'tree', False))
         with mock.patch.dict(os.environ, {copy_record.COPIES_ENV: str(alias)}):
             linked = alias / "show-maker" / "a"
             self.assertEqual(copy_record.copy_folder(linked), path)
-            scratch.register_copy(linked, task="gate:copy", owner_unit="maker-unit", source_path=str(self.base),
+            scratch.register_copy(linked, task="gate:copy", owner_unit="maker", source_path=str(self.base),
                                   source_commit="a", copy_commit="b", target_mode="none", seed_source="", borrows_from="")
             with scratch.copy_lock(linked), scratch.busy_path(path).open("r") as probe:
                 with self.assertRaises(BlockingIOError):
@@ -580,7 +580,7 @@ print(scratch.target('gate:proof', 'tree', False))
         run = self.base / "run"
         run.mkdir()
         _ = (run / "progress_history_state.json").write_text(json.dumps({"phase": {"id": "21", "status": "active"}}))
-        phase = self.copy("phase", task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
+        phase = self.copy("phase", task="phase:maker/21", run_dir=str(run), phase_id="21")
         parent = self.copy("parent", task="until:2000-01-01T0000Z")
         child = self.copy("child")
         record = scratch.task_of(child)
@@ -619,7 +619,7 @@ print(scratch.target('gate:proof', 'tree', False))
     def test_all_recorder_terminal_states_end_a_phase(self) -> None:
         run = self.base / "run"
         run.mkdir()
-        path = self.copy(task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
+        path = self.copy(task="phase:maker/21", run_dir=str(run), phase_id="21")
         for status in ("completed", "stopped", "error"):
             with self.subTest(status=status):
                 _ = (run / "progress_history_state.json").write_text(json.dumps(
@@ -634,7 +634,7 @@ print(scratch.target('gate:proof', 'tree', False))
         self.git(source, "update-ref", "refs/remotes/origin/main", "HEAD")
         self.git(source, "commit", "--allow-empty", "-qm", "work")
         self.git(source, "update-ref", "refs/remotes/origin/work", "HEAD")
-        path = self.copy(task="landed:maker-unit/work", land_target="origin/main")
+        path = self.copy(task="landed:maker/work", land_target="origin/main")
         record = scratch.task_of(path)
         assert isinstance(record, copy_record.Registered)
         scratch.atomic_record(path / copy_record.RECORD, {**record.fields, "source_path": str(source)})
@@ -843,7 +843,7 @@ print(scratch.target('gate:proof', 'tree', False))
         for run, phase, status in ((old_run, "21", "completed"), (new_run, "22", "active")):
             _ = (run / "progress_history_state.json").write_text(json.dumps(
                 {"phase": {"id": phase, "status": status}}))
-        path = self.copy(task="phase:maker-unit/21", run_dir=str(old_run), phase_id="21", land_target="origin/old")
+        path = self.copy(task="phase:maker/21", run_dir=str(old_run), phase_id="21", land_target="origin/old")
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
         scratch.hand_over(path, "next-unit", "phase:next-unit/22")
         self.assertIsInstance(scratch.lifetime(path), scratch.Unknown)
@@ -853,7 +853,7 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertEqual(record.fields["run_dir"], str(new_run))
         self.assertEqual(record.fields["phase_id"], "22")
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
-        self.assertEqual(scratch.end("phase:maker-unit/21"), [])
+        self.assertEqual(scratch.end("phase:maker/21"), [])
         scratch.hand_over(path, "next-unit", "gate:next")
         record = scratch.task_of(path)
         assert isinstance(record, copy_record.Registered)
@@ -962,7 +962,7 @@ print(scratch.target('gate:proof', 'tree', False))
 
     def test_end_removes_only_the_tasks_folders(self) -> None:
         mine = [scratch.new(ROW, "demo", visible=True), scratch.new(ROW, "copy")]
-        other = scratch.new("phase:builds-unit/7")
+        other = scratch.new("phase:builds/7")
         loose = self.base / "scratch" / "loose"
         loose.mkdir()
         self.assertEqual(sorted(scratch.end(ROW)), sorted(mine))

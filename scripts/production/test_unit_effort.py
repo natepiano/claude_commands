@@ -94,9 +94,9 @@ class UnitEffortTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
         _ = self.enterContext(fake_unit_host.private_process_registry())
         units = [
-            labeled_host("review", "w1:p1", "review", slug="build-followups", screen=EMPTY),
-            labeled_host("widget", "w2:p1", "widget", slug="tool-based-ui", screen=screen("❯ my draft")),
-            labeled_host("trunk", "w3:p1", "trunk", slug="tool-based-ui", screen=screen("❯ \x1b[2mtry this\x1b[22m")),
+            labeled_host("review", "w1:p1", "review", production_name="build-followups", screen=EMPTY),
+            labeled_host("widget", "w2:p1", "widget", production_name="tool-based-ui", screen=screen("❯ my draft")),
+            labeled_host("trunk", "w3:p1", "trunk", production_name="tool-based-ui", screen=screen("❯ \x1b[2mtry this\x1b[22m")),
             HostedUnit("notes", "w4:p1", {}, EMPTY),
         ]
         identities = {unit.session: unit.marks["CODEX_THREAD_ID"] for unit in units

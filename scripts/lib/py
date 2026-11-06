@@ -3,6 +3,39 @@
 # Set the package root without another process or a working directory change.
 set -uo pipefail
 
+shim="${BASH_SOURCE[0]}"
+[[ "$shim" == /* ]] || shim="$PWD/$shim"
+# Normalize parent segments without a process or a directory change.
+IFS=/ read -r -a shim_parts <<< "$shim"
+shim=""
+for part in "${shim_parts[@]}"; do
+    case "$part" in
+        ''|.) ;;
+        ..) shim="${shim%/*}" ;;
+        *) shim="$shim/$part" ;;
+    esac
+done
+root="${shim%/*/*/*}"
+
+# Inline programs import from this install before inherited Python paths.
+option_value=0
+for argument in "$@"; do
+    if (( option_value )); then
+        option_value=0
+        continue
+    fi
+    case "$argument" in
+        -|-c*|-m*)
+            export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+            set -- -P "$@"
+            break ;;
+        -W|-X|--check-hash-based-pycs) option_value=1 ;;
+        --) break ;;
+        -*) ;;
+        *) break ;;
+    esac
+done
+
 NEED_MAJOR=3
 NEED_MINOR=12
 

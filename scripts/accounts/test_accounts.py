@@ -315,7 +315,7 @@ class AccountsTests(unittest.TestCase):
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
         _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
-            showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="America/Los_Angeles", doc=""),
+            showrunners.Showrunner(session="fixture", socket="", name="fixture", zone="America/Los_Angeles", doc=""),
         ]))
 
     def live_report(self, config_dir: Path) -> agent_accounts.Report:
@@ -867,7 +867,48 @@ class AccountsTests(unittest.TestCase):
                 machines = document["accounts"][0]["role_counts_by_machine"]
                 self.assertEqual(machines[peer]["units"], count)
                 self.assertEqual(machines[here]["units"], {"busy": 1, "shell": 1, "idle": 2, "total": 4})
-                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 1, "shell": 1, "idle": 2, "total": 4}])
+                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 4, "shell": 3, "idle": 3, "total": 10}])
+                self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(4, 3, 3),))
+                self.assertIn("units 10 (busy 4, shell 3, idle 3)", accounts.render_status_table(
+                    accounts.StatusReading(rows, (), (), timezone.utc, now)))
+
+    def test_combined_role_counts_preserve_role_order_and_codex_has_no_shell(self) -> None:
+        now = datetime.now(timezone.utc)
+        row = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex",
+            roles=("workers", "units"), role_counts=(accounts.RoleSessionCounts(1, accounts.UnknownShellCount(), 2),))
+        peer = remote.other_machine()
+        _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {
+            "codex1": {"units": {"busy": 2, "shell": None, "idle": 1, "total": 3},
+                       "workers": {"busy": 3, "shell": None, "idle": 4, "total": 7}}}}))
+        rows, problems = machine_role_counts((row,), now)
+        reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertEqual(document["accounts"][0]["roles"], ["workers", "units"])
+        self.assertEqual(document["accounts"][0]["role_counts"], [
+            {"busy": 4, "shell": None, "idle": 6, "total": 10},
+            {"busy": 2, "shell": None, "idle": 1, "total": 3}])
+        table = accounts.render_status_table(reading)
+        self.assertIn("workers 10 (busy 4, idle 6)", table)
+        self.assertIn("units 3 (busy 2, idle 1)", table)
+        self.assertNotIn("shell", table)
+
+    def test_unreported_roles_have_zero_counts_and_spare_has_no_count(self) -> None:
+        now = datetime.now(timezone.utc)
+        peer = remote.other_machine()
+        _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {}}))
+        for tool in ("claude", "codex"):
+            for role in ("units", "spare"):
+                with self.subTest(tool=tool, role=role):
+                    row = replace(SharedStatusDocumentTests().row(), tool=tool, roles=(role,), role_counts=())
+                    rows, problems = machine_role_counts((row,), now)
+                    reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
+                    document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                    expected = None if role == "spare" else {
+                        "busy": 0, "shell": 0 if tool == "claude" else None, "idle": 0, "total": 0}
+                    self.assertEqual(document["accounts"][0]["role_counts"], [expected])
+                    text = "spare" if role == "spare" else (
+                        "units 0 (busy 0, shell 0, idle 0)" if tool == "claude" else "units 0 (busy 0, idle 0)")
+                    self.assertIn(text, accounts.render_status_table(reading))
 
     def test_session_counts_use_aliases_when_hostnames_differ(self) -> None:
         now = datetime.now(timezone.utc)
@@ -1977,11 +2018,11 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "other@example.invalid")
         inventory = import_module("scripts.shutdown.inventory")
-        stale = showrunners.Showrunner(session="", socket="", slug="missing", zone="America/New_York",
+        stale = showrunners.Showrunner(session="", socket="", name="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
               patch.object(inventory, "showrunner_registrations", return_value=ShowrunnerRegistrations((
-                  ShowrunnerRegistration("missing", stale["slug"], stale["doc"]),))),
+                  ShowrunnerRegistration("missing", stale["name"], stale["doc"]),))),
               patch.object(accounts, "move_sessions") as moved):
             code, output, error = self.run_cli("move", "showrunners", "claude3", "--dry-run")
         self.assertEqual((code, error), (0, ""))
@@ -1990,7 +2031,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("missing: no session runs under the id", output)
         self.assertIn("in any Claude session on", output)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", output)
-        self.assertIn("--production /w/missing-production.md", output)
+        self.assertIn("--production missing", output)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
         moved.assert_not_called()
@@ -2001,22 +2042,22 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "other@example.invalid")
         inventory = import_module("scripts.shutdown.inventory")
-        stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
-                                       doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
+        stale = [showrunners.Showrunner(session="", socket="", name=name, zone="America/New_York",
+                                       doc=f"/w/doc-{name}-production.md") for name in ("first", "second")]
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
               patch.object(inventory, "showrunner_registrations", return_value=ShowrunnerRegistrations(tuple(
-                  ShowrunnerRegistration(runner["slug"], runner["slug"], runner["doc"]) for runner in stale))),
+                  ShowrunnerRegistration(runner["name"], runner["name"], runner["doc"]) for runner in stale))),
               patch.object(accounts, "move_sessions") as moved):
             code, output, error = self.run_cli("move", "showrunners", "claude3")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         self.assertIn("showrunners: no live session moves", output)
         for runner in stale:
-            line = next(line for line in output.splitlines() if line.startswith(runner["slug"] + ":"))
+            line = next(line for line in output.splitlines() if line.startswith(runner["name"] + ":"))
             self.assertIn("no session runs under the id", line)
             self.assertIn("in any Claude session on", line)
             self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
-            self.assertIn(f"--production {runner['doc']}", line)
+            self.assertIn(f"--production {runner['name']}", line)
         moved.assert_not_called()
 
     def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
@@ -7561,18 +7602,6 @@ class PickerTests(unittest.TestCase):
         self.reading("Claude", "third@example.invalid", 0, 2)
         self.assert_picked("claude2", keep=accounts.KeepAccount("claude2"))
         self.assert_picked("claude1")
-
-    def test_claude_launch_with_room_prepares_the_selected_account_and_preserves_refusals(self) -> None:
-        selected = accounts.claude_account_with_room(self.now)
-        self.assertEqual(selected.label, "claude3")
-        self.assertEqual(selected.dir, accounts.account_dir("claude3"))
-        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("fixture account denied")):
-            with self.assertRaisesRegex(accounts.AccountsError, "fixture account denied"):
-                _ = accounts.claude_account_with_room(self.now)
-        for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
-            self.reading("Claude", login, 0, 2)
-        with self.assertRaisesRegex(accounts.AccountsError, "no claude account has room"):
-            _ = accounts.claude_account_with_room(self.now)
 
     def test_picker_prefers_soonest_weekly_reset_over_most_room(self) -> None:
         self.assert_picked("claude3")

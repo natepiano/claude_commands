@@ -3,15 +3,16 @@
 
 The separate asyncRewake Stop entry runs this hook in the background.
 Exit 2 sends the reason from stderr to the agent in a system-reminder.
-The wake starts a new request for compaction.
 The guards permit declared waits, background tasks, and stops without context measurements.
-The next Stop payload sets stop_hook_active, so the hook wakes once only.
+The hook repeats the wake above the threshold until compaction reduces the context.
+Paused status lines permit the stop without a wake.
 Exceptions permit the stop without output.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import cast
@@ -28,11 +29,10 @@ from direct_run import active_run
 
 REASON = """\
 /unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%).
-Compaction runs on the next request.
-Take the next workflow action.
+Compaction runs when the context reaches {trigger:,} tokens. It does not run while the session is idle.
+Take the next workflow action now. Do not wait for compaction.
 Read ~/.claude/commands/unit/direct.md after compaction.
-If you need a user decision, state it in one line and end the turn.
-This hook wakes once only."""
+If you need a user decision, state it in one line and end the turn."""
 
 
 class StopPayload(HookInput, total=False):
@@ -65,9 +65,6 @@ def main() -> None:
 
     if record_turn_wait(session_dir, session_id, final_message):
         return
-    # Already continuing because of a previous block -- let this one through.
-    if payload.get("stop_hook_active"):
-        return
     # Measure first: the window is clamped to the model's own context window, and
     # only the transcript names the model.
     measurement = measure(payload)
@@ -78,6 +75,15 @@ def main() -> None:
         return
     tokens = measurement["tokens"]
     if tokens < handoff_threshold(window):
+        return
+
+    from scripts.production.stall_watch import watch_config
+
+    lines = final_message.strip().splitlines()
+    status = lines[-1].strip().removeprefix("— ") if lines else ""
+    if re.search(
+        watch_config(status_defaults=True)["paused_status_pattern"].strip(), status, re.IGNORECASE
+    ):
         return
 
     # Only live tasks reported by the CLI supply a later request. A worker's

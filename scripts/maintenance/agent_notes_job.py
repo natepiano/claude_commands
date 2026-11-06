@@ -163,6 +163,7 @@ def _perform(part: Part) -> int:
         relative = [str(Path(path).relative_to(vault)) for path in paths]
         if vault_commit.changed(str(vault), relative, patterns):
             from scripts.direct import phase_table
+            from scripts.production import staff
 
             phase_notes = vault / "showrunners"
             tracked_phases = vault_commit.git(str(vault), "ls-files", "-z", "--", "showrunners")
@@ -171,6 +172,7 @@ def _perform(part: Part) -> int:
                 vault / path for path in tracked_phases.stdout.split("\0")
                 if Path(path).suffix == ".md" and Path(path).parent.parent == Path("showrunners")
             )
+            record = staff.snapshot()
             for path in candidates:
                 content = vault_commit.read(str(path))
                 if isinstance(content, vault_commit.NoteAbsent):
@@ -178,7 +180,7 @@ def _perform(part: Part) -> int:
                     if shown.returncode != 0:
                         continue
                     content = vault_commit.NoteContent(shown.stdout)
-                if isinstance(phase_table.phase_note_ownership(content.text), phase_table.NoteOwnership):
+                if isinstance(phase_table.phase_note_ownership(content.text, record), phase_table.NoteOwnership):
                     paths.add(str(path))
         return vault_commit.main(["--job", "agent-notes", *[arg for pattern in timestamps for arg in ("--timestamp", pattern)], "--", *sorted(paths)])
     return 0

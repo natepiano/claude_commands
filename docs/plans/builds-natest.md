@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Record each `~/.claude` test run, test module and slow test in the build log, show their history at once with `/test_times`, and make the slowest test modules faster, from the top of a descending sort down.
 
-> **Production: builds** — unit `natest-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 
@@ -727,37 +726,85 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - A shell reader of config gives the same value and exit as `conf.py get`, or gives the read to `conf.py`.
 - `review.sh`, `implement.sh` and `mac_run.sh` source `conf.sh`; a change to it runs their tests.
 
-### Phase 31 — `test_verify_lint_judgment.py` runs in half its time  · status: todo
+### Phase 31 — `test_verify_lint_judgment.py` runs in half its time  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `test_compile_errors_and_unknown_101_repair_and_return_final_judgment` runs each of its 5 compile diagnostics once, with the final status alternating 0, 101, 0, 101, 0, so each diagnostic and each status stays checked. Test names and assertions are the same.
+- `test_verify_build_key.py` uses the fixture's one admission service lookup; the second lookup and its import are gone.
+- Same-load pairs (median of 3): 237.4 s -> 198.6 s wall, 180.9 -> 148.5 CPU s; `test_verify_build_key.py` 4.0 -> 3.9 s. The gate on this phase plus builds was green.
+- Floor: the production route takes 3.1 s per `verify.sh lint` run with no repair and 5.2 s with repair: Python starts for step-record writes (`verify.sh`) and admission clients (`scripts/lint/memory_gate.sh`), plus about 2.0 s of admission start spacing for each later run in one test. Half time (107.5 s) is under that floor. The repair decision has no callable home (`verify.sh:3711-3714`), so the status tables stay end-to-end runs.
+
+**Files:**
+- `scripts/direct/test_verify_lint_judgment.py` — the compile-error diagonal
+- `scripts/direct/test_verify_build_key.py` — one admission lookup
+
+**Binds later work:**
+- A verify or merge-gate fixture does not advance the admission clock by hand; queue-unit fixes the start spacing in `scripts/build_queue/admission_test_support.py`.
+
+**Ruled out:**
+- A manual `allow_next_start()` advance in the verify fixtures: a workaround for the spacing (showrunner ruling).
+
+### Phase 32 — `smoke_launch.sh` reads its settings with no process for each key  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/production/smoke_launch.sh` sources `scripts/lib/conf.sh` and reads its 9 settings with no Python start for each key. Each read keeps its key, order, variable name and exit. `user_zone.py` and `process_group.py` still start as before.
+- `conf.sh` gives a read it cannot answer to `conf.py` through the `py` launcher in the same folder, held in one global `_CONF_LIB` (`.` for a bare file name). `py` honors `CLAUDE_PYTHON` and finds Python 3.12 or newer.
+- `py_floor_test_support.seed_interpreter_cache(cache_home, interpreter=sys.executable)` writes the interpreter cache that `py` reads. `test_conf_sh.py` and 8 `scripts/direct` fixtures use it.
+- Settings read of one real smoke launch (median of 3): 0.770 s -> 0.076 s. `test_smoke_launch.py` same-load pairs: 1.1 s -> 1.1 s. The full gate on this phase plus builds was green.
+
+**Files:**
+- `scripts/production/smoke_launch.sh` — one `conf.sh` source for its 9 settings
+- `scripts/lib/conf.sh` — shell settings reader; fallback through `py`
+- `scripts/lib/py_floor_test_support.py` — `seed_interpreter_cache`
+- `scripts/lib/test_conf_sh.py` — fixture with a `bash` link and a seeded cache
+
+**Gotchas:**
+- A fixture whose PATH holds only a stub folder needs a `bash` link, because `py` starts with `#!/usr/bin/env bash`. Without a seeded cache, `py` runs the stub once more to check its version.
+
+**Ruled out:**
+- Starting `scripts/build_hold/cargo`, the BRP launch hook and `scripts/lint/lint` through `py` in this phase: outside its scope; a next item after the PYTHONPATH item.
+
+### Phase 33 — `test_fast_track.py` runs in half its time  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** `scripts/direct/test_verify_lint_judgment.py` (rank 3 at 210.4 s, 172.2 CPU s, 10 tests; the highest ranked module that no phase holds) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+**Goal:** `scripts/production/test_fast_track.py` (rank 4 in `test_times top` at 216.9 s median, 108.7 CPU s, 55 tests, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
 
-**Spec:** Follow the Speed method. verify-unit owns `verify.sh`, `scripts/lint/` and the verify test support files; no open verify phase holds this module or its support files (showrunner, 2026-11-05). Rank 1 `test_verify_mac_only.py` waits on verify's hang fix in `verify_mac_offload_test_support.py`; rank 2 `agents/test_codex_mesh.py` stays excluded.
+**Spec:** Follow the Speed method. The showrunner approved this phase (2026-11-05). No builds unit holds `test_fast_track.py` or `fast_track.py`. Claim the files with cargo-berth before the first edit; send any holder to the showrunner.
 
-1. Profile before any edit. Each `invoke_verify("lint", ...)` costs about 5.5-7 s; a test with one run costs about 3.6 s. Four tests hold 176 s of the 205 s: `test_compile_errors_and_unknown_101_repair_and_return_final_judgment` (10 subtests, 70.7 s), `test_first_judgment_nonlint_status_never_repairs` (11 subtests, 60.9 s), `test_fix_limit_is_read_from_config` (3 subtests, 25.5 s) and `test_lint_finding_repairs_formats_and_returns_final_judgment` (3 subtests, 19.4 s). For one `verify.sh lint` run in the fixture, name where the time goes: process starts, Python imports, config reads, admission or token waits, fixed sleeps, and the stub cargo. Check first whether a later run in one test waits on an admission spacing or a token the earlier run left, as in Phase 27. Write the result into this Spec and name the files and changes before the code step.
-   **Profile result (2026-11-05, load 28-58):** baseline 215.0 s wall, 160.7 CPU s, 33 `verify.sh lint` runs in 10 tests. The main cost is production process work in `verify.sh` and `scripts/lint/`: at least 36 Python starts for a no-repair run and 61 for a repair run. Step-record state writes (`verify.sh:356-358`, `verify.sh:1925-1934`) and admission client starts (`scripts/lint/memory_gate.sh:17-22`) hold most of it. A later run in one test waits about 2.0 s for admission start spacing (`recovery_start_seconds=5`); there is no token or hold wait and no fixed sleep. The route floor after a clock advance is 3.1 s with no repair and 5.2 s with repair, so half time (107.5 s) is under the floor of the production route.
-   **Code step:** the fixture does not advance the admission clock by hand. A manual `allow_next_start()` advance is a workaround (showrunner, 2026-11-05): queue-unit fixes the start spacing in the shared admission fixture, and this module is measured again after that fix. The fixture keeps one admission service lookup. `test_compile_errors_and_unknown_101_repair_and_return_final_judgment` runs each compile diagnostic once, with the final status alternating 0 and 101, so each diagnostic and each status stays checked. The repair decision has no callable home (`verify.sh:3711-3714`), so Spec step 4 does not apply. Three production proposals went to their owners: step-record state reuse (verify), a lighter admission client start (queue) and a callable repair decision (verify).
+1. Profile before any edit. Phase 7 took this module from 304 s to 193 s (load 40-73), with a floor of about 3.5 s of real Git work in each of 55 tests. The median is now 216.9 s with 108.7 CPU s, so about half of the wall time has no CPU. Find where it goes: waits (polls, sleeps, timeouts, lock or admission waits), Git process starts, repository setup in each test, and Python starts. Compare against the Phase 7 floor, and name what grew since then. Write the result into this Spec and name the files and changes before the code step.
+   **Profile result (2026-11-05):**
+   - Baseline: 243.0 s wall, 110.8 CPU s. Admission waits take 0.02 s. Setup takes 2.9 s and cleanup 0.8 s over 55 tests; the class already shares its seed repository.
+   - 4,627 Git calls take 118.6 s in the test process. 22 fast-track CLI runs take 105.5 s, with their own Git work.
+   - What grew since Phase 7: the Phase 7 repair added 5 tests and a Python watchdog for each Git call. 3,612 watchdog starts take a median of 38.3 ms each; a shell watchdog takes 13.8 ms.
+   - Sleeps take 15.2 s, mostly subprocess deadline polls. The blocked-hook test waits for two 5 s deadlines by design.
+   - Change: `GIT_HANG_GUARD` in `test_fast_track.py` becomes a bash job-control guard with the same deadline and the same process-group kill. `merge_checkpoint_test_support.py` does not change.
+   - Production proposals (Spec step 3): repeated `rev-parse` (898), `update-ref` (777) and `cat-file` (283) calls around `fast_track.reconcile`; 403 fetches through `copies.py` remote refresh; the Phase 7 injected Git runner.
 2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
-3. A cut in `verify.sh`, `scripts/lint/*.sh` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase.
-4. A subtest table that checks a pure status or diagnostic rule may move to a direct test of that rule only when the rule has one callable home. Keep at least one end-to-end `verify.sh lint` run for each route: no repair, one repair, and the fix limit. Keep every test name, and keep each status and diagnostic case as a checked case.
-5. `verify_lint_cache_test_support.py` also serves `test_verify_lint_cache_versions.py`, `test_verify_lint_cache_mend.py`, `test_verify_lint_cache_token_loss.py`, `test_verify_python_starts.py`, `test_verify_token_renew.py` and `test_verify_verbs.py`. A change there keeps all of them green and measures each.
+3. A cut in `fast_track.py` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase. The Phase 7 proposal (one injected Git runner in `fast_track.py`) is already with the showrunner.
+4. A change to `merge_checkpoint_test_support.py` or `cli_fixture.py` keeps every importer green; name each one in the final run.
+5. Keep every test name and assertion, and each `@process_boundary` case as a process. Add no guard, refusal or check that this Work Order does not name.
 
 **Files:**
-- `scripts/direct/test_verify_lint_judgment.py` — the module
-- `scripts/direct/verify_lint_cache_test_support.py` — only for a shared per-run cut the profile names
+- `scripts/production/test_fast_track.py` — the module
+- `scripts/production/merge_checkpoint_test_support.py` — only for a shared cut the profile names
 
 **Workers:** 1 writer (one module and its fixture; the files do not split)
 - `impl` — all files above
 
 **Constraints from prior phases:**
+- Phase 7: `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary. `cli_fixture.py` `@process_boundary` keeps a named test as a process. The Git hang guard script forks a watcher in its own process group.
 - Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
-- Phase 30: `conf.sh` reads the host name once when sourced and ignores inherited `HOSTNAME` and `HOST`; a change to it runs the `review.sh`, `implement.sh` and `mac_run.sh` tests.
+- Phase 31: the manual admission clock advance is a workaround (showrunner ruling); queue-unit fixes the start spacing in the shared admission fixture. Do not advance the admission clock by hand.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `scripts/direct/test_verify_lint_judgment.py` green, with the same test names and every case checked
-- each module in Spec step 5 green when the support file changes, with its before and after time in same-load pairs
+- `python3 -m unittest discover -s scripts/production -p 'test_fast_track.py'` green, with the same test names and assertions
+- each importer in Spec step 4 green when a support file changes, with its before and after time in same-load pairs
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`

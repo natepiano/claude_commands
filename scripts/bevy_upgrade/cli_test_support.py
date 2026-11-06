@@ -72,7 +72,7 @@ class CliFixture(unittest.TestCase):
         _ = shutil.copytree(self.snapshot, self.root)
         self.addCleanup(shutil.rmtree, self.root)
         self.checkout = self.root / "checkout"
-        self.doc = self.checkout / "demo-production.md"
+        self.doc = self.checkout / "different-document.md"
         self.env = dict(os.environ)
         self.env.update(cast(dict[str, str], json.loads((self.root / "environment.json").read_text())))
 
@@ -80,7 +80,7 @@ class CliFixture(unittest.TestCase):
         self.checkout.mkdir()
         _ = (self.checkout / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
         self.write_lock()
-        self.doc = self.checkout / "demo-production.md"
+        self.doc = self.checkout / "different-document.md"
         _ = self.doc.write_text(
             "# Demo\n\n- **Merge branch:** demo\n"
             + f"- **Showrunner checkout:** {self.checkout}\n"
@@ -154,7 +154,7 @@ class CliFixture(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1", "BEVY_UPGRADE_FIXTURES": str(self.root / "fixtures.json"),
         })
         with isolated_staff_file(self.root / "staff.json", self.env):
-            owner = fixture_member("showrunner", name="owner-name", runtime_id=OWNER_ID,
+            owner = fixture_member("showrunner", name="demo", runtime_id=OWNER_ID,
                                    doc=staff.LiveDoc("natedev", self.doc))
             _ = staff.update_current_session(owner.current_session, staff.native_id(CURRENT_ID))
         _ = (self.root / "environment.json").write_text(json.dumps({
@@ -288,7 +288,7 @@ class CliFixture(unittest.TestCase):
         )
         command = [str(SCRIPT.parents[1] / "lib/py"), "-c", counter]
         if explicit_production:
-            command.extend(["--production", str(self.doc)])
+            command.extend(["--production", "demo"])
         result = subprocess.run(command + list(arguments), cwd=self.checkout, env=self.env,
                                 capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         return result
@@ -299,7 +299,7 @@ class CliFixture(unittest.TestCase):
         if process_boundary_for_case(self):
             return self.run_cli_process(*arguments, explicit_production=explicit_production,
                                         count_saves=count_saves)
-        command = ["--production", str(self.doc)] if explicit_production else []
+        command = ["--production", "demo"] if explicit_production else []
         real_fetch = upstream.fixture_fetch
         real_save = upgrade_record.save
         real_run = subprocess.run

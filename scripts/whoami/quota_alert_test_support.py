@@ -67,7 +67,7 @@ REFUSAL_ACTION = "At chatgpt.com/codex/settings/usage, add credits for account c
 
 def running(*names: str) -> list[quota_alert.Showrunner]:
     """Running showrunners called `names`, as their update timers and session records would give them."""
-    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", slug=name.replace(" ", "-"),
+    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", name=name,
                                    zone="America/Los_Angeles", doc="") for name in names]
 
 

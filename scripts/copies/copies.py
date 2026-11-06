@@ -427,6 +427,11 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
             checkout.mkdir()
             initialize_git(checkout, source.resolve())
             _ = git(checkout, "reset", "--hard", "--quiet")
+            source_commit = git(checkout, "rev-parse", "HEAD").decode().strip()
+            _ = scratch.update_record(path, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}),
+                "source_commit": source_commit,
+            }, scratch_settings=scratch_settings)
     except (OSError, CopyError) as error:
         raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
     return checkout

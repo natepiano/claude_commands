@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from scripts.message.sessions import RegistryRead, SessionRecord
     from scripts.lib.names import JobKey
 
-from scripts.agents import worker_lifecycle
+from scripts.agents import mesh_run_process, worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.usage import agents_log
@@ -560,7 +560,7 @@ def _reviewer_destination(owner: staff.StaffRow) -> str:
     if owner.kind == "unit" and not isinstance(owner.worktree, staff.PresentWorktree):
         raise WorkerUnavailable("invalid worker state: missing working_dir")
     from scripts.production.production_doc import read_production
-    directory = str(read_production(owner.doc.path).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
+    directory = str(read_production(owner).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
                     else owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd())
     result = subprocess.run(
         ["bash", str(Path(__file__).with_name("worker_name.sh")),
@@ -690,12 +690,11 @@ def _runs(ledger: UnitWorkers) -> tuple[Path, ...]:
 
 def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
     """Recorded supervisors only; no process discovery by name."""
-    from scripts.agents import mesh_runs
     records: list[tuple[Path, dict[str, object]]] = []
     for path in sorted((run / "mesh_runs").glob("*.json")):
         record = worker_lifecycle.read_json_object(path)
         pid = record.get("pid")
-        if record.get("status") == "running" and isinstance(pid, int) and mesh_runs.supervises(pid, path):
+        if record.get("status") == "running" and isinstance(pid, int) and mesh_run_process.supervises(pid, path):
             records.append((path, record))
     return tuple(records)
 
@@ -726,7 +725,7 @@ def held_claude_sessions() -> set[str]:
 
 
 def end_unit(owner: staff.StaffRow) -> None:
-    from scripts.agents import codex_mesh, mesh_runs
+    from scripts.agents import codex_mesh
     # Run cleanup reads this ledger too; load only its binary lookup interface
     # here so neither module owns a static import cycle.
     with worker_lifecycle.operation_deadline(timeout=codex_mesh.THREAD_RELEASE_TIMEOUT_SECS):
@@ -758,8 +757,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                         print(f"cancelled pending message of {name}: {message}")
                                     _write_inbox(inbox, {})
                                 current = _object(_read_roster(run).get(name))
-                                if (isinstance(worker.backend, CodexThread) and current
-                                        and current.get("status") != "ended"):
+                                if isinstance(worker.backend, CodexThread) and current:
                                     result = codex_mesh.end_worker_locked(argparse.Namespace(session_dir=str(run), to=name))
                                     if result:
                                         raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")
@@ -767,7 +765,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                     if detached.get("worker") != name:
                                         continue
                                     pid = detached["pid"]
-                                    if isinstance(pid, int) and mesh_runs.supervises(pid, path):
+                                    if isinstance(pid, int) and mesh_run_process.supervises(pid, path):
                                         try:
                                             os.kill(pid, signal.SIGTERM)
                                         except ProcessLookupError:

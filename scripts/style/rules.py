@@ -36,7 +36,7 @@ class NotStyleUnit:
 def style_family(unit: str) -> Family | NotStyleUnit:
     families: tuple[Family, ...] = ("names", "values", "types", "modules")
     for family in families:
-        suffix = f"{family}-unit"
+        suffix = family
         if unit == suffix or unit.endswith("-" + suffix):
             return family
     return NotStyleUnit()

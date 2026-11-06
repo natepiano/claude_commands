@@ -25,6 +25,7 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[2]
 from scripts.lib import conf
+from scripts.agents import codex_mesh
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
@@ -46,6 +47,9 @@ else:
     inventory_module = import_module("scripts.shutdown.inventory")
     sessions = import_module('scripts.message.sessions')
     herdr = import_module("scripts.herdr.herdr")
+
+
+CLAUDE_LIMIT_PHRASES = ("hit your session limit", "hit your weekly limit")
 
 
 @dataclass(frozen=True)
@@ -393,6 +397,7 @@ class TranscriptEntry(TypedDict, total=False):
     timestamp: str
     message: object
     quotaLimits: object
+    payload: object
 
 
 @dataclass(frozen=True)
@@ -426,35 +431,74 @@ def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchang
                         entry = cast(dict[str, object], value)
                         if entry.get("type") in ("user", "assistant"):
                             return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
+                        payload = entry.get("payload")
+                        if isinstance(payload, dict):
+                            message = cast(dict[str, object], payload)
+                            if (entry.get("type") == "event_msg" and message.get("type") in (
+                                    "user_message", "agent_message", "error") or
+                                    entry.get("type") == "response_item" and message.get("type") == "message"
+                                    and message.get("role") in ("user", "assistant")):
+                                return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
     except OSError:
         pass
     return NoExchange()
 
 
-def transcript_refusal(session_id: str, *, config_dir: Path | None = None, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> TranscriptRefusal | NoSessionRefusal:
+def transcript_refusal(session_id: str, *, config_dir: Path | None = None, screen_text: str = "", account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> TranscriptRefusal | NoSessionRefusal:
+    """Read transcript evidence first. Use supplied pane text only without transcript evidence."""
     account_config = accounts.read_account_settings(account_config)
     root = config_dir if config_dir is not None else Path.home() / ".claude"
     try:
         paths = list((root / "projects").glob("*/" + session_id + ".jsonl"))
-    except OSError:
-        return NoSessionRefusal()
-    return _transcript_refusal(paths, account_config.whole("transcript_chunk_bytes"))
-
-
-def _transcript_refusal(paths: list[Path], chunk_bytes: int) -> TranscriptRefusal | NoSessionRefusal:
-    try:
         if not paths:
-            return NoSessionRefusal()
-        transcript = max(paths, key=lambda path: path.stat().st_mtime)
+            homes = [config_dir] if config_dir is not None else agent_accounts.codex_homes(agent_accounts.codex_home())
+            paths = [path for home in homes for folder in ("sessions", "archived_sessions")
+                     for path in (home / folder).rglob(f"*{session_id}.jsonl")]
     except OSError:
-        return NoSessionRefusal()
-    latest = _newest_exchange(transcript, chunk_bytes)
+        paths = []
+    return _transcript_refusal(paths, account_config.whole("transcript_chunk_bytes"), screen_text=screen_text)
+
+
+def _transcript_refusal(paths: list[Path], chunk_bytes: int, *, screen_text: str = "") -> TranscriptRefusal | NoSessionRefusal:
+    try:
+        latest = _newest_exchange(max(paths, key=lambda path: path.stat().st_mtime), chunk_bytes) if paths else NoExchange()
+    except OSError:
+        latest = NoExchange()
+    quota: object = None
+    codex_error = isinstance(latest, NoExchange) or latest.entry.get("type") == "event_msg"
     if isinstance(latest, NoExchange):
-        return NoSessionRefusal()
-    entry = latest.entry
-    if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
-        return NoSessionRefusal()
-    entry_id, timestamp = entry.get("uuid"), entry.get("timestamp")
+        text = screen_text
+        timestamp = datetime.now(timezone.utc).isoformat()
+        entry_id = hashlib.sha256(text.encode()).hexdigest()
+    else:
+        entry = latest.entry
+        timestamp = entry.get("timestamp")
+        if codex_error:
+            payload_value = entry.get("payload")
+            if not isinstance(payload_value, dict):
+                return NoSessionRefusal()
+            payload = cast(dict[str, object], payload_value)
+            if payload.get("type") != "error":
+                return NoSessionRefusal()
+            text = str(payload.get("message", ""))
+            entry_id = entry.get("uuid") or hashlib.sha256((str(timestamp or "") + text).encode()).hexdigest()
+        else:
+            if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
+                return NoSessionRefusal()
+            entry_id = entry.get("uuid")
+            message = entry.get("message")
+            content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "\n".join(str(cast(dict[str, object], block).get("text", ""))
+                                 for block in cast(list[object], content) if isinstance(block, dict))
+            else:
+                text = ""
+            quota = entry.get("quotaLimits")
+    if codex_error and codex_mesh.QUOTA_REFUSAL not in text.casefold():
+        if not isinstance(latest, NoExchange) or not any(phrase in text.casefold() for phrase in CLAUDE_LIMIT_PHRASES):
+            return NoSessionRefusal()
     if not isinstance(entry_id, str) or not entry_id or not isinstance(timestamp, str):
         return NoSessionRefusal()
     try:
@@ -463,21 +507,12 @@ def _transcript_refusal(paths: list[Path], chunk_bytes: int) -> TranscriptRefusa
         return NoSessionRefusal()
     if at.tzinfo is None:
         return NoSessionRefusal()
-    message = entry.get("message")
-    content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else ""
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        text = "\n".join(str(cast(dict[str, object], block).get("text", ""))
-                         for block in cast(list[object], content) if isinstance(block, dict))
-    else:
-        text = ""
     folded = text.casefold()
     window: refusals.KnownWindow | refusals.UnknownWindow = (
-        refusals.KnownWindow("weekly") if "weekly limit" in folded else
-        refusals.KnownWindow("five_hour") if "hit your session limit" in folded else refusals.UnknownWindow())
+        refusals.KnownWindow("weekly") if "weekly limit" in folded or codex_error and "weekly" in folded else
+        refusals.KnownWindow("five_hour") if CLAUDE_LIMIT_PHRASES[0] in folded or codex_error and (
+            "5-hour" in folded or "five-hour" in folded) else refusals.UnknownWindow())
     reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
-    quota = entry.get("quotaLimits")
     if isinstance(quota, dict):
         limits = cast(dict[str, object], quota)
         rate_type = limits.get("rateLimitType")

@@ -37,7 +37,7 @@ def change_counts(doc: Path, record: staff.StaffSnapshot) -> tuple[int, int]:
     """Count the production tab and the unrouted tab in one routed pass."""
     try:
         scope = change_review.review_scope(doc, False, record)
-        routed = change_review.routed_review_entries(change_review.scope_list(doc), doc, record=record)
+        routed = change_review.routed_review_entries(change_review.scope_list(doc, record=record), doc, record=record)
         return (sum(owner.tab in scope for _, owner, _ in routed),
                 sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
     except (change_review.ChangeReviewError, OSError):
@@ -103,9 +103,15 @@ def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
 
 def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
     """Watch the count sources and each open record."""
+    from scripts.production.update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
+                                     question_folder, question_records_for_document)
+
     try:
-        listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
-    except (change_review.ChangeReviewError, OSError):
+        if identities is None:
+            identities = QuestionStaff.read()
+        listed = [item.path for item in change_review.scope_lists(
+            change_review.scope_list(doc, record=identities.record), doc, record=identities.record)]
+    except (change_review.ChangeReviewError, staff.StaffRefused, OSError):
         listed = []
     folder = proposals_folder.issues_folder(doc)
     queue = proposals_folder.ledger(doc)
@@ -121,9 +127,6 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
             found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
         except OSError:
             pass
-    from scripts.production.update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
-                                     question_folder, question_records_for_document)
-
     try:
         if identities is None:
             identities = QuestionStaff.read()

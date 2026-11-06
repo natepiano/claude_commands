@@ -175,6 +175,7 @@ export async function loadAccounts(
       refreshLiveness = status.session_inputs.length > 0;
       await watchInputs(status.session_inputs);
     }
+    // Keep Python's combined role_counts and separate machine records unchanged.
     return status;
   } catch { throw new Error('Stored accounts status is invalid.'); }
 }

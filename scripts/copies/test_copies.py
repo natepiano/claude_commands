@@ -131,6 +131,7 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(record.task, "gate:camera")
         self.assertIs(record.fields["test_hana_clone"], True)
         self.assertEqual(record.fields["source_path"], str(self.source))
+        self.assertEqual(record.fields["source_commit"], self.git(checkout, "rev-parse", "HEAD"))
         self.assertEqual(scratch.end("gate:camera"), [checkout.parent])
         self.assertFalse(checkout.parent.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")

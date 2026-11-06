@@ -53,7 +53,7 @@ class ReportTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.current = {
-            "staff_id": "fixture-owner", "production": str(doc), "checkout": str(checkout),
+            "staff_id": "fixture-owner", "production": "demo", "checkout": str(checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1", "0.20.0"], "pins_read": NOW.isoformat(), "dependencies": {},
             "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,

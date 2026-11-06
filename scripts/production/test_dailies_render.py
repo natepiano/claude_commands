@@ -19,7 +19,6 @@ from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import dailies_render
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.dailies_render import (NoLastReportedEta, StateClear, StateRefused,
@@ -129,7 +128,7 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
     environment = {**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
                    "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
     if subprocess_cli:
-        result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
+        result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=environment,
                                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
     else:
         result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
@@ -313,7 +312,7 @@ for name in ("first", "second"):
     assert sys.path == caller_path
     paths(caller)
 '''
-            result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", program], env=environment,
+            result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program], env=environment,
                                     cwd=SCRIPT.parent, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -512,7 +511,7 @@ class IdleGroupTests(unittest.TestCase):
         self.assertIn(message, result.error)
 
     def fields(self, length: str = "simple") -> dict[str, object]:
-        working = {**unit(False), "unit": "working-unit", "name": "working", "label": "working"}
+        working = {**unit(False), "unit": "working", "name": "working", "label": "working"}
         return {
             "length": length,
             "zone": ZONE,
@@ -936,7 +935,7 @@ class EtaResolutionTests(unittest.TestCase):
 
     def test_fixed_unit_id_keeps_name_labels_and_log_names(self) -> None:
         fixed_id = fixture_runtime_id("renderer-owner")
-        entry = {**unit(False), "unit": fixed_id, "name": "panel-ui-unit"}
+        entry = {**unit(False), "unit": fixed_id, "name": "panel-ui"}
         del entry["label"]
         fields = {**report(False), "units": [entry]}
         result, saved, logged = self.run_with_state(fields, {}, AT, unit_id=fixed_id)
@@ -944,10 +943,10 @@ class EtaResolutionTests(unittest.TestCase):
         text = "\n".join(result.lines)
         self.assertIn("panel-ui", text)
         self.assertNotIn(fixed_id, text)
-        self.assertIn("panel-ui-unit Phase 2 of 3", logged)
+        self.assertIn("panel-ui Phase 2 of 3", logged)
         self.assertNotIn(fixed_id, logged)
         self.assertIn(fixed_id, saved)
-        self.assertNotIn("panel-ui-unit", saved)
+        self.assertNotIn("panel-ui", saved)
 
     def test_interrupted_state_publish_preserves_first_eta_and_same_command_reruns(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -1199,8 +1198,8 @@ class GanttTests(unittest.TestCase):
         self.assertEqual(self.above_chart(self.gantt([moved], {"widget-enhancements": last})), [])
 
     def test_a_unit_the_last_report_had_and_this_one_lacks_is_named(self) -> None:
-        state = {"widget-enhancements": self.last_report(), "retired-unit": self.last_report()}
-        self.assertEqual(self.above_chart(self.gantt([unit(False)], state)), ["- retired-unit: no longer in the report"])
+        state = {"widget-enhancements": self.last_report(), "retired": self.last_report()}
+        self.assertEqual(self.above_chart(self.gantt([unit(False)], state)), ["- retired: no longer in the report"])
 
 
 def saved_row(name: str, started: str = "", eta: str = "") -> dict[str, object]:
@@ -1386,7 +1385,7 @@ def style_summary(**changed: object) -> dict[str, object]:
 @final
 class StyleChildReportTests(unittest.TestCase):
     def saved_style(self, **changed: object) -> dict[str, object]:
-        return {**saved("2026-10-04T10:40", saved_row("names-unit")),
+        return {**saved("2026-10-04T10:40", saved_row("names")),
                 "style": style_summary(**changed)}
 
     def parsed(self, fields: dict[str, object]) -> dailies_render.ChildReport:
@@ -1398,7 +1397,7 @@ class StyleChildReportTests(unittest.TestCase):
         return result.lines
 
     def test_legacy_report_has_no_style_line_and_keeps_its_child_row(self) -> None:
-        fields = saved("2026-10-04T10:40", saved_row("names-unit"))
+        fields = saved("2026-10-04T10:40", saved_row("names"))
         self.assertIsInstance(self.parsed(fields).style, dailies_render.NoStyleSummary)
         lines = self.rendered(fields)
         self.assertEqual([line for line in lines if line.startswith("hana-style")],
@@ -1406,7 +1405,7 @@ class StyleChildReportTests(unittest.TestCase):
         self.assertFalse(any("rules done" in line or "style summary" in line for line in lines))
 
     def test_unavailable_summary_is_printed_directly_under_the_child_row(self) -> None:
-        fields = {**saved("2026-10-04T10:40", saved_row("names-unit")),
+        fields = {**saved("2026-10-04T10:40", saved_row("names")),
                   "style": {"unavailable": "ledger database is locked"}}
         parsed = self.parsed(fields).style
         self.assertIsInstance(parsed, dailies_render.StyleSummaryUnavailable)
@@ -1479,7 +1478,7 @@ class StyleChildReportTests(unittest.TestCase):
             _ = self.parsed(self.saved_style(invented=1))
 
     def test_style_child_expansion_keeps_all_four_unit_rows(self) -> None:
-        names = ("names-unit", "types-unit", "modules-unit", "structure-unit")
+        names = ("names", "types", "modules", "structure")
         fields = {**saved("2026-10-04T10:40", *(saved_row(name) for name in names), units=4),
                   "style": style_summary()}
         lines = self.rendered(fields, expand=True)

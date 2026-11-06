@@ -92,7 +92,7 @@ class SessionTest(unittest.TestCase):
         timer = self.state / "showrunner-production"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_text(
-            f"TARGET=session:{SHOWRUNNER}\nCHECK=~/.claude/scripts/production/production_check.sh {doc}\n", encoding="utf-8")
+            f"TARGET=session:{SHOWRUNNER}\nCHECK=~/.claude/scripts/production/production_check.sh production\n", encoding="utf-8")
 
         _ = self.enterContext(isolated_staff_file(Path(root.name) / "staff.json", {}))
         _ = fixture_member("showrunner", name="production", runtime_id=SHOWRUNNER,

@@ -28,11 +28,10 @@ chmod +x "$CLAUDE_BIN"
 export PATH="$TEST_DIR/bin:$PATH"
 export AGENT_NOTES_DIR="$TEST_DIR/notes"
 mkdir -p "$AGENT_NOTES_DIR"
-"${BASH_SOURCE[0]%/*}/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
+"$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import json, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import accounts
 from scripts.whoami.account_test_support import write_codex_auth, write_claude_account
 notes = Path.home().parent / "notes"
@@ -202,11 +201,10 @@ CODEX_HOME="$TEST_DIR/caller" agents_exec_main \
 assert_equal "fallback followed its caller instead of the workers role" "$HOME/.codex1" "$(cat "$TEST_CODEX_HOME_FILE")"
 
 # A named Claude route applies only to worker launches and lasts until it closes.
-"${BASH_SOURCE[0]%/*}/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
+"$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import role_map
 from scripts.whoami.account_test_support import create_claude_account
 create_claude_account("claude4", "route@example.invalid")
@@ -275,15 +273,18 @@ CASES
 
 test_every_claude_print_launch_keeps_agents_and_reports_errors
 
+export CLAUDE_CONFIG_DIR="$HOME/.claude2"
+agents_exec_main direct.simplify readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+assert_equal "simplify replaced the caller account with the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
+
 # The worker's registry-selected Claude path uses the same account.
 export STAFF_FILE="$TEST_DIR/staff.json"
 export AGENT_BG_ROLE=impl
 export FAKE_CLAUDE_PID=$$
 export FIXTURE_CHECKOUT="$SCRIPT_DIR/../.."
-"${BASH_SOURCE[0]%/*}/../lib/py" - "$TEST_DIR" <<'PYTHON'
+"$SCRIPT_DIR/../lib/py" - "$TEST_DIR" <<'PYTHON'
 import os, shlex, sys
 from pathlib import Path
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production.staff_test_support import source_environment, unit_membership
 root = Path(sys.argv[1])
 environment = source_environment(root / "sources")
@@ -295,8 +296,7 @@ _ = (root / "staff-environment").write_text("".join(
 PYTHON
 source "$TEST_DIR/staff-environment"
 cat > "$TEST_DIR/send.py" <<'PYTHON'
-import os, sys
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
+import os
 from scripts.production import staff
 assert staff.by_id(staff.StaffId(os.environ["FAKE_CLAUDE_SESSION_ID"])) is not None
 print("SENT: fixture")
@@ -307,7 +307,6 @@ run_background_fixture() {
 import os, subprocess, sys
 from pathlib import Path
 root = Path(sys.argv[2]).resolve()
-sys.path.insert(0, str(root))
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 command, environment = backend_fixture_command(
     Path(sys.argv[1]), ["bash", str(root / "scripts/agents/agent_bg.sh"), *sys.argv[3:]], dict(os.environ))
@@ -320,7 +319,6 @@ printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
 printf '%s\n' "${AGENT_BG_WORKERS+set}" > "$TEST_CLAUDE_WORKERS_FLAG_FILE"
 "$FIXTURE_CHECKOUT/scripts/lib/py" - <<'PYTHON'
 import os, sys
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production.staff_test_support import record_fixture_claude_start
 record_fixture_claude_start(sys.argv[1:])
 PYTHON
@@ -349,10 +347,9 @@ cp "$MODELS_CONFIG_FILE" "$TEST_DIR/cli.conf"
 write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.commit_prep=claude
 MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
 assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-"${BASH_SOURCE[0]%/*}/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
+"$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import role_map
 from datetime import datetime, timezone
 role_map.write_role_map(role_map.WorkersClaudeRouteChange(

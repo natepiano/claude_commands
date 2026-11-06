@@ -75,9 +75,9 @@ Also read each phase's **Goal**, **Constraints from prior phases**, and its depe
    touches most.
 4. **Order.** Record start-order waits as owed actions in the showrunner's notes.
    Use `cargo-berth sequence` for merge order.
-5. **Names.** Name each unit `<area>-unit` after the crate or module it owns:
+5. **Names.** Name each unit `<area>` after the crate or module it owns:
    short, lowercase, hyphenated. A unit that keeps the source plan's main line
-   may be `trunk-unit`.
+   may be `trunk`.
 </FormUnits>
 
 ---

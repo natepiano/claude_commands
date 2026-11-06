@@ -85,7 +85,6 @@ from scripts.message.unit_labels import (
     make_labels as _unit_labels,
     production_of as _production_of,
     unit_of as _unit_of,
-    short_unit as _short_unit,
     ProductionPlace as _ProductionPlace,
     StaffDiagnostics as _StaffDiagnostics,
     StaffRowAnomaly as _StaffRowAnomaly,
@@ -295,7 +294,7 @@ class JobUnassigned:
 
 @dataclass(frozen=True)
 class ProductionPart:
-    slug: str
+    name: str
 
 
 @dataclass(frozen=True)
@@ -322,10 +321,10 @@ class ShownName:
 
     def render(self) -> str:
         parts: list[str] = []
-        if isinstance(self.production, ProductionPart) and self.production.slug:
-            parts.append(self.production.slug)
+        if isinstance(self.production, ProductionPart) and self.production.name:
+            parts.append(self.production.name)
         if isinstance(self.unit, UnitPart) and self.unit.unit:
-            parts.append(_short_unit(self.unit.unit))
+            parts.append(self.unit.unit)
         if isinstance(self.job, ShownJob):
             loaded = names.runtime_names()
             if not isinstance(loaded, names.Names):
@@ -806,10 +805,14 @@ def _worker_slot(run: Path, name: str, record: Mapping[str, object], problems: l
     return fallback
 
 
+def _role_log() -> agents_log.RoleLog:
+    return agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+
+
 def _worker_assignment(run: Path, slot: str, record: Mapping[str, object],
-                       membership: staff.StaffSnapshot) -> WorkerAssignment:
-    assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-                                    session_staff.worker_session(record, membership), datetime.now(timezone.utc))
+                       membership: staff.StaffSnapshot, role_log: agents_log.RoleLog) -> WorkerAssignment:
+    assignment = agents_log.role_at(role_log, session_staff.worker_session(record, membership),
+                                    datetime.now(timezone.utc))
     if isinstance(assignment, agents_log.Unassigned):
         return WorkerAssignment("no role", str(run), AssignmentUnrecorded(), slot)
     role = worker_role({"role": assignment.role})
@@ -889,7 +892,7 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     place = places.get(unit_runs.director(run))
     if place is not None:
         showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
-    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership)
+    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership, _role_log())
     entry = RosterEntry(machine="", kind="codex", role="worker", name=name, status="",
                         reach=Messageable(name), cwd="", showrunner=showrunner,
                         director=director, assignment=assignment)
@@ -1073,7 +1076,7 @@ def _claude_entries(
         assignment: Assignment = NotAWorker()
         if session_id in runner_ids:
             role: Role = "showrunner"
-            showrunner = RunsProduction(runner_ids[session_id]["slug"])
+            showrunner = RunsProduction(runner_ids[session_id]["name"])
         elif session_id in production_places:
             role = "unit director"
             place = production_places[session_id]
@@ -1243,6 +1246,7 @@ def _unit_workers(
     process_cwds = _process_cwds(table)
     entries: list[RosterEntry] = []
     worker_threads: set[str] = set()
+    role_log = _role_log()
     for run in runs:
         server_homes = _run_server_homes(run)
         place = _run_place(run, claude_entries, production_places)
@@ -1287,7 +1291,8 @@ def _unit_workers(
                 cwd=cwd,
                 showrunner=showrunner,
                 director=director,
-                assignment=_worker_assignment(Path(run_path), _worker_slot(run.path, name, record, problems), record, membership),
+                assignment=_worker_assignment(Path(run_path), _worker_slot(run.path, name, record, problems), record, membership,
+                                              role_log),
                 thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
                 account=_worker_account(run, record, server_homes),
             ))
@@ -1443,7 +1448,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
             for session in daemon
             if session.thread_id not in worker_threads
         )
-    interactive = _herdr_codex_panes(machine, (runner["slug"] for runner in registered))
+    interactive = _herdr_codex_panes(machine, (runner["name"] for runner in registered))
     problems.extend(interactive.problems)
     excluded = diagnostics.excluded_sessions
     entries = [entry for entry in [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]

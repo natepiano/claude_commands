@@ -897,6 +897,42 @@ class LinuxProcessTests(unittest.TestCase):
                 _ = linux_runner.slot_processes(self.mirror, self.proc)
         self.assertTrue(marker.exists())
 
+    def test_unmarked_slot_ignores_an_unreadable_same_uid_process(self) -> None:
+        self.process(102, cwd=self.root)
+        self.deny_reads(environ=(102,), cwd=(102,), cmdline=(102,))
+
+        self.assertEqual(linux_runner.select_slot_processes(self.mirror, self.proc),
+                         linux_runner.SlotProcessSelection((), False))
+
+    def test_unmarked_slot_keeps_positive_runner_and_directory_evidence(self) -> None:
+        self.process(101, cwd=self.mirror)
+        self.process(102, command=("python3", "/scripts/linux_runner.py", "--mirror", str(self.mirror)),
+                     cwd=self.root)
+        self.deny_reads(cwd=(102,), cmdline=(101,))
+
+        self.assertEqual(linux_runner.select_slot_processes(self.mirror, self.proc),
+                         linux_runner.SlotProcessSelection((101, 102), False))
+
+    def test_leftover_selectors_resolve_after_removing_a_previous_boot_marker(self) -> None:
+        marker = self.marker()
+        lease = cast(linux_runner.SlotRun, json.loads(marker.read_text()))
+        lease['boot_id'] = 'previous-boot'
+        _ = marker.write_text(json.dumps(lease))
+        self.process(102, cwd=self.root)
+        self.deny_reads(environ=(102,), cwd=(102,), cmdline=(102,))
+        self.use_private_processes()
+        with mock.patch.object(offload, "mirror_selector_script",
+                               return_value=linux_runner.mirror_selector_script(str(self.mirror))):
+            script = offload.leftover_check_script(offload.KnownRepository("hana", "https://example.invalid/hana"), "aws")
+        selections = script.count('leftover_pids=$(select_leftovers)')
+        self.assertEqual(selections, 3)
+        for index in range(selections):
+            with self.subTest(selection=index):
+                reply = self.selector_output()
+                self.assertEqual(reply.returncode, 0, reply.stderr)
+                self.assertEqual(reply.stdout.strip(), "")
+                self.assertFalse(marker.exists())
+
     def test_unreadable_process_before_the_lease_allows_confirmed_cleanup(self) -> None:
         marker = self.marker()
         self.process(102, start=100, cwd=self.root)

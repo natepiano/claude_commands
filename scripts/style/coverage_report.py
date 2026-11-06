@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -19,8 +18,9 @@ from typing import TypedDict, cast
 
 from scripts.style import rules
 from scripts.style import style_ledger
-from scripts.production import staff, unit_lookup, unit_names
+from scripts.production import staff, unit_lookup
 from scripts.lib.user_zone import user_zone
+from scripts.style.add_style import NoStyleProduction, standing_style_production
 
 
 class RuleSnapshot(TypedDict):
@@ -48,7 +48,7 @@ class PreviousReport:
 
 @dataclass(frozen=True)
 class StyleProduction:
-    slug: str
+    name: str
     branch_point: str
     units: tuple[str, ...]
 
@@ -61,21 +61,15 @@ def git(repo: Path, *arguments: str) -> str:
 
 
 def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
-    main = Path(git(ledger.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
-    slug = main.name + "-style"
-    doc = main.parent / slug / "docs" / f"{slug}-production.md"
-    units = tuple(f"{slug}-{family}-unit" for family in ("modules", "names", "values", "types"))
-    if doc.is_file():
-        text = doc.read_text(encoding="utf-8")
-        branch = re.search(r"^\s*-?\s*\*\*Branch point:\*\*\s*(.+)$", text, re.MULTILINE)
-        if branch is None:
-            raise style_ledger.LedgerError(f"{doc}: missing Branch point")
-        declared = tuple(unit for unit in (unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, staff.snapshot()))
+    standing = standing_style_production(ledger.repo)
+    units = tuple(f"{standing.name}-{family}" for family in ("modules", "names", "values", "types"))
+    if not isinstance(standing, NoStyleProduction):
+        declared = tuple(unit for unit in (row.name for row in unit_lookup.doc_units(standing.doc, staff.snapshot()))
                          if not isinstance(rules.style_family(unit), rules.NotStyleUnit))
-        return StyleProduction(slug, branch[1].strip().removeprefix("refs/heads/"), declared or units)
+        return StyleProduction(standing.name, standing.branch_point, declared or units)
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
     branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])
-    return StyleProduction(slug, branch_point, units)
+    return StyleProduction(standing.name, branch_point, units)
 
 
 def previous_report(path: Path) -> FirstReport | PreviousReport:
@@ -202,7 +196,7 @@ def prepare_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "")
     file_delta = f" ({file_count - days[yesterday]:+d} since yesterday)" if yesterday in days else ""
     synced = summary.synced_at.astimezone(user_zone())
     lines = [
-        f"{style.slug} — synced {style.branch_point} {summary.synced_tip[:7]} at {synced:%H:%M %Z}, {file_count:,} files{file_delta}",
+        f"{style.name} — synced {style.branch_point} {summary.synced_tip[:7]} at {synced:%H:%M %Z}, {file_count:,} files{file_delta}",
         f"Rules done: {summary.rules_done} of {summary.rules_total} ({sum(row.complete and row.tier == 'A' for row in progress)} by lint)"
         + f" · cells current {one_decimal(summary.cells_current_pct)}% · open {sum(row.open for row in counts.values()):,}"
         + f" · stale {summary.stale:,} · awaiting merge {sum(row.awaiting_merge for row in counts.values()):,}"

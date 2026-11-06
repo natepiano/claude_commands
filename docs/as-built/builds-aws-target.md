@@ -12,7 +12,7 @@ The user approved these spending and capacity values on 2026-11-03, all in `conf
 4. `start_min_waiting=2`, `start_after_wait_s=120` and `idle_stop_minutes=15`: the box starts when 2 steps wait 120 s, and stops after 15 idle minutes.
 5. `slots=2`, `slots.hana=4`, `slots.cargo-liner=4` and `build_budget_gib=32`: the slots per repository and the build space.
 
-The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws-unit wrote that private file on natedev (mode 0600) from the address the user gave.
+The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws wrote that private file on natedev (mode 0600) from the address the user gave.
 The user approved `deployment_price_file=~/.config/aws-build/deployment-price` on 2026-11-03. `deploy.py price` writes the Spot price and its read time there (mode 0600), outside the repository.
 
 The target is live. The user approved go-live on 2026-11-03. The stacks exist in `us-east-2`, and the box is instance `i-0216cf933a26bd1ea`. `offload=on`, and `targets=mac,natedev,aws` lists AWS after natedev. [The runbook](../plans/builds-aws-runbook.md) gives the steps. The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
@@ -90,7 +90,8 @@ An interruption marker reports the instance generation.
   The remote service and Linux runner need this config during import.
 - A version refusal names the target, each mismatched tool, both versions, and the file set by `version_pin_file`.
   The verify output and the step attempt record keep this reason.
-- `release_stopped_claims` releases only claims bound to the stopped host and generation, and writes `release-evidence/`.
+- `release_stopped_claims` releases host claims after a confirmed stop or a generation change, and writes `release-evidence/`.
+  A generation change releases only claims with a nonempty older generation and a start time at or before the observation.
 
 ### Status and report
 
@@ -138,6 +139,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
    It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
    HTTP refusals include the status and validation details without user fields; network refusals include the failure reason.
 2. `box-join` checks SSM and the instance's Tailscale identity.
+   `box-join` writes the box host keys from Tailscale to `~/.ssh/known_hosts` for the host name and address; box setup refusals show the last stderr line.
    It starts a stopped instance through the existing guarded setup path.
    It creates a single-use, pre-approved key and revokes it after the join attempt.
    SSM disables terminal echo before the helper sends the key through stdin.

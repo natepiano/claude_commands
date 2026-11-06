@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
+from scripts.production.staff_test_support import unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -55,12 +55,12 @@ class NativeClaudeUnitTests(StaffTestCase):
         current = staff.native_id(fixture_runtime_id("renamed-unit-current"))
         _ = staff.update_current_session(owner.current_session, current)
         _ = staff.rename(owner.id, "row-name")
-        _ = fixture_member("unit", name="saved-name", parent=runner.id, runtime_id=fixture_runtime_id("decoy-unit"))
+        _ = fixture_member("unit", name="saved-name", parent=runner.id, runtime_id=fixture_runtime_id("decoy"))
         request = add_unit.UnitLaunch(
-            production=read_production(document), branch="kept", worktree=self.root,
+            production=read_production(runner.name), branch="kept", worktree=self.root,
             plan=add_unit.PlanGiven(Path("plan.md")), port=add_unit.OmittedCell(),
             session=add_unit.ResumedSession(current, self.root), timeout=5,
-            identity=add_unit.UnitIdentity("saved-name-unit", "saved-name"))
+            identity=add_unit.UnitIdentity("saved-name", "saved-name"))
         from scripts.accounts.accounts import NamedAccount
 
         with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", return_value=
@@ -79,16 +79,16 @@ class NativeClaudeUnitTests(StaffTestCase):
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
                                 + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
         runner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", document))
-        production = read_production(document)
-        folder = self.root / "fresh-unit"
+        production = read_production(runner.name)
+        folder = self.root / "fresh"
         folder.mkdir()
-        identity = fixture_runtime_id("fresh-Claude-unit")
+        identity = fixture_runtime_id("fresh-Claude")
         backend = ClaudeBackendFixture(identity, self.root / "claude-account")
         request = add_unit.UnitLaunch(
             production=production, branch="fresh", worktree=folder,
             plan=add_unit.PlanGiven(Path("plan.md")), port=add_unit.OmittedCell(),
             session=add_unit.NewSession(), timeout=5,
-            identity=add_unit.UnitIdentity("fresh-unit", "fresh"))
+            identity=add_unit.UnitIdentity("fresh", "fresh"))
         from scripts.accounts.accounts import NamedAccount
 
         with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", side_effect=backend.launch)):
@@ -179,7 +179,6 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(unit_config.read(worktree), expected)
         path = worktree / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
-        _ = self.doc.write_text(self.doc.read_text().split("## Units")[0])
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--responsibility", "nightly-review")
         self.assertEqual(unit_config.read(worktree), expected)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
@@ -231,8 +230,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_explicit_paths_and_named_responsibilities_ignore_document_owns(self) -> None:
         _ = self.doc.write_text(self.doc.read_text() +
-                               "## Units\n\n| Unit | Owns |\n| --- | --- |\n| alpha-unit | ignored/path |\n")
-        _ = self.successful("alpha-unit", "--standby", "--responsibility", "nightly-review",
+                               "## Units\n\n| Unit | Owns |\n| --- | --- |\n| alpha | ignored/path |\n")
+        _ = self.successful("alpha", "--standby", "--responsibility", "nightly-review",
                             "--responsibility", "scripts/production/add_unit.py",
                             "--responsibility", "scripts/production/unit_config.py",
                             "--responsibility", "settings.json")
@@ -258,11 +257,18 @@ class AddUnitLaunchTests(AddUnitTestCase):
         before = self.doc.read_bytes()
         result = self.cli("alpha", "--standby")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("alpha-unit", result.stdout)
+        self.assertIn("alpha", result.stdout)
         self.assertEqual(self.doc.read_bytes(), before)
         self.assertTrue((self.root / "project-alpha").exists())
         self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
             unit_config.StandbyPlan(), unit_config.NoAppPort(), ()))
+
+    def test_named_responsibilities_are_written_once(self) -> None:
+        _ = self.successful("alpha", "--standby", "--responsibility", "nightly-review",
+                            "--responsibility", "build-check", "--responsibility", "nightly-review")
+        config = unit_config.read(self.root / "project-alpha")
+        assert isinstance(config, unit_config.UnitConfig)
+        self.assertEqual(config.responsibilities, ("build-check", "nightly-review"))
 
     def test_standby_launch_writes_the_standby_plan_in_its_unit_config(self) -> None:
         _ = self.successful("alpha", "--standby")
@@ -284,7 +290,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertTrue((self.checkout / config.plan.path).is_file())
 
     def test_existing_unit_name_under_another_production_requires_an_explicit_move(self) -> None:
-        old_doc = self.staff.production("old", "alpha-unit", workspace="original")
+        old_doc = self.staff.production("old", "alpha", workspace="original")
         original = fixture_member("showrunner", name="original", doc=staff.LiveDoc("natedev", old_doc))
         old = fixture_member("unit", name="alpha", parent=original.id)
         before = self.staff.staff_file.read_bytes()
@@ -375,7 +381,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_new_row_with_a_running_labeled_session_refuses_before_any_write(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        owner = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        owner = unit_membership("build-followups", "alpha")
         owner = staff.update_current_session(owner.current_session,
             staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         owner = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", prior), expected=owner.worktree)
@@ -383,7 +389,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         repository = self.repository_state()
         head = self.git("rev-parse", "build-followups")
         plans = {path: path.read_bytes() for path in self.plan.parent.iterdir() if path.is_file()}
-        marked = unit_lookup.LabeledSession("alpha-unit",
+        marked = unit_lookup.LabeledSession("alpha",
             unit_lookup.LiveClaude("alpha", owner.current_session, "/fixture/socket", 4242),
             HerdrPlace("running-host", "w1:p1"), identity=unit_lookup.LiveSession(owner.current_session))
         modes = (("--plan", "docs/plans/given.md"), ("--brief", "Write the missing plan."),
@@ -393,7 +399,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 (), ("--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--autocompact", "200k"))
             for flags in launches:
                 with self.subTest(mode=mode, flags=flags):
-                    arguments = ["--production", str(self.doc), "alpha", *mode, *flags]
+                    arguments = ["--production", self.production_name, "alpha", *mode, *flags]
                     with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
                           patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
                           patch.object(add_unit, "launch_session") as launched,
@@ -403,7 +409,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
                     self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
                     self.assertEqual(result.stderr,
-                        "add_unit: unit alpha-unit already runs in session running-host but has no .unit.toml; "
+                        "add_unit: unit alpha already runs in session running-host but has no .unit.toml; "
                         + "end that session, then run " + shlex.join(["add_unit.py", *arguments]) + "\n")
                     self.assertEqual(self.doc.read_bytes(), document)
                     self.assertEqual(self.git("rev-parse", "build-followups"), head)
@@ -425,8 +431,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         head = self.git("rev-parse", "HEAD")
         errors = io.StringIO()
         missing = self.checkout / "missing-production.md"
+        _ = fixture_member("showrunner", name="missing", doc=staff.LiveDoc("natedev", missing))
         with patch.dict(os.environ, self.env), redirect_stderr(errors):
-            code = add_unit.main(["--production", str(missing), "alpha", "--permanent",
+            code = add_unit.main(["--production", "missing", "alpha", "--permanent",
                                   "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(self.root)])
         self.assertEqual(code, 2, errors.getvalue())
         self.assertIn("cannot read production doc:", errors.getvalue())
@@ -442,7 +449,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach agents, workspace director, tab alpha\n")
+        self.assertEqual(output.getvalue(), "alpha started: herdr session attach agents, workspace build-followups, tab alpha\n")
 
     def test_unit_start_not_ready_prints_screen_and_sends_no_prompt_or_key(self) -> None:
         screen = "Do you trust this folder?"
@@ -508,7 +515,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
               patch.object(herdr, "start_server", side_effect=timeout) as start,
               patch.object(herdr, "open_tab") as opened,
               patch.object(herdr, "start_agent") as agent):
-            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md"])
+            code = add_unit.main(["--production", self.production_name, "alpha", "--plan", "docs/plans/given.md"])
         self.assertEqual(code, 1)
         self.assertEqual(errors.getvalue(), f"add_unit: {timeout}\n")
         start.assert_called_once_with(SHARED, 90_000)
@@ -519,7 +526,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.herdr_overrides[f"--session {SHARED} status server"] = CommandResponse(code=0, stdout="status: running\n")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(self.servers_started(), [])
-        self.assertEqual(self.opened()[:6], ["--session", SHARED, "workspace", "create", "--label", "director"])
+        self.assertEqual(self.opened()[:6], ["--session", SHARED, "workspace", "create", "--label", "build-followups"])
 
     def test_new_work_still_refuses_a_row_off_the_naming_pattern(self) -> None:
         recorded = self.commit_row_off_the_naming_pattern()
@@ -529,7 +536,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
             result.stderr,
-            f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
+            f"add_unit: unit trunk Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
         )
         self.assert_no_launch_change(document, head)
 
@@ -546,7 +553,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertFalse(self.config.exists())
         self.assertEqual({key: value for key, value in self.pane_environment().items() if key.startswith("SHOWRUNNER_")}, {})
         command = self.opening_prompt()
-        prompt = (f"You are alpha-unit in production build-followups (doc {self.doc}), "
+        prompt = (f"You are alpha in production build-followups (doc {self.doc}), "
                   "under the showrunner, whose `SendMessage` address `~/.claude/scripts/lib/py "
                   "~/.claude/scripts/production/showrunners.py address build-followups` prints (look it up "
                   "before each message: it changes when the showrunner restarts), on standby. "
@@ -555,7 +562,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIn(prompt, command)
         self.assert_director_flags("opus", "xhigh")
         self.assertRegex(self.log.read_text(),
-                         rf"^- {LAUNCHED_AT:%H:%M %Z}: added alpha-unit \(standby\), worktree ")
+                         rf"^- {LAUNCHED_AT:%H:%M %Z}: added alpha \(standby\), worktree ")
 
     def test_permanent_launch_says_wrap_keeps_it(self) -> None:
         _ = self.successful("alpha", "--permanent")
@@ -571,7 +578,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
             "oauthAccount": {"emailAddress": "owner@example.com"},
             "projects": {**self.trusted_projects(), str(folder): {"hasTrustDialogAccepted": True}}}))
         result = self.successful("nightly-review", "--permanent", "--responsibility", "nightly-review")
-        self.assertIn("nightly-review-unit started: herdr session attach agents, workspace director, tab nightly-review", result.stdout)
+        self.assertIn("nightly-review started: herdr session attach agents, workspace build-followups, tab nightly-review", result.stdout)
         self.assertEqual(self.opened()[7], str(folder))
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(config.parent))
         arguments = self.agent_arguments()
@@ -620,7 +627,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),
                          self.git("rev-parse", "build-followups"))
         self.assertEqual(self.servers_started(), [["--user", "start", "herdr-agents.service"]])
-        self.assertEqual(self.opened()[:8], ["--session", SHARED, "workspace", "create", "--label", "director",
+        self.assertEqual(self.opened()[:8], ["--session", SHARED, "workspace", "create", "--label", "build-followups",
                                              "--cwd", str(worktree)])
         self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
                        "alpha"], self.herdr_calls())
@@ -640,9 +647,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
         self.assertRegex(self.log.read_text(),
-                         rf"^- {LAUNCHED_AT:%H:%M %Z}: added alpha-unit \(plan\), worktree ")
+                         rf"^- {LAUNCHED_AT:%H:%M %Z}: added alpha \(plan\), worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
-        self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
+        self.assertIn("alpha started: herdr session attach agents, workspace build-followups, tab alpha", result.stdout)
 
     def test_a_review_named_unit_opens_unit_direct(self) -> None:
         _ = self.successful("review", "--plan", "docs/plans/given.md")
@@ -656,7 +663,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         result = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(len(self.servers_started()), 1)
         self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
-        self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
+        self.assertIn("alpha started: herdr session attach agents, workspace build-followups, tab alpha", result.stdout)
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
 
     def existing_config(self, plan: unit_config.PlanFile | unit_config.StandbyPlan, branch: str) -> None:
@@ -678,7 +685,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         head = self.git("rev-parse", "HEAD")
         _ = self.successful("alpha", "--standby")
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
-        self.assertIn("added alpha-unit (standby)", self.log.read_text())
+        self.assertIn("added alpha (standby)", self.log.read_text())
 
     def test_another_units_worktree_refuses_before_launch(self) -> None:
         _ = self.prepare_restored_worktree("beta", self.root / "project-alpha")
@@ -719,7 +726,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertTrue(stub.exists())
         content = stub.read_text()
         self.assertIn("# alpha", content)
-        self.assertIn("> **Production: build-followups** — unit `alpha-unit`; production doc", content)
+        self.assertNotIn("Production:", content)
         self.assertIn("## Source", content)
         self.assertIn(words, content)
         self.assertIn(f"{LAUNCHED_AT:%Y-%m-%d %H:%M %Z}", content)
@@ -729,24 +736,24 @@ class AddUnitLaunchTests(AddUnitTestCase):
         prompt = self.opening_prompt()
         self.assertIn("Write the full phased plan there", prompt)
         self.assertIn("wait for its approval before you run /unit:direct docs/plans/build-followups-alpha.md", prompt)
-        self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
+        self.assertIn("alpha started: herdr session attach agents, workspace build-followups, tab alpha", result.stdout)
         self.assert_director_flags("opus", "xhigh")
 
-    def test_branch_takes_the_slug_and_the_stub_sits_beside_the_production_doc(self) -> None:
+    def test_branch_takes_the_production_name_and_the_stub_sits_beside_the_production_doc(self) -> None:
         _ = self.git("checkout", "-b", "init/catalyst")
         self.doc = self.checkout / "docs/hana/tool-based-ui-production.md"
         _ = self.doc.parent.mkdir(parents=True)
         _ = self.doc.write_text(self.production_doc("init/catalyst"), encoding="utf-8")
         _ = self.git("add", "docs/hana/tool-based-ui-production.md")
         _ = self.git("commit", "-m", "production under another merge branch")
-        (self.staff.source_root / "notifier/showrunner-build-followups/conf").unlink()
-        _ = self.staff.record_production("tool-based-ui", self.doc)
+        self.production_name = "hana"
+        _ = self.staff.record_production(self.production_name, self.doc)
         _ = self.successful("lfo", "--brief", "Add the LFO tool")
         worktree = self.root / "project-lfo"
         self.assert_staff_folder("lfo", worktree)
-        self.assert_unit_config(worktree, unit_config.PlanFile(Path("docs/hana/tool-based-ui-lfo.md")))
-        self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "tool-based-ui-lfo")
-        self.assertEqual(self.git("show", "--pretty=format:", "--name-only", "HEAD"), "docs/hana/tool-based-ui-lfo.md")
+        self.assert_unit_config(worktree, unit_config.PlanFile(Path("docs/hana/hana-lfo.md")))
+        self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "hana-lfo")
+        self.assertEqual(self.git("show", "--pretty=format:", "--name-only", "HEAD"), "docs/hana/hana-lfo.md")
         self.assertFalse((self.checkout / "docs/plans/init").exists())
         self.assertEqual(self.git("branch", "--list", "init/catalyst-lfo"), "")
 
@@ -760,7 +767,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(first.returncode, 1, (first.stdout, first.stderr))
         self.assertIn("/remote-control did not become active", first.stderr)
         self.assertIn("(herdr agents:", first.stderr)
-        self.assertEqual(first.stderr.count("anomaly: alpha-unit: registry has no remote-control evidence\n"), 1)
+        self.assertEqual(first.stderr.count("anomaly: alpha: registry has no remote-control evidence\n"), 1)
         self.assertFalse(self.config.exists())
         self.assertFalse(self.log.exists())
         commit = self.git("rev-parse", "HEAD")
@@ -789,15 +796,6 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 self.assertEqual(self.doc.read_text(), initial)
                 self.assertEqual(self.git("rev-parse", "HEAD"), head)
                 self.assertFalse(self.config.exists())
-
-    def test_refuses_plan_without_production_header(self) -> None:
-        _ = self.plan.write_text("# No production header\n", encoding="utf-8")
-        _ = self.git("add", "docs/plans/given.md")
-        _ = self.git("commit", "-m", "remove production header")
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertFalse((self.root / "project-alpha").exists())
-        self.assert_staff_units()
 
     def test_refuses_missing_production_field(self) -> None:
         original = self.doc.read_text()
@@ -831,10 +829,10 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def commit_brief_row(self) -> Path:
         stub = self.checkout / "docs/plans/build-followups-alpha.md"
         _ = stub.write_text(
-            "# Alpha\n\n> **Production: build-followups** — unit `alpha-unit`\n\n"
+            "# Alpha\n\n> **Production: build-followups** — unit `alpha`\n\n"
             + "## Source\n\nWrite a full plan.\n", encoding="utf-8")
         _ = self.git("add", "docs/plans/build-followups-alpha.md")
-        _ = self.git("commit", "-m", "production(build-followups): add unit alpha-unit (brief)")
+        _ = self.git("commit", "-m", "production(build-followups): add unit alpha (brief)")
         self.existing_config(unit_config.PlanFile(Path("docs/plans/build-followups-alpha.md")), "build-followups-alpha")
         return stub
 
@@ -851,13 +849,13 @@ class AddUnitLaunchTests(AddUnitTestCase):
         plan_head = self.git("rev-parse", "HEAD")
         self.assertNotEqual(plan_head, head)
         self.assertEqual(self.git("log", "-1", "--format=%s"),
-                         "production(build-followups): add unit alpha-unit (plan)")
+                         "production(build-followups): add unit alpha (plan)")
         self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), self.git("rev-parse", f"{head}^{{tree}}"))
-        self.assertIn("added alpha-unit (plan)", self.log.read_text())
+        self.assertIn("added alpha (plan)", self.log.read_text())
         prompts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]]
-        marked = unit_lookup.LabeledSession("alpha-unit",
+        marked = unit_lookup.LabeledSession("alpha",
             unit_lookup.LiveClaude("alpha", "plan-session-id", "/fixture/socket", 4242),
-            HerdrPlace("plan-host", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+            HerdrPlace("plan-host", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha").current_session))
 
         with patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)), \
                 patch.object(add_unit, "wait_for_remote_control", return_value=marked):
@@ -881,12 +879,12 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertNotEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual((self.root / "project-alpha/docs/plans/given.md").read_bytes(), self.plan.read_bytes())
         self.assertEqual(stub.read_bytes(), content)
-        self.assertIn("added alpha-unit (plan)", self.log.read_text())
+        self.assertIn("added alpha (plan)", self.log.read_text())
 
     def test_running_brief_refuses_plan_mode_before_any_write(self) -> None:
         stub = self.commit_brief_row()
         worktree = self.root / "project-alpha"
-        owner = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        owner = unit_membership("build-followups", "alpha")
         owner = staff.update_current_session(owner.current_session,
             staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         owner = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", worktree), expected=owner.worktree)
@@ -901,7 +899,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
             worktree / "docs/plans/build-followups-production.md",
             worktree / "docs/plans/build-followups-alpha.md",
         )}
-        marked = unit_lookup.LabeledSession("alpha-unit",
+        marked = unit_lookup.LabeledSession("alpha",
             unit_lookup.LiveClaude("alpha", owner.current_session, "/fixture/socket", 4242),
             HerdrPlace("brief-host", "w1:p1"), identity=unit_lookup.LiveSession(owner.current_session))
 
@@ -915,7 +913,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                         result = self.cli("alpha", "--plan", plan, *flags)
 
                     self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-                    self.assertIn("unit alpha-unit runs its brief in session brief-host; end that session, then run",
+                    self.assertIn("unit alpha runs its brief in session brief-host; end that session, then run",
                                   result.stderr)
                     self.assertIn(f"--plan {plan}", result.stderr)
                     self.assertEqual(self.repository_state(), repository)
@@ -947,7 +945,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                               "--cwd", str(worktree))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("plan docs/plans/missing.md is missing on build-followups or lacks the Production header",
+        self.assertIn("plan docs/plans/missing.md is missing on build-followups",
                       result.stderr)
         self.assertEqual(self.repository_state(), repository)
         self.assertEqual(self.git("log", "--format=%H:%s", "build-followups"), history)
@@ -967,7 +965,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         plan_path = "docs/plans/approved-later.md"
         late_plan = self.checkout / plan_path
         _ = late_plan.write_text(
-            "# Approved plan\n\n> **Production: build-followups** — unit `alpha-unit`\n\n"
+            "# Approved plan\n\n> **Production: build-followups** — unit `alpha`\n\n"
             + "## Phases\n\n1. Finish the unit.\n", encoding="utf-8")
         _ = self.git("add", plan_path)
         _ = self.git("commit", "-m", "approve the full plan")
@@ -992,7 +990,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("unit alpha-unit was added in standby mode; plan mode cannot reuse its row", result.stderr)
+        self.assertIn("unit alpha was added in standby mode; plan mode cannot reuse its row", result.stderr)
         self.assertIn("--standby", result.stderr)
         self.assertNotIn("already taken", result.stderr)
         self.assertEqual((self.doc.read_text(), self.git("rev-parse", "HEAD"), self.servers_started()), (original, head, []))
@@ -1057,22 +1055,22 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_remote_control_timeout_names_the_unit_and_place(self) -> None:
         request = add_unit.UnitLaunch(
-            production=read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            production=read_production(self.production_name), identity=add_unit.UnitIdentity("alpha", "alpha"),
             branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), session=add_unit.NewSession(), timeout=0,
         )
-        marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(),
+        marked = unit_lookup.LabeledSession("alpha", unit_lookup.ClaudeNotRunning(),
             HerdrPlace("native", "w1:p1"), identity=unit_lookup.LiveSession(fixture_runtime_id("remote-control-alpha")))
         errors = io.StringIO()
         with patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)), redirect_stderr(errors):
             with self.assertRaises(RuntimeError) as caught:
                 _ = add_unit.wait_for_remote_control(request)
-        self.assertEqual(str(caught.exception), "alpha-unit (herdr native:w1:p1): /remote-control did not become active")
-        self.assertEqual(errors.getvalue(), "anomaly: alpha-unit: registry has no remote-control evidence\n")
+        self.assertEqual(str(caught.exception), "alpha (herdr native:w1:p1): /remote-control did not become active")
+        self.assertEqual(errors.getvalue(), "anomaly: alpha: registry has no remote-control evidence\n")
 
     def test_remote_control_reads_the_session_registry(self) -> None:
         request = add_unit.UnitLaunch(
-            production=read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            production=read_production(self.production_name), identity=add_unit.UnitIdentity("alpha", "alpha"),
             branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), session=add_unit.NewSession(), timeout=0,
         )
@@ -1081,8 +1079,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         place = HerdrPlace("native", "w1:p1")
         live = unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/socket", 4242)
         identity = unit_lookup.LiveSession(live.session_id)
-        starting = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(), place, identity=identity)
-        marked = unit_lookup.LabeledSession("alpha-unit", live, place, identity=identity)
+        starting = unit_lookup.LabeledSession("alpha", unit_lookup.ClaudeNotRunning(), place, identity=identity)
+        marked = unit_lookup.LabeledSession("alpha", live, place, identity=identity)
         cases: tuple[tuple[str, dict[str, str], bool], ...] = (
             ("bridged", {"bridgeSessionId": "session_bridge"}, True),
             ("no bridge", {}, False),
@@ -1104,7 +1102,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                     else:
                         with self.assertRaisesRegex(RuntimeError, "did not become active$"):
                             _ = add_unit.wait_for_remote_control(request)
-                        self.assertEqual(errors.getvalue(), "anomaly: alpha-unit: registry has no remote-control evidence\n")
+                        self.assertEqual(errors.getvalue(), "anomaly: alpha: registry has no remote-control evidence\n")
 
     def test_underscore_name_and_checkout_without_trunk_suffix(self) -> None:
         renamed = self.root / "project"

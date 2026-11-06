@@ -54,10 +54,7 @@ import tempfile
 import time
 from typing import Literal, TextIO, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_group
 from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.production import change_review, staff  # noqa: E402
@@ -393,21 +390,13 @@ def interrupted(signum: int, _frame: object) -> None:
 
 
 @contextmanager
-def rollback_signals(*, defer: bool = False) -> Generator[None, None, None]:
-    pending: list[int] = []
-
-    def record(signum: int, _frame: object) -> None:
-        pending.append(signum)
-
-    signals = (*ROLLBACK_SIGNALS, signal.SIGINT) if defer else ROLLBACK_SIGNALS
-    previous = {sig: signal.signal(sig, record if defer else interrupted) for sig in signals}
+def rollback_signals() -> Generator[None, None, None]:
+    previous = {sig: signal.signal(sig, interrupted) for sig in ROLLBACK_SIGNALS}
     try:
         yield
     finally:
         for sig, handler in previous.items():
             _ = signal.signal(sig, handler)
-    if pending:
-        signal.raise_signal(pending[0])
 
 
 def fetch_branches(repo: Path, *branches: str) -> None:
@@ -591,7 +580,7 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
     """Collect the leader's status and CPU once, including children it waited for."""
     if job.process.returncode is not None:
         return
-    with rollback_signals(defer=True):
+    with build_folders.defer_signals():
         pid, status, usage = os.wait4(job.process.pid, 0 if block else os.WNOHANG)
         if pid:
             job.process.returncode = os.waitstatus_to_exitcode(status)
@@ -608,22 +597,24 @@ def kill_job_group(job: RunningGateJob) -> None:
     reap_gate_job(job, block=True)
 
 
-def stop_gate_job(job: RunningGateJob) -> None:
-    """Stop the group and reap its leader before capacity returns."""
+def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
+    """Stop all groups with one deadline, then reap their leaders."""
     config = memory_admit.read_memory_config()
-    try:
-        process_group.send_process_group(job.process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
     deadline = time.monotonic() + config.program_stop_seconds
-    while job.process.returncode is None:
-        reap_gate_job(job)
+    for job in jobs:
+        try:
+            process_group.send_process_group(job.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    while True:
+        for job in jobs:
+            reap_gate_job(job)
         remaining = deadline - time.monotonic()
-        if job.process.returncode is not None or remaining <= 0:
+        if remaining <= 0 or all(job.process.returncode is not None for job in jobs):
             break
         time.sleep(min(config.program_sample_seconds, remaining))
-    # Kill surviving group members even when the leader has exited.
-    kill_job_group(job)
+    for job in jobs:
+        kill_job_group(job)
 
 
 def one_minute_load() -> float:
@@ -661,7 +652,7 @@ def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str
     tools = root / "build-tool-tripwires"
     tools.mkdir()
     marker = root / "build-tool-calls.jsonl"
-    script = f"""#!{sys.executable}
+    script = f"""#!{Path(__file__).resolve().parents[1] / "lib/py"}
 import fcntl, json, sys
 with open({str(marker)!r}, "a") as output:
     fcntl.flock(output, fcntl.LOCK_EX)
@@ -932,9 +923,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     if not modules:
         raise GateRefused("the test list is empty")
     runner = module_runner(repo)
-    tmpfs = Path("/dev/shm")
+    tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
+        raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
     hold = BuildHoldWait()
     hold.wait_until_free()
     initial_hold_seconds = hold.seconds
@@ -1070,7 +1061,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, str(runner), str(path.parent), path.name])
-                    with rollback_signals(defer=True):
+                    with build_folders.defer_signals():
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
@@ -1145,9 +1136,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            with rollback_signals(defer=True):
+            with build_folders.defer_signals():
+                stop_gate_jobs(running)
                 for job in running:
-                    stop_gate_job(job)
                     job.output.close()
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
@@ -1340,7 +1331,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    remote_check = "./scripts/lib/py -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
               f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
@@ -1381,7 +1372,7 @@ def notify_style(repo: Path, branch: str, tip: str) -> None:
     try:
         script = (os.environ.get("MERGE_GATE_STYLE_SYNC") or shutil.which("style_sync.py")
                   or str(Path(__file__).resolve().parents[1] / "style/style_sync.py"))
-        python = shutil.which("python3") or sys.executable
+        python = str(Path(__file__).resolve().parents[1] / "lib/py")
         _ = sys.stdout.flush()
         result = subprocess.run(
             [python, script, "notify", "--repo-dir", str(repo), "--branch", branch, "--tip", tip],
@@ -1531,7 +1522,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
 
 
 def nightly_owner(args: GateArguments) -> str:
-    from scripts.production import session_staff, showrunners, staff
+    from scripts.production import session_staff, showrunners, staff, unit_lookup
     from scripts.shutdown import remote
 
     try:
@@ -1547,7 +1538,7 @@ def nightly_owner(args: GateArguments) -> str:
         if len(matching) != 1:
             return copies.fallback_owner("nightly")
         doc = matching[0]
-    return showrunners.production_slug(str(doc))
+    return unit_lookup.doc_owner(doc, staff.snapshot()).name
 
 
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
@@ -1614,7 +1605,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
-                            help="the production doc whose header names the list (default: the calling showrunner's)")
+                            help="the production staff name (default: the calling showrunner's)")
     _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
     _ = parser.add_argument("--promote", action="store_true")
     _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")

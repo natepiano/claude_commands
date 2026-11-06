@@ -590,7 +590,7 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(status, 0)
             lines = short.splitlines()
             self.assertLessEqual(len(lines), 60)
-            self.assertTrue(lines[0].startswith("From model-study-unit: INTERIM director model study"))
+            self.assertTrue(lines[0].startswith("From model-study: INTERIM director model study"))
             verdict_at = lines.index("Verdict:")
             measures = lines[1:verdict_at]
             shown = [line.split(":", 1)[0] for line in measures if line.startswith("director_")]

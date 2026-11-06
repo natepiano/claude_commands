@@ -5,14 +5,22 @@ import json
 import os
 import shutil
 import subprocess
+import unittest
+from collections.abc import Callable
 from pathlib import Path
-from typing import TypedDict, cast, final
+from typing import TextIO, TypedDict, cast, final, override
 from unittest.mock import patch
 
 from scripts.agents import test_codex_mesh as mesh_fixture
-from scripts.direct.assign_launcher_test_support import ASSIGN, AssignLauncherFixture, LauncherScript, read_object
+from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
 from scripts.direct import assign
 from scripts.direct.findings_test_support import invoke_findings
+import herdr
+
+from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
+from scripts.production.cli_fixture import invoke_cli
+from scripts.direct import progress_history
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import style_review
 
 
@@ -27,7 +35,188 @@ class RepairState(TypedDict):
 
 
 @final
+class PaneReviewLauncherTests(unittest.TestCase):
+    """The assignment launcher uses the real dispatch and its transcript receipts."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.fixture = worker_fixture.WorkerCommandTests("runTest")
+        self.ready = Path()
+        self.phase = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.ready = self.fixture.run_dir / "final.ready"
+        self.phase = self.fixture.run_dir / "phases/8"
+        write_text_atomic(self.fixture.run_dir / "worker_transport", "herdr\n")
+        write_text_atomic(self.fixture.prompt, "Phase 8 — Workers\nReview Stage 1, then review the final diff in Stage 2.\n")
+        opened = self.fixture.opened("impl", "impl")
+        _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="impl", phase="8", role="impl",
+            worker_name="impl", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run_worker_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) > 1 and Path(command[1]).resolve() == ROOT / "scripts/production/worker.py":
+                result = invoke_cli(worker, lambda: worker.main(command[2:]), command[2:],
+                                    cast(dict[str, str], options["env"]), ROOT)
+                output = cast(TextIO, options["stdout"])
+                _ = output.write(result.stdout + result.stderr)
+                return result
+            return run_process(command, **options)
+
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run_worker_command))
+        _ = self.enterContext(patch.object(assign, "require_live_director"))
+
+    def launch_review(self) -> subprocess.CompletedProcess[str]:
+        arguments = ["--role", "review", "--to", "review", "--cwd", str(self.fixture.fixture.root),
+                     "--phase", "8", "--session-dir", str(self.fixture.run_dir),
+                     "--prompt", str(self.fixture.prompt), "--early-ready", str(self.ready)]
+        return invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+
+    def test_review_stage_two_uses_its_own_done_line_and_reuses_both_receipts(self) -> None:
+        reports: list[str] = []
+        summary = self.phase / "review_summary_1.txt"
+        summary.parent.mkdir(parents=True)
+        write_text_atomic(summary, "The previous full report.\n")
+
+        def final_diff_ready() -> None:
+            if len(self.fixture.agent.submitted) == 1:
+                write_text_atomic(self.ready.with_suffix(".diff"), "+the final change\n")
+                write_text_atomic(self.ready, "ready\n")
+            else:
+                reports.append(summary.read_text())
+
+        self.fixture.agent.during_prompt = final_diff_ready
+        prompt = self.fixture.prompt.read_bytes()
+        result = self.launch_review()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first, second = self.fixture.agent.submitted
+        self.assertEqual(first[0], second[0])
+        dispatch_id = first[1].split("DONE ")[-1].split(".")[0]
+        self.assertIn(f"DONE {dispatch_id}-2.", second[1])
+        self.assertIn(str(self.ready.with_suffix(".diff")), second[1])
+        self.assertEqual(reports, ["The previous full report.\n"])
+        self.assertTrue(summary.read_text().endswith(f"DONE {dispatch_id}-2\n"))
+        self.assertEqual((self.phase / "review_status_1").read_text(), "done\n")
+        panes = self.fixture.fixture.world.locations.copy()
+        repeated = self.launch_review()
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.fixture.agent.submitted, [first, second])
+        self.assertEqual(self.fixture.fixture.world.locations, panes)
+        self.assertEqual(self.fixture.prompt.read_bytes(), prompt)
+
+    def test_review_stage_two_retry_waits_for_the_submitted_turn_without_another_prompt(self) -> None:
+        def interrupt_stage_two() -> None:
+            if len(self.fixture.agent.submitted) == 1:
+                write_text_atomic(self.ready, "ready\n")
+            else:
+                pane = self.fixture.agent.submitted[-1][0]
+                self.fixture.fixture.world.locations[pane]["agent_status"] = "working"
+                self.fixture.agent.interrupt = "prompt"
+                self.fixture.agent.finish_after = 1
+
+        self.fixture.agent.during_prompt = interrupt_stage_two
+        first = self.launch_review()
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        submitted = self.fixture.agent.submitted.copy()
+        self.assertEqual(len(submitted), 2)
+        self.fixture.agent.during_prompt = lambda: None
+        repeated = self.launch_review()
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.fixture.agent.submitted, submitted)
+        self.assertEqual(self.fixture.agent.waited, [submitted[-1][0]])
+        second_id = submitted[-1][1].split("DONE ")[-1].split(".")[0]
+        self.assertTrue((self.phase / "review_summary_1.txt").read_text().endswith(f"DONE {second_id}\n"))
+
+    def test_review_stage_one_done_does_not_complete_stage_two_or_replace_the_report(self) -> None:
+        def omit_stage_two_done() -> None:
+            if len(self.fixture.agent.submitted) == 1:
+                write_text_atomic(self.ready, "ready\n")
+            else:
+                self.fixture.agent.without_done = True
+
+        self.fixture.agent.during_prompt = omit_stage_two_done
+        summary = self.phase / "review_summary_1.txt"
+        summary.parent.mkdir(parents=True)
+        write_text_atomic(summary, "The previous full report.\n")
+        result = self.launch_review()
+        self.assertEqual(result.returncode, worker.ExitCode.NO_DONE, result.stdout + result.stderr)
+        self.assertEqual(len(self.fixture.agent.submitted), 2)
+        self.assertEqual(summary.read_text(), "The previous full report.\n")
+        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+        state = read_object(self.fixture.run_dir / "progress_history_state.json")
+        self.assertEqual(assign.object_map(assign.object_map(state["pass"])["review"])["status"], "active")
+
+    def assert_start_not_delivered(self, code: worker.ExitCode, reason: str) -> None:
+        result = self.launch_review()
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        self.assertIn(reason, (self.phase / "review_agent_1.log").read_text())
+        self.assertEqual(self.fixture.agent.submitted, [])
+        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+
+    def test_review_incomplete_start_keeps_the_pane_without_either_stage(self) -> None:
+        self.fixture.fixture.world.outcome = herdr.PromptNotSubmitted("startup hook failed")
+        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "incomplete startup: startup hook failed")
+        self.assertEqual(len(self.fixture.fixture.world.launches), 2)
+        self.assertEqual(self.fixture.fixture.world.closed, [])
+
+    def test_review_failed_publication_keeps_the_backend_without_either_stage(self) -> None:
+        rows = staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id)
+        with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("publication unavailable")):
+            self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication refused: publication unavailable")
+        self.assertIn("review: publication failed: staff: review:", (self.phase / "review_agent_1.log").read_text())
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id), rows)
+        self.assertEqual(len(self.fixture.fixture.world.launches), 2)
+        self.assertEqual(self.fixture.fixture.world.closed, [])
+
+    def test_review_admission_failure_sends_neither_stage(self) -> None:
+        launches = self.fixture.fixture.world.launches.copy()
+        with patch.object(worker_admission, "worker_operation", side_effect=worker_admission.AdmissionRefused("admission unavailable")):
+            self.assert_start_not_delivered(worker.ExitCode.REFUSED, "staff: review: not opened: admission unavailable")
+        self.assertEqual(self.fixture.fixture.world.launches, launches)
+
+    def test_review_unknown_process_keeps_the_worker_without_either_stage(self) -> None:
+        opened = self.fixture.opened("review", "review")
+        self.fixture.fixture.world.unknown[opened.pane] = "native reader unavailable"
+        before = self.fixture.fixture.staff_state()
+        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "native reader unavailable")
+        self.assertEqual(self.fixture.fixture.staff_state(), before)
+
+    def test_review_missing_terminal_keeps_the_worker_without_either_stage(self) -> None:
+        opened = self.fixture.opened("review", "review")
+        self.fixture.fixture.world.locations[opened.pane]["terminal_id"] = ""
+        before = self.fixture.fixture.staff_state()
+        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "terminal")
+        self.assertEqual(self.fixture.fixture.staff_state(), before)
+
+    def test_review_role_refusal_keeps_the_active_worker_and_types_neither_stage(self) -> None:
+        opened = self.fixture.opened("review", "impl")
+        _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="review", phase="8", role="impl",
+            worker_name="review", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
+        before = self.fixture.fixture.staff_state()
+        self.assert_start_not_delivered(worker.ExitCode.REFUSED, "role change blocked by active work: active dispatch has another role")
+        self.assertEqual(self.fixture.fixture.staff_state(), before)
+        self.assertIn(opened.pane, self.fixture.fixture.world.foreground)
+        self.assertEqual(self.fixture.fixture.world.stops, [])
+
+
+@final
 class AssignLauncherTests(AssignLauncherFixture):
+    def test_herdr_assignment_retains_unknown_workers_without_a_mesh_backend(self) -> None:
+        _ = (self.session_dir / "worker_transport").write_text("herdr\n")
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        prompt = self.prompt.read_bytes()
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            result = self.launch(execution=LauncherScript(ASSIGN))
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertEqual(self.prompt.read_bytes(), prompt)
+        self.assertEqual((self.session_dir / "phases/7/impl_status").read_text(), "error\n")
+
     def finding_command(self, verb: str, *options: str, phase: str = "7") -> str:
         result = invoke_findings([verb, "--session-dir", str(self.session_dir), "--phase", phase, *options],
                                  os.environ.copy(), self.project)
@@ -161,6 +350,9 @@ class AssignLauncherTests(AssignLauncherFixture):
         passes = [event for event in self.events() if event.get("event_type") == "pass_started"]
         self.assertEqual([event["worker_id"] for event in passes], [worker["staff_id"]])
         self.assertEqual([event["worker_name"] for event in passes], [name])
+        command = cast(list[str], passes[0]["launcher_command"])
+        self.assertEqual(command[:4], ["bash", str(ASSIGN), "--role", "implement"])
+        self.assertEqual(command[command.index("--session-dir") + 1], str(self.session_dir))
 
     def test_only_a_live_claude_or_codex_ancestor_permits_assignment(self) -> None:
         for family in ("claude", "codex"):

@@ -73,7 +73,7 @@ class WasteWatchTests(unittest.TestCase):
         owner = recorded_showrunner("watch", showrunner_doc)
         _ = fixture_unit_location(owner, "alpha", self.worktree)
         self.lookup = waste_watch.ShowrunnersFound((waste_watch.Showrunner(
-            "watch", ADDRESS, usage_report.document_units(showrunner_doc)),))
+            "watch", ADDRESS, usage_report.document_units(owner)),))
         self.lookups = 0
 
         def registered(*, resolver: session_staff.RowResolver | None = None) -> waste_watch.ShowrunnerLookup:
@@ -126,7 +126,7 @@ class WasteWatchTests(unittest.TestCase):
             found = REAL_DISCOVERY()
         self.assertIsInstance(found, waste_watch.ShowrunnersFound)
         assert isinstance(found, waste_watch.ShowrunnersFound)
-        self.assertEqual([runner.slug for runner in found.showrunners], ["watch"])
+        self.assertEqual([runner.name for runner in found.showrunners], ["watch"])
         self.assertEqual(errors.getvalue().splitlines(), ["warning: docless: the production document is not recorded"])
 
     def test_partial_discovery_keeps_the_lookup_unknown_instead_of_complete(self) -> None:
@@ -247,7 +247,7 @@ class WasteWatchTests(unittest.TestCase):
         self.wait("worker", 1, 500_000)
         for lookup, reason in (
                 (waste_watch.ShowrunnersFound((waste_watch.Showrunner(
-                    "watch", "", usage_report.document_units(self.root / "elsewhere/watch-production.md")),)),
+                    "watch", "", usage_report.document_units(showrunners.owner_for("watch"))),)),
                  "showrunner watch is not running"),
                 (waste_watch.ShowrunnerLookupFailed("showrunner lookup failed: invented"),
                  "showrunner lookup failed: invented")):

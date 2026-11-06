@@ -63,7 +63,7 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         _ = self.held_proposal(read, self.sources[0])
         ledger = self.ledger()
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [self.sources[0]], [read])
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[0]], [read])
         ledger.ticket_assign("1", "demo-style-names")
         rule_file = self.rule_dir / "read.md"
         _ = rule_file.write_text(rule_file.read_text() + "Changed body.\n")
@@ -79,7 +79,7 @@ class StylePlanTests(StylePlanFixture):
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='1'").fetchone(), ("dropped",))
         self.assertIsInstance(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Withdrawn)
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit"))[0]["files"], [self.sources[0]])
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["files"], [self.sources[0]])
 
     def test_old_held_judgment_does_not_hide_a_current_body_finding(self) -> None:
         read = self.rule("read")
@@ -139,7 +139,7 @@ class StylePlanTests(StylePlanFixture):
         self.write(self.sources[2], "pub fn other_crate_on_main() {}\n")
         _ = self.commit()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["crate"], ticket["base"]), ("crates/alpha", self.tip))
         self.assertEqual(ticket["files"], list(self.sources[:2]))
         self.assertEqual(self.sync_wait_rows(), [])
@@ -152,7 +152,7 @@ class StylePlanTests(StylePlanFixture):
             self.write(path, content + "# incoming build input\n")
         _ = self.commit()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["base"]), (list(self.sources[:2]), self.tip))
         self.assertEqual(self.sync_wait_rows(), [])
 
@@ -191,7 +191,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.git("mv", self.sources[2], "crates/beta/src/moved.rs")
         _ = self.commit()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["base"], self.tip)
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["base"], self.tip)
         self.assertEqual(self.sync_wait_rows(), [])
 
     def test_refill_starts_after_a_copy_in_another_crate(self) -> None:
@@ -200,7 +200,7 @@ class StylePlanTests(StylePlanFixture):
         self.write("crates/beta/src/copied.rs", (self.repo / self.sources[2]).read_text())
         _ = self.commit()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["base"], self.tip)
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["base"], self.tip)
         self.assertEqual(self.sync_wait_rows(), [])
 
     def test_main_changes_reads_a_weak_copy_as_an_added_path(self) -> None:
@@ -296,13 +296,13 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("read")
         self.sync()
         ledger = self.ledger()
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [self.sources[0]], [rule])
         self.write(self.sources[0], "pub fn changed_on_main() {}\n")
         _ = self.commit()
         self.assertEqual(self.run_next(), (
             3, f"waiting for sync: read crates/alpha: main touched {self.sources[0]}\n", ""))
-        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names-unit"))], ["1"])
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit")), ())
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names"))], ["1"])
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names")), ())
 
     def test_refill_holds_the_selected_decision_before_starting_it(self) -> None:
         rule = self.rule("read")
@@ -327,7 +327,7 @@ class StylePlanTests(StylePlanFixture):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors + output)
         start.assert_called_once()
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["proposal"], ticket["files"], ticket["base"]),
                          ("proposal", str(issue), list(self.sources[:1]), self.tip))
         self.assertEqual(self.sync_wait_rows(), [])
@@ -352,7 +352,7 @@ class StylePlanTests(StylePlanFixture):
         issue = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),))
         ledger = self.ledger()
         finding = ledger.proposal_findings(issue)[0]
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [finding.path], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [finding.path], [rule],
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         path = "crates/alpha/src/gauge.rs"
         self.write(path, "pub fn level() { crate::probe::sample(); }\n")
@@ -361,8 +361,8 @@ class StylePlanTests(StylePlanFixture):
             self.assertEqual(self.run_next(), (
                 3, f"waiting for sync: proposal crates/alpha: main touched {path}\n", ""))
         start.assert_not_called()
-        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names-unit"))], ["1"])
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit")), ())
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names"))], ["1"])
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names")), ())
 
     def test_refill_holds_when_the_selected_footprint_at_main_cannot_be_read(self) -> None:
         rule = self.rule("read")
@@ -390,13 +390,13 @@ class StylePlanTests(StylePlanFixture):
         self.write(path, "pub fn before() {}\n")
         self.commit_to_every_checkout()
         ledger = self.ledger()
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
         self.write(path, "pub fn after() {}\n")
         _ = self.commit()
         self.assertEqual(self.run_next(), (
             3, f"waiting for sync: read crates/alpha: main touched {path}\n", ""))
-        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names-unit"))], ["1"])
-        self.assertEqual(ledger.ticket_open(ticket_owner_id("names-unit")), ())
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names"))], ["1"])
+        self.assertEqual(ledger.ticket_open(ticket_owner_id("names")), ())
 
     def test_main_changes_refuses_a_path_that_cannot_cross_the_ledger_text_boundary(self) -> None:
         path = os.fsdecode(b"crates/alpha/src/non_utf8_\xff.rs")
@@ -434,7 +434,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.git("merge", "--no-ff", "-qm", "Integration", "style/main")
         _ = self.git("push", "-q", "origin", "main")
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["base"], self.tip)
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["base"], self.tip)
         self.assertEqual(self.sync_wait_rows(), [])
 
     def test_refill_selects_work_after_sync_merges_the_branch_point_into_a_distinct_style_tip(self) -> None:
@@ -457,13 +457,13 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
         before = self.plan.read_bytes()
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.write("README.md", "Branch point moved during an assigned ticket.\n")
         _ = self.commit()
         with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read on resume")):
             self.assertEqual(self.run_next(), (0, "resume 1\n", ""))
         self.assertEqual(self.plan.read_bytes(), before)
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0], ticket)
+        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0], ticket)
         self.assertEqual(self.count_tickets(), 1)
         self.assertEqual(self.sync_wait_rows(), [])
 

@@ -4,7 +4,7 @@ Usage: counts_row.py <notifier instance dir>
 
 statusline.sh runs this only when the cache is older than a file it was read from, or a deferred
 question has fallen due, so a render runs no Python while nothing changed. The cache is
-`<showrunner state>/counts/<slug>`:
+`<showrunner state>/counts/<staff id>`:
 
   line 1  the counts line, empty when nothing is counted;
   line 2  the epoch second the soonest deferred question falls due, empty when none is deferred;
@@ -27,8 +27,8 @@ from scripts.production import staff
 from scripts.production.update_registration import QuestionStaff
 
 
-def cache_path(slug: str) -> Path:
-    return showrunner_footer.state_root() / "counts" / slug
+def cache_path(name: str) -> Path:
+    return showrunner_footer.state_root() / "counts" / name
 
 
 def watched(path: Path) -> Path:
@@ -57,7 +57,9 @@ def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str
     sources.extend(footer_counts.sources(production.doc, identities=identities))
     sources.extend(footer_counts.routing_sources(identities.record))
     try:
-        owner = identities.owner(production.doc)
+        owner = production.owner
+        if identities.record.by_id(owner.id) is None:
+            raise RegistrationFailure("questions", f"{production.doc}: no showrunner staff row")
     except (RegistrationFailure, staff.StaffRefused) as error:
         print(f"questions: unavailable — {error}", file=sys.stderr)
         line = footer_counts.counts_line(footer_counts.read_counts(production.doc, record=identities.record)) or ""

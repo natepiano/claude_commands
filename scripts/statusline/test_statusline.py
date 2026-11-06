@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +16,7 @@ from typing import NotRequired, TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
-from scripts.production import session_labels, showrunners, staff
+from scripts.production import session_labels, staff
 from scripts.shutdown import remote
 from scripts.statusline import assignment, rebuild_row
 
@@ -549,7 +548,7 @@ class RoleTests(unittest.TestCase):
         rows = (OWNER, UNIT, WORKER)
         for members in (rows, (*rows, other, duplicate)):
             _ = self.write_staff(*members)
-            reader = session_labels.StaffLabels(staff.StaffSnapshot(members), {}, {})
+            reader = session_labels.StaffLabels(staff.StaffSnapshot(members))
             for identity, name in (("", "trunk"), ("", "trunk-unit"), ("", "trunk_unit"),
                                    ("", "show"), ("", "missing"), ("", "bad name"),
                                    (UNIT.id, "show"), (OWNER.id, "trunk"), (WORKER.id, "trunk"),
@@ -582,13 +581,11 @@ class RoleTests(unittest.TestCase):
         unit = replace(UNIT, name="geometry-material", worktree=staff.PresentWorktree(machine, Path(folder)))
         other = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "showrunner", "other", staff.StaffRoot(), current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
         duplicate = replace(unit, id=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), parent=staff.ReportsTo(other.id))
-        source = showrunners.ShowrunnerSource(showrunners.Timer("different-slug", "session:runner-id", doc, "UTC"), "")
-        sources = {source.timer.slug: source}
-        instance = self.home / ".local/state/notifier/showrunner-different-slug"
+        instance = self.home / f".local/state/notifier/showrunner-{runner.id}"
         instance.mkdir(parents=True)
         _ = doc.write_text("# Production\n")
         _ = (instance / "conf").write_text(
-            f"TARGET=session:runner-id\nCHECK=zsh /scripts/production_check.sh {shlex.quote(str(doc))}\n")
+            f"TARGET=session:{runner.id}\nCHECK=zsh /scripts/production_check.sh {runner.id}\n")
         cases: list[tuple[str, tuple[staff.StaffRow, ...], dict[str, str], str, str, str, str]] = [
             ("folder gives no identity", (runner, unit, other), {}, "own-id", "other", folder, ""),
             ("timer gives no identity", (runner, unit, other), {}, "runner-id", "other", folder, ""),
@@ -616,7 +613,7 @@ class RoleTests(unittest.TestCase):
                 path = self.write_staff(*rows)
                 # Exercise the schema emitted by staff's current writer.
                 _ = path.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
-                reader = session_labels.StaffLabels(staff.StaffSnapshot(rows), sources, {source.timer.slug: runner})
+                reader = session_labels.StaffLabels(staff.StaffSnapshot(rows))
                 resolved = reader.environment(environment, session_id)
                 row = reader.record.by_id(staff.StaffId(resolved.get("CLAUDE_CODE_SESSION_ID", "")))
                 self.assertEqual(row.id if row is not None else "", expected)
@@ -680,7 +677,7 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(self.role(), "unassigned")
 
     def test_notifier_timers_and_inherited_environment_do_not_assign_a_session(self) -> None:
-        self.timer("showrunner-show", "session:aaaa-1111")
+        self.timer(f"showrunner-{OWNER.id}", f"session:{OWNER.id}")
         self.assertEqual(self.role(SHOWRUNNER_UNIT="show", UNIT_TEAM_ROLE="impl"), "unassigned")
 
     def test_the_account_label_follows_the_role(self) -> None:
@@ -719,11 +716,11 @@ class CountsRowTests(unittest.TestCase):
         self.ledger = self.home / "ledger.md"
         _ = doc.write_text("# show\n\n> **Status: PRODUCTION — running**\n"
                            + f"- **Improvement queue:** {self.ledger}\n", encoding="utf-8")
-        instance = self.home / ".local/state/notifier/showrunner-show"
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
         instance.mkdir(parents=True)
-        _ = (instance / "conf").write_text(f"TARGET=session:{OWNER.id}\nCHECK=zsh /x/production_check.sh {doc}\n",
+        _ = (instance / "conf").write_text(f"TARGET=session:{OWNER.id}\nCHECK=zsh /x/production_check.sh {OWNER.id}\n",
                                            encoding="utf-8")
-        self.cache = self.home / ".local/state/showrunner/counts/show"
+        self.cache = self.home / f".local/state/showrunner/counts/{OWNER.id}"
         path = self.home / ".local/state/staff/staff.json"
         path.parent.mkdir(parents=True)
         _ = path.write_text(staff_text(replace(OWNER, doc=staff.LiveDoc("natedev", doc))), encoding="utf-8")

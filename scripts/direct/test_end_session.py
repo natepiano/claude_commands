@@ -45,7 +45,7 @@ class EndSessionTests(unittest.TestCase):
         session_id = fixture_runtime_id(f"end-session:{self.root.name}")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         owner = fixture_member("showrunner", name="end-owner")
-        _ = fixture_member("unit", name="end-unit", parent=owner.id, runtime_id=session_id)
+        _ = fixture_member("unit", name="end", parent=owner.id, runtime_id=session_id)
         active_root = self.root / "active"
         active_root.mkdir()
         self.marker = active_root / session_id
@@ -144,7 +144,7 @@ class EndSessionTests(unittest.TestCase):
         parent = membership.by_current_session(director)
         if parent is None:
             owner = next(row for row in membership.find(kind="showrunner") if row.name == "end-owner")
-            parent = fixture_member("unit", name="other-unit", parent=owner.id,
+            parent = fixture_member("unit", name="other", parent=owner.id,
                                     runtime_id=fixture_runtime_id(director))
         _ = (run / "progress_history_state.json").write_text(
             json.dumps({"owner_staff_id": parent.id}), encoding="utf-8")

@@ -351,7 +351,7 @@ print('complete', flush=True)
 
 class UnitConfigTests(UnitConfigFixture):
     def test_responsibilities_accept_names_and_paths_and_reject_invalid_values(self) -> None:
-        responsibilities = ("nightly-review", "scripts/production/", "settings.json", config.BOARD_FREE)
+        responsibilities = ("nightly-review", "scripts/production/", "settings.json")
         value = config.UnitConfig(config.StandbyPlan(), config.NoAppPort(), responsibilities)
         self.assertEqual(value.responsibilities, tuple(sorted(responsibilities)))
         for invalid in ("", "all production scripts", "../outside", "/absolute", "scripts/../outside"):

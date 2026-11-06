@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for fixture parsing and one isolated machine memory sample."""
 
 from __future__ import annotations
@@ -8,15 +8,12 @@ import os
 import re
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.buildlog import cli
 from scripts.buildlog import index
@@ -24,12 +21,8 @@ from scripts.buildlog import sample
 from scripts.buildlog import store
 from scripts.buildlog.cgroup_test_support import CPU, GIB, ZRAM_READING, write_cgroup, write_zram
 from scripts.buildlog.test_index import use_test_log
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lib.cargo_output_test_support import fake_cargo_output_roots
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib import test_hang_guard
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 use_test_log()
 
@@ -103,8 +96,8 @@ class SampleTests(unittest.TestCase):
             "import sys; from scripts.buildlog import sample; "
             "reading = sample.filesystem_reading(); "
             "assert reading['state'] == 'measured', reading; "
-            "assert 'disk' not in sys.modules, 'filesystem reading imported disk'; "
-            "assert 'sweep' not in sys.modules, 'filesystem reading imported sweep'"
+            "assert 'scripts.buildlog.disk' not in sys.modules, 'filesystem reading imported disk'; "
+            "assert 'scripts.buildlog.sweep' not in sys.modules, 'filesystem reading imported sweep'"
         )
         result = subprocess.run(
             [str(CLI.parents[1] / "lib/py"), "-c", command],

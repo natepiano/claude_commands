@@ -229,8 +229,10 @@ class ProductionPathsTests(unittest.TestCase):
             owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc("natedev", document))
             _ = fixture_member("unit", name="a", parent=owner.id,
                                worktree=staff.PresentWorktree("natedev", branch_worktree))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent, staff.snapshot())), (owner,))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent / "other", staff.snapshot())), ())
             self.assertEqual(
-                outcomes.production_paths(document),
+                outcomes.production_paths(owner),
                 (Path("/repo/main"), branch_worktree),
             )
 
@@ -255,7 +257,7 @@ class ProductionPathsTests(unittest.TestCase):
         _ = fixture_member("unit", name="a", parent=owner.id,
                            worktree=staff.PresentWorktree("natedev", worktree))
         self.assertEqual(
-            outcomes.production_paths(document),
+            outcomes.production_paths(owner),
             (repository, worktree),
         )
 
@@ -1083,7 +1085,8 @@ from scripts.production.staff_test_support import StaffTestCase
 class BranchRepositoryLocationTests(StaffTestCase):
     def test_repository_discovery_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        self.assertEqual(outcomes.production_paths(fixture.doc), (fixture.doc.parents[1], fixture.worktree))
+        with patch.object(staff.StaffSnapshot, "by_doc", side_effect=AssertionError("repeated owner lookup")):
+            self.assertEqual(outcomes.production_paths(fixture.runner), (fixture.doc.parents[1], fixture.worktree))
 
 
 if __name__ == "__main__":

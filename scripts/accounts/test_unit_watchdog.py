@@ -115,7 +115,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(patch.object(unit_lookup, "runs_dir", return_value=self.runs))
         _ = self.enterContext(patch.object(unit_lookup, "every_labeled_session", side_effect=self.marked))
         _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([
-            showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", slug="fixture", zone="UTC", doc=str(self.doc))])))
+            showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", name="fixture", zone="UTC", doc=str(self.doc))])))
         _ = self.enterContext(patch.object(showrunners, "tell", side_effect=self.tell))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
@@ -147,7 +147,7 @@ class UnitWatchdogTests(unittest.TestCase):
             if name in self.finished:
                 events.append({"event_type": "run_finished"})
             _ = (self.runs / (name + ".jsonl")).write_text("\n".join(json.dumps(event) for event in events))
-        _ = self.doc.write_text("# Fixture\n- **Production slug:** fixture\n")
+        _ = self.doc.write_text("# Fixture\n")
 
     def add_unit(self, name: str, *, label: str = "claude4") -> inventory.Session:
         owner = self.fixture.owner(name, host="unit", label=label)
@@ -183,7 +183,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.fixture.live.append(sessions.SessionRecord(pid=owner["pid"], sessionId=identity, name=owner["name"],
             procStart=owner["proc_start"], messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]))
 
-    def tell(self, _slug: str, _key: str, text: str) -> str:
+    def tell(self, _name: str, _key: str, text: str) -> str:
         self.notices.append(text)
         return "told fixture"
 
@@ -242,7 +242,7 @@ class UnitWatchdogTests(unittest.TestCase):
             first_seen=NOW.isoformat(), alert_context=unit_watchdog.RecoveryOwner(production="missing", unit="beta"),
             job=unit_watchdog.RecoveryJob(result=str(self.home / "pending-result"), started=NOW.isoformat(), source="fixture"))
         unit_watchdog._write_state(saved)  # pyright: ignore[reportPrivateUsage]
-        runner = showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", slug="fixture",
+        runner = showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", name="fixture",
                                        zone="UTC", doc=str(self.doc))
         partial = showrunners.ShowrunnerDiscovery([runner], (
             showrunners.ShowrunnerLookupFailure("missing", "fixture lookup unavailable"),))
@@ -632,7 +632,7 @@ class UnitWatchdogTests(unittest.TestCase):
               herdr.process_snapshot()):
             self.assertEqual(herdr.herdr_processes(), [])
             processes.append(fresh)
-            self.assertEqual(unit_watchdog._live_account(self.doc, "unit"), "claude4")  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(unit_watchdog._live_account("fixture", "unit"), "claude4")  # pyright: ignore[reportPrivateUsage]
 
     def test_live_unit_report_reuses_the_scan_without_starting_recovery(self) -> None:
         owner = self.add_unit("unit")

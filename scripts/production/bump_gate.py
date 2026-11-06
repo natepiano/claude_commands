@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 
-from merge_checkpoint import (
+from scripts.production.merge_checkpoint import (
     Stop, complete_gate, read_record, record_lock,
     run_checkpoint_test_steps, save_record,
 )
-from scripts.production.production_doc import Production
+from scripts.production.production_doc import ProductionDocument
 from scripts.message import sessions
 
 
@@ -37,8 +35,8 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
-        with copies.standing(record["slug"], Path(record["checkout"]), record["tip"]) as clone:
-            production = Production(Path(record["production_doc"]), record["slug"], record["merge_branch"],
+        with copies.standing(record["name"], Path(record["checkout"]), record["tip"]) as clone:
+            production = ProductionDocument(Path(record["production_doc"]), record["name"], record["merge_branch"],
                                     clone, Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
             os.environ["BUILDLOG_UNIT"] = record["unit"]
             detail = run_checkpoint_test_steps(

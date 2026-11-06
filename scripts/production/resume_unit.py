@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Restore a retired unit's worktree and resume its staff session.
 
-Usage: resume_unit.py <slug> <unit> [--dry-run]
+Usage: resume_unit.py <production_name> <unit> [--dry-run]
 Staff supplies the folder, branch, and session id. The parked configuration supplies the plan.
 A preview changes no files. A repeated command preserves completed steps.
 Exit 0 on success, 1 on refusal or failure, and 2 on invalid arguments.
@@ -59,13 +59,13 @@ class RetiredUnitRecovery:
             raise Refused(f"{self.name}: recovery requires a session id")
 
 
-def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = None) -> RetiredUnitRecovery | NoRecoveryRequired:
+def find_unit(production_name: str, given: str, *, record: staff.StaffSnapshot | None = None) -> RetiredUnitRecovery | NoRecoveryRequired:
     record = staff.initial_snapshot() if record is None else record
-    production = retire_unit.production_of(slug, record=record)
+    production = retire_unit.production_of(production_name, record=record)
     row = record.by_id(staff.StaffId(given))
     member = (staff_sources.MemberFound(row) if row is not None and row.kind == "unit" else
-              unit_lookup.member_sources().member(staff_sources.UnitMember(production.slug, given), record))
-    name = unit_names.unit_id(member.row.name) if isinstance(member, staff_sources.MemberFound) else given
+              staff_sources.member(staff_sources.UnitMember(production.name, given), record))
+    name = member.row.name if isinstance(member, staff_sources.MemberFound) else given
     if isinstance(member, staff_sources.NoSuchMember):
         raise Refused(f"{name}: no staff row")
     location = member.row.worktree
@@ -117,7 +117,7 @@ def has_transcript(unit: RetiredUnitRecovery) -> bool:
 def is_running(unit: RetiredUnitRecovery) -> bool:
     """Whether the unit's mark is on a live Claude that is the session it resumes."""
     try:
-        found = unit_lookup.labeled_session(unit.production.slug, unit.name)
+        found = unit_lookup.labeled_session(unit.production.name, unit.name)
     except OSError as error:
         raise Refused(f"{unit.name}: cannot tell whether Claude is running: {error}") from error
     return (found is not None and isinstance(found.claude, unit_lookup.LiveClaude)
@@ -143,7 +143,7 @@ def refusals(unit: RetiredUnitRecovery) -> list[str]:
 
 def launch_command(unit: RetiredUnitRecovery) -> list[str]:
     # The row name is both the branch and the add_unit name.
-    return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), unit.branch,
+    return [sys.executable, str(ADD_UNIT), "--production", unit.production.name, unit.branch,
             "--resume", unit.session_id, "--cwd", str(unit.worktree), *unit_config.plan_arguments(unit.plan)]
 
 
@@ -171,7 +171,7 @@ def launch(unit: RetiredUnitRecovery) -> None:
 
 
 def dry_run(unit: RetiredUnitRecovery) -> int:
-    print(f"resume {unit.name} of {unit.production.slug}: dry run, nothing changes")
+    print(f"resume {unit.name} of {unit.production.name}: dry run, nothing changes")
     refused = refusals(unit)
     print("\n".join(f"refused: {reason}" for reason in refused))
     if refused:
@@ -183,8 +183,8 @@ def dry_run(unit: RetiredUnitRecovery) -> int:
     return 1 if refused else 0
 
 
-def resumed_session_proven(slug: str, name: str, session_id: str, row: staff.StaffRow) -> bool:
-    marked = unit_lookup.labeled_session(slug, name)
+def resumed_session_proven(production_name: str, name: str, session_id: str, row: staff.StaffRow) -> bool:
+    marked = unit_lookup.labeled_session(production_name, name)
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
         return False
     entry = pane_record.read(marked.place.session).get(marked.place.pane)
@@ -197,14 +197,14 @@ def resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
-    member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), record)
+    member = staff_sources.member(staff_sources.UnitMember(unit.production.name, unit.name), record)
     if isinstance(member, staff_sources.NoSuchMember):
         raise Refused(f"{unit.name}: no retained staff row")
     make_worktree(unit)
     unit_config.restore(member.row.id, unit.worktree)
     row = staff.restore_unit(member.row.id, staff.PresentWorktree(remote.local_machine(), unit.worktree))
     launch(unit)
-    if not resumed_session_proven(unit.production.slug, unit.name, unit.session_id, row):
+    if not resumed_session_proven(unit.production.name, unit.name, unit.session_id, row):
         raise Refused(f"{unit.name}: resumed native session identity is not proven; parked facts kept")
     print(f"{unit.name} resumed")
     completed = resume_record(unit.production, unit.name).with_suffix(".done")
@@ -216,13 +216,13 @@ def resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
 
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    _ = parser.add_argument("slug")
+    _ = parser.add_argument("production_name")
     _ = parser.add_argument("unit")
     _ = parser.add_argument("--dry-run", action="store_true")
     options = parser.parse_args(argv)
     try:
         record = staff.initial_snapshot()
-        unit = find_unit(cast(str, options.slug), cast(str, options.unit), record=record)
+        unit = find_unit(cast(str, options.production_name), cast(str, options.unit), record=record)
         completed = completion_receipt.read_receipt(resume_record(unit.production, unit.name).with_suffix(".done"),
                                                 record)
         if (isinstance(unit, NoRecoveryRequired) and isinstance(completed, completion_receipt.OwnedReceipt)
@@ -230,7 +230,7 @@ def _main(argv: list[str]) -> int:
                 and completed.fields.get("unit") == unit.name
                 and isinstance(completed.owner.worktree, staff.PresentWorktree)
                 and isinstance(completed.fields.get("session_id"), str)
-                and resumed_session_proven(unit.production.slug, unit.name,
+                and resumed_session_proven(unit.production.name, unit.name,
                     cast(str, completed.fields["session_id"]), completed.owner)):
             print(f"{unit.name} already resumed")
             return 0
