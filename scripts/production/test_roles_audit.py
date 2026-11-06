@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import roles_audit as audit
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import isolated_staff_file
-from scripts.lib.test_names import NAMES_TOML
+from scripts.lib.test_names import NAMES_TOML, fixture_names
 from scripts.shutdown import remote
 
 
@@ -89,6 +89,13 @@ class NameTests(unittest.TestCase):
             "docs/a.md:1: retired 'review pool'; no current name replaces it",
             "docs/a.md:1: retired 'seat'; use 'worker'",
         ])
+
+    def test_retired_candidates_keep_boundaries_and_spaces_created_by_masking(self) -> None:
+        terms = (term("worker", "seat", kept=("x",), retired=("seat",)),
+                 term("held design role", "guild head", kept=("x",), retired=("guild head",)))
+        files = (audit.LiveFile("docs/a.md", "Ready.\nxseat\nguildxhead\nguild/head\n"),)
+        self.assertEqual([(use.line, use.name) for use in audit.check_retired(terms, files)],
+                         [(2, "seat"), (3, "guild head")])
 
     def test_scoped_protocol_history_and_legacy_contexts_keep_lexical_counts(self) -> None:
         data = WORKER_TERMS + '''
@@ -212,6 +219,21 @@ def display(label):
 display("worker")
 '''
         self.assertEqual(audit.python_prose(source).text, "")
+
+    def test_nested_helper_returns_keep_their_scope_and_physical_lines(self) -> None:
+        source = '''def outer():
+    def shown():
+        return "worker"
+    def hidden():
+        return "tester"
+    return shown()
+print(outer())
+'''
+        prose = audit.python_prose(source)
+        self.assertEqual(audit.check_fixed_display(fixture_names(), (
+            audit.LiveFile("scripts/nested.py", prose.text, prose.source_lines,
+                           prose.printed_text, prose.printed_lines),)), (
+                audit.DisplayLabel("scripts/nested.py", 3, "worker"),))
 
     def test_shell_counts_output_heredocs_but_does_not_parse_input_bodies_as_commands(self) -> None:
         text = '''cat <<'EOF'
@@ -418,8 +440,7 @@ class SourceCheckTests(unittest.TestCase):
                         status = audit.main([action, "--root", str(root)])
                     self.assertEqual(status, 1)
                     if action == "check":
-                        self.assertEqual(output.getvalue().splitlines(), [
-                            expected, "role words in sentences: 0 (list with --prose)"])
+                        self.assertEqual(output.getvalue().splitlines(), [expected])
                         self.assertEqual(errors.getvalue(), "")
                     else:
                         self.assertEqual(output.getvalue(), "")
@@ -453,6 +474,34 @@ class SourceCheckTests(unittest.TestCase):
                 "scripts/output.py:1: fixed display name 'worker'; read config/names.toml",
             ))
             self.assertEqual(audit.source_check(root), audit.source_check(root, full_extraction=True))
+
+    def test_plain_selection_keeps_every_extracted_string_assembly(self) -> None:
+        cases = {
+            "conditional suffix binding": 'ending = "ker" if ready else "kers"\nprint("wor" + ending)\n',
+            "conditional prefix binding": 'prefix = "wor" if ready else "tes"\nprint(prefix + "ker")\n',
+            "annotated binding": 'ending: str = "ker" if ready else "kers"\nprint("wor" + ending)\n',
+            "binding alias": 'ending = "ker" if ready else "kers"\nalias = ending\nprint("wor" + alias)\n',
+            "lexical binding": 'ending = "ker" if ready else "kers"\ndef show():\n    print("wor" + ending)\n',
+            "helper return": 'def label():\n    return "wor" + "ker"\nprint(label())\n',
+            "direct branches": 'print("wor" + ("ker" if ready else "kers"))\n',
+            "f-string suffix binding": 'ending = "ker" if ready else "kers"\nprint(f"wor{ending}")\n',
+            "f-string prefix binding": 'prefix = "wor" if ready else "tes"\nprint(f"{prefix}ker")\n',
+            "f-string branches": 'print(f"wor{\"ker\" if ready else \"kers\"}")\n',
+            "nested joins": 'ending = "ker" if ready else "kers"\nprint("w" + ("or" + ending))\n',
+            "nested fields": 'ending = "ker" if ready else "kers"\nprint(f"w{f\"or{ending}\"}")\n',
+            "nested branches": 'ending = ("ker" if first else "kers") if ready else "ker"\nprint("wor" + ending)\n',
+            "literal join": 'print("wor" + "ker")\n',
+        }
+        for name, source in cases.items():
+            with self.subTest(assembly=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_check_root(root, {"scripts/output.py": source})
+                complete = audit.source_check(root, full_extraction=True, prose=False)
+                self.assertTrue(complete.labels, "The fixture must produce a display finding.")
+                terms = audit.parse_terms((root / "scripts/production/role_terms.toml").read_text())
+                retired = audit.forms_pattern(tuple(form for item in terms for form in item.retired))
+                self.assertTrue(audit.extraction_candidate(source, True, retired, frozenset({"worker"}), prose=False))
+                self.assertEqual(audit.source_check(root, prose=False), complete)
 
     def test_key_uses_stay_contracts_without_relying_on_binding_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -502,9 +551,8 @@ class SourceCheckTests(unittest.TestCase):
             output = StringIO()
             with redirect_stdout(output):
                 status = audit.main(["check", "--root", str(root)])
-            count_line = "role words in sentences: 2 (list with --prose)"
             self.assertEqual(status, 0)
-            self.assertEqual(output.getvalue().splitlines(), [count_line])
+            self.assertEqual(output.getvalue(), "")
             detailed = StringIO()
             with redirect_stdout(detailed):
                 status = audit.main(["check", "--root", str(root), "--prose"])
@@ -514,6 +562,30 @@ class SourceCheckTests(unittest.TestCase):
                 "scripts/messages.py:2: 'unit director'",
                 "scripts/messages.py:3: 'worker'",
             ])
+
+    def test_plain_check_keeps_findings_and_diagnostics_without_sentence_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_check_root(root, {
+                "scripts/sentences.py": 'print("The worker needs help.")\n',
+                "scripts/labels.py": 'print("wor" + "ker")\nprint(f"{name} · designer")\n',
+                "scripts/escaped.py": r'print("Dispatch a \x73eat.")' + "\n",
+                "scripts/conditional.py": 'print(f"wor{"ker" if ready else "kers"}")\n',
+                "scripts/broken.py": "print(\n",
+            })
+            detailed = audit.source_check(root)
+            plain = audit.source_check(root, prose=False)
+            self.assertEqual(detailed, audit.source_check(root, full_extraction=True))
+            self.assertEqual(plain.issues, detailed.issues)
+            self.assertEqual(plain.labels, detailed.labels)
+            self.assertEqual(plain.unread_sources, detailed.unread_sources)
+            self.assertEqual(plain.sentences, ())
+            self.assertTrue(detailed.sentences)
+            output = StringIO()
+            with redirect_stdout(output):
+                status = audit.main(["check", "--root", str(root)])
+            self.assertEqual(status, 1)
+            self.assertEqual(output.getvalue().splitlines(), list(detailed.issues))
 
     def test_account_group_keys_are_neither_label_failures_nor_sentence_uses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -665,6 +737,36 @@ class SourceCheckTests(unittest.TestCase):
                 _ = destination.write_bytes((repository / name).read_bytes())
             self.assertEqual(audit.check_sources(root), audit.check_sources(root, full_extraction=True))
 
+    def test_parallel_check_keeps_source_order_contexts_and_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {f"scripts/source{index:02}.py": "# Padding.\n" * index + 'print("Ready.")\n'
+                       for index in range(64)}
+            sources.update({
+                "docs/protocol.md": "Keep a seat stable.\nA seat needs work.\n",
+                "scripts/first.py": 'print("Dispatch a seat.")\n',
+                "scripts/last.py": 'print("worker")\n',
+                "scripts/broken.py": "print(\n",
+            })
+            self.write_check_root(root, sources)
+            inventory = root / "scripts/production/role_terms.toml"
+            with inventory.open("a", encoding="utf-8") as output:
+                _ = output.write('''
+[[terms.kept_contexts]]
+path = "docs/protocol.md"
+text = "Keep a seat stable."
+reason = "The protocol keeps this term."
+''')
+            _ = (root / "scripts/unreadable.py").write_bytes(b"\xff")
+            checked = audit.source_check(root)
+            self.assertEqual(checked, audit.source_check(root, full_extraction=True))
+            self.assertEqual(len(checked.unread_sources), 2)
+            self.assertEqual(checked.issues[2:], (
+                "docs/protocol.md:2: retired 'seat'; use 'worker'",
+                "scripts/first.py:1: retired 'seat'; use 'worker'",
+                "scripts/last.py:1: fixed display name 'worker'; read config/names.toml",
+            ))
+
     def test_formatted_string_fragments_keep_prose_when_they_cannot_tokenize(self) -> None:
         sources = {
             "scripts/apostrophe.py": 'print(f"Dispatch a seat\'s work to {name}.")\n',
@@ -780,7 +882,6 @@ class SourceCheckTests(unittest.TestCase):
                             self.assertEqual(audit.main(["check", "--root", str(root)]), 1)
                         self.assertEqual(output.getvalue().splitlines(), [
                             f"docs/roles.md:1: retired {name!r}; use 'held design role'",
-                            "role words in sentences: 0 (list with --prose)",
                         ])
 
 
