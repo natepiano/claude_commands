@@ -909,7 +909,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Binds later work:** a tree-writing step records `natedev_only` for its lifetime; the call's decision comes back before the next read-only step.
 
-### Phase 38 — Publish a step state without starting Python · status: todo
+### Phase 38 — Publish a step state without starting Python · status: done
 
 **Depends on:** none
 
