@@ -302,6 +302,22 @@ only I can bump
 
 **Ruled out:** deleting stale gate folders in this phase; a name list for repositories.
 
+### Phase 20c — A merge gate near its end keeps less memory with rerun records in its history  · status: done
+
+#### As-built
+
+- The look-ahead window in `window_peak` stops at the end of `suites:1` (`GATE_FIRST_PASS` in `scripts/build_queue/progress_profile.py`).
+- A gate that reads a profile with old `suites:2` records now gets its first pass tail: measured 0.23 GiB at 85-86%, 0.14 GiB at 95%.
+- Crossings between `build:` and `test:` phases, and `build:1` to `build:2`, stay. A `suites:2` counter over measured bins follows the normal window rule.
+
+**Files:** `scripts/build_queue/progress_profile.py`, `scripts/build_queue/test_progress_profile.py`, `scripts/production/test_merge_gate_suites_admission.py`, `docs/as-built/build-memory-admission.md`.
+
+**Binds later work:** the service reads this rule after a restart. The Change-Review row comes after a live gate past 85% shows under 1 GiB.
+
+**Gotchas:** old-code gates still write `suites:2` records until each tree carries 20a; they have no effect on the first pass.
+
+**Ruled out:** removal of live records; a change to `merge_gate.py`.
+
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
 #### As-built
