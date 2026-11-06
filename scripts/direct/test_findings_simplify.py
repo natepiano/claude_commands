@@ -111,7 +111,7 @@ class SimplifyFindingTests(FindingsLedgerFixture):
             ("open", "--severity", "minor", "--title", "Late change", "--caught-by", "worker"),
             ("gate",),
             ("dispatch", "--covers", held_id),
-            ("route", "--id", held_id, "--reason", "spec-gap", "--owner", "later-unit",
+            ("route", "--id", held_id, "--reason", "spec-gap", "--owner", "later",
              "--work-order", "docs/plan.md — Phase later — Retry", "--due", "later checkpoint"),
         )
         for parked in (False, True):

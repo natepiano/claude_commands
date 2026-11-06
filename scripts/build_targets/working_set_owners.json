@@ -247,10 +247,6 @@
       "owner": "screenshot-unit"
     },
     {
-      "path": "scripts/hierarchies/",
-      "owner": "hierarchies-unit"
-    },
-    {
       "path": "scripts/history/",
       "owner": "fix-rounds-unit"
     },

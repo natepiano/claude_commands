@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 import conversation_pause as conversation_pause
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
@@ -155,6 +156,7 @@ class ConversationPauseFixture(unittest.TestCase):
         self.root = self.fixture_root
         self.bind_environment()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = self.showrunner_timer("demo")
 
     def build_fixture(self) -> None:
         self.root.mkdir()
@@ -319,6 +321,14 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             "AUTO_SILENCE_LOG": str(self.activity_log),
             "UNIT_ACTIVE_DIR": str(self.unit_active_root),
         }
+
+    def showrunner_timer(self, name: str) -> str:
+        """Return the timer name for a production fixture."""
+        doc = self.root / f"{name}-production.md"
+        if not doc.exists():
+            _ = doc.write_text(f"# {name}\n")
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+        return f"showrunner-{owner.id}"
 
     def create_instance(
         self,

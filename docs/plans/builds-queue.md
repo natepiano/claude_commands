@@ -6,7 +6,6 @@
 
 > **As-built disposition: amend** — `docs/as-built/unit-board.md` (the queue pane); `docs/as-built/build-memory-admission.md` (snapshot, `queue_read`, `LineWaiter` checks, `match_waiters`; later the service); `docs/as-built/build-targets.md` (the `/build:queue` row)
 
-> **Production: builds** — unit `queue-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 
@@ -262,6 +261,42 @@ only I can bump
 9. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:407` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 
 **Workers:** `1 writer + 1 tester` — `impl` owns the counter parsers, the profile writer, `memory_admit.py` and the caller files that set the cargo progress variables (`scripts/build_hold/cargo` and each nextest or clippy launch path the design finds; name outside owners in the notice); `test` owns the parser fixtures, the transition tests and the caller suites, with production caller fixtures that use `loop_turn()`.
+
+### Phase 20 — One build queue outage sends one message to the builds session and no repeated phone pushes  · status: done
+
+**Depends on:** nothing. Source: the user, 2026-11-05, via natedev and builds: "I received about 8 of these. That's not helpful". Builds: fix first, before other phase work, at the source. One alert per outage.
+
+#### Work Order
+
+**Goal:** One outage of the build queue service sends one alert. The alert goes to the builds session, which can act. The phone gets a push only when the user must act, and that push names the exact command.
+
+**Spec:**
+1. **Cause, proved from the journal (2026-11-05 17:06-17:20 EST).** The send was not at fault: each `build-admission-alert.service` run logs `SENT: to the user` and `Deactivated successfully`, so `outage_alerts.delivered` ran. `build-admission.service` restarted every 32 s after a watchdog kill. `Server` listener setup calls `outage_alerts.clear("build-admission", ...)` at each start, so each start erased the delivered mark while the outage went on. Each next OnFailure run waited two minutes and sent again: six pushes, one every 2 min 9 s.
+2. **The outage ends only after a steady run.** Remove the clear from listener setup. The service clears the `build-admission` claim once, from its main loop, after it has run for `silence_seconds` since listener setup. That is the same time that makes an outage. Use the last usable `gate.MemoryConfig`. A failed clear prints one line and tries again on a later loop, as the reading alert does. A start that dies inside that time clears nothing.
+3. **The alert goes to the builds session.** `down_alert` sends a message to session `builds` with `session_send_argv`, sender `build-admission`, text on stdin. The text: the build queue service has not answered for two minutes; builds wait; it restarts by itself; read `journalctl -u build-admission.service`; if the user must act, push the phone with `sudo systemctl restart build-admission.socket build-admission.service`.
+4. **The phone only when the user must act.** When that send does not return `sent` (the builds session is not live, or the send fails), no session can act. Then push the phone once through catalog entry `alert.blocked`: title "Build queue service is down", action "On natedev, run: sudo systemctl restart build-admission.socket build-admission.service", body "No session is live to handle it. Builds wait until the service answers.". Give `--clears-when` a command that exits 0 when the service answers (`admission_client.py view`, through `scripts/lib/py`); check that `view` exits nonzero when the service is down.
+5. **The claim follows what was sent.** Mark the claim delivered after any result that sent or kept a message: `sent`, `queued`, `held`, `pending`. Release it only when nothing went out and nothing waits: `failed`, `refused`, `retry`. A held text never sends a second time.
+6. **Delete `build_admission.down`** from `scripts/notify/push_catalog.py` and from `scripts/notify/push_texts_reviewed.json`. A phone push must name the user's action, and this one named none.
+7. **Doc.** Correct `docs/as-built/build-memory-admission.md` (the startup section): what clears the claim, where the alert goes, when the phone gets a push.
+8. **Proof.** Tests with mocked sends; no test reaches a live session or the live service.
+   - Replay the outage: repeated service starts with a delivered claim keep the claim, and repeated `down_alert` runs send once.
+   - A service that runs past `silence_seconds` clears the claim, and the next outage sends again.
+   - The claim survives a start that dies before `silence_seconds`.
+   - `down_alert` sends to `builds` with the exact restart command in the text, and pushes no phone on `sent`.
+   - On `queued` or a failed send it pushes the phone once with the exact command; on a failed phone send it releases the claim; on `held` it keeps the claim.
+
+**Files:**
+- `scripts/build_queue/admission_client.py` — `down_alert`.
+- `scripts/build_queue/admission_service.py` — where the claim clears.
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the removed entry.
+- `docs/as-built/build-memory-admission.md` — the startup section.
+- `scripts/build_queue/test_admission_client.py`, `scripts/build_queue/test_admission_service.py` — the tests.
+
+**Workers:** `1 writer + 1 tester`.
+
+**State:** the outage claim record in `~/.local/state/accounts/unit_outage_alerts.json`. No change to its form.
+
+**Acceptance gate:** queue, notify and accounts suites pass; basedpyright 0/0/0. Change-Review: The next build queue outage sends no repeated phone pushes | On natedev, read `~/.local/state/notify/pushover.jsonl` after the next outage | One push at most, and it names a command.
 
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 

@@ -50,9 +50,9 @@ import approved_renames
 import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
-from scripts.production import session_staff, staff, unit_names
+from scripts.production import session_staff, staff
 from scripts.production.production_doc import Refusal, production_field
-from proposal_issue import ApprovedDecision, decision_answer, require_generated_body
+from proposal_issue import ApprovedDecision, decision_answer, proposal_unit, require_generated_body
 from unit_files import changed_files, git, report_unit_problems_once, unit_file_holders, unit_worktrees
 from unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
                         parse_pilot_scope, unit_plan_path)
@@ -361,7 +361,7 @@ def style_document(repo: Path) -> Path:
     standing = standing_style_production(repo)
     if isinstance(standing, StandingStyleProduction):
         return standing.doc
-    raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
+    raise style_ledger.LedgerError(f"no standing style production: {standing.name}")
 
 
 def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, board: berth_board.Board) -> BusyFiles:
@@ -2074,7 +2074,7 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
     review = ticket_review_scope(ledger.repo, ticket, held) if ticket["kind"] == "proposal" else ReviewScope.PRODUCTION
     phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells, waived, review)
     owner = ledger.unit_row(ticket["unit"])
-    own_family = rules.style_family(unit_names.unit_id(owner.name)) if owner.kind == "unit" else rules.NotStyleUnit()
+    own_family = rules.style_family(owner.name) if owner.kind == "unit" else rules.NotStyleUnit()
     if not isinstance(own_family, rules.NotStyleUnit) and ticket["family"] != own_family:
         previous = next((match.group(0) for match in PHASE.finditer(text) if match.group("id") == ticket["id"]), "")
         saved = re.search(r"(?m)^Borrowed from .+$", previous)
@@ -2458,7 +2458,7 @@ def _select_phase(
     else:
         if not folder.is_absolute():
             folder = doc.parent.parent / folder
-        decision_units = ((unit_names.unit_id(ledger.unit_name(unit)),) if selection == FamilySelection.OWN else
+        decision_units = ((ledger.unit_name(unit),) if selection == FamilySelection.OWN else
                           tuple(row.unit for row in unit_worktrees(doc) if rules.style_family(row.unit) == family))
         decisions = tuple(issue for owner in decision_units for issue in style_proposals.approved_decisions(folder, owner))
     unbuilt = {issue.path: _unbuilt_findings(ledger, issue.path) for issue in decisions if issue.value("style_rule") in definitions}
@@ -2863,7 +2863,7 @@ def select_family_work(ledger: style_ledger.Ledger, unit: str, branch: str, plan
                        definitions: Mapping[str, rules.Rule], changes: MainChanges | UnknownMainChanges,
                        predecessor: WaitingCheckpoint | NoCheckpointBlock) -> (PhaseWritten | NoAvailableWork |
                        WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge):
-    own = rules.style_family(unit_names.unit_id(ledger.unit_name(unit)))
+    own = rules.style_family(ledger.unit_name(unit))
     if isinstance(own, rules.NotStyleUnit):
         raise style_ledger.LedgerError(f"{unit}: unknown style family")
     result = _select_phase(ledger, unit, branch, plan, repo, doc, text, scope, busy, first_files,
@@ -2962,7 +2962,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             return WaitingForSync(0, f"touched set unknown: {error}")
         standing = standing_style_production(repo)
         if not isinstance(standing, StandingStyleProduction):
-            raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
+            raise style_ledger.LedgerError(f"no standing style production: {standing.name}")
         changes_on_main = main_changes(ledger, standing.branch_point, tip)
         if isinstance(changes_on_main, UnknownMainChanges):
             if isinstance(predecessor, WaitingCheckpoint):
@@ -3099,7 +3099,7 @@ def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: Unit
                 decisions[path] = False
             else:
                 issue = Issue(path, frontmatter(path))
-                decisions[path] = (rules.style_family(issue.value("unit")) == family
+                decisions[path] = (rules.style_family(proposal_unit(issue)) == family
                                    and isinstance(decision_answer(issue), ApprovedDecision))
         if decisions[path]:
             population.append((finding, path))

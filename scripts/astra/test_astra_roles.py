@@ -20,7 +20,10 @@ from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import process_start
+from scripts.lib.stop_injection_test_support import stop_in_child
 
 SCRIPT = Path(__file__).with_name("astra_roles.py")
 
@@ -96,7 +99,12 @@ class AstraRolesTests(StaffTestCase):
             record = cast(dict[str, object], json.loads((self.state / "99340615-2159-5777-b1c8-71572890df55.json").read_text()))
             self.assertEqual({key: record[key] for key in ("design_id", "role_id", "session_dir", "worker", "pid")},
                              {"design_id": design_id, "role_id": "designer", "session_dir": None, "worker": None, "pid": None})
-            live = astra_roles.live_roles()
+            world = PaneWorld()
+            row = staff.by_id(staff.StaffId("99340615-2159-5777-b1c8-71572890df55"))
+            assert row is not None
+            world.add(row, "w1:p1", live=False)
+            with mock.patch("herdr.Herdr", return_value=world):
+                live = astra_roles.live_roles()
             self.assertEqual([(entry["thread_id"], entry["manager"], entry["state"]) for entry in live],
                              [("99340615-2159-5777-b1c8-71572890df55", self.parent.current_session, "idle")])
             ended = replace(design, roles=(replace(design.roles[0], lifecycle=design_roles.RoleEnded(staff.StaffId("99340615-2159-5777-b1c8-71572890df55"))), design.roles[1]))
@@ -265,6 +273,17 @@ class AstraRolesTests(StaffTestCase):
             _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(self.records(), [])
         self.assertFalse((self.state / "4f832112-25a1-5946-bf2c-52640f8daba4.json").exists())
+
+    def test_exec_hold_rerun_after_stop_does_not_attach_to_a_reused_pid(self) -> None:
+        identity = "4f832112-25a1-5946-bf2c-52640f8daba4"
+        original_pid = os.getpid()
+        with mock.patch.dict(os.environ, self.environment):
+            stop_in_child(lambda: astra_roles.hold("reviewer", identity, pid=original_pid),
+                          os, "replace", argument=1,
+                          matches=lambda destination: Path(str(destination)) == self.state / (identity + ".json"))
+            with mock.patch.object(process_start, "process_start", return_value=process_start.Started("replacement-lifetime")):
+                roles = astra_roles.live_roles()
+        self.assertEqual(roles, [])
 
     def test_release_removes_a_record_and_is_safe_to_repeat(self) -> None:
         self.assertEqual(self.hold_mesh().returncode, 0)

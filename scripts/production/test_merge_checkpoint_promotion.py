@@ -46,7 +46,7 @@ def setUpModule() -> None:
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
     def assert_completed_handoff_preserves_published_tip(self, *, with_review: bool) -> None:
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         if with_review:
             self.production_doc(change_review=review)
         _ = self.child_production()
@@ -85,7 +85,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assert_completed_handoff_preserves_published_tip(with_review=True)
 
     def test_completed_handoff_repairs_missing_publication_records(self) -> None:
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
         _ = self.child_production()
         checkpoint = self.dated_checkpoint(
@@ -210,7 +210,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             _ = (self.state / "mac-rc").write_text("1\n")
         else:
             self.write(self.promote, "src/alpha.txt", "local edit\n")
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
         if handoff:
             _ = self.child_production()
@@ -635,7 +635,7 @@ with lock.open("a") as held:
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
-                production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
+                production="example", unit="alpha", phase="2", hash=sha,
                 also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
                 cancel_prior=False, started=STARTED, regime="after", holds=0,
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
@@ -690,8 +690,8 @@ with lock.open("a") as held:
                          set(self.git("rev-list", "--first-parent", "--merges", "HEAD").splitlines()))
         integration, = [row for row in receipts if row["merge_commit"] == tip]
         self.assertEqual(integration["source_checkpoint"], self.git("rev-parse", "HEAD^2"))
-        self.assertRegex(result.process.stdout, re.escape(f"into: {self.checkout} (production) — ") + ".*unblocks: G1: beta-unit Phase 4")
-        self.assertRegex(result.process.stdout, re.escape(f"into: {self.promote} (main) — ") + ".*unblocks: the live gate of alpha-unit phase 2")
+        self.assertRegex(result.process.stdout, re.escape(f"into: {self.checkout} (production) — ") + ".*unblocks: the unit’s next checkpoint")
+        self.assertRegex(result.process.stdout, re.escape(f"into: {self.promote} (main) — ") + ".*unblocks: the live gate of alpha phase 2")
         self.assertIn("the merge branch collects every unit's checkpoints", result.process.stdout)
         self.assertIn("sessions on", result.process.stdout)
         self.assertIn("into: " + str(self.root / "mac-installed"), result.process.stdout)
@@ -701,17 +701,16 @@ with lock.open("a") as held:
         merged_at = review[0][review[0].index("--merged") + 1]
         self.assertRegex(merged_at, r"^\d{4}-\d\d-\d\dT")
         self.assertEqual(review[0], [
-            "add", "--unit", "alpha-unit", "--plan", "docs/plans/alpha.md", "--phase", "2", "--regime", "trial",
+            "add", "--unit", "alpha", "--plan", "docs/plans/alpha.md", "--phase", "2", "--regime", "trial",
             "--started", STARTED, "--merged", merged_at, "--holds", "2",
             "--merge-defects", "1", "--ux-findings", "2", "--code-findings", "3",
             "--review-minutes", "14", "--ux-check-minutes", "4",
             "--ux-repair-minutes", "1", "--excluded", "no merge design check",
         ])
-        self.assertRegex(self.log.read_text(), rf"- {MERGED_AT:%H:%M %Z}: alpha-unit phase 2 \([0-9a-f]+\) merged as [0-9a-f]+; .*green; pushed; promoted")
-        self.assertIn("send alpha-unit:", result.process.stdout)
+        self.assertRegex(self.log.read_text(), rf"- {MERGED_AT:%H:%M %Z}: alpha phase 2 \([0-9a-f]+\) merged as [0-9a-f]+; .*green; pushed; promoted")
+        self.assertIn("send alpha:", result.process.stdout)
     def test_promotion_refusal_keeps_pushed_merge_and_resume_reaches_only_missing_place(self) -> None:
         self.promotions = str(self.promote)
-        self.gate = False
         self.production_doc()
         sha = self.checkpoint()
         self.write(self.promote, "src/beta.txt", "staged local edit\n")
@@ -725,14 +724,13 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "HEAD"), pushed)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), failed.before)
         self.assertIn(f"into: {self.checkout} (production)", failed.process.stdout)
-        self.assertIn("unblocks: no gate", failed.process.stdout)
+        self.assertIn("unblocks: the unit’s next checkpoint", failed.process.stdout)
         self.assertNotIn(f"into: {self.promote} (main)", failed.process.stdout)
         _ = self.git("restore", "src/alpha.txt", cwd=self.promote)
         resumed = self.run_checkpoint(sha)
         self.assertEqual(resumed.process.returncode, 0, resumed.process.stderr + resumed.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), pushed)
         self.assertIn(f"into: {self.promote} (main)", resumed.process.stdout)
-        self.assertNotIn("unblocks: G1", resumed.process.stdout)
         self.assertEqual((self.promote / "src/beta.txt").read_text(), "local edit\n")
         self.assertEqual(self.git("show", ":src/beta.txt", cwd=self.promote), "staged local edit")
     def test_mac_rc_failure_is_reported_after_local_promotion(self) -> None:
@@ -798,12 +796,12 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "HEAD"), pushed)
         self.assertEqual(len(self.events("checkpoint-test")), 1)
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
-        self.assertIn("unblocks: no gate", resumed.process.stdout)
+        self.assertIn("unblocks: the unit’s next checkpoint", resumed.process.stdout)
     def test_a_merge_killed_before_its_push_is_tested_before_a_rerun_pushes_it(self) -> None:
         # Killed after the merge and before its tests finished: nothing proves the merge green.
         sha = self.checkpoint()
         before = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
-        subject = f"Merge alpha-unit phase 2 ({sha[:7]}) into production"
+        subject = f"Merge alpha phase 2 ({sha[:7]}) into production"
         _ = self.git("merge", "--no-ff", "-q", "-m", subject, sha, cwd=self.checkout)
         _ = (self.state / "fail-checkpoint-test").touch()
         red = self.run_checkpoint(sha)

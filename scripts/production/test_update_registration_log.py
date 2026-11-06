@@ -40,16 +40,29 @@ class RegistrationTests(RegistrationFixture):
         log = (self.checkout / "production.log").read_text(encoding="utf-8")
         self.assertEqual(log.count("### STATE "), 1)
         self.assertEqual(len(re.findall(r"^- \d{2}:\d{2} [A-Z]{3}: event \d+$", log, re.MULTILINE)), 10)
-        self.assertIn("alpha-unit: not stated; last merged none; waits on not stated", log)
-        self.assertIn("beta-unit: not stated; last merged none; waits on not stated", log)
+        self.assertIn("alpha: not stated; last merged none; waits on not stated", log)
+        self.assertIn("beta: not stated; last merged none; waits on not stated", log)
 
-    def test_state_block_matches_unit_and_merge_history_and_reads_outstanding(self) -> None:
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 (abc1234)")
+    def test_state_block_reports_recorded_checkpoint_after_the_branch_is_deleted(self) -> None:
+        alpha = self.root / "alpha"
+        (alpha / ".git").unlink()
+        alpha.rmdir()
+        _ = self.git("worktree", "add", "-b", "alpha-branch", str(alpha))
+        _ = self.git("commit", "--allow-empty", "-m", "Integrate completed work")
+        commit = self.git("rev-parse", "alpha-branch")
+        merged = commit[:7]
+        history = self.root / "history/runs/alpha.jsonl"
+        history.parent.mkdir(parents=True)
+        _ = history.write_text(json.dumps({"schema_version": 1, "event_type": "checkpoint", "phase_id": "2",
+                                          "working_dir": str(alpha), "checkpoint_commit": commit}) + "\n")
+        self.env["UNIT_HISTORY_DIR"] = str(history.parent.parent)
+        _ = self.git("worktree", "remove", str(alpha))
+        _ = self.git("branch", "-D", "alpha-branch")
         outstanding = self.outstanding()
         _ = outstanding.write_text(json.dumps([{"since": "2026-10-04T10:00", "text": "review colors"}]) + "\n",
                                    encoding="utf-8")
         state = self.root / "judgment.json"
-        _ = state.write_text(json.dumps({"units": [{"unit": self.fixture_staff_id("alpha-unit"), "phase": "Phase 2 of 3: panels",
+        _ = state.write_text(json.dumps({"units": [{"unit": self.fixture_staff_id("alpha"), "phase": "Phase 2 of 3: panels",
                                                     "wait": "review"}],
                                            "merges_held": ["alpha phase 2"],
                                            "open_for_user": ["stale state item"],
@@ -58,20 +71,21 @@ class RegistrationTests(RegistrationFixture):
         before = self.run_command("log", "compacting", "--state", str(state), "--before-compaction")
         self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
         log = (self.checkout / "production.log").read_text(encoding="utf-8")
-        self.assertIn("alpha-unit: Phase 2 of 3: panels; last merged phase 2 (abc1234); waits on review", log)
+        self.assertIn(f"alpha: Phase 2 of 3: panels; last merged phase 2 ({merged}); waits on review", log)
         self.assertIn("Merges accepted but held: alpha phase 2", log)
         self.assertIn("Open for the user: review colors", log)
         self.assertNotIn("stale state item", log)
         self.assertIn("Next: merge alpha phase 2 when its gate is green; send the restarts plan at 03:30", log)
 
     def test_the_first_call_moves_the_scratchpad_state_and_rewrites_the_tick_prompt(self) -> None:
-        slug = self.doc.name.removesuffix("-production.md")
-        timer = self.state / "notifier" / f"showrunner-{slug}"
+        owner = staff.by_id(self.fixture_staff_id())
+        assert owner is not None
+        timer = self.state / "notifier" / f"showrunner-{owner.id}"
         timer.mkdir(parents=True)
-        _ = (timer / "conf").write_text("TARGET=session:old-showrunner\n", encoding="utf-8")
-        scratch = self.root / "tmp" / "claude-1000" / "-project" / "old-showrunner" / "scratchpad"
+        _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\n", encoding="utf-8")
+        scratch = self.root / "tmp" / "claude-1000" / "-project" / owner.current_session / "scratchpad"
         (scratch / "unit_status").mkdir(parents=True)
-        _ = (scratch / "unit_status" / "blocks_open").write_text("alpha-unit\n", encoding="utf-8")
+        _ = (scratch / "unit_status" / "blocks_open").write_text("alpha\n", encoding="utf-8")
         _ = (scratch / "showrunner_state.json").write_text('{"merges_held": ["from scratch"]}\n', encoding="utf-8")
         owner = self.fixture_staff_id()
         target = self.state / "showrunner" / owner / "session"
@@ -84,7 +98,7 @@ class RegistrationTests(RegistrationFixture):
         result = self.run_command("log", "first event", env=env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"state-dir: ok — copied unit_status to {target}", result.stdout)
-        self.assertEqual((target / "unit_status" / "blocks_open").read_text(encoding="utf-8"), "alpha-unit\n")
+        self.assertEqual((target / "unit_status" / "blocks_open").read_text(encoding="utf-8"), "alpha\n")
         self.assertIn("kept", (target / "showrunner_state.json").read_text(encoding="utf-8"))
         self.assertIn(f"unit_status.sh {target}/unit_status ", prompt.read_text(encoding="utf-8"))
 

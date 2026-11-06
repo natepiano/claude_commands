@@ -4,6 +4,7 @@
 # Staff supplies its current identity for later messages and cleanup.
 
 set -euo pipefail
+"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 unset STAFF_ID
 
 ATTACH=0
@@ -117,7 +118,6 @@ import json
 import os
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(os.environ["HOME"]) / ".claude"))
 from scripts.message import sessions
 matches = sessions.transcript_locations(os.environ["NATIVE_ID"])
 count = 0
@@ -210,32 +210,7 @@ fi
 
 [[ -z "$SWITCH_PID" ]] || switch_signal dispatched || exit 2
 
-if [[ "$ATTACH" == 1 ]]; then
-  if [[ -n "${UNIT_RUN_DIR:-}" && -n "${UNIT_TEAM_ROLE:-}" ]]; then
-    FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" "$ADMISSION_RUN" <<'PY'
-import json
-import os
-from pathlib import Path
-
-import sys
-sys.path.insert(0, sys.argv[1])
-from worker_state import worker_claim_lock
-
-root = Path(sys.argv[2])
-slot = os.environ["UNIT_TEAM_ROLE"]
-with worker_claim_lock(root):
-    path = root / f"impl_claim_{slot}.json"
-    try:
-        claim = json.loads(path.read_text())
-    except (OSError, ValueError):
-        raise SystemExit
-    if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
-        claim["turn_id"] = f"claude-turn-{os.environ['FOLLOW_TURN_INDEX']}"
-        path.write_text(json.dumps(claim))
-PY
-  fi
-else
-
+if [[ "$ATTACH" == 0 ]]; then
 "$PY" "$(dirname "${BASH_SOURCE[0]}")/../usage/agents_log.py" append --id "${BG_ID}" --role worker || true
 if [[ "${DETACH}" == "1" ]]; then
   echo "launched ${MESH_NAME} (${BG_ID})"

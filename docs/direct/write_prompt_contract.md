@@ -68,6 +68,7 @@ Codex review prompts also include section 3's command block.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
    For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
+   For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
    Include these repair rules:
    - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
    - Before a rename or signature change, use LSP `findReferences`. Update all references and reread the changed body.
@@ -151,12 +152,11 @@ changed code, so a caller red shows before the full gate.
 phase records two passes. The recorder keys them by slot and closes only that slot's stale pass;
 <LaunchImplementation/> step 5 owns the argument positions.
 
-Launch both in **one message** so they run concurrently, each with its own
-prompt file and its slot as the ninth argument to `implement.sh`; continue an
-open Codex worker with `--to <full-worker-name>`, then apply
-<DispatchContract/> once for the team: the run's one notifier instance covers
-the Claude phase; the Codex poll covers its phase. <LaunchImplementation/> owns
-the rest of the procedure.
+Run both workers through `assign.sh` in separate background shells of the director session.
+Give each worker its own `--prompt`, `--paths`, and `--role`.
+Use `--to <full-worker-name>` to continue an open worker.
+Apply <DispatchContract/> once for the team.
+See <LaunchImplementation/> for the command format.
 
 The phase is complete only when every slot has a terminal `${PHASE_DIR}/impl_status_<slot>`,
 not when the first one lands. Reading one slot's `implemented` as the phase's
@@ -241,7 +241,7 @@ mid-run, without waiting for a phase to end.
   implementer has reported done, and get an answer rather than silence. **A
   finished Codex turn holds `send` for its next turn.** Its thread remains open.
   Only the unit director starts its next turn — a later phase, repair, or
-  follow-up — through `implement.sh --to <worker>`. That turn receives the held
+  follow-up — through `assign.sh --role implement --to <worker>`. That turn receives the held
   messages first and its prompt last. The launcher attempts compaction above
   `UNIT_COMPACT_ABOVE_TOKENS`, continues after a failed attempt, and
   presses on after overflow per <LongLivedWorkers/>.
@@ -274,7 +274,7 @@ Check both output filesystems with `df -h` before a large build.
 An uncoordinated `verify.sh` run can block its peer for minutes.
 
 **`verify.sh` takes the `cargo` token itself, and no prompt ever asks an agent
-to take it.** `implement.sh` exports the board directory and the slot;
+to take it.** `assign.sh` exports the board directory and the slot;
 `verify.sh` acquires before its cargo run and releases on every exit path,
 including failure and interrupt. A rule that lives only in a prompt is a rule an
 agent can drop, so it is enforced where the cargo command actually runs.

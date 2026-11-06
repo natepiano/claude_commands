@@ -8,7 +8,7 @@ Read at the point of use from `/unit:direct`. Defines `<DualReview/>`,
 completes, or when `<EarlyReviewArm/>` arms a reviewer.
 
 <TeamReview>
-A phase's broad review runs `adversary`, `contract`, and `simplify` together.
+A phase's broad review runs `adversary` and `contract` together.
 It also runs `rerun` when <DualReview/> arms it.
 Each prompt names its lens. The director performs the main review under <DualReview/>.
 
@@ -17,7 +17,6 @@ Each prompt names its lens. The director performs the main review under <DualRev
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason |
 | `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions; and the repository's targets file (`docs/hana/targets.md` in hana), when present |
 | `rerun` | whether interrupted or failed work can finish when run again; lasting records, marks, locks, claims, state files, moved or deleted files, and lists of steps where one failure can stop later steps |
-| `simplify` | the complete phase diff, under the simplify instructions below |
 
 The `rerun` reviewer asks these questions for each lasting write or step list:
 
@@ -47,28 +46,6 @@ The Codex lenses use the unit's own read-only reviewer. Dispatch with
 `assign.sh --role review`; it resumes `review`, or `review2` when `review` is
 busy. Keep both threads across phases and plans. Writers keep their own roles.
 
-The `simplify` lens uses the fresh reviewer path in `review.sh`, with task `direct.simplify` and no worker address.
-It keeps `Agent` for the agents in `SIMPLIFY_AGENTS`.
-This lens alone permits Claude subagents.
-`config/models.conf` selects its model and effort.
-`assign.py` reads `SIMPLIFY_LENS=on|off` from `config/direct.conf` at each launch.
-The review launcher reads `config/review/simplify.md` after it obtains the lock.
-That file defines the report rules and the standing instructions.
-The report permits a heading or preamble before `Pass` or item 1.
-Every Claude print launch disables background tasks and returns an error for `is_error` or an `errors` array.
-At each launch, the shared account picker selects a Claude account with room.
-The launcher prints its label on stderr and in the review log.
-No available quota, a Claude error, an empty report, or a busy run produces `error`; the phase continues under <DualReview/> step 6.
-`assign.py` replaces itself with `review.sh`.
-After it obtains the lock, `review.sh` clears the earlier report and writes the prompt.
-Every simplify launch starts a fresh review, including a retry after failure.
-`SIMPLIFY_AGENTS` supplies the prompt names and the required number of completed agents.
-`review.sh` holds `${PHASE_DIR}/review_launch_simplify.lock` until the review child exits.
-The lock owner alone writes the report, status, and summary.
-The status file contains one atomic status line.
-A rejected launch reports its reason on stderr and changes none of the shared files.
-`simplify_result finish` prints the review failure reason once.
-
 The worker is the address and the lens is the judgment. Pass the lens to
 `assign.sh`; its returned handle names the selected worker and summary. Each
 lens has its own artifact paths.
@@ -81,7 +58,7 @@ applies to the `rerun` reviewer's attempt to build a rerun case.
 Findings come back in each dispatch's summary under `${PHASE_DIR}`. Every
 launch names its phase, lens and pass, so concurrent reviews keep separate
 files. The summary is the whole review result: <Synthesize/> reads every
-selected lens's summary, including `simplify` and `rerun` when armed, tags each finding
+selected lens's summary, including `rerun` when armed, tags each finding
 with the lens that caught it, and can tell two independent findings from
 one finding found twice.
 
@@ -156,8 +133,7 @@ if no repair needs closure, dispatch that reviewer with the owed assignment
 alone. The director reads the ledger and result for <RunSummary/> and never
 substitutes a guide load or rule walk. Early reviews cannot carry this option:
 style input requires the final phase diff.
-The alternate `review.sh` entry point accepts the same range options and uses the
-same preparation and capture module, `scripts/lint/style_review.py`.
+Use `assign.sh` for every review dispatch.
 
 Every code review prompt, under any lens and in a closure review, also asks
 this, verbatim:
@@ -177,9 +153,6 @@ In cargo-liner-tile checkpoint e21d5b93, a weakened `assert_eq!` in a
 Write one prompt per lens at
 `${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md`, each under
 <ReviewPromptContract/> with:
-
-For `simplify`, include the Work Order, phase paths, and any unit instructions relayed from the user.
-The remaining prompt contract applies to the Codex lenses.
 
 ```
 [the role-switch opening from <ReviewPromptContract/>]
@@ -299,7 +272,7 @@ final diff only.
    early. All broad reviewers read the same review copy and final diff.
    Create each lens's prompt under <ReviewPromptContract/>.
 3. Launch each reviewer under <DispatchContract/>.
-   Launch pass 1's `adversary`, `contract`, `simplify`, and armed `rerun` lenses in one message.
+   Launch pass 1's `adversary`, `contract`, and armed `rerun` lenses in one message.
    When the adversary is already armed, launch the other selected lenses together.
    Each call uses:
 
@@ -309,8 +282,6 @@ final diff only.
      --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
      --prompt "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md"
    ```
-
-   For `simplify`, also pass the required `--diff <saved phase diff path>`.
 
    A closure review omits `--lens` and uses `review_prompt_${REVIEW_PASS}.md`.
    Keep each dispatch handle. The allocator resumes `review`, then `review2`

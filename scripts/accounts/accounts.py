@@ -64,7 +64,8 @@ from scripts.accounts.role_map import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
-    from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
+    from scripts.shutdown.inventory import ListedSession, Session
+    from scripts.production import staff
 
 
 MoveAlerts = Literal["user", "none"]
@@ -1716,15 +1717,6 @@ def prepare_claude_launch(label: str, *, resume: bool) -> PreparedAccount:
     return prepared
 
 
-def claude_account_with_room(now: datetime) -> NamedAccount:
-    """Select and prepare a Claude account with quota."""
-    selected = pick("claude", now)
-    if isinstance(selected, NoAccountWithRoom):
-        raise AccountsError(no_room_line("claude", selected))
-    _ = prepare_claude_launch(selected.label, resume=False)
-    return NamedAccount(selected.label, selected.dir)
-
-
 def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
                              target: str = "", config_dir: str = "", source_fallback: bool = False) -> ClaudeLaunchAccount:
     """Use the group account, except for a moved unit restored on its source."""
@@ -2261,23 +2253,23 @@ def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["un
     return "ungrouped"
 
 
-def live_group_members(*, registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> dict[ClaudeGroup, list[ListedSession]]:
-    """Classify local live owners without their restart resources or worktrees."""
-    sys.path.insert(0, str(SCRIPTS / "shutdown"))
-    if TYPE_CHECKING:
-        from scripts.shutdown import inventory
-    else:
-        inventory = import_module("inventory")
-    members: dict[ClaudeGroup, list[ListedSession]] = {"units": [], "showrunners": []}
-    for session in inventory.listing(registrations=registrations):
-        group = session_group(session)
-        if group != "ungrouped":
-            members[group].append(session)
-    return members
+@dataclass(frozen=True)
+class LiveGroupMember:
+    """A current staff member and the account of its live process."""
+
+    session_id: str
+    name: str
+    group: ClaudeGroup
+    config_dir: Path
 
 
-def session_account_label(session: ListedSession) -> str:
-    return account.label_for("Claude", session.login)
+def live_group_members() -> dict[ClaudeGroup, list[LiveGroupMember]]:
+    """Share the board's staff membership and live process accounts."""
+    return _read_local_role_sessions(GroupAccounts(), include_workers=False).members
+
+
+def session_account_label(session: ListedSession | LiveGroupMember) -> str:
+    return claude_config_label(session.config_dir)
 
 
 def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
@@ -2684,16 +2676,24 @@ class MoveRefused:
 class SessionMoveRefused:
     session_id: str
     reason: str
+    returncode: int = 1
 
 
 SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused
 
 
+class PaneMoves(Protocol):
+    def move_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
+                    why: str, run: Path) -> SessionMoveOutcome: ...
+
+    def run_for_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> Path: ...
+
+
 class SessionBatchMove(Protocol):
-    def __call__(self, sessions: list[str], target: str, *, why: str) -> list[stop_results.MoveResult]: ...
+    def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
     """Stop and resume each selected local owner through the shared move API."""
 
     account_config = read_account_settings(account_config)
@@ -2717,7 +2717,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config
             eligible.append(identity)
     outcomes: dict[str, SessionMoveOutcome] = dict(refused)
     batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
-    results = batch(eligible, checked.destination.label, why=why)
+    results = batch(eligible, checked.destination.label, why=why, cause=cause)
     for identity, result in zip(eligible, results):
         if isinstance(result, stop_results.SessionNotFound):
             account_anomaly(f"{identity}: no saved session was found")
@@ -2785,9 +2785,14 @@ class GroupMoveStarted:
 def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS
                  ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
-    """Stop workers and retain their staff rows until assign.sh can restart them."""
+    """Resume pane workers on the destination; keep mesh-pinned workers on their existing path."""
     from scripts.production import staff, session_staff
-    del why
+    pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
+    if TYPE_CHECKING:
+        from scripts.herdr import herdr
+    else:
+        import herdr
+
     target = note_file.canonical_label(target)
     if _label_is(target, "codex"):
         _ = _codex_move_target(target)
@@ -2804,18 +2809,29 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             return f"cannot restart on {target} through assign.sh"
         return ""
 
+    runs_by_worker = session_staff.worker_run_index(record)
+
     if dry_run:
         lines: list[str] = []
         for row in rows:
+            run = pane_moves.run_for_worker(row, record)
             reason = restart_refusal(row.id)
-            preview = f"not moved: {reason}" if reason else f"would stop; restart on {target} stays pending"
+            preview = (f"would stop; restart on {target} stays pending" if unit_runs.worker_transport(run) == "mesh"
+                       else f"would stop and resume the same conversation on {target} in its worker pane")
+            if reason:
+                preview = f"not moved: {reason}"
             lines.append(f"{row.name} ({row.id}): {preview}")
         return GroupMoveDryRun(identities, tuple(lines))
     release_source = cast(stop_results.ReleaseSource, import_module("scripts.shutdown.stop_resume").release_source)
-    runs_by_worker = session_staff.worker_run_index(record)
     results: list[SessionMoveOutcome] = []
     for row in rows:
         try:
+            run = pane_moves.run_for_worker(row, record)
+            if unit_runs.worker_transport(run) != "mesh":
+                reason = restart_refusal(row.id) if row.current_session else ""
+                results.append(SessionMoveRefused(row.id, reason) if reason else
+                               pane_moves.move_worker(row, record, target, why, run))
+                continue
             with staff.row_operation(row.id):
                 if reason := restart_refusal(row.id):
                     raise AccountsError(f"{reason}; source remains running")
@@ -2824,12 +2840,13 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
                     raise AccountsError(released.reason)
                 results.append(stop_results.ResumePending(row.id, target,
                     "assign.sh cannot carry the staff id and destination account yet"))
-        except (OSError, ValueError, AccountsError, staff.StaffRefused) as error:
+        except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr.HerdrFailure) as error:
             results.append(SessionMoveRefused(row.id, str(error).replace("\n", " ")))
     outcomes = tuple(results)
     stdout, stderr, code = _move_output(outcomes, ())
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
     return outcome(identities, target, stdout, stderr, code, outcomes=outcomes)
+
 
 
 def _move_target(target: str, *, repair: bool = True) -> NamedAccount | MoveRefused:
@@ -2885,7 +2902,7 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True, accoun
     return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
 
 
-def move_preview_line(member: ListedSession, target: str) -> str:
+def move_preview_line(member: ListedSession | LiveGroupMember, target: str) -> str:
     return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
 
 
@@ -2899,7 +2916,8 @@ def _move_output(results: tuple[SessionMoveOutcome, ...],
             stderr += line
         else:
             stdout += line
-    return stdout, stderr, int(any(isinstance(item, (SessionMoveRefused, stop_results.ResumePending)) for item in results))
+    return stdout, stderr, max((item.returncode if isinstance(item, SessionMoveRefused) else
+                               int(isinstance(item, stop_results.ResumePending)) for item in results), default=0)
 
 
 @role_map.role_map_command
@@ -2913,21 +2931,21 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
     if isinstance(checked, MoveRefused):
         return checked
-    if TYPE_CHECKING:
-        from scripts.shutdown import inventory
-    else:
-        inventory = import_module("inventory")
-    registrations = inventory.showrunner_registrations()
-    members = live_group_members(registrations=registrations)[group]
+    members = live_group_members()[group]
     selected = [session for session in members if not session_on_account(session, target)]
     ids = tuple(session.session_id for session in selected)
     reason = why or f"{group} moved by hand"
     notices = (f"{group}: no live session moves",) if not ids else ()
     if group == "showrunners":
+        if TYPE_CHECKING:
+            from scripts.shutdown import inventory
+        else:
+            inventory = import_module("inventory")
+        live_ids = {member.session_id for member in members}
         notices += tuple(
-            f"{runner['slug']}: no session runs under the id its update timer names; "
-            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner['doc'])}"
-            for runner in inventory.unregistered_showrunners(members, registrations=registrations))
+            f"{runner.name}: no session runs under the id its update timer names; "
+            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.name)}"
+            for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
             *(move_preview_line(item, target) for item in selected), *notices))
@@ -2938,12 +2956,10 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     return outcome(ids, target, stdout, stderr, code)
 
 
-def session_on_account(session: ListedSession, label: str) -> bool:
-    if not _label_is(label, "claude"):
-        return False
-    destination = account_identity(claude_account_dir(label))
-    return (isinstance(destination, agent_accounts.NumberedAccount)
-            and session.login.casefold() == destination.login.casefold())
+def session_on_account(session: ListedSession | LiveGroupMember, label: str) -> bool:
+    if _label_is(label, "codex"):
+        return agent_accounts.codex_home_matches_label(session.config_dir, label)
+    return _label_is(label, "claude") and session.config_dir == claude_account_dir(label)
 
 
 @overload
@@ -4709,6 +4725,7 @@ class LocalRoleSessions:
     """One local observation supplies counts and detail output."""
 
     counts: dict[tuple[Path, str], dict[str, str]]
+    members: dict[ClaudeGroup, list[LiveGroupMember]]
     inputs: tuple[str, ...]
     session_lines: tuple[str, ...]
     continuation_lines: tuple[str, ...]
@@ -4739,14 +4756,14 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
     return ""
 
 
-def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
+def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
     """Read local registries without account checks or host discovery."""
+    sys.path.insert(0, str(SCRIPTS / "herdr"))
     from scripts.message import sessions
-    from scripts.shutdown import inventory
     from scripts.herdr import pane_launch
-    from scripts.production import showrunners, session_staff, staff
+    from scripts.production import session_staff, staff
 
-    inputs = {sessions.sessions_dir(), pane_launch.record_directory(), showrunners.NOTIFIER_STATE_DIR}
+    inputs = {sessions.sessions_dir(), pane_launch.record_directory()}
     counts: dict[tuple[Path, str], dict[str, str]] = {}
     launches: dict[str, pane_launch.PaneLaunch] = {}
     for path in pane_launch.record_directory().glob("*.json"):
@@ -4766,32 +4783,28 @@ def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
             print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
     inputs.update(Path(path) for path in membership.inputs)
-    runners = inventory.showrunner_registrations()
-    runner_ids = {runner.session_id for runner in runners.entries}
-    for path in showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*/conf"):
-        inputs.add(path)
     for path in sessions.sessions_dir().glob("*.json"):
         inputs.add(path)
     live = {session["sessionId"]: session for session in sessions.running_sessions()}
     session_lines: list[str] = []
+    members: dict[ClaudeGroup, list[LiveGroupMember]] = {"units": [], "showrunners": []}
     for identity, session in live.items():
         owner = membership.by_current_session(identity)
         candidates = [launch for reference, launch in launches.items()
                       if owner is not None and reference in (owner.id, owner.current_session)]
         launch = max(candidates, key=lambda launch: launch["written_at"]) if candidates else launches.get(identity)
-        role = "showrunners" if identity in runner_ids else ""
-        if not role:
-            try:
+        role = ""
+        try:
+            member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
+                                             session_staff.LiveSession(identity))
+            if isinstance(member, session_staff.NoSuchMember) and launch is not None:
                 member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                 session_staff.LiveSession(identity))
-                if isinstance(member, session_staff.NoSuchMember) and launch is not None:
-                    member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                     session_staff.StoredReference(launch["session_id"]))
-            except (staff.StaffUnreadable, ValueError) as error:
-                print(f"accounts: unit {identity}: {error}", file=sys.stderr)
-                continue
-            if isinstance(member, session_staff.MemberFound):
-                role = "units"
+                                                 session_staff.StoredReference(launch["session_id"]))
+        except (staff.StaffUnreadable, ValueError) as error:
+            print(f"accounts: unit {identity}: {error}", file=sys.stderr)
+            continue
+        if isinstance(member, session_staff.MemberFound):
+            role = "units"
         if owner is not None and owner.kind in ("showrunner", "worker"):
             role = "showrunners" if owner.kind == "showrunner" else "workers"
         setting = _session_config_dir(session["pid"])
@@ -4799,6 +4812,9 @@ def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
         label = claude_config_label(directory) if directory is not None else "account unreadable"
         suffix = _moving_role_suffix(role, label, groups)
         session_lines.append(f"session {identity} ({session['name']}): {label}{suffix}")
+        if role in CLAUDE_GROUPS and directory is not None:
+            group = role
+            members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             counts.setdefault((directory, role), {})[identity] = "busy" if session.get("status") == "busy" else "idle"
     # A stopped member stays on its last observed account, never the requested account.
@@ -4821,7 +4837,7 @@ def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
     from scripts.message.unit_labels import MeshWorker, listed_mesh_worker
 
     continuation_lines: list[str] = []
-    for run, name, entry, home in _worker_status_records(inputs):
+    for run, name, entry, home in (_worker_status_records(inputs) if include_workers else ()):
         if home and listed_mesh_worker(cast(MeshWorker, cast(object, entry))):
             counts.setdefault((Path(home), "workers"), {})[str(run / name)] = (
                 "busy" if entry.get("status") in ("running", "starting") else "idle")
@@ -4831,7 +4847,7 @@ def _read_local_role_sessions(groups: GroupAccounts) -> LocalRoleSessions:
                 reason = ("waiting for capacity on the selected account" if entry.get("status") == "waiting_capacity"
                           else "quota refusal; waiting for account recovery or a confirmed move")
             continuation_lines.append(f"worker {run.name}/{name}: continuation owed — {reason}")
-    return LocalRoleSessions(counts, tuple(str(path) for path in sorted(inputs)),
+    return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), tuple(continuation_lines))
 
 
@@ -4974,9 +4990,14 @@ def _machine_role_counts(
         roles = tuple(dict.fromkeys((*row.roles, *(role for counts in machines.values() for role in counts))))
         if any(role != "spare" for role in roles):
             roles = tuple(role for role in roles if role != "spare")
-        local_by_role = dict(zip(row.roles, row.role_counts))
-        counted.append(replace(row, roles=roles, role_counts=tuple(local_by_role.get(role,
-            _role_session_counts((), row.tool)) for role in roles), role_counts_by_machine=machines))
+        combined: list[RoleSessionCounts | NoRoleCount] = []
+        for role in roles:
+            counts = [machine[role] for machine in machines.values() if role in machine]
+            combined.append(NoRoleCount() if role == "spare" else RoleSessionCounts(
+                busy=sum(count["busy"] for count in counts),
+                shell=sum(count["shell"] or 0 for count in counts) if row.tool == "claude" else UnknownShellCount(),
+                idle=sum(count["idle"] for count in counts)))
+        counted.append(replace(row, roles=roles, role_counts=tuple(combined), role_counts_by_machine=machines))
     return tuple(counted), (() if available else (f"{peer} unavailable: counts are {local} only",))
 
 
@@ -4985,17 +5006,12 @@ def _role_count_text(row: StatusRow, role: str) -> str:
     selected = " ✓" if role in row.selected_roles else ""
     if role == "spare":
         return role
-    if row.role_counts_by_machine:
-        counts = [machine[role] for machine in row.role_counts_by_machine.values() if role in machine]
-        busy, idle, total = (sum(count[key] for count in counts) for key in ("busy", "idle", "total"))
-        shell = sum(count["shell"] or 0 for count in counts) if row.tool == "claude" else None
-    else:
-        index = row.roles.index(role)
-        count = row.role_counts[index] if index < len(row.role_counts) else NoRoleCount()
-        if not isinstance(count, RoleSessionCounts):
-            return role + selected
-        busy, idle, total = count.busy, count.idle, count.total
-        shell = count.shell if isinstance(count.shell, int) else None
+    index = row.roles.index(role)
+    count = row.role_counts[index] if index < len(row.role_counts) else NoRoleCount()
+    if not isinstance(count, RoleSessionCounts):
+        return role + selected
+    busy, idle, total = count.busy, count.idle, count.total
+    shell = count.shell if isinstance(count.shell, int) else None
     activity = f"busy {busy}, " + (f"shell {shell}, " if shell is not None else "") + f"idle {idle}"
     return f"{role}{selected} {total} ({activity})"
 

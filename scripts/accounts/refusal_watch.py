@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
 sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
 from scripts.lib import conf
+from scripts.agents import codex_mesh
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
@@ -49,6 +50,9 @@ else:
     inventory_module = import_module("inventory")
     sessions = import_module("sessions")
     herdr = import_module("herdr")
+
+
+CLAUDE_LIMIT_PHRASES = ("hit your session limit", "hit your weekly limit")
 
 
 @dataclass(frozen=True)
@@ -396,6 +400,7 @@ class TranscriptEntry(TypedDict, total=False):
     timestamp: str
     message: object
     quotaLimits: object
+    payload: object
 
 
 @dataclass(frozen=True)
@@ -429,35 +434,74 @@ def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchang
                         entry = cast(dict[str, object], value)
                         if entry.get("type") in ("user", "assistant"):
                             return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
+                        payload = entry.get("payload")
+                        if isinstance(payload, dict):
+                            message = cast(dict[str, object], payload)
+                            if (entry.get("type") == "event_msg" and message.get("type") in (
+                                    "user_message", "agent_message", "error") or
+                                    entry.get("type") == "response_item" and message.get("type") == "message"
+                                    and message.get("role") in ("user", "assistant")):
+                                return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
     except OSError:
         pass
     return NoExchange()
 
 
-def transcript_refusal(session_id: str, *, config_dir: Path | None = None, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> TranscriptRefusal | NoSessionRefusal:
+def transcript_refusal(session_id: str, *, config_dir: Path | None = None, screen_text: str = "", account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> TranscriptRefusal | NoSessionRefusal:
+    """Read transcript evidence first. Use supplied pane text only without transcript evidence."""
     account_config = accounts.read_account_settings(account_config)
     root = config_dir if config_dir is not None else Path.home() / ".claude"
     try:
         paths = list((root / "projects").glob("*/" + session_id + ".jsonl"))
-    except OSError:
-        return NoSessionRefusal()
-    return _transcript_refusal(paths, account_config.whole("transcript_chunk_bytes"))
-
-
-def _transcript_refusal(paths: list[Path], chunk_bytes: int) -> TranscriptRefusal | NoSessionRefusal:
-    try:
         if not paths:
-            return NoSessionRefusal()
-        transcript = max(paths, key=lambda path: path.stat().st_mtime)
+            homes = [config_dir] if config_dir is not None else agent_accounts.codex_homes(agent_accounts.codex_home())
+            paths = [path for home in homes for folder in ("sessions", "archived_sessions")
+                     for path in (home / folder).rglob(f"*{session_id}.jsonl")]
     except OSError:
-        return NoSessionRefusal()
-    latest = _newest_exchange(transcript, chunk_bytes)
+        paths = []
+    return _transcript_refusal(paths, account_config.whole("transcript_chunk_bytes"), screen_text=screen_text)
+
+
+def _transcript_refusal(paths: list[Path], chunk_bytes: int, *, screen_text: str = "") -> TranscriptRefusal | NoSessionRefusal:
+    try:
+        latest = _newest_exchange(max(paths, key=lambda path: path.stat().st_mtime), chunk_bytes) if paths else NoExchange()
+    except OSError:
+        latest = NoExchange()
+    quota: object = None
+    codex_error = isinstance(latest, NoExchange) or latest.entry.get("type") == "event_msg"
     if isinstance(latest, NoExchange):
-        return NoSessionRefusal()
-    entry = latest.entry
-    if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
-        return NoSessionRefusal()
-    entry_id, timestamp = entry.get("uuid"), entry.get("timestamp")
+        text = screen_text
+        timestamp = datetime.now(timezone.utc).isoformat()
+        entry_id = hashlib.sha256(text.encode()).hexdigest()
+    else:
+        entry = latest.entry
+        timestamp = entry.get("timestamp")
+        if codex_error:
+            payload_value = entry.get("payload")
+            if not isinstance(payload_value, dict):
+                return NoSessionRefusal()
+            payload = cast(dict[str, object], payload_value)
+            if payload.get("type") != "error":
+                return NoSessionRefusal()
+            text = str(payload.get("message", ""))
+            entry_id = entry.get("uuid") or hashlib.sha256((str(timestamp or "") + text).encode()).hexdigest()
+        else:
+            if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
+                return NoSessionRefusal()
+            entry_id = entry.get("uuid")
+            message = entry.get("message")
+            content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "\n".join(str(cast(dict[str, object], block).get("text", ""))
+                                 for block in cast(list[object], content) if isinstance(block, dict))
+            else:
+                text = ""
+            quota = entry.get("quotaLimits")
+    if codex_error and codex_mesh.QUOTA_REFUSAL not in text.casefold():
+        if not isinstance(latest, NoExchange) or not any(phrase in text.casefold() for phrase in CLAUDE_LIMIT_PHRASES):
+            return NoSessionRefusal()
     if not isinstance(entry_id, str) or not entry_id or not isinstance(timestamp, str):
         return NoSessionRefusal()
     try:
@@ -466,21 +510,12 @@ def _transcript_refusal(paths: list[Path], chunk_bytes: int) -> TranscriptRefusa
         return NoSessionRefusal()
     if at.tzinfo is None:
         return NoSessionRefusal()
-    message = entry.get("message")
-    content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else ""
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        text = "\n".join(str(cast(dict[str, object], block).get("text", ""))
-                         for block in cast(list[object], content) if isinstance(block, dict))
-    else:
-        text = ""
     folded = text.casefold()
     window: refusals.KnownWindow | refusals.UnknownWindow = (
-        refusals.KnownWindow("weekly") if "weekly limit" in folded else
-        refusals.KnownWindow("five_hour") if "hit your session limit" in folded else refusals.UnknownWindow())
+        refusals.KnownWindow("weekly") if "weekly limit" in folded or codex_error and "weekly" in folded else
+        refusals.KnownWindow("five_hour") if CLAUDE_LIMIT_PHRASES[0] in folded or codex_error and (
+            "5-hour" in folded or "five-hour" in folded) else refusals.UnknownWindow())
     reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
-    quota = entry.get("quotaLimits")
     if isinstance(quota, dict):
         limits = cast(dict[str, object], quota)
         rate_type = limits.get("rateLimitType")
@@ -610,7 +645,7 @@ def session_observation() -> Generator[None]:
 
 
 @herdr.process_action()
-def _action_group_members() -> dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]]:
+def _action_group_members() -> dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]]:
     """Read members fresh before refusal, queued or committed group moves."""
     return accounts.live_group_members()
 
@@ -750,8 +785,12 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                  and previous["state"] in ("requested", "cancelled", "continued", "group selected")))
     refusing_logins: set[str] = set()
     owners = live_owners(only=refused_ids) if refused_ids else []
+    all_members: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]] = (
+        _action_group_members() if owners else {"units": [], "showrunners": []})
+    owner_groups: dict[str, accounts.ClaudeGroup | Literal["ungrouped"]] = {
+        member.session_id: member.group for members in all_members.values() for member in members}
     owners = [session for session in owners if not isinstance(detected[session["session_id"]], ProofRefusal)
-              or accounts.session_group(session) == "ungrouped"]
+              or session["session_id"] not in owner_groups]
     if owners and not dry_run:
         refresh_usage()
         now = max(now, datetime.now(timezone.utc))
@@ -785,7 +824,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 _set_transition(state, session_id, refusal.entry_id, "waited", journaled_wait["move_id"])
     # A short reset wait applies to the whole group.
     for session in owners:
-        group_name = accounts.session_group(session)
+        group_name = owner_groups.get(session["session_id"], "ungrouped")
         if group_name == "ungrouped" or group_name in pending_groups:
             continue
         if group_name in unconfigured:
@@ -828,7 +867,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         previous = state["sessions"].get(session_id)
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] in ("requested", "cancelled", "continued", "group selected"):
             continue
-        if (accounts.session_group(session) in unconfigured
+        if (owner_groups.get(session["session_id"], "ungrouped") in unconfigured
                 and not (previous and previous["entry_id"] == refusal.entry_id and previous["state"] == "waited")):
             continue
         login = accounts.claude_login(Path(session.get("config_dir", str(accounts.main_config_dir()))))
@@ -868,7 +907,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         if isinstance(refusal, TranscriptRefusal):
             refusing_logins.add(login.casefold())
         subject = session_id + ": " + session["name"]
-        pending_head = accounts.session_group(session) in pending_groups
+        pending_head = owner_groups.get(session["session_id"], "ungrouped") in pending_groups
         if (isinstance(wait_reset, refusals.KnownReset) and (pending_head
                 or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
                 and timedelta(0) < wait_reset.at - now < reset_wait)):
@@ -883,16 +922,16 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             continue
         if pending_head:
             continue
-        group_name = accounts.session_group(session)
+        group_name = owner_groups.get(session["session_id"], "ungrouped")
         key = ("proof group" if proof_group else "proof:" + session_id if isinstance(refusal, ProofRefusal)
                else login.casefold()) if group_name == "ungrouped" else "group:" + group_name
         groups.setdefault(key, []).append((session, refusal, account_refusal))
     fingerprint = _reading_values_fingerprint()
     if dry_run:
         lines.insert(0, accounts.group_status_line(selected_groups))
-    all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = (_action_group_members()
-        if not proof_group and any(key.startswith("group:") for key in groups)
-        else {"units": [], "showrunners": []})
+    if not proof_group and any(key.startswith("group:") for key in groups):
+        all_members = _action_group_members()
+
     moved_groups: set[accounts.ClaudeGroup] = set()
     no_room_groups: set[accounts.ClaudeGroup] = set()
     for login, group in groups.items():
@@ -976,7 +1015,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         if not accounts.session_on_account(session, chosen.label))
         else:
             ids = tuple(session["session_id"] for session, _, _ in group)
-        outcomes = accounts.move_sessions(ids, chosen.label, why=why) if ids else ()
+        outcomes = accounts.move_sessions(ids, chosen.label, why=why, cause="refusal") if ids else ()
         by_id = {session["session_id"]: refusal for session, refusal, _ in group}
         for outcome in outcomes:
             lines.append(accounts.move_result_line(outcome))
@@ -1003,8 +1042,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         eligible: set[accounts.ClaudeGroup] = {group for group in accounts.CLAUDE_GROUPS
                     if group not in moved_groups | waiting_groups | no_room_groups
                     and isinstance(accounts.group_label(selected_groups, group), str)}
-        def completion_members(observed: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]],
-                               group_name: accounts.ClaudeGroup, target: str) -> list[inventory_module.ListedSession]:
+        def completion_members(observed: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]],
+                               group_name: accounts.ClaudeGroup, target: str) -> list[accounts.LiveGroupMember]:
             return [session for session in observed[group_name]
                        if not accounts.session_on_account(session, target)
                        and not (session.session_id in state["sessions"] and state["sessions"][session.session_id]["state"] == "cancelled"
@@ -1047,7 +1086,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         why = f"complete {group_name} move to {target}"
                         if isinstance(transition.origin, accounts.AutoOrigin):
                             why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
-                        outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why)
+                        outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why,
+                            cause=accounts.move_origin_fields(transition.origin)["cause"])
                         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original_state:
         _save_state(state)
@@ -1212,7 +1252,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         _save_state(state)
         ids = tuple(member.session_id for member in members[rule.group]
                     if not accounts.session_on_account(member, rule.to))
-        outcomes = accounts.move_sessions(ids, rule.to, why=why) if ids else ()
+        outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto") if ids else ()
         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original:
         _save_state(state)

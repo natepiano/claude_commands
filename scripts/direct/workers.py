@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from scripts.message.sessions import RegistryRead, SessionRecord
     from scripts.lib.names import JobKey
 
-from scripts.agents import worker_lifecycle
+from scripts.agents import mesh_run_process, worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.usage import agents_log
@@ -56,6 +56,7 @@ class WorkerArguments(argparse.Namespace):
     command: str = ""
     session_dir: Path = Path()
     role: str = ""
+    working_dir: str = ""
     owner_pid: int = 0
     model: str = ""
     effort: str = ""
@@ -369,7 +370,7 @@ def _worker_from_record(name: str, run: Path, record: dict[str, object], members
     policy: dict[str, object] = {"kind": type(access).__name__}
     if isinstance(access, PhaseBoundDesigner):
         policy.update({"binding_generation": access.binding_generation, "launch_sandbox": access.launch_sandbox})
-    settings = codex_mesh.recorded_turn_settings(record)
+    settings = worker_lifecycle.recorded_turn_settings(record)
     return UnitWorker(name, _worker_task_role(record, membership, assignments), "codex", settings.model,
                       settings.effort, policy,
                       CodexThread(_text(session_staff.worker_session(record, membership)), _text(session_staff.worker_home(record, membership)) or
@@ -429,7 +430,7 @@ def note_backend(run: Path, name: str, thread_id: str, home: Path) -> None:
                                                 old_thread_id=previous, thread_id=thread_id))
                 worker.access_policy = _object(record.get("access_policy")) or worker.access_policy
                 from scripts.agents import codex_mesh
-                settings = codex_mesh.recorded_turn_settings(record)
+                settings = worker_lifecycle.recorded_turn_settings(record)
                 worker.model, worker.effort = settings.model, settings.effort
                 worker.backend = CodexThread(thread_id, str(home.resolve()))
                 worker.ownership = HeldBy(str(run))
@@ -465,13 +466,13 @@ def _next_worker_name(ledger: UnitWorkers, roster: Mapping[str, object], role: s
     return name
 
 
-def resolve(run: Path, role: str, *, model: str = "", effort: str = "") -> str:
+def resolve(run: Path, role: str, *, model: str = "", effort: str = "", working_dir: Path | None = None) -> str:
     """Return an idle worker, carry one over, reopen one, or open the next name."""
-    return _resolve(run, role, os.getpid(), model=model, effort=effort)
+    return _resolve(run, role, os.getpid(), model=model, effort=effort, working_dir=working_dir)
 
 
 def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: str = "",
-             new_name: str = "") -> str:
+             new_name: str = "", working_dir: Path | None = None) -> str:
     from scripts.agents import codex_mesh
     if role not in ROLES:
         raise WorkerUnavailable(f"unsupported worker role: {role}")
@@ -540,7 +541,8 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
             name = new_name
         record = codex_mesh.open_unit_worker(str(run), name, role,
             model=model or (carried.model if carried is not None else ""),
-            effort=effort or (carried.effort if carried is not None else ""))
+            effort=effort or (carried.effort if carried is not None else ""),
+            cwd=str(working_dir) if working_dir is not None else "")
         if carried is not None:
             record.update({"turn_model": carried.model, "turn_effort": carried.effort})
             with _roster_locked(run) as (handle, current):
@@ -558,7 +560,7 @@ def _reviewer_destination(owner: staff.StaffRow) -> str:
     if owner.kind == "unit" and not isinstance(owner.worktree, staff.PresentWorktree):
         raise WorkerUnavailable("invalid worker state: missing working_dir")
     from scripts.production.production_doc import read_production
-    directory = str(read_production(owner.doc.path).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
+    directory = str(read_production(owner).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
                     else owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd())
     result = subprocess.run(
         ["bash", str(Path(__file__).with_name("worker_name.sh")),
@@ -688,12 +690,11 @@ def _runs(ledger: UnitWorkers) -> tuple[Path, ...]:
 
 def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
     """Recorded supervisors only; no process discovery by name."""
-    from scripts.agents import mesh_runs
     records: list[tuple[Path, dict[str, object]]] = []
     for path in sorted((run / "mesh_runs").glob("*.json")):
         record = worker_lifecycle.read_json_object(path)
         pid = record.get("pid")
-        if record.get("status") == "running" and isinstance(pid, int) and mesh_runs.supervises(pid, path):
+        if record.get("status") == "running" and isinstance(pid, int) and mesh_run_process.supervises(pid, path):
             records.append((path, record))
     return tuple(records)
 
@@ -724,7 +725,7 @@ def held_claude_sessions() -> set[str]:
 
 
 def end_unit(owner: staff.StaffRow) -> None:
-    from scripts.agents import codex_mesh, mesh_runs
+    from scripts.agents import codex_mesh
     # Run cleanup reads this ledger too; load only its binary lookup interface
     # here so neither module owns a static import cycle.
     with worker_lifecycle.operation_deadline(timeout=codex_mesh.THREAD_RELEASE_TIMEOUT_SECS):
@@ -756,8 +757,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                         print(f"cancelled pending message of {name}: {message}")
                                     _write_inbox(inbox, {})
                                 current = _object(_read_roster(run).get(name))
-                                if (isinstance(worker.backend, CodexThread) and current
-                                        and current.get("status") != "ended"):
+                                if isinstance(worker.backend, CodexThread) and current:
                                     result = codex_mesh.end_worker_locked(argparse.Namespace(session_dir=str(run), to=name))
                                     if result:
                                         raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")
@@ -765,7 +765,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                     if detached.get("worker") != name:
                                         continue
                                     pid = detached["pid"]
-                                    if isinstance(pid, int) and mesh_runs.supervises(pid, path):
+                                    if isinstance(pid, int) and mesh_run_process.supervises(pid, path):
                                         try:
                                             os.kill(pid, signal.SIGTERM)
                                         except ProcessLookupError:
@@ -833,6 +833,7 @@ def main() -> int:
     command = commands.add_parser("resolve")
     _ = command.add_argument("--session-dir", type=Path, required=True)
     _ = command.add_argument("--role", choices=ROLES, required=True)
+    _ = command.add_argument("--working-dir", default="", help="working directory for a new worker")
     _ = command.add_argument("--owner-pid", type=int, default=0)
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
@@ -848,7 +849,8 @@ def main() -> int:
             print(shown_name(run, args.name))
         else:
             print(_resolve(run, role, args.owner_pid or director_pid(run),
-                           model=args.model, effort=args.effort, new_name=args.name))
+                           model=args.model, effort=args.effort, new_name=args.name,
+                           working_dir=Path(args.working_dir) if args.working_dir else None))
         return 0
     except (WorkerUnavailable, OSError, ValueError) as error:
         print(f"workers: {error}", file=sys.stderr)

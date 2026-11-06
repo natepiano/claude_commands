@@ -29,7 +29,7 @@ The roster joins records that each name one part of the picture. A session's rol
 
 |---|---|---|
 
-| Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
+| Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, showrunner staff name, production doc |
 
 | Unit staff rows | `staff.json`, via `unit_lookup.doc_units` with a present worktree | unit id and worktree per row (fallback only) |
 
@@ -85,7 +85,8 @@ Codex rows:
 
 `roster.py` holds the one rule that names a session's showrunner and unit for build views and copy folders. Callers never derive these names themselves.
 
-- `UnitLabels(session, showrunner="—", unit="—")` is frozen, and each field is whitespace-collapsed. Showrunner is the production slug and unit is the unit id without its `-unit` suffix, read through `_production_of` and `_unit_of`, the same helpers `shown_name` uses through `_production(entry)` and `_unit(entry)`; `_short_unit` is the one place that strips `-unit`. A production with no running showrunner still names its slug. These are the short names herdr shows (production `builds`, unit `report-unit` gives `builds`, `report`), never a session name. `—` marks a missing part.
+- `UnitLabels` shows the parent showrunner row's `name` and the unit row's `name`.
+  A stopped showrunner keeps its staff name. `—` marks a missing part.
 - `unit_labels(entries) -> dict[str, UnitLabels]` keys a full roster's entries by Claude session id and Codex thread id. `/build:queue` uses it (`docs/as-built/build-memory-admission.md`, "Queue API").
 - `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` is the fast path for known Claude session ids. It reads the session records, the showrunner registry through `showrunners.registered_showrunners(known_sessions=...)`, and session labels through `session_staff.session_staff_and_directors(records, environment)`, which reads only each record's `/proc/<pid>/environ` (`HERDR_PROC` replaces `/proc`). It never reads the process table, Codex meshes or accounts. A session whose `CLAUDE_CODE_SESSION_ID` names another known session resolves under that director and takes its production and unit. Unknown ids are left out, and any error returns `{}`. `/build:status` uses it (`docs/as-built/build-targets.md`).
 - Both paths use `session_staff.group_labeled_sessions`. Native runtime ids select staff rows. Duplicate live or unknown processes produce a fault.
@@ -120,7 +121,7 @@ send.py drain-sockets
 The argparse boundary builds `RecipientSelection = RosterLookup(to) | MeshWorker(session_dir, worker)` and `RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine(host)`: `--here` is `LocalOnly`, `--machine HOST` is `NamedMachine`, neither is `LocalThenPeer`; the two together are a usage error. `Options.action: MessageUserAction = UserAction | NoUserRecipient`.
 
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
-A typed name first matches a staff path or short name. Unit names accept both `resources` and `resources-unit`.
+A typed name first matches a staff path or short name. Unit names accept both `resources` and `resources`.
 One staff row selects its `current_session`. Several staff rows produce a named ambiguity error and no delivery.
 The repeat-notice owner follows staff parents to the showrunner. It uses the default owner for a non-staff sender.
 
@@ -479,7 +480,7 @@ Release recalculates the priority of a kept decision.
 - `--plugin-dir` reloads the folder when its files change. A pull on main replaces the worker 19–23 s after `register.ts` changes. The relay covers a stale heartbeat. The shutdown pane record retains each plugin directory as an absolute path. Account moves and pane restores pass those directories to Claude again. Old records without those directories need a manual launch with the plugin flag. A stopped postmaster needs a manual start.
 - After about 32 quick sends to one session the engine answers `isDelivered: false` (then about one per 2 s); the mod does not pace, so these surface as `failed` and the client relays them.
 - A reply only counts when the recipient answers the postmaster session with SendMessage. A recipient that answers through `send.py --to postmaster` sends through the relay, whose socket holds no route, so the postmaster takes an ordinary turn.
-- `quota_alert.py` gives a session send 45 s in all (`RELAY_TIMEOUT` 40 plus 5); its phone sends wait `review.user_send_seconds()` plus kill grace instead, since a push may be reviewed twice. One budget covers both paths: the relay after a miss gets `--timeout` less the attempt's seconds, at least 1 s, which keeps the 5 s worst-case attempt, the relay and 10 s of kill grace inside it.
+- `quota_alert.py` reads `quota_relay_timeout_seconds` from `config/accounts.conf` for session sends. The default is 40 seconds, with 10 seconds reserved before `send_budget.seconds()` adds the delivery allowances. Phone sends use `review.user_send_seconds()` and `send_budget.user_seconds()`.
 - Unmeasured: whether a `$` taken in `session.receive` keeps the outbox poll timer alive after a receive-first start. The live check could not reach receive-first; a hook reload starts the new worker through `session.start`.
 - The test kit skips a throwing `fs.list` hook, so a test that makes the listing throw sees the kit's own implementation failure instead.
 - `/home/natepiano/postmaster` is outside the repo and trusted per account. A new account or a removed/recreated directory can meet the folder-trust dialog.

@@ -903,9 +903,16 @@ def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
     return words
 
 
-def _review_slugs(record: PauseRecord) -> frozenset[str]:
-    return frozenset(name.removeprefix("showrunner-")
-                     for name in record.instances if name.startswith("showrunner-"))
+def _review_names(record: PauseRecord) -> frozenset[str]:
+    from scripts.production import showrunners, staff
+
+    names: set[str] = set()
+    for name in record.instances:
+        if name.startswith("showrunner-"):
+            owner = showrunners.owner_for_timer(notifier_root() / name)
+            if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+                names.add(owner.name)
+    return frozenset(names)
 
 
 def _timer_paused(instance: Path) -> bool:
@@ -1004,8 +1011,8 @@ def tick(now: int) -> tuple[str, ...]:
             try:
                 record = read_record(path)
                 review_open = any(
-                    showrunner_footer.review_pause_path(slug).exists()
-                    for slug in _review_slugs(record)
+                    showrunner_footer.review_pause_path(name).exists()
+                    for name in _review_names(record)
                 )
                 _advance(path, record, now, session, review_open, questions, actions)
             except FileNotFoundError:

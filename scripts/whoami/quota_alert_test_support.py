@@ -67,7 +67,7 @@ REFUSAL_ACTION = "At chatgpt.com/codex/settings/usage, add credits for account c
 
 def running(*names: str) -> list[quota_alert.Showrunner]:
     """Running showrunners called `names`, as their update timers and session records would give them."""
-    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", slug=name.replace(" ", "-"),
+    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", name=name,
                                    zone="America/Los_Angeles", doc="") for name in names]
 
 
@@ -108,7 +108,7 @@ class QuotaReminderFixture(unittest.TestCase):
         self.prepare_files()
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
-        config = self.root / "showrunners.json"
+        config = self.root / "showrunners.conf"
         registry = self.root / "models.conf"
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
                             ("tell_user", self.tell_user), ("REGISTRY", registry)):
@@ -140,9 +140,15 @@ class QuotaReminderFixture(unittest.TestCase):
         codex_home.mkdir()
         claims = base64.urlsafe_b64encode(json.dumps({"email": "someone@example.com"}).encode()).decode().rstrip("=")
         _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
-        _ = (self.root / "showrunners.json").write_text(json.dumps({
-            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": 5,
-            "faults_to": "natedev", "always": ["natedev"]}))
+        _ = (self.root / "showrunners.conf").write_text(("""# range: 0..
+threshold_percent=1
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=natedev
+always=natedev
+"""))
         _ = write_registry((self.root / "models.conf"), base_text=REGISTRY)
         (self.root / "catalog synced").touch()
 
@@ -350,9 +356,16 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
-        config = self.root / "showrunners.json"
-        _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
-            "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
+        config = self.root / "showrunners.conf"
+        _ = config.write_text(("""# range: 0..
+threshold_percent=1
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=director
+always=director
+"""))
         registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))

@@ -15,17 +15,26 @@ Staff supplies each run's current owner. Run records keep task history.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import json
 import os
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from importlib import import_module
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 RUN_TEMP_NAME = "tmp"
-RUN_ROOT = Path("/tmp/claude/unit")
-FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
+# SCRATCH_ROOT also selects the parent folder for temporary unit runs.
+RUN_ROOT = Path(os.environ.get("SCRATCH_ROOT") or "/tmp/claude/scratch").parent / "unit"
+FORMER_RUN_ROOT = RUN_ROOT.parent / "delegate"
 # Notifier instances a unit run once had; conversation_pause names them "status reports".
 INSTANCE_PREFIXES = ("unit-", "delegate-")
 # A run's shared liveness log, beaten every 60 s per worker while one runs.
@@ -35,6 +44,7 @@ HEARTBEAT = "heartbeat.log"
 LIVE_HEARTBEAT_SECS = 600
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
+OWNER_FIELD = "owner_staff_id"
 SERVER_FILE = "mesh_server.json"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
@@ -51,6 +61,30 @@ new, former = state / '{HISTORY_NAME}', state / '{FORMER_HISTORY_NAME}'
 root = Path(sys.argv[1] or os.environ.get('UNIT_HISTORY_DIR') or os.environ.get('PLAN_DELEGATE_HISTORY_DIR')
             or (former if not new.exists() and former.exists() else new)).expanduser()
 """
+
+
+@dataclass(frozen=True)
+class RunOwnerUnrecorded:
+    reason: str
+
+
+def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnrecorded:
+    """Resolve a fixed owner first; older runs can still name their director."""
+    from scripts.production import staff
+
+    reference = fields.get(OWNER_FIELD)
+    if isinstance(reference, str) and reference:
+        row = record.by_id(staff.StaffId(reference))
+        if row is None or row.kind != "unit":
+            raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
+        return row
+    identity = fields.get("main_agent")
+    agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
+    reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
+    row = record.by_member_reference(reference) if isinstance(reference, str) and reference else None
+    if row is not None and row.kind == "worker":
+        row = record.parent_of(row)
+    return row if row is not None and row.kind == "unit" else RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -71,6 +105,61 @@ def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
 def run_temp_path(run: Path) -> Path:
     """Name the temporary folder that shares the run's lifetime."""
     return run / RUN_TEMP_NAME
+
+
+def worker_transport(run: Path) -> Literal["mesh", "herdr"]:
+    """Pin the configured worker transport for this run."""
+    from scripts.lib import conf
+    from scripts.lib.atomic_file import write_text_atomic
+
+    run.mkdir(parents=True, exist_ok=True)
+    pin = run / "worker_transport"
+    with (run / "worker_transport.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            selected = pin.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            selected = conf.read("direct").text("WORKER_TRANSPORT")
+            selected = _transport(selected, run)
+            write_text_atomic(pin, selected + "\n")
+        return _transport(selected, pin)
+
+
+def _transport(selected: str, source: str | Path) -> Literal["mesh", "herdr"]:
+    if selected not in ("mesh", "herdr"):
+        raise ValueError(f"{source}: invalid worker transport: {selected}")
+    return selected
+
+
+class NoRunPin(Enum):
+    ABSENT = "the run has no transport pin"
+
+
+def run_pin(run: Path) -> Literal["mesh", "herdr"] | NoRunPin:
+    """Read a run's transport pin without writing it."""
+    pin = run / "worker_transport"
+    try:
+        return _transport(pin.read_text(encoding="utf-8").strip(), pin)
+    except FileNotFoundError:
+        return NoRunPin.ABSENT
+
+
+class RunStaffAtUse(Enum):
+    LOCAL = "read the local staff record"
+
+
+def parent_transport(session_id: str, *, scanned: dict[str, list[str]] | None = None,
+                     record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL
+                     ) -> Literal["mesh", "herdr"]:
+    """Read the first held run's pin, or current configuration, without writing."""
+    from scripts.lib import conf
+
+    runs = held(session_id, os.environ.get("ROSTER_RUN_ROOT"), scanned=scanned, record=record)
+    if runs:
+        selected = run_pin(Path(runs[0]))
+        if not isinstance(selected, NoRunPin):
+            return selected
+    return _transport(conf.read("direct").text("WORKER_TRANSPORT"), "config/direct.conf")
 
 
 def activate(run: Path, session_id: str) -> None:
@@ -129,21 +218,24 @@ def marker_must_stay(path: Path) -> bool:
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
-def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
-    """Find the run's current owner in staff."""
+def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
+             record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> str:
+    """Read the run owner's current session from staff."""
     from scripts.production import staff
+
     if dependencies is not None:
         dependencies(staff.record_path())
         dependencies(run / STATE_FILE)
-    find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
     try:
-        return find_parent(staff.local_snapshot(), run=run).current_session
+        find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
+        return find_parent(staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record, run=run).current_session
     except (OSError, ValueError) as error:
         print(f"anomaly: {run}: {error}", file=sys.stderr)
         return ""
 
 
-def held_by_session(root_override: str | Path | None = None) -> dict[str, list[str]]:
+def held_by_session(root_override: str | Path | None = None, *,
+                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
     """Read each folder's director once, in root order and then name order."""
     found: dict[str, list[str]] = {}
     seen: set[Path] = set()
@@ -154,19 +246,21 @@ def held_by_session(root_override: str | Path | None = None) -> dict[str, list[s
             continue
         for folder in folders:
             resolved = folder.resolve()
-            if folder.is_dir() and resolved not in seen:
+            if (folder.is_dir() and resolved not in seen
+                    and any((folder / name).is_file() for name in (STATE_FILE, "mesh_roster.json"))):
                 seen.add(resolved)
-                found.setdefault(director(folder), []).append(str(folder))
+                found.setdefault(director(folder, record=record), []).append(str(folder))
     return found
 
 
 def held(session_id: str, root_override: str | Path | None = None,
          active_override: str | Path | None = None, *,
-         scanned: dict[str, list[str]] | None = None) -> list[str]:
+         scanned: dict[str, list[str]] | None = None,
+         record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> list[str]:
     """List directed folders with the verified marker first, then the shared scan's order."""
     if not session_id:
         return []
-    folders = held_by_session(root_override) if scanned is None else scanned
+    folders = held_by_session(root_override, record=record) if scanned is None else scanned
     try:
         lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
@@ -177,7 +271,7 @@ def held(session_id: str, root_override: str | Path | None = None,
         owner = next((session for session, paths in folders.items()
                       if any(Path(path).resolve() == resolved for path in paths)), None)
         if owner is None:
-            owner = director(Path(target))
+            owner = director(Path(target), record=record)
             if owner == session_id:
                 # Cache an outside target only after its marker owner matches its director.
                 folders.setdefault(owner, []).append(target)
@@ -190,6 +284,58 @@ def held(session_id: str, root_override: str | Path | None = None,
             seen.add(resolved)
             runs.append(folder)
     return runs
+
+
+def _json_object(text: str) -> dict[str, object]:
+    try:
+        raw = cast(object, json.loads(text))
+    except ValueError:
+        return {}
+    return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
+
+
+def migrate_owners(root: Path, *, dry_run: bool = False) -> int:
+    """Replace active run names with proved staff ids; keep history files unchanged."""
+    from scripts.lib import atomic_file
+    from scripts.production import staff
+
+    unavailable = False
+    for path in sorted(root.glob(f"*/{STATE_FILE}")):
+        try:
+            with (path.parent / ".progress_history.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                fields = _json_object(path.read_text(encoding="utf-8"))
+                if not fields:
+                    raise ValueError(f"{path}: run state is unreadable")
+                if fields.get("status") != "active":
+                    continue
+                record = staff.snapshot()
+                owner = run_owner(fields, record)
+                if isinstance(owner, RunOwnerUnrecorded):
+                    production, unit = fields.get("production"), fields.get("unit")
+                    parents = {row.id for row in record.find(kind="showrunner") if row.name == production}
+                    matches = [row for row in record.find(kind="unit") if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents
+                               and isinstance(unit, str) and row.name == unit]
+                    if len(matches) != 1:
+                        raise staff.StaffUnreadable(f"{path}: run owner is unavailable")
+                    owner = matches[0]
+                changed = dict(fields)
+                changed[OWNER_FIELD] = owner.id
+                folder = fields.get("working_dir")
+                for key in ("plan_doc", "project_plan_doc"):
+                    value = fields.get(key)
+                    if isinstance(folder, str) and isinstance(value, str) and value.startswith(folder + "/"):
+                        changed[key] = str(Path(value).relative_to(folder))
+                for key in ("production", "unit", "working_dir", "worktree", "branch"):
+                    _ = changed.pop(key, None)
+                if changed != fields:
+                    if not dry_run:
+                        atomic_file.write_text_atomic(path, json.dumps(changed, indent=2, sort_keys=True) + "\n")
+                    print(f"{'would migrate' if dry_run else 'migrated'} {path}: {owner.id}")
+        except (OSError, ValueError) as error:
+            unavailable = True
+            print(f"run owner unavailable: {error}", file=sys.stderr)
+    return int(unavailable)
 
 
 class FormerOwner(NamedTuple):
@@ -282,6 +428,19 @@ def _held_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "worker-transport":
+        try:
+            print(worker_transport(Path(argv[1])))
+        except (OSError, ValueError) as error:
+            print(f"unit_runs: {error}", file=sys.stderr)
+            return 2
+        return 0
+    if argv and argv[0] == "migrate-owners":
+        parser = argparse.ArgumentParser(description="Migrate active run owners to staff ids.")
+        _ = parser.add_argument("--root", type=Path, required=True)
+        _ = parser.add_argument("--dry-run", action="store_true")
+        args = parser.parse_args(argv[1:])
+        return migrate_owners(cast(Path, args.root), dry_run=cast(bool, args.dry_run))
     if len(argv) == 3 and argv[0] == "activate":
         try:
             activate(Path(argv[1]), argv[2])
@@ -297,7 +456,7 @@ def main(argv: list[str]) -> int:
     if argv == ["move-history"]:
         return move_history(time.time())
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id>",
+        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id> | worker-transport <run folder>",
               file=sys.stderr)
         return 2
     if TYPE_CHECKING:

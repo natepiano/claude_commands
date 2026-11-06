@@ -111,7 +111,7 @@ class QueueEvidenceTests(unittest.TestCase):
             machine="test-machine", kind="codex", role="freestanding", name=f"{name}-session",
             status="running", reach=roster.CannotReceiveMessages("fixture"), cwd="/tmp/tree",
             showrunner=roster.UnderShowrunner("hana", "hana", "session:hana"),
-            director=roster.UnderDirector(f"{name}-unit", name, f"session:{name}"),
+            director=roster.UnderDirector(name, name, f"session:{name}"),
             assignment=roster.NotAWorker(), thread=roster.CodexThread(f"id-{name}"),
             session=roster.NoClaudeSession(),
         )

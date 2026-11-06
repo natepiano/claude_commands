@@ -149,7 +149,9 @@ class UnitConfig:
     formatting: RepositoryTaploConfig | DefaultTaploConfig = field(default_factory=DefaultTaploConfig, compare=False)
 
     def __post_init__(self) -> None:
-        # A responsibility is a short name (`nightly-review`) or an owned repository path (the old Owns cell).
+        # A responsibility is a short name or a repository path.
+        # Responsibilities are a set; sorted order matches taplo's reorder_arrays in a repository config.
+        object.__setattr__(self, "responsibilities", tuple(sorted(self.responsibilities)))
         for name in self.responsibilities:
             if re.fullmatch(r"[A-Za-z0-9._-][A-Za-z0-9._/-]*", name) is None or ".." in name.split("/"):
                 raise ConfigRefused(f"responsibilities: invalid name or repository path {name!r}")
@@ -390,6 +392,15 @@ def write(worktree: Path, config: UnitConfig) -> Published | AlreadyCurrent:
         formatted = _formatted(desired, worktree, repository_formatting(worktree))
         git_exclude.ensure_excluded(worktree, "/.unit.toml")
         return _publish(worktree / ".unit.toml", desired, formatted)
+
+
+def set_plan(worktree: Path, plan: Path) -> None:
+    """Change only the plan in the existing unit configuration."""
+    with writer_lock():
+        config = read(worktree, cleanup=False)
+        if isinstance(config, ConfigMissing):
+            raise staff.StaffUnreadable(config.reason)
+        _ = write(worktree, replace(config, plan=PlanFile(plan)))
 
 
 def first_difference(left: UnitConfig, right: UnitConfig) -> str:

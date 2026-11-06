@@ -24,6 +24,7 @@ from typing import final, override
 from unittest.mock import patch
 
 from scripts.whoami import agent_accounts, usage_store
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.whoami.agent_accounts import command_json
 
@@ -218,6 +219,31 @@ class SharedUsageReadTests(unittest.TestCase):
         self.assertEqual(timeout, 15)
         return io.BytesIO(b'{"seven_day":{"utilization":25,"resets_at":"2026-10-25T12:00:00Z"}}')
 
+    def test_account_commands_read_the_current_timeout_with_and_without_an_environment(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        original = config.read_text()
+        done = subprocess.CompletedProcess([], 0, "{}", "")
+        for limit in (15, 27):
+            _ = config.write_text(original.replace("account_command_timeout_seconds=15", f"account_command_timeout_seconds={limit}"))
+            for environment in (None, {"FIXTURE": "1"}):
+                with (self.subTest(limit=limit, environment=environment),
+                      patch.object(agent_accounts, "executable", return_value="fixture-command"),
+                      patch.object(subprocess, "run", return_value=done) as run):
+                    self.assertEqual(command_json("fixture-command", environment=environment), {})
+                self.assertEqual(run.call_args.kwargs["timeout"], limit)
+                if environment is None:
+                    self.assertNotIn("env", run.call_args.kwargs)
+                else:
+                    self.assertEqual(run.call_args.kwargs["env"], environment)
+
+    def test_usage_http_request_reads_the_account_timeout(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        _ = config.write_text(config.read_text().replace("claude_usage_timeout_seconds=15", "claude_usage_timeout_seconds=23"))
+        with patch.object(urllib.request, "urlopen", return_value=self.response(
+                urllib.request.Request("https://example.invalid"), timeout=15)) as request:
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+        self.assertEqual(request.call_args.kwargs["timeout"], 23)
+
     def test_signed_out_cli_exit_preserves_the_last_good_reading(self) -> None:
         folder = self.home / ".claude2"
         login = "shared@example.invalid"
@@ -360,7 +386,7 @@ with (patch.object(agent_accounts, 'command_json', return_value={
                   + "claim = usage_store.claim_read\n"
                   + f"usage_store.claim_read = lambda login, now: claim(login, datetime.fromisoformat({self.now.isoformat()!r}))\n"
                   + script)
-        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rate_limit_holds_for_ten_minutes_even_when_the_caller_does_not_save(self) -> None:

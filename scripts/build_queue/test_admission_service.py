@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
 from collections.abc import Callable
+from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import datetime
 import io
@@ -27,6 +28,7 @@ from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
 from scripts.lint import memory_admit as gate
+from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
     from scripts.buildlog import store
@@ -108,6 +110,55 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
                             for request in requests}
                 self.assertEqual(fixture.server.caller_versions, expected)
                 self.assertEqual(service.read_state(fixture.state_dir).caller_versions, expected)
+
+
+class OutageClaimTests(unittest.TestCase):
+    def test_outage_claim_clears_once_after_listener_uptime_using_the_last_usable_config(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.clock.epoch = time.time()
+            fixture.configure(silence_seconds=7)
+            claimed = outage_alerts.claim("build-admission")
+            assert isinstance(claimed, outage_alerts.AlertClaim)
+            outage_alerts.delivered(claimed)
+            fixture.clock.advance(100)
+            with fixture.loop_turn():
+                fixture.restart()
+                fixture.server.run_once()
+                fixture.clock.advance(6)
+                fixture.server.run_once()
+                self.assertIsInstance(outage_alerts.claim("build-admission"), outage_alerts.AlertDelivered)
+                fixture.configure(silence_seconds=float("nan"))
+                fixture.server.run_once()
+                self.assertIsInstance(fixture.server.configuration, gate.UnusableAdmissionConfiguration)
+                fixture.clock.advance(1)
+                with mock.patch.object(outage_alerts, "clear", wraps=outage_alerts.clear) as clear:
+                    fixture.server.run_once()
+                    fixture.clock.advance(7)
+                    fixture.server.run_once()
+                self.assertEqual([call for call in clear.call_args_list if call.args[0] == "build-admission"],
+                    [mock.call("build-admission", fixture.clock.now() - 7)])
+            next_claim = outage_alerts.claim("build-admission")
+            self.assertIsInstance(next_claim, outage_alerts.AlertClaim)
+
+    def test_failed_outage_claim_clear_reports_once_per_attempt_and_retries_in_the_loop(self) -> None:
+        for failure in (False, OSError("ledger unavailable")):
+            with self.subTest(failure=failure), AdmissionFixture() as fixture:
+                fixture.configure(silence_seconds=7)
+                with fixture.loop_turn():
+                    fixture.restart()
+                    fixture.server.run_once()
+                    fixture.clock.advance(7)
+                    with mock.patch.object(outage_alerts, "clear", side_effect=[failure, True]) as clear, \
+                            redirect_stderr(io.StringIO()) as errors:
+                        fixture.server.run_once()
+                        self.assertEqual(clear.call_args_list, [mock.call("build-admission", fixture.clock.now())])
+                        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                        self.assertIn("cannot clear outage alert", errors.getvalue())
+                        fixture.server.run_once()
+                        fixture.server.run_once()
+                        self.assertEqual(clear.call_args_list,
+                            [mock.call("build-admission", fixture.clock.now())] * 2)
+                        self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
 
 class ReadingAlertTests(unittest.TestCase):

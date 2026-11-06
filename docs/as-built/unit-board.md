@@ -20,7 +20,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
                          phase_table.build_plan(plan) ◄───────┘  (chain, gates, PhaseHistory)
                                   │                        │
             progress_history.py progress           board_json.py --session <id>
-            (short report / --tables)              writes <slug>.json, prints {files, watch}
+            (short report / --tables)              writes <staff id>.json, prints {files, watch}
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
                                        mod: /showrunner:accounts ── runs accounts.py status --json --stored
@@ -55,15 +55,15 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 ### The board generator
 
 ```
-~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--session <id> | --production <slug>)
+~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--session <id> | --production <showrunner name>)
 ```
 
-[`board_json.py`](../../scripts/direct/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. An unreadable staff file also gives no boards and prints one line on stderr with the cause.
+[`board_json.py`](../../scripts/direct/board_json.py) reads the staff file to resolve each production. It writes each board atomically to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<showrunner-staff-id>.json`. It prints one line: `{"files": [...], "watch": [...]}`. The plugin reads these returned paths directly. A rename, transfer, or session replacement preserves the cache path. An unresolved production returns `"files": []` and exits 0. An unreadable staff file also prints its cause to stderr.
 
-- Resolve: read one staff snapshot and use it for every board’s unit rows. Join the session to its newest pane launch’s `STAFF_ID`, then follow its staff parents to the first showrunner. Unit and worker sessions see that showrunner’s production and every showrunner production below it, nearest level first. `--production <slug>` selects the same subtree by its mapped staff row and takes precedence if both selectors are supplied. The shared `MemberSources.showrunner_members` mapping joins each showrunner row to its production; `showrunners.registered_showrunners()` supplies the doc and zone. Unmapped productions are left out. A session with no staff row or no showrunner above it gives no files.
-- `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
+- `board_json.resolve` reads one staff snapshot for all boards. It finds the session with `record.by_current_session`, then follows staff parents to the first showrunner. Unit and worker sessions see that production and its descendant productions, nearest level first. `--production <showrunner name>` selects the same subtree by staff name and takes precedence over `--session`. The resolver reads document paths from showrunner staff rows and zones through `showrunners.timer_for`. It excludes showrunners without timer registrations. A session without a staff row or a showrunner ancestor produces no files.
+- `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<staff id>` for every registered showrunner: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<showrunner name>/` before the update timer, so the dir exists before any attach.
 - The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/direct/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
-- `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
+- `BoardUnit`: `key` (the staff name), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
 - `stage`, in order:
   - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;
   - a `finding_batch_dispatched` not yet landed in the open phase instance, as `Repair round <dispatched batches>`;
@@ -75,7 +75,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `state` comes from `unit_run.local_run`, which reads each run file only up to its `run_started` line (every run file holds one, on line 1) and skips lines without `"run_started"` before parsing.
 - The record is built from the found run's own plan (`project_plan_doc`, else `plan_doc` resolved against the worktree), falling back to the Plan cell's plan.
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
-  - A run on another plan than its production row (tool-based-ui `demo`) shows its real phase.
+  - A run on another plan than its production row (hana `demo`) shows its real phase.
   - `plan` is the Plan cell, and is empty when that file no longer exists.
 - `workers` come from the run's session dir: `mesh_roster.json` (role, status; `done` shows as `idle`, `ended` stays), `impl_worker_<slot>.json` (slot, family/model) and the slot's newest `board.log` line as `doing`.
   - Slots drop the worktree's mesh prefix.
@@ -86,7 +86,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 ### The mod
 
-`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`.
+`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`. Claude Code 2.1.316 and later reads the mod in place from `~/.claude/mods/unit-board`, because `nate-local` is a local folder marketplace and lists the mod by a relative path. `claude plugin list` shows `Read from: ~/.claude/mods/unit-board`. A promoted change takes effect at the next session start or `/reload-plugins`, and no copy exists in `~/.claude/plugins/cache`. A session started on an older Claude Code loads a copy from that cache instead. Restart such a session on the current Claude Code.
 
 | File | Role |
 | --- | --- |
@@ -213,7 +213,9 @@ The build queue reads process memory every ten seconds while open.
   Each role has a separate row with its own counts.
   The first row shows all account values.
   Later rows show only the role and its counts.
-  The view sums the available entries in `role_counts_by_machine` without changing their separate JSON representation.
+  Python combines available machine counts once in `role_counts`, in role order.
+  The view reads these counts directly; `role_counts_by_machine` keeps the separate machine records.
+  A role with no reported members has zero counts; `spare` has no count.
   A totals row sums the known activity counts.
   Codex shell counts remain unknown; they do not become zero.
   The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
@@ -308,7 +310,7 @@ The accounts view uses `accounts.py status --json --stored` to read saved usage 
 It watches usage, group selection, worker selection, role-map cache, peer-count cache, and reported session inputs.
 When the generator reports session inputs, each open-pane tick refreshes local liveness counts.
 The stored read uses an existing peer-count cache without waiting for its refresh.
-The separate machine counts let the view sum available observations without hiding a missing peer.
+Python combines available observations in `role_counts`; the separate machine records and problem lines identify a missing peer.
 Aligned headers and complete facts keep the same contract readable in wide and narrow panes.
 
 

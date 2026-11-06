@@ -212,7 +212,9 @@ class BoxSetup:
         result = self.execute(arguments, capture_output=True, text=True,
                               timeout=conf.read(self.settings).whole('box_setup_timeout_s'), check=False)
         if result.returncode:
-            raise BoxRefused(f'{arguments[0]} failed during box setup (exit {result.returncode})')
+            last = next((line for line in reversed(result.stderr.splitlines()) if line.strip()), '')
+            detail = ': ' + ' '.join(last.split())[:300] if last else ''
+            raise BoxRefused(f'{arguments[0]} failed during box setup (exit {result.returncode}){detail}')
         return result.stdout.strip()
 
     def _api(self) -> AwsCli:
@@ -340,11 +342,28 @@ class BoxSetup:
         if address not in ipaddress.ip_network('100.64.0.0/10') and address not in ipaddress.ip_network('fd7a:115c:a1e0::/48'):
             raise BoxRefused('SSM returned an address outside Tailscale')
         self.joined = JoinedBox(str(address), ledger.text(state, 'id'))
+        self._write_host_keys(self.joined)
         saved = deployment_record(self.directory)
         if (saved.get('tailscale_node_id'), saved.get('tailscale_instance_id')) != (self.joined.node_id, self._instance()):
             saved.update(tailscale_node_id=self.joined.node_id, tailscale_instance_id=self._instance())
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
         return True
+
+    def _write_host_keys(self, joined: JoinedBox) -> None:
+        peers = (ledger.mapping(peer) for peer in ledger.mapping(self._status().get('Peer')).values())
+        peer = next((peer for peer in peers if peer.get('ID') == joined.node_id), dict[str, object]())
+        keys = public_strings(peer.get('sshHostKeys'))
+        if not keys:
+            return
+        names = (offload.read_connection_settings(self.settings).host, joined.address)
+        known_hosts = Path.home() / '.ssh' / 'known_hosts'
+        known_hosts.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        known_hosts.touch(mode=0o600, exist_ok=True)
+        for name in names:
+            _ = self._run(['ssh-keygen', '-R', name, '-f', str(known_hosts)])
+        with known_hosts.open('a') as handle:
+            for key in keys:
+                _ = handle.write(','.join(names) + ' ' + key + '\n')
 
     def join(self) -> None:
         _ = self.start()
@@ -366,11 +385,11 @@ class BoxSetup:
         finally:
             _ = self.tailnet.call('DELETE', 'keys/' + key_id)
 
-    def _ssh(self, command: str) -> str:
+    def _ssh(self, command: str, *, user: str = 'natepiano') -> str:
         if isinstance(self.joined, UnjoinedBox):
             raise BoxRefused('the box has no SSM-confirmed Tailscale identity')
         connection = offload.read_connection_settings(self.settings)
-        return self._run(['ssh', *offload.ssh_options(connection), 'natepiano@' + self.joined.address, command])
+        return self._run(['ssh', *offload.ssh_options(connection), user + '@' + self.joined.address, command])
 
     def _desired_system(self) -> str:
         return self.desired_system
@@ -422,19 +441,19 @@ class BoxSetup:
         reset_idle = 'rm -f -- ' + shlex.quote(str(idle_record))
         # Hold the controller lock and use a bounded box timer during the copy and detached switch.
         with control_lock(self.directory):
-            _ = self._ssh(f'sudo systemd-run --unit=aws-build-setup-stop --on-active={timeout}s --collect ' +
+            _ = self._ssh(f'systemd-run --unit=aws-build-setup-stop --on-active={timeout}s --collect ' +
                           '/run/current-system/sw/bin/systemctl poweroff && ' +
-                          'sudo systemctl stop aws-build-remote.service && ' +
+                          'systemctl stop aws-build-remote.service && ' +
                           'if systemctl cat aws-build-first-boot-stop.timer >/dev/null 2>&1; then ' +
-                          'sudo systemctl stop aws-build-first-boot-stop.timer; fi')
+                          'systemctl stop aws-build-first-boot-stop.timer; fi', user='root')
             try:
                 self._copy([desired])
                 recovery = reset_idle + '; systemctl start aws-build-remote.service'
                 script = ('trap ' + shlex.quote(recovery) + ' EXIT; ' +
                           shlex.quote(desired + '/bin/switch-to-configuration') + ' switch')
                 try:
-                    _ = self._ssh('sudo systemd-run --unit=aws-build-switch --collect --no-block ' +
-                                  '/run/current-system/sw/bin/bash -c ' + shlex.quote(script))
+                    _ = self._ssh('systemd-run --unit=aws-build-switch --collect --no-block ' +
+                                  '/run/current-system/sw/bin/bash -c ' + shlex.quote(script), user='root')
                 except BoxRefused as error:
                     if 'exit 255' not in str(error):
                         raise
@@ -449,9 +468,9 @@ class BoxSetup:
             finally:
                 # A failed reconnect leaves the poweroff timer armed.
                 try:
-                    _ = self._ssh(reset_idle + ' && sudo systemctl start aws-build-remote.service && ' +
+                    _ = self._ssh(reset_idle + ' && systemctl start aws-build-remote.service && ' +
                                   'systemctl is-active --quiet aws-build-remote.service && ' +
-                                  'sudo systemctl stop aws-build-setup-stop.timer')
+                                  'systemctl stop aws-build-setup-stop.timer', user='root')
                 except (BoxRefused, OSError, subprocess.SubprocessError):
                     pass
 
@@ -461,7 +480,7 @@ class BoxSetup:
         # Nix uses the same bounded SSH connection as the other box commands.
         options = offload.ssh_options(offload.read_connection_settings(self.settings))
         _ = self._run(['env', 'NIX_SSHOPTS=' + shlex.join(options), 'nix', 'copy', '--substitute-on-destination',
-                      '--to', 'ssh://natepiano@' + self.joined.address, *paths])
+                      '--to', 'ssh://root@' + self.joined.address, *paths])
 
     def _versions(self, *, on_box: bool) -> dict[str, str]:
         versions: dict[str, str] = {}

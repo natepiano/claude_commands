@@ -75,7 +75,21 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 `status --json` prints `{"accounts": [...], "upcoming_moves": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the problem lines below the normal table.
 `upcoming_moves` contains the rendered upcoming move lines, including the heading.
 
-Each account has `label`, `tool` (`claude` or `codex`), `roles`, `selected_roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles include observed members and selected roles with zero members. `selected_roles` identifies the selected account independently. Codex roles are `workers` or `spare`. Each `role_counts` entry counts local members for the role at the same index, as `{busy, shell, idle, total}`: a Claude session takes its session-record state; a stopped member uses `shell`, and a Codex worker is busy while its turn runs or starts, else idle, with a null `shell`. `spare` has a null entry. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
+Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`.
+`tool` is `claude` or `codex`.
+Roles include observed members and selected roles with zero members.
+`selected_roles` identifies the selected account independently.
+Codex roles are `workers` or `spare`.
+Each `role_counts` entry combines available machine counts for the role at the same index, as `{busy, shell, idle, total}`.
+Claude sessions use their session-record state; stopped members use `shell`.
+Codex workers are busy while their turns run or start; otherwise, they are idle.
+Codex shell counts are null.
+A role with no reported members has zero counts; `spare` has a null entry.
+Missing readings are null.
+Reset and read times are ISO 8601 UTC strings.
+Credits are a number, `"unlimited"`, or null.
+Claude has null credits and `use_credits: false`.
+Codex `use_credits` is true unless its note says `use_credits: off`.
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
@@ -105,7 +119,7 @@ The board has no `in use` or `read` column or fact.
 Failed reads and old readings appear in Problems.
 The dot stays red until the account has a current reading without a read failure.
 
-Counts read local session records, saved launches, staff membership, notifier registrations, and mesh records once per status read.
+Counts read local session records, saved launches, staff membership, and mesh records once per status read.
 `session-counts-read` prints live local counts without a file write.
 Status reads compute local counts without a file write.
 Every board read starts a background fetch of the other machine's counts through the shared role-map transport.
@@ -123,8 +137,9 @@ A later successful fetch restores the combined counts on the next board tick.
 Each JSON account has `role_counts_by_machine`, keyed by machine and then role.
 Each role value contains `busy`, `shell`, `idle`, and `total`.
 The JSON omits unavailable machines from this field.
-The existing `role_counts` field retains local counts in role order.
-The board sums `role_counts_by_machine`; older data without this field uses `role_counts`.
+Python combines the available machine counts once in `role_counts`, in role order.
+The board and text table read `role_counts` without combining machine records again.
+Claude shell counts include each available machine; Codex shell counts stay null.
 The JSON has no session identities or account directories.
 
 The JSON `session_inputs` lists the files and directories that the board watches, including the peer cache.
@@ -132,7 +147,7 @@ Each existing ten-second tick refreshes local liveness.
 A dead process disappears from local counts even when no file changes.
 The reader skips damaged launch entries and retains valid entries.
 A failed refresh retains its watches and retries on the next tick.
-An unavailable local staff record supplies no unit membership.
+An unavailable local staff record supplies no group membership.
 
 
 Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. An MCP server difference is the one exception. It has one line per account, server and direction, and it counts only the projects where the account differs from the same project in `~/.claude`: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp`. The home scope counts as the project `~`; both files read the same `~/.claude` project. The command at the end makes that server match the baseline in every differing project. It writes atomically, preserves the file mode and keeps a `.claude.json.mcp-backup-<time>` beside the account file. It preserves other servers and account settings. The read-only `mcp-projects <account> <server> <off|on>` command remains available to inspect those paths before a repair. The table and JSON `problems` use the same lines; JSON omits the `* ` footnote prefix. A direct folder or sign-in check replaces the empty-row summary for that cause.
@@ -143,7 +158,7 @@ A reserved test-domain login has its own cause. For example: `~/.codex: test sig
 
 Each Claude group with no account has a note: `units: not configured; the role map selects no account; run accounts.py move units <claudeN>` (or `showrunners`). A configured group has no such note; its account has the group in the Role column. The JSON `problems` list has the same notes.
 
-`status --stored`, with or without `--json`, skips live usage requests and network or host discovery. Session counts read local registry and retained launch files, notifier registrations and live mesh rosters, using their existing local process-liveness checks. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. Using this saved map is expected in stored mode and adds no problem line. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
+`status --stored`, with or without `--json`, skips live usage requests and network or host discovery. Session counts read local session records, saved launches, staff membership and live mesh rosters. They use the existing local process checks. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. Using this saved map is expected in stored mode and adds no problem line. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
 
 Without `--stored`, a role map that cannot be fetched or read from cache refuses status with an error on stderr and exit 1, for both the table and JSON.
 
@@ -420,16 +435,22 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role worker
 
 A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
-It retires each run's current server and tells each affected unit director once.
+Pane workers stop and resume the same conversation on the target account in their own panes.
+A stopped pane keeps its terminal; a closed pane resumes the same conversation in a new worker pane.
+An active pass receives one resume message; an idle worker receives no text.
+A held worker lock or unknown process leaves that worker unchanged while other workers continue.
+A failed target launch permits one source resume only after fresh evidence proves that no target process owns the conversation.
+Mesh-pinned runs keep their server release path until Phase 18.
 A running worker resumes the same thread on the new account.
 Held messages move with it.
-The move confirms that the old server released the thread before the new server resumes it.
+A mesh-pinned move confirms the old server released the thread before the new server resumes it.
 An unreadable thread state or unconfirmed release starts no replacement turn.
 A failed resume names the worker, the failed step, and the manual resume command.
 
 A swap prints `Workers moving <source> → <target>:` and one showrunner · unit · worker → target line per worker. A worker that was mid-turn adds `, interrupted and resumed`. An interrupt or resume failure names that worker, the failed step and its manual resume command; other workers still move and the selected role stays changed. `--dry-run` uses `Workers would move` with the same worker lines and interrupts nothing, with no role or history write. `set-role workers codexN` selects future turns directly, without the swap's usage check or notices. Each authoritative role write preserves the other selections; `unit` and `workers` history share `~/.local/state/accounts/roles.jsonl`.
 
-Swaps and sign-in changes leave ended sessions' workers alone, even when their launchers survive. A run stays live while any holder session is running, with or without a messaging socket; a run with no holder stays live only while a worker launcher is alive. Ended runs have no worker rows or holder notices. Their outgoing servers are checked for safe shutdown, and the output says `N leftover servers from ended sessions, M stopped`. Busy servers stay running and get a `left running: <pid> on port <port> (<run folder>): <reason>` line. A preview stops nothing and says `N leftover servers from ended sessions: M can be stopped, K would stay`, with a `would stay:` line for each busy server.
+Mesh-pinned swaps and sign-in changes leave workers unchanged when their sessions end.
+This rule also applies when their launchers survive. A run stays live while any holder session is running, with or without a messaging socket; a run with no holder stays live only while a worker launcher is alive. Ended runs have no worker rows or holder notices. Their outgoing servers are checked for safe shutdown, and the output says `N leftover servers from ended sessions, M stopped`. Busy servers stay running and get a `left running: <pid> on port <port> (<run folder>): <reason>` line. A preview stops nothing and says `N leftover servers from ended sessions: M can be stopped, K would stay`, with a `would stay:` line for each busy server.
 
 Worker rows name the holder session, or the session that launched the run when it has no holder marker. They fold by that session and slot, across plans and run folders. A folded row shows ` ×N`, followed by `, K interrupted and resumed` when K entries were mid-turn. Every failed entry retains its own row, reason and manual resume command.
 
@@ -515,7 +536,8 @@ The selected account needs a fresh reading at or below the entry's percentage.
 A Codex target needs a fresh reading above that threshold and no unresolved quota refusal.
 A failed move keeps the entry queued and delays later entries.
 The watcher tells showrunners once when the failure reason changes.
-Successful moves record cause `auto` and reason `auto: <id>` in both histories.
+Automatic moves record cause `auto` and reason `auto: <id>` in the group history and the moves log.
+Each session attempt has its own `move_id`, with a request and one confirmed or failed outcome.
 
 A workers move to Claude needs a known source weekly reset and holds its work routing on Claude until that reset, even if Codex has room earlier. Status detail shows it under `Codex work routing:` with cause `auto`. While any workers entry is queued, default, provider-refusal and credits-off moves wait. With no workers entry, weekly zero first moves workers to included Codex usage when it is available. With credits on and no included room, workers stay and spend their paid credits. With credits off, or after a refusal, workers use the Codex account with room whose weekly reset is soonest, else Claude.
 
@@ -551,13 +573,23 @@ Watcher inventories read live sessions and `staff.json` membership. They neither
 
 The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
 
-Group membership uses the lightweight listing; absent registration targets are checked separately. Manual move previews are described above.
+The board and group moves share one staff member list. Each live member uses its process account. Timer registrations do not decide membership. Absent registration targets are checked separately.
 
 A known 5-hour reset in less than 20 minutes waits once per session and reset. With a queued Claude group head, any known refusal reset waits and continues on the current account when it ends; an unknown reset waits for the head, and queued workers retain their brief reset wait. Without a pending next entry, other refusals move; no room sends one account notice until a usage reading changes. When a refusal requires a move, the watcher uses the same immediate stop-and-resume path as a manual move.
 
 `scripts/accounts/refusal_watch.py --dry-run` reports decisions without changing anything. For a live proof, `--assume-refused '<session id or name>' weekly|five-hour [--reset-in <minutes>]` holds a refusal in memory for that owner and runs once. The proof changes neither the account refusal nor other sessions’ picks. The optional reset affects its wait decision, not stored account usage. Add `--proof-group <probe id>…` to move exactly those probes together, without touching real groups. The stop-and-resume API returns the resumed account and pane, or one failure reason.
 
-Account status with `--detail` also shows live sessions' accounts, the Codex workers account and its destination on refusal, workers still owing a continuation, and the last ten move entries with outcomes and their `refusal`, `credits off`, `auto` or `by hand` cause. Hand moves never inherit a stored refusal. Group selections keep their transition and reason across member retries; member moves have no shutdown request ID. `Codex work routing:` lists assignment fallbacks separately, paired by their start time, as open, routed back, or not restored (partial or failed). Recovery is recorded only after all assignments are restored or kept because they were reassigned. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
+Account status with `--detail` shows session accounts, the workers account, pending continuations, and the last ten move entries.
+Each entry shows its outcome and its `refusal`, `credits off`, `auto` or `by hand` cause.
+Hand moves never inherit a stored refusal.
+Group selections keep their transition and reason across member retries.
+Each session attempt has its own `move_id` and cause.
+A session already on the target writes no move entry.
+`Codex work routing:` lists assignment fallbacks separately, paired by their start time, as open, routed back, or not restored.
+Recovery is recorded only after all assignments are restored or kept because they were reassigned.
+The first line names both groups.
+Table role cells show their selected accounts.
+A member still on its old account shows as `moving`.
 
 ## Low-quota alerts
 

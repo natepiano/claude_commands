@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready; long-running.** Find the agent hierarchy that delivers Hana fastest under the user's constraints: measure today's hierarchy, collect the constraints, propose the best hierarchy with a step-by-step change to it, then build and measure one approved step at a time.
 
-> **Production: sdlc** — unit `hierarchies-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Source
 
@@ -36,7 +35,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - **Project started:** 2026-10-20T20:46:48.678+00:00
 - **Stack:** Python 3.13, standard library only; Markdown.
 - **Layout:**
-  - `scripts/hierarchies/` — `measure.py`, `push_audit.py`, `worker_owners.py`, `log_records.py` (shared log helpers; `measure.py` imports `push_audit.py`, never the reverse) and their tests
+  - `scripts/hierarchies/worker_adoption.py` — the one file left in this folder; `measure.py`, `push_audit.py`, `worker_owners.py` and `log_records.py` are deleted
   - `config/hierarchies/sessions.toml` — keys and display names of top-level sessions
   - `docs/plans/build-followups-hierarchies-design.md` — the design doc (new)
   - read only, outside the repository: `~/.local/state/message/log.jsonl`, `~/.local/state/notify/` (`pushover.jsonl`, `review.jsonl`, `questions/`), `~/.local/state/showrunner/` (`counts`, `outstanding`, `<production>/`), `~/.local/state/unit-board/*.json`, `~/.local/state/nightly-review/ledger.md`, `~/.local/state/plan-backlog/ledger.md`, `~/rust/hanadocs/` (issues, `backlog-rankings.jsonl`, `prioritization goals.md`, `change-review/`)
@@ -530,3 +529,99 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Gotchas:** an early option scan must not refuse an unknown short option (`git commit -qJ`) outside Cargo; unreadable plain calls keep the old scope.
 
 **Ruled out:** reading `--trailer` values into the message (git's `=` form, amend and subject order made it unsafe); listing merge-only commits as change-review rows.
+
+### Phase 19 — The hierarchy measure command and its tests are deleted  · status: done
+
+#### As-built
+
+- The hierarchy measure command is deleted (user, 2026-11-03: "delete it and its tests"). `scripts/hierarchies/` and `config/hierarchies/` no longer exist.
+- Deleted with it: the helper modules that only it used (`log_records.py`, `worker_owners.py`, `push_audit.py`), all four test files, and `config/hierarchies/coverage.toml` and `sessions.toml`.
+- The `scripts/hierarchies` entries in `pyrightconfig.json` and `scripts/build_targets/working_set_owners.json` are removed.
+- No new code. The change removes 10991 lines.
+
+**Files:**
+- `pyrightconfig.json`, `scripts/build_targets/working_set_owners.json`.
+- `scripts/production/test_transfer_unit.py` — its fixture file is now `work.py`, not `measure.py`.
+
+**Gotchas:** the assertion guard needs a ruling for each helper function in a deleted test file, not only `::test_*`.
+
+### Phase 20 — A unit transfer tells the moved unit, and its tab takes its place in the new showrunner's tab order  · status: done
+
+#### As-built
+
+- When a transfer changes the staff parent, `transfer_unit.py apply` sends the moved unit one message: "Your unit now belongs to production <slug>." It goes to `staff:<member id>` with the key `transfer:<member id>:<parent id>`, from the `showrunners` sender. A rerun that changes nothing sends no message.
+- The message goes after the staff parent changes and before `staff_move.move_unit`. If the tab move fails, the unit still gets the message.
+- The status line reads the staff parent at each run. Claude Code runs it again when the conversation changes, so the message makes it show the new production.
+- `herdr._bind_row_tab` places a newly bound tab by the `tab_order` rule (showrunner first, unit directors A-Z, other tabs A-Z). Before, it was put at the end of the saved order. It reads staff at use, or the record that `move_row_tabs` passes. Other saved tabs keep their order.
+- No other check, guard or refusal is added.
+
+**Files:**
+- `scripts/production/transfer_unit.py`, `scripts/production/transfer_unit_test_support.py`, `scripts/production/test_transfer_unit.py`.
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
+- `scripts/hooks/test_showrunner_footer.py` — one test of the deleted hierarchy measure is deleted.
+
+**Gotchas:** in a workspace with no showrunner tab and no saved order, the moved tab goes first. This was the same before the phase.
+
+### Phase 21 — A transfer's message reaches the moved unit  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the message from Phase 20 reaches the moved unit. In the live proof on 2026-11-05 (main 3b42139d0: hierarchies-unit to builds and back to sdlc), both transfers printed `could not tell hierarchies-unit: send.py: absence of staff:<id> here is not proven`. The tab moves were correct both ways.
+
+**Cause (found by the unit director):** `transfer_unit.py apply` sends to `staff:<member id>`. `send.py` does not take a `staff:` address: `resolve_staff_recipient` looks up the whole text as a staff id, finds nothing, and the roster lookup then fails. `send.py --to <member id>` (the bare staff id) resolves the row and delivers; a live probe proved it. The Phase 20 test replaced the sender with a fake, so it did not see this.
+
+**Spec:**
+1. `scripts/production/transfer_unit.py` `apply`: send to the bare staff id (`str(request.member.id)`), not `staff:<id>`.
+2. `scripts/production/test_transfer_unit.py`: the expected `--to` value is the bare staff id. Add one test that `send.resolve_staff_recipient` resolves that value to the moved unit's staff row, so a fake sender cannot hide a wrong address again.
+3. `commands/showrunner/transfer_unit.md` (the unit director writes this): it still describes a stop, a relaunch, a plan-header commit and a journal. Make it say what `transfer_unit.py` does now: the staff parent change, the one message, and the tab move.
+4. Add no other check, guard or refusal. Do not edit `scripts/production/unit_lookup.py`.
+
+**Acceptance gate:**
+- The unittest module `scripts/production/test_transfer_unit.py` passes, and basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
+- Live, from main after the merge: transfer hierarchies-unit to builds and back to sdlc. Each transfer prints `told hierarchies-unit`, the unit gets the message, its status line names the new production, and its tab is in its A-Z place.
+
+### Phase 22 — Displays read workers through observe  · status: done
+
+#### As-built
+
+- `worker_panes.observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]` makes one pane read for many parents and no read for no parents. `PaneRead`, `PaneReadUnavailable`, `_read_panes` and `_parent_evidence` hold that read. `agent_inventory(client)` reads agent status for worker and freestanding displays. `_stop_row` imports `scripts.shutdown.restart` at use, which removes a type-graph import cycle.
+- `session_staff.pane_parents(record)` selects the parents whose held run reads herdr. `unit_runs.parent_transport(session_id, *, scanned, record)` decides this from the first held run's pin, else configuration, and writes nothing.
+- `unit_runs.run_pin(run) -> Literal["mesh", "herdr"] | NoRunPin` is the one reader of a run's pin. An invalid pin raises `ValueError`. `RunStaffAtUse.LOCAL` names a staff read at the point of use.
+- `held_by_session` includes a folder with `progress_history_state.json` or `mesh_roster.json`, because `worker_admission.parent` resolves a run through either file.
+- The roster, `board_json`, `staff_sources.live`, `codex_winddown` and `tmp_sweep` show pane workers in the five states. `ProcessUnknownWorker` never shows as stopped or absent, and `UncertainWorker` never shows as closed. A mesh-pinned run displays as before. No display writes a pin.
+- `staff_sources.live` adds a `pane_state` field to each pane member and a top-level `problems` list. `board_json.pane_worker_rows`, `ReadPaneRows` and `PaneRowsUnreadable` hold the board's read; `tmp_sweep.PaneRunUse`, `PaneRunsUnreadable`, `ReadPaneRuns`, `read_pane_runs`, `pane_run_use` and `run_pane_owner` hold the sweep's read.
+- A display that cannot read a pin, a member or an owner names the cause on a problem line and keeps its other workers. A run makes one staff snapshot: `unit_labels.stopped_run_place(run, record)` and `unit_runs.director(run, record=)` take the display's record.
+- The roster's freestanding pane list reads agent status through `worker_panes.agent_inventory`. This costs 12 ms after the roster's own imports. It matches a worker by `process.marks`, and reads no process environment.
+
+**Files:**
+- `scripts/herdr/worker_panes.py` — the one pane read and the agent status read.
+- `scripts/lib/unit_runs.py` — the run pin reader, the parent transport and the held-run scan.
+- `scripts/production/session_staff.py` — the parent selection.
+- `scripts/production/staff_sources.py`, `scripts/production/codex_winddown.py` — pane state in staff and winddown reports.
+- `scripts/message/roster.py`, `scripts/message/unit_labels.py` — the roster's pane and mesh rows.
+- `scripts/direct/board_json.py` — the board's pane rows.
+- `scripts/lint/tmp_sweep.py` — the sweep's pane run owners and use.
+
+**Binds later work:** the Cleanup phase of the herdr worker panes plan deletes the retained mesh code, 396 lines: `roster._worker_ledger`, `_worker_slot`, `mesh_shown_name`, `mesh_title`, `_run_place`, `_between_turns_reason`, `_run_server_homes`, `_worker_account`, `_worker_status`, `_process_cwds`, `_ledger_workers`, `_review_workers` and the `_unit_workers` mesh run loop; the `board_json.workers` mesh branch; the roster branches of `tmp_sweep.run_folder_guards`, `worker_use` and `cleanup_end_reason`; `process_table.is_codex_agent`; `unit_runs.run_pin`, `NoRunPin` and `parent_transport`; `unit_labels.mesh_records`.
+
+**Gotchas:**
+- A pane with unknown evidence makes every closed worker `UncertainWorker`. Morty's two bare `codex` panes are unknown today.
+- `unit_runs.director` prints one anomaly line on stderr for a run folder with no staff owner, so the roster prints one such line for each old folder until the tmp sweep removes it.
+- One `observe_parents` read takes 1.438 s over 45 parents and 528 workers. `pane_parents` takes 0.513 s.
+
+**Ruled out:** a state-file-only filter in `held_by_session`, which drops the pin of a run with only a mesh roster.
+
+### Phase 23 — An unknown process does not refuse a staff write about another row  · status: done
+
+#### As-built
+
+- `staff_sources.require_worker_stopped` prints each diagnostic on stderr as `anomaly: <line>` and continues. This covers a process with no thread id, a pane with no staff member and each `peer.problems` entry.
+- The target's own live identity and `PeerNotReached` still refuse.
+- `UnavailableWorkerPolicy` and its two raises are deleted. `observe_workers` always returns its diagnostics.
+- `live` and `migrate_staff_ids.py` did not change. No other check, guard or refusal is added.
+
+**Files:** `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py`.
+
+**Gotchas:** the gate on this checkpoint was red in 4 modules: `test_progress_history`, `test_session_pane`, `test_roles_audit` and `test_stop_resume`. The cause is outside this phase. Tests with a private staff record read the real timer folder, and the sdlc-devtools fix ec4762af6 repairs it.

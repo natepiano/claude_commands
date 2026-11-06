@@ -35,6 +35,7 @@ else:
     import pane_launch
     import review
     from user_action import NoActionRequired
+from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.accounts import accounts
 from scripts.lib import nix_env
 from scripts.production import staff
@@ -92,7 +93,9 @@ class HerdrLaunchTests(NixFixture):
         _ = self.continued(lambda: herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture"))
 
     def production(self) -> Production:
-        return Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
+        return Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"),
+                          staff.StaffRow(staff.StaffId(""), "showrunner", "child", staff.StaffRoot(),
+                                         current_session=staff.StaffId("")))
 
     def test_choke_point_keeps_the_new_tab_when_agent_start_fails(self) -> None:
         with (patch.object(nix_env, "ensure", return_value=nix_env.NoEnvrc(self.env)),
@@ -252,7 +255,11 @@ class ShellLaunchTests(NixFixture):
         for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh"):
             destination = self.scripts / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
+            if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
+                destination.symlink_to(ROOT / "scripts" / relative)
+            else:
+                _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
+        (self.scripts / "direct").symlink_to(ROOT / "scripts/direct", target_is_directory=True)
         py = self.scripts / "lib/py"
         _ = py.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
         py.chmod(0o755)
@@ -274,8 +281,11 @@ print('{"type":"result","result":"fixture completed"}')
         _ = (self.root / "prompt").write_text("fixture prompt")
 
     def run_script(self, relative: str, args: list[str], directory: Path) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(self.scripts / relative), *args], cwd=directory, env=self.env,
-                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+        command, environment = ["bash", str(self.scripts / relative), *args], self.env
+        if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
+            command, environment = backend_fixture_command(self.root / "assign-parent", command, environment)
+        return subprocess.run(command, cwd=directory, env=environment, capture_output=True, text=True,
+                              timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def launch_contract(self, relative: str, args: list[str], directory: Path) -> None:
         _ = self.envrc(directory)

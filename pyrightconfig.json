@@ -12,10 +12,6 @@
       "extraPaths": [".", "scripts/direct", "scripts/lib", "scripts/history", "scripts/agents", "scripts/astra", "scripts/production", "scripts/message"]
     },
     {
-      "root": "scripts/hierarchies",
-      "extraPaths": [".", "scripts/hierarchies", "scripts/lib", "scripts/production", "scripts/message", "scripts/direct", "scripts/nightly_review"]
-    },
-    {
       "root": "scripts/herdr",
       "extraPaths": [
         ".",
@@ -39,6 +35,7 @@
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
+        "scripts/herdr",
         "scripts/whoami",
         "scripts/lib"
       ]

@@ -40,9 +40,8 @@ Every action finds the list from its production, written `<production>` below:
 
 - A showrunner passes nothing: the script finds the production from this
   session's update timer, as `/showrunner:proposals` does. A session with no
-  timer passes `--production <doc>`.
-- A unit director passes `--production <doc>`, with the doc its plan header's
-  `> **Production:**` line names.
+  timer passes `--production <showrunner name>`.
+- A unit director passes `--production <showrunner name>` from the parent showrunner row's `name`.
 
 The list is named for the production's top-level showrunner while it runs, and
 otherwise is the path the doc's **Change review** line names. `list-path`
@@ -75,8 +74,9 @@ sees in the app, such as a table's columns or a status line.
 `--due`), `later` or `user`; leave it out for a normal row. `--after` names a
 row that must be checked first.
 
-One row per change, written for a person with no context. Each part is one
-line. `--check` names the machine (natedev or the Mac), the session (a
+One row per change, written for a person with no context.
+The change description uses one line. The check and result can use several lines.
+`--check` names the machine (natedev or the Mac), the session (a
 terminal, a showrunner session, a unit session, any Claude session) and what to
 type; `--see` is what the person then sees. Example: `--change "The unit board
 shows each unit's phase" --check "In a showrunner session on natedev, type
@@ -101,12 +101,10 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 When the user asks to review changes, follow [Bare command](#bare-command).
 
 The page contains every waiting change, with staff-based showrunner tabs.
-Each row stores its producer's fixed staff id in the Producer cell.
-The reader follows that id to the unit's current staff showrunner.
-An empty cell belongs to the list's showrunner.
-A showrunner id belongs to that showrunner.
-Names come from the staff record at use.
-Renamed and retired units keep their ids.
+An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
+The reader follows a unit's current staff parent and displays current names.
+Reviewed rows keep the production name recorded at the verdict.
+Renames and transfers do not rewrite these cells.
 The `unrouted` tab shows an unknown id or a broken staff parent chain.
 Verdicts save without sending a message.
 This tab offers no question control, and the server refuses question submissions without saving.
@@ -121,7 +119,7 @@ A failed HTTP save keeps the typed answer, error text, answer form, and waiting 
 A saved verdict shows **Saved: <answer>**.
 Validate yourself removes the row from every waiting count and Next order when the request saves.
 A direct link shows **The showrunner will validate this** without answer buttons.
-Ask a question uses the one-line feedback field.
+Ask a question uses the feedback box.
 It removes the row from every waiting count until the showrunner answers.
 A direct link shows **The showrunner will answer this** without answer buttons.
 Send feedback saves the text unchanged; text that starts with `works` or `fine` can land the change.
@@ -216,10 +214,11 @@ Use the `verdict` command above for both. The row stays out of the user's count 
 3. Save the answer with this command:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <doc> --list <list> --row C<n> --question <id> --text "<answer>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"
 ```
 
 The row returns to the user's count with the question and answer below the change.
+The answer and cells can hold several lines; lines that start with `- ` or `1. ` show as lists.
 The user can give a verdict or ask another question.
 The same question ID and answer text change nothing and exit 0 on a rerun.
 The command refuses an old or unknown ID, a different answer, or a row without an open question.
@@ -232,10 +231,15 @@ counted among the open questions. It goes on this list, and the user asks for
 
 ### Producer ids
 
-The merge writer matches each checkpoint branch to a unit staff row and stores that row's id in Producer.
-A unit with no staff row leaves the cell empty and prints one named note.
+Producer retains the unit's fixed staff id for verdict delivery.
+Unknown units leave Producer empty and print one named note.
 For `add`, `--repo` selects the directory; the default is `.`.
-A unit worktree stores its id.
-A showrunner directory or an unowned directory leaves the cell empty.
-The page, status line, and `/next` use one staff routing rule.
-The owner's staff showrunner supplies the production document, even when the list's document reference is missing.
+A showrunner directory or an unowned directory records a production-owned change.
+
+## Migrate owner cells
+
+Run `migrate-owners [--list <list>]` to list conversions and unknown names.
+Add `--write` to replace known names with fixed staff ids.
+Without `--list`, the command reads all change review lists.
+Unknown names and reviewed rows remain unchanged.
+A retry completes interrupted work; a finished retry writes nothing.

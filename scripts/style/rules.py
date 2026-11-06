@@ -36,10 +36,16 @@ class NotStyleUnit:
 def style_family(unit: str) -> Family | NotStyleUnit:
     families: tuple[Family, ...] = ("names", "values", "types", "modules")
     for family in families:
-        suffix = f"{family}-unit"
+        suffix = family
         if unit == suffix or unit.endswith("-" + suffix):
             return family
     return NotStyleUnit()
+
+
+def pinned_family(text: str) -> Family | NotStyleUnit:
+    """Read the family from pinned rule text."""
+    match = re.search(r"(?m)^family:[ \t]*(names|values|types|modules)[ \t]*$", text)
+    return cast(Family, match[1]) if match else NotStyleUnit()
 
 
 # The ranked families, highest first. On each file a family's work waits while a family ranked above it has open work

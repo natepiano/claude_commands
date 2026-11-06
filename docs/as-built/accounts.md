@@ -131,6 +131,9 @@ The [launch environment](nix-shell-launch.md) describes shared Nix setup and acc
 ## Moves, refusals, and workers
 
 Account moves use the shared stop and resume API.
+Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
+Each attempt has its own move ID and cause.
+A session already on the target writes nothing.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
@@ -172,7 +175,11 @@ Without a queued workers move, provider refusal or unavailable included usage ca
 Credit policy determines whether an exhausted account can continue.
 Worker assignment fallback to Claude remains separate from the selected Codex account.
 Routing returns only when the selected Codex account can work and its refusal has resolved.
-The [worker design](long-lived-workers.md) owns thread interruption, continuation, held roles, and server retirement.
+Pane workers move through their dispatch lock, fresh pane evidence, `restart.stop_row`, and `worker_panes.start_or_resume`.
+They keep the same conversation and reuse a stopped pane.
+Only an open pass receives resume text through the shared target check.
+`config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
+Mesh-pinned runs keep the [worker design](long-lived-workers.md) server release path until Phase 18.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.
@@ -285,6 +292,10 @@ Account creation, identity resolution, and missing-note instructions use that sa
 A new process sees a changed notes-folder setting.
 
 The default usage age is ten minutes.
+Codex alert readings use the same `usage_stale_minutes` setting.
+The quota relay limit defaults to 40 seconds, and the registry editor limit defaults to 30 seconds.
+Account commands and Claude usage HTTP requests each default to 15 seconds.
+The Codex account server has three seconds to stop after termination.
 The role-map transport has a five-second connection limit and a twenty-second command limit.
 The outage claim lease is fifteen minutes, longer than the normal send deadline.
 These values live in configuration; their values are not independent code defaults.

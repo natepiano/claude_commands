@@ -131,15 +131,19 @@ class RegistrationTests(RegistrationFixture):
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(showrunner_tree, "user_facing", return_value=["example"]),
               redirect_stdout(io.StringIO()) as output):
-            registration.open_items(read_production(self.doc))
+            registration.open_items(read_production("example"))
         self.assertIn(full, output.getvalue())
         self.assertIn(unavailable, output.getvalue())
         self.assertIn("Reminder", output.getvalue())
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(full.split()), questions)
             _ = self.run_questions(self.question_state([]))
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(full.split()), questions)
 
     def test_blank_reviewer_rewrite_stores_original_as_review_unavailable(self) -> None:
         question = "Retry build 42?"

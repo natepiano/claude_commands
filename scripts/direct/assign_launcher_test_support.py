@@ -4,7 +4,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import shutil
+import sys
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,13 +18,34 @@ from scripts.lib.git_test_support import commit_repository
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production import staff
 from scripts.production.staff_test_support import fixture_worker_records
 
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
+
+
+def backend_fixture_command(directory: Path, command: list[str],
+                            environment: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """Test a backend beneath the actual assign process."""
+    directory.mkdir(parents=True, exist_ok=True)
+    startup = directory / "sitecustomize.py"
+    _ = startup.write_text("\n".join((
+        "import os, subprocess, sys",
+        "def enter(frame, event, argument):",
+        f"    if event == 'call' and frame.f_code.co_filename == {str(ASSIGN.with_suffix('.py'))!r} and frame.f_code.co_name == 'main':",
+        "        sys.setprofile(None)",
+        "        environment = dict(os.environ)",
+        "        environment['PYTHONPATH'] = environment.pop('FIXTURE_ASSIGN_PYTHONPATH')",
+        f"        raise SystemExit(subprocess.call({command!r}, env=environment))",
+        f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
+    )) + "\n")
+    child_environment = dict(environment)
+    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT))
+    child_environment["PYTHONPATH"] = os.pathsep.join((str(directory), str(ROOT)))
+    return ["bash", str(ASSIGN)], child_environment
 
 
 @dataclass(frozen=True)
@@ -40,7 +61,8 @@ class LauncherScript:
 
 
 AssignmentExecution = InProcessAssignment | LauncherScript
-DEFAULT_ASSIGNMENT_EXECUTION = InProcessAssignment()
+# Worker admission requires the actual assignment process.
+DEFAULT_ASSIGNMENT_EXECUTION = LauncherScript(ASSIGN)
 
 
 def read_object(path: Path) -> dict[str, object]:
@@ -81,6 +103,10 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         self.server.hang_guard = self.hang_guard
         self.project = self.session_dir.parent / "project"
         self.project.mkdir()
+        _ = subprocess.run(["git", "init", "-q", str(self.project)], check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = unit_config.write(self.project, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
         owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert owner is not None
         parent = staff.local_snapshot().parent_of(owner)
@@ -114,7 +140,7 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         self.record("start-run", "--working-dir", str(self.project), "--plan-doc", "plan.md",
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "high",
                     "--main-session-id", owner.current_session)
-        self.record("set-unit", "--production", "fixture-production", "--unit", "fixture-unit")
+        self.record("set-unit", "--production", "fixture-production", "--unit", "fixture")
         self.record("start-phase", "--phase-id", "7", "--phase-title", "Assignment core")
         self.claims = []
         self.reservations = []
@@ -166,12 +192,34 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             return invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
         return self.run_launcher(["bash", str(execution.path), *arguments])
 
-    def run_launcher(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        with subprocess.Popen(arguments, env=os.environ.copy(), cwd=ROOT, text=True,
+    def run_launcher(self, arguments: list[str], *, family: str = "codex",
+                     isolate_ancestors: bool = False) -> subprocess.CompletedProcess[str]:
+        director = self.session_dir.parent / family
+        if not director.exists():
+            director.symlink_to(sys.executable)
+        completion = self.session_dir.parent / "launcher-exit"
+        script = "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))"
+        if isolate_ancestors:
+            completion.unlink(missing_ok=True)
+            script = "\n".join((
+                "import os, select, subprocess, sys",
+                "from pathlib import Path",
+                "starter = os.pidfd_open(os.getpid())",
+                "if os.fork(): os._exit(0)",
+                # The pidfd becomes readable after the kernel reparents the child.
+                "select.select([starter], [], [])",
+                "os.close(starter)",
+                f"Path({str(completion)!r}).write_text(str(subprocess.call(sys.argv[1:])))",
+            ))
+        command = [str(director), "-c", script, *arguments]
+        with subprocess.Popen(command, env=os.environ.copy(), cwd=ROOT, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               start_new_session=True) as child:
             output, errors = communicate_launcher(child)
-            return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
+            if isolate_ancestors:
+                self.assertTrue(completion.exists(), output + errors)
+            code = int(completion.read_text()) if isolate_ancestors else child.returncode
+            return subprocess.CompletedProcess(arguments, code, output, errors)
 
     def successful(self, role: str = "implement", *options: str,
                    execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
@@ -180,12 +228,7 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         return result
 
     def review_launcher(self, option: str, name: str, pass_number: str) -> None:
-        result = self.run_launcher([
-            "bash", str(ROOT / "scripts/direct/review.sh"), option, name, "--phase", "7",
-            str(self.session_dir), str(self.project), str(self.prompt), "review", "Code review",
-            "Reviewing assigned changes", pass_number, "contract",
-        ])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        _ = self.successful("review", option, name, "--lens", "contract", "--pass", pass_number)
 
     def assignment_records(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], read_object(self.session_dir / codex_mesh.ROSTER_FILE))
@@ -209,22 +252,35 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         return [cast(dict[str, object], json.loads(line)) for line in
                 (self.history / "runs" / f"{self.session_dir.name}.jsonl").read_text().splitlines()]
 
-    def prepare_launcher(self) -> tuple[Path, Path]:
-        # Allocate only the folder here; the phase and dispatch helpers stay real.
-        tree = self.session_dir.parent / "launcher/scripts"
-        direct = tree / "direct"
-        direct.mkdir(parents=True)
-        for source in (ROOT / "scripts/direct").iterdir():
-            if source.is_file() and source.name not in {"assign.sh", "assign.py", "prepare_session.sh"}:
-                (direct / source.name).symlink_to(source)
-        for directory in ("agents", "lib", "production"):
-            (tree / directory).symlink_to(ROOT / "scripts" / directory, target_is_directory=True)
-        _ = shutil.copy2(ASSIGN, direct / "assign.sh")
-        coordinator = ASSIGN.with_suffix(".py")
-        if coordinator.exists():
-            _ = shutil.copy2(coordinator, direct / "assign.py")
+    def instrument_launcher(self, code: str) -> None:
+        """Instrument boundaries inside the actual coordinator process."""
+        directory = self.session_dir.parent / "instrument"
+        directory.mkdir(exist_ok=True)
+        injection = directory / "injection.py"
+        _ = injection.write_text(code.replace("from scripts.direct import assign",
+                                               "import sys; assign = sys.modules['__main__']"))
+        _ = (directory / "sitecustomize.py").write_text("\n".join((
+            "import runpy, sys",
+            "def enter(frame, event, arg):",
+            f"    if event == 'call' and frame.f_code.co_filename == {str(ASSIGN.with_suffix('.py'))!r} and frame.f_code.co_name == 'main':",
+            "        sys.setprofile(None)",
+            f"        runpy.run_path({str(injection)!r})",
+            f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
+        )))
+        self.patches.enter_context(patch.dict(os.environ, {"PYTHONPATH": f"{directory}{os.pathsep}{ROOT}"}))
+
+    def prepare_launcher(self) -> Path:
         prepared = self.session_dir.parent / "prepare-called"
-        prepare = direct / "prepare_session.sh"
-        _ = prepare.write_text(f"#!/bin/sh\ntouch '{prepared}'\nprintf '%s\\n' '{self.session_dir}'\n")
-        prepare.chmod(0o755)
-        return direct / "assign.sh", prepared
+        self.instrument_launcher("\n".join((
+            "import subprocess",
+            "from pathlib import Path",
+            "from scripts.direct import assign",
+            "real_call = assign.call",
+            "def call(command, env, **options):",
+            "    if command[1] == str(assign.SCRIPTS / 'prepare_session.sh'):",
+            f"        Path({str(prepared)!r}).touch()",
+            f"        return subprocess.CompletedProcess(command, 0, {str(self.session_dir)!r} + '\\n', '')",
+            "    return real_call(command, env, **options)",
+            "assign.call = call",
+        )))
+        return prepared

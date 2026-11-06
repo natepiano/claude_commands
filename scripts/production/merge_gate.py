@@ -60,7 +60,7 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib import build_folders
-from scripts.production import change_review  # noqa: E402
+from scripts.production import change_review, staff  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -393,21 +393,13 @@ def interrupted(signum: int, _frame: object) -> None:
 
 
 @contextmanager
-def rollback_signals(*, defer: bool = False) -> Generator[None, None, None]:
-    pending: list[int] = []
-
-    def record(signum: int, _frame: object) -> None:
-        pending.append(signum)
-
-    signals = (*ROLLBACK_SIGNALS, signal.SIGINT) if defer else ROLLBACK_SIGNALS
-    previous = {sig: signal.signal(sig, record if defer else interrupted) for sig in signals}
+def rollback_signals() -> Generator[None, None, None]:
+    previous = {sig: signal.signal(sig, interrupted) for sig in ROLLBACK_SIGNALS}
     try:
         yield
     finally:
         for sig, handler in previous.items():
             _ = signal.signal(sig, handler)
-    if pending:
-        signal.raise_signal(pending[0])
 
 
 def fetch_branches(repo: Path, *branches: str) -> None:
@@ -591,7 +583,7 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
     """Collect the leader's status and CPU once, including children it waited for."""
     if job.process.returncode is not None:
         return
-    with rollback_signals(defer=True):
+    with build_folders.defer_signals():
         pid, status, usage = os.wait4(job.process.pid, 0 if block else os.WNOHANG)
         if pid:
             job.process.returncode = os.waitstatus_to_exitcode(status)
@@ -608,22 +600,24 @@ def kill_job_group(job: RunningGateJob) -> None:
     reap_gate_job(job, block=True)
 
 
-def stop_gate_job(job: RunningGateJob) -> None:
-    """Stop the group and reap its leader before capacity returns."""
+def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
+    """Stop all groups with one deadline, then reap their leaders."""
     config = memory_admit.read_memory_config()
-    try:
-        process_group.send_process_group(job.process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
     deadline = time.monotonic() + config.program_stop_seconds
-    while job.process.returncode is None:
-        reap_gate_job(job)
+    for job in jobs:
+        try:
+            process_group.send_process_group(job.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    while True:
+        for job in jobs:
+            reap_gate_job(job)
         remaining = deadline - time.monotonic()
-        if job.process.returncode is not None or remaining <= 0:
+        if remaining <= 0 or all(job.process.returncode is not None for job in jobs):
             break
         time.sleep(min(config.program_sample_seconds, remaining))
-    # Kill surviving group members even when the leader has exited.
-    kill_job_group(job)
+    for job in jobs:
+        kill_job_group(job)
 
 
 def one_minute_load() -> float:
@@ -932,9 +926,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     if not modules:
         raise GateRefused("the test list is empty")
     runner = module_runner(repo)
-    tmpfs = Path("/dev/shm")
+    tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
+        raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
     hold = BuildHoldWait()
     hold.wait_until_free()
     initial_hold_seconds = hold.seconds
@@ -1070,7 +1064,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, str(runner), str(path.parent), path.name])
-                    with rollback_signals(defer=True):
+                    with build_folders.defer_signals():
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
@@ -1145,9 +1139,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            with rollback_signals(defer=True):
+            with build_folders.defer_signals():
+                stop_gate_jobs(running)
                 for job in running:
-                    stop_gate_job(job)
                     job.output.close()
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
@@ -1515,7 +1509,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
     """Add a row per visible change to the list, then name any landed merge still missing its rows."""
     merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
     try:
-        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production)
+        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production, record=staff.snapshot())
         drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED,
                                       change_review.foreign_units(production))
     except (change_review.ChangeReviewError, OSError) as error:
@@ -1531,24 +1525,23 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
 
 
 def nightly_owner(args: GateArguments) -> str:
-    from scripts.production import showrunners
-    from scripts.production.production_units import Refusal, production_field
+    from scripts.production import session_staff, showrunners, staff, unit_lookup
+    from scripts.shutdown import remote
 
     try:
         doc = change_review.production_doc(args.production)
     except change_review.ChangeReviewError:
         matching: list[Path] = []
+        record = staff.initial_snapshot()
+        resolver = session_staff.RowResolver(record)
         for candidate in showrunners.timer_docs().values():
-            try:
-                branch = production_field(candidate.read_text().splitlines(), "Merge branch")
-            except Refusal:
-                continue
-            if branch == args.merge_branch:
+            row = record.by_doc(remote.local_machine(), candidate)
+            if row is not None and resolver.merge_branch(row) == session_staff.Branch(args.merge_branch):
                 matching.append(candidate)
         if len(matching) != 1:
             return copies.fallback_owner("nightly")
         doc = matching[0]
-    return showrunners.production_slug(str(doc))
+    return unit_lookup.doc_owner(doc, staff.snapshot()).name
 
 
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
@@ -1615,7 +1608,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
-                            help="the production doc whose header names the list (default: the calling showrunner's)")
+                            help="the production staff name (default: the calling showrunner's)")
     _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
     _ = parser.add_argument("--promote", action="store_true")
     _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")

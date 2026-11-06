@@ -2,18 +2,21 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import unit_runs  # noqa: E402
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, showrunner_relationship
+from scripts.lib import atomic_file, unit_runs  # noqa: E402
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
 if TYPE_CHECKING:
     from scripts.message import sessions
 else:
@@ -21,11 +24,220 @@ else:
     import sessions
 
 
+class RunOwnerMigrationTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        lock = fcntl.flock
+
+        def fail_on_lock_wait(descriptor: int | IO[str], operation: int) -> None:
+            try:
+                lock(descriptor, operation | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise AssertionError(f"run-owner migration test would block on a file lock: {descriptor}") from error
+
+        _ = self.enterContext(patch.object(fcntl, "flock", side_effect=fail_on_lock_wait))
+        super().setUp()
+
+    def test_interrupted_owner_migration_repeats_after_clear_without_changing_history_or_finished_runs(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        row = fixture_member("unit", name="tools", parent=owner.id)
+        runs = self.root / "runs"
+        history = self.root / "history.jsonl"
+        _ = history.write_text('{"production":"former","unit":"tools"}\n')
+        for name, status in (("a", "active"), ("b", "active"), ("old", "completed")):
+            run = runs / name
+            run.mkdir(parents=True)
+            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+                "status": status, "production": "production", "unit": "tools",
+                "main_agent": {"session_id": row.current_session}, "history_file": str(history)}))
+        finished = runs / "old" / unit_runs.STATE_FILE
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)]
+        publish = atomic_file.write_text_atomic
+        changed_session = fixture_runtime_id("run-owner-clear")
+        interrupted_once = False
+
+        def interrupted(path: Path, text: str) -> None:
+            nonlocal interrupted_once
+            publish(path, text)
+            if path != runs / "a" / unit_runs.STATE_FILE or interrupted_once:
+                return
+            interrupted_once = True
+            _ = staff.update_current_session(row.id, staff.StaffId(changed_session))
+            raise RuntimeError("migration interrupted")
+
+        with (patch.object(atomic_file, "write_text_atomic", side_effect=interrupted),
+              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+            with self.assertRaisesRegex(RuntimeError, "migration interrupted"):
+                _ = unit_runs.migrate_owners(runs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(unit_runs.migrate_owners(runs), 0)
+        paths = [runs / name / unit_runs.STATE_FILE for name in ("a", "b")]
+        for path in paths:
+            fields = cast(dict[str, object], json.loads(path.read_text()))
+            self.assertEqual(fields["owner_staff_id"], row.id)
+            self.assertNotIn("production", fields)
+            self.assertNotIn("unit", fields)
+        published = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(unit_runs.migrate_owners(runs), 0)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], published)
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)], before)
+
+    def test_unproved_owner_keeps_the_active_run_and_reports_unavailable(self) -> None:
+        _ = fixture_member("showrunner", name="production")
+        run = self.root / "runs/unknown"
+        run.mkdir(parents=True)
+        path = run / unit_runs.STATE_FILE
+        _ = path.write_text('{"status":"active","main_agent":{"session_id":"gone"}}')
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(unit_runs.migrate_owners(run.parent), 1)
+        self.assertIn("run owner is unavailable", errors.getvalue())
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+
 class UnitRunsTest(StaffTestCase):
+    def test_parent_transport_reads_the_first_held_pin_without_writing(self) -> None:
+        runs, config = self.root / "runs", self.root / "config"
+        config.mkdir()
+        session = fixture_runtime_id("transport-parent")
+        first, second = runs / "a-first", runs / "b-second"
+        first.mkdir(parents=True)
+        second.mkdir()
+        self.staff_owner(first, session)
+        self.staff_owner(second, session)
+        runner = fixture_member("showrunner", name="roster-parent")
+        worker = fixture_worker("impl", runner.id)
+        roster_run = runs / "c-roster"
+        roster_run.mkdir()
+        write_text_atomic(roster_run / "mesh_roster.json", json.dumps({"impl": {"staff_id": worker.id}}))
+        with (patch.object(unit_runs, "RUN_ROOT", runs),
+              patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"),
+              patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(runs)})):
+            for transport in ("herdr", "mesh"):
+                write_text_atomic(config / "direct.conf", f"# one of: mesh, herdr\nWORKER_TRANSPORT={transport}\n")
+                before = sorted(path.relative_to(runs) for path in runs.rglob("*"))
+                self.assertEqual(unit_runs.parent_transport(session), transport)
+                self.assertEqual(unit_runs.parent_transport(runner.current_session), transport)
+                self.assertEqual(unit_runs.parent_transport(fixture_runtime_id("no-held-run")), transport)
+                self.assertEqual(sorted(path.relative_to(runs) for path in runs.rglob("*")), before)
+            write_text_atomic(first / "worker_transport", "herdr\n")
+            write_text_atomic(second / "worker_transport", "mesh\n")
+            before_pin = (first / "worker_transport").read_bytes(), (first / "worker_transport").stat().st_mtime_ns
+            self.assertEqual(unit_runs.parent_transport(session), "herdr")
+            self.assertEqual(((first / "worker_transport").read_bytes(),
+                              (first / "worker_transport").stat().st_mtime_ns), before_pin)
+            unit_runs.activate(second, session)
+            self.assertEqual(unit_runs.parent_transport(session), "mesh")
+            (second / "worker_transport").unlink()
+            self.assertEqual(unit_runs.parent_transport(session), "mesh")
+            self.assertFalse((second / "worker_transport").exists())
+            record = staff.snapshot()
+            with patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as reads:
+                self.assertEqual(unit_runs.parent_transport(session, record=record), "mesh")
+            self.assertEqual(reads.call_count, 0)
+
+    def test_roster_only_run_keeps_its_mesh_pin_with_herdr_configured(self) -> None:
+        owner = fixture_member("showrunner", name="roster-owner")
+        worker = fixture_worker("impl", owner.id)
+        run, config = self.root / "runs/roster-only", self.root / "config"
+        run.mkdir(parents=True)
+        config.mkdir()
+        write_text_atomic(run / "mesh_roster.json", json.dumps({"impl": {"staff_id": worker.id}}))
+        write_text_atomic(run / "worker_transport", "mesh\n")
+        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=herdr\n")
+        with patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(run.parent)}):
+            self.assertEqual(unit_runs.parent_transport(owner.current_session, record=staff.snapshot()), "mesh")
+
+    def test_run_pin_reads_absent_valid_and_invalid_values_without_writing(self) -> None:
+        run = self.root / "read-pin"
+        run.mkdir()
+        pin = run / "worker_transport"
+        self.assertIs(unit_runs.run_pin(run), unit_runs.NoRunPin.ABSENT)
+        self.assertEqual(list(run.iterdir()), [])
+        for selected in ("mesh", "herdr"):
+            with self.subTest(selected=selected):
+                write_text_atomic(pin, selected + "\n")
+                before = pin.stat().st_mtime_ns
+                self.assertEqual(unit_runs.run_pin(run), selected)
+                self.assertEqual(pin.read_text(), selected + "\n")
+                self.assertEqual(pin.stat().st_mtime_ns, before)
+        write_text_atomic(pin, "junk\n")
+        with self.assertRaisesRegex(ValueError, "invalid worker transport: junk") as error:
+            _ = unit_runs.run_pin(run)
+        self.assertIn(str(pin), str(error.exception))
+        self.assertEqual(pin.read_text(), "junk\n")
+
+    def test_run_transport_remains_pinned_after_configuration_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = root / "config"
+            config.mkdir()
+            run = root / "first"
+            with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+                self.assertEqual(unit_runs.worker_transport(run), "mesh")
+                pin = run / "worker_transport"
+                unchanged = pin.stat().st_mtime_ns
+                write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+                self.assertEqual(unit_runs.worker_transport(run), "mesh")
+                self.assertEqual(pin.read_text(), "mesh\n")
+                self.assertEqual(pin.stat().st_mtime_ns, unchanged)
+                self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
+                self.assertEqual((root / "second/worker_transport").read_text(), "herdr\n")
+
+    def test_unreadable_transport_configuration_does_not_replace_a_saved_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            run = root / "run"
+            run.mkdir()
+            write_text_atomic(run / "worker_transport", "herdr\n")
+            with patch.dict(os.environ, {"CONF_DIR": str(root / "missing")}):
+                self.assertEqual(unit_runs.worker_transport(run), "herdr")
+            self.assertEqual((run / "worker_transport").read_text(), "herdr\n")
+
+    def test_invalid_saved_transport_stays_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder)
+            write_text_atomic(run / "worker_transport", "unknown\n")
+            with self.assertRaisesRegex(ValueError, "invalid worker transport"):
+                _ = unit_runs.worker_transport(run)
+            self.assertEqual((run / "worker_transport").read_text(), "unknown\n")
+
     def staff_owner(self, run: Path, session_id: str) -> None:
         parent = showrunner_relationship("runs-fixture")
         owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
         _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name}))
+
+    def test_director_without_progress_state_resolves_roster_parent_without_output(self) -> None:
+        production = fixture_member("showrunner", name="roster-production")
+        owner = fixture_member("unit", name="roster", parent=production.id)
+        worker = fixture_worker("impl", owner.id)
+        run = self.root / "roster-run"
+        run.mkdir()
+        _ = (run / "mesh_roster.json").write_text(json.dumps({"impl": {"staff_id": worker.id}}))
+        self.assertFalse((run / unit_runs.STATE_FILE).exists())
+        with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(unit_runs.director(run), owner.current_session)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_director_reports_existing_invalid_or_unreadable_progress_state(self) -> None:
+        _ = fixture_member("showrunner", name="state-diagnostics")
+        for kind in ("invalid", "unreadable"):
+            with self.subTest(kind=kind):
+                run = self.root / kind
+                run.mkdir()
+                path = run / unit_runs.STATE_FILE
+                if kind == "invalid":
+                    _ = path.write_text("{")
+                else:
+                    path.mkdir()
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    _ = unit_runs.director(run)
+                self.assertIn("anomaly:", errors.getvalue())
+                self.assertIn(str(path), errors.getvalue())
 
     def test_both_roots_are_read_the_new_name_first(self) -> None:
         self.assertEqual(unit_runs.run_roots(), (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate")))
@@ -136,6 +348,18 @@ class UnitRunsTest(StaffTestCase):
                 self.assertEqual(unit_runs.held(fixture_runtime_id("other"), root, active, scanned=scanned), [str(root / "other-run")])
                 self.assertEqual(read.call_count, 3)
                 self.assertEqual({call.args[0] for call in read.call_args_list}, set(root.iterdir()))
+
+    def test_shared_scan_omits_folders_without_run_state(self) -> None:
+        root = self.root / "runs"
+        run = root / "recorded"
+        run.mkdir(parents=True)
+        self.staff_owner(run, fixture_runtime_id("director"))
+        (root / "active").mkdir()
+        (root / "solo").mkdir()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            scanned = unit_runs.held_by_session(root)
+        self.assertEqual(scanned, {fixture_runtime_id("director"): [str(run)]})
+        self.assertEqual(errors.getvalue(), "")
 
     def test_marker_outside_the_scan_is_verified_and_keeps_its_spelling(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

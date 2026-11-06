@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # Unit status for /showrunner:produce's update schedule.
-# Usage: unit_status.sh <state-dir> <user-zone> --production <production doc>
+# Usage: unit_status.sh <state-dir> <user-zone> --production <staff name>
 # The units are the live rows of the production doc.
 # Native session ids select panes. Staff ids identify saved state.
 # Each call checks every unit director: that its session and Claude are running, tick
@@ -11,7 +11,7 @@
 # would fail the `tail` before it with SIGPIPE.
 
 if (( $# != 4 )) || [[ $3 != --production && $3 != --showrunner ]]; then
-  print -u2 'usage: unit_status.sh <state-dir> <user-zone> --production <production doc>'
+  print -u2 'usage: unit_status.sh <state-dir> <user-zone> --production <staff name>'
   exit 2
 fi
 # An update prompt written before a production was named by its doc passes `--showrunner <session>`.
@@ -32,14 +32,13 @@ PY=$REPO/scripts/lib/py
 staff_lines=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
 import sys
 sys.path.insert(0, sys.argv[1])
-from pathlib import Path
-from scripts.production import staff, unit_lookup, unit_names
-from scripts.production.showrunners import named
+from scripts.production import staff
+from scripts.production.showrunners import owner_for
 arguments = sys.argv[2:]
-doc = Path(arguments[1]) if arguments[0] == "--production" else Path(named(arguments[0])["doc"])
-for row in unit_lookup.doc_units(doc, staff.snapshot()):
-    for label in {row.name, unit_names.unit_id(row.name)}:
-        print(f"{label}\t{row.id}")
+record = staff.snapshot()
+owner = owner_for(arguments[1] if arguments[0] == "--production" else arguments[0], record=record)
+for row in record.find(parent=owner.id, kind="unit"):
+    print(f"{row.name}\t{row.id}")
 PYTHON
 ) || exit 1
 staff_rows=("${(@f)staff_lines}")

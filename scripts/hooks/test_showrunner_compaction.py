@@ -16,6 +16,10 @@ from typing import Protocol, cast, final, override
 from unittest.mock import patch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+SESSION = fixture_runtime_id("compaction-showrunner")
 HOOK = Path(__file__).resolve().parent / "showrunner-compaction.py"
 # Record any call to the former PreCompact writer.
 FAKE_LOG = """\
@@ -44,13 +48,17 @@ class ShowrunnerCompactionTests(unittest.TestCase):
         timer = self.root / "notifier" / "showrunner-example"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_text(
-            f"TARGET=session:showrunner-id\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh example\n", encoding="utf-8")
         self.fake = self.root / "update_registration.py"
         _ = self.fake.write_text(FAKE_LOG, encoding="utf-8")
         self.calls = self.root / "calls.jsonl"
         self.env = {**os.environ, "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                     "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
                     "SHOWRUNNER_UPDATE_REGISTRATION": str(self.fake), "CALLS": str(self.calls)}
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
+        _ = fixture_member("showrunner", name="example", runtime_id=SESSION,
+                           doc=staff.LiveDoc("natedev", self.doc))
 
     def run_hook(self, payload: dict[str, str], **env: str) -> str:
         result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,
@@ -68,13 +76,13 @@ class ShowrunnerCompactionTests(unittest.TestCase):
         state.parent.mkdir(parents=True)
         _ = state.write_text('{"next": ["merge alpha"]}\n', encoding="utf-8")
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
-        self.assertEqual(self.run_hook({"session_id": "showrunner-id", "hook_event_name": "PreCompact",
+        self.assertEqual(self.run_hook({"session_id": SESSION, "hook_event_name": "PreCompact",
                                         "trigger": "auto"}), "")
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
         self.assertEqual(self.logged(), [])
 
     def test_session_start_after_compaction_names_the_resume(self) -> None:
-        output = self.run_hook({"session_id": "showrunner-id", "hook_event_name": "SessionStart", "source": "compact"})
+        output = self.run_hook({"session_id": SESSION, "hook_event_name": "SessionStart", "source": "compact"})
         context = cast(dict[str, dict[str, str]], json.loads(output))["hookSpecificOutput"]["additionalContext"]
         self.assertIn(f"run `/showrunner:produce {self.doc} resume`", context)
         self.assertIn("just compacted", context)
@@ -84,7 +92,7 @@ class ShowrunnerCompactionTests(unittest.TestCase):
         self.assertEqual(self.run_hook({"session_id": "unit-id", "hook_event_name": "PreCompact"}), "")
         self.assertEqual(self.run_hook({"session_id": "unit-id", "hook_event_name": "SessionStart",
                                         "source": "compact"}), "")
-        self.assertEqual(self.run_hook({"session_id": "showrunner-id", "hook_event_name": "SessionStart",
+        self.assertEqual(self.run_hook({"session_id": SESSION, "hook_event_name": "SessionStart",
                                         "source": "startup"}), "")
         self.assertEqual(self.logged(), [])
 
