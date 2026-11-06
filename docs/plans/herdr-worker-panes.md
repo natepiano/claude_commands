@@ -2763,7 +2763,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Acceptance gate:** basedpyright 0/0 on both files and on the callers `scripts/production/worker.py` and `scripts/accounts/pane_moves.py`. `test_worker_panes` and `test_worker` pass. A test with a pass that finished before a phase boundary fails without the repair and passes with it. Live, on the installed tree: `worker.py end review3` exits 0 and closes its pane.
 
-### Phase 14h — A friend launches with the worker policy  · status: todo
+### Phase 14h — A friend launches with the worker policy  · status: done
 
 **Depends on:** Phase 14g, because both phases change `scripts/herdr/worker_panes.py`.
 

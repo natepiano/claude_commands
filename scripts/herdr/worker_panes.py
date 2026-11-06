@@ -483,6 +483,19 @@ def launch_policy(role: WorkerRole) -> LaunchPolicy:
     sandbox = READ_ONLY_SANDBOX if role in ("review", "astra-reviewer") else WORKER_SANDBOX
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
+    return _launch_policy(settings, sandbox)
+
+
+def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
+    """Use the worker's file permissions with the supplied model settings."""
+    from scripts.agents.codex_mesh import WORKER_SANDBOX
+
+    return _launch_policy(settings, WORKER_SANDBOX)
+
+
+def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> LaunchPolicy:
+    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
+
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
     compact_above_tokens = (conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
                             if settings.kind == "codex" else ClaudeCompaction.NATIVE)
