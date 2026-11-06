@@ -146,7 +146,7 @@ A missing document reference in the source list does not block a row with an ava
 An unrouted row retains verdict controls when its list's staff showrunner has an available document.
 In that case, its owner remains unrouted and receives no message.
 
-`merge_checkpoint`, `merge_gate`, and `change_review.py append` store each checkpoint unit's Producer id.
+`change_review.list_ready`, which `merge_checkpoint` and `merge_gate` call, stores each checkpoint unit's Producer id.
 `merge_gate` reads the staff record before the merge.
 `merge_checkpoint` reads the staff record before the push.
 An unreadable staff record stops either run before anything is pushed.

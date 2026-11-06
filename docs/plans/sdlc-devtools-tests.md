@@ -1338,7 +1338,7 @@ Source: sdlc [fc249e32], [c4e2eefc], [ecddfb26]. review-links.service ran from 1
 
 **State:** none. The phase writes no new lasting record.
 
-### Phase 8h — A change reaches the list only when it is on main and live  · status: todo
+### Phase 8h — A change reaches the list only when it is on main and live  · status: done
 
 Source: the user via builds, natedev and sdlc [c4e2eefc]: "a change cannot be in the change list unless it is ready to check". sdlc [7c534629]: the rule covers every path that adds a row. One code path for `add`, `merge_checkpoint.py:1444` and `merge_gate.py:1475`, no copies. A change that needs a restart or deploy gets its row when that step is done. The design is this unit's.
 

@@ -509,11 +509,8 @@ class MergeWriterRoutingTests(ProducerFixture):
         from scripts.production import merge_gate
         from scripts.review_links import change_page
 
-        merged = self.merge()
-        commits = change_review.merge_commits(self.repo, merged)
-        with mock.patch.object(change_review, "drift", return_value=[]):
-            merge_gate.record_changes(self.repo, self.listing, self.doc,
-                                      change_review.publication_changes(commits, self.doc), "main")
+        _ = self.merge()
+        merge_gate.record_changes(self.repo, self.listing, self.doc, "main")
         row = change_review.pending(self.listing)[0]
         owner = change_routing.StaffRouting(staff.snapshot(), {}).owner(row, self.listing)
         self.assertIsInstance(owner, change_routing.StaffRoutedChange)

@@ -65,17 +65,6 @@ class NotYetPushed(NamedTuple):
     pass
 
 
-class ChangesReadBeforePush(NamedTuple):
-    changes: list[change_review.PublicationChange]
-
-
-class ReadChangesWhenWriting(NamedTuple):
-    pass
-
-
-_READ_CHANGES_WHEN_WRITING = ReadChangesWhenWriting()
-
-
 class PromotionAlreadyAtTip(NamedTuple):
     tip: str
 
@@ -441,49 +430,21 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
     return checkout / path
 
 
-def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str,
-                   changes: ChangesReadBeforePush | ReadChangesWhenWriting) -> None:
-    record_publication_changes(request.production, commits, merge_head, changes=changes, record=request.staff_record)
-
-
-def record_publication_changes(production: ProductionDocument, commits: list[change_review.Commit], merge_head: str,
-                               *, changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING,
-                               report_unchanged: bool = True,
+def record_publication_changes(production: ProductionDocument, *, report_unchanged: bool = True,
                                record: staff.StaffSnapshot | None = None) -> None:
-    """Register each visible change and report merges with missing rows."""
+    """Scan published merges after every promotion step succeeds."""
     doc = change_review.list_path(production.doc, record=record)
     if doc is None:
         if report_unchanged:
             report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
-    done = checkpoint_step_record(production.checkout, merge_head, "change-review")
-    if done.exists():
-        if report_unchanged:
-            report("change review", "ok", "checkpoint changes already recorded")
-        return
-    merged = good(git(production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
-        # A stop after the list write but before the receipt must not add it twice.
-        record = staff.snapshot() if record is None else record
-        publication = (changes.changes if isinstance(changes, ChangesReadBeforePush)
-                       else change_review.publication_changes(commits, production.doc, record=record))
-        existing = change_review.pending(doc) if doc.exists() else []
-        held = {row["Change"] for row in existing
-                if any(sha.startswith(merged) or merged.startswith(sha)
-                       for sha in cast(list[str], change_review._HASH.findall(row.get("Merged", ""))))}  # pyright: ignore[reportPrivateUsage]
-        rows = [] if publication and all(change.item.change in held for change in publication) else change_review.append_rows(
-            doc, publication, datetime.now(production.zone).date(), merged, production.doc, record=record)
-        done.parent.mkdir(parents=True, exist_ok=True)
-        done.touch()
-        drifted = change_review.drift(production.checkout, production.merge_branch,
-                                      change_review.read(doc), change_review.LANDED,
-                                      change_review.foreign_units(production.doc, record=record))
+        rows = change_review.list_ready(production.checkout, production.doc, production.merge_branch, record=record)
     except (change_review.ChangeReviewError, OSError) as error:
-        report("change review", "failed", f"{doc} not written: {error}; add its rows by hand")
+        report("change review", "failed", f"{doc} not written: {error}; retry after the repair")
         return
-    report("change review", "ok", f"{len(rows)} row(s) added to {doc}" + "".join(f"; {row}" for row in rows))
-    for line in drifted:
-        report("change review", "drift", line)
+    if rows or report_unchanged:
+        report("change review", "ok", f"{len(rows)} row(s) added to {doc}" + "".join(f"; {row}" for row in rows))
 
 
 def merge_paths(checkout: Path, base: str, tip: str) -> tuple[str, ...]:
@@ -1385,10 +1346,9 @@ def run(request: MergeRequest) -> int:
             for step in steps:
                 report(step, "ok", "checkpoint already merged; resuming promotion")
             paths = changed_paths(request, f"{merge_head}^1")
-        changes: ChangesReadBeforePush | ReadChangesWhenWriting = _READ_CHANGES_WHEN_WRITING
         if isinstance(pushed, NotYetPushed) and change_review.list_path(request.production.doc, record=request.staff_record) is not None:
             try:
-                changes = ChangesReadBeforePush(change_review.publication_changes(commits, request.production.doc, record=request.staff_record))
+                _ = change_review.publication_changes(commits, request.production.doc, record=request.staff_record)
             except (change_review.ChangeReviewError, OSError) as error:
                 undo_unpushed_merge(request.production, merge_head)
                 raise Stop("change review", "failed", f"{error}: the staff record is read before the push",
@@ -1441,8 +1401,8 @@ def run(request: MergeRequest) -> int:
             if tip:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
                                      issue=str(request.unit.plan))
-                record_changes(request, commits, merge_head, changes)
                 notify_published_style(request.production, merge_head, tip)
+        record_publication_changes(request.production, record=request.staff_record)
         promotion_done.parent.mkdir(parents=True, exist_ok=True)
         promotion_done.touch()
         record(request, merge_head, tests_green)
@@ -1633,8 +1593,6 @@ def notify_published_style(production: ProductionDocument, merge_head: str, tip:
 def record_handoff_publication(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
     record_pushed_merges(request.production, merge_head, request.checkpoint, tip,
                          phase_id="", issue=f"{request.child.name} hand-off")
-    record_publication_changes(request.production, change_review.merge_commits(request.production.checkout, merge_head),
-                               merge_head, report_unchanged=False)
     notify_published_style(request.production, merge_head, tip)
 
 
@@ -1664,6 +1622,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
             finish_handoff_promotion(request, delivery.merge_head)
         finally:
             record_handoff_publication(request, delivery.merge_head, tip)
+        record_publication_changes(request.production, report_unchanged=False)
         record_handoff_completion(request, delivery.merge_head, tip)
         finish_handoff(request, delivery.merge_head)
         return 0
@@ -1712,6 +1671,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     finally:
         if tip:
             record_handoff_publication(request, merge_head, tip)
+    record_publication_changes(request.production, report_unchanged=False)
     record_handoff_completion(request, merge_head, tip)
     finish_handoff(request, merge_head)
     print(f"hand-off {checkpoint[:7]} merged as {merge_head[:7]}", flush=True)
