@@ -530,8 +530,8 @@ class BoxSetup:
 
     def _versions(self, *, on_box: bool) -> dict[str, str]:
         versions: dict[str, str] = {}
-        for tool, command in (('rustc', ['rustc', '-V']), ('nextest', ['cargo', 'nextest', '--version']),
-                              ('mend', ['cargo', 'mend', '--version'])):
+        for tool, command in (('nextest', ['cargo-nextest', 'nextest', '--version']),
+                              ('mend', ['cargo-mend', 'mend', '--version'])):
             output = self._ssh(shlex.join(command)) if on_box else self._run(command)
             versions[tool] = linux_runner.normalize_tool_version(output)
             if not versions[tool]:

@@ -58,8 +58,8 @@ def filtered(rows):
             for tag in row.get('Tags', [])) for f in filters)]
 def versions(command, remote=False):
     if 'rustc' in command: print(s.get('local_rustc', 'rustc fixture') if not remote else 'rustc fixture')
-    elif 'nextest' in command: print('cargo-nextest fixture\n  release fixture  ' if not s.get('mismatch') or not remote else 'cargo-nextest wrong')
-    elif 'mend' in command: print('mend fixture')
+    elif 'nextest' in command: print(s.get('local_nextest', 'cargo-nextest fixture\n  release fixture  ') if not remote else 'cargo-nextest wrong' if s.get('mismatch') else 'cargo-nextest fixture\n  release fixture  ')
+    elif 'mend' in command: print('mend wrong' if remote and s.get('mend_mismatch') else 'mend fixture')
     else: raise AssertionError(command)
 if name == 'aws':
     op = args[args.index('--region') + 3]
@@ -134,7 +134,7 @@ elif name == 'systemctl':
         s['controller'] = True; save()
     elif 'is-enabled' in args: print('enabled' if s.get('controller') else 'disabled')
     elif 'is-active' in args: print('active' if s.get('controller') else 'inactive')
-elif name in ('rustc', 'cargo'):
+elif name in ('rustc', 'cargo', 'cargo-nextest', 'cargo-mend'):
     if name == 'cargo' and args[:1] == ['metadata']:
         output({'workspace_root': str(pathlib.Path.cwd()), 'target_directory': str(pathlib.Path.cwd() / 'target')})
     else:
@@ -202,7 +202,7 @@ elif name == 'ssh':
         assert 'volbox' in command and 'lsblk' in command and 'SERIAL' in command
         if s.get('wrong_volume'): sys.exit(1)
         print('healthy')
-    elif command in ('rustc -V', 'cargo nextest --version', 'cargo mend --version'): versions(shlex.split(command), True)
+    elif command in ('cargo-nextest nextest --version', 'cargo-mend mend --version'): versions(shlex.split(command), True)
     else: raise AssertionError(command)
 else: raise AssertionError(name)
 '''
@@ -322,7 +322,7 @@ class BoxTests(unittest.TestCase):
                                              for line in config.splitlines()) + '\n')
         bin_path = self.root / 'bin'
         bin_path.mkdir()
-        for name in ('aws', 'ssh', 'git', 'nix', 'tailscale', 'systemctl', 'bash', 'rustc', 'cargo'):
+        for name in ('aws', 'ssh', 'git', 'nix', 'tailscale', 'systemctl', 'bash', 'rustc', 'cargo', 'cargo-nextest', 'cargo-mend'):
             path = bin_path / name
             _ = path.write_text(f'#!{sys.executable}\n' + FAKE)
             path.chmod(0o700)
@@ -824,9 +824,12 @@ class BoxTests(unittest.TestCase):
         before = [c for c in self.commands() if c[0] == 'nix']
         self.assertTrue(self.subject.checks_present())
         self.assertEqual([c for c in self.commands() if c[0] == 'nix'], before)
-        for command in (['rustc', '-V'], ['cargo', 'nextest', '--version'], ['cargo', 'mend', '--version']):
+        for command in (['cargo-nextest', 'nextest', '--version'], ['cargo-mend', 'mend', '--version']):
             self.assertIn(command, self.commands())
         self.assertFalse(any(c[0] == 'nix' for c in self.commands()))
+        recorded = mapping(box.json_record((self.directory / 'box-tools.json').read_text())['versions'])
+        self.assertEqual(set(recorded), {'nextest', 'mend'})
+        self.assertFalse(any(c[0] == 'rustc' or c[-1] == 'rustc -V' for c in self.commands()))
         self.change(mismatch=True)
         self.assertFalse(self.subject.checks_present())
         with self.assertRaisesRegex(box.BoxRefused, 'nextest box=cargo-nextest wrong natedev=cargo-nextest fixture release fixture'):
@@ -835,13 +838,19 @@ class BoxTests(unittest.TestCase):
         self.subject.checks()
         self.assertTrue(self.subject.checks_present())
 
+    def test_checks_refuse_a_mend_version_mismatch(self) -> None:
+        self.change(joined=True, mend_mismatch=True)
+        with self.assertRaisesRegex(box.BoxRefused, 'mend box=mend wrong natedev=mend fixture'):
+            self.subject.checks()
+        self.assertFalse((self.directory / 'box-tools.json').exists())
+
     def test_checks_refuse_a_wrong_home_volume_and_an_inactive_remote_service(self) -> None:
         for values in ({'wrong_volume': True, 'active': True}, {'wrong_volume': False, 'active': False}):
             with self.subTest(values=values):
                 self.change(joined=True, **values)
                 with self.assertRaises(box.BoxRefused):
                     self.subject.checks()
-                self.assertFalse(any(c[0] in ('rustc', 'cargo') for c in self.commands()))
+                self.assertFalse(any(c[0] in ('rustc', 'cargo-nextest', 'cargo-mend') for c in self.commands()))
 
 
     def test_idle_stop_records_the_instance_and_never_waits_again(self) -> None:
@@ -1157,7 +1166,7 @@ class BoxTests(unittest.TestCase):
                 _ = (self.directory / 'up.json').write_bytes(saved)
                 _ = (self.directory / 'box-tools.json').write_bytes(tools)
                 self.change(ec2='stopped', desired=SYSTEM if change == 'tools' else SYSTEM + '-new',
-                            local_rustc='rustc new' if change == 'tools' else 'rustc fixture')
+                            local_nextest='cargo-nextest new' if change == 'tools' else 'cargo-nextest fixture release fixture')
                 subject = box.BoxSetup(self.settings, self.directory, self.start,
                                        admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet, monotonic=self.monotonic, pause=self.monotonic.advance)
                 if change == 'system':

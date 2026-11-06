@@ -141,7 +141,7 @@ Sender copies cannot disable its idle shutdown through natedev's `offload=off` s
 The sender copies every tracked file under `scripts/` and `config/`.
 This includes `config/build_folders.conf`, which the remote service and Linux runner need during import.
 A version refusal names each mismatched tool, both versions, and the file set by `version_pin_file`.
-Move the box pins in that file before you retry the step.
+Move the box pins in that file before you retry the step. A rustc difference does not refuse a step: each job uses its tree's toolchain.
 The controller also stops a running box after `idle_stop_minutes` without published permission when no target claim remains.
 It saves the first unpublished time for each generation in `controller.json`.
 A successful publication or a new generation resets this timer.
@@ -370,8 +370,8 @@ One waiting pinned step gives the controller immediate work to start the box.
 Do not bypass permission or delete another slot's output.
 
 1. Record the configured shell selector and the selected repository slot.
-2. Confirm the reserved execution probe checks `rustc -V` inside that shell.
-3. Confirm it checks `cargo nextest --version` and `cargo mend --version` inside the same shell.
+2. Confirm the runner checks `rustc -V` inside that shell, in the mirror, after it installs the tree's toolchain.
+3. Confirm the reserved execution probe checks `cargo-nextest nextest --version` and `cargo-mend mend --version` inside the same shell.
 4. Confirm it checks the tracked scripts commit.
 5. Run pinned test, check, and staged doc commands.
 

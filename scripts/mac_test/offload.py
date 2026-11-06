@@ -1431,14 +1431,14 @@ def probe_mac(
                 return probe
             expected = expected_linux_parity(controller, config)
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-            if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == value for key, value in expected.items()):
+            if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == expected[key] for key in ("nextest", "mend", "scripts_commit")):
                 return probe
             if TYPE_CHECKING:
                 from . import linux_runner
             else:
                 import linux_runner
             detail = (linux_runner.version_mismatch(target, values,
-                      {"rustc": expected["rustc"], "nextest": expected["nextest"], "mend": expected["mend"]},
+                      {"nextest": expected["nextest"], "mend": expected["mend"]},
                       config.values.get("version_pin_file", ""))
                       if not isinstance(expected, UnavailableToolParity) else "")
             if detail:

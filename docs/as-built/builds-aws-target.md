@@ -96,6 +96,14 @@ An interruption marker reports the instance generation.
   The remote service and Linux runner need this config during import.
 - A version refusal names the target, each mismatched tool, both versions, and the file set by `version_pin_file`.
   The verify output and the step attempt record keep this reason.
+- The box has `rustup`, `rustc`, `cargo` and `rustdoc` as rustup proxies. The Nix compiler builds only cargo-mend and cargo-tile. It does not select a job's compiler.
+  The Linux runner keeps the caller PATH after the development shell PATH, then runs `shellHook`.
+  Each job installs its toolchain in the mirror, before the parity checks and the work, in the job's process group.
+  rustup's order selects the toolchain, the same as on natedev: `RUSTUP_TOOLCHAIN`, then the tree's toolchain file. With neither, a plain `x.y.z` version from natedev becomes `RUSTUP_TOOLCHAIN`. Other forms leave it unset, and parity declines the job.
+  One `flock` per toolchain protects the install. The lock name is `RUSTUP_TOOLCHAIN`, or the file's channel, or the SHA-256 of a file with no channel. A second job waits on the lock and downloads nothing.
+  An install failure declines the attempt with its error text, and the job goes to normal routing.
+  Toolchains stay in `~/.rustup` on `/home`, not in the image. A new volume downloads each version once, about 1.6 GB and 20 s.
+  The probe measures the checkout filesystem and runs no cargo or rustc. It reads nextest and mend through `cargo-nextest` and `cargo-mend`. The runner compares rustc after it enters the mirror.
 - `release_stopped_claims` releases host claims after a confirmed stop or a generation change, and writes `release-evidence/`.
   A generation change releases only claims with a nonempty older generation and a start time at or before the observation.
 
@@ -162,7 +170,8 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
    The helper resets the old idle timestamp before it restarts the remote service.
    It waits for the expected system and an active `aws-build-remote` service.
 4. `checks` confirms SSM, the EBS serial under `/home`, ext4, and the remote service.
-   It compares `rustc -V`, `cargo nextest --version`, and `cargo mend --version` in the plain environment on both hosts.
+   It compares `cargo-nextest nextest --version` and `cargo-mend mend --version` in the plain environment on both hosts.
+   It does not compare rustc: each job uses its tree's toolchain.
    Non-interactive SSH uses the box tools from `environment.systemPackages` in `/etc/nixos/hosts/aws-build.nix`.
    The stage reads no other source repository and copies no shell inputs.
    It uses `normalize_tool_version` for both results.

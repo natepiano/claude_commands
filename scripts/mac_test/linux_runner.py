@@ -163,6 +163,15 @@ def positive_setting(values: dict[str, str], key: str) -> float:
     return value
 
 
+def shell_environment_script(shell: ShellEnvironment) -> str:
+    """Keep the caller's tools after the development shell's tools."""
+    return ('linux_runner_path=$PATH\n'
+            + f'source {shlex.quote(str(shell.exports))} || exit 75\n'
+            + 'export PATH="$PATH:$linux_runner_path"\n'
+            + 'unset linux_runner_path\n'
+            + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n')
+
+
 def policy_setting(values: dict[str, str], key: str, repository: str) -> str:
     return values[f'{key}.{repository}'] if f'{key}.{repository}' in values else values[key]
 
@@ -190,29 +199,16 @@ def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
         f'mkdir -p -- "$HOME"/{shlex.quote(mirror)} || exit 1',
         f'checkout="$HOME"/{shlex.quote(mirror)}',
-        'if [[ -f "$checkout/Cargo.toml" ]]; then',
-        "  capacity_code=" + shlex.quote("\n".join((
-            "import sys",
-            "from pathlib import Path",
-            "sys.path.insert(0, str(Path.home() / '.claude'))",
-            "from scripts.mac_test.linux_runner import output_free_bytes",
-            "print(f'{output_free_bytes(Path(sys.argv[1])) / 1024 ** 3:.6f}')",
-        ))),
-        '  free_gib=$(python3 -c "$capacity_code" "$checkout") || { printf \'disk capacity unavailable\\n\' >&2; exit 1; }',
-        'else',
-        '  disk_usage=$(df -Pk "$checkout") || exit 1',
-        '  free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
-        'fi',
+        'disk_usage=$(df -Pk "$checkout") || exit 1',
+        'free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
         'printf \'free_gib=%s\\nhost=%s\\n\' "$free_gib" "$(hostname -s)"',
-        'rustc_version=$(rustc -V) || exit 1',
-        'nextest_version=$(cargo nextest --version) || exit 1',
-        'mend_version=$(cargo mend --version) || exit 1',
-        f'rustc_version=$(printf \'%s\' "$rustc_version" | {tool_version_filter()}) || exit 1',
+        'nextest_version=$(cargo-nextest nextest --version) || exit 1',
+        'mend_version=$(cargo-mend mend --version) || exit 1',
         f'nextest_version=$(printf \'%s\' "$nextest_version" | {tool_version_filter()}) || exit 1',
         f'mend_version=$(printf \'%s\' "$mend_version" | {tool_version_filter()}) || exit 1',
         'scripts_commit=$(cat "$HOME/.claude/.build-target-script-commit") || exit 1',
-        'printf \'rustc=%s\\nnextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
-        + '"$rustc_version" "$nextest_version" "$mend_version" "$scripts_commit"',
+        'printf \'nextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
+        + '"$nextest_version" "$mend_version" "$scripts_commit"',
     ))
 
 
@@ -612,8 +608,7 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
                                   positive_setting(values, 'shell_timeout_s'))
             if permission_refused(values):
                 return 75
-            command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
-                       + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
+            command = (shell_environment_script(shell)
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                        + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
             return subprocess.run(['bash', '-c', command], cwd=mirror, check=False).returncode
@@ -690,6 +685,47 @@ def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[s
     return f'{target} version mismatch: ' + '; '.join(differences) + hint
 
 
+def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
+    """Install the tree's toolchain under one lock for its channel."""
+    version = re.fullmatch(r'rustc (\d+\.\d+\.\d+)(?: .*)?', expected_rustc)
+    fallback = (f'export RUSTUP_TOOLCHAIN={shlex.quote(version[1])}' if version else ':')
+    name_code = '\n'.join((
+        'import hashlib, os, tomllib',
+        'from pathlib import Path',
+        'path = next((p for p in (Path("rust-toolchain"), Path("rust-toolchain.toml")) if p.is_file()), None)',
+        'if os.environ.get("RUSTUP_TOOLCHAIN"):',
+        '    print(os.environ["RUSTUP_TOOLCHAIN"])',
+        'elif path is None:',
+        '    print("")',
+        'else:',
+        '    text = path.read_text()',
+        '    try:',
+        '        toolchain = tomllib.loads(text)["toolchain"].get("channel") or hashlib.sha256(text.encode()).hexdigest()',
+        '    except tomllib.TOMLDecodeError:',
+        '        toolchain = text.strip()',
+        '    print(toolchain)',
+    ))
+    return '\n'.join((
+        'if [[ -z ${RUSTUP_TOOLCHAIN-} && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then',
+        f'  {fallback}',
+        'fi',
+        f'toolchain=$(python3 -c {shlex.quote(name_code)}) || exit 75',
+        'if [[ -n "$toolchain" ]]; then',
+        '  mkdir -p -- "${RUSTUP_HOME:-$HOME/.rustup}" || exit 75',
+        '  (',
+        '    flock -x 9 || exit 75',
+        '    if install_output=$(rustup toolchain install --no-self-update --no-update 2>&1); then',
+        '      if [[ -n "$install_output" ]]; then printf \'%s\\n\' "$install_output"; fi',
+        '    else',
+        '      install_output=${install_output//$\'\\n\'/ }',
+        f'      printf \'%s version mismatch: toolchain install failed: %s\\n\' {shlex.quote(target)} "$install_output" >&2',
+        '      exit 75',
+        '    fi',
+        '  ) 9>"${RUSTUP_HOME:-$HOME/.rustup}/$toolchain.lock" || exit 75',
+        'fi',
+    ))
+
+
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
         words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
     if verb not in ('nextest', 'check', 'doc'):
@@ -759,9 +795,9 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         '  exit 75',
         'fi',
     ])
-    command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
-               + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
+    command = (shell_environment_script(shell)
                + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
+               + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
                + '\n'.join(parity) + '\n'
                + f'export {assignments}\n')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
