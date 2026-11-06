@@ -146,9 +146,12 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
 
 
 def pane_holds_other_work(client: herdr.Herdr, pane_id: str, identity: str) -> bool:
-    fresh = next((pane for pane in client.tab_sessions() if pane.pane_id == pane_id), None)
-    if fresh is not None and ((fresh.session_id and fresh.session_id != identity)
-            or not isinstance(client.pane_activity(pane_id), herdr.PaneAtShell)):
+    fresh = next((pane for pane in client.panes() if pane["pane_id"] == pane_id), None)
+    if fresh is None:
+        return False
+    activity = client.pane_activity(pane_id)
+    if ((fresh["session_id"] and fresh["session_id"] != identity)
+            or not isinstance(activity, herdr.PaneAtShell)):
         print(f"{pane_id}: pane close anomaly: pane holds other work; kept open", file=sys.stderr)
         return True
     return False
@@ -207,6 +210,13 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 _anomaly(row, "duplicate panes retained")
             elif panes and (original is None or original["cwd"] == str(folder)):
                 target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
+            elif (not panes and publication is not None
+                    and publication.path == pane_record.record_path(client.session)
+                    and publication.entry["cwd"] == str(folder)):
+                retained = next((pane for pane in client.panes() if pane["pane_id"] == publication.entry["pane_id"]), None)
+                if (retained is not None and (terminal := retained.get("terminal_id", ""))
+                        and isinstance(client.pane_activity(retained["pane_id"]), herdr.PaneAtShell)):
+                    target = herdr.ExistingPane(retained["pane_id"], terminal)
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             _anomaly(row, error)
         # Read liveness again immediately before the launch.
@@ -232,8 +242,11 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if original is not None and projected is not None and result.pane != original["pane_id"]:
             if not pane_holds_other_work(client, original["pane_id"], str(row.current_session)):
                 path = pane_record.record_path(client.session)
-                pane_launch.finish_restore(path, original, pane_launch.resume_attempt(path, result.pane),
-                                           names.resume_proof(original, projected), close=client.close_tab_confirmed)
+                try:
+                    pane_launch.finish_restore(path, original, pane_launch.resume_attempt(path, result.pane),
+                                               names.resume_proof(original, projected), close=client.close_tab_confirmed)
+                except (OSError, ValueError, herdr.HerdrFailure) as error:
+                    _anomaly(row, error)
         try:
             client.remember_row_tab(str(row.id), result.pane)
             if present:

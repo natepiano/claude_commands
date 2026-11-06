@@ -307,7 +307,7 @@ class PaneRestoreTests(unittest.TestCase):
         for other_conversation in (False, True):
             with self.subTest(other_conversation=other_conversation):
                 self.opened.clear()
-                self.entry()
+                self.entry(cwd="/old/alpha")
                 client = FakeClient([{ "pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
                 activity = herdr.PaneRunning(("other work",)) if not other_conversation else herdr.PaneAtShell()
 
@@ -572,6 +572,12 @@ class RestoreStaffNamesTests(StaffTestCase):
                        for index, row in enumerate(saved_client.rows)]
         client.count = 20
         record = staff.snapshot()
+        path = directory / "agents.json"
+        entries = pane_launch.read_strict(path)
+        for entry in entries.values():
+            if record.by_member_reference(entry["session_id"]) is not None:
+                entry["cwd"] = str(self.root / "previous-folder")
+        pane_launch.save(path, entries)
         identities: dict[str, str] = {}
         started: list[str] = []
         config = self.root / ".claude3"
@@ -865,7 +871,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         with self.codex_restore(backend) as (client, _proof):
             with (mock.patch.object(pane_launch, "save", side_effect=refuse_retirement),
                   redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
-                self.assertEqual(pane_restore.restore("agents", dry_run=False), 1)
+                self.assertEqual(pane_restore.restore("agents", dry_run=False), 0)
         self.assertEqual(client.closed, ["w1:p1"])
         self.assertIn("w1:p1", pane_record.read("agents"))
         with (self.retirement_evidence(backend, client),
@@ -882,7 +888,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         with self.codex_restore(backend) as (client, _proof):
             with (mock.patch.object(client, "close_tab_of", side_effect=herdr.HerdrFailure("forced close failure")),
                   redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
-                self.assertEqual(pane_restore.restore("agents", dry_run=False), 1)
+                self.assertEqual(pane_restore.restore("agents", dry_run=False), 0)
         self.assertIn("w1:p1", pane_record.read("agents"))
         with (self.retirement_evidence(backend, client),
               mock.patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.LiveSessionProcess(backend.pid)),
@@ -954,6 +960,9 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         transcript.parent.mkdir(parents=True)
         _ = transcript.write_text(json.dumps({"type": "session_meta", "payload": {
             "id": self.owner.current_session, "cwd": str(self.old_folder)}}) + "\n")
+        retained = pane_record.read("agents")["w1:p1"]
+        retained["cwd"] = str(self.old_folder)
+        pane_record.write("agents", retained)
         return backend, transcript
 
     @contextmanager
@@ -1097,6 +1106,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         backend.publish_process_state()
         entry = pane_record.read("agents")["w1:p1"]
         entry["ended"] = False
+        entry["cwd"] = str(self.old_folder)
         pane_record.write("agents", entry)
         transcript = backend.config / "projects/work" / f"{self.owner.current_session}.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -1128,7 +1138,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                       redirect_stdout(io.StringIO()) as output, redirect_stderr(output)):
                     code = pane_restore.restore("agents", dry_run=False)
                 if not publish:
-                    self.assertEqual(code, 1)
+                    self.assertEqual(code, 0)
                     self.assertNotIn("w1:p1", client.closed)
                     self.assertEqual(pane_record.read("agents"), before)
                 else:
