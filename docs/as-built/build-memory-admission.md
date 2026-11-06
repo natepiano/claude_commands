@@ -281,6 +281,25 @@ A publication retry also advances the generation. The service never prunes or re
 A refresh uses the open admission connection. An unregistered client uses a read-only `build_history` query.
 A pass retries a retained finalization intent even while its owner remains alive.
 It preserves the first `since` and episode across refreshes and reconnects.
+
+With `--wait-events`, the client emits `first`, then `holder <json>`.
+It emits another holder event only when the holder changes.
+The JSON identifies a session (`kind`, `session_id`, `session_name`), a unit (`kind`, `unit`), or no holder (`kind=none`).
+The pass records the holder in `AdmissionWaitSnapshot.holder`.
+An order hold names its protected waiter, including a continuation that requests extra memory.
+A room wait names the run with the largest recorded charge, including held slots.
+A held slot keeps the run's recorded unit after its reservation ends.
+The charge uses grouped anonymous use and the current keep-aside.
+Unavailable run use retains the full keep-aside charge.
+Unregistered CI jobs never become holders.
+Pressure, unreadable host readings, start spacing, and estimate refresh report no holder.
+The holder defaults to `NoHolder` when an older service omits the field.
+An older client ignores the added field and keeps its wait.
+At a service restart, the client reconnects with the same episode and arrival time.
+It prints `admission service restarted; waiting again` once when the connection closes.
+The existing unreachable limit still applies until a valid reply arrives.
+`QueueInputs` and the queue snapshot version remain unchanged.
+
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
 The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.

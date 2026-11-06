@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import errno
+import json
 import math
 import os
 from pathlib import Path
@@ -572,6 +573,7 @@ class WaitOutput:
     last_reasons: tuple[str, ...] = ()
     last_need: int = 0
     last_position: int = 0
+    last_holder: records.WaitHolder = field(default_factory=records.NoHolder)
     on_event: Callable[[str], None] = field(default=lambda _event: None)
     configuration: records.MemoryConfig | wire.AcquisitionTiming | ReadConfigurationAtUse = field(
         default=READ_CONFIGURATION_AT_USE, kw_only=True)
@@ -590,9 +592,16 @@ class WaitOutput:
         if first:
             self.next_notice, self.held = now + self.reply_seconds(), True
             self.on_event("first")
-        elif now < self.next_notice and not changed:
+        if first or reply.snapshot.holder != self.last_holder:
+            holder = reply.snapshot.holder
+            payload = ({"kind": "session", "session_id": holder.session_id, "session_name": holder.session_name}
+                       if isinstance(holder, records.SessionHolder) else
+                       {"kind": "unit", "unit": holder.unit} if isinstance(holder, records.UnitHolder) else {"kind": "none"})
+            self.on_event("holder " + json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+            self.last_holder = reply.snapshot.holder
+        if not first and now < self.next_notice and not changed:
             return
-        elif now >= self.next_notice:
+        if now >= self.next_notice:
             self.next_notice = now + self.reply_seconds()
         self.last_reasons, self.last_need = reasons, reply.snapshot.peak.bytes
         snapshot = reply.snapshot

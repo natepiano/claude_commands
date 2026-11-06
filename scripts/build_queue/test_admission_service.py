@@ -270,6 +270,99 @@ class RunnerAuthorizationTests(unittest.TestCase):
             fixture.release(granted)
 
 
+class WaitHolderServiceTests(unittest.TestCase):
+    def test_the_wait_socket_receives_the_holder_from_the_grouped_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            for need, session, owner_run in ((5, "group", run), (5, "group", run), (8, "single", wire.NO_RUN)):
+                fixture.allow_next_start()
+                request = fixture.request(need=need * GIB, run=owner_run)
+                request = replace(request, identity=replace(request.identity, session_id=session, name=session))
+                with fixture.loop_turn():
+                    _ = only_admitted(fixture.server.handle_request(request))
+            fixture.allow_next_start()
+            fixture.free(4 * GIB)
+            request = fixture.request(need=20 * GIB)
+            with fixture.loop_turn():
+                peer = fixture.connect(request)
+                replies = peer.replies()
+                waits = [reply for reply in replies if isinstance(reply, wire.Wait)]
+                self.assertTrue(waits)
+                self.assertEqual(waits[-1].snapshot.holder, records.SessionHolder("group", "group"))
+                result = fixture.server.last_result
+                assert isinstance(result, gate.PassResult)
+                row = next(row for row in result.rows if row.owner == records.run_owner(
+                    request.owner.pid, request.owner.start_time))
+                self.assertEqual(waits[-1].snapshot.holder, row.holder)
+                self.assertEqual(wire.parse_reply(wire.encode_reply(waits[-1])), waits[-1])
+
+    def test_a_released_steps_held_slot_keeps_its_holder_identity(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = (fixture.proc.path / str(run.pid) / "environ").write_bytes(
+                b"CLAUDE_CODE_SESSION_ID=gap-session\0CLAUDE_SESSION_NAME=gap-worker\0")
+            fixture.allow_next_start()
+            request = fixture.request(need=12 * GIB, run=run)
+            request = replace(request, identity=replace(request.identity, session_id="gap-session", name="gap-worker"))
+            with fixture.loop_turn():
+                granted = only_admitted(fixture.server.handle_request(request))
+                fixture.allow_next_start()
+                fixture.release(granted)
+                self.assertFalse(fixture.server.reservations)
+            fixture.allow_next_start()
+            other = fixture.request(need=8 * GIB)
+            other = replace(other, identity=replace(other.identity, session_id="other", name="other"))
+            with fixture.loop_turn():
+                _ = only_admitted(fixture.server.handle_request(other))
+            fixture.allow_next_start()
+            fixture.free(4 * GIB)
+            with fixture.loop_turn():
+                peer = fixture.connect(fixture.request(need=20 * GIB))
+                waits = [reply for reply in peer.replies() if isinstance(reply, wire.Wait)]
+                self.assertTrue(waits)
+                self.assertEqual(waits[-1].snapshot.holder, records.SessionHolder("gap-session", "gap-worker"))
+
+    def test_a_released_unit_steps_held_slot_keeps_its_unit_without_a_session(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            fixture.allow_next_start()
+            request = fixture.request(need=12 * GIB, run=run)
+            request = replace(request, identity=replace(request.identity, session_id="", name="", unit="gap-unit"))
+            with fixture.loop_turn():
+                granted = only_admitted(fixture.server.handle_request(request))
+            fixture.restart()
+            with fixture.loop_turn():
+                fixture.allow_next_start()
+                fixture.release(granted)
+                self.assertFalse(fixture.server.reservations)
+            fixture.allow_next_start()
+            other = fixture.request(need=8 * GIB)
+            with fixture.loop_turn():
+                _ = only_admitted(fixture.server.handle_request(other))
+            fixture.allow_next_start()
+            fixture.free(4 * GIB)
+            with fixture.loop_turn():
+                peer = fixture.connect(fixture.request(need=20 * GIB))
+                waits = [reply for reply in peer.replies() if isinstance(reply, wire.Wait)]
+                self.assertTrue(waits)
+                self.assertEqual(waits[-1].snapshot.holder, records.UnitHolder("gap-unit"))
+
+    def test_a_unit_holder_reaches_the_wait_socket_without_a_session(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.allow_next_start()
+            request = fixture.request(need=12 * GIB)
+            request = replace(request, identity=replace(request.identity, session_id="", name="", unit="compile-unit"))
+            with fixture.loop_turn():
+                _ = only_admitted(fixture.server.handle_request(request))
+            fixture.allow_next_start()
+            fixture.free(4 * GIB)
+            with fixture.loop_turn():
+                peer = fixture.connect(fixture.request(need=20 * GIB))
+                waits = [reply for reply in peer.replies() if isinstance(reply, wire.Wait)]
+                self.assertTrue(waits)
+                self.assertEqual(waits[-1].snapshot.holder, records.UnitHolder("compile-unit"))
+
+
 class AdmissionCallerPersistenceTests(unittest.TestCase):
 
     def test_serving_rejects_direct_calls_without_loop_turn(self) -> None:

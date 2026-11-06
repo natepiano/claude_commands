@@ -1274,6 +1274,25 @@ def run_owner(pid: int, start_time: str) -> str:
 
 
 @dataclass(frozen=True)
+class SessionHolder:
+    session_id: str
+    session_name: str
+
+
+@dataclass(frozen=True)
+class UnitHolder:
+    unit: str
+
+
+@dataclass(frozen=True)
+class NoHolder:
+    pass
+
+
+WaitHolder = SessionHolder | UnitHolder | NoHolder
+
+
+@dataclass(frozen=True)
 class AdmissionWaitSnapshot:
     decision: AdmissionDecision
     peak: ExpectedPeak
@@ -1286,6 +1305,7 @@ class AdmissionWaitSnapshot:
     head_need: int = 0
     head_label: str = ""
     head_reason: WaitReason = ReadyForAdmission()
+    holder: WaitHolder = field(default_factory=NoHolder)
 
 
 def eligible_head_position(waiting: Sequence[WaitingStep]) -> int:

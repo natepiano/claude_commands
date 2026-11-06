@@ -315,21 +315,27 @@ only I can bump
 
 **Change-Review:** none — no behavior changes.
 
-### Phase 10h — A memory wait names what holds it  · status: todo
+### Phase 10h — A memory wait names what holds it  · status: done
 
-**Depends on:** 10z and 10x (it rewrites the admission client and service).
+#### As-built
 
-1. **The ask (verify-unit, 2026-11-04).** verify Phase 8 names the holder of a memory wait. verify-unit reads it; this phase sends it.
-2. **The event.** With `--wait-events`, `admission_client.py` prints `holder <json>` after `first`, and again only when the holder changes.
-3. **The JSON.** One tagged form: `{"kind":"session","session_id":…,"session_name":…}`, `{"kind":"unit","unit":…}` or `{"kind":"none"}`.
-4. **The holder.** A step that waits behind the protected waiter names that waiter, from the order hold the pass records. A continuation that asks for extra memory can stand before the ordinary first in line; then it is the protected waiter. The first in line, waiting for room, names the running run with the largest charge (use plus keep-aside), counted over grouped runs (`MemoryRoom.runs`) and held slots. Read the charge the pass records: `RunKeepAside.memory` holds 10k's look-ahead value, not a frozen need. CI use (`MemoryRoom.ci_use`, Phase 13) is in the cap, not in the room or the runs, so an unregistered CI job is never a holder.
-5. **Causes that name no holder.** Pressure, an unreadable reading, start spacing and estimate refresh name `{"kind":"none"}`, never an unrelated running run.
-6. **Recorded holder.** The pass picks a tagged holder and records it. Define the tagged holder beside `AdmissionWaitSnapshot` in `scripts/build_queue/admission_records.py:1267` (Phase 10o moved it from `memory_admit.py`; architect review of 15 and 10o, 2026-11-06). `AdmissionWaitSnapshot` holds only running steps today, so the holder is a new tagged field. `AdmissionWaitSnapshot` goes to the client on the wire (`Wait.snapshot`, `admission_protocol.py:174`), and `queue.json` version 5 covers only `QueueInputs` and policy (`queue_snapshot.py:28`), so a disk version does not protect a waiting client. The holder is a defaulted field, as `MemoryRoom.ci_use` is: a reply from a service that has not restarted decodes as `{"kind":"none"}`. Tests: a new client reads a reply with no holder field; a client from the installed code keeps its wait through a reply with the field, and the notice names what a running waiter does at the service restart. When `QueueInputs` also changes shape, raise the `queue.json` version; an old version reads as `NoQueueSnapshot` until the next pass, so it needs no conversion program.
-7. **Proof.** Client and service tests for each kind, for grouped reservations and held slots, for each no-holder cause and for no repeat on an unchanged holder. verify-unit builds the reader in verify.sh.
-8. **Holder from the counted use (architect review of 10s, 2026-11-05).** Pick the holder from the recorded `MemoryRoom.runs`, which carry the use `run_memories` attributes (`memory_admit.py:1835`: a shared process counts once), never from raw reservation readings. A run whose `RunKeepAside.memory.use` is unavailable is charged its full keep-aside, the same rule the room uses; never count it as zero use. That state is not an unreadable host or pressure reading, which names `{"kind":"none"}`. Tests: overlapping process trees in both reservation orders give the same holder; a run with unavailable use and the largest full keep-aside is the holder.
-9. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:420` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
+- `AdmissionWaitSnapshot.holder` is a `WaitHolder` in `scripts/build_queue/admission_records.py`: `SessionHolder(session_id, session_name)`, `UnitHolder(unit)` or `NoHolder()`. The field has a default, so a reply from an older service decodes as `{"kind":"none"}`.
+- `admission_wait_holder(decision, reason, inputs, room)` in `scripts/lint/memory_admit.py` names the recorded order hold, else the largest grouped charge over `MemoryRoom.runs`. The charge is `RunKeepAside.memory` plus anonymous use, with the full charge for unavailable use. A tie breaks on the owner key. Session identity wins over unit.
+- A wait has no holder for pressure, an unreadable reading, start spacing, an estimate refresh or an admitted row. Unregistered CI use is never a holder.
+- `wire.RunPlace.unit` (default empty) keeps a run's unit, so a held slot names that unit after its reservation ends. An older stored row reads as no unit, with no conversion.
+- `WaitOutput.last_holder` in `scripts/build_queue/admission_client.py` emits `holder <json>` after `first` and at each change, before notice throttling.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `admission_client.py`, `admission_service.py`, `admission_records.py`, `admission_protocol.py`, the pass record in `memory_admit.py`; `test` owns their tests.
+**Files:**
+- `scripts/build_queue/admission_records.py` — the holder types
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — `PassRow.holder`, `wait_holder_identity`, `admission_wait_holder`
+- `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_client.py` and their tests
+- `docs/as-built/build-memory-admission.md` — the holder JSON and the held-slot rule
+
+**Binds later work:** the verify wait display reads the `holder` event. A new `StepMemory` kind or a new required snapshot field stops a waiting client from older code at the next service restart, so the notice names it. A `RunPlace` change is a stored record change.
+
+**Gotchas:** a held slot does not survive a service restart. The installed client decoder refuses a new memory kind with `invalid snapshot variant`. A client keeps its loaded code and emits no holder event until it restarts. The holder is computed for each waiter on each pass.
+
+**Ruled out:** a permanent test against the previous revision, because `git show HEAD` compares new code with new code after a commit; a `queue.json` version raise.
 
 ### Phase 10k — Rust runs and merge gates keep aside memory by percent done  · status: done
 

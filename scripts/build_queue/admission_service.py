@@ -31,7 +31,7 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_snapshot
-from scripts.build_queue.admission_records import reason_phrase
+from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 
@@ -824,7 +824,7 @@ class AdmissionServer:
         run = request.run
         key = gate.run_owner(run.pid, run.start_time)
         if key not in self.run_places and self._run_alive(run):
-            self.run_places[key] = wire.RunPlace(run, place.since, request.owner)
+            self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
 
     def _live(self, owner: wire.Owner) -> bool:
         return self.proc.owner_start(owner.pid) == LiveOwnerIdentity(owner.start_time)
@@ -958,7 +958,7 @@ class AdmissionServer:
             memory = gate.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
                                              pid=run.pid, activity=replace(evidence, run=live))
             between.append(gate.RunningStep(evidence.session_id, evidence.session_name, "between steps",
-                                           evidence.folder, 0, memory, live, live.started_at, pid=run.pid))
+                                           evidence.folder, 0, memory, live, live.started_at, pid=run.pid, unit=place.unit))
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
         return self._progress_inputs(self._inputs_with_current_slots(inputs), processes, policy)
@@ -1148,7 +1148,7 @@ class AdmissionServer:
                 waiting = self.waiters[episode]
                 reason = decision.reason
                 reply = wire.Wait(reason, position, head, reason_phrase(reason, waiting_steps),
-                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason))
+                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder))
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
@@ -1191,14 +1191,14 @@ class AdmissionServer:
 
     def _wait_snapshot(self, waiting: WaitingAdmission, decision: gate.AdmissionDecision,
                        inputs: gate.QueueInputs, config: gate.MemoryConfig,
-                       reason: gate.WaitReason) -> gate.AdmissionWaitSnapshot:
+                       reason: gate.WaitReason, holder: WaitHolder) -> AdmissionWaitSnapshot:
         head = gate.first_queued_waiter(row for _, row in inputs.ordered)
         head_need = head.waiter["need"] if isinstance(head, gate.QueuedWaiter) else 0
         head_label = head.waiter.get("session_name", "") if isinstance(head, gate.QueuedWaiter) else ""
-        return gate.AdmissionWaitSnapshot(decision, waiting.request.profile.peak, inputs.running,
+        return AdmissionWaitSnapshot(decision, waiting.request.profile.peak, inputs.running,
             inputs.host.available if isinstance(inputs.host, gate.HostMemory) else 0,
             waiting.request.profile.repo, waiting.request.profile.step, config.policy, config.diagnostics,
-            head_need if not isinstance(decision.order_hold, gate.NoOrderHold) else 0, head_label, reason)
+            head_need if not isinstance(decision.order_hold, gate.NoOrderHold) else 0, head_label, reason, holder)
 
     def _drain_lifecycle(self) -> None:
         """Publish saved lifecycle facts after each durable state transition."""

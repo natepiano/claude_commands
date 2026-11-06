@@ -55,6 +55,7 @@ class RunPlace:
     run: RunIdentity
     since: float
     first_owner: Owner
+    unit: str = ""
 
 
 @dataclass(frozen=True)

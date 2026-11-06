@@ -6,6 +6,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 import errno
 import io
+import json
 import os
 import shlex
 import subprocess
@@ -91,6 +92,50 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual((release.reservation, release.status), (granted.reservation, 137))
             self.assertEqual(transport.timeouts[-1], 7)
             self.assertNotIn("step stopped", output.getvalue())
+
+    def test_wait_events_name_each_holder_change_without_repeating_an_unchanged_holder(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            holders: tuple[records.WaitHolder, ...] = (
+                records.SessionHolder("first-id", "first-name"),
+                records.SessionHolder("first-id", "first-name"),
+                records.SessionHolder("second-id", "second-name"),
+                records.UnitHolder("compiler"), records.NoHolder())
+            waits = [replace(WAIT, snapshot=replace(WAIT.snapshot, holder=holder)) for holder in holders]
+            interval = records.read_memory_config(report=False).wait_reply_seconds
+            events = [TimedChunk(interval + 1, reply_bytes(waits[1])),
+                      *(reply_bytes(wait) for wait in waits[2:]), reply_bytes(GRANTED)]
+            transport = self.use_transport(fixture, Exchange(reply_bytes(waits[0]), *events))
+            with mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                    request.profile, step_estimator.ReusableEstimate())), \
+                 redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()) as output:
+                status = client.main(["admit", "--pid", str(request.owner.pid), "--wait-events", "--", "cargo", "check"])
+            self.assertEqual(status, 0)
+            lines = output.getvalue().splitlines()
+            self.assertEqual((lines[0], lines[-1]), ("first", "done"))
+            self.assertTrue(all(line.startswith("holder ") for line in lines[1:-1]))
+            self.assertEqual([json.loads(line.removeprefix("holder ")) for line in lines[1:-1]], [
+                {"kind": "session", "session_id": "first-id", "session_name": "first-name"},
+                {"kind": "session", "session_id": "second-id", "session_name": "second-name"},
+                {"kind": "unit", "unit": "compiler"}, {"kind": "none"}])
+            self.assertEqual(len(transport.requests), 1)
+
+    def test_a_wait_reply_without_a_holder_keeps_the_wait_and_reports_no_holder(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            record = cast(dict[str, object], json.loads(wire.encode_reply(WAIT)))
+            data_record = cast(dict[str, object], record["data"])
+            snapshot = cast(dict[str, object], data_record["snapshot"])
+            del snapshot["holder"]
+            data = (json.dumps(record) + "\n").encode()
+            transport = self.use_transport(fixture, Exchange(data, reply_bytes(GRANTED)))
+            with mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                    request.profile, step_estimator.ReusableEstimate())), \
+                 redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()) as output:
+                status = client.main(["admit", "--pid", str(request.owner.pid), "--wait-events", "--", "cargo", "check"])
+            self.assertEqual(status, 0)
+            self.assertEqual(output.getvalue().splitlines(), ["first", 'holder {"kind":"none"}', "done"])
+            self.assertEqual(len(transport.requests), 1)
 
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1240,7 +1285,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual((first.run, second.run), (run, run))
             self.assertEqual((first.owner, first.episode, first.since),
                              (second.owner, second.episode, second.since))
-            self.assertEqual(output.getvalue().splitlines(), ["first", "done"])
+            self.assertEqual(output.getvalue().splitlines(), ["first", 'holder {"kind":"none"}', "done"])
 
     def test_missing_or_malformed_run_keeps_the_step_identity_and_admits(self) -> None:
         for value in (None, "", "missing", "42", "0:123", "-4:123", "abc:123", "42:", "42:abc", "42:1:2"):
