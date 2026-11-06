@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import NamedTuple, final
+from typing import Literal, NamedTuple, final
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -27,6 +27,29 @@ class RegistryRow(NamedTuple):
     key: str
     value: str
     line: str
+
+
+class LaunchSettings(NamedTuple):
+    kind: Literal["claude", "codex"]
+    model: str
+    effort: str
+    service_tier: str
+
+
+def launch_settings(section: str, key: str) -> LaunchSettings:
+    """Read launch settings through the existing shell resolver."""
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1" && agents_resolve "$2.$3" && '
+         + 'printf "%s\\n%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "$AGENT_SERVICE_TIER"',
+         "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key],
+        text=True, capture_output=True, check=False, env={**os.environ, "MODELS_CONFIG_TIER_ONLY": "1"})
+    values = result.stdout.splitlines()
+    kind = values[0] if values else ""
+    if result.returncode or len(values) != 4 or kind not in ("claude", "codex") or not values[1]:
+        raise ValueError(result.stderr.strip() or f"invalid launch settings for {section}.{key}")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return LaunchSettings(kind, values[1], values[2], values[3])
 
 
 class RowChange(NamedTuple):

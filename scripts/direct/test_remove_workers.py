@@ -84,8 +84,11 @@ class RemoveWorkersTest(unittest.TestCase):
             parent = staff.update_current_session(parent.current_session, staff.native_id(orchestrator))
             _ = (selected / "active" / orchestrator).write_text(f"{run}\n", encoding="utf-8")
         _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "cleanup", "unit": name}))
+        roster: dict[str, object] = {}
         for worker in workers:
-            _ = fixture_worker("worker-" + worker, parent.id, runtime_id=fixture_runtime_id(worker + "-full"))
+            member = fixture_worker("worker-" + worker, parent.id, runtime_id=fixture_runtime_id(worker + "-full"))
+            roster[member.name] = {"staff_id": member.id}
+        _ = (run / "mesh_roster.json").write_text(json.dumps(roster))
         return run
 
     def list_rows(self, rows: list[remove_workers.AgentRow]) -> None:
@@ -161,6 +164,63 @@ class RemoveWorkersTest(unittest.TestCase):
     def remove_workers(self, session_dir: Path | list[Path] | None = None, caller: str = "") -> tuple[int, list[str]]:
         result, removed = self.run_remove_workers(session_dir, caller)
         return result.returncode, sorted(removed)
+
+    def test_herdr_removal_retains_a_worker_without_proved_pane_evidence(self) -> None:
+        run = self.run_dir("pane-unknown", ["first"], orchestrator=ORCHESTRATOR)
+        _ = (run / "worker_transport").write_text("herdr\n")
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": ORCHESTRATOR, "HERDR_BIN": "/nonexistent/herdr"}):
+            result, removed = self.run_remove_workers(run)
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual(removed, [])
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertIn("/nonexistent/herdr", result.stderr)
+
+    def test_sweep_keeps_pane_workers_out_of_claude_removal(self) -> None:
+        run = self.run_dir("pane-ended", ["first"])
+        _ = (run / "worker_transport").write_text("herdr\n")
+        self.list_rows([row("first", "worker-first")])
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        result, removed = self.run_remove_workers()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(removed, [])
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertIn("pane worker retained", result.stderr)
+
+    def test_workers_of_one_parent_use_their_own_runs_removal_transport(self) -> None:
+        pane_run = self.run_dir("pane-run", ["pane"], orchestrator=ORCHESTRATOR)
+        mesh_run = self.run_dir("mesh-run", ["mesh"])
+        parent = unit_membership("cleanup", "pane-run")
+        pane_worker = next(member for member in staff.local_snapshot().find(kind="worker") if member.name == "worker-pane")
+        mesh_worker = next(member for member in staff.local_snapshot().find(kind="worker") if member.name == "worker-mesh")
+        mesh_worker = staff.move(mesh_worker.id, staff.ReportsTo(parent.id))
+        _ = (mesh_run / "progress_history_state.json").write_text(json.dumps({"production": "cleanup", "unit": "pane-run"}))
+        _ = (pane_run / "worker_transport").write_text("herdr\n")
+        _ = (mesh_run / "worker_transport").write_text("mesh\n")
+        _ = (pane_run / "progress_history_state.json").write_text(json.dumps({
+            "production": "cleanup", "unit": "pane-run", "pass": {"impl": {
+                "instance_id": "pane-dispatch", "worker_name": pane_worker.name,
+            }},
+        }))
+        (pane_run / "mesh_roster.json").unlink()
+        self.list_rows([row("pane", pane_worker.name), row("mesh", mesh_worker.name)])
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": ORCHESTRATOR, "HERDR_BIN": "/nonexistent/herdr"}):
+            result, removed = self.run_remove_workers([pane_run, mesh_run])
+        self.assertEqual((result.returncode, removed), (8, ["mesh"]), result.stdout + result.stderr)
+        self.assertIn("/nonexistent/herdr", result.stderr)
+        self.assertNotIn("pane worker retained", result.stderr)
+        self.assertEqual(staff.by_id(pane_worker.id), pane_worker)
+        self.assertIsNone(staff.by_id(mesh_worker.id))
+
+    def test_pane_removal_cannot_select_another_native_callers_workers(self) -> None:
+        run = self.run_dir("pane-other", ["first"])
+        _ = (run / "worker_transport").write_text("herdr\n")
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        result, removed = self.run_remove_workers(run)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(removed, [])
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertIn("does not belong to the native caller", result.stderr)
 
     def test_retirement_retries_after_the_staff_publication_is_interrupted(self) -> None:
         fixture = StaffTestCase()

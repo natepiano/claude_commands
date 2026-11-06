@@ -646,6 +646,13 @@ read_metadata() {
     fi
 }
 
+set_gate_metadata() {
+    export BUILDLOG_OUTPUT_ROOTS=""
+    GATE_METADATA="$(cargo metadata --no-deps --format-version 1)" || { GATE_METADATA=""; return 1; }
+    BUILDLOG_OUTPUT_ROOTS="$("$PY" "$VERIFY_START_DIR/../buildlog/step_context.py" output-roots \
+        <<< "$GATE_METADATA" 2>/dev/null)" || BUILDLOG_OUTPUT_ROOTS=""
+}
+
 # Read the metadata once. Later requests use the shell values.
 # Validate dev features before Cargo. Find changed members after mend.
 METADATA_READY=0
@@ -700,7 +707,7 @@ load_metadata() {
             if [[ "$valid" == 1 ]]; then requests+=("build-targets:$package:$kind:$name"); fi
             ;;
     esac
-    GATE_METADATA="$(read_metadata)" || exit 2
+    if [[ -z "${GATE_METADATA:-}" ]]; then set_gate_metadata || exit 2; fi
     values="$("$PY" "$VERIFY_METADATA_SCRIPT" "${requests[@]}" <<< "$GATE_METADATA")" || exit 2
     eval "$values"
     METADATA_READY=1
@@ -2674,6 +2681,7 @@ finish_run() {
 # Checked before the cache lookup and any build, so a recorded pass never
 # stands in for the rule that examples carry no tests.
 GATE_METADATA=""
+export BUILDLOG_OUTPUT_ROOTS=""
 CHECK_UNTESTED_EXAMPLES=0
 if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
     || ( ${#ARGS[@]} -eq 3 && "${ARGS[1]}" == --features ) ) ) ]]; then
@@ -2687,7 +2695,7 @@ if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
 fi
 # A test record's key reads the package's dependencies from it (tree_key).
 if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
-    GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
+    set_gate_metadata 2>/dev/null || true
 fi
 
 HOLD_WAIT_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"

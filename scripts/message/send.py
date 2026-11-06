@@ -27,8 +27,10 @@ removed, so it never passes for the session that ran this. Its relay
 name is separate from the sender, who is named in the message. Delivery is read from the
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
-`worker:` addresses queue through codex_mesh.py; `codex:` addresses queue through
-the shared Codex daemon. One staff snapshot selects each staff recipient.
+Staff `worker:` paths deliver through observed panes or their holders.
+Mesh `worker:` addresses keep their existing queues.
+`codex:` addresses queue through the shared Codex daemon.
+One staff snapshot selects each staff recipient.
 Unit names accept the optional `-unit` suffix. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
 A non-staff name uses a unique live roster session, locally before the peer.
@@ -137,7 +139,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
-from scripts.lib import conf
+from scripts.lib import conf, unit_runs
 from scripts.notify import decision_priority
 from scripts.message import send_budget
 from scripts.message.send_result import (
@@ -539,6 +541,10 @@ class Result(NamedTuple):
     receiver: str = ""
 
 
+class PaneTextDelivered(Result):
+    """The observed worker pane accepted the text input."""
+
+
 @dataclass(frozen=True)
 class NoClaudeRoute:
     pass
@@ -594,6 +600,11 @@ class CodexSessionRecipient:
     daemon: codex_daemon.CodexDaemon
 
 
+@dataclass(frozen=True)
+class PaneWorkerRecipient:
+    row: staff.StaffRow
+
+
 SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient
 
 
@@ -633,7 +644,7 @@ class TransportQueueOwner:
 TRANSPORT_QUEUE_OWNER = TransportQueueOwner()
 
 
-DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
+DeliveryRoute = SessionRecipient | PaneWorkerRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
 
 
 @dataclass(frozen=True)
@@ -1761,6 +1772,20 @@ def resolve_staff_recipient(
                     reference = entry.thread.thread_id
                 elif isinstance(entry.session, roster.ClaudeSession):
                     reference = entry.session.session_id
+        if reference == target:
+            path = target.removeprefix("worker:")
+            if len(path.split("/")) == 2:
+                sender = roster.sender_identity(os.environ)
+                identity = (sender.thread_id if isinstance(sender, roster.CodexThread)
+                            else sender.session_id if isinstance(sender, roster.ClaudeSession) else "")
+                ancestor = membership.by_current_session(identity)
+                while ancestor is not None and ancestor.kind != "showrunner":
+                    ancestor = membership.parent_of(ancestor)
+                if ancestor is not None and path.split("/", 1)[0] != ancestor.name:
+                    path = f"{ancestor.name}/{path}"
+            member = membership.by_path(path)
+            if member is not None and member.kind == "worker":
+                return member
     if target.startswith("uds:"):
         record = next((record for record in records
                        if f"uds:{record['messagingSocketPath']}" == target), None)
@@ -1897,6 +1922,17 @@ def resolve_recipient(
         member = resolve_staff_recipient(to, membership, observed=observed.entries)
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
+        if (not isinstance(scope, NamedMachine) and to.startswith("worker:")
+                and isinstance(member, staff.StaffRow) and member.kind == "worker"):
+            from scripts.herdr import worker_panes
+
+            holder = membership.parent_of(member)
+            if holder is not None:
+                run = worker_panes.worker_run(holder)
+                if unit_runs.worker_transport(run) == "herdr":
+                    return PaneWorkerRecipient(member)
+                if not _sender_label_matches(to, observed.entries):
+                    return CodexWorkerRecipient(to, member.name, str(run))
         if isinstance(member, staff.StaffRow):
             for anomaly in observed.row_anomalies:
                 if anomaly.row.id == member.id:
@@ -2866,17 +2902,54 @@ def delivered_text(message: Message, entry_id: str) -> str:
 
 
 def send(options: Options) -> Result:
+    try:
+        membership = (staff.snapshot() if options.to != USER and isinstance(options.selection, RosterLookup)
+                      else staff.StaffSnapshot(()))
+    except staff.StaffUnreadable as error:
+        usage_error(f"staff lookup for {options.to!r}: {error}")
     if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
-        return _send(options)
+        return _send(options, membership=membership)
     identity = Message(options.recipient_identity.name, options.sender or default_sender(),
                        options.summary or "", "", options.key)
     with delivery_turn(identity) as acquired:
         if not acquired:
             return Result("retry", f"key {options.key!r} has a delivery in progress; retry")
-        return _send(options)
+        return _send(options, membership=membership)
 
 
-def _send(options: Options) -> Result:
+def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
+                        sender: str, timeout: float, reason: str = "") -> Result:
+    """Deliver to a proved pane or retain the message through its holder."""
+    from scripts.herdr import worker_panes
+    import herdr
+
+    holder = membership.parent_of(worker)
+    if holder is None:
+        return Result("failed", f"{worker.name}: worker holder is unavailable")
+    if not reason:
+        state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
+        if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
+            try:
+                herdr.Herdr(herdr.shared_session()).prompt(state.pane, text, target=str(worker.current_session))
+                return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
+            except (herdr.HerdrFailure, OSError) as error:
+                reason = str(error)
+        elif state is None:
+            reason = "worker observation is unavailable"
+        elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+            reason = state.reason
+        elif isinstance(state, worker_panes.OpenWorker):
+            reason = "worker is blocked"
+        elif isinstance(state, worker_panes.StoppedWorker):
+            reason = "worker is stopped"
+        else:
+            reason = "worker pane is closed"
+    options = parse(["--here", "--to", f"session:{holder.current_session}", "--from", sender,
+                     "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"])
+    return _send(options, membership=membership)
+
+
+def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     import roster
 
     if options.to == USER and not options.text_id:
@@ -2890,11 +2963,6 @@ def _send(options: Options) -> Result:
         usage_error("the message is empty")
     first = next(iter(text.strip().splitlines()), options.summary or "")
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
-    try:
-        membership = (staff.snapshot() if options.to != USER and isinstance(options.selection, RosterLookup)
-                      else staff.StaffSnapshot(()))
-    except staff.StaffUnreadable as error:
-        usage_error(f"staff lookup for {options.to!r}: {error}")
     # A forwarded display is authoritative; only recipient lookup may read the receiver's roster.
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
@@ -2999,6 +3067,9 @@ def _send(options: Options) -> Result:
         result = codex(transport, route.session_dir, options.timeout)
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
+    elif isinstance(route, PaneWorkerRecipient):
+        result = deliver_worker_text(route.row, membership, agent_text(message),
+                                     sender=message.sender, timeout=options.timeout)
     else:
         claude_started = time.monotonic()
         def relay_and_queue(relay_message: Message, timeout: float) -> Result:

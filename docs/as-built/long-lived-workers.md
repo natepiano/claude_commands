@@ -1,6 +1,6 @@
 # Long-lived Codex workers and held Astra roles
 
-Code reviewers belong to the unit ledger. `assign.sh --role review` resumes
+Codex code reviewers belong to the unit ledger. `assign.sh --role review` resumes
 `<worktree>-review`; concurrent work uses `<worktree>-review2`. Both are
 read-only and persist across phases and plans. The fresh Claude helper in
 `<UXReview/>` remains the design check.
@@ -8,15 +8,17 @@ read-only and persist across phases and plans. The fresh Claude helper in
 ## What it is
 
 A unit keeps its worker threads across phases and plans. `assign.sh` selects
-an idle worker by role, resumes it, and claims it for the dispatch. Code review
-uses the unit's read-only `review` workers. Writers keep their writing roles.
+an idle worker by role, resumes it, and claims it for the dispatch.
+Codex code review uses the unit's read-only `review` workers.
+The [simplify lens](simplify-lens.md) uses a fresh Claude review.
+Writers keep their writing roles.
 Each follow compacts when the recorded context exceeds the configured limit.
 Phase cleanup ends turns and keeps threads. Unit pause, move and end use the
 worker ledger. Usage reports compare checkpointed phases through the usage store.
 
 ## Unit code reviewers
 
-Code reviewers use the ordinary unit worker ledger. Resolution reuses an idle
+Codex code reviewers use the ordinary unit worker ledger. Resolution reuses an idle
 reviewer and registers a roster-only reviewer in the ledger without changing its
 thread. A concurrent review uses `review2`.
 
@@ -128,8 +130,8 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 - It reads the threshold from `config/direct.conf` (`UNIT_CONFIG` can override the path). A missing, non-numeric or non-positive value exits 2 with an error naming the key.
 - A worker assigned a different role keeps its slot as the 9th argument and changes only the task and pass-kind words.
 
-**Code review dispatch.** Use `assign.sh --role review --session-dir <run>
---phase <phase> --prompt <file> --cwd <worktree>`. Each broad-review lens has
+**Codex code review dispatch.** Use `assign.sh --role review --session-dir <run>
+--phase <phase> --prompt <file> --cwd <worktree>`. Each Codex broad-review lens has
 its own dispatch; closure review omits the lens.
 Each artifact uses the worker name: `<worker>_status`, `<worker>_summary.txt`,
 `<worker>_agent.log`, and `<worker>_reply.txt`.
@@ -170,7 +172,7 @@ After the turn `review_tree.py changes` checks every path that was dirty before 
 
 The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/dual_review.md` (`<TeamReview/>` and `<ReviewPromptContract/>`), `docs/direct/run_phase_review.md`, `docs/direct/write_prompt_contract.md` (`<RoleReassignment/>`) and `commands/plan/phase_review.md`:
 
-- Each lens dispatches the unit's own read-only reviewer with `assign.sh --role
+- Each Codex lens dispatches the unit's own read-only reviewer with `assign.sh --role
   review`. The allocator reuses a thread before opening the next concurrent slot.
 - Only the adversary lens starts early. Keep its dispatch handle and selected
   slot for Stage 2 and cancellation. Closure review uses the same role without
@@ -300,7 +302,7 @@ See `unit-rename.md`.
 - **Open once.** Before this design, each phase opened new `impl` and `test` threads and every review was a new thread, so every task paid a worker's startup cost. A worker that stays open pays that cost once per run.
 - **Compact between tasks.** Startup turned out to be a small share of usage. Over 1,437 natedev threads, usage before the first edit was 19% of uncached input, 4% of cached input and 10% of output: about 6% of weighted usage. Most usage is cached context that long threads read again on every call. A long-lived worker saves its startup but carries its context, so frequent compaction is what keeps the saving.
 - **Codex workers only.** The cost being addressed is Codex worker startup. Claude workers are the fallback family and keep their existing lifecycle.
-- **Read-only unit reviewers.** Code review uses the unit's own role and read-only sandbox. Writers keep their roles. The fresh Claude helper remains the design check.
+- **Read-only unit reviewers.** Codex code review uses the unit's own role and read-only sandbox. Writers keep their roles. The fresh Claude design check and [simplify lens](simplify-lens.md) use separate launches.
 - **Verdict per checkpointed phase.** The amount of work changes from day to day, so usage per day would not compare the two windows. Account switches are too rare for a verdict: the baseline had 2 in about five days, too few to show a change within a week. They are reported alongside the verdict.
 - **Hyphens refused in `--slot`.** `--to` derives the slot from the worker name, so refusing hyphens is simpler than resolving a hyphenated slot from its recorded identity.
 - **Second-overflow error kept.** It stops a worker that fills its context again and again without doing work, so press-on cannot loop forever.
