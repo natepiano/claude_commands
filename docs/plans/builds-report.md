@@ -695,3 +695,44 @@ A good vault sync closes the question that its outage filed, through the public 
 - A retry of a failed withdraw: an answered question would retry for ever.
 - A withdraw on a deferral: a deferral is not a good sync.
 - A migration: the live state had no outage and no open hanadocs question.
+
+### Phase 32 — One shared helper merges overlapping time spans  · status: done
+**Depends on:** none
+
+From the builds showrunner (not the user), 2026-11-05: one shared interval-union helper; "You own holds.py and costs.py; history.py is sdlc's, so name its owner in the notice and switch all three callers." It accepted the form: plain float pairs, no key.
+
+#### Work Order
+
+**Goal:** One function merges overlapping time spans. `holds.py`, `costs.py`, `history.py` and `progress_history.py` call it and keep no merge loop of their own. Behavior does not change.
+
+**Spec:**
+- New module `scripts/lib/intervals.py` with two public functions:
+  - `merged_spans(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]` returns the spans sorted by start, with each span that overlaps or touches the one before it merged into that one. No spans give an empty list.
+  - `union_seconds(spans: Iterable[tuple[float, float]]) -> float` returns the sum of `end - start` over `merged_spans(spans)`.
+- `scripts/buildlog/holds.py`: delete its `union_seconds`. `hold_duration` passes each span as whole microseconds from the requested start, because float timestamps lose precision, and converts the shared `union_seconds` result back through `timedelta`. `HoldDuration` keeps its form.
+- `scripts/buildlog/costs.py` `source_coverage`: group the coverage by machine, call `merged_spans` for each machine, and build the `IndexedSourceCoverage` rows from the result. The returned order stays machine, then start.
+- `scripts/history/history.py` `_elapsed_union`: keep the function, its docstring and its `started_at > 0` filter. It maps the rows to `(started_at, started_at + seconds)` pairs and returns the shared `union_seconds`. Keep the file's `from scripts.lib...` import form.
+- `scripts/direct/progress_history.py` `_work_seconds`: walk `merged_spans(windows)`. The idle grace and the wall-clock branch stay.
+- `holds.py` and `costs.py` import the module in the form that each file's other shared imports use.
+
+**Files:**
+- `scripts/lib/intervals.py` — new; the helper.
+- `scripts/lib/test_intervals.py` — new; the helper's tests.
+- `scripts/buildlog/holds.py` — calls the helper; its loop is gone.
+- `scripts/buildlog/test_holds.py` — pins fractional hold seconds to a full minute.
+- `scripts/buildlog/costs.py` — calls the helper; its loop is gone.
+- `scripts/history/history.py` — calls the helper; its loop is gone. Owner: sdlc.
+- `scripts/direct/progress_history.py` — calls the helper; its loop is gone. Owner: sdlc.
+
+**Workers:** 1 writer — `rowcpu` owns all files; nothing splits.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 26 keeps `source_coverage` when it deletes the `buildlog costs` output, so this change stays.
+
+**Acceptance gate:**
+- `scripts/lib/test_intervals.py` proves these cases through `merged_spans` and `union_seconds`: no spans, spans out of order, overlapping spans, a span inside another, touching spans, and spans with a gap.
+- `scripts/buildlog/test_holds.py`, `test_costs.py`, `scripts/history/test_rounds.py`, `test_routed.py` and `scripts/direct/test_progress_history.py` pass with no assertion changed.
+- Holds at second offsets [0,20.1], [30,50.1], [60,79.8] total 60.0 seconds and read `0:01`.
+- A search of the four caller files finds no merge loop.
+- `basedpyright` on the changed Python files: 0 errors, 0 warnings, 0 notes.

@@ -31,6 +31,7 @@ from scripts.direct import phase_reservation, plan_history, recorder_state  # no
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs  # noqa: E402
+from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import production_doc, session_staff, showrunners, staff, unit_config  # noqa: E402
@@ -2397,12 +2398,9 @@ def _work_seconds(
         # History with no windows says nothing about idleness, so the wall clock stands.
         return max(0, int(until - started_at))
     work, idle_from = 0.0, started_at
-    for start, end in sorted(windows):
-        if start > idle_from:
-            work += min(start - idle_from, IDLE_GRACE_SECONDS)
-        if end > idle_from:
-            work += end - max(start, idle_from)
-            idle_from = end
+    for start, end in merged_spans(windows):
+        work += min(start - idle_from, IDLE_GRACE_SECONDS) + end - start
+        idle_from = end
     if until > idle_from:
         work += min(until - idle_from, IDLE_GRACE_SECONDS)
     return int(work)
