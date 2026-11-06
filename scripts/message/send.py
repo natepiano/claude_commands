@@ -3037,8 +3037,11 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
     needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
-    running = (sessions.running_sessions() if needs_recipient_roster or needs_sender_roster
-               or (options.to != USER and isinstance(options.selection, RosterLookup)) else [])
+    reads_registry = (needs_recipient_roster or needs_sender_roster
+                      or (options.to != USER and isinstance(options.selection, RosterLookup)))
+    running = sessions.running_sessions() if reads_registry else []
+    if reads_registry:
+        membership = replace(membership, running_sessions=frozenset(record["sessionId"] for record in running))
     observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, records=running) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
     records = [record for record in running if sessions.messaging_socket_exists(record)]

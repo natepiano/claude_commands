@@ -570,12 +570,17 @@ class RosterTests(unittest.TestCase):
     def test_keyed_send_reuses_roster_registry_before_delivery(self) -> None:
         state = self.root / "message"
         state.mkdir()
+        unit = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
+        _ = fixture_worker("impl2", unit.id)
         identity = "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"
         registered = sessions.addressed(f"session:{identity}", sessions.live_sessions())
         assert registered is not None
         started = send.now()
         targets = ("free-claude", f"session:{identity}", f"uds:{registered['messagingSocketPath']}")
+        from scripts.message import sessions as runtime_sessions
+
         for target in targets:
+            registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
                 _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {target: started.isoformat()}}}))
                 options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
@@ -583,7 +588,8 @@ class RosterTests(unittest.TestCase):
                 with (mock.patch.object(send, "STATE", state),
                       mock.patch.object(send, "now", return_value=started),
                       mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
-                      mock.patch.object(sessions, "read_registry", wraps=sessions.read_registry) as registry,
+                      mock.patch.object(sessions, "read_registry", registry),
+                      mock.patch.object(runtime_sessions, "read_registry", registry),
                       mock.patch.object(send, "relay", return_value=send.Result("sent", "fixture")) as relay):
                     self.assertEqual(send.send(options).outcome, "skipped")
                 registry.assert_called_once_with()

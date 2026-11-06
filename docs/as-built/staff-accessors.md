@@ -22,6 +22,7 @@ The fixed `id` identifies a member across session changes.
 `CodexBackend.family` is `codex`; its `codex_home` names the serving account.
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
+A caller that already read the session registry sets `StaffSnapshot.running_sessions`, and `backends` then reads no registry.
 Staff storage uses schema 2.
 `staff_sources.live` emits observations with schema 3.
 `WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
