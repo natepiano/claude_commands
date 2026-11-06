@@ -146,6 +146,18 @@ A deleted or renamed Python file, a graph/read error, a change under `scripts/li
 It uses the production's standing checkout through `copies.standing(owner, repo, commit)`.
 It runs all test modules and basedpyright over `NIGHTLY_TYPE_DIRS`, which names `scripts` and includes hooks.
 The 03:00 timer calls this path.
+Each exit sends `nightly.result`, or `nightly.not_run` when the checks could not start.
+The result names the branch, finish time, type result and full test result.
+The failure text names the reason on one line within the message limit.
+Both pushes use need `note` and the key `nightly-result`.
+The result requires no action. The failure text includes an action.
+The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+Silence keeps only the newest push on that key and delivers it when silence ends.
+The gate reads `nightly_result_push` and `nightly_result_modules` from `config/merge_gate.conf` at use.
+`nightly_result_push=off` disables both texts. The default is `on`.
+`nightly_result_modules=8` limits the failed test modules named before `and N more`.
+A push failure does not change the gate result, marker or showrunner notice.
+A run that never reaches merge_gate.py sends no push unless the timer script sends one.
 The checkout retains its ignored build files and holds the copies busy lock during the run.
 The caller's local branches, HEAD and edits stay unchanged.
 Git disables terminal credential prompts and uses SSH batch mode.
@@ -169,7 +181,8 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
 - **Shared admission.** After the build hold ends, `gate_reservation` obtains one `merge-gate` reservation through `queue_place`.
   It reads `program_first_peak_gib.merge-gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
   The gate uses the first peak as its full need.
-  A matching anonymous profile uses the progress window after admission.
+  A matching anonymous profile uses the first pass's progress window after admission.
+  Reruns publish no progress counter and keep the full need.
   A missing or legacy profile keeps the full need.
   A wait keeps its gate identity and queue place.
   An admission error refuses the gate with its last reason line.
