@@ -30,7 +30,7 @@ from scripts.message import sessions
 import sessions as stop_sessions
 from scripts.direct.recorder_state import STATE_FILENAME
 import merge_checkpoint
-from scripts.production.production_doc import Production, read_production
+from scripts.production.production_doc import Production, production_field, read_production
 import rename
 from scripts.production import showrunners
 import tidy_wrapped
@@ -140,6 +140,9 @@ class FolderMoveBackend:
             record = self.fixture.root / "rollout-folder-current.jsonl"
             _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.fixture.owner.current_session}}) + "\n")
             descriptor.symlink_to(record)
+
+    def pane_row(self, pane: str) -> herdr.PaneIdentity | herdr.NoPane:
+        return next((row for row in self.panes() if row["pane_id"] == pane), herdr.NoPane(pane))
 
     def panes(self) -> list[herdr.PaneIdentity]:
         return [
@@ -459,33 +462,30 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
         with mock.patch.object(tidy_wrapped, "STATE_DIR", state), unit_move.production_lock():
             pass
     productions: dict[str, Production] = {}
-    for source in showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.RAISE):
-        if source.timer.slug in members:
-            production = read_production(source.timer.doc)
-            productions[source.timer.slug] = production
-            with merge_checkpoint.merge_lock(production.checkout, source.timer.slug):
-                pass
-    for slug in members.keys() - productions.keys():
-        candidates = [production for path in sorted(case.root.rglob(f"{slug}-production.md"))
-                      if (production := read_production(path)).doc.is_relative_to(production.checkout)]
-        case.assertEqual(len(candidates), 1, f"{slug}: expected one production document in its checkout")
-        production = candidates[0]
-        productions[slug] = production
-        with merge_checkpoint.merge_lock(production.checkout, slug):
+    for production_name in members:
+        candidates = [path for path in sorted(case.root.rglob(f"{production_name}-production.md"))
+                      if path.is_relative_to(Path(production_field(
+                          path.read_text().splitlines(), "Showrunner checkout")).expanduser().resolve())]
+        case.assertEqual(len(candidates), 1, f"{production_name}: expected one production document")
+        _ = fixture_member("showrunner", name=production_name,
+                           doc=staff.LiveDoc(remote.local_machine(), candidates[0]))
+        production = read_production(production_name)
+        productions[production_name] = production
+        with merge_checkpoint.merge_lock(production.checkout, production_name):
             pass
     with staff.operation():
-        for slug, units in members.items():
-            production = productions[slug]
-            row = fixture_member("showrunner", name=slug,
+        for production_name, units in members.items():
+            production = productions[production_name]
+            row = fixture_member("showrunner", name=production_name,
                                  doc=staff.LiveDoc(remote.local_machine(), production.doc))
             for unit in units:
                 name = unit_names.name(unit)
-                tree = locations[(slug, unit)]
+                tree = locations[(production_name, unit)]
                 _ = fixture_member("unit", name=name, parent=row.id,
                                    worktree=staff.PresentWorktree(remote.local_machine(), tree))
                 if not tree.is_dir():
                     continue
-                plan = plans.get((slug, unit))
+                plan = plans.get((production_name, unit))
                 mode = unit_config.StandbyPlan() if plan is None else unit_config.PlanFile(plan)
                 _ = unit_config.write(tree, unit_config.UnitConfig(mode, unit_config.NoAppPort(), ()))
 
@@ -609,7 +609,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.old_tip = self.git("rev-parse", "HEAD")
         self.write(self.notifier / "showrunner-old/conf",
                    "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
-                   + shlex.join(["zsh", "/scripts/production_check.sh", str(self.doc)])
+                   + shlex.join(["zsh", "/scripts/production_check.sh", fixture_runtime_id(f"showrunner::{OLD}")])
                    + "\nPROMPT_FILE=unchanged-prompt\n")
         self.write(self.notifier / "showrunner-old/prompt", "Historical prompt mentions old.\n")
 

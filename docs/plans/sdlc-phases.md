@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready; long-running.** Own the phase process: measure how a `/unit:direct` phase runs from start to end and how design and documentation docs are made before a plan exists, find where time and tokens go, propose changes, then build and measure one approved change at a time.
 
-> **Production: sdlc** — unit `phases-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Source
 
@@ -543,6 +542,8 @@ The showrunner routed five rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep
 - `scripts/hooks/stop-direct-continue.py` measures context before any wake-source check. Below the handoff threshold, or when context cannot be measured, the stop passes.
 - At or above the threshold, a live entry in `background_tasks` (`pending_background_tasks`) permits the stop. With none, the hook repeats the wake until compaction reduces the context. A finished worker also writes `heartbeat.log`, so its age does not supply a wake. `workers_working` no longer exists in `direct_run.py`.
 - The other early returns permit subagents, missing session ids, missing active runs, and declared user or supplier waits (`record_turn_wait`).
+- The hook permits a stop when the final status matches `paused_status_pattern`.
+- Holding and blocked prefixes alone do not prevent the wake.
 
 **Files:**
 - `scripts/hooks/stop-direct-continue.py` — context first, then background tasks

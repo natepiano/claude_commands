@@ -78,8 +78,9 @@ Everything below is the contract.
    **Between windows, report the last recorded values.** The recorder prints
    an `as of` line and `No pass or activity is open.` without opening a window
    or changing progress. A closed pass alone does not finish a dispatch: check
-   `phases/<id>/impl_status_<slot>`, board posts and launcher completion. Alive
-   means keep the run going; terminal means step 1. Never open an activity just
+   the dispatch's returned status path, board posts, and launcher completion.
+   Only an existing mesh pin uses `phases/<id>/impl_status_<slot>`.
+   Keep an active run running; terminal completion means step 1. Never open an activity just
    to render a report. An activity still open after the phase closes remains
    the stage; `No active phase to report` means no phase or activity is open.
 

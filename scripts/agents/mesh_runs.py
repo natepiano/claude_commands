@@ -66,6 +66,7 @@ from uuid import NAMESPACE_URL, uuid5
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh, mesh_run_process, worker_lifecycle
 from scripts.buildlog import treekey
+from scripts.direct import assign_gate
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
@@ -121,7 +122,6 @@ class RunRecord(TypedDict):
     exit_code: NotRequired[int]
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
-    pane_result_typed: NotRequired[Literal[True]]
     # Set when the run ended without its supervisor: "supervisor gone".
     ended: NotRequired[str]
 
@@ -561,18 +561,11 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
                     return f"already delivered: {record['run_id']}"
             except (OSError, ValueError) as error:
                 reason = f"worker transcript is unavailable: {error}"
-            record_path = runs / f"{record['run_id']}.json"
-            record = _read_record(record_path)
-            if record.get("pane_result_typed"):
-                return f"already delivered: {record['run_id']}"
             timeout = send_budget.seconds()
             result = send.deliver_worker_text(member, membership, marker + "\n" + text,
                                               sender="mesh-runs", timeout=timeout, reason=reason)
             if result.outcome in ("failed", "refused"):
                 raise RunDeliveryFailed(f"{result.outcome}: {result.detail}")
-            if isinstance(result, send.PaneTextDelivered):
-                record["pane_result_typed"] = True
-                _write_record(record_path, record)
             return f"{result.outcome}: {result.detail}"
     thread_id = member.current_session
     roster = worker_lifecycle.read_worker_state(Path(session_dir) / codex_mesh.ROSTER_FILE)
@@ -602,8 +595,12 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
             state = reason
         case codex_mesh.NoLauncherAttached(status=status):
             state = f"{name} is {status or 'unknown'}"
+    assignment = codex_mesh.task_role(thread_id, codex_mesh.task_assignments(),
+                                     default_role=str(entry.get("role", "")))
+    task_role = assignment.role if isinstance(assignment, codex_mesh.AssignedWorkerRole) else "<role>"
+    assigned_role = assign_gate.assign_role(task_role)
     note = (f"Worker {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
-            + f"({state}), so the result comes to you. Dispatch the worker (implement.sh --to {name}) "
+            + f"({state}), so the result comes to you. Dispatch the worker (assign.sh --role {assigned_role} --to {name}) "
             + "when it should act on it.")
     message = "\n".join([note, f"Worker: {name}", f"Command: {' '.join(record['command'])}", "", text])
     for session in _director_sessions(record):

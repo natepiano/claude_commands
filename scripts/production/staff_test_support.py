@@ -24,9 +24,10 @@ from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import pane_record
+from scripts.shutdown import pane_record, remote
 
 FIXTURE_GIT: str = shutil.which("git") or "git"
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -289,21 +290,41 @@ class ClaudeBackendFixture:
 
 @contextmanager
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
-    """Use the same private record in this process and its fixture children."""
+    """Use private staff and registry paths in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
     _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
+    _ = environment.setdefault("NOTIFIER_STATE_DIR", str(path.parent / "notifier"))
+    for key, folder in (
+        ("SHOWRUNNER_STATE_DIR", "showrunners"),
+        ("NOTIFIER_SESSIONS_DIR", "sessions"),
+        ("HERDR_PANE_RECORD_DIR", "panes"),
+        ("XDG_CONFIG_HOME", "config"),
+    ):
+        _ = environment.setdefault(key, str(path.parent / folder))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
+            "NOTIFIER_STATE_DIR": environment["NOTIFIER_STATE_DIR"],
+            "SHOWRUNNER_STATE_DIR": environment["SHOWRUNNER_STATE_DIR"],
+            "NOTIFIER_SESSIONS_DIR": environment["NOTIFIER_SESSIONS_DIR"],
+            "HERDR_PANE_RECORD_DIR": environment["HERDR_PANE_RECORD_DIR"],
+            "XDG_CONFIG_HOME": environment["XDG_CONFIG_HOME"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
             "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
         })))
-        if "HERDR_PANE_RECORD_DIR" in environment:
-            _ = contexts.enter_context(mock.patch.object(
-                pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
-            ))
+        for name in ("showrunners", "scripts.production.showrunners"):
+            module = sys.modules.get(name)
+            if module is not None:
+                for key in ("NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
+                    _ = contexts.enter_context(mock.patch.object(module, key, Path(environment[key])))
+        for name in ("pane_record", "scripts.shutdown.pane_record"):
+            module = sys.modules.get(name)
+            if module is not None:
+                _ = contexts.enter_context(mock.patch.object(
+                    module, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
+                ))
         yield
 
 
@@ -326,7 +347,8 @@ def recorded_showrunner(name: str, doc: Path, parent: str = "") -> staff.StaffRo
     """Record the document that identifies one private production owner."""
     rows = [row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == name]
     row = rows[0] if rows and not parent else showrunner_relationship(name, parent)
-    return staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+    location = staff.LiveDoc(remote.local_machine(), doc)
+    return row if row.doc == location else staff.set_doc(row.id, location)
 
 
 def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> staff.StaffRow:
@@ -378,14 +400,6 @@ def production_membership(showrunner: str, *units: str) -> None:
     _ = showrunner_relationship(showrunner)
     for unit in units:
         _ = unit_membership(showrunner, unit)
-
-
-def fixture_showrunner_name(slug: str, doc: Path) -> str:
-    """Keep the real doc's workspace name; extra fixture productions use their slugs."""
-    from scripts.production import showrunners
-    from scripts.production.production_doc import read_production
-
-    return showrunners.herdr_space(slug, str(doc)) if slug == read_production(doc).slug else slug
 
 
 def source_environment(source: Path) -> dict[str, str]:
@@ -522,7 +536,7 @@ class RowProductionFixture:
     worker: staff.StaffRow
     doc: Path
     worktree: Path
-    slug: str
+    name: str
 
 
 class StaffTestCase(unittest.TestCase):
@@ -554,6 +568,7 @@ class StaffTestCase(unittest.TestCase):
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
+            "CLAUDE_PYTHON": sys.executable,
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
@@ -615,7 +630,7 @@ class StaffTestCase(unittest.TestCase):
 
     def script(self, script: Path, *arguments: str, code: int = 0, input: str | None = None) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
-            [sys.executable, "-c", OWNER_CLI, str(script), *arguments],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", OWNER_CLI, str(script), *arguments],
             cwd=CHECKOUT, input=input, capture_output=True, text=True, check=False,
             timeout=TEST_HANG_GUARD_SECS,
         )
@@ -650,44 +665,46 @@ class StaffTestCase(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
-    def production(self, slug: str, *units: str, workspace: str = "", parent: str = "") -> Path:
+    def production(self, production_name: str, *units: str, workspace: str = "", parent: str = "") -> Path:
         """Write real timer/doc sources; each listed unit has a staff row and a folder."""
-        doc = self.source_root / f"{slug}-production.md"
-        self.write_production_doc(doc, workspace=workspace or slug)
-        self.register_production(slug, doc, name=workspace or slug)
+        doc = self.source_root / f"{production_name}-production.md"
+        self.write_production_doc(doc, workspace=workspace or production_name)
+        self.register_production(production_name, doc, name=workspace or production_name)
         for unit in units:
             _ = self.worktree(unit)
-            owner = fixture_runtime_id("showrunner::" + (workspace or slug))
+            owner = fixture_runtime_id("showrunner::" + (workspace or production_name))
             from scripts.production import unit_names
 
             identity = fixture_runtime_id("unit:" + owner + ":" + unit_names.name(unit))
             # A test can make or rename the row first; keep that row.
             if staff.initial_snapshot().by_id(staff.StaffId(identity)) is None:
-                _ = unit_membership(workspace or slug, unit)
-            self.pane(f"fixture:{slug}/{unit}", session_id=identity,
+                _ = unit_membership(workspace or production_name, unit)
+            self.pane(f"fixture:{production_name}/{unit}", session_id=identity,
                       environment={"CLAUDE_CODE_SESSION_ID": identity},
                       written_at="2026-10-01T00:00:00+00:00")
         if parent:
-            parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / slug / "parent"
+            parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / production_name / "parent"
             parent_file.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(parent_file, parent + "\n")
         return doc
 
-    def register_production(self, slug: str, doc: Path, *, name: str = "") -> None:
+    def register_production(self, production_name: str, doc: Path, *, name: str = "") -> None:
         """Register an existing fixture document without making a second production."""
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
+        row = recorded_showrunner(name or production_name, doc)
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{row.id}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
-        identity = fixture_runtime_id("showrunner::" + (name or slug))
-        write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
+        identity = row.id
+        write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {row.id}\n")
 
-    def record_production(self, slug: str, doc: Path) -> staff.StaffRow:
+    def record_production(self, production_name: str, doc: Path) -> staff.StaffRow:
         """Register the timer and record its private owner document."""
-        row = recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
-        self.register_production(slug, doc, name=row.name)
+        row = recorded_showrunner(production_name, doc)
+        self.register_production(production_name, doc, name=row.name)
         return row
 
     def write_production_doc(self, doc: Path, *, workspace: str) -> None:
-        write_text_atomic(doc, f"# Fixture production\n- **Showrunner session:** `{workspace}`\n")
+        del workspace
+        write_text_atomic(doc, "# Fixture production\n")
 
     def worktree(self, unit: str) -> Path:
         folder = self.source_root / "worktrees" / unit
@@ -704,9 +721,9 @@ class StaffTestCase(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def fill_production(self, slug: str, *units: str) -> Path:
+    def fill_production(self, production_name: str, *units: str) -> Path:
         """Build a timer doc and real linked worktrees for the live fill."""
-        repository = self.source_root / "repositories" / slug
+        repository = self.source_root / "repositories" / production_name
         repository.mkdir(parents=True)
         _ = self.fixture_git(repository, "init", "-b", "main")
         _ = self.fixture_git(repository, "config", "user.email", "fixture@example.invalid")
@@ -717,13 +734,13 @@ class StaffTestCase(unittest.TestCase):
             folder.parent.mkdir(parents=True, exist_ok=True)
             _ = self.fixture_git(repository, "worktree", "add", "-b", unit, str(folder))
             write_text_atomic(folder / ".unit.toml", 'plan = "standby"\nresponsibilities = []\n')
-        doc = repository / "docs" / f"{slug}-production.md"
+        doc = repository / "docs" / f"{production_name}-production.md"
         doc.parent.mkdir()
-        self.write_production_doc(doc, workspace=slug)
-        self.register_production(slug, doc)
-        production_membership(slug, *units)
+        self.write_production_doc(doc, workspace=production_name)
+        self.register_production(production_name, doc)
+        production_membership(production_name, *units)
         for unit in units:
-            row = unit_membership(slug, unit)
+            row = unit_membership(production_name, unit)
             _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source_root / "worktrees" / unit),
                                    expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
@@ -734,8 +751,8 @@ class StaffTestCase(unittest.TestCase):
 
     def row_production(self) -> RowProductionFixture:
         """Create private git evidence and conflicting legacy metadata."""
-        slug = "timer-alias"
-        repository = self.source_root / "repositories" / slug
+        production_name = "timer-alias"
+        repository = self.source_root / "repositories" / production_name
         repository.mkdir(parents=True)
         _ = self.fixture_git(repository, "init", "-b", "merge-from-git")
         _ = self.fixture_git(repository, "config", "user.email", "fixture@example.invalid")
@@ -748,7 +765,7 @@ class StaffTestCase(unittest.TestCase):
                           + 'port = 4317\nresponsibilities = ["shared-fixture"]\n')
         doc = repository / "docs" / "row-production.md"
         doc.parent.mkdir()
-        write_text_atomic(doc, "# Production\n- **Showrunner session:** `row-owner`\n")
+        write_text_atomic(doc, "# Production\n")
         runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc("natedev", doc))
         unit = fixture_member("unit", name="member", parent=runner.id,
                               worktree=staff.PresentWorktree("natedev", folder))
@@ -758,11 +775,11 @@ class StaffTestCase(unittest.TestCase):
         current = staff.native_id(fixture_runtime_id("row-worker-current"))
         fixture_session(current, CLAUDE_BACKEND)
         worker = staff.update_current_session(worker.current_session, current)
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.id}" / "conf"
         timer.parent.mkdir(parents=True)
         write_text_atomic(timer, f"TARGET=session:{runner.id}\n"
-                          + f"CHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
-        return RowProductionFixture(runner, unit, worker, doc, folder, slug)
+                          + f"CHECK=zsh /fixture/production_check.sh {runner.id}\n")
+        return RowProductionFixture(runner, unit, worker, doc, folder, runner.name)
 
     def separated_unit_folders(self) -> RowProductionFixture:
         """Give the production doc its checkout fields beside the unit's own folder."""
@@ -807,12 +824,12 @@ class StaffTestCase(unittest.TestCase):
         })
         return path
 
-    def worker_run(self, slug: str, unit: str, director: str) -> Path:
+    def worker_run(self, production_name: str, unit: str, director: str) -> Path:
         """A unit run with actual state, roster, server and director records."""
-        run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{slug}-{unit}"
+        run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
         self.write_json(run / "progress_history_state.json", {
-            "production": slug, "unit": unit,
+            "production": production_name, "unit": unit,
             "main_agent": {"family": "claude", "session_id": director},
         })
         write_text_atomic(run / "director", director + "\n")
@@ -822,8 +839,8 @@ class StaffTestCase(unittest.TestCase):
 
     @contextmanager
     def lock_notice(self, lock: Path) -> Generator[socket.socket]:
-        path = self.root / "operation-notice.sock"
-        with socket.socket(socket.AF_UNIX) as listener:
+        with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+            path = Path(directory) / "operation-notice.sock"
             listener.bind(str(path))
             listener.listen()
             listener.settimeout(TEST_HANG_GUARD_SECS)
@@ -832,7 +849,7 @@ class StaffTestCase(unittest.TestCase):
 
     def start_script(self, script: Path, *arguments: str) -> subprocess.Popen[str]:
         pending = subprocess.Popen(
-            [sys.executable, "-c", OWNER_CLI, str(script), *arguments], cwd=CHECKOUT,
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", OWNER_CLI, str(script), *arguments], cwd=CHECKOUT,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 

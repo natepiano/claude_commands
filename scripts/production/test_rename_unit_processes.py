@@ -51,7 +51,7 @@ class RunProcessTests(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(isolated_parents())
-        PARENTS["alpha-unit"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
+        PARENTS["alpha"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, config_environment(self.root / "config")))
         self.unit_folder = self.root / "claude-demo-alpha"
@@ -113,7 +113,7 @@ class RunProcessTests(StaffTestCase):
         return ["sh", "-c", WATCHER, str(retire_unit.MESH.resolve()), "900", "51101", str(folder.resolve()),
                 "python3", "300"]
 
-    def no_units(self, _slug: str) -> dict[str, object]:
+    def no_units(self, _production_name: str) -> dict[str, object]:
         return {}
 
     def inside(self, worktree: Path) -> list[int]:

@@ -68,7 +68,7 @@ date_created: "[[2026-10-10]]"
 date_modified: "[[2026-10-10]]"
 kind: feature
 link: https://github.com/natepiano/hana/commit/afb0f5e992069a3e2d948bfff093292eff8f41a4
-production: tool-based-ui
+production: hana
 project: "[[hana]]"
 release: []
 replaced_by: []

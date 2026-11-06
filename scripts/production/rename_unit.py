@@ -29,13 +29,13 @@ class UnitRename:
     name: str
 
 
-def plan(slug: str, old: str, new: str) -> UnitRename:
+def plan(production_name: str, old: str, new: str) -> UnitRename:
     record = staff.snapshot()
-    found = staff_sources.member(staff_sources.UnitMember(slug, old), record)
+    found = staff_sources.member(staff_sources.UnitMember(production_name, old), record)
     if isinstance(found, staff_sources.NoSuchMember):
-        found = staff_sources.member(staff_sources.UnitMember(slug, new), record)
+        found = staff_sources.member(staff_sources.UnitMember(production_name, new), record)
     if isinstance(found, staff_sources.NoSuchMember):
-        raise ValueError(f"{slug}/{old}: no unit staff row")
+        raise ValueError(f"{production_name}/{old}: no unit staff row")
     name = unit_names.name(new)
     if (found.row.name != name and not isinstance(found.row.worktree, staff.WorktreeUnfilled)
             and found.row.worktree.machine != remote.local_machine()):
@@ -95,11 +95,11 @@ def repair_displays(row: staff.StaffRow) -> bool:
     return changed
 
 
-def apply(slug: str, old: str, new: str) -> UnitRename:
-    request = plan(slug, old, new)
+def apply(production_name: str, old: str, new: str) -> UnitRename:
+    request = plan(production_name, old, new)
     with staff.row_operation(str(request.member.id)):
         if (row := staff.by_id(request.member.id)) is None:
-            raise ValueError(f"{slug}/{old}: no unit staff row")
+            raise ValueError(f"{production_name}/{old}: no unit staff row")
         changed = row.name != request.name
         pending = unit_move.pending_move(row.id)
         if isinstance(pending, unit_move.FolderMove) and changed:
@@ -107,7 +107,7 @@ def apply(slug: str, old: str, new: str) -> UnitRename:
                 print("unchanged")
                 return request
             if (row := staff.by_id(request.member.id)) is None:
-                raise ValueError(f"{slug}/{old}: no unit staff row")
+                raise ValueError(f"{production_name}/{old}: no unit staff row")
             pending = unit_move.pending_move(row.id)
         movement = pending
         if isinstance(pending, unit_move.PendingRename) and pending.name != request.name:
@@ -148,7 +148,7 @@ def apply(slug: str, old: str, new: str) -> UnitRename:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("action", choices=("plan", "apply", "verify"))
-    _ = parser.add_argument("slug")
+    _ = parser.add_argument("production_name")
     _ = parser.add_argument("old")
     _ = parser.add_argument("new")
     _ = parser.add_argument("--scratch", help=argparse.SUPPRESS)
@@ -156,10 +156,10 @@ def main(argv: list[str]) -> int:
     def run() -> int:
         try:
             if cast(str, args.action) == "plan":
-                request = plan(cast(str, args.slug), cast(str, args.old), cast(str, args.new))
+                request = plan(cast(str, args.production_name), cast(str, args.old), cast(str, args.new))
                 print(f"Rename {request.member.name} to {request.name}")
             else:
-                _ = apply(cast(str, args.slug), cast(str, args.old), cast(str, args.new))
+                _ = apply(cast(str, args.production_name), cast(str, args.old), cast(str, args.new))
             return 0
         except worker_lifecycle.OperationDeadlineExpired as error:
             print(f"rename_unit: anomaly: {error}", file=sys.stderr)

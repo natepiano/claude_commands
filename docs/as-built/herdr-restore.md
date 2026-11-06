@@ -53,10 +53,8 @@ The settings.json entry, one more SessionStart item:
   `--settings '{"disableAgentView": true}'`, with no opening prompt. Then it closes the restored
   tab by its pane id: ordering the tabs keeps pane ids. A failed start closes the new tab and
   keeps the restored one. Any failure makes the exit status 1.
-- `herdr.keeps_restored_layout(session)` is true for `shared_session()` only when herdr's
-  config sets `[session] resume_agents_on_restore = false`. Else herdr resumes each pane itself
-  on the server's account, so `_clear_restored_workspaces` clears the layout, as for every other
-  session.
+- Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
+  herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
 - `shutdown.py restart --all` stops and starts the local live Claude staff rows.
 - `shutdown.py restart` starts the missing rows from the saved row ID list.
 - Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
@@ -88,6 +86,27 @@ Settings entry for the user, one more SessionEnd item:
   `CLAUDE_CONFIG_DIR` and the names the entry keeps; every other value, a token included, is
   dropped as it is read. The Mac hides the environment of a system binary such as `/bin/zsh`,
   never of Claude.
+
+## Codex panes
+
+- A Codex pane launch passes `--no-daemon`. A daemon-attached Codex reports no `agent_session`.
+- A fresh Codex worker gets one short first turn, `WORKER_FIRST_TURN_TEXT`, with the limit
+  `WORKER_FIRST_TURN_SECONDS` (`config/direct.conf`). `worker_panes.start_or_resume` then publishes
+  the staff row from the pane's `agent_session`.
+- A known identity launches with `resume <id>` and gets no first turn.
+- `herdr.pane_native_process` is the one reader of pane membership. For one foreground `codex`:
+  - an open rollout proves the pane;
+  - an `agent_session` equal to the row's `current_session` proves the pane;
+  - a `resume` argument proves the pane when the report is empty (`UnreportedResume`: a resumed
+    Codex reports nothing before its first prompt) or equals the argument;
+  - a report that names another session proves nothing, and so does a pane row that cannot be read.
+- `PANE_AGENT_START_SECONDS` is the one launch deadline, for a worker and for a side pane.
+- `herdr.child_environment` removes `NO_COLOR`. With it, Claude draws no SGR, and `_composer_input`
+  reads the faint placeholder as typed text.
+- The pane's terminal owns `TERM` and `COLORTERM`. `herdr._pane_environment` removes them at a new
+  tab, a split and an existing-pane launch. A Codex tool shell holds `TERM=dumb`. With it, `/etc/zshrc`
+  turns off the line editor, so zsh keeps the raw tty that a stopped Codex leaves, and the Enter
+  from `pane run` never ends a line.
 
 ## Still to come
 

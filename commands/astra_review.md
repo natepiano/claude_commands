@@ -25,7 +25,11 @@ changes no file.
    A held document uses its sole reviewer pane under the unit or showrunner.
    The held role uses `worker.py` with the explicit `astra-reviewer` role and keeps its native conversation.
    Report a busy or unavailable reviewer; do not start a replacement.
-   A consultation outside the staff hierarchy uses a side pane without a staff row.
+   Without a held document, a unit or showrunner review starts through `assign.sh --role review --operation astra-review`.
+   The launcher uses the review run's transport pin.
+   If worker end fails, its staff row remains visible in `worker.py list`.
+   The exec hold ends with the launcher process.
+   A review outside the staff hierarchy keeps its one-turn `codex exec` path.
    - **Claude:** run it with `run_in_background: true`, tell the caller in one
      line that the astra review is running, then end the turn or do other work.
      The task notification is the wait. Never poll it, sleep or read its output

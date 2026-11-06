@@ -153,7 +153,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if not isinstance(started, worker_panes.OpenWorker):
             return _startup_result(name, started)
         instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
-            worker_name=name.value, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
+            worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
             fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
@@ -322,7 +322,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready)
 
 
-def end(parent: StaffId, name: WorkerName) -> ExitCode:
+def end(parent: StaffId, name: WorkerName, *,
+        run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT) -> ExitCode:
     with worker_panes.worker_lock(parent, name) as hold:
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
@@ -330,7 +331,7 @@ def end(parent: StaffId, name: WorkerName) -> ExitCode:
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         if row is None:
             return ExitCode.OK
-        result = worker_panes.close(parent, name, lock=hold)
+        result = worker_panes.close(parent, name, run=run, lock=hold)
         if isinstance(result, worker_panes.Kept):
             print(result.blocker, file=sys.stderr)
             return ExitCode.KEPT
@@ -392,6 +393,7 @@ def _launcher_arguments(text: str) -> list[str]:
 @final
 class Arguments(argparse.Namespace):
     command: str = ""
+    parent: str = ""
     role: str = ""
     name: str = ""
     prompt: str = ""
@@ -419,12 +421,15 @@ def main(arguments: list[str] | None = None) -> int:
             _ = child.add_argument("--json", action="store_true")
     ending = commands.add_parser("end")
     _ = ending.add_argument("name")
+    _ = ending.add_argument("--session-dir", default="")
+    _ = ending.add_argument("--parent", default="")
     adding = commands.add_parser("add")
     _ = adding.add_argument("role", choices=staff.WORKER_ROLES)
     _ = adding.add_argument("--name", default="")
     _ = adding.add_argument("--json", action="store_true")
     _ = adding.add_argument("--session-dir", default="")
     assignment = commands.add_parser("assign")
+    _ = assignment.add_argument("--parent", default="")
     _ = assignment.add_argument("role", choices=staff.WORKER_ROLES)
     _ = assignment.add_argument("prompt")
     for flag in ("session-dir", "slot", "phase", "kind", "lens", "name", "reply", "dispatch-id", "fix-cause", "activity", "early-ready"):
@@ -436,7 +441,7 @@ def main(arguments: list[str] | None = None) -> int:
     args = parser.parse_args(arguments, namespace=Arguments())
     try:
         record = staff.snapshot()
-        owner = record.by_current_session(staff.runtime_id())
+        owner = record.by_id(StaffId(args.parent)) if args.parent else record.by_current_session(staff.runtime_id())
         if owner is None or owner.kind not in ("unit", "showrunner"):
             print("staff: caller: not opened: caller is not a unit or showrunner", file=sys.stderr)
             return ExitCode.REFUSED
@@ -459,7 +464,8 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "restore":
             return restore(owner.id)
         if args.command == "end":
-            code = end(owner.id, WorkerName.parse(args.name))
+            code = end(owner.id, WorkerName.parse(args.name),
+                run=worker_panes.DispatchRun(Path(args.session_dir)) if args.session_dir else worker_panes.HolderRun.CURRENT)
         elif args.command == "add":
             result = add(owner.id, cast(WorkerRole, args.role), name=args.name)
             if args.json and isinstance(result, worker_panes.OpenWorker):

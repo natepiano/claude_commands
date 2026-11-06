@@ -32,7 +32,7 @@ Use one `design_roles.py` designer and at most one reviewer per design.
 `models.conf` selects the role's model and effort.
 Held roles use `worker.py` with explicit `astra-designer` or `astra-reviewer` roles.
 Keep the worker's row, native conversation, and pane across rounds, phases, and runs.
-An Astra caller outside the staff hierarchy uses `side_pane.py` without a staff row.
+An ad hoc Astra review outside the staff hierarchy keeps its one-turn `codex exec` path.
 Ask-a-friend uses `side_pane.py open|send|close` beside its caller and creates no staff row.
 `design_roles.py` saves each headed prompt and reply. Do not also use `astra_work.py brief` for that role.
 For another designer, include `config/design_roles/designer.md` in its brief.
@@ -151,6 +151,8 @@ For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prom
 The launcher calls `worker.py assign` with the explicit role.
 Use `worker.py list` to inspect workers and `worker.py restore` to resume retained workers.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
+An unknown pane outside this parent's tabs does not make its absent workers uncertain.
+An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
 The worker command selects idle workers and reuses stopped workers.
 Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
@@ -213,7 +215,7 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 
 <ProductionUnit>
 Your staff row identifies your unit and its parent showrunner.
-The parent row identifies your production and its document.
+The parent row's `name` is your production name. Its `doc.path` gives the document.
 Read `~/.claude/docs/production_format.md` → <ProductionUnit/> at <PrepareSession/> and after every compaction.
 Apply it throughout the run when your staff row has a parent showrunner. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
@@ -381,7 +383,9 @@ only to complete a report.
 <WorkerLaunchFailure>
 For `herdr`, inspect `worker.py list` and the named pane.
 Keep incomplete, unpublished, busy, and unknown workers unchanged.
-Resume the same pass through its saved launcher command.
+A failed fresh start prints `publication failed: ...` and retains its pane without a saved pass.
+Rerun the original launcher command; it publishes once from that pane.
+For a published worker, resume the same pass through its saved launcher command.
 The following recovery rules apply only when the existing run's pin is `mesh`.
 A dispatch that dies in seconds never reached the provider, and a provider
 message it prints is a message some earlier call received. Workers launched
@@ -611,6 +615,17 @@ including a reviewer's style finding. Each open phase has
 its own ledger, and `--phase` names which one: with two phases open, a call
 naming none is refused. Every launch names its phase (<PassOwnership/>), so the
 launcher's own `landed` and `abandon` reach that phase's ledger.
+
+When a daily simplify run reports items, its director performs these steps:
+
+1. Add a phase `simplify-<date>` to the plan from the report.
+2. Record every item under that phase with `--lens simplify`; discard none.
+3. Send in-scope items and items that remove a copy to Codex fix workers as one repair phase.
+   Use the normal checkpoint.
+4. Open other items with `--held-for-decision` and include the proposed change, files, and reason.
+
+A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. Settle every other held item under DecisionEconomy and state the call in one line (user, 2026-11-02).
+Record the user's answer with `decision --user-words`.
 
 | Command | Purpose |
 | --- | --- |
@@ -1345,21 +1360,14 @@ Then apply <RetainPhaseReservation/> before review, another dispatch, or a repor
 </FixDispatch>
 
 <Synthesize>
-1. Merge the `adversary`, `contract`, `simplify`, armed `rerun`, UX, and main review findings.
+1. Merge the `adversary`, `contract`, armed `rerun`, UX, and main review findings.
    Combine duplicate findings and record every contributing lens with `--lens`.
-   Record each simplify item; discard none.
-   Open behavior-preserving items within the phase as `minor --lens simplify`.
-   Add `--held-for-decision` for each behavior change or change outside the phase.
-   Open a change that removes a copy as `minor --lens simplify`, not held, also outside the phase.
-   Include the proposed change, files, and reason in its detail.
-   A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. Settle every other held item under DecisionEconomy and state the call in one line (user, 2026-11-02).
-   Record the user's answer with `decision --user-words`.
    Explain each refuted finding from another lens.
+   Handle daily simplify reports under <FindingsLedger/>.
    Report reviewer disagreements under <DelegationResultFormat/>.
 2. Present <DelegationResultFormat/>. If the user is confused, apply
    <ExplainOnDemand/> before any choice.
-3. Codex fix workers apply every simplify repair.
-   For other lenses, if every remaining issue is trivial — doc-only, an agreed rename, or a
+3. If every remaining issue is trivial — doc-only, an agreed rename, or a
    small mechanical change whose one correct edit is evident from the finding
    itself, with no design judgment and no reviewer disputing the reading —
    the unit director applies them all directly,

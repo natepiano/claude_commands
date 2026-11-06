@@ -18,6 +18,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `docs/associate-producer/operations.md` | read | staff.json (shell) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
+| `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/agent_bg.sh` | read | runtime_id |
@@ -30,7 +31,6 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/astra/design_roles.py` | read | runtime_id |
 | `scripts/bevy_upgrade/bevy_upgrade.py` | read | snapshot |
 | `scripts/bevy_upgrade/cli_test_support.py` | write | native_id, update_current_session |
-| `scripts/bevy_upgrade/migrate_bevy_watch.py` | read | operation, snapshot |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
@@ -52,6 +52,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
+| `scripts/herdr/side_pane.py` | read | runtime_id |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation, ReportsTo, StaffId |
 | `scripts/hooks/conversation_pause.py` | read | LiveDoc, WrappedDoc (types only) |
@@ -61,9 +62,11 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
+| `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
@@ -78,10 +81,12 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
 | `scripts/production/change_review.py` | read | snapshot |
 | `scripts/production/change_routing.py` | read | staff.json path |
+| `scripts/production/codex_winddown.py` | read | snapshot |
 | `scripts/production/completion_receipt.py` | read | native_id |
 | `scripts/production/dailies_input.py` | read | snapshot |
 | `scripts/production/dailies_input_test_support.py` | write | rename, snapshot |
 | `scripts/production/delivery_state.py` | read | staff.json path |
+| `scripts/production/fake_showrunner.py` | write | native_id, update_current_session |
 | `scripts/production/fake_unit_host.py` | read | by_path |
 | `scripts/production/footer_counts.py` | read | snapshot |
 | `scripts/production/live_units.py` | read | snapshot |
@@ -89,21 +94,16 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
 | `scripts/production/merge_gate.py` | read | staff.json path |
-| `scripts/production/migrate_middle_stores.py` | read | operation, snapshot |
-| `scripts/production/migrate_next_pins.py` | read | operation, snapshot |
-| `scripts/production/migrate_proposals.py` | read | snapshot, StaffId |
-| `scripts/production/migrate_showrunner_settings.py` | read | snapshot, StaffId |
-| `scripts/production/migrate_showrunner_state.py` | read | operation, snapshot |
-| `scripts/production/migrate_showrunner_timers.py` | read | snapshot, StaffId |
-| `scripts/production/migrate_staff_ids.py` | read | _file, is_owner, native_id, operation, publish_native_ids, runtime_id, snapshot |
+| `scripts/production/merge_gate_test_support.py` | read | LiveDoc |
 | `scripts/production/next_item.py` | read | snapshot |
-| `scripts/production/owns_fill.py` | read | snapshot, PresentWorktree, RemovedWorktree |
+| `scripts/production/production_doc.py` | read | StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
 | `scripts/production/proposal_issue.py` | read | snapshot, StaffId |
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
+| `scripts/production/prune_phase_notes.py` | read | snapshot |
 | `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, set_doc, snapshot |
 | `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
@@ -111,7 +111,6 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/production/resume_unit.py` | read | cli_result, initial_snapshot, operation, restore_unit |
 | `scripts/production/retire_unit.py` | write | cli_result, operation, operation_fds, set_worktree, snapshot |
-| `scripts/production/roles_audit.py` | read | snapshot |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
@@ -158,6 +157,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
 | `scripts/statusline/counts_row.py` | read | none (StaffRefused exception) |
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |
+| `scripts/style/add_style.py` | read | snapshot, LiveDoc, WrappedDoc |
 | `scripts/style/coverage_report.py` | read | snapshot |
 | `scripts/style/ledger_test_support.py` | write | apply_seed, initial_snapshot, set_doc |
 | `scripts/style/style_ledger.py` | read | snapshot |
@@ -171,7 +171,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-156 accessors: 29 write, 126 read, 1 owner.
+155 accessors: 30 write, 124 read, 1 owner.
 
 ## Approved copies
 
@@ -180,3 +180,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/command_inputs.rs`) | the user, 2026-11-04 |
 
 No other copy of the staff facts is allowed without the user's approval. Remake this list before any staff migration.
+
+`Herdr.codex_client_session` reads the current thread for a bare Codex pane from its tab's staff row.
+Both `Herdr._codex_launch` and `pane_record.seed` use this method.
+`pane_record.py` still reads staff for saved launch references and resume operations.

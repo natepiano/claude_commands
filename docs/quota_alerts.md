@@ -36,7 +36,8 @@ One log line says `workers wait for <label>'s 5-hour reset at <time>`.
 Exactly 20 minutes, a passed reset, or an unknown window or reset causes a move.
 The picker excludes the refusing home and chooses the Codex account with room whose weekly reset is soonest, including credits.
 The workers role changes through `swap workers`.
-A pane move waits for or interrupts a turn and resumes its conversation in the same pane.
+A pane move stops a live agent, then resumes its conversation in the same pane.
+An active or refused pass receives one resume message; an idle worker receives no text.
 The log says `workers moved from <old> to <new>: <old> refused (<window> limit until <reset>)`.
 Only an existing mesh-pinned run uses the retained waiting follow and its held messages.
 That follow starts `Continue where you stopped.` before held messages when the new home becomes available or its wait ends.
@@ -59,7 +60,8 @@ Fallback state distinguishes no fallback, an account-owned fallback, and a legac
 `~/.local/state/accounts/moves.jsonl` records each transition under an append lock.
 Entries share the time, tool, subject, and stable move id.
 A workers role write records `requested`; a proved destination resume records success for that worker.
-Pane moves record each finished step by worker staff id and move id, including the retained terminal.
+Pane moves record the request, confirmation, or failure by worker staff id and move id.
+The request includes the retained terminal.
 Only an existing run pinned to `mesh` uses `codex_mesh.py` to record its resumed worker confirmation.
 Failures, waits, wait completion, no room, and renewed room have separate entries.
 Readers skip malformed lines, including during duplicate confirmation checks.
@@ -89,7 +91,7 @@ The notice names the balance, refill, and destination when credits run out.
 With credits off, workers prefer included usage in both windows and the soonest weekly refill.
 Only when no account has weekly room can they move to another account's paid credits.
 The notice names that choice.
-The pane move waits for or interrupts a live turn before it stops the agent.
+The pane move stops the live agent before it resumes the conversation.
 The request records `cause: credits off`, separately from provider refusal.
 Without room, or after a failed move, that pass routes Codex assignments to Claude.
 The notice names the earliest refill and any failure.
