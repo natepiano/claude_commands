@@ -1133,40 +1133,34 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 
 **Ruled out:** In-process launcher calls: the identity check needs the real process chain.
 
-### Phase 55 — The assign launcher tests use half their CPU  · status: todo
+### Phase 55 — The Claude launcher records test uses half its CPU  · status: todo
 **Depends on:** Phase 54
 
 #### Work Order
 
-**Goal:** the five assign launcher test files (344 CPU s per gate on 2026-11-06, the largest group outside `test_verify*`) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
+**Goal:** `test_implement_launcher_records.py` (43.6 CPU s per gate on 2026-11-06) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
 
 **Spec:** Follow the Speed method.
-1. Take a new baseline after the merge. Name each file's test count at dispatch, and each real launcher process each test starts.
-2. Test launcher logic by direct calls. Keep a few real dispatches, each for a path that no direct call can prove. A test that only needs the state of a first dispatch uses `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. The Phase 54 wall floors of `_reuse` and `_identity` do not hold these files back.
+1. Take a new baseline with `module_cost.py --tests 10 --commands 10`. Name the test count, and each real launcher process that each test starts.
+2. Test launcher logic by direct calls. Keep a few real dispatches, each for a path that no direct call can prove.
 3. A cut in a production file goes to the director first, with the measured gain.
 4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
 
 **Files:**
-- `scripts/direct/test_assign_launcher.py` — 120.7 CPU s
-- `scripts/direct/test_assign_launcher_reuse.py` — 71.9 CPU s
-- `scripts/direct/test_assign_launcher_identity.py` — 64.5 CPU s
-- `scripts/direct/test_assign_launcher_review.py` — 43.8 CPU s
 - `scripts/direct/test_implement_launcher_records.py` — 43.6 CPU s
-- `scripts/direct/assign_launcher_test_support.py` — the assign fixture
 - `scripts/direct/implement_launcher_test_support.py` — the Claude records fixture
 
-**Workers:** 2 writers, one for each fixture family
-- `impl4` — the four `test_assign_launcher*` files and `assign_launcher_test_support.py`, role impl
-- `test` — `test_implement_launcher_records.py` and `implement_launcher_test_support.py`, role impl
+**Workers:** 1 writer on slot `test` (one test file and its fixture)
+- `test` — all files above, role impl
 
 **Constraints from prior phases:**
-- Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. The coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
+- Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor.
 - Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- each changed file green; the behavior map has one row per assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- CPU s, processes, execs and wall s before and after for each file, in the checkpoint notice
+- the changed file and each module that imports the fixture are green; the behavior map has one row per assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after, in the checkpoint notice
 - the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
@@ -1348,10 +1342,10 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 
 **Spec:**
 1. No failure log exists: the gate prints the failure to its caller's shell, and its record keeps only the failed test name (queue-unit, 2026-11-06). Reproduce each failure at the load of its gate. Quote the failing line and the source line before any fix.
-2. `test_verify_token_mac_step.py`, `test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready`: gates 460168a30 (record natedev-20261106T162938-718feb) and 14f4644ef (record natedev-20261106T162943-34348c), one minute apart under load, and once at load 59 on 11-05.
+2. `test_verify_token_mac_step.py`, `test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready`: gates 460168a30 (record natedev-20261106T162938-718feb) and 14f4644ef (record natedev-20261106T162943-34348c), one minute apart under load, and once at load 59 on 11-05. One candidate: the fixture writes `block-probe` with `write_text`, but `wait_for_path` observes only that the file exists before the test reads its contents. Force a pause after the file is created, and see if the read is empty. Atomic publication can keep the existing assertion. Do not state that this explains the gate failures without evidence.
 3. `test_verify_mac_copy_ownership.py`, `test_a_stopped_call_leaves_no_step_or_copy_running`: gate 735747766 (record natedev-20261106T133609-c0e02e).
 4. `test_verify_example_edits.py`, `test_edit_during_the_test_run_records_no_pass`: gate aa0e60d56 (record natedev-20261106T154319-4912ce). The first run of that gate, natedev-20261106T140052-6ac435, passed this module.
-5. A flaky file's fixed wait goes first. Move what you can onto direct calls, under the Speed method, because each moved check also leaves the race.
+5. A flaky file's fixed wait goes first. Move a check onto a direct call only when it needs no live process. Copy cleanup and edits during a run need live processes and the real caller order, so `test_a_stopped_call_leaves_no_step_or_copy_running` and `test_edit_during_the_test_run_records_no_pass` stay process tests. Observe cleanup before `module_run.py` ends, because Phase 62 then ends the remaining descendants independently.
 6. A cut in `verify.sh` or another production file goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
@@ -1359,12 +1353,12 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 - `scripts/direct/test_verify_mac_copy_ownership.py`
 - `scripts/direct/test_verify_example_edits.py`
 
-**Workers:** 1 writer on slot `impl` (three small files; one writer reads all the logs)
-- `impl` — all files above, role impl
+**Workers:** 1 writer on slot `impl4` (three small files; one writer does all the reproductions)
+- `impl4` — all files above, role impl
 
 **Constraints from prior phases:**
 - Phase 56: an event wait uses one held descriptor and bounded reads.
-- Verify's support files `verify_mac_offload_test_support.py` and `verify_token_wait_test_support.py` change in its batch. Start only after its hash.
+- Verify's batch a36296ed2, with its changes to `verify_mac_offload_test_support.py` and `verify_token_wait_test_support.py`, is on builds.
 
 **Acceptance gate:**
 - For each file, the quoted failing line and the named cause are in the summary.
@@ -1493,3 +1487,40 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
 - The changed files pass. When `VerifyLintJudgmentFixture` or its constants change, these also pass: `test_verify_lint_cache.py`, `test_verify_lint_cache_fix_limit.py`, `test_verify_lint_fix_failures.py`, `test_verify_lint_fix_limit.py`, `test_verify_lint_fixes.py` and `test_verify_token_renew.py`.
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
+
+### Phase 68 — The assign launcher tests use half their CPU  · status: todo
+**Depends on:** Phase 54
+**Blocked by:** devtools' `assign.py` coordinator change on builds. The showrunner sends the word.
+
+#### Work Order
+
+**Source:** the Phase 64 architect review, 2026-11-06. The coordinator change removes the recorder and resolver children from real dispatches, so a test replacement for those children made before it becomes obsolete.
+
+**Goal:** the four assign launcher test files (300.9 CPU s per gate on 2026-11-06, before the coordinator change) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Merge builds with the coordinator change. Take a new baseline with `module_cost.py --tests 10 --commands 10`. Measure the remaining CPU before you select a direct call. Name each file's test count, and each real launcher process that each test starts.
+2. Test launcher logic by direct calls. Keep a few real dispatches, each for a path that no direct call can prove. `FirstDispatchFixture` already shares first-dispatch state, and `DEFAULT_ASSIGNMENT_EXECUTION` keeps the real dispatches. A test that only needs the state of a first dispatch uses `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. The Phase 54 wall floors of `_reuse` and `_identity` do not hold these files back.
+3. A cut in a production file goes to the director first, with the measured gain.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/direct/test_assign_launcher.py` — 120.7 CPU s
+- `scripts/direct/test_assign_launcher_reuse.py` — 71.9 CPU s
+- `scripts/direct/test_assign_launcher_identity.py` — 64.5 CPU s
+- `scripts/direct/test_assign_launcher_review.py` — 43.8 CPU s
+- `scripts/direct/assign_launcher_test_support.py` — the assign fixture
+
+**Workers:** 1 writer on slot `impl4` (one fixture family)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. Before the coordinator change, the coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- each changed file green; the behavior map has one row per assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after for each file, in the checkpoint notice
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
