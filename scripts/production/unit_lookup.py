@@ -33,7 +33,7 @@ from scripts.production.session_labels import StaffLabels
 from scripts.shutdown import remote
 from scripts.lib import unit_runs  # noqa: E402
 
-USAGE = "usage: unit_lookup.py list <production production_name> | pane <production production_name> <unit>"
+USAGE = "usage: unit_lookup.py list <production name> | pane <production name> <unit>"
 
 
 from scripts.production.session_staff import (
@@ -79,11 +79,6 @@ def doc_units(doc: Path, record: staff.StaffSnapshot) -> tuple[staff.StaffRow, .
     return tuple(record.find(kind="unit", parent=doc_owner(doc, record).id))
 
 
-def production_name_for_document(doc: Path, record: staff.StaffSnapshot) -> str:
-    """Resolve a production through its registered document and fixed owner."""
-    return doc_owner(doc, record).name
-
-
 def local_worktree(selected: MemberFound | NoSuchMember) -> staff.PresentWorktree | staff.RemovedWorktree:
     """Require a recorded local location without changing its lifecycle state."""
     if isinstance(selected, NoSuchMember):
@@ -109,10 +104,10 @@ class UnitMetadata:
     problems: tuple[UnitProblem, ...]
 
 
-def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
+def unit_metadata(record: staff.StaffSnapshot, *,
                   name: str | None = None) -> UnitMetadata:
     """Return unit facts and problems without writing diagnostics."""
-    productions = production_members(record, sources)
+    productions = production_members(record)
     rows = (tuple(row for children in productions.values() for row in children) if name is None
             else productions.get(name, ()))
     resolver = session_staff.RowResolver(record, rows=rows)
@@ -545,7 +540,7 @@ def labeled_session(production_name: str, name: str, *, record: staff.StaffSnaps
                 running: Sequence[SessionRecord] | None = None) -> LabeledSession | None:
     """Return one unit of the production. Unreadable herdr raises OSError."""
     record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources(record=record)
+    sources = sources if sources is not None else member_sources()
     selected = sources.member(UnitMember(production_name, name), record)
     label = selected.row.name if isinstance(selected, MemberFound) else name
     marked = observed_session_labels(record=record, running=running)

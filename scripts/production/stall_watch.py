@@ -1205,39 +1205,40 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
         print(f"stall-watch: process snapshot: {rows.reason}", file=sys.stderr)
     runners = showrunners.ShowrunnerDiscovery()
     record = staff.StaffSnapshot(())
+    work: list[PaneInspection] = []
+    members_by_parent: dict[staff.ReportsTo | staff.StaffRoot, tuple[str, ...]] = {}
     try:
         record = staff.snapshot()
+        sessions = unit_lookup.every_labeled_session(record=record)
     except (OSError, UnicodeError) as error:
         print(f"stall-watch: units: their run state is unknown: {error}", file=sys.stderr)
     else:
         runners = showrunners.registered_showrunners(deadline=inspection_deadline, membership=record)
-    work: list[PaneInspection] = []
-    members_by_parent: dict[staff.ReportsTo | staff.StaffRoot, tuple[str, ...]] = {}
-    for configured in runners:
-        # A showrunner that is not running has no one to tell: its units are not watched.
-        showrunner_socket = configured["socket"]
-        if not showrunner_socket:
-            continue
-        try:
-            zone = ZoneInfo(configured["zone"])
-        except (KeyError, ValueError):
-            print(f"stall-watch: invalid zone for {configured['name']}: {configured['zone']}", file=sys.stderr)
-            continue
-        try:
-            production_name = configured["name"]
-            marked = unit_lookup.labeled_sessions(production_name, record=record)
-            for name, unit in marked.items():
-                if isinstance(unit.identity, session_staff.NoSession):
-                    raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
-                row = unit_lookup.unit_row(name, record, reference=unit.identity)
-                if row.parent not in members_by_parent:
-                    members_by_parent[row.parent] = tuple(member.name
-                        for member in (record.find(kind="unit", parent=row.parent.id) if isinstance(row.parent, staff.ReportsTo) else ())
-                        if not isinstance(member.worktree, staff.RemovedWorktree))
-                work.append(PaneInspection(production_name, configured, zone, members_by_parent[row.parent], name, unit, row))
-        except (OSError, UnicodeError, ValueError) as error:
-            print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
-            continue
+        for configured in runners:
+            # A showrunner that is not running has no one to tell: its units are not watched.
+            showrunner_socket = configured["socket"]
+            if not showrunner_socket:
+                continue
+            try:
+                zone = ZoneInfo(configured["zone"])
+            except (KeyError, ValueError):
+                print(f"stall-watch: invalid zone for {configured['name']}: {configured['zone']}", file=sys.stderr)
+                continue
+            try:
+                production_name = configured["name"]
+                marked = sessions.status_units(production_name)
+                for name, unit in marked.items():
+                    if isinstance(unit.identity, session_staff.NoSession):
+                        raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
+                    row = unit_lookup.unit_row(name, record, reference=unit.identity)
+                    if row.parent not in members_by_parent:
+                        members_by_parent[row.parent] = tuple(member.name
+                            for member in (record.find(kind="unit", parent=row.parent.id) if isinstance(row.parent, staff.ReportsTo) else ())
+                            if not isinstance(member.worktree, staff.RemovedWorktree))
+                    work.append(PaneInspection(production_name, configured, zone, members_by_parent[row.parent], name, unit, row))
+            except (OSError, UnicodeError, ValueError) as error:
+                print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
+                continue
     runs = unit_lookup.HeldRunLookup(record=record)
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 from zoneinfo import ZoneInfo
@@ -17,13 +18,22 @@ class Refusal(Exception):
     """An invalid request that must leave the production unchanged."""
 
 
-class Production(NamedTuple):
+@dataclass(frozen=True)
+class ProductionDocument:
     doc: Path
     name: str
     merge_branch: str
     checkout: Path
     log: Path
     zone: ZoneInfo
+
+    def for_owner(self, owner: staff.StaffRow) -> Production:
+        return Production(self.doc, self.name, self.merge_branch, self.checkout, self.log, self.zone, owner)
+
+
+@dataclass(frozen=True)
+class Production(ProductionDocument):
+    owner: staff.StaffRow
 
 
 def cell_value(value: str) -> str:
@@ -75,18 +85,19 @@ def production_field(lines: list[str], field: str) -> str:
     return value
 
 
-def read_production(name: str, record: staff.StaffSnapshot | None = None) -> Production:
+def read_production(reference: str | staff.StaffRow, record: staff.StaffSnapshot | None = None) -> Production:
     """Read the document from the showrunner row."""
     try:
-        row = showrunners.owner_for(name, record)
+        row = reference if isinstance(reference, staff.StaffRow) else showrunners.owner_for(reference, record)
         if not isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
-            raise Refusal(f"{name}: no production document")
-        return read_new_production(row.doc.path, row.name)
+            raise Refusal(f"{row.name}: no production document")
+        document = read_new_production(row.doc.path, row.name)
+        return document.for_owner(row)
     except (OSError, UnicodeError, KeyError, ValueError) as error:
         raise Refusal(f"cannot read production doc: {error}") from error
 
 
-def read_new_production(doc: Path, name: str) -> Production:
+def read_new_production(doc: Path, name: str) -> ProductionDocument:
     """Read a new production document with its specified staff name."""
     try:
         doc = doc.expanduser().resolve(strict=True)
@@ -96,7 +107,7 @@ def read_new_production(doc: Path, name: str) -> Production:
         log = Path(production_field(lines, "Log"))
         if log.is_absolute():
             raise Refusal("production Log must be relative to Showrunner checkout")
-        return Production(doc, name, merge_branch, checkout, checkout / log, user_zone())
+        return ProductionDocument(doc, name, merge_branch, checkout, checkout / log, user_zone())
     except (OSError, UnicodeError, KeyError, ValueError) as error:
         raise Refusal(f"cannot read production doc: {error}") from error
 

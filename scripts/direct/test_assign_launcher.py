@@ -52,9 +52,9 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.phase = self.fixture.run_dir / "phases/8"
         write_text_atomic(self.fixture.run_dir / "worker_transport", "herdr\n")
         write_text_atomic(self.fixture.prompt, "Phase 8 — Workers\nReview Stage 1, then review the final diff in Stage 2.\n")
-        _ = self.fixture.opened("impl", "impl")
+        opened = self.fixture.opened("impl", "impl")
         _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="impl", phase="8", role="impl",
-            worker_name="impl", launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
+            worker_name="impl", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run_worker_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -194,7 +194,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def test_review_role_refusal_keeps_the_active_worker_and_types_neither_stage(self) -> None:
         opened = self.fixture.opened("review", "impl")
         _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="review", phase="8", role="impl",
-            worker_name="review", launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
+            worker_name="review", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
         before = self.fixture.fixture.staff_state()
         self.assert_start_not_delivered(worker.ExitCode.REFUSED, "role change blocked by active work: active dispatch has another role")
         self.assertEqual(self.fixture.fixture.staff_state(), before)

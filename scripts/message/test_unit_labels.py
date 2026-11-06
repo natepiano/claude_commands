@@ -79,7 +79,7 @@ class FileOnlyLabelTests(unittest.TestCase):
             timer_path = root / f"showrunner-{identity}"
             timer_path.mkdir()
             _ = (timer_path / "conf").write_text(
-                f"TARGET=session:{identity}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+                f"TARGET=session:{identity}\nCHECK=zsh /scripts/production_check.sh {identity}\n")
             record: SessionRecord = {
                 "pid": 123, "sessionId": identity, "name": "healthy", "messagingSocketPath": "",
                 "updatedAt": 1, "tmux": "", "formerNames": [],
@@ -141,6 +141,30 @@ class FileOnlyLabelTests(unittest.TestCase):
                         self.assertIn("broken-owner", problems[0])
                         self.assertIn("fixture timer cannot be read", problems[0])
 
+    def test_production_places_reads_each_parent_timer_once(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production import showrunners
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
+            doc = Path(directory) / "production.md"
+            _ = doc.write_text("# Production\n")
+            parents = [fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+                       for name in ("healthy", "broken")]
+            for parent in parents:
+                for number in range(3):
+                    _ = fixture_member("unit", name=f"{parent.name}-{number}", parent=parent.id)
+            record = staff.snapshot()
+            problems: list[str] = []
+            with mock.patch.object(showrunners, "timer_for", side_effect=[showrunners.NoTimer("fixture"),
+                                                                       OSError("fixture timer failed")]) as timers:
+                places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=record)
+            self.assertEqual(timers.call_args_list, [mock.call(parent, record) for parent in parents])
+            self.assertEqual({place.director for place in places.values()},
+                             {unit_labels.DirectsUnit(f"healthy-{number}") for number in range(3)})
+            self.assertEqual(len(problems), 1)
+            self.assertIn("fixture timer failed", problems[0])
+
     def test_unreadable_timer_file_does_not_remove_another_showrunners_rows(self) -> None:
         from scripts.message import unit_labels
         from scripts.production import session_staff, showrunners
@@ -163,7 +187,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                 timer_path = timers / f"showrunner-{owner_id}"
                 timer_path.mkdir(parents=True)
                 _ = (timer_path / "conf").write_text(
-                    f"TARGET=session:{owner_id}\nCHECK=zsh /scripts/production_check.sh {document}\n")
+                    f"TARGET=session:{owner_id}\nCHECK=zsh /scripts/production_check.sh {owner_id}\n")
             unreadable = timers / f"showrunner-{rows[0].id}" / "conf"
             unreadable.unlink()
             unreadable.mkdir()
@@ -233,7 +257,7 @@ from scripts.production import session_staff
 record = json.loads(sys.stdin.read())
 with (mock.patch.object(unit_labels, "newest_sessions", return_value=[record]),
       mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
-      mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ()))):
+      mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(()))):
     labels = unit_labels.unit_labels_for([record["sessionId"]], {
         "HERDR_PROC": sys.argv[1], "NOTIFIER_STATE_DIR": sys.argv[1],
         "NOTIFIER_SESSIONS_DIR": sys.argv[1],

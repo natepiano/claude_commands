@@ -227,7 +227,7 @@ class RosterTests(unittest.TestCase):
         instance.mkdir()
         _ = (instance / "conf").write_text(
             "TARGET=session:acd50bad-5afa-5d3d-b155-3766b7d113e0\n"
-            + f"CHECK=zsh /scripts/production_check.sh {self.production_doc}\n",
+            + f"CHECK=zsh /scripts/production_check.sh {showrunner_relationship('alpha').id}\n",
             encoding="utf-8",
         )
 
@@ -626,7 +626,7 @@ class RosterTests(unittest.TestCase):
         _ = staff.set_doc(receiving.id, staff.LiveDoc("natedev", doc))
         timer = self.notifier / "showrunner-receiving"
         timer.mkdir()
-        _ = (timer / "conf").write_text(f"TARGET=session:522e6367-86e1-5829-ada8-2c71b5c28c97\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+        _ = (timer / "conf").write_text(f"TARGET=session:522e6367-86e1-5829-ada8-2c71b5c28c97\nCHECK=zsh /scripts/production_check.sh {receiving.id}\n")
         self._write_session(str(os.getppid()), "receiving-runner", "522e6367-86e1-5829-ada8-2c71b5c28c97", self.home / "receiving",
                             pid=os.getppid())
         director = self._entries()["director"]
@@ -2485,7 +2485,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
         _ = recorded_showrunner("builds", doc)
         timer = notifier / "showrunner-builds"
         timer.mkdir()
-        _ = (timer / "conf").write_text(f"TARGET=session:{self.runner_id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+        _ = (timer / "conf").write_text(f"TARGET=session:{self.runner_id}\nCHECK=zsh /scripts/production_check.sh builds\n")
         run = self.runs / "run-00"
         self.mesh(run, {"report-test2": {"thread_id": self.thread, "status": "running"}})
         _ = (self.runs / "active" / self.director_id).write_text(str(run) + "\n")
@@ -2673,7 +2673,7 @@ class UnitLabelsTests(unittest.TestCase):
         notifier = root / "notifier"
         (notifier / "showrunner-cargo-liner-style").mkdir(parents=True)
         _ = (notifier / "showrunner-cargo-liner-style/conf").write_text(
-            f"TARGET=session:{unit.parent.id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+            f"TARGET=session:{unit.parent.id}\nCHECK=zsh /scripts/production_check.sh {unit.parent.id}\n")
         with mock.patch.object(unit_labels, "newest_sessions", return_value=records), \
              mock.patch.object(sessions, "sessions_dir", return_value=registry), \
              mock.patch.object(sessions, "running_session", return_value=True), \

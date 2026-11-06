@@ -263,22 +263,21 @@ class NextItemTests(unittest.TestCase):
                 f'[{{"since": "2026-10-06T09:00", "text": "{name}-item"}}]')
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{name}"
             timer.mkdir(parents=True)
-            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
+            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
         tree = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"], "side": ["side"]}
 
         def owner_docs(doc: Path, *, record: staff.StaffSnapshot | None = None) -> list[Path]:
             return [docs[name] for name in tree[unit_lookup.doc_owner(doc, record if record is not None else staff.snapshot()).name]]
 
-        def the_list(production: str) -> Path:
+        def the_list(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
+            del record
             # Only the root's doc has a Change review line; its children read its list.
             if production in ("kid", "grand"):
                 raise change_review.ChangeReviewError("no line")
             return side_list if production == "side" else path
 
-        def production(name: str, record: staff.StaffSnapshot | None = None) -> Production:
-            del record
-            doc = docs[name]
-            return Production(doc, name, "", self.root, self.root / "log.md", ZoneInfo("UTC"))
+        def production(owner: staff.StaffRow) -> Production:
+            return Production(docs[owner.name], owner.name, "", self.root, self.root / "log.md", ZoneInfo("UTC"), owner)
 
         def shown(kind: str, name: str, below: bool = False) -> list[str]:
             queue = next_item.read_queue(kind, docs[name], below)
@@ -323,7 +322,8 @@ class NextItemTests(unittest.TestCase):
         _ = change_review.append_rows(path, [Visible("kid change", "Run it", "It works")], date(2026, 10, 15), "",
                                       kid, record=staff.snapshot())
 
-        def the_list(production: str) -> Path:
+        def the_list(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
+            del record
             if production == "kid":
                 raise change_review.ChangeReviewError(f"{kid} has no line")
             return path

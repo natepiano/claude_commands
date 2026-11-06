@@ -3783,12 +3783,14 @@ with patch.object(fcntl, "flock", admission):
                                      "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
             first = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
             path = session / "progress_history_state.json"
             before = (path.read_bytes(), path.stat().st_mtime_ns)
             resumed = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
             self.assertEqual(resumed, first)
@@ -3797,6 +3799,7 @@ with patch.object(fcntl, "flock", admission):
             _ = stage_two.write_text("Phase 3 — Retry handling\nComplete the second review stage.\n")
             second_stage = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=stage_two, kind="broad", lens="contract",
             )
             self.assertEqual(second_stage, first)
@@ -3805,6 +3808,7 @@ with patch.object(fcntl, "flock", admission):
             before = (path.read_bytes(), path.stat().st_mtime_ns)
             finished = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
             self.assertEqual(finished, first)
@@ -3825,6 +3829,7 @@ with patch.object(fcntl, "flock", admission):
                                      "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
             instance = progress_history.begin_dispatch(
                 session, slot="test", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
             for status in ("active", "completed"):
@@ -3866,11 +3871,13 @@ with patch.object(fcntl, "flock", admission):
             with self.assertRaisesRegex(SystemExit, "Fix launch has no ledger round"):
                 _ = progress_history.begin_dispatch(
                     session, slot="test", phase="3", role="fix", worker_name="fix",
+                    worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                     launcher_command=command, prompt=prompt, kind="implementation", lens="",
                 )
             self.assertEqual(self.pass_slots(session), {})
             instance = progress_history.begin_dispatch(
                 session, slot="test", phase="3", role="fix", worker_name="fix",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="implementation", lens="",
                 fix_cause="The recorder gate failed", fix_pass=2, activity="repair the recorder gate",
             )
