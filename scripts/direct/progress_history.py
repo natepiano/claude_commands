@@ -18,6 +18,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -1074,36 +1075,78 @@ class NoDispatchRecorded:
     """The worker has no recorded dispatch."""
 
 
-def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
-    """Read the newest finished dispatch across the staff parent's runs."""
+@dataclass
+class DispatchReads:
+    record: staff.StaffSnapshot
+    states: dict[Path, dict[str, object]]
+    events: dict[Path, list[dict[str, object]]]
+    roles: agents_log.RoleLog
+
+
+class ReadDispatches(Enum):
+    CURRENT = "read dispatch history at use"
+
+
+_dispatch_reads: ContextVar[DispatchReads | ReadDispatches] = ContextVar("dispatch_reads", default=ReadDispatches.CURRENT)
+
+
+@contextmanager
+def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generator[None]:
+    """Share history reads within one command, without retaining them afterward."""
+    states: dict[Path, dict[str, object]] = {}
+    for run in runs:
+        path = run / unit_runs.STATE_FILE
+        try:
+            states[path] = _json_object(path.read_text(encoding="utf-8")) or {}
+        except (OSError, UnicodeError):
+            continue
+    token = _dispatch_reads.set(DispatchReads(record, states, {},
+        agents_log.assignments(agents_log.state_dir() / "agents.jsonl")))
     try:
-        membership = staff.local_snapshot()
-        worker = membership.by_id(worker_id)
-    except staff.StaffUnreadable:
-        return NoDispatchRecorded()
+        yield
+    finally:
+        _dispatch_reads.reset(token)
+
+
+def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
+    """Read the newest open or finished dispatch across the staff parent's runs."""
+    reads = _dispatch_reads.get()
+    if isinstance(reads, ReadDispatches):
+        try:
+            membership = staff.local_snapshot()
+        except staff.StaffUnreadable:
+            return NoDispatchRecorded()
+        runs = [path.parent for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT"))
+                for path in root.glob(f"*/{unit_runs.STATE_FILE}")]
+        if private := unit_runs.environ("RUN_DIR"):
+            runs.append(Path(private))
+        with dispatch_reads(membership, dict.fromkeys(runs)):
+            return last_dispatch(worker_id)
+    membership = reads.record
+    worker = membership.by_id(worker_id)
     if worker is None or worker.kind != "worker":
         return NoDispatchRecorded()
     parent = membership.parent_of(worker)
     records: list[tuple[Path, dict[str, object]]] = []
-    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
-        for path in root.glob(f"*/{unit_runs.STATE_FILE}"):
-            try:
-                state = _json_object(path.read_text(encoding="utf-8")) or {}
-                if unit_runs.run_owner(state, membership) != parent:
-                    continue
-            except (OSError, UnicodeError):
-                continue
-            passes = [*_pass_slots(state).values(), *(
+    for path, state in reads.states.items():
+        try:
+            owner = unit_runs.run_owner(state, membership)
+        except (OSError, UnicodeError):
+            continue
+        if owner != parent:
+            continue
+        if path not in reads.events:
+            reads.events[path] = _run_events(state, record=membership)
+        passes = [*_pass_slots(state).values(), *(
                 {**event, "instance_id": event.get("pass_instance_id"), "kind": event.get("pass_kind"),
                  "started_at": event.get("pass_started_at"), "finished_at": event.get("timestamp_epoch"),
                  "phase": {"id": event.get("phase_id")}}
-                for event in _run_events(state) if event.get("event_type") == "pass_finished")]
-            records.extend((path.parent, record) for record in passes
-                           if _string(record.get("status")) in {"completed", "error", "canceled", "interrupted"}
-                           and (record.get("worker_id") == worker_id if record.get("worker_id")
-                                else record.get("worker_name") == worker.name))
-    task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-                              worker.current_session, datetime.now(UTC))
+                for event in reads.events[path] if event.get("event_type") == "pass_finished")]
+        records.extend((path.parent, record) for record in passes
+                       if _string(record.get("status")) in {"active", "completed", "error", "canceled", "interrupted"}
+                       and (record.get("worker_id") == worker_id if record.get("worker_id")
+                            else record.get("worker_name") == worker.name))
+    task = agents_log.role_at(reads.roles, worker.current_session, datetime.now(UTC))
     run, latest = max(records, key=lambda item: _number(item[1].get("finished_at"), _number(item[1].get("started_at"))),
                       default=(Path(), dict[str, object]()))
     role = _string(latest.get("kind")) or (task.role if isinstance(task, agents_log.Assignment) else "")
@@ -2686,7 +2729,9 @@ LEGACY_BOTH_LENS = "both"
 LEGACY_BOTH_LENSES: tuple[str, ...] = ("adversary", "contract")
 
 
-def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
+def _run_events(state: dict[str, object], *,
+                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL
+                ) -> list[dict[str, object]]:
     """Every event this run recorded, oldest first.
 
     Scoped to the one run rather than `_load_events`' whole history: the stage
@@ -2704,7 +2749,7 @@ def _run_events(state: dict[str, object]) -> list[dict[str, object]]:
     except OSError:
         return []
     events: list[dict[str, object]] = []
-    record = staff.initial_snapshot()
+    record = staff.initial_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
     for line in lines:
         event = _json_object(line)
         if event is not None and _integer(event.get("schema_version")) == SCHEMA_VERSION:
