@@ -303,7 +303,8 @@ The existing unreachable limit still applies until a valid reply arrives.
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
 The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
-Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the look-ahead window.
+Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
+The gate removes its progress counter before reruns, which keep the full need.
 The merge-gate progress profile key includes `shape` (`tests` or `types`).
 Earlier profiles do not match, and nightly runs use separate profiles.
 It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.

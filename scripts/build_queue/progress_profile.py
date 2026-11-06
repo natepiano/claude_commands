@@ -247,6 +247,10 @@ def publish_counter(sidecar: Path, counter: ProgressCounter) -> None:
     atomic_sample(progress_path(sidecar, "json"), json.dumps(snapshot_value(counter), separators=(",", ":")))
 
 
+def clear_counter(sidecar: Path) -> None:
+    progress_path(sidecar, "json").unlink(missing_ok=True)
+
+
 def read_counter(sidecar: Path) -> ProgressCounter | NoCounter:
     try:
         return cast(ProgressCounter, parse_snapshot_value(

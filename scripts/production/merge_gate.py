@@ -1031,11 +1031,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         requests = {(job.kind, job.suite, job.module): job for job in pending}
         progress_total = len(pending)
         progress_done = 0
-        progress_phase = "suites:1"
         def publish_progress() -> None:
             if progress_total:
                 progress_profile.publish_counter(reservation.sidecar,
-                    progress_profile.ProgressCounter(progress_phase, progress_done, progress_total))
+                    progress_profile.ProgressCounter("suites:1", progress_done, progress_total))
 
         publish_progress()
         try:
@@ -1150,8 +1149,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         first_runs = {(result.suite, result.module): result for result in failed}
                         pending.extend(requests[(result.kind, result.suite, result.module)] for result in failed)
                         if failed:
-                            progress_phase, progress_done, progress_total = "suites:2", 0, len(failed)
-                            publish_progress()
+                            progress_total = 0
+                            progress_profile.clear_counter(reservation.sidecar)
                 if running or pending:
                     time.sleep(0.05)
         finally:
