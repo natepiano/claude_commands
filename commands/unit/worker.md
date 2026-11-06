@@ -8,7 +8,7 @@ Run `scripts/lib/py scripts/production/worker.py` from the unit's session.
 The caller's native identity selects the parent.
 Use the supplied arguments: `$ARGUMENTS`.
 
-1. Use `list [--json]` to show names, dispatch roles, pane states, and unknown evidence.
+1. Use `list [--json]` to show names, dispatch roles, worker states, and activity.
 2. Use `add <role> [--name <name>] [--json]` to create a worker or reconcile named creation.
 3. Use `end <name>` to close a worker and remove its row after confirmed closure.
 4. Use `restore` to resume retained workers on their recorded native sessions.
@@ -29,6 +29,10 @@ Selection uses the first idle or resumable worker in role-number order.
 The first standard assignment creates the default team.
 A rerun uses the same pass and transcript receipt without another submission.
 The prompt file remains unchanged.
+For a mesh-pinned run, `list` reads the mesh roster through the shared board reader.
+For that run, `check` prints incomplete rows and returns 1 only when one exists.
+For that run, `restore` prints `unchanged`, returns 0, and changes no pane or staff row.
+Other callers use the pane states.
 A complete restore rerun prints `unchanged`.
 Retire, wrap, and promote retain stopped workers for restore.
 

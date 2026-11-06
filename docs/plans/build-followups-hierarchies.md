@@ -626,16 +626,17 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 - `unit_runs.report_anomaly` prints each anomaly line once per process. `unit_runs.director` and `worker_admission.parent` use it.
 - `unit_runs` and `scripts.lib.unit_runs` are one module through `sys.modules.setdefault`, so both names share that record.
-- `worker_panes.dispatch_role` takes the run as an argument. `worker.py` reads `worker_run(parent)` once before each loop, so one list makes one scan. `pane_moves._move_locked` passes `move.run`.
+- One list makes one run scan. herdr phase 14d owns this: `worker._read_workers` reads the held runs once and `progress_history.dispatch_reads` shares them, so `dispatch_role(row)` scans nothing. Phase 24's own `dispatch_role(row, run)` form was dropped at the merge with 14d.
 - `worker_lifecycle.locked_state`: a shared read of a missing folder creates nothing. A writer still creates its folder and lock.
 - `worker_admission.parent` looks up a showrunner only when a production name is known. With no name, the error is a whole sentence that names what is missing.
 - No folder is deleted by code, and no check, guard or refusal is added. The cause of the mangled folder names is workers that retype a run path. sdlc gave herdr that design note.
 
-**Files:** `scripts/lib/unit_runs.py`, `scripts/herdr/worker_panes.py`, `scripts/production/worker.py`, `scripts/production/worker_admission.py`, `scripts/agents/worker_lifecycle.py`, `scripts/accounts/pane_moves.py` and their test modules.
+**Files:** `scripts/lib/unit_runs.py`, `scripts/production/worker_admission.py`, `scripts/agents/worker_lifecycle.py` and their test modules, and `scripts/production/test_worker.py`.
 
 **Gotchas:**
 - Do not run 223 test modules in one process. That run gave 214 failures and 60 errors from tests that interfere. Use `merge_gate.py --checkout <tree> --tests-only`.
 - A merge can bring a new caller of a changed signature. The sdlc merge brought `pane_moves.py`, and only the full gate found it.
+- `ROSTER_RUN_ROOT` selects the scanned runs in a worker list. The `test_worker` fixture sets it to its root folder.
 
 ### Phase 25 — A new tab takes its place past saved worker tabs  · status: todo
 

@@ -10,6 +10,9 @@ TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sync-codex-catalog.XXXXXX")"
 # it writable again to clear the tree.
 trap 'chmod -R u+rwx "$TEST_DIR" 2>/dev/null; rm -rf "$TEST_DIR"' EXIT
 
+export HOME="$TEST_DIR/home"
+mkdir -p "$HOME"
+
 AGENTS="$TEST_DIR/models.conf"
 export MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG="$TEST_DIR/config.toml"
@@ -86,6 +89,13 @@ test_model_families() (
         claude.families/opus=opus \
         claude.families/sonnet=sonnet \
         claude.families/haiku=haiku
+    "$SCRIPT_DIR/../lib/py" - "$AGENTS" <<'PYTHON'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+path.write_text(re.sub(r"^(direct|gpt-[^=\n]*)=", r"\1 = ", path.read_text(), flags=re.MULTILINE))
+PYTHON
     printf '%s\n' 'model = "gpt-9-sol"' > "$CODEX_CONFIG"
     cat > "$MODELS_CACHE" <<'EOF'
 {"models":[
@@ -404,7 +414,9 @@ grep -q '^gpt-current=medium,high$' <(effective_registry) \
 # the catalog and the state file itself.
 mkdir -p "$(dirname "$SYNC_STATE")"
 mkdir "$(dirname "$SYNC_STATE")/sync.lock"
+registry_read_probe "$TEST_DIR" "$AGENTS"
 run_sync >"$TEST_DIR/stdout" 2>"$STDERR_FILE" || fail "a held lock did not exit 0"
+[[ ! -s "$TEST_REGISTRY_READS" ]] || fail "a sync without sync.lock read the registry: $(cat "$TEST_REGISTRY_READS")"
 assert_contains "$(<"$TEST_DIR/stdout")" "already running" \
     "a held lock was not reported as contention"
 rmdir "$(dirname "$SYNC_STATE")/sync.lock"
@@ -439,9 +451,11 @@ assert_contains "$(<"$STDERR_FILE")" "cannot create the sync state directory" \
 before="$TEST_DIR/before-invalid.conf"
 cp "$AGENTS" "$before"
 printf '%s\n' '{invalid' > "$MODELS_CACHE"
+: > "$TEST_REGISTRY_READS"
 if run_sync >/dev/null 2>&1; then
     fail "invalid cache unexpectedly succeeded"
 fi
+[[ -s "$TEST_REGISTRY_READS" ]] || fail "the invalid-cache sync did not read the registry"
 cmp "$before" "$AGENTS" || fail "invalid cache changed the registry"
 
 # Updating the shared catalog must keep the registry and its mode

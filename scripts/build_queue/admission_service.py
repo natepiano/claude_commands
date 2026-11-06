@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from collections.abc import Generator, Mapping
+from concurrent.futures import Future
 from contextlib import contextmanager
 import errno
 from dataclasses import dataclass, field, replace
@@ -11,20 +13,26 @@ import os
 from pathlib import Path
 import select
 import socket
+import struct
 import subprocess
 import sys
 import threading
-import time
 from typing import TYPE_CHECKING, Callable, Protocol, cast
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.build_queue import snapshot_codec as codec
 from scripts.lib import conf, inotify
+from scripts.lib.boot_identity import boot_identity
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_records as records
+from scripts.build_queue import step_estimator
+from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_snapshot
-from scripts.build_queue.queue_view import reason_phrase
+from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
+from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 
 if TYPE_CHECKING:
@@ -32,14 +40,15 @@ if TYPE_CHECKING:
 else:
     import store
 
-from scripts.build_queue.scope_activity import LiveBuildRun, ScopeActivityReader, ScopeProcesses
+from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses
 from scripts.lint.build_shape import build_shape, recorded_build_shape
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
 from scripts.message import send_budget, send_result
 from scripts.message.session_send import session_send_argv
 
 
+CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
 READING_ALERT_KEY = "build-admission-reading"
 
 
@@ -97,25 +106,20 @@ def retry_cleanup(path: Path) -> Generator[None]:
         print(f"memory admission: cannot finish cleanup {path}: {error}; will retry", file=sys.stderr)
 
 
+def _live_run(run: wire.RunIdentity) -> LiveBuildRun:
+    return LiveBuildRun(run.pid, run.start_time, 0.0)
+
+
 class Clock(Protocol):
     def now(self) -> float: ...
     def monotonic(self) -> float: ...
 
 
-class SystemClock:
-    def now(self) -> float:
-        return time.time()
-
-    def monotonic(self) -> float:
-        return time.monotonic()
-
-    def sleep(self, seconds: float) -> None:
-        time.sleep(seconds)
 
 
 class Readings(Protocol):
     def host(self) -> gate.HostMemory | gate.ReadingUnavailable: ...
-    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure | gate.PressureUnavailable: ...
+    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure: ...
     def compilers(self) -> list[gate.StepMemory]: ...
     def reservation(self, path: Path, row: gate.Reservation, now: datetime,
                     processes: dict[int, gate.ProcessIdentity], proc: Path, policy: gate.AdmissionPolicy) -> gate.StepMemory: ...
@@ -128,8 +132,8 @@ class SystemReadings:
         except (OSError, ValueError) as error:
             return gate.ReadingUnavailable(str(error) or "memory reading unavailable")
 
-    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure | gate.PressureUnavailable:
-        return gate.read_pressure_reading(host, policy=policy)
+    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure:
+        return gate.read_pressure(host, policy=policy)
 
     def compilers(self) -> list[gate.StepMemory]:
         return gate.sccache_memory()
@@ -156,7 +160,7 @@ class Proc(Protocol):
     def owner_start(self, pid: int) -> LiveOwnerIdentity | OwnerProcessGone: ...
     def pidfd(self, pid: int) -> int: ...
     def lifetime(self, row: gate.Reservation, owner_live: bool
-                 ) -> gate.PopulatedStepScope | gate.LiveOwnerProcess | gate.EndedStep: ...
+                 ) -> gate.StepLifetime: ...
 
 
 class SystemProc:
@@ -175,7 +179,7 @@ class SystemProc:
         return os.pidfd_open(pid)
 
     def lifetime(self, row: gate.Reservation, owner_live: bool
-                 ) -> gate.PopulatedStepScope | gate.LiveOwnerProcess | gate.EndedStep:
+                 ) -> gate.StepLifetime:
         return gate.reservation_lifetime(row, owner_live)
 
 
@@ -281,7 +285,8 @@ def reservation_row(record: ReservationRecord) -> gate.Reservation:
         "package": record.package, "filters": list(record.filters),
     }
     if isinstance(record.run, wire.RunIdentity):
-        row["build_run"] = LiveBuildRun(record.run.pid, record.run.start_time, 0.0)
+        row["build_run"] = _live_run(record.run)
+        row["run_origin"] = gate.CallerRun(row["build_run"])
     if record.repo_identity:
         row["repo_identity"] = record.repo_identity
     if record.shape:
@@ -293,23 +298,6 @@ def reservation_row(record: ReservationRecord) -> gate.Reservation:
     if not isinstance(record.charge_use, gate.NoTestPhaseChargeUse):
         row["test_phase_charge_use"] = record.charge_use
     return row
-
-
-def reservation_record(episode: str, path: str, row: gate.Reservation) -> ReservationRecord:
-    """Build service state from a validated reservation record."""
-    width, call = row["test_threads"], row["call_id"]
-    return ReservationRecord(episode, path, wire.Owner(row["pid"], row["start_time"]), row["need"],
-        row["repo"], row["step"], row["worktree"], row["admitted_at"], row["sidecar"],
-        width, call,
-        row.get("reservation_id", ""), row.get("queue_waiter", {
-            "pid": row["pid"], "start_time": row["start_time"], "need": row["need"],
-            "since": datetime.fromisoformat(row["admitted_at"]).timestamp(), **gate.reservation_identity(row)}),
-        row.get("repo_identity", ""), row.get("test_scope", "full"), row.get("package", ""),
-        tuple(row.get("filters", [])), row.get("shape", ""), gate.read_test_phase_need(row.get("test_phase_need")),
-        finalization=row.get("finalization", NoFinalizationIntent()),
-        charge_use=row.get("test_phase_charge_use", gate.NoTestPhaseChargeUse()),
-        run=(wire.RunIdentity(row["build_run"].pid, row["build_run"].start_time)
-             if "build_run" in row and isinstance(row["build_run"], LiveBuildRun) else wire.NO_RUN))
 
 
 @dataclass(frozen=True)
@@ -345,12 +333,10 @@ class ServiceState:
     reservations: dict[str, ReservationRecord]
     places: dict[str, WaiterPlace]
     ledger: dict[str, ReplayEntry]
-    recovery: gate.StartSpacing
+    spacing: gate.StartSpacing
     override: gate.HeadAdmissionOverride | gate.NoHeadAdmissionOverride
     priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
-    legacy_cleanup: tuple[str, ...] = ()
     build_history_generation: int = 0
-    legacy_pending: tuple[str, ...] = ()
 
     run_places: dict[str, wire.RunPlace] = field(default_factory=dict)
     caller_versions: dict[str, str] = field(default_factory=dict)
@@ -420,6 +406,38 @@ class Connection:
     finished: bool = False
 
 
+QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest
+
+
+@dataclass
+class OrderedQueueChange:
+    request: QueueChange
+    connections: list[Connection]
+
+
+@dataclass(frozen=True)
+class NoPendingPriorityRoster:
+    """No priority change waits for a roster read."""
+
+
+@dataclass(frozen=True)
+class PendingPriorityRoster:
+    change: OrderedQueueChange
+    result: Future[Mapping[str, gate.UnitMembership]]
+
+
+def read_priority_roster(result: Future[Mapping[str, gate.UnitMembership]], wake: int) -> None:
+    """Read the roster without changing service state."""
+    try:
+        try:
+            result.set_result(gate.priority_labels(gate.RosterUnits()))
+        except Exception as error:
+            result.set_exception(error)
+        os.eventfd_write(wake, 1)
+    finally:
+        os.close(wake)
+
+
 @dataclass
 class WaitingAdmission:
     request: wire.AdmitRequest | wire.LaunchRequest
@@ -439,7 +457,7 @@ def _no_fault(_stage: str) -> None:
 
 
 def _place_key(owner: wire.Owner, since: float) -> str:
-    return f"{owner.pid}-{owner.start_time}:{since:.17g}"
+    return f"{gate.run_owner(owner.pid, owner.start_time)}:{since:.17g}"
 
 
 def _notify(message: str) -> None:
@@ -496,9 +514,33 @@ class StateIntents:
         self.persist()
 
 
+@dataclass(frozen=True)
+class ServiceEstimatedAdmission(wire.AdmitRequest):
+    """Retain service estimation for this connection without changing saved records."""
+
+
+def peer_uid(connection: Connection | NoConnection) -> int:
+    """Read the account before any replay or state lookup."""
+    if isinstance(connection, NoConnection):
+        return os.getuid()
+    credentials = connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    return struct.unpack("3i", credentials)[1]
+
+
+def process_uid(pid: int, proc: Path) -> int | OwnerProcessGone:
+    try:
+        for line in (proc / str(pid) / "status").read_text().splitlines():
+            if line.startswith("Uid:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return OwnerProcessGone()
+
+
 class AdmissionServer:
     def __init__(self, state_dir: Path, clock: Clock, readings: Readings, proc: Proc, *,
-                 fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None) -> None:
+                 fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
+                 capture_root: Path = CARGO_CAPTURE_ROOT) -> None:
         self.state_dir: Path = state_dir
         self.clock: Clock = clock
         self.readings: Readings = readings
@@ -506,18 +548,16 @@ class AdmissionServer:
         self.fault: Callable[[str], None] = fault
         self.socket_path: Path = socket_path if socket_path is not None else wire.admission_socket_path()
         self.waiters: dict[str, WaitingAdmission] = {}
-        self.launches: dict[str, WaitingAdmission] = {}
         self.reservations: dict[str, ReservationRecord] = {}
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
         self.run_places: dict[str, wire.RunPlace] = {}
         self.build_history_generation: int = 0
         self.ledger: dict[str, ReplayEntry] = {}
-        self.recovery: gate.StartSpacing = gate.ReadyToStart()
+        self.spacing: gate.StartSpacing = gate.ReadyToStart()
         self.override: gate.HeadAdmissionOverride | gate.NoHeadAdmissionOverride = gate.NoHeadAdmissionOverride()
         self.last_inputs: gate.QueueInputs | NoPass = NoPass()
         self.last_result: gate.PassResult | NoPass = NoPass()
-        self.last_limits: gate.AdmissionLimits | NoPass = NoPass()
         self.last_policy: gate.AdmissionPolicy | NoPass = NoPass()
         self.reading_hold: UnreadableReadingHold | NoReadingHold = NoReadingHold()
         self.reading_alert_delivery: ReadingAlertDelivery | NoReadingAlertDelivery = NoReadingAlertDelivery()
@@ -528,19 +568,28 @@ class AdmissionServer:
         self.last_usable_configuration: gate.MemoryConfig | NoPass = NoPass()
         self.caller_versions: dict[str, str] = {}
         self.slots: dict[str, gate.RunSlot] = {}
+        self.progress_history: progress.ProfileHistory = progress.ProfileHistory(state_dir / "progress_profiles")
+        self.progress_captures: progress.CaptureReader = progress.CaptureReader(capture_root)
+        try:
+            self.boot_id: str = boot_identity(proc.path)
+        except (OSError, ValueError):
+            self.boot_id = ""
+        self.host: str = store.host_name()
         self.pass_stale: bool = False
         self.pending_configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration | NoPass = NoPass()
         self.priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
+        self.pending_priority: PendingPriorityRoster | NoPendingPriorityRoster = NoPendingPriorityRoster()
+        self.queue_changes: deque[OrderedQueueChange] = deque()
         self.last_diagnostics: tuple[gate.ConfigurationDiagnostic, ...] = ()
         self._pending_replies: dict[str, list[wire.Reply]] = {}
-        self.legacy_cleanup: tuple[str, ...] = ()
-        self.legacy_pending: tuple[str, ...] = ()
         self._persisted: str = ""
         self.override_reconnect_until: ReconnectDeadline | ReconnectAwaitingListener | NoReconnectGrace = NoReconnectGrace()
         self.receiving_requests: bool = False
         self.connections: dict[int, Connection] = {}
         self.watchers: dict[int, OwnerWatch | ScopeWatch] = {}
         self.epoll: select.epoll = select.epoll()
+        self.priority_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self.epoll.register(self.priority_events, select.EPOLLIN)
         self.listener: socket.socket | NoConnection = NoConnection()
         self.stopped: bool = False
         self.closed: bool = False
@@ -576,93 +625,20 @@ class AdmissionServer:
             self.priority["transition"] = gate.SettledPriority()
         self.persist()
 
-    def _import_legacy(self) -> None:
-        """Import once, before a state file exists; remove files only after persistence."""
-        imported: list[Path] = []
-        self.legacy_pending = tuple(str(path) for path in self.state_dir.glob("*.token-wait"))
-        for path, row in gate.reservation_rows(self.state_dir):
-            stem = path.with_suffix("")
-            row["reservation_id"] = row.get("reservation_id") or stem.name
-            evidence = gate.read_test_phase_charge_use(path, row["reservation_id"])
-            if not isinstance(evidence, gate.NoTestPhaseChargeUse):
-                row["test_phase_charge_use"] = evidence
-            episode = row["reservation_id"]
-            current = reservation_record(episode, str(stem), row)
-            self.reservations[episode] = current
-            imported.append(path)
-            evidence_path = path.with_suffix(".test-phase-charge.json")
-            if evidence_path.exists():
-                imported.append(evidence_path)
-        for path in self.state_dir.glob("*.waiting"):
-            row = gate.read_waiter(path)
-            owner = wire.Owner(row["pid"], row["start_time"])
-            self.places[_place_key(owner, row["since"])] = waiter_place(row, path.stem)
-            imported.append(path)
-        self.priority = gate.load_queue_priority(self.state_dir)
-        self.recovery = gate.ReadyToStart()
-        self.override = gate.read_head_override(self.state_dir)
-        if not isinstance(self.override, gate.NoHeadAdmissionOverride):
-            self.override_reconnect_until = ReconnectAwaitingListener()
-        for name in ("queue_priority.json", "pressure-recovery", gate.head_override_path(self.state_dir).name):
-            path = self.state_dir / name
-            if path.exists():
-                imported.append(path)
-        self.legacy_cleanup = tuple(str(path) for path in imported)
-        if not isinstance(self.override, gate.NoHeadAdmissionOverride):
-            self.override["waiter"] = Path(self.override["waiter"]).stem
-        self.persist()
-        self.fault("after_import_state")
-        self._retry_legacy_imports()
-
-    def _retry_legacy_imports(self) -> None:
-        """Retry retained intents without repeating the completed legacy import."""
-        for name in self.legacy_pending:
-            path = Path(name)
-            with retry_cleanup(path):
-                intent = gate.read_token_wait(path)
-                row = intent["waiter"]
-                owner = wire.Owner(row["pid"], row["start_time"])
-                for episode, record in self.reservations.items():
-                    if Path(record.path + ".reservation") == Path(intent["reservation"]):
-                        self.reservations[episode] = replace(record, queue_waiter=row,
-                            ending=TokenWaiting("import-" + episode, row.get("token_left_at", self.clock.now())))
-                self.places[_place_key(owner, row["since"])] = waiter_place(row, path.stem)
-                pending, cleanup = self.legacy_pending, self.legacy_cleanup
-                self.legacy_pending = tuple(value for value in pending if value != name)
-                self.legacy_cleanup = (*cleanup, name)
-                try:
-                    self.persist()
-                except BaseException:
-                    self.legacy_pending, self.legacy_cleanup = pending, cleanup
-                    raise
-        self._finish_import()
-
-    def _finish_import(self) -> None:
-        for name in self.legacy_cleanup:
-            Path(name).unlink(missing_ok=True)
-        if self.legacy_cleanup:
-            self.legacy_cleanup = ()
-            self.persist()
-        self.fault("after_import_cleanup")
 
     def _restore(self) -> None:
         path = self.state_dir / "state.json"
         if path.exists():
             state = read_state(self.state_dir)
             self.reservations, self.places, self.ledger = state.reservations, state.places, state.ledger
-            self.recovery, self.override, self.priority = state.recovery, state.override, state.priority
-            self.legacy_cleanup = state.legacy_cleanup
-            self.legacy_pending = state.legacy_pending
+            self.spacing, self.override, self.priority = state.spacing, state.override, state.priority
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
             self._persisted = wire.encode_record(state)
-            self._retry_legacy_imports()
             if not isinstance(self.override, gate.NoHeadAdmissionOverride):
                 self.override_reconnect_until = ReconnectAwaitingListener()
-        else:
-            self._import_legacy()
         self.persist()
         for episode, record in list(self.reservations.items()):
             if not self._end_if_finished(episode, record):
@@ -709,8 +685,8 @@ class AdmissionServer:
                            or entry.reservation in live_reservations
                            or now - entry.ended_at < self.last_usable_configuration.replay_retention_seconds}
         encoded = wire.encode_record(ServiceState(
-            self.reservations, self.places, self.ledger, self.recovery, self.override, self.priority,
-            self.legacy_cleanup, self.build_history_generation, self.legacy_pending, self.run_places, self.caller_versions, self.lifecycle_outbox))
+            self.reservations, self.places, self.ledger, self.spacing, self.override, self.priority,
+            self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox))
         if encoded != self._persisted:
             write_text_atomic(self.state_dir / "state.json", encoded)
             self._persisted = encoded
@@ -739,7 +715,7 @@ class AdmissionServer:
             return
         self.watchers[descriptor] = OwnerWatch(owner)
 
-    def _watch_scope(self, lifetime: gate.PopulatedStepScope | gate.LiveOwnerProcess | gate.EndedStep,
+    def _watch_scope(self, lifetime: gate.StepLifetime,
                      episode: str) -> None:
         if not isinstance(lifetime, gate.PopulatedStepScope):
             return
@@ -762,7 +738,7 @@ class AdmissionServer:
 
     def _prune_watches(self) -> None:
         owners = {record.owner for record in self.reservations.values()}
-        owners.update(waiting.request.owner for waiting in (*self.waiters.values(), *self.launches.values()))
+        owners.update(waiting.request.owner for waiting in self.waiters.values())
         owners.update(place.owner for place in self.places.values())
         owners.update(wire.Owner(place.run.pid, place.run.start_time) for place in self.run_places.values())
         for descriptor, watch in list(self.watchers.items()):
@@ -776,7 +752,7 @@ class AdmissionServer:
             row = gate.rank_waiter(waiting.row, gate.NormalOrder())
             row["order_since"] = row.get("order_since", row["since"])
             if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.run, wire.RunIdentity):
-                place = self.run_places.get(self._run_key(waiting.request.run))
+                place = self.run_places.get(gate.run_owner(waiting.request.run.pid, waiting.request.run.start_time))
                 if place is not None:
                     row["order_since"] = min(place.since, row["order_since"])
             rows.append((self.state_dir / gate.waiter_owner(row), row))
@@ -806,8 +782,8 @@ class AdmissionServer:
     def _prune_runs(self) -> None:
         now = self.clock.now()
         for key, slot in list(self.slots.items()):
-            if (not self._live(wire.Owner(slot.run.pid, slot.run.start_time))
-                    or isinstance(slot, gate.BetweenStepsSlot) and now >= slot.expires_at):
+            if (not self._run_alive(gate.between_steps(slot).run)
+                    or not gate.slot_in_force(slot, now)):
                 del self.slots[key]
         for key, place in list(self.run_places.items()):
             owner = wire.Owner(place.run.pid, place.run.start_time)
@@ -819,8 +795,8 @@ class AdmissionServer:
     def _free_claim(self, owner: str) -> None:
         for key, slot in list(self.slots.items()):
             if isinstance(slot, gate.ContinuationSlot) and slot.owner == owner:
-                if slot.expires_at > self.clock.now() and self._live(wire.Owner(slot.run.pid, slot.run.start_time)):
-                    self.slots[key] = gate.BetweenStepsSlot(slot.run, slot.reservation, slot.bytes, slot.expires_at)
+                if gate.slot_in_force(slot.slot, self.clock.now()) and self._run_alive(slot.slot.run):
+                    self.slots[key] = slot.slot
                 else:
                     del self.slots[key]
 
@@ -839,23 +815,22 @@ class AdmissionServer:
             if not candidates:
                 continue
             key, slot = min(candidates, key=lambda item: (item[1].expires_at, item[0]))
-            self.slots[key] = gate.ContinuationSlot(slot.run, owner, slot.bytes, slot.reservation, slot.expires_at)
+            self.slots[key] = gate.ContinuationSlot(slot, owner)
             claimed.add(owner)
-
-    @staticmethod
-    def _run_key(run: wire.RunIdentity) -> str:
-        return f"{run.pid}-{run.start_time}"
 
     def _run_place(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace) -> None:
         if not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity):
             return
         run = request.run
-        key = self._run_key(run)
-        if key not in self.run_places and self._live(wire.Owner(run.pid, run.start_time)):
-            self.run_places[key] = wire.RunPlace(run, place.since, request.owner)
+        key = gate.run_owner(run.pid, run.start_time)
+        if key not in self.run_places and self._run_alive(run):
+            self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
 
     def _live(self, owner: wire.Owner) -> bool:
         return self.proc.owner_start(owner.pid) == LiveOwnerIdentity(owner.start_time)
+
+    def _run_alive(self, run: wire.RunIdentity | LiveBuildRun) -> bool:
+        return self._live(wire.Owner(run.pid, run.start_time))
 
     def _prune_places(self) -> None:
         for key, place in list(self.places.items()):
@@ -912,7 +887,7 @@ class AdmissionServer:
                    and matches_build_estimate(record.repo, record.repo_identity, record.shape, profile, shape)
                    for record in self.reservations.values())
 
-    def _inputs(self, config: gate.MemoryConfig) -> tuple[gate.QueueInputs, gate.AdmissionLimits]:
+    def _inputs(self, config: gate.MemoryConfig) -> gate.QueueInputs:
         now = self.clock.now()
         policy = config.policy
         lifetimes = {episode: self.proc.lifetime(reservation_row(record),
@@ -930,8 +905,11 @@ class AdmissionServer:
                 if episode not in self.reservations:
                     continue
             row = reservation_row(record)
-            row["build_run"] = (LiveBuildRun(record.run.pid, record.run.start_time, 0.0)
-                if isinstance(record.run, wire.RunIdentity) else activity.run(record.owner.pid))
+            if "build_run" not in row:
+                row["build_run"] = activity.run(record.owner.pid)
+                row["run_origin"] = gate.FoundRun(row["build_run"])
+            elif isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
+                row["run_origin"] = gate.CallerRun(NoLiveBuildRun())
             memory = (gate.GoneMemory() if isinstance(lifetimes[episode], gate.EndedStep) else
                       self.readings.reservation(Path(record.path), row, datetime.fromtimestamp(now, UTC),
                                                 processes, self.proc.path, policy))
@@ -939,18 +917,22 @@ class AdmissionServer:
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
+            if record.episode.startswith("uid:") and isinstance(memory, gate.MeasuredMemory):
+                if isinstance(memory.anonymous, gate.AnonymousRunUse):
+                    self._sample_runner(record, memory.anonymous.bytes, now)
             memories.append((row, memory))
             self._watch_scope(lifetimes[episode], episode)
-        for waiting in (*self.waiters.values(), *self.launches.values()):
+        for waiting in self.waiters.values():
             waiting.row["build_history_current"] = not self._build_estimate_expired(waiting.request)
             request = waiting.request
-            waiting.row["build_run"] = (LiveBuildRun(request.run.pid, request.run.start_time, 0.0)
-                if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity)
-                else activity.run(request.owner.pid))
+            if "build_run" not in waiting.row:
+                waiting.row["build_run"] = (_live_run(request.run)
+                    if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity)
+                    else activity.run(request.owner.pid))
         host = self.readings.host()
         pressure = self.readings.pressure(host if isinstance(host, gate.HostMemory) else
                                          gate.HostMemory(0, gate.UnknownHostTotal()), policy)
-        readings = gate.QueueSnapshotReadings(processes, {}, host, pressure, self.recovery,
+        readings = gate.QueueSnapshotReadings(processes, {}, host, pressure, self.spacing,
                                              self.readings.compilers(), policy=policy)
         ordered, priority = self._queue_order()
         unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
@@ -976,11 +958,71 @@ class AdmissionServer:
             memory = gate.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
                                              pid=run.pid, activity=replace(evidence, run=live))
             between.append(gate.RunningStep(evidence.session_id, evidence.session_name, "between steps",
-                                           evidence.folder, 0, memory, live, live.started_at, pid=run.pid))
+                                           evidence.folder, 0, memory, live, live.started_at, pid=run.pid, unit=place.unit))
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
-        limits = gate.resolve_admission_limits(config)
-        return self._inputs_with_current_slots(inputs), limits
+        return self._progress_inputs(self._inputs_with_current_slots(inputs), processes, policy)
+
+    def _sample_runner(self, record: ReservationRecord, use: int, now: float) -> None:
+        maximum = Path(record.path).with_suffix(".max")
+        try:
+            peak = int(maximum.read_text())
+        except (OSError, ValueError):
+            peak = 0
+        runner_peak = 0
+        if record.sidecar:
+            try:
+                runner_peak = int(Path(record.sidecar).with_suffix(".max").read_text())
+            except (OSError, ValueError):
+                pass
+        maximum_use = max(peak, use, runner_peak)
+        if maximum_use > peak:
+            atomic_sample(maximum, f"{maximum_use}\n")
+        wave = Path(record.path).with_suffix(".wave")
+        if use > 0 and use >= maximum_use / 2:
+            atomic_sample(wave, f"{maximum_use} {int(now)}\n")
+        elif runner_peak > 0 and runner_peak == maximum_use:
+            try:
+                sampled, at = map(int, Path(record.sidecar).with_suffix(".wave").read_text().split())
+                if sampled == maximum_use:
+                    atomic_sample(wave, f"{sampled} {at}\n")
+            except (OSError, ValueError):
+                pass
+
+    def _progress_inputs(self, inputs: gate.QueueInputs, processes: dict[int, gate.ProcessIdentity],
+                         policy: gate.AdmissionPolicy) -> gate.QueueInputs:
+        """Capture counters and profile samples on the service loop thread."""
+        attributed = iter(gate.attributed_step_uses(inputs))
+        running: list[gate.RunningStep] = []
+        cutoff = inputs.now - gate.HISTORY_DAYS * 86400
+        self.progress_history.prune(cutoff)
+        for step in inputs.running:
+            if not gate.running_has_reservation(step):
+                running.append(step)
+                continue
+            row, step, use = next(attributed)
+            if row["step"] not in gate.PROGRESS_STEPS:
+                running.append(step)
+                continue
+            memory = step.measured
+            if not isinstance(memory, gate.MeasuredMemory):
+                running.append(step)
+                continue
+            sidecar = Path(row["sidecar"])
+            counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
+            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
+                counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
+            if isinstance(counter, progress.NoCounter) and row["step"] != "merge-gate" and self.boot_id:
+                pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
+                counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
+            key = gate.reservation_profile_key(row, self.host)
+            profile = self.progress_history.matching(key, cutoff)
+            adjusted = gate.progress_memory(row, memory, use, counter, profile, policy)
+            running.append(replace(step, measured=adjusted))
+            if use.owns_source and isinstance(use.use, gate.AnonymousRunUse) and "reservation_id" in row:
+                self.progress_history.observe(row["reservation_id"], key, counter, use.use.bytes, inputs.now)
+        self.progress_captures.end_pass()
+        return replace(inputs, running=tuple(running))
 
     def run_pass(self) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         return self._run_pass(self._take_configuration())
@@ -1049,8 +1091,6 @@ class AdmissionServer:
 
     def _run_pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
-        if self.legacy_pending:
-            self._retry_legacy_imports()
         self._prune_runs()
         self.configuration = configuration
         self.pass_stale = False
@@ -1059,14 +1099,14 @@ class AdmissionServer:
             self.next_pass = self.next_config_watch_retry
             self.next_source_check = (self.clock.monotonic() + self.last_usable_configuration.source_check_seconds
                                       if isinstance(self.last_usable_configuration, gate.MemoryConfig) else float("inf"))
-            self.last_inputs = self.last_result = self.last_limits = self.last_policy = NoPass()
+            self.last_inputs = self.last_result = self.last_policy = NoPass()
             self.last_diagnostics = ()
             for episode, record in list(self.reservations.items()):
                 if self._end_if_finished(episode, record):
                     self._prune_places()
             self.persist()
             (self.state_dir / "queue.json").unlink(missing_ok=True)
-            for waiting in (*self.waiters.values(), *self.launches.values()):
+            for waiting in self.waiters.values():
                 self._deliver(waiting, wire.Refused(self.configuration.reason))
                 if isinstance(waiting.connection, Connection):
                     if self._detach_admission(waiting.connection):
@@ -1079,30 +1119,23 @@ class AdmissionServer:
                                      self.clock.monotonic() + config.source_check_seconds)
         policy = config.policy
         self.last_diagnostics = config.diagnostics
-        inputs, limits = self._inputs(config)
-        if self.launches:
-            for episode, waiting in list(self.launches.items()):
-                self.waiters[episode] = waiting
-                self._save_place(waiting)
-                del self.launches[episode]
-            ordered, priority = self._queue_order()
-            inputs = replace(inputs, ordered=ordered, priority=priority)
+        inputs = self._inputs(config)
         preserve_override = self._override_pending_reconnect()
         if preserve_override:
             inputs = replace(inputs, override=gate.NoHeadAdmissionOverride())
-        result = gate.admission_pass(inputs, inputs.now, limits, policy)
+        result = gate.admission_pass(inputs, inputs.now, policy)
         self._check_reading_alert(inputs, result, config)
-        self.last_inputs, self.last_limits, self.last_result, self.last_policy = inputs, limits, result, policy
+        self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
         by_owner = {gate.waiter_owner(waiting.row): episode for episode, waiting in self.waiters.items()}
         starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                         key=lambda row: cast(gate.ProposedAdmission, row.admission).rank)
         if not starts:
-            self._effects(result.policy.recovery, result.policy.override, result.policy.totals, preserve_override)
+            self._effects(inputs.spacing, result.policy.override, result.policy.totals, preserve_override)
         for decision in starts:
             episode = by_owner[decision.owner]
             waiting = self.waiters[episode]
             proposed = cast(gate.ProposedAdmission, decision.admission)
-            self._effects(proposed.recovery, proposed.override, decision.decision, preserve_override)
+            self._effects(proposed.spacing, proposed.override, decision.decision, preserve_override)
             self._admit(waiting, config)
         self.persist()
         waiting_steps = tuple(gate.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
@@ -1115,11 +1148,11 @@ class AdmissionServer:
                 waiting = self.waiters[episode]
                 reason = decision.reason
                 reply = wire.Wait(reason, position, head, reason_phrase(reason, waiting_steps),
-                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason))
+                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder))
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
-        interval = config.waiting_pass_seconds if self.waiters or self.launches else config.running_pass_seconds
+        interval = config.waiting_pass_seconds if self.waiters else config.running_pass_seconds
         self.next_pass = self.clock.monotonic() + interval
         if isinstance(self.override_reconnect_until, ReconnectDeadline):
             self.next_pass = min(self.next_pass, self.override_reconnect_until.at)
@@ -1128,15 +1161,15 @@ class AdmissionServer:
         try:
             ordered, priority = self._queue_order()
             queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, recovery=self.recovery, override=self.override, priority=priority), policy)
+                replace(inputs, ordered=ordered, spacing=self.spacing, override=self.override, priority=priority), policy)
         except OSError:
             # An old snapshot expires without changing the admission result.
             pass
         return result
 
-    def _effects(self, recovery: gate.StartSpacing, override: gate.OverrideKept | gate.OverrideEnded,
+    def _effects(self, spacing: gate.StartSpacing, override: gate.OverrideKept | gate.OverrideEnded,
                  decision: gate.AdmissionDecision, preserve_override: bool) -> None:
-        self.recovery = recovery
+        self.spacing = spacing
         if preserve_override:
             return
         if isinstance(override, gate.OverrideEnded):
@@ -1156,17 +1189,16 @@ class AdmissionServer:
         self.places[key] = replace(place, queue_identity=previous.queue_identity) if previous is not None else place
 
 
-
     def _wait_snapshot(self, waiting: WaitingAdmission, decision: gate.AdmissionDecision,
                        inputs: gate.QueueInputs, config: gate.MemoryConfig,
-                       reason: gate.WaitReason) -> gate.AdmissionWaitSnapshot:
+                       reason: gate.WaitReason, holder: WaitHolder) -> AdmissionWaitSnapshot:
         head = gate.first_queued_waiter(row for _, row in inputs.ordered)
         head_need = head.waiter["need"] if isinstance(head, gate.QueuedWaiter) else 0
         head_label = head.waiter.get("session_name", "") if isinstance(head, gate.QueuedWaiter) else ""
-        return gate.AdmissionWaitSnapshot(decision, waiting.request.profile.peak, inputs.running,
+        return AdmissionWaitSnapshot(decision, waiting.request.profile.peak, inputs.running,
             inputs.host.available if isinstance(inputs.host, gate.HostMemory) else 0,
             waiting.request.profile.repo, waiting.request.profile.step, config.policy, config.diagnostics,
-            head_need if not isinstance(decision.order_hold, gate.NoOrderHold) else 0, head_label, reason)
+            head_need if not isinstance(decision.order_hold, gate.NoOrderHold) else 0, head_label, reason, holder)
 
     def _drain_lifecycle(self) -> None:
         """Publish saved lifecycle facts after each durable state transition."""
@@ -1182,14 +1214,14 @@ class AdmissionServer:
                         "is_head": pending.is_head,
                         "wait_seconds": pending.wait_seconds,
                 }
-                gate.append_queue_time(self.state_dir, cast(dict[str, object], gate.snapshot_value(event)), admitted_at)
+                gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(event)), admitted_at)
                 self.fault("after_admitted_append")
             else:
                 left: gate.LeftEvent = {
                     **gate.lifecycle_event(pending.identity, "left", pending.episode + ":" + pending.reason),
                     "reason": pending.reason, "ended_at": pending.ended_at,
                 }
-                gate.append_queue_time(self.state_dir, cast(dict[str, object], gate.snapshot_value(left)), pending.ended_at)
+                gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(left)), pending.ended_at)
                 self.fault("after_left_append")
             self.lifecycle_outbox = self.lifecycle_outbox[1:]
 
@@ -1199,7 +1231,7 @@ class AdmissionServer:
     def _freeze_test_phase_need(self, record: ReservationRecord, config: gate.MemoryConfig) -> ReservationRecord:
         if record.step != "nextest":
             return record
-        need = gate.test_phase_need(reservation_row(record), store.host_name(),
+        need = gate.test_phase_need(reservation_row(record), self.host,
             datetime.fromtimestamp(self.clock.now(), UTC), self.state_dir,
             history_path=self.state_dir / "anon_peaks.jsonl", config=config)
         return replace(record, test_phase_need=need)
@@ -1215,12 +1247,18 @@ class AdmissionServer:
             # The episode disambiguates grants at the same clock tick after release.
             while any(record.path == str(stem) for record in self.reservations.values()):
                 stem = stem.with_name(stem.name + "0")
+            if profile.step == "build":
+                shape = build_shape(list(request.argv)).key
+            elif profile.step == "merge-gate":
+                shape = gate.merge_gate_shape(request.argv)
+            else:
+                shape = ""
             record = ReservationRecord(request.episode, str(stem), request.owner, profile.peak.bytes,
                 profile.repo, profile.step, profile.worktree, store.utc_iso(now), request.sidecar,
                 request.test_width, request.call, stem.name, gate.stored_waiter(waiting.row),
                 profile.repository.key if isinstance(profile.repository, gate.RepositoryIdentity) else "",
                 profile.scope, gate.test_package(list(request.argv)), tuple(gate.test_filters(list(request.argv))),
-                build_shape(list(request.argv)).key if profile.step == "build" else "", run=request.run)
+                shape, run=request.run)
             record = self._freeze_test_phase_need(record, config)
             result = self.last_result
             candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
@@ -1245,18 +1283,22 @@ class AdmissionServer:
 
     def _end(self, episode: str, ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting) -> None:
         record = self.reservations[episode]
-        if record.path + ".token-wait" in self.legacy_pending:
-            return
         record = replace(record, ending=ending)
         self.reservations[episode] = record
         self.persist()
         row = reservation_row(record)
-        lifetime = self.proc.lifetime(row, self._live(record.owner))
-        if isinstance(lifetime, gate.PopulatedStepScope) and isinstance(ending, (OwnerExited, NotEnding)):
-            self._watch_scope(lifetime, episode)
-            return
-        ended_at = (datetime.fromisoformat(record.finalization["ended_at"].replace("Z", "+00:00")).timestamp()
+        if isinstance(ending, (OwnerExited, NotEnding)):
+            lifetime = self.proc.lifetime(row, self._live(record.owner))
+            if isinstance(lifetime, gate.PopulatedStepScope):
+                self._watch_scope(lifetime, episode)
+                return
+        ended_at = (gate.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
+        if record.episode.startswith("uid:"):
+            self._sample_runner(record, 0, ended_at)
+        self.progress_history.finish(record.reservation_id, ended_at, ended_at - gate.HISTORY_DAYS * 86400)
+        if record.sidecar:
+            self.progress_captures.remove(Path(record.sidecar))
         path = Path(record.path)
         outcome, status, end_kind = finalization_outcome(ending)
         if isinstance(ending, TokenWaiting):
@@ -1267,11 +1309,11 @@ class AdmissionServer:
             intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault, self.places),
             end_kind=end_kind)
         if (isinstance(record.run, wire.RunIdentity)
-                and self._live(wire.Owner(record.run.pid, record.run.start_time))
+                and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, gate.MemoryConfig)):
-            self.slots[record.reservation_id] = gate.BetweenStepsSlot(
-                LiveBuildRun(record.run.pid, record.run.start_time, 0.0), record.reservation_id, record.need,
-                ended_at + self.last_usable_configuration.policy.timing.slot_gap_seconds)
+            slot = gate.ended_step_slot(row, ended_at, self.last_usable_configuration.policy)
+            if isinstance(slot, gate.BetweenStepsSlot):
+                self.slots[slot.reservation] = slot
         self._prune_watches()
         for key, entry in list(self.ledger.items()):
             if entry.reservation == record.reservation_id:
@@ -1283,27 +1325,84 @@ class AdmissionServer:
             self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
 
+    def _authorize(self, request: wire.Request, uid: int) -> str:
+        if uid == os.getuid():
+            return ""
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest)):
+            return "queue priority and head admission require the service account"
+        if isinstance(request, (wire.BuildHistoryRequest, wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
+            return ""
+        key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
+               else request.request_id)
+        if not key.startswith(f"uid:{uid}:"):
+            return "request belongs to another account"
+        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
+            if process_uid(request.owner.pid, self.proc.path) != uid or not self._live(request.owner):
+                return "owner belongs to another account or no longer exists"
+            if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity):
+                if process_uid(request.run.pid, self.proc.path) != uid or not self._run_alive(request.run):
+                    return "run belongs to another account or no longer exists"
+            return ""
+        if key in self.ledger:
+            return ""
+        record = next((record for record in self.reservations.values()
+                       if record.reservation_id == request.reservation), None)
+        if record is None or not record.episode.startswith(f"uid:{uid}:"):
+            return "reservation belongs to another account"
+        return ""
+
+    def _runner_reply(self, reply: wire.Reply) -> wire.Reply:
+        if not isinstance(reply, wire.Admitted):
+            return reply
+        config = records.read_memory_config()
+        return wire.RunnerAdmitted(reply.reservation, reply.need, reply.source, reply.max_path,
+            reply.wave_path, reply.sampling_context, reply.cleanup_timing,
+            execution=wire.RunnerExecutionTiming(config.program_sample_seconds,
+                config.program_stop_seconds, config.peak_wave_seconds))
+
+    def _service_estimate(self, request: wire.ServiceEstimateRequest) -> wire.AdmitRequest:
+        config = records.read_memory_config()
+        estimate = step_estimator.step_estimate(list(request.argv), request.cwd, records.INFER_FROM_ARGV,
+            lambda: datetime.fromtimestamp(self.clock.now(), UTC), self.state_dir.parent, config.policy,
+            first_peak_bytes=config.program_first_peaks["cargo"],
+            build_history_generation=lambda: records.BuildHistoryGeneration(self.build_history_generation),
+            location=step_estimator.RepositoryLocation(request.repository, request.worktree))
+        label = config.ci_label.format(runner=request.runner, job=request.job)
+        identity = wire.Identity("", label, estimate.profile.step, request.worktree, request.runner)
+        return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
+            request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
+            isinstance(estimate.cache, records.FreshTest), code_version=request.code_version)
+
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
+        refusal = self._authorize(request, peer_uid(connection))
+        if refusal:
+            return [wire.Refused(refusal)]
+        if isinstance(connection, Connection):
+            self._record_caller_version(request, connection)
+        if isinstance(request, wire.ServiceEstimateRequest):
+            replay = self.ledger.get(request.episode)
+            if replay is not None:
+                return [self._runner_reply(replay.reply)]
+            request = self._service_estimate(request)
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and request.code_version:
-            self.caller_versions[f"{request.owner.pid}-{request.owner.start_time}"] = request.code_version
+            self.caller_versions[gate.run_owner(request.owner.pid, request.owner.start_time)] = request.code_version
         if isinstance(request, wire.BuildHistoryRequest):
             return [wire.BuildHistoryReply(self.build_history_generation)]
         if isinstance(request, (wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
             if not isinstance(self.pending_configuration, NoPass):
                 _ = self.run_pass()
             elif self.pass_stale and isinstance(self.last_inputs, gate.QueueInputs):
-                if isinstance(self.last_limits, gate.AdmissionLimits) and isinstance(self.last_policy, gate.AdmissionPolicy):
+                if isinstance(self.last_policy, gate.AdmissionPolicy):
                     self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
-                    self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_limits, self.last_policy)
+                    self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
                 self.pass_stale = False
             if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
                 return [wire.Refused(self.configuration.reason)]
             if (not isinstance(self.last_inputs, gate.QueueInputs)
-                    or not isinstance(self.last_limits, gate.AdmissionLimits)
                     or not isinstance(self.last_policy, gate.AdmissionPolicy)):
                 raise RuntimeError("service has no pass")
-            reading = gate.queue_read_from_pass(self.last_inputs, self.last_limits, self.last_policy,
+            reading = gate.queue_read_from_pass(self.last_inputs, self.last_policy,
                 cast(gate.PassResult, self.last_result))
             reading = replace(reading, diagnostics=self.last_diagnostics)
             if isinstance(request, wire.ExplainRequest):
@@ -1313,6 +1412,8 @@ class AdmissionServer:
         replay = self.ledger.get(key)
         if replay is not None:
             return [replay.reply]
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest)):
+            return self._submit_queue_change(request, connection)
         configuration = (self.configuration if isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest))
                          else self._take_configuration())
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
@@ -1321,7 +1422,7 @@ class AdmissionServer:
             if any(record.owner == request.owner for record in self.reservations.values()):
                 return self._mutation_reply(key, wire.Refused("owner already has a reservation"))
             if any(waiting.request.owner == request.owner and episode != key
-                   for episode, waiting in (*self.waiters.items(), *self.launches.items())):
+                   for episode, waiting in self.waiters.items()):
                 return self._mutation_reply(key, wire.Refused("owner already has an admission episode"))
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
@@ -1353,16 +1454,86 @@ class AdmissionServer:
                     self.reservations[episode] = updated
             live = any(record.reservation_id == request.reservation for record in self.reservations.values())
             self.ledger[key] = ReplayEntry(wire.Ok(), LiveGrant() if live else self.clock.now(), request.reservation)
-        elif isinstance(request, wire.TokenWaitRequest):
+        else:
             for episode, record in list(self.reservations.items()):
                 if record.reservation_id == request.reservation:
                     self._end(episode, TokenWaiting(key, self.clock.now()))
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
-        elif isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
+        if isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest)):
+            self.persist()
+            if (isinstance(self.last_inputs, gate.QueueInputs)
+                    and isinstance(self.last_policy, gate.AdmissionPolicy)):
+                self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
+                self.pass_stale = True
+            self.next_pass = self.clock.monotonic()
+            return [self.ledger[key].reply]
+        _ = self._run_pass(configuration)
+        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
+            return self._pending_replies.pop(key, [])
+        return [self.ledger[key].reply]
+
+    def _submit_queue_change(self, request: QueueChange,
+                             connection: Connection | NoConnection) -> list[wire.Reply]:
+        connections = [connection] if isinstance(connection, Connection) else []
+        if isinstance(self.pending_priority, PendingPriorityRoster):
+            for change in (self.pending_priority.change, *self.queue_changes):
+                if change.request.request_id == request.request_id:
+                    for client in connections:
+                        if all(client is not previous for previous in change.connections):
+                            change.connections.append(client)
+                    return []
+            self.queue_changes.append(OrderedQueueChange(request, connections))
+            return []
+        if isinstance(request, wire.PrioritySetRequest) and request.unit.strip():
+            result: Future[Mapping[str, gate.UnitMembership]] = Future()
+            self.pending_priority = PendingPriorityRoster(OrderedQueueChange(request, connections), result)
+            threading.Thread(target=read_priority_roster, args=(result, os.dup(self.priority_events)),
+                             daemon=True, name="priority-roster").start()
+            return []
+        return self._apply_queue_change(request, {})
+
+    def _finish_priority_roster(self) -> None:
+        pending = self.pending_priority
+        if not isinstance(pending, PendingPriorityRoster) or not pending.result.done():
+            return
+        self.pending_priority = NoPendingPriorityRoster()
+        self._complete_queue_change(pending.change,
+            lambda: self._apply_queue_change(pending.change.request, pending.result.result()))
+        self._continue_queue_changes()
+
+    def _continue_queue_changes(self) -> None:
+        while self.queue_changes and isinstance(self.pending_priority, NoPendingPriorityRoster):
+            change = self.queue_changes.popleft()
+            self._complete_queue_change(change,
+                lambda: self._submit_queue_change(change.request, NO_CONNECTION))
+            if isinstance(self.pending_priority, PendingPriorityRoster):
+                self.pending_priority.change.connections.extend(change.connections)
+
+    def _complete_queue_change(self, change: OrderedQueueChange,
+                               apply: Callable[[], list[wire.Reply]]) -> None:
+        try:
+            replies = apply()
+        except (ValueError, TypeError) as error:
+            for connection in change.connections:
+                if connection.socket.fileno() >= 0:
+                    self._refuse_connection(connection, str(error))
+        else:
+            self._reply_to_queue_change(change, replies)
+
+    def _reply_to_queue_change(self, change: OrderedQueueChange, replies: list[wire.Reply]) -> None:
+        for connection in change.connections:
+            if connection.socket.fileno() >= 0:
+                for reply in replies:
+                    self._send(connection, reply)
+
+    def _apply_queue_change(self, request: QueueChange,
+                            labels: Mapping[str, gate.UnitMembership]) -> list[wire.Reply]:
+        key = request.request_id
+        configuration = self._take_configuration()
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
             if isinstance(request, wire.PrioritySetRequest):
                 if not request.unit.strip():
                     return self._mutation_reply(key, wire.Refused("unit is required"))
-                labels = gate.priority_labels(gate.RosterUnits())
                 rows = [waiting.row for waiting in self.waiters.values()]
                 rows.extend(record.queue_waiter for record in self.reservations.values())
                 recorded_sessions = {row.get("session_id", "") for row in rows if row.get("unit", "")}
@@ -1381,7 +1552,7 @@ class AdmissionServer:
             at = self.clock.now()
             priority["transition"] = gate.PendingPriorityTransition(key,
                 "set" if isinstance(request, wire.PrioritySetRequest) else "clear", at,
-                store.read_last_whole_row_end(store.host_file(store.host_name(), at)))
+                store.read_last_whole_row_end(store.host_file(self.host, at)))
             self.priority = priority
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
             self.persist()
@@ -1397,8 +1568,7 @@ class AdmissionServer:
                 return self._mutation_reply(key, wire.Refused("all waiting steps are waiting for the cargo token"))
             row = candidate.waiter
             host = self.last_inputs.host
-            limits = cast(gate.AdmissionLimits, self.last_limits)
-            reserve = gate.decide(host.available, host.total, row["need"], [], limits=limits).reserve
+            reserve = cast(gate.AdmissionPolicy, self.last_policy).safety_bytes
             self.override = {"waiter": gate.waiter_owner(row), "pid": row["pid"], "start_time": row["start_time"],
                 "unit": gate.waiter_unit_name(gate.RecordedQueueIdentities().identity(row["pid"],
                     cast(dict[str, object], cast(object, row))), row["pid"]),
@@ -1406,18 +1576,7 @@ class AdmissionServer:
                 "why": request.why, "set_by": request.actor}
             gate.head_override_event("set", self.override, row["need"], host.available, reserve, self.clock.now())
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
-        if isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest)):
-            self.persist()
-            if (isinstance(self.last_inputs, gate.QueueInputs)
-                    and isinstance(self.last_limits, gate.AdmissionLimits)
-                    and isinstance(self.last_policy, gate.AdmissionPolicy)):
-                self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
-                self.pass_stale = True
-            self.next_pass = self.clock.monotonic()
-            return [self.ledger[key].reply]
         _ = self._run_pass(configuration)
-        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
-            return self._pending_replies.pop(key, [])
         return [self.ledger[key].reply]
 
     def _mutation_reply(self, key: str, reply: wire.Ok | wire.Refused, reservation: str = "") -> list[wire.Reply]:
@@ -1427,6 +1586,8 @@ class AdmissionServer:
         return [reply]
 
     def _deliver(self, waiting: WaitingAdmission, reply: wire.Reply) -> None:
+        if isinstance(waiting.request, ServiceEstimatedAdmission):
+            reply = self._runner_reply(reply)
         episode = waiting.request.episode
         if episode in self._pending_replies:
             self._pending_replies[episode].append(reply)
@@ -1500,10 +1661,6 @@ class AdmissionServer:
                 self._free_claim(gate.waiter_owner(waiting.row))
                 del self.waiters[episode]
                 changed = True
-        for episode, waiting in list(self.launches.items()):
-            if waiting.connection is connection:
-                del self.launches[episode]
-                changed = True
         if changed:
             self.persist()
         return changed
@@ -1517,12 +1674,11 @@ class AdmissionServer:
     def _record_caller_version(self, request: wire.Request, connection: Connection) -> None:
         if not request.code_version:
             return
-        import struct
         pid, uid, gid = struct.unpack("3i", connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         del uid, gid
         identity = self.proc.owner_start(pid)
         if isinstance(identity, LiveOwnerIdentity):
-            self.caller_versions[f"{pid}-{identity.start_time}"] = request.code_version
+            self.caller_versions[gate.run_owner(pid, identity.start_time)] = request.code_version
             self.persist()
 
     def _read_request(self, connection: Connection) -> None:
@@ -1551,7 +1707,6 @@ class AdmissionServer:
                 cleanup = isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest))
                 if len(line) + 1 > (wire.CLEANUP_REQUEST_MAX_BYTES if cleanup else request_limit):
                     raise ValueError(reason)
-                self._record_caller_version(request, connection)
                 if not isinstance(request, wire.BuildHistoryRequest):
                     if not isinstance(connection.request, NoRequest):
                         raise ValueError("one request for admission per connection")
@@ -1689,6 +1844,8 @@ class AdmissionServer:
         now = self.clock.monotonic()
         delay = min(timeout, max(0, min(self.next_pass, self.next_source_check, self.next_config_watch_retry) - now))
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)
+        if any(descriptor == self.priority_events for descriptor, _events in ready):
+            _ = os.eventfd_read(self.priority_events)
         configuration_changed = (any(descriptor == self.config_events for descriptor, _events in ready)
                                  and self._configuration_changed())
         if self.clock.monotonic() >= self.next_config_watch_retry:
@@ -1724,11 +1881,9 @@ class AdmissionServer:
                     if not self._live(waiting.request.owner):
                         self._free_claim(gate.waiter_owner(waiting.row))
                         del self.waiters[episode]
-                for episode, waiting in list(self.launches.items()):
-                    if not self._live(waiting.request.owner):
-                        del self.launches[episode]
                 self._prune_watches()
                 self.next_pass = self.clock.monotonic()
+        self._finish_priority_roster()
         if self.clock.monotonic() >= self.next_pass:
             _ = self.run_pass()
         if self.clock.monotonic() >= self.next_source_check:
@@ -1765,6 +1920,7 @@ class AdmissionServer:
         self.closed = True
         self.stopped = True
         os.close(self.config_events)
+        os.close(self.priority_events)
         for connection in list(self.connections.values()):
             connection.socket.close()
         self.connections.clear()
@@ -1788,63 +1944,7 @@ ADMISSION_CALLERS = {
 }
 
 def read_state(directory: Path) -> ServiceState:
-    record = wire.parse_record((directory / "state.json").read_text(), dict[str, object])
-    if record.keys() == {"kind", "reservations", "places", "ledger", "recovery", "override"}:
-        # The first state form stores neither a queue priority nor pending import cleanup.
-        record["priority"] = gate.snapshot_value(gate.NO_QUEUE_PRIORITY)
-        record["legacy_cleanup"] = gate.snapshot_value(())
-    _ = record.setdefault("run_places", {})
-    _ = record.setdefault("caller_versions", {})
-    _ = record.setdefault("legacy_pending", gate.snapshot_value(()))
-    old_fields = gate.snapshot_fields(ServiceState).keys() - {"build_history_generation"} | {"kind"}
-    if record.keys() == old_fields | {"build_invalidations"}:
-        del record["build_invalidations"]
-    if record.keys() == old_fields:
-        record["build_history_generation"] = 0
-    priority = record.get("priority")
-    if isinstance(priority, dict) and "unit" in priority:
-        priority = cast(dict[str, object], priority)
-        transition = priority.get("transition")
-        if transition is None:
-            priority["transition"] = gate.snapshot_value(gate.SettledPriority())
-        elif isinstance(transition, dict) and "kind" not in transition:
-            transition = cast(dict[str, object], transition)
-            priority["transition"] = {**transition, "kind": "PendingPriorityTransition",
-                                      "month_row_end": transition.get("month_row_end", 0)}
-    places = record.get("places")
-    if isinstance(places, dict):
-        legacy_fields = gate.snapshot_fields(WaiterPlace).keys()
-        for place in cast(dict[str, object], places).values():
-            if isinstance(place, dict):
-                value = cast(dict[str, object], place)
-                if "order_since" not in value:
-                    value["order_since"] = gate.snapshot_value(OrderNotStarted())
-                if "queue_identity" not in value or value["queue_identity"] == {"kind": "NoWaiter"}:
-                    owner = cast(wire.Owner, gate.parse_snapshot_value(value["owner"], wire.Owner))
-                    since = cast(float, value["since"])
-                    episode = cast(str, value["episode"])
-                    row: gate.Waiter = {"pid": owner.pid, "start_time": owner.start_time,
-                                        "need": 0, "since": since}
-                    waiting_path = directory / (episode + ".waiting")
-                    if waiting_path.exists():
-                        row = gate.read_waiter(waiting_path)
-                    value["queue_identity"] = gate.snapshot_value(waiter_place(row, episode).queue_identity)
-                if value.keys() - {"priority_rank", "build_estimate"} == legacy_fields | {"kind"}:
-                    _ = value.pop("priority_rank", None)
-                    _ = value.pop("build_estimate", None)
-    if "caller_versions" not in record:
-        record["caller_versions"] = {}
-    ledger = record.get("ledger")
-    if isinstance(ledger, dict):
-        for entry in cast(dict[str, object], ledger).values():
-            if not isinstance(entry, dict):
-                continue
-            reply = cast(dict[str, object], entry).get("reply")
-            if isinstance(reply, dict):
-                grant = cast(dict[str, object], reply)
-                if grant.get("kind") == "Admitted" and "cleanup_timing" not in grant:
-                    grant["cleanup_timing"] = gate.snapshot_value(wire.PROTOCOL_CLEANUP_TIMING)
-    return cast(ServiceState, gate.parse_snapshot_value(record, ServiceState))
+    return wire.parse_record((directory / "state.json").read_text(), ServiceState)
 
 
 def _older_caller(pid: int, args: list[str], proc: Proc, scripts: dict[str, bytes],
@@ -1865,7 +1965,7 @@ def _older_caller(pid: int, args: list[str], proc: Proc, scripts: dict[str, byte
         identity = proc.owner_start(pid)
         if not isinstance(identity, LiveOwnerIdentity):
             return True
-        version = versions.get(f"{pid}-{identity.start_time}", "")
+        version = versions.get(gate.run_owner(pid, identity.start_time), "")
         if not version or not current_version or version != current_version:
             return True
     return False
@@ -1893,7 +1993,7 @@ def drain_check(directory: Path, *, service: bool, include_gate_callers: bool, p
             owners.append(wire.Owner(row["pid"], row["start_time"]))
     for owner in owners:
         if proc.owner_start(owner.pid) == LiveOwnerIdentity(owner.start_time):
-            waiting.append(f"{owner.pid}-{owner.start_time}")
+            waiting.append(gate.run_owner(owner.pid, owner.start_time))
     for name, row in rows:
         live = proc.owner_start(row["pid"]) == LiveOwnerIdentity(row["start_time"])
         if not isinstance(proc.lifetime(row, live), gate.EndedStep):

@@ -6,8 +6,8 @@ from collections.abc import Sequence
 from scripts.build_queue import head_facts, queue_evidence
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.scope_activity import NotServiceSlice
-from scripts.build_queue.queue_view import (QueueModel, check_line, check_lines, clock, estimate_minutes,
-    eligible_head_position, has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
+from scripts.build_queue.queue_view import (QueueModel, behind_place, eligible_head_position, check_line, check_lines, clock, estimate_minutes,
+    has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
 from scripts.lint import memory_admit as gate
 
 
@@ -27,7 +27,7 @@ def order_check(model: QueueModel, position: int) -> Line:
     if isinstance(reason, gate.TokenWaitingWaiter):
         return check_line(False, reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindHead):
-        text = f"#{eligible_head_position(model.reading.view.waiting)}'s turn"
+        text = f"#{behind_place(reason, model.reading.view.waiting) or eligible_head_position(model.reading.view.waiting)}'s turn"
         if isinstance(model.facts, head_facts.HeadFacts):
             text += "      " + head_facts.order_rule(model.facts)
         return check_line(False, text)
@@ -45,7 +45,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
         step = waiting[position - 1]
         if card:
             add()
-        add((Span(f"#{position} of {len(waiting)} · {queue_evidence.pid_text(queue_evidence.step_pid(step))} · ", bold=True), *name_spans(step, model.labels),
+        add((Span(f"#{position} of {len(waiting)} · {queue_evidence.step_pid_text(step)} · ", bold=True), *name_spans(step, model.labels),
              Span(f" · {step.step} · {step.need / gate.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Queue arrival {clock(model, step.since)}; waiting {age(step.since, model.reading.explanation.now)} min. "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
@@ -85,7 +85,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                     detail = f"joined {clock(model, order_since)}, {minutes} min {'after' if later else 'before'} it"
                 if isinstance(priority_order, gate.PriorityUnit):
                     detail += f"; {priority_order.unit} (queue priority)"
-                add((Span(f"  #{place} {queue_evidence.pid_text(queue_evidence.step_pid(ahead))} · "), Span("↑  " if is_moved(model, place) else "   "),
+                add((Span(f"  #{place} {queue_evidence.step_pid_text(ahead)} · "), Span("↑  " if is_moved(model, place) else "   "),
                      *name_spans(ahead, model.labels), Span(f" {ahead.step}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
@@ -159,7 +159,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         return lines
     add()
     if not head_card:
-        add(f"First in line: {queue_evidence.pid_text(queue_evidence.step_pid(head.waiter))} · {name_text(head.waiter, model)} {head.waiter.step}; "
+        add(f"First in line: {queue_evidence.step_pid_text(head.waiter)} · {name_text(head.waiter, model)} {head.waiter.step}; "
             + f"queue arrival {clock(model, head.waiter.since)}; "
             + f"waiting {age(head.waiter.since, explanation.now)} min; "
             + f"need {queue_evidence.gib(head.waiter.need)}")

@@ -170,19 +170,16 @@ def resolve_roster(run: Path, entries: dict[str, object]) -> dict[str, object]:
     return entries
 
 
-def admit(name: str, run: Path, *, role: str, production: str = "", unit: str = "", reference: str = "") -> WorkerStartAllowed:
+def admit(name: str, run: Path, *, reference: str = "") -> WorkerStartAllowed:
     """Refuse before starting a backend or taking lifecycle, inbox or roster locks."""
     try:
-        del role
         record = staff.snapshot()
         if reference:
             existing = record.by_id(staff.StaffId(reference))
             if existing is None or existing.kind != "worker" or not isinstance(existing.parent, staff.ReportsTo):
                 raise AdmissionRefused(f"{reference}: no worker staff row")
             return WorkerStartAllowed(existing.name, existing.parent.id, run, ExistingWorkerSlot(existing))
-        explicit = bool(production or unit)
-        owner = parent(record, staff_id="" if explicit else staff.runtime_id(),
-                       production=production, unit=unit, run=None if explicit else run)
+        owner = parent(record, staff_id=staff.runtime_id(), run=run)
         _ = staff.WorkerName.parse(name)
         if isinstance(owner.worktree, staff.RemovedWorktree):
             print(f"staff: {name}: parent {owner.id} is retired; admission continues", file=sys.stderr)
@@ -316,16 +313,25 @@ def assignment_id(prompt: Path) -> str:
     return hashlib.sha256(str(prompt.resolve()).encode() + str(prompt.stat().st_mtime_ns).encode() + prompt.read_bytes()).hexdigest()
 
 
-def dispatch_record(allowed: WorkerStartAllowed, *, report_anomaly: bool = True) -> DispatchRecord:
-    entry = session_staff.read_worker_roster(allowed.run / "mesh_roster.json").get(allowed.name)
+def dispatch_record(run: Path, name: str, *, report_anomaly: bool = True) -> DispatchRecord:
+    entry = session_staff.read_worker_roster(run / "mesh_roster.json").get(name)
     fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
     try:
         return DispatchRecord(str(fields.get("assignment_id", "")),
                               SwitchState(fields.get("dispatch_state", SwitchState.NO_RECORD)))
     except ValueError:
         if report_anomaly:
-            print(f"anomaly: {allowed.name}: unknown dispatch_state {fields.get('dispatch_state')!r}; using NO_RECORD", file=sys.stderr)
+            print(f"anomaly: {name}: unknown dispatch_state {fields.get('dispatch_state')!r}; using NO_RECORD", file=sys.stderr)
         return DispatchRecord(str(fields.get("assignment_id", "")), SwitchState.NO_RECORD)
+
+
+def dispatch_pending(run: Path, name: str, prompt: Path) -> bool:
+    try:
+        record = dispatch_record(run, name)
+    except (OSError, worker_lifecycle.WorkerStateUnreadable) as error:
+        print(f"anomaly: {name}: {error}".replace("\n", " "), file=sys.stderr)
+        return False
+    return record.assignment_id == assignment_id(prompt) and record.state is not SwitchState.ASSIGNMENT_ACCEPTED
 
 
 def record_dispatch(allowed: WorkerStartAllowed, request: str, state: SwitchState, *, expected_request: str = "") -> None:
@@ -387,7 +393,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
             raise AdmissionRefused(f"{allowed.slot.row.id}: source staff row is missing")
         backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
         same = not isinstance(backend, staff.BackendUnavailable) and backend.family == family
-        prior = dispatch_record(allowed)
+        prior = dispatch_record(allowed.run, allowed.name)
         request = request or (hashlib.sha256(f"{allowed.slot.row.id}:{family}".encode()).hexdigest()
                               if isinstance(allowed.slot, ExistingWorkerSlot) else "")
         retry = bool(request and prior.assignment_id == request)
