@@ -924,34 +924,18 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 38 — Three scripts start Python through `scripts/lib/py`  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** every bare `python3` start in `scripts/build_hold/cargo`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh` and `scripts/lint/lint` goes through `scripts/lib/py`.
+- `scripts/build_hold/cargo`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh` and `scripts/lint/lint` start Python through `scripts/lib/py`, with the same arguments, stdin and exit status. Filename-only and symlink starts of these scripts resolve the launcher.
+- `scripts/mac_test/test_offload.py` runs the two lint routes with a cargo stub. `test_cargo_wrapper.py` and `test_brp_launch_gate.py` seed the interpreter cache with `seed_interpreter_cache`.
+- `pyrightconfig.json` has `"."` in the `scripts/mac_test` extraPaths.
 
-**Spec:** on a Mac with Apple's Python 3.9 first on PATH, a bare `python3` can start the wrong interpreter. Phase 32 fixed the same fault in `conf.sh`.
-1. The starts: `cargo:59`; `pre-tool-use-brp-launch-gate.sh:5`, `:12` and `:35`; `lint:75`.
-2. Before the edit, run the hook and lint routes on the Mac and record whether each fails today. Run the cargo hold route on Linux: `cargo:38` skips that route on the Mac.
-3. Switch every listed start to `scripts/lib/py`. Keep each start's arguments, stdin and exit status.
-4. The showrunner holds all three files for the natest unit. Before the first edit, tell the resources unit (the hook) and the verify unit (`scripts/lint/lint`) in one line each.
-5. Add no guard, refusal or check (user rule, 2026-11-05).
-
-**Files:**
-- `scripts/build_hold/cargo` — line 59
-- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — lines 5, 12 and 35
-- `scripts/lint/lint` — line 75
-
-**Workers:** 1 writer on slot `review3` (five lines in three scripts; slots `impl` and `impl3` hold other phases)
-- `review3` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 32: `conf.sh` starts its reader through `scripts/lib/py`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green
-- each caller module of the hook and of `scripts/lint/lint` green in the gate form
-- the Mac result of step 2 and of the same routes after the edit, in the checkpoint notice
-- the full test green on the phase commit merged with `origin/builds`
+| Route | Machine | Before | After |
+| --- | --- | --- | --- |
+| BRP launch hook, labelled launch | Mac | `rc=0`, Python Traceback | `rc=0`, one `memory_gate.sh:160` warning |
+| BRP launch hook, filename start | Mac | not run | `rc=0`, deny JSON that names `HANA_TEST_PURPOSE` |
+| lint_scope | Mac | `rc=0`, `--workspace` | `rc=0`, `--workspace` |
+| cargo hold | Linux clone | `rc=1`, the hold message | `rc=1`, the hold message |
 
 ### Phase 39 — `test_verify_mac_only.py` runs in half its time  · status: done
 **Depends on:** none
