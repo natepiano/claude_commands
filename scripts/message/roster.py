@@ -85,7 +85,6 @@ from scripts.message.unit_labels import (
     make_labels as _unit_labels,
     production_of as _production_of,
     unit_of as _unit_of,
-    short_unit as _short_unit,
     ProductionPlace as _ProductionPlace,
     StaffDiagnostics as _StaffDiagnostics,
     StaffRowAnomaly as _StaffRowAnomaly,
@@ -295,7 +294,7 @@ class JobUnassigned:
 
 @dataclass(frozen=True)
 class ProductionPart:
-    slug: str
+    name: str
 
 
 @dataclass(frozen=True)
@@ -322,10 +321,10 @@ class ShownName:
 
     def render(self) -> str:
         parts: list[str] = []
-        if isinstance(self.production, ProductionPart) and self.production.slug:
-            parts.append(self.production.slug)
+        if isinstance(self.production, ProductionPart) and self.production.name:
+            parts.append(self.production.name)
         if isinstance(self.unit, UnitPart) and self.unit.unit:
-            parts.append(_short_unit(self.unit.unit))
+            parts.append(self.unit.unit)
         if isinstance(self.job, ShownJob):
             loaded = names.runtime_names()
             if not isinstance(loaded, names.Names):
@@ -1077,7 +1076,7 @@ def _claude_entries(
         assignment: Assignment = NotAWorker()
         if session_id in runner_ids:
             role: Role = "showrunner"
-            showrunner = RunsProduction(runner_ids[session_id]["slug"])
+            showrunner = RunsProduction(runner_ids[session_id]["name"])
         elif session_id in production_places:
             role = "unit director"
             place = production_places[session_id]
@@ -1451,7 +1450,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
             for session in daemon
             if session.thread_id not in worker_threads
         )
-    interactive = _herdr_codex_panes(machine, (runner["slug"] for runner in registered))
+    interactive = _herdr_codex_panes(machine, (runner["name"] for runner in registered))
     problems.extend(interactive.problems)
     excluded = diagnostics.excluded_sessions
     entries = [entry for entry in [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]

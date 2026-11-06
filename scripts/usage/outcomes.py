@@ -90,7 +90,9 @@ def repositories(claude_repo: Path, production_docs: Path, *, resolver: session_
     candidates = [claude_repo]
     candidates.extend(
         path
-        for document in sorted(production_docs.glob("*-production.md"))
+        for document in (owner.doc.path for owner in resolver.record.find(kind="showrunner")
+                         if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                         and owner.doc.path.parent == production_docs)
         for path in production_paths(document, resolver=resolver)
     )
     unique: dict[str, Path] = {}
@@ -361,7 +363,9 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
             record = staff.StaffSnapshot(())
             state = PartialSourceRead()
         resolver = session_staff.RowResolver(record)
-        candidates = (claude_repo, *(path for document in sorted(production_docs.glob("*-production.md"))
+        candidates = (claude_repo, *(path for document in (owner.doc.path for owner in resolver.record.find(kind="showrunner")
+                         if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                         and owner.doc.path.parent == production_docs)
                                      for path in production_paths(document, resolver=resolver)))
         # Repository discovery omits failures; retain them in this source's state.
         # A worktree removed after its merge is no failure: its commits stay in the shared repository.

@@ -567,7 +567,7 @@ def _detach(arguments: list[str], task: str) -> None:
 
     # Capture the registry identity before the child loses the caller's session id.
     if "--requester" not in arguments:
-        requester = showrunners.own_slug()
+        requester = showrunners.own_name()
         options = ["--requester", requester]
         boundary = arguments.index("--") if "--" in arguments else len(arguments)
         arguments = [*arguments[:boundary], *options, *arguments[boundary:]]
@@ -647,9 +647,9 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         next_step = f"resume it: cd ~/.claude && {command}"
     cause = f"{name} stopped {elapsed:.1f} s after its move or resume to {account}; {next_step}"
     try:
-        slug = staff_sources.unit_parent(unit, identity).slug if unit else requester
-        if slug:
-            print(showrunners.tell(slug, f"resume-ended-{identity}-{uuid4().hex}", cause, sender="shutdown"))
+        name = staff_sources.unit_parent(unit, identity).name if unit else requester
+        if name:
+            print(showrunners.tell(name, f"resume-ended-{identity}-{uuid4().hex}", cause, sender="shutdown"))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"{identity}: could not tell showrunner: {error}")
     if environment.get(PROBE_ENV) != "1":

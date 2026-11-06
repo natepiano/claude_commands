@@ -1,7 +1,7 @@
 # Model registry
 
 Codex code reviews use the unit's persistent `review` and `review2` workers through `assign.sh --role review`.
-The [simplify lens](simplify-lens.md) uses a fresh Claude review.
+The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Pool maintenance paths do not dispatch new reviews.
 
 ## What it is

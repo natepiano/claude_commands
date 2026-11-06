@@ -281,7 +281,7 @@ def migrate_owners(root: Path, *, dry_run: bool = False) -> int:
                     production, unit = fields.get("production"), fields.get("unit")
                     parents = {row.id for row in record.find(kind="showrunner") if row.name == production}
                     matches = [row for row in record.find(kind="unit") if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents
-                               and isinstance(unit, str) and row.name.removesuffix("-unit") == unit.removesuffix("-unit")]
+                               and isinstance(unit, str) and row.name == unit]
                     if len(matches) != 1:
                         raise staff.StaffUnreadable(f"{path}: run owner is unavailable")
                     owner = matches[0]

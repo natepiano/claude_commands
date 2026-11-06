@@ -10,7 +10,7 @@ read-only and persist across phases and plans. The fresh Claude helper in
 A unit keeps its worker threads across phases and plans. `assign.sh` selects
 an idle worker by role, resumes it, and claims it for the dispatch.
 Codex code review uses the unit's read-only `review` workers.
-The [simplify lens](simplify-lens.md) uses a fresh Claude review.
+The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Writers keep their writing roles.
 Each follow compacts when the recorded context exceeds the configured limit.
 Phase cleanup ends turns and keeps threads. Unit pause, move, and end use staff membership and the worker ledger. Usage reports compare checkpointed phases through the usage store.
@@ -36,7 +36,7 @@ reviewer can take the work.
 
 One renderer makes every worker's thread title and message prefix:
 `workers.shown_name`. A unit run gives `<production> · <unit> · <job>[ <n>]`,
-with the unit's `-unit` suffix removed. The job label comes from
+with the unit's staff name. The job label comes from
 `config/names.toml`: `implementer`, `tester`, `repair_worker` or
 `code_reviewer` for the `impl`, `test`, `fix` and `review` roles, and `worker`
 for any other role. The second holder of a role gets the number 2, and so on.
@@ -111,14 +111,15 @@ This anomaly does not refuse admission.
 
 `dispatch_pending(run, name, prompt)` matches the assignment id and any state other than `ASSIGNMENT_ACCEPTED`.
 An unreadable roster prints one anomaly and returns false.
-`implement.sh` checks family before the pending record, so a family change still reaches the switch path.
+`assign.py` and `implement.sh` check family before the pending record, so a family change still reaches the switch path.
 A retry for the published destination restores the saved extract before its assignment.
 It reuses that destination instead of creating another backend.
 An accepted retry prints `unchanged`.
 
-`assign.sh --to` routes a Codex family change or pending delivery through the implementation launcher and `codex_mesh.py start`.
+`assign.py` routes a Codex family change or pending delivery to `codex_mesh.py start`.
+Its `--assignment-file` names the original prompt, so a retry computes the same assignment id.
 An accepted record or a record for another prompt keeps the normal follow path.
-`review.sh` has no pending-dispatch check. Its follow path does not restore a saved extract.
+`implement.sh` and `review.sh` are Claude launchers. `review.sh` has no pending-dispatch check, and its follow path does not restore a saved extract.
 
 ### Claude coordinator and friends
 
@@ -179,7 +180,7 @@ The verbs:
 
 | Verb | Signature | Behavior |
 | --- | --- | --- |
-| `start` | `--session-dir --name [--role impl\|test\|fix\|review] [--lens] --cwd --prompt-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--sandbox danger-full-access] [--resident]` | Opens a thread and blocks until its turn ends. `--role` is optional, and roleless threads such as ask-a-friend friends leave it out. A given role, with `--lens` when passed, is appended to `agents.jsonl` for the new thread. |
+| `start` | `--session-dir --name [--staff-id] [--assignment-file] [--role impl\|test\|fix\|review] [--lens] --cwd --prompt-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--sandbox danger-full-access] [--resident]` | Opens a thread and blocks until its turn ends. `--role` is optional, and roleless threads such as ask-a-friend friends leave it out. A given role, with `--lens` when passed, is appended to `agents.jsonl` for the new thread. |
 | `follow` | `--session-dir --to --role (required) [--lens] [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--cwd] [--read-only] [--image …]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. `--cwd`, `--read-only` and `--image` apply to that turn only and also apply to unit-owned reviewers; without them the request is the worker's usual one. |
 | `prime`, `fork`, `reset` | `--session-dir`, worker name and command-specific arguments | Prime a thread with standing instructions, fork a named thread, or remove turns from an idle thread. Held roles restrict these operations as described below. |
 | `compact` | `--session-dir --to` | Exits 2 for a worker that is running or busy, a worker with no recorded context size, and a worker whose size is `not_measured_since_compaction` (`size not measured since its last compaction; compact refused`). Otherwise it reads the entry's `revision`, resumes the thread, waits up to 60 s (`COMPACT_IDLE_WAIT_SECS`) for a turn still live on it to end, exits 3 (`COMPACT_TURN_STILL_LIVE`) if one stays live, and calls `thread/compact/start`. It waits until the compaction turn has a `thread/compacted` notice or a `contextCompaction` item, a token-usage update and a `turn/completed`. It then writes the new size under `RosterUnchanged(thread_id, revision)`, so a turn that wrote the entry in between keeps its record. A refused write exits 4 (`COMPACT_ROSTER_CHANGED`), reports the current status, thread, turn and revision, and refuses the follow-up. Old followers detach once their launcher no longer owns the entry; broadcast compaction notices cannot change, settle or clean up a paused, finished or newly claimed worker. A size above 0 prints `compacted <worker>: <before> -> <after> tokens`; a compaction turn that reports 0 stores `not_measured_since_compaction` and prints `compacted <worker>: <before> tokens, size not measured until its next turn`. A compaction that has not finished in 300 s (`CompactionTimedOut`) is interrupted with `turn/interrupt` and the thread is read until idle, up to the same 60 s: idle is exit 1 with `…; interrupted the compaction turn, the worker is idle and not compacted`, so a follow-up can still be sent; a turn still live is exit 3. |
@@ -368,7 +369,7 @@ See [unit rename](unit-rename.md) for explicit worktree moves.
 | File | Role |
 | --- | --- |
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
-| `scripts/direct/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
+| `scripts/direct/implement.sh` | Claude writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
 | `scripts/direct/assign.py`, `assign.sh` | Unit role allocation, persistent reviewer dispatch, read-only follow and own review records |
 | `scripts/direct/review.sh` | Compatibility flags, explicit recipient follow, own allocation and tree guard |
 | `scripts/direct/end_session.sh` | Unbinds held design roles, preserves a live director's workers and servers, otherwise pauses recorded runs; no sweep |

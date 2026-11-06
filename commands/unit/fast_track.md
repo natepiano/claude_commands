@@ -9,11 +9,11 @@ A unit director may write and send a small fix from its own `~/.claude`
 worktree with:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/production/fast_track.py --unit <unit> --production <production doc> --why "<one line>" <path>...
+~/.claude/scripts/lib/py ~/.claude/scripts/production/fast_track.py --unit <unit> --production <showrunner name> --why "<one line>" <path>...
 ```
 
-Use the production doc in the unit plan header. Its `Promote:` field names the
-installation targets. Name only the fix's files, including new files. The
+Use the parent showrunner row's `name` for `--production`.
+Read the doc from that row's `doc.path`. Its `Promote:` field names the installation targets. Name only the fix's files, including new files. The
 command takes their changes against HEAD; it refuses paths outside the repo,
 no change, conflicts with main, and the `refused_paths` in
 `config/fast_track.conf`; Python files that import a refused repo module, directly or through other repo modules, are also refused.

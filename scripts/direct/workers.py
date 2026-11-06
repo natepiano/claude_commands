@@ -371,7 +371,7 @@ def _worker_from_record(name: str, run: Path, record: dict[str, object], members
     policy: dict[str, object] = {"kind": type(access).__name__}
     if isinstance(access, PhaseBoundDesigner):
         policy.update({"binding_generation": access.binding_generation, "launch_sandbox": access.launch_sandbox})
-    settings = codex_mesh.recorded_turn_settings(record)
+    settings = worker_lifecycle.recorded_turn_settings(record)
     return UnitWorker(name, _worker_task_role(record, membership, assignments), "codex", settings.model,
                       settings.effort, policy,
                       CodexThread(_text(session_staff.worker_session(record, membership)), _text(session_staff.worker_home(record, membership)) or
@@ -431,7 +431,7 @@ def note_backend(run: Path, name: str, thread_id: str, home: Path) -> None:
                                                 old_thread_id=previous, thread_id=thread_id))
                 worker.access_policy = _object(record.get("access_policy")) or worker.access_policy
                 from scripts.agents import codex_mesh
-                settings = codex_mesh.recorded_turn_settings(record)
+                settings = worker_lifecycle.recorded_turn_settings(record)
                 worker.model, worker.effort = settings.model, settings.effort
                 worker.backend = CodexThread(thread_id, str(home.resolve()))
                 worker.ownership = HeldBy(str(run))
@@ -562,7 +562,7 @@ def _reviewer_destination(owner: staff.StaffRow) -> str:
     if owner.kind == "unit" and not isinstance(owner.worktree, staff.PresentWorktree):
         raise WorkerUnavailable("invalid worker state: missing working_dir")
     from scripts.production.production_doc import read_production
-    directory = str(read_production(owner.doc.path).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
+    directory = str(read_production(owner.name).checkout if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
                     else owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd())
     result = subprocess.run(
         ["bash", str(Path(__file__).with_name("worker_name.sh")),
@@ -759,8 +759,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                         print(f"cancelled pending message of {name}: {message}")
                                     _write_inbox(inbox, {})
                                 current = _object(_read_roster(run).get(name))
-                                if (isinstance(worker.backend, CodexThread) and current
-                                        and current.get("status") != "ended"):
+                                if isinstance(worker.backend, CodexThread) and current:
                                     result = codex_mesh.end_worker_locked(argparse.Namespace(session_dir=str(run), to=name))
                                     if result:
                                         raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")

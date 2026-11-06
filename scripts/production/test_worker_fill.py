@@ -114,9 +114,9 @@ class WorkerFillTests(StaffTestCase):
                                  else worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
 
     def test_staff_id_admits_without_reading_unrelated_malformed_evidence(self) -> None:
-        production_membership("demo", "models-unit")
-        parent = unit_membership("demo", "models-unit")
-        run = self.worker_run("demo", "models-unit", "director")
+        production_membership("demo", "models")
+        parent = unit_membership("demo", "models")
+        run = self.worker_run("demo", "models", "director")
         for evidence in (Path(os.environ["HERDR_PANE_RECORD_DIR"]) / "agents.json",
                          run / "progress_history_state.json"):
             with self.subTest(evidence=evidence.name):
@@ -134,12 +134,12 @@ class WorkerFillTests(StaffTestCase):
                 _ = staff.retire(admitted.row.id)
 
     def test_retired_unit_cannot_admit_a_worker(self) -> None:
-        doc = self.production("demo", "models-unit")
+        doc = self.production("demo", "models")
         _ = recorded_showrunner("demo", doc)
-        production_membership("demo", "models-unit")
-        parent = unit_membership("demo", "models-unit")
+        production_membership("demo", "models")
+        parent = unit_membership("demo", "models")
         _ = staff.set_worktree(parent.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=parent.worktree)
-        run = self.worker_run("demo", "models-unit", "director")
+        run = self.worker_run("demo", "models", "director")
         with redirect_stderr(io.StringIO()) as errors:
             allowed = worker_admission.admit("impl", run)
         self.assertEqual(allowed.parent, parent.id)

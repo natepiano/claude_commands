@@ -101,16 +101,11 @@ agents_exec_main() {
         claude)
             source "$script_dir/claude_account.sh"
             if [[ "$task" == direct.simplify ]]; then
-                if [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]]; then
-                    claude_launch_environment quota || return 1
-                else
-                    claude_launch_environment quota 2>"$log_file" || return 1
-                    cat "$log_file" >&2
-                fi
+                claude_launch_environment || return 1
             else
                 claude_launch_environment workers || return 1
-                [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]] || : > "$log_file"
             fi
+            [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]] || : > "$log_file"
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
             command=(env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 "$PY" "$script_dir/../lib/nix_env.py" exec "$(command -v claude)" --print)

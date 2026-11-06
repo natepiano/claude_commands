@@ -196,7 +196,7 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 
 <ProductionUnit>
 Your staff row identifies your unit and its parent showrunner.
-The parent row identifies your production and its document.
+The parent row's `name` is your production name. Its `doc.path` gives the document.
 Read `~/.claude/docs/production_format.md` → <ProductionUnit/> at <PrepareSession/> and after every compaction.
 Apply it throughout the run when your staff row has a parent showrunner. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
@@ -589,6 +589,17 @@ including a reviewer's style finding. Each open phase has
 its own ledger, and `--phase` names which one: with two phases open, a call
 naming none is refused. Every launch names its phase (<PassOwnership/>), so the
 launcher's own `landed` and `abandon` reach that phase's ledger.
+
+When a daily simplify run reports items, its director performs these steps:
+
+1. Add a phase `simplify-<date>` to the plan from the report.
+2. Record every item under that phase with `--lens simplify`; discard none.
+3. Send in-scope items and items that remove a copy to Codex fix workers as one repair phase.
+   Use the normal checkpoint.
+4. Open other items with `--held-for-decision` and include the proposed change, files, and reason.
+
+A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. Settle every other held item under DecisionEconomy and state the call in one line (user, 2026-11-02).
+Record the user's answer with `decision --user-words`.
 
 | Command | Purpose |
 | --- | --- |
@@ -1326,21 +1337,14 @@ reporting anything about the round.
 </FixDispatch>
 
 <Synthesize>
-1. Merge the `adversary`, `contract`, `simplify`, armed `rerun`, UX, and main review findings.
+1. Merge the `adversary`, `contract`, armed `rerun`, UX, and main review findings.
    Combine duplicate findings and record every contributing lens with `--lens`.
-   Record each simplify item; discard none.
-   Open behavior-preserving items within the phase as `minor --lens simplify`.
-   Add `--held-for-decision` for each behavior change or change outside the phase.
-   Open a change that removes a copy as `minor --lens simplify`, not held, also outside the phase.
-   Include the proposed change, files, and reason in its detail.
-   A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. Settle every other held item under DecisionEconomy and state the call in one line (user, 2026-11-02).
-   Record the user's answer with `decision --user-words`.
    Explain each refuted finding from another lens.
+   Handle daily simplify reports under <FindingsLedger/>.
    Report reviewer disagreements under <DelegationResultFormat/>.
 2. Present <DelegationResultFormat/>. If the user is confused, apply
    <ExplainOnDemand/> before any choice.
-3. Codex fix workers apply every simplify repair.
-   For other lenses, if every remaining issue is trivial — doc-only, an agreed rename, or a
+3. If every remaining issue is trivial — doc-only, an agreed rename, or a
    small mechanical change whose one correct edit is evident from the finding
    itself, with no design judgment and no reviewer disputing the reading —
    the unit director applies them all directly,

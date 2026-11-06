@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 from scripts.lib import atomic_file, copy_record
-from scripts.production import showrunners, staff, change_routing, merge_checkpoint
+from scripts.production import showrunners, staff, change_routing, merge_checkpoint, unit_lookup
 from scripts.shutdown import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
@@ -59,7 +59,7 @@ GRID = Visible("The grid fades more gently", "Run `hana` in a natedev terminal",
 SEE = f"Change-Review: {GRID.change} | {GRID.check} | {GRID.see}"
 # A production doc as the vault records it; a write never reads the doc itself.
 PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
-DOC = str(PRODUCTION)
+DOC = "demo"
 DEMO_ID = fixture_runtime_id("showrunner::demo")
 
 
@@ -153,7 +153,7 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("config", "user.name", "Producer fixture")
         _ = self.git("config", "user.email", "producer@example.invalid")
         _ = self.git("commit", "--allow-empty", "-m", "Initial")
-        self.unit = self.branch_unit("new-unit", "unit", "old-branch", "old-plan.md")
+        self.unit = self.branch_unit("new", "unit", "old-branch", "old-plan.md")
         _ = self.doc.write_text(f"# Top\n- **Repository:** `{self.repo}`\n"
             + f"- **Showrunner checkout:** `{self.repo}`\n- **Change review:** `{self.listing}`\n")
 
@@ -186,7 +186,7 @@ class ProducerWriterTests(ProducerFixture):
         assert isinstance(parent, staff.ReportsTo)
         destination = fixture_member("showrunner", name="destination")
         _ = staff.rename(parent.id, "renamed-production")
-        _ = staff.rename(self.unit.id, "renamed-unit")
+        _ = staff.rename(self.unit.id, "renamed")
         _ = staff.move(self.unit.id, staff.ReportsTo(destination.id))
         snapshot = change_review.review_snapshot(self.listing)
         unit, production = snapshot.pending
@@ -197,14 +197,14 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual(router.owner(unit, self.listing).tab, "destination")
         self.assertEqual(router.owner(production, self.listing).tab, "renamed-production")
         self.assertIn("Production: destination", change_review.describe(unit))
-        self.assertIn("Producer: renamed-unit", change_review.describe(unit))
+        self.assertIn("Producer: renamed", change_review.describe(unit))
         self.assertEqual(self.listing.read_bytes(), before)
 
     def legacy_list(self, name: str) -> Path:
         path = self.root / name
         _ = path.write_text("## To review\n\n| # | Change | Production | Producer |\n| --- | --- | --- | --- |\n"
             + f"| C1 | Unit | top | {self.unit.id} |\n| C2 | Production | top | |\n"
-            + "| C3 | Unknown producer | top | lost-unit |\n| C4 | Unknown production | lost-production | |\n\n"
+            + "| C3 | Unknown producer | top | lost |\n| C4 | Unknown production | lost-production | |\n\n"
             + "## Reviewed\n\n| # | Change | Production | Verdict | Date |\n| --- | --- | --- | --- | --- |\n"
             + "| C5 | History | top | works | 2026-11-01 |\n", encoding="utf-8")
         return path
@@ -214,7 +214,7 @@ class ProducerWriterTests(ProducerFixture):
         before = path.read_bytes()
         messages = change_review.migrate_owners([path], write=False)
         self.assertEqual(path.read_bytes(), before)
-        self.assertTrue(any("C3" in line and "lost-unit" in line for line in messages))
+        self.assertTrue(any("C3" in line and "lost" in line for line in messages))
         self.assertTrue(any("C4" in line and "lost-production" in line for line in messages))
         with redirect_stdout(io.StringIO()):
             self.assertEqual(change_review.main(["migrate-owners", "--list", str(path), "--write"]), 0)
@@ -232,7 +232,7 @@ class ProducerWriterTests(ProducerFixture):
         interrupted = [self.legacy_list(f"retry-{index}.md") for index in range(2)]
         clean = [self.legacy_list(f"clean-{index}.md") for index in range(2)]
         original_write = atomic_file.write_text_atomic
-        new_session = staff.StaffId(fixture_runtime_id("cleared-unit"))
+        new_session = staff.StaffId(fixture_runtime_id("cleared"))
 
         def write(path: Path, text: str) -> None:
             if path == interrupted[1]:
@@ -254,14 +254,14 @@ class ProducerWriterTests(ProducerFixture):
         finished.assert_not_called()
 
     def colliding_units(self) -> staff.StaffRow:
-        _ = self.branch_unit("new-unit", "unit", "branch-a", "branch-b.md")
-        return self.branch_unit("second-unit", "second", "branch-b", "second.md")
+        _ = self.branch_unit("new", "unit", "branch-a", "branch-b.md")
+        return self.branch_unit("second", "second", "branch-b", "second.md")
 
     def test_an_exact_branch_wins_over_an_earlier_unit_alias(self) -> None:
         _ = self.colliding_units()
         source = change_review.unit_branches([self.doc])["branch-b"]
         self.assertEqual(source.worktree, self.root / "second")
-        self.assertEqual(source.name, "second-unit")
+        self.assertEqual(source.name, "second")
 
     def test_merge_publication_uses_the_exact_branch_producer_before_an_alias(self) -> None:
         second = self.colliding_units()
@@ -298,7 +298,7 @@ class ProducerWriterTests(ProducerFixture):
         output = io.StringIO()
         with redirect_stdout(output):
             code = change_review.main(["append", "--repo", str(self.repo), "--checkpoint", "HEAD",
-                "--previous", previous, "--merge-branch", "main", "--production", str(self.doc),
+                "--previous", previous, "--merge-branch", "main", "--production", "top",
                 "--list", str(self.listing), "--merged", self.git("rev-parse", "HEAD")])
         self.assertEqual(code, 0)
         self.assertEqual([row["Producer"] for row in change_review.pending(self.listing)], [self.unit.id, "", ""])
@@ -329,7 +329,8 @@ class ProducerWriterTests(ProducerFixture):
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
         output = io.StringIO()
         with (mock.patch.object(change_review, "drift", return_value=[]),
-              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), redirect_stdout(output)):
+              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(
+                  tuple(staff.snapshot().find(kind="showrunner")))), redirect_stdout(output)):
             merge_checkpoint.record_publication_changes(production, commits, merge)
         notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
         self.assertEqual(len(notes), 1)
@@ -340,7 +341,7 @@ class ProducerWriterTests(ProducerFixture):
         for directory, expected in ((self.root / "unit", self.unit.id),
                                     (self.root / "unit" / "src", self.unit.id), (self.repo, ""), (self.root, "")):
             with self.subTest(directory=directory), redirect_stdout(io.StringIO()):
-                result = change_review.main(["add", "--repo", str(directory), "--production", str(self.doc),
+                result = change_review.main(["add", "--repo", str(directory), "--production", "top",
                     "--list", str(self.listing), "--change", str(directory), "--check", "Read", "--see", "Proof"])
                 self.assertEqual(result, 0)
                 self.assertEqual(change_review.pending(self.listing)[-1]["Producer"], expected)
@@ -435,7 +436,8 @@ class ListTest(unittest.TestCase):
         for listing in listings:
             _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n| C2 | Second |\n")
         links = root / "links"
-        record = staff.StaffSnapshot(())
+        record = staff.StaffSnapshot((fixture_member("showrunner", name="top",
+            doc=staff.LiveDoc(remote.local_machine(), doc)),))
         scans = mock.Mock(wraps=links.glob)
         folder = mock.Mock(glob=scans)
         with (mock.patch.object(change_review, "lists_directory", return_value=root),
@@ -470,25 +472,22 @@ class ListTest(unittest.TestCase):
         with mock.patch.object(change_review, "showrunner_of", side_effect=down):
             self.assertEqual(change_review.list_path(doc), stale)
 
-    def test_a_child_production_takes_its_root_showrunners_name(self) -> None:
-        from scripts.production import showrunners
-
-        names = {"build-followups": "natedev"}
-
-        def name_of(slug: str) -> str:
-            return names.get(slug, "")
-
-        with (mock.patch.object(showrunners, "canonical_slug", side_effect=str),
-              mock.patch.object(showrunner_tree, "root_of", return_value="build-followups") as root,
-              mock.patch.object(showrunners, "current_name", side_effect=name_of)):
-            self.assertEqual(change_review.showrunner_of(Path("/p/child-production.md")), "natedev")
-            root.assert_called_once_with("child")
-            names.clear()
-            self.assertRaises(change_review.ChangeReviewError, change_review.showrunner_of,
-                              Path("/p/child-production.md"))
 
 
 from scripts.production.staff_test_support import isolated_staff_file
+
+
+class StaffProductionNameTests(unittest.TestCase):
+    def test_child_document_uses_the_staff_parent_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with isolated_staff_file(root / "staff.json", {}):
+                parent = fixture_member("showrunner", name="hana")
+                doc = root / "tool-based-ui-production.md"
+                _ = fixture_member("showrunner", name="child", parent=parent.id,
+                                   doc=staff.LiveDoc(remote.local_machine(), doc))
+                self.assertEqual(change_review.showrunner_of(doc), "hana")
+                self.assertEqual(change_review.production_doc("child"), doc)
 
 
 class AttachedListTest(unittest.TestCase):
@@ -520,6 +519,22 @@ class AttachedListTest(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         producer_rows(self.root, {"parent": self.root / "parent-production.md", "child": self.doc},
                         {self.current: "parent", self.earlier: "child"})
+
+    def test_descendant_lists_use_the_supplied_staff_names_after_a_rename(self) -> None:
+        child = unit_lookup.doc_owner(self.doc, staff.snapshot())
+        doc = self.root / "descendant-settings.md"
+        _ = doc.write_text("# Descendant\n")
+        _ = fixture_member("showrunner", name="grandchild", parent=child.id,
+                           doc=staff.LiveDoc(remote.local_machine(), doc))
+        earlier = self.root / "change-review - grandchild.md"
+        _ = earlier.write_text("# Earlier changes\n")
+        record = staff.snapshot()
+        _ = staff.rename(child.id, "renamed-child")
+        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("use the supplied snapshot")):
+            lists = change_review.scope_lists(self.current, self.doc, below=True, record=record)
+            scope = change_review.review_scope(self.doc, True, record)
+        self.assertEqual([item.path for item in lists], [self.current, self.earlier, earlier])
+        self.assertEqual(scope, {"child", "grandchild"})
 
     def test_columnless_earlier_rows_belong_to_the_attached_production_without_list_edits(self) -> None:
         before = {path: path.read_bytes() for path in (self.current, self.earlier)}
@@ -642,6 +657,7 @@ class StampTest(unittest.TestCase):
 
     def test_a_new_production_is_added_after_the_listed_ones(self) -> None:
         other = Path.home() / "rust/cargo-liner/docs/child-production.md"
+        _ = fixture_member("showrunner", name="child", doc=staff.LiveDoc(remote.local_machine(), other))
         _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "", other, record=staff.snapshot())
         _ = change_review.record_verdict(self.path, "C1", "works", date(2026, 10, 16), other)
         self.assertEqual(self.frontmatter()[2:6], [
@@ -1143,11 +1159,14 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(sorted(row.split(" ")[1] for row in rows), [f"C{number}" for number in range(81, 89)])
 
     def test_list_path_prints_the_list_a_production_doc_names(self) -> None:
+        self.fresh = self.fresh.with_name("change-review - fixture-list.md")
+        _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.fresh.parent))
         doc = self.path.with_name("production.md")
         _ = doc.write_text(f"# p\n\n- **Change review:** `{self.fresh}`\n", encoding="utf-8")
-        self.assertEqual(run("list-path", "--production", str(doc)), (0, f"{self.fresh}\n", ""))
+        _ = fixture_member("showrunner", name="fixture-list", doc=staff.LiveDoc(remote.local_machine(), doc))
+        self.assertEqual(run("list-path", "--production", "fixture-list"), (0, f"{self.fresh}\n", ""))
         _ = doc.write_text("# p\n", encoding="utf-8")
-        self.assertEqual(run("list-path", "--production", str(doc))[:2], (1, ""))
+        self.assertEqual(run("list-path", "--production", "fixture-list")[:2], (1, ""))
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
             self.assertIn("pass --production", run("list-path")[2])
 
@@ -1357,7 +1376,7 @@ class ProductionMergeCommitsTest(unittest.TestCase):
 
     def test_linked_worktree_excludes_commits_reviewed_in_the_common_repository(self) -> None:
         checkout = self.repo.parent / "unit-checkout"
-        _ = self.git("worktree", "add", "-q", "-b", "linked-unit", str(checkout), "unit")
+        _ = self.git("worktree", "add", "-q", "-b", "linked", str(checkout), "unit")
         self.repo = checkout
         own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
         self.assertEqual([commit.sha for commit in self.commits()], [own])
@@ -1603,7 +1622,7 @@ class RepositoryTest(unittest.TestCase):
                             + "| C3 | no hash | 2026-10-15 | x |\n\n"
                             + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
         before = path.read_text(encoding="utf-8")
-        _ = recorded_unit("kid", "u-unit", self.repo / "u", kid, plan="docs/u-plan.md")
+        _ = recorded_unit("kid", "u", self.repo / "u", kid, plan="docs/u-plan.md")
         top_owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
         tree = change_review.Tree([top, kid])
         kid_owner = staff.snapshot().by_doc("natedev", kid)
@@ -1627,7 +1646,7 @@ class RepositoryTest(unittest.TestCase):
         style = folder / "top-style-production.md"
         _ = style.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** style/main\n- **Kind:** style\n"
                              + f"- **Parent production:** {top}\n", encoding="utf-8")
-        _ = recorded_unit("top-style", "u-unit", self.repo / "u", style, plan="docs/u-plan.md")
+        _ = recorded_unit("top-style", "u", self.repo / "u", style, plan="docs/u-plan.md")
         owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
         child = staff.snapshot().by_doc("natedev", style)
         assert child is not None
@@ -1646,7 +1665,7 @@ class RepositoryTest(unittest.TestCase):
         _ = top.write_text("# Top\n", encoding="utf-8")
         commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE}", ()),
                    change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE}", ())]
-        _ = recorded_unit("kid", "u-unit", self.repo, kid, plan="docs/u-plan.md")
+        _ = recorded_unit("kid", "u", self.repo, kid, plan="docs/u-plan.md")
         _ = recorded_showrunner("top", top)
         _ = recorded_showrunner("kid", kid, parent="top")
         with mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}):

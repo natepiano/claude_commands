@@ -3,6 +3,7 @@
 
 setopt no_unset pipe_fail extended_glob
 (( $# == 1 )) || exit 1
+name=$(PYTHONPATH="${0:A:h:h:h}" "${0:A:h:h}/lib/py" -c 'import sys; from scripts.production import showrunners; print(showrunners.owner_for(sys.argv[1]).name)' "$1") || exit 1
 doc=$("${0:A:h:h}/lib/py" "${0:A:h}/showrunners.py" doc "$1") || exit 1
 
 for line in "${(@f)$(<$doc)}"; do
@@ -11,7 +12,7 @@ for line in "${(@f)$(<$doc)}"; do
     case $doc_status in
       running)
         # One copy of LOG per update tick. A failed copy never changes the check's answer.
-        "${0:A:h:h}/lib/py" "${0:A:h}/log_backup.py" "$doc" >/dev/null || true
+        "${0:A:h:h}/lib/py" "${0:A:h}/log_backup.py" "$name" >/dev/null || true
         exit 0 ;;
       wrapped) exit 2 ;;
       *) exit 1 ;;

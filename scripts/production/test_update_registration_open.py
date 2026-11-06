@@ -13,8 +13,8 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 class RegistrationTests(RegistrationFixture):
     def test_open_lists_only_the_productions_own_items_in_full_never_those_below(self) -> None:
-        for slug in ("example", "kid", "grandkid", "stranger"):
-            self.timer(slug)
+        for name in ("example", "kid", "grandkid", "stranger"):
+            self.timer(name)
         self.attach("kid", "example")
         self.attach("grandkid", "kid")
         self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"},
@@ -38,8 +38,8 @@ class RegistrationTests(RegistrationFixture):
         ])
 
     def test_a_middle_showrunner_lists_its_own_items_and_marks_one_below_never_above(self) -> None:
-        for slug in ("top", "example", "kid"):
-            self.timer(slug)
+        for name in ("top", "example", "kid"):
+            self.timer(name)
         self.attach("example", "top")
         self.attach("kid", "example")
         self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"})

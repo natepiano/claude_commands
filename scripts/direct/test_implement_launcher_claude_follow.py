@@ -27,12 +27,12 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
             request = worker_admission.assignment_id(self.prompt_file)
             worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
 
-        failed = self.claude_follow(session_dir, transcript, "queued")
+        failed = self.worker_launch(session_dir, to="fixture-impl", behavior="queued")
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name),
                          worker_admission.DispatchRecord(request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT))
 
-        retried = self.claude_follow(session_dir, transcript, "complete")
+        retried = self.worker_launch(session_dir, to="fixture-impl", behavior="complete")
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
         self.assertEqual(len(transcript.read_text(encoding="utf-8").splitlines()), 2)
         self.assertEqual((self.root / "delivered_to.txt").read_text(), f"session:{row.current_session}")
@@ -43,7 +43,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         accepted = worker_admission.dispatch_record(allowed.run, allowed.name)
         self.assertEqual(accepted, worker_admission.DispatchRecord(request, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED))
 
-        followed = self.claude_follow(session_dir, transcript, "complete")
+        followed = self.worker_launch(session_dir, to="fixture-impl", behavior="complete")
         self.assertEqual(followed.returncode, 0, followed.stdout + followed.stderr)
         self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), accepted)
         self.assertNotIn(str(extract), (self.root / "delivered_message.txt").read_text())
@@ -68,7 +68,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         environment = self.environment()
         environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
         with patch.object(self, "environment", return_value=environment):
-            result = self.claude_follow(run, transcript, "complete")
+            result = self.worker_launch(run, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr.splitlines(),
                          [f"anomaly: {row.name}: {run / 'mesh_roster.json'}: worker state unreadable: fixture roster read failed"])
@@ -77,7 +77,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
 
     def test_family_switch_continues_after_an_unknown_dispatch_state(self) -> None:
         run = self.start_phase("switch-unknown-record")
-        transcript = self.claude_worker(run)
+        _ = self.claude_worker(run)
         old = self.recorded_worker(run)
         with isolated_staff_file(self.root / "staff.json", {}):
             identity = staff.native_id(fixture_runtime_id("Codex source with an unknown dispatch state"))
@@ -90,7 +90,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         environment = self.environment()
         environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
         with patch.object(self, "environment", return_value=environment):
-            result = self.claude_follow(run, transcript, "complete")
+            result = self.worker_launch(run, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([line for line in result.stderr.splitlines() if line.startswith("anomaly:")],
                          [f"anomaly: {row.name}: unknown dispatch_state 'invalid'; using NO_RECORD"])
@@ -105,7 +105,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
 
     def test_claude_follow_records_the_dispatch_role_before_delivery(self) -> None:
         session_dir = self.start_phase("claude-role-change")
-        transcript = self.claude_worker(session_dir)
+        _ = self.claude_worker(session_dir)
         sender = self.root / "send"
         original = sender.read_text()
         probe = "\n".join((
@@ -124,7 +124,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         _ = sender.write_text(original.replace("import sys", probe + "\nimport sys", 1))
         with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.root / "usage")}):
             agents_log.append("abc12345-2222-4333-8444-555555555555", "fix", None, datetime.now(timezone.utc))
-            result = self.claude_follow(session_dir, transcript, "complete")
+            result = self.worker_launch(session_dir, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads((self.root / "delivered-role.json").read_text()), "impl")
         self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "completed")
@@ -133,7 +133,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         session_dir = self.start_phase("claude-short-turn")
         transcript = self.claude_worker(session_dir)
 
-        result = self.claude_follow(session_dir, transcript, "complete")
+        result = self.worker_launch(session_dir, to="fixture-impl", behavior="complete")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(transcript.read_text(encoding="utf-8").splitlines()), 2)
@@ -144,9 +144,9 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
 
     def test_claude_follow_retries_unreadable_agents_listing(self) -> None:
         session_dir = self.start_phase("claude-unreadable")
-        transcript = self.claude_worker(session_dir)
+        _ = self.claude_worker(session_dir)
 
-        result = self.claude_follow(session_dir, transcript, "unreadable_once")
+        result = self.worker_launch(session_dir, to="fixture-impl", behavior="unreadable_once")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "completed")
@@ -155,7 +155,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         session_dir = self.start_phase("claude-queued")
         transcript = self.claude_worker(session_dir)
 
-        result = self.claude_follow(session_dir, transcript, "queued")
+        result = self.worker_launch(session_dir, to="fixture-impl", behavior="queued")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(transcript.read_text(encoding="utf-8").splitlines()), 1)
@@ -166,9 +166,9 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
 
     def test_claude_worker_gone_after_delivery_is_a_worker_error(self) -> None:
         session_dir = self.start_phase("claude-gone")
-        transcript = self.claude_worker(session_dir)
+        _ = self.claude_worker(session_dir)
 
-        result = self.claude_follow(session_dir, transcript, "gone")
+        result = self.worker_launch(session_dir, to="fixture-impl", behavior="gone")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "error")

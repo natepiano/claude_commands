@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Dispatch the configured worker and record its pass outcome.
+# Launch the configured Claude worker and record its pass outcome.
 # --to follows an existing worker. --phase selects its artifact directory.
-# Each team slot has a status, summary, reply, log, and resolved model record.
+# Each team slot has a status, summary, log, and resolved model record.
 # The shared board and heartbeat describe each worker during its pass.
 
 set -euo pipefail
-"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 LAUNCHER_COMMAND=(bash "${BASH_SOURCE[0]}" "$@")
+"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -73,27 +73,19 @@ export UNIT_TEAM_ROLE="${TEAM_ROLE}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-PY="${SCRIPT_DIR}/../lib/py"
-TRANSPORT="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" worker-transport "${SESSION_DIR}")"
-MESH_NAME="${FOLLOW_TO:-${TEAM_ROLE}}"
-if [[ "${TRANSPORT}" == mesh ]]; then
-  MESH_PREFIX="${10:-}"
-  LEGACY_PREFIX="$(basename "${SESSION_DIR}")"
-  if [[ -z "${MESH_PREFIX}" ]] && grep -qF "mesh=${LEGACY_PREFIX}-" "${SESSION_DIR}/board.log" 2>/dev/null; then
-    MESH_PREFIX="${LEGACY_PREFIX}"
-  fi
-  if [[ -n "${FOLLOW_TO}" ]]; then
-    MESH_NAME="${FOLLOW_TO}"
-  else
-    MESH_NAME="$(bash "${SCRIPT_DIR}/worker_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
-  fi
-
+MESH_PREFIX="${10:-}"
+LEGACY_PREFIX="$(basename "${SESSION_DIR}")"
+if [[ -z "${MESH_PREFIX}" ]] && grep -qF "mesh=${LEGACY_PREFIX}-" "${SESSION_DIR}/board.log" 2>/dev/null; then
+  MESH_PREFIX="${LEGACY_PREFIX}"
+fi
+if [[ -n "${FOLLOW_TO}" ]]; then
+  MESH_NAME="${FOLLOW_TO}"
 else
-  TASK="direct.${PASS_KIND}"
+  MESH_NAME="$(bash "${SCRIPT_DIR}/worker_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
 fi
 
+PY="${SCRIPT_DIR}/../lib/py"
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
-REPLY_FILE="${ARTIFACT_DIR}/impl_reply${SLOT}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/impl_status${SLOT}"
 LOG_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}"
@@ -105,47 +97,32 @@ PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 FINDINGS_HELPER="${SCRIPT_DIR}/findings.py"
 FINDINGS_STATE="${SESSION_DIR}/findings_state.json"
 HEARTBEAT_INTERVAL_SECS=60
-source "${SCRIPT_DIR}/../lib/conf.sh"
-COMPACT_ABOVE_TOKENS="$(conf_value direct UNIT_COMPACT_ABOVE_TOKENS)"
 
 source "${SCRIPT_DIR}/../agents/models_config.sh"
 models_launch_configuration || exit 1
-if ! agents_resolve "${TASK}"; then
-  exit 1
-fi
+agents_resolve_claude_launcher "${TASK}" implement.sh || exit $?
 
-# Lock identity checks and claim writes. Compact after the claim releases the lock.
+# Lock identity checks and claim writes.
 worker_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
-  "${AGENT_FAMILY}" "${AGENT_MODEL}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
-  "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${PASS_KIND}" "${PROMPT_FILE}" <<'PY'
+  "${AGENT_MODEL}" "${SCRIPT_DIR}" "${PASS_KIND}" "${PROMPT_FILE}" <<'PY'
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-(
-    action, root_text, slot, name, family, model, mesh_script,
-    board_helper, compact_above_text, pass_kind, prompt_text,
-) = sys.argv[1:]
+action, root_text, slot, name, model, script_dir, pass_kind, prompt_text = sys.argv[1:]
 root = Path(root_text)
-compact_above = int(compact_above_text)
 claim_file = root / f"impl_claim_{slot}.json"
-sys.path.insert(0, str(Path(mesh_script).resolve().parents[2]))
+sys.path.insert(0, str(Path(script_dir).resolve().parents[1]))
 from scripts.production import staff, session_staff, worker_admission
-sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
+sys.path.insert(0, str(Path(script_dir)))
 from worker_state import worker_claim_lock, worker_record_path, worker_status_path
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
     raise SystemExit(2)
-
-def post(message):
-    subprocess.run(
-        ["bash", board_helper, "post", root_text, slot, "status", message],
-        capture_output=True, text=True,
-    )
 
 def read(path):
     try:
@@ -163,8 +140,6 @@ if action == "admit":
 
 with worker_claim_lock(root):
     identity_file = worker_record_path(root, name, "fix" if pass_kind == "fix" else slot)
-    roster = read(root / "mesh_roster.json")
-    entry = roster.get(name, {}) if isinstance(roster, dict) else {}
     snapshot = staff.local_snapshot()
     member = worker_admission.member(root, name, snapshot)
     reference = member.id if member else ""
@@ -172,7 +147,7 @@ with worker_claim_lock(root):
     if action == "switch":
         if not member:
             raise SystemExit(1)
-        if session_staff.worker_family(snapshot, member.id) != family:
+        if session_staff.worker_family(snapshot, member.id) != "claude":
             raise SystemExit(0)
         raise SystemExit(0 if worker_admission.dispatch_pending(root, name, Path(prompt_text)) else 1)
     elif action == "record":
@@ -199,102 +174,37 @@ with worker_claim_lock(root):
             else:
                 fail(f"{name} is claimed by launcher {pid}")
         if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
-            launcher = entry.get("launcher_pid", 0) if isinstance(entry, dict) else 0
-            if isinstance(launcher, int) and launcher > 0:
-                try:
-                    os.kill(launcher, 0)
-                except ProcessLookupError:
-                    pass
-                else:
-                    fail(f"{name} is already implementing")
             status_path.write_text("error\n")
-        if family == "codex":
-            if entry.get("held_design_id"):
-                fail(f"{name}: held roles resume through design_roles.py")
-        else:
-            claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
-            try:
-                result = subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
-            except OSError:
-                fail("cannot read claude agents")
-            try:
-                rows = json.loads(result.stdout)
-            except ValueError:
-                fail("cannot read claude agents")
-            row = next((row for row in rows if row.get("sessionId") == worker_id), None)
-            if row is None or row.get("status") != "idle":
-                fail(f"{name} is busy or gone")
-        claim_file.write_text(json.dumps({"pid": int(os.environ["FOLLOW_LAUNCHER_PID"]), "worker": name, "turn_id": ""}))
+        claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
+        try:
+            result = subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
+        except OSError:
+            fail("cannot read claude agents")
+        try:
+            rows = json.loads(result.stdout)
+        except ValueError:
+            fail("cannot read claude agents")
+        row = next((row for row in rows if row.get("sessionId") == worker_id), None)
+        if row is None or row.get("status") != "idle":
+            fail(f"{name} is busy or gone")
+        claim_file.write_text(json.dumps({"pid": int(os.environ["FOLLOW_LAUNCHER_PID"]), "worker": name}))
     elif action == "release":
         claim = read(claim_file)
         if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
-            if family == "codex":
-                subprocess.run(
-                    [sys.executable, mesh_script, "release-follow", "--session-dir", root_text,
-                     "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"]],
-                    capture_output=True, text=True,
-                )
             claim_file.unlink(missing_ok=True)
-    elif action == "turn":
-        claim = read(claim_file)
-        if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
-            turn_id = (
-                entry.get("turn_id", "") if entry.get("status") == "running" else ""
-            ) if family == "codex" else claim.get("turn_id", "")
-            if not turn_id:
-                raise SystemExit(1)
-            claim["turn_id"] = turn_id
-            claim_file.write_text(json.dumps(claim))
-            print(turn_id)
-if action == "claim" and family == "codex":
-    context_tokens = entry.get("context_tokens")
-    if isinstance(context_tokens, int) and context_tokens > compact_above:
-        compact = subprocess.run(
-            [sys.executable, mesh_script, "compact", "--session-dir", root_text,
-             "--to", name],
-            capture_output=True, text=True,
-        )
-        if compact.returncode == 0:
-            line = compact.stdout.strip() or f"compacted {name}"
-            post(f"launcher: {line}")
-        else:
-            detail = (compact.stderr.strip() or compact.stdout.strip()
-                      or f"exit {compact.returncode}").splitlines()[-1]
-            # Exit 3 indicates a live turn after compaction.
-            if compact.returncode == 3:
-                post(f"launcher: {name} still has a live turn after compaction: {detail}; "
-                     "follow-up not sent")
-                fail(f"{name} still has a live turn after compaction; end the worker "
-                     f"(codex_mesh.py end --to {name}) and start a fresh one")
-            if compact.returncode == 4:
-                post(f"launcher: {detail}; follow-up not sent")
-                fail(f"{name}: roster changed during compaction; follow-up not sent; "
-                     f"inspect the worker and use codex_mesh.py reopen --to {name} if idle")
-            post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
-    with worker_claim_lock(root):
-        check = subprocess.run(
-            [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
-             "--to", name, "--claim-pid", os.environ["FOLLOW_LAUNCHER_PID"],
-             "--role", pass_kind],
-            capture_output=True, text=True,
-        )
-        if check.returncode != 0:
-            fail(check.stderr.strip() or f"{name} is busy or not followable")
 
 PY
 }
 
-if [[ "${TRANSPORT}" == mesh ]]; then
-  worker_record admit
-  "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
-fi
+worker_record admit
+"$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
 
-if [[ "${TRANSPORT}" == mesh && -n "${FOLLOW_TO}" ]] && worker_record switch; then
+if [[ -n "${FOLLOW_TO}" ]] && worker_record switch; then
   FOLLOW_TO=""
 fi
 
-if [[ "${TRANSPORT}" == mesh && -n "${FOLLOW_TO}" ]]; then
+if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
   trap 'worker_record release' EXIT
   AGENT_MODEL="$(worker_record claim)"
@@ -312,13 +222,12 @@ if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim 
 fi
 
 : > "${SUMMARY_FILE}"
-rm -f "${REPLY_FILE}"
 echo "implementing" > "${STATUS_FILE}"
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
-if [[ "${TRANSPORT}" == mesh && -f "${PROGRESS_STATE}" ]]; then
+if [[ -f "${PROGRESS_STATE}" ]]; then
   if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind "${PASS_KIND}" \
@@ -331,6 +240,7 @@ if [[ "${TRANSPORT}" == mesh && -f "${PROGRESS_STATE}" ]]; then
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}" \
+    --launcher-command "$("$PY" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${LAUNCHER_COMMAND[@]}")" \
     ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
     echo "ERROR: unable to record the ${PASS_KIND} pass start." >&2
     echo "error" > "${STATUS_FILE}"
@@ -342,13 +252,6 @@ fi
 
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
-if [[ "${TRANSPORT}" == herdr ]]; then
-  MESH_FIELD="transport=herdr; reach=worker.py"
-elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  MESH_FIELD="mesh=${MESH_NAME}; reach=SendMessage"
-else
-  MESH_FIELD="mesh=${MESH_NAME}; reach=codex_mesh.py"
-fi
 # Record the opening role. Later board role changes remain authoritative.
 ROLE_FIELD="role=${PASS_KIND}; "
 if [[ -n "${FOLLOW_TO}" ]]; then
@@ -357,7 +260,7 @@ else
   LAUNCH_NOTE="launcher up"
 fi
 bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
-  "${SUBTASK} ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; ${ROLE_FIELD}status in impl_status${SLOT}" || true
+  "${SUBTASK} ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); mesh=${MESH_NAME}; reach=SendMessage; ${ROLE_FIELD}status in impl_status${SLOT}" || true
 
 export UNIT_RUN_DIR="${SESSION_DIR}"
 # Keep temporary test files under this run for later cleanup.
@@ -368,50 +271,22 @@ if [[ ! -d "$TMPDIR" ]]; then
 fi
 export TMPDIR
 
-if [[ "${TRANSPORT}" == herdr ]]; then
-  WORKER_ARGS=(assign "${PASS_KIND}" "${PROMPT_FILE}" --session-dir "${SESSION_DIR}"
-    --slot "${TEAM_ROLE}" --phase "${PHASE_ID}" --kind implement --reply "${REPLY_FILE}"
-    --fix-cause "${FIX_CAUSE}"
-    --fix-pass "${FIX_PASS}" --activity "${PASS_ACTIVITY}")
-  [[ -z "${FOLLOW_TO}" ]] || WORKER_ARGS+=(--name "${FOLLOW_TO}")
-  "$PY" "${SCRIPT_DIR}/../production/worker.py" "${WORKER_ARGS[@]}" --launcher-command "$("$PY" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${LAUNCHER_COMMAND[@]}")" >"${LOG_FILE}" 2>&1 &
-elif [[ -n "${FOLLOW_TO}" ]]; then
+if [[ -n "${FOLLOW_TO}" ]]; then
   FOLLOW_MESSAGE="${ARTIFACT_DIR}/impl_follow_message${SLOT}.$$.txt"
   cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
   printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
-  if [[ "${AGENT_FAMILY}" == "claude" ]]; then
-    AGENT_BG_ROLE="${PASS_KIND}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach --run "${SESSION_DIR}" \
-      "${MESH_NAME}" "${WORKING_DIR}" "${FOLLOW_MESSAGE}" "${SUMMARY_FILE}" \
-      "${LOG_FILE}" "${AGENT_MODEL}" &
-  else
-    "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
-      --session-dir "${SESSION_DIR}" --to "${MESH_NAME}" --claim-pid "${FOLLOW_LAUNCHER_PID}" \
-      --role "${PASS_KIND}" \
-      --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
-      --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
-      --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
-  fi
-elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
+  AGENT_BG_ROLE="${PASS_KIND}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach --run "${SESSION_DIR}" \
+    "${MESH_NAME}" "${WORKING_DIR}" "${FOLLOW_MESSAGE}" "${SUMMARY_FILE}" \
+    "${LOG_FILE}" "${AGENT_MODEL}" &
+else
   AGENT_BG_ROLE="${PASS_KIND}" AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --run "${SESSION_DIR}" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${AGENT_MODEL}" &
-else
-  "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
-    --session-dir "${SESSION_DIR}" \
-    --name "${MESH_NAME}" \
-    --role "${PASS_KIND}" \
-    --prompt-file "${PROMPT_FILE}" \
-    --summary-file "${SUMMARY_FILE}" \
-    --reply-file "${REPLY_FILE}" \
-    --log-file "${LOG_FILE}" \
-    --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 fi
 AGENT_PID=$!
-if [[ "${TRANSPORT}" == mesh && ( -z "$FOLLOW_TO" || "$AGENT_FAMILY" == codex ) ]]; then
-  RECORD_ACTION=record
-  [[ -z "$FOLLOW_TO" ]] || RECORD_ACTION=turn
+if [[ -z "$FOLLOW_TO" ]]; then
   for ((worker_wait=0; worker_wait<${UNIT_WORKER_WAIT_ATTEMPTS:-30}; worker_wait++)); do
-    if worker_record "$RECORD_ACTION" >/dev/null 2>&1; then
+    if worker_record record >/dev/null 2>&1; then
       break
     fi
     kill -0 "$AGENT_PID" 2>/dev/null || break
@@ -427,22 +302,14 @@ HEARTBEAT_LOOP_PID=$!
 
 AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
-if [[ "${TRANSPORT}" == mesh && -n "${FOLLOW_TO}" ]]; then
-  if [[ "${AGENT_FAMILY}" == "codex" ]]; then
-    worker_record turn >/dev/null || true
-  fi
+if [[ -n "${FOLLOW_TO}" ]]; then
   rm -f "${FOLLOW_MESSAGE}"
-elif [[ "${TRANSPORT}" == mesh ]]; then
+else
   worker_record record 2>/dev/null || true
 fi
 
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
-
-# Keep the worker summary when it exists. Use its last reply otherwise.
-if [[ ! -s "${SUMMARY_FILE}" && -s "${REPLY_FILE}" ]]; then
-  cp "${REPLY_FILE}" "${SUMMARY_FILE}"
-fi
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   if [[ -f "${PROGRESS_STATE}" ]]; then
@@ -474,7 +341,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
 else
   LEDGER_CODE=0
-  if [[ "${TRANSPORT}" == mesh && -f "${PROGRESS_STATE}" ]]; then
+  if [[ -f "${PROGRESS_STATE}" ]]; then
     UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       || { echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2; LEDGER_CODE=1; }

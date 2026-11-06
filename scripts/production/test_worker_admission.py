@@ -97,7 +97,7 @@ class WorkerAdmissionTests(StaffTestCase):
         self.assertEqual(allowed.parent, unit.id)
         self.assertEqual(staff.by_id(unit.id), changed)
         self.assertEqual(self.staff_file.read_bytes(), before)
-        worker = worker_admission.publish(allowed, fixture_runtime_id("worker-of-codex-unit"))
+        worker = worker_admission.publish(allowed, fixture_runtime_id("worker-of-codex"))
         self.assertEqual(worker.row.parent, staff.ReportsTo(unit.id))
         self.assertEqual(staff.by_current_session(current), changed)
         self.assertIsNone(staff.by_current_session(unit.id))
@@ -557,7 +557,7 @@ except admission.AdmissionRefused as error:
     raise SystemExit(2)
 '''
             environment = staff.child_environment(os.environ)
-            contender = subprocess.run([sys.executable, "-c", program, old.id, str(allowed.run)],
+            contender = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, old.id, str(allowed.run)],
                 env=environment, cwd=CHECKOUT, capture_output=True, text=True,
                 check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(contender.returncode, 2, contender.stdout + contender.stderr)

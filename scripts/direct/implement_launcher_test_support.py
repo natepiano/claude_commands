@@ -1,11 +1,4 @@
-"""Integration tests for implement.sh's worker arguments.
-
-The failure these exist for left no error anywhere. A repair round went out with
-the pass kind on one worker, the other two launchers ran their agents normally,
-and the ledger kept describing the round before it -- two records closed `error`
-an hour earlier -- until the one live window closed and the recorder began
-refusing every progress call while two agents were still working.
-"""
+"""Test Claude launcher arguments, staff identity, and pass records."""
 
 from __future__ import annotations
 
@@ -23,7 +16,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 
-from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
+from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 
 if TYPE_CHECKING:
     from ..lint.memory_test_support import config_environment, write_config_fixture
@@ -36,133 +29,7 @@ AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
 
 
-STUB_MESH = "#!/usr/bin/env python3\n" + STUB_ATOMIC_JSON_WRITER + """
-import json
-import os
-import pathlib
-import sys
-import time
-import signal
-
-verb = sys.argv[1]
-def option(name):
-    return sys.argv[sys.argv.index(name) + 1]
-
-session = pathlib.Path(option('--session-dir'))
-roster_path = session / 'mesh_roster.json'
-roster = json.loads(roster_path.read_text()) if roster_path.exists() else {}
-if verb in ('compact', 'can-follow', 'follow'):
-    with (session / 'mesh_events.txt').open('a') as events:
-        events.write(verb + '\\n')
-if verb == 'follow':
-    from scripts.production import staff, session_staff, worker_admission
-    member = worker_admission.member(session, option('--to'))
-    (session / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(staff.local_snapshot(), member.id)))
-if verb == 'start':
-    baseline = session / 'phases/3/phase_baseline'
-    if baseline.exists():
-        (session / 'baseline-at-worker-open').write_bytes(baseline.read_bytes())
-    name = option('--name')
-    roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
-                    'status': 'done', 'role': option('--role'), 'task': option('--task')}
-    from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
-    from scripts.production import staff
-    with isolated_staff_file(pathlib.Path(os.environ['STAFF_FILE']), {}):
-        worker = fixture_worker(name, staff.native_id(os.environ['CODEX_THREAD_ID']), backend=staff.CodexBackend(pathlib.Path.home() / '.codex'))
-    roster[name]['staff_id'] = worker.id
-    pathlib.Path(option('--reply-file')).write_text('initial reply\\n')
-    if os.environ.get('TEST_WORKER_STARTED'):
-        pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
-elif verb == 'compact':
-    name = option('--to')
-    if os.environ.get('STUB_COMPACT_FAIL') == '1':
-        print('stub compaction failed', file=sys.stderr)
-        sys.exit(1)
-    if os.environ.get('STUB_COMPACT_FAIL') == '3':
-        print('stub turn still live', file=sys.stderr)
-        sys.exit(3)
-    before = roster[name].get('context_tokens', 0)
-    after = int(os.environ.get('STUB_COMPACT_AFTER', '12000'))
-    roster[name]['context_tokens'] = ('not_measured_since_compaction'
-                                    if (session / 'compact_reports_zero').exists() else after)
-    write_json(roster_path, roster)
-    if (session / 'compact_reports_zero').exists():
-        print(f'compacted {name}: {before} tokens, size not measured until its next turn')
-    else:
-        print(f'compacted {name}: {before} -> {after} tokens')
-elif verb == 'can-follow':
-    status_file = session / 'impl_status_impl'
-    if status_file.exists():
-        (session / 'status_before_claim.txt').write_text(status_file.read_text())
-    name = option('--to')
-    entry = roster.get(name, {})
-    status = entry.get('status')
-    pid = entry.get('launcher_pid', 0)
-    alive = False
-    if isinstance(pid, int) and pid > 0:
-        try:
-            os.kill(pid, 0)
-            alive = True
-        except ProcessLookupError:
-            pass
-    if status not in ('done', 'failed', 'paused') and not (
-        status in ('running', 'starting') and pid and not alive
-    ):
-        sys.exit(2)
-    if entry.get('live_turn'):
-        sys.exit(2)
-    entry['previous_status'] = status if status in ('done', 'failed') else 'failed'
-    entry['status'] = 'starting'
-    entry['role'] = option('--role')
-    entry['launcher_pid'] = int(option('--claim-pid'))
-    write_json(roster_path, roster)
-    sys.exit(0)
-elif verb == 'follow':
-    name = option('--to')
-    if roster[name].get('status') != 'starting' or roster[name].get('launcher_pid') != int(option('--claim-pid')):
-        sys.exit(2)
-    if os.environ.get('STUB_FOLLOW_PEER_AFTER_CLAIM') == '1':
-        roster[name] = {'thread_id': roster[name]['thread_id'], 'turn_id': 'peer-turn',
-                        'status': 'running'}
-        write_json(roster_path, roster)
-        sys.exit(1)
-    if os.environ.get('STUB_FOLLOW_HOLD') == 'before':
-        signal.pause()
-    roster[name]['role'] = option('--role')
-    roster[name]['task'] = option('--task')
-    (session / 'follow_message.txt').write_text(pathlib.Path(option('--message-file')).read_text())
-    if os.environ.get('STUB_FOLLOW_FAIL') == '1':
-        roster[name]['status'] = 'failed'
-        write_json(roster_path, roster)
-        sys.exit(1)
-    roster[name]['turn_id'] = 'turn-2'
-    roster[name]['status'] = 'running' if os.environ.get('STUB_FOLLOW_HOLD') == 'after' else 'done'
-    if os.environ.get('STUB_FOLLOW_HOLD') == 'after':
-        roster[name]['launcher_pid'] = os.getpid()
-    write_json(roster_path, roster)
-    if os.environ.get('STUB_FOLLOW_HOLD') == 'after':
-        if os.environ.get('STUB_LAUNCH_RELEASE'):
-            import subprocess
-            subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
-        else:
-            signal.pause()
-        roster[name]['status'] = 'done'
-    pathlib.Path(option('--summary-file')).write_text('follow-up summary\\n')
-elif verb == 'release-follow':
-    name = option('--to')
-    entry = roster.get(name, {})
-    if entry.get('status') == 'starting' and entry.get('launcher_pid') == int(option('--claim-pid')):
-        roster[name] = {'thread_id': entry['thread_id'],
-                        'status': entry.get('previous_status', 'failed')}
-else:
-    sys.exit(2)
-write_json(roster_path, roster)
-if verb == 'start' and os.environ.get('STUB_LAUNCH_RELEASE'):
-    import subprocess
-    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
-"""
-
-CLAUDE_REGISTRY = registry_text({'assignments': {'direct': 'claude'}, 'direct.claude': {'impl': 'opus:high', 'test': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
+CLAUDE_REGISTRY = registry_text({'assignments': {'direct': 'claude'}, 'direct.claude': {'impl': 'opus:high', 'test': 'opus:high', 'fix': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
 
 STUB_CLAUDE = """#!/usr/bin/env python3
 import json
@@ -172,6 +39,15 @@ import sys
 
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
 if sys.argv[1] == '--bg':
+    settings = json.loads(sys.argv[sys.argv.index('--settings') + 1])['env']
+    session = pathlib.Path(settings['UNIT_RUN_DIR'])
+    with (session / 'mesh_events.txt').open('a') as events:
+        events.write('open\\n')
+    baseline = session / 'phases/3/phase_baseline'
+    if baseline.exists():
+        (session / 'baseline-at-worker-open').write_bytes(baseline.read_bytes())
+    if os.environ.get('TEST_WORKER_STARTED'):
+        pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
     (root / 'launch_args.json').write_text(json.dumps(sys.argv[1:]))
     (root / 'launch_environment.json').write_text(json.dumps({
         key: os.environ.get(key, '')
@@ -226,12 +102,17 @@ import sys
 
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
 (root / 'delivered_to.txt').write_text(sys.argv[sys.argv.index('--to') + 1])
+transcript = pathlib.Path(os.environ['STUB_TRANSCRIPT'])
+from scripts.production import staff, session_staff
+rows = staff.local_snapshot()
+worker = rows.by_current_session(transcript.name.removesuffix('.jsonl'))
+if worker is not None:
+    (root / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(rows, worker.id)))
 (root / 'delivered_message.txt').write_text(pathlib.Path(sys.argv[sys.argv.index('--file') + 1]).read_text())
 behavior = os.environ.get('STUB_SEND_BEHAVIOR', 'complete')
 if behavior == 'queued':
     print('QUEUED')
     sys.exit(0)
-transcript = pathlib.Path(os.environ['STUB_TRANSCRIPT'])
 with transcript.open('a') as output:
     output.write(json.dumps({'type': 'assistant', 'message': {'stop_reason': 'end_turn'}}) + '\\n')
 pathlib.Path(os.environ['STUB_SUMMARY']).write_text('Claude follow-up summary\\n')
@@ -253,9 +134,6 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-MODELS_REGISTRY = launcher_registry(("impl", "test", "fix"))
-
-
 class ImplementLauncherFixture(LauncherFixture):
     """Every worker carries a kind, and the board line says which."""
 
@@ -272,7 +150,7 @@ class ImplementLauncherFixture(LauncherFixture):
     def staff_parent(self) -> str:
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         with isolated_staff_file(self.root / "staff.json", {}):
-            parent = unit_membership("fixture", "fixture-unit")
+            parent = unit_membership("fixture", "fixture")
             from scripts.production import staff
             parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.working_dir), expected=parent.worktree)
         return parent.id
@@ -289,7 +167,7 @@ class ImplementLauncherFixture(LauncherFixture):
                 "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
                 "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
                 "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2", "",
-            ), MODELS_REGISTRY,
+            ), CLAUDE_REGISTRY,
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
         _ = config_environment(self.root)
@@ -322,14 +200,14 @@ class ImplementLauncherFixture(LauncherFixture):
         for name in ("conf.py", "conf.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
-        home_lib = self.root / ".claude/scripts/lib"
-        home_lib.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib/py", home_lib / "py")
         configure_launcher_fixture(direct_dir / "implement.sh")
         _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
-        mesh = agents / "codex_mesh.py"
-        _ = mesh.write_text(STUB_MESH, encoding="utf-8")
-        mesh.chmod(0o755)
+        claude = self.root / "claude-bin"
+        _ = claude.write_text(STUB_CLAUDE, encoding="utf-8")
+        claude.chmod(0o755)
+        sender = self.root / "send"
+        _ = sender.write_text(STUB_SEND, encoding="utf-8")
+        sender.chmod(0o755)
         _ = shutil.copy2(DIRECT_DIR.parent / "production/worker_fill.py", self.root / "scripts/production/worker_fill.py")
         opening_sender = self.root / "opening-send.py"
         _ = opening_sender.write_text("import json, os, pathlib, sys\n"
@@ -350,7 +228,9 @@ class ImplementLauncherFixture(LauncherFixture):
     @override
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
-        environment["CONF_DIR"] = str(self.root)
+        environment["CLAUDE_BIN"] = str(self.root / "claude-bin")
+        environment["STUB_CLAUDE_ROOT"] = str(self.root)
+        environment["NOTIFIER_SESSIONS_DIR"] = str(self.root / "sessions")
         environment["STAFF_FILE"] = str(self.root / "staff.json")
         environment["CODEX_THREAD_ID"] = self.staff_parent
         _ = environment.pop("STAFF_ID", None)
@@ -369,31 +249,28 @@ class ImplementLauncherFixture(LauncherFixture):
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         return environment
 
-    def launch(
-        self, session_dir: Path, kind: str, slot: str
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                "bash", str(self.implement_script), str(session_dir), str(self.working_dir),
-                str(self.prompt_file), kind, "the retry path", kind,
-                "writing the retry path", "0", slot,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
+    def implement_command(self, session: Path, *options: str, kind: str = "impl",
+                          slot: str = "impl", subtask: str = "impl") -> list[str]:
+        return ["bash", str(self.implement_script), *options, str(session), str(self.working_dir),
+                str(self.prompt_file), subtask, "the retry path", kind, "writing the retry path", "0", slot]
+
+    def launch_environment(self, session: Path, slot: str = "impl") -> dict[str, str]:
+        environment = self.environment()
+        environment["STUB_SUMMARY"] = str(session / f"impl_summary_{slot}.txt")
+        return environment
+
+    def launch(self, session_dir: Path, kind: str, slot: str) -> subprocess.CompletedProcess[str]:
+        return self.worker_launch(session_dir, kind=kind, slot=slot, subtask=kind)
 
     def checked_launch(
         self, session: Path, *options: str, kind: str = "impl",
     ) -> subprocess.CompletedProcess[str]:
-        environment = self.environment()
+        environment = self.launch_environment(session)
         _ = environment.pop("TEST_LEGACY_LAUNCH", None)
         environment["TEST_WORKER_STARTED"] = str(session / "worker-started")
+        environment["STUB_SUMMARY"] = str(session / "phases" / "3" / "impl_summary_impl.txt")
         return subprocess.run(
-            ["bash", str(self.implement_script), *options, str(session), str(self.working_dir),
-             str(self.prompt_file), kind, "the retry path", kind, "writing the retry path", "0", "impl"],
+            self.implement_command(session, *options, kind=kind, subtask=kind),
             check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
@@ -422,61 +299,37 @@ printf 'claim\\n' >> {session / "mesh_events.txt"}
 printf '%s\\n' '{answer}'
 """, encoding="utf-8")
         berth.chmod(0o755)
-        environment = self.mesh_environment()
+        environment = self.environment()
         environment["PATH"] = str(binaries) + os.pathsep + environment["PATH"]
         environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
         return environment, calls
 
-    def mesh_environment(self, fail: bool = False) -> dict[str, str]:
-        environment = self.environment()
-        if fail:
-            environment["STUB_FOLLOW_FAIL"] = "1"
-        return environment
-
-    def finish_default_launcher(self, process: subprocess.Popen[str], release: Path,
-                                mesh: Path, timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS) -> tuple[str, str]:
-        try:
-            release.touch()
-            return communicate_launcher(process, timeout)
-        finally:
-            # A timeout must also restore the fixture for the next subcase.
-            _ = mesh.write_text(STUB_MESH)
-
-    def mesh_launch(
+    def worker_launch(
         self, session_dir: Path, *, to: str = "", slot: str = "impl",
-        kind: str = "impl", fail: bool = False, resolves_round: bool = False,
-        compact_fail: bool = False, subtask: str = "", compact_still_live: bool = False,
-        fix_cause: str = "",
+        kind: str = "impl", behavior: str = "complete", resolves_round: bool = False,
+        fix_cause: str = "", subtask: str = "impl",
     ) -> subprocess.CompletedProcess[str]:
-        arguments = [
-            "bash", str(self.implement_script),
-            str(session_dir), str(self.working_dir), str(self.prompt_file),
-            subtask or kind, "the retry path", kind, "writing the retry path", "0", slot,
-        ]
-        if fix_cause:
-            arguments[2:2] = ["--fix-cause", fix_cause]
+        options: list[str] = []
         if to:
-            arguments.insert(2, "--to")
-            arguments.insert(3, to)
-        environment = self.mesh_environment(fail=fail)
-        if compact_fail:
-            environment["STUB_COMPACT_FAIL"] = "1"
-        if compact_still_live:
-            environment["STUB_COMPACT_FAIL"] = "3"
+            options.extend(("--to", to))
+        if fix_cause:
+            options.extend(("--fix-cause", fix_cause))
+        environment = self.launch_environment(session_dir, slot)
+        if to:
+            records = [cast(dict[str, object], json.loads(path.read_text()))
+                       for path in (self.root / "sessions").glob("*.json")]
+            session_id = next((str(row["sessionId"]) for row in records if row["name"] == to), "")
+            if session_id:
+                transcript = next((self.root / ".claude/projects").rglob(f"{session_id}.jsonl"))
+                environment.update({"STUB_TRANSCRIPT": str(transcript),
+                                    "CLAUDE_PROJECTS_DIR": str(transcript.parent.parent),
+                                    "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
+                                    "STUB_SEND_BEHAVIOR": behavior})
         if resolves_round:
             environment["UNIT_RESOLVES_ROUND"] = "1"
-        return subprocess.run(
-            arguments, check=False, capture_output=True, text=True,
-            env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
-
-    def set_mesh_context(self, session_dir: Path, name: str, tokens: int) -> None:
-        roster_path = session_dir / "mesh_roster.json"
-        roster = cast("dict[str, dict[str, object]]", json.loads(
-            roster_path.read_text(encoding="utf-8")
-        ))
-        roster[name]["context_tokens"] = tokens
-        _ = roster_path.write_text(json.dumps(roster), encoding="utf-8")
+        return subprocess.run(self.implement_command(session_dir, *options, kind=kind, slot=slot, subtask=subtask),
+                              check=False, capture_output=True, text=True,
+                              env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def open_repair_round(self, session_dir: Path) -> None:
         findings = self.root / "scripts" / "direct" / "findings.py"
@@ -539,8 +392,6 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         return member
 
     def claude_worker(self, session_dir: Path) -> Path:
-        registry = self.root / ".claude" / "config" / "models.conf"
-        _ = write_registry(registry, base_text=CLAUDE_REGISTRY)
         sessions = self.root / "sessions"
         sessions.mkdir()
         projects = self.root / ".claude" / "projects" / "fixture"
@@ -569,65 +420,20 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             "implemented\n", encoding="utf-8"
         )
         _ = (self.root / "worker_state").write_text("idle\n", encoding="utf-8")
-        for name, content in (("claude-bin", STUB_CLAUDE), ("send", STUB_SEND)):
-            script = self.root / name
-            _ = script.write_text(content, encoding="utf-8")
-            script.chmod(0o755)
         return transcript
-
-    def claude_follow(
-        self, session_dir: Path, transcript: Path, behavior: str
-    ) -> subprocess.CompletedProcess[str]:
-        environment = self.environment()
-        environment.update({
-            "CLAUDE_BIN": str(self.root / "claude-bin"),
-            "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
-            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "CLAUDE_PROJECTS_DIR": str(transcript.parent.parent),
-            "STUB_CLAUDE_ROOT": str(self.root),
-            "STUB_TRANSCRIPT": str(transcript),
-            "STUB_SUMMARY": str(session_dir / "impl_summary_impl.txt"),
-            "STUB_SEND_BEHAVIOR": behavior,
-        })
-        try:
-            return subprocess.run(
-                ["bash", str(self.implement_script), "--to", "fixture-impl",
-                 str(session_dir), str(self.working_dir), str(self.prompt_file),
-                 "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
-                check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-            )
-        except subprocess.TimeoutExpired as error:
-            delivered = self.root / "delivered_message.txt"
-            raise AssertionError(
-                " ".join((
-                    f"Claude follow timed out: transcript={transcript.read_text()!r},",
-                    f"delivered={delivered.exists()},",
-                    f"worker_state={(self.root / 'worker_state').read_text()!r},",
-                    f"stdout={error.stdout!r}, stderr={error.stderr!r}",
-                ))
-            ) from error
 
     def claude_launch(
         self, session_dir: Path, registry_row: str, *, inherited_effort: str = "", kind: str = "impl"
     ) -> subprocess.CompletedProcess[str]:
         registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
-        stub = self.root / "claude-bin"
-        _ = stub.write_text(STUB_CLAUDE, encoding="utf-8")
-        stub.chmod(0o755)
-        environment = self.environment()
-        environment["CLAUDE_BIN"] = str(stub)
-        environment["STUB_CLAUDE_ROOT"] = str(self.root)
-        environment["NOTIFIER_SESSIONS_DIR"] = str(self.root / "sessions")
-        environment["STUB_SUMMARY"] = str(session_dir / "impl_summary_impl.txt")
+        environment = self.launch_environment(session_dir)
         if inherited_effort:
             environment["AGENT_BG_EFFORT"] = inherited_effort
         else:
             _ = environment.pop("AGENT_BG_EFFORT", None)
         return subprocess.run(
-            ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
-             str(self.prompt_file), "impl", "the retry path", kind,
-             "writing the retry path", "0", "impl"],
+            self.implement_command(session_dir, kind=kind),
             check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 

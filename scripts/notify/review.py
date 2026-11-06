@@ -236,12 +236,12 @@ Verdict = Approved | Rewritten | Questions | Failed | Withheld
 
 @dataclass(frozen=True)
 class QuestionKey:
-    slug: str
+    name: str
     text: str
 
     @property
     def digest(self) -> str:
-        return hashlib.sha256((self.slug + self.text).encode()).hexdigest()[:16]
+        return hashlib.sha256((self.name + self.text).encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -842,7 +842,7 @@ def review_question(key: QuestionKey, question: str, revision: bool = False, *,
         raise ValueError("question needs nonempty text")
     path = state_path() / "questions" / f"{key.digest}.json"
     context = QuestionReview(key)
-    draft = Draft(key.slug, "0", "", NoActionRequired(), question, False)
+    draft = Draft(key.name, "0", "", NoActionRequired(), question, False)
     timeout = review_timeout_seconds()
     outcome = _review(draft, revision or path.exists(), runner, context, timeout_seconds=timeout)
     log_review(draft, outcome, sample=context)
@@ -866,7 +866,7 @@ def review_question(key: QuestionKey, question: str, revision: bool = False, *,
     else:
         result = QuestionReviewFailed(question, tuple(outcome.failed_rules), outcome.failures)
     if isinstance(result, (QuestionAwaitingFacts, QuestionReviewFailed)):
-        record = QuestionHoldRecord(slug=key.slug, text=key.text, question=question,
+        record = QuestionHoldRecord(slug=key.name, text=key.text, question=question,
                                     details=list(result.questions if isinstance(result, QuestionAwaitingFacts) else result.details))
         path.parent.mkdir(parents=True, exist_ok=True)
         scratch = path.with_suffix(".tmp")

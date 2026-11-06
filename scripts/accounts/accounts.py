@@ -1716,15 +1716,6 @@ def prepare_claude_launch(label: str, *, resume: bool) -> PreparedAccount:
     return prepared
 
 
-def claude_account_with_room(now: datetime) -> NamedAccount:
-    """Select and prepare a Claude account with quota."""
-    selected = pick("claude", now)
-    if isinstance(selected, NoAccountWithRoom):
-        raise AccountsError(no_room_line("claude", selected))
-    _ = prepare_claude_launch(selected.label, resume=False)
-    return NamedAccount(selected.label, selected.dir)
-
-
 def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
                              target: str = "", config_dir: str = "", source_fallback: bool = False) -> ClaudeLaunchAccount:
     """Use the group account, except for a moved unit restored on its source."""
@@ -2925,8 +2916,8 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             inventory = import_module("inventory")
         live_ids = {member.session_id for member in members}
         notices += tuple(
-            f"{runner.slug}: no session runs under the id its update timer names; "
-            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.doc)}"
+            f"{runner.name}: no session runs under the id its update timer names; "
+            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.name)}"
             for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
