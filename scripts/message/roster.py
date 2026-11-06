@@ -728,44 +728,16 @@ class _ReviewerProcessNotFound:
 _ReviewerProcessState = _ReviewerProcess | _ReviewerProcessNotFound
 
 
-def _raw_session_details(records: list[SessionRecord], problems: list[str]) -> dict[str, _ClaudeDetails]:
-    directory = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions")))
-    try:
-        paths = [path for path in directory.iterdir() if path.suffix == ".json"]
-    except OSError as error:
-        _problem(problems, "Claude session records", error)
-        paths = []
-    chosen = {(record["sessionId"], record["pid"]) for record in records}
-    chosen_files = {str(record["pid"]) for record in records}
-    raw: dict[tuple[str, int], tuple[int, _ClaudeDetails]] = {}
-    for path in paths:
-        try:
-            data = _read_object(path)
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-            if path.stem in chosen_files:
-                _problem(problems, f"Claude session record {path}", error)
-            continue
-        pid = data.get("pid")
-        key = (_as_string(data.get("sessionId")), pid if isinstance(pid, int) else 0)
-        if key not in chosen:
-            continue
-        updated_value = data.get("updatedAt")
-        updated = updated_value if isinstance(updated_value, int) else 0
-        if key not in raw or updated > raw[key][0]:
-            raw[key] = (updated, _ClaudeDetails(
-                cwd=_as_string(data.get("cwd")), status=_as_string(data.get("status"))
-            ))
+def _session_details(records: list[SessionRecord]) -> dict[str, _ClaudeDetails]:
     details: dict[str, _ClaudeDetails] = {}
     for record in records:
-        session_id = record["sessionId"]
-        detail = raw.get((session_id, record["pid"]), (0, _ClaudeDetails("", "")))[1]
-        cwd = detail.cwd
+        cwd = record.get("cwd", "")
         if not cwd:
             try:
                 cwd = os.readlink(f"/proc/{record['pid']}/cwd")
             except OSError:
                 cwd = ""
-        details[session_id] = _ClaudeDetails(cwd, detail.status or "running")
+        details[record["sessionId"]] = _ClaudeDetails(cwd, record.get("status", "") or "running")
     return details
 
 
@@ -1445,7 +1417,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     for record in running:
         _ = newest.setdefault(record["sessionId"], record)
     records = list(newest.values())
-    details = _raw_session_details(records, problems)
+    details = _session_details(records)
     resolver = session_staff.RowResolver(membership)
     diagnostics = _StaffDiagnostics(problems)
     registered = _registered_showrunners(

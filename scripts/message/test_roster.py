@@ -1093,6 +1093,19 @@ class RosterTests(unittest.TestCase):
             roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
 
+    def test_a_roster_takes_folder_and_status_from_the_records_it_receives(self) -> None:
+        path = self.sessions / "solo.json"
+        record = sessions.read_session(path)
+        if isinstance(record, sessions.UnreadableSessionRecord):
+            self.fail("the fixture session record is unreadable")
+        path.unlink()
+
+        found = roster.roster(os.environ, roster.ThisMachine(), records=[record])
+
+        entry = next(entry for entry in found.entries if entry.name == "solo-director")
+        self.assertEqual((entry.cwd, entry.status), (record.get("cwd"), "waiting"))
+        self.assertEqual(found.problems, [])
+
     def test_a_roster_build_reads_the_role_log_once(self) -> None:
         with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
             entries = self._entries()
