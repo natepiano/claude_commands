@@ -890,6 +890,14 @@ class BoxTests(unittest.TestCase):
         self.assertEqual(self.starts, 1)
         self.assertTrue(self.subject.idle_stop_present())
 
+    def test_idle_stop_waits_for_shutting_down_before_refusing_terminated(self) -> None:
+        with (mock.patch.object(box.BoxSetup, '_instance_state', side_effect=['shutting-down', 'terminated']) as state,
+              self.assertRaisesRegex(box.BoxRefused, 'state terminated')):
+            self.subject.idle_stop()
+        self.assertEqual(state.call_count, 2)
+        self.assertEqual(self.starts, 0)
+        self.assertFalse(self.subject.idle_stop_present())
+
     def test_idle_stop_waits_for_live_claims_before_starting_with_routing_closed(self) -> None:
         self.change(ec2='stopped', joined=True, stop_after=3)
         def pause(seconds: float) -> None:

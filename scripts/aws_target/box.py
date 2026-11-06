@@ -755,9 +755,9 @@ class BoxSetup:
         state = self._instance_state()
         def stable() -> bool:
             nonlocal state
-            if state in ('pending', 'stopping'):
+            if state in ('pending', 'stopping', 'shutting-down'):
                 state = self._instance_state()
-            return state not in ('pending', 'stopping')
+            return state not in ('pending', 'stopping', 'shutting-down')
         self._wait(stable, 'idle stop requires a stable instance state')
         started = state == 'stopped'
         try:

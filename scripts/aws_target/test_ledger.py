@@ -72,6 +72,17 @@ class LedgerTests(CostFixture):
         self.assertEqual(after, before)
         self.assertEqual(sum(r.end - r.start for r in after.intervals if r.kind == "instance"), 3600)
 
+    def test_shutting_down_persists_without_compute_charges(self) -> None:
+        self.running(self.start)
+        self.book.record_price(ledger.PriceSample(self.start, Decimal("0.75"), "Spot fixture"))
+        self.observe(self.start + 60, "shutting-down")
+        self.book = ledger.CostLedger(self.state)
+        self.assertEqual(self.book.read_snapshot().observations[-1].state, "shutting-down")
+        self.observe(self.start + 120, "terminated")
+        costs = self.estimate(self.start + 120)
+        self.assertEqual(sum(r.end - r.start for r in costs.intervals if r.kind == "instance"), 60)
+        self.assertEqual(costs.monthly.usd, Decimal("0.0125"))
+
     def test_unknown_observation_rejection_keeps_evidence_and_allows_later_charging(self) -> None:
         self.running(self.start)
         before = self.book.path.read_bytes()

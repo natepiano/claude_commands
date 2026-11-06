@@ -655,7 +655,9 @@ Start with one small run:
 
 The bundle excludes uncommitted changes.
 The image has no box Tailscale identity or box idle service.
-The gate uses its own admission service and the default gate limits.
+The gate uses its own admission service.
+It sets `max_running_jobs` to the instance CPU count and records this value in JSON and text.
+It sets the memory governor to `gate_trial_governor_gib_per_vcpu` GiB per vCPU, with a default of 3.
 A failed suite remains a measured result.
 
 The command calls `DescribeSubnets` for the configured VPC.
@@ -713,7 +715,10 @@ The bucket has public access blocked and a one-day object lifetime.
 
 User data schedules `shutdown -h +30` before other commands by default.
 It runs the tool shell directly and creates no systemd unit.
-A shell failure uploads `boot.log` and an error result through the image's curl.
+The guest uploads `boot.log`, `gate.log`, and the current UTC time every `gate_trial_log_push_s` seconds.
+The default interval is 30 seconds. A failed upload does not stop later uploads.
+The final log contains the same files and time. The reserve and reported S3 cost include periodic uploads.
+A shell failure uploads the combined log and an error result through the image's curl.
 The controller downloads logs for failed attempts in both steps.
 A missing log object is harmless.
 
@@ -724,6 +729,8 @@ It executes shell user data through the runtime shell on each boot.
 Source access date: 2026-11-06.
 
 Guest shutdown terminates the instance and deletes its root volume.
+Cleanup waits through `shutting-down` until the instance reaches `terminated`.
+The ledger accepts `shutting-down` and adds no compute charge for that state.
 The command first terminates stopping and stopped instances with the `GateTrial` tag key.
 Cleanup finds active instances through the current run's tag.
 A lost launch reply causes up to three calls with the same `ClientToken`.

@@ -76,6 +76,8 @@ class FakeAws:
         self.refuse_bucket: bool = False
         self.cleanup_signal: int = 0
         self.terminate_timeout: bool = False
+        self.termination_transition: bool = False
+        self.observed_states: list[str] = []
         self.delete_dependencies: int = 0
         self.signal_number: int = 0
         self.signal_handled: Callable[[], None] | None = None
@@ -217,8 +219,12 @@ class FakeAws:
                 return reply({'Reservations': [{'Instances': [{'InstanceId': instance} for instance in instances]}]})
             self.clock.advance(3)
             instance = option('--instance-ids')
+            state = self.states[instance]
+            self.observed_states.append(state)
+            if state == 'shutting-down':
+                self.states[instance] = 'terminated'
             return reply({'Reservations': [{'Instances': [{'InstanceId': instance, 'LaunchTime': 'fixture-boot',
-                          'State': {'Name': self.states[instance]}}]}]})
+                          'State': {'Name': state}}]}]})
         if operation == 'get-object':
             if option('--key').endswith('/log') and self.missing_log:
                 return error('NoSuchKey')
@@ -250,6 +256,8 @@ class FakeAws:
         if operation in ('terminate-instances', 'stop-instances', 'start-instances'):
             self.states[option('--instance-ids')] = {'terminate-instances': 'terminated',
                 'stop-instances': 'stopped', 'start-instances': 'running'}[operation]
+            if operation == 'terminate-instances' and self.termination_transition:
+                self.states[option('--instance-ids')] = 'shutting-down'
             self.clock.advance(4)
         if operation == 'list-objects-v2':
             if not self.bucket_exists:
@@ -326,7 +334,11 @@ class GateTrialTests(unittest.TestCase):
         self.assertLess(operations.index('terminate-instances'), operations.index('delete-bucket'))
 
     def test_full_attempt_has_five_times_result_and_report(self) -> None:
+        settings = self.root / 'trial.conf'
+        _ = settings.write_text(trial_config().replace('gate_trial_governor_gib_per_vcpu=3', 'gate_trial_governor_gib_per_vcpu=2'))
         command = self.run_trial()
+        links = ledger.mapping(cast(object, json.loads(self.fake.payloads[0].split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0])))
+        self.assertEqual(links['governor_gib'], 32)
         row = command.attempts[0]
         self.assertEqual(row.verdict, 'pass')
         self.assertEqual(row.times['request_to_running_s'], 5)
@@ -346,6 +358,31 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('i-fixture', saved.read_text())
         self.assertNotIn('i-fixture', content)
         self.assert_cleanup()
+
+    def test_terminate_waits_through_shutting_down_and_runs_next_attempt(self) -> None:
+        self.fake.termination_transition = True
+        command = self.run_trial(runs=2)
+        self.assertEqual([row.verdict for row in command.attempts], ['pass', 'pass'])
+        self.assertEqual(self.fake.observed_states, ['running', 'shutting-down', 'terminated'] * 2)
+        self.assertEqual(command.cleanup_errors, [])
+        self.assertEqual(command.remaining(), [])
+        self.assert_cleanup()
+
+    def test_log_upload_interval_changes_projection_and_s3_cost(self) -> None:
+        settings = self.root / 'trial.conf'
+        _ = settings.write_text(trial_config().replace('gate_trial_log_push_s=30', 'gate_trial_log_push_s=15'))
+        for step, boots in (('size', 1), ('start', 2)):
+            with self.subTest(step=step):
+                self.fake.gate_status = 'ready' if step == 'start' else 'pass'
+                command = self.run_trial(step=step)
+                prices = trial.Prices(**command.attempts[0].prices)
+                lifetime = 30 * 60
+                uploads = lifetime // 15 * boots
+                self.assertEqual(command.puts, 1 + 2 * boots + uploads)
+                expected = (prices.lifetime(lifetime, 32) * boots + prices.put * (4 + uploads)
+                            + prices.get * (lifetime * 2 / command.option('poll_pause_s') + 100))
+                self.assertAlmostEqual(command.projection(prices, step), expected)
+                self.assertIn('while sleep 15; do', self.fake.payloads[-1])
 
     def test_lost_launch_then_refusal_keeps_reservation_and_sweeps(self) -> None:
         self.fake.lost_reply = True
@@ -583,7 +620,8 @@ class GateTrialTests(unittest.TestCase):
         self.assertNotIn('exec nix', data)
         self.assertNotIn('gate-trial.service', data)
         self.assertIn('export PATH=/run/current-system/sw/bin:$PATH', data)
-        self.assertIn('type_dirs=[\'scripts\'], full=True', data)
+        self.assertIn('type_dirs=[\'scripts\'], full=True, max_running_jobs=', data)
+        self.assertLess(data.index('push_logs &'), data.index('trap boot_failed EXIT'))
         self.assertIn('admission_service.py', data)
         _ = compile(trial.GUEST, '<guest>', 'exec')
 
@@ -814,7 +852,8 @@ class GateTrialTests(unittest.TestCase):
                     (root / 'prepared').touch()
                 curl = root / 'curl'
                 _ = curl.write_text('#!' + sys.executable + "\nimport json, pathlib, sys\n"
-                    + "args=sys.argv[1:]\nbody=pathlib.Path(args[args.index('--data-binary')+1][1:]).read_text()\n"
+                    + "args=sys.argv[1:]\nsource=args[args.index('--data-binary')+1]\n"
+                    + "body=sys.stdin.read() if source=='@-' else pathlib.Path(source[1:]).read_text()\n"
                     + "with pathlib.Path(__file__).with_name('uploads').open('a') as out: out.write(json.dumps([args[-1],body])+'\\n')\n")
                 curl.chmod(0o700)
                 # Execute the rendered trap with temporary paths and a fake curl.
@@ -823,12 +862,44 @@ class GateTrialTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 uploads = [cast(list[str], json.loads(line)) for line in (root / 'uploads').read_text().splitlines()]
-                self.assertEqual(uploads[0], [links['log'], 'fixture nix failure'])
+                self.assertEqual(uploads[0][0], links['log'])
+                self.assertIn('fixture nix failure\nUTC: ', uploads[0][1])
                 key = 'result' if step == 'size' else 'ready-warm' if warm else 'ready-cold'
                 self.assertEqual(uploads[1][0], links[key])
                 payload = ledger.mapping(cast(object, json.loads(uploads[1][1])))
                 self.assertEqual(payload['verdict'], 'error')
                 self.assertIn('exit 1', str(payload['error']))
+
+    def test_log_loop_uploads_available_files_and_survives_failed_curl(self) -> None:
+        root = self.root
+        _ = (root / 'boot.log').write_text('fixture boot\n')
+        sleep = root / 'sleep'
+        _ = sleep.write_text('#!' + sys.executable + '\nimport pathlib, sys, time\n'
+            + "root=pathlib.Path(__file__).parent\ncount=root/'sleeps'\n"
+            + "number=int(count.read_text())+1 if count.exists() else 1\ncount.write_text(str(number))\n"
+            + "assert sys.argv[1]=='0.001'\ntime.sleep(float(sys.argv[1]))\nsys.exit(number>2)\n")
+        sleep.chmod(0o700)
+        curl = root / 'curl'
+        _ = curl.write_text('#!' + sys.executable + '\nimport json, pathlib, sys\n'
+            + "root=pathlib.Path(__file__).parent\nargs=sys.argv[1:]\n"
+            + "assert args[args.index('--data-binary')+1]=='@-'\n"
+            + "body=sys.stdin.read()\nfirst=not (root/'uploads').exists()\n"
+            + "with (root/'uploads').open('a') as out: out.write(json.dumps([args[-1],body])+'\\n')\n"
+            + "(root/'gate.log').write_text('fixture gate\\n')\nsys.exit(22 if first else 0)\n")
+        curl.chmod(0o700)
+        links = {'log': 'https://fixture.invalid/log'}
+        script = 'set -eu\n' + trial.log_push_loop(links, 0.001).replace('/var/lib/gate-trial', str(root))
+        result = subprocess.run(['sh', '-c', script + 'wait "$log_push_pid"\n'], capture_output=True,
+                                text=True, timeout=10, env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH']})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        uploads = [cast(list[str], json.loads(line)) for line in (root / 'uploads').read_text().splitlines()]
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual([row[0] for row in uploads], [links['log']] * 2)
+        self.assertNotIn('fixture gate', uploads[0][1])
+        self.assertIn('fixture gate', uploads[1][1])
+        for _, content in uploads:
+            self.assertIn('fixture boot\n', content)
+            self.assertRegex(content, r'\nUTC: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$')
 
     def test_source_bundle_contains_head_without_uncommitted_changes(self) -> None:
         _ = (self.repo / 'source').write_text('uncommitted change')
@@ -892,7 +963,8 @@ class GuestTests(unittest.TestCase):
             _ = (root / 'boot.log').write_text('fixture publish failure')
             curl = root / 'curl'
             _ = curl.write_text('#!' + sys.executable + "\nimport json, pathlib, sys\n"
-                + "args=sys.argv[1:]\nbody=pathlib.Path(args[args.index('--data-binary')+1][1:]).read_text()\n"
+                + "args=sys.argv[1:]\nsource=args[args.index('--data-binary')+1]\n"
+                + "body=sys.stdin.read() if source=='@-' else pathlib.Path(source[1:]).read_text()\n"
                 + "with pathlib.Path(__file__).with_name('uploads').open('a') as out: out.write(json.dumps([args[-1],body])+'\\n')\n")
             curl.chmod(0o700)
             guest = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
@@ -909,7 +981,8 @@ class GuestTests(unittest.TestCase):
             self.assertIn('publish failed', result.stderr)
             self.assertFalse((root / 'prepared').exists())
             uploads = [cast(list[str], json.loads(line)) for line in (root / 'uploads').read_text().splitlines()]
-            self.assertEqual(uploads[0], [links['log'], 'fixture publish failure'])
+            self.assertEqual(uploads[0][0], links['log'])
+            self.assertIn('fixture publish failure\nUTC: ', uploads[0][1])
             self.assertEqual(uploads[1][0], links['ready-cold'])
             self.assertEqual(ledger.mapping(cast(object, json.loads(uploads[1][1])))['verdict'], 'error')
 
@@ -919,7 +992,8 @@ class GuestTests(unittest.TestCase):
             (root / 'repo').mkdir()
             links = {'step': 'size', 'commit': 'fixture-head', 'source': 'https://fixture.invalid/source',
                      'log': 'https://fixture.invalid/log', 'result': 'https://fixture.invalid/result'}
-            _ = (root / 'links.json').write_text(json.dumps(links))
+            _ = (root / 'links.json').write_text(json.dumps({**links, 'governor_gib': 48}))
+            _ = (root / 'boot.log').write_text('fixture tool preparation\n')
             uploads: dict[str, bytes] = {}
             def http(request: str | Request, *, timeout: float) -> BytesIO:
                 self.assertIn(timeout, (30, 60))
@@ -936,11 +1010,18 @@ class GuestTests(unittest.TestCase):
             code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root))).replace("'/root/.claude'", repr(str(root / 'home'))).replace("'/root/.claude/config'", repr(str(root / 'home/config')))
             _ = (root / 'meminfo').write_text('MemTotal: 1000000 kB\nMemAvailable: 200000 kB\n')
             child = GuestChild()
+            governors: list[float] = []
+            def run_suites(repo: Path, type_dirs: list[str], full: bool, max_running_jobs: int) -> merge_gate.GateRun:
+                self.assertEqual((repo, type_dirs, full, max_running_jobs), (root / 'repo', ['scripts'], True, 16))
+                governors.append(merge_gate.merge_gate_governor_gib())
+                return merge_gate.GateRun(jobs, 4, 1)
             with (mock.patch.dict(os.environ), mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch('urllib.request.urlopen', side_effect=http),
                   mock.patch('subprocess.run', return_value=subprocess.CompletedProcess(['fixture'], 0, 'version', '')),
                   mock.patch('subprocess.Popen', return_value=child),
-                  mock.patch.object(merge_gate, 'run_suites', return_value=merge_gate.GateRun(jobs, 4, 1)) as run,
+                  mock.patch('os.cpu_count', return_value=16),
+                  mock.patch.object(merge_gate, 'merge_gate_governor_gib'),
+                  mock.patch.object(merge_gate, 'run_suites', side_effect=run_suites) as run,
                   mock.patch.object(merge_gate, 'rollback_signals', return_value=nullcontext()),
                   mock.patch.object(merge_gate, 'typecheck_python', return_value=root / 'python')):
                 previous = Path.cwd()
@@ -949,16 +1030,21 @@ class GuestTests(unittest.TestCase):
                 finally:
                     os.chdir(previous)
             payload = ledger.mapping(cast(object, json.loads(uploads[links['result']])))
+            self.assertEqual(payload['governor_gib'], 48)
+            self.assertEqual(governors, [48])
             self.assertEqual(payload['memory_peak_bytes'], 800000 * 1024)
+            self.assertEqual(payload['max_running_jobs'], 16)
             self.assertEqual(payload['verdict'], 'fail')
             self.assertEqual(payload['tests'], 3)
             self.assertEqual(payload['skips'], 1)
             self.assertEqual(payload['failed_modules'], ['fixture/test_broken.py'])
             self.assertIn('gate_started_at', payload)
             self.assertIn('gate_finished_at', payload)
-            run.assert_called_once_with(root / 'repo', type_dirs=['scripts'], full=True)
+            run.assert_called_once_with(root / 'repo', type_dirs=['scripts'], full=True, max_running_jobs=16)
             self.assertTrue(child.terminated)
             self.assertIn(links['log'], uploads)
+            self.assertIn(b'fixture tool preparation\n', uploads[links['log']])
+            self.assertIn(b'UTC: ', uploads[links['log']])
 
     def test_start_guest_repeats_ready_marker_without_a_gate(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -969,7 +1055,8 @@ class GuestTests(unittest.TestCase):
             uploads: dict[str, dict[str, object]] = {}
             def http(request: Request, *, timeout: float) -> BytesIO:
                 self.assertEqual(timeout, 30)
-                uploads[request.full_url] = ledger.mapping(cast(object, json.loads(cast(bytes, request.data))))
+                if request.full_url != links['log']:
+                    uploads[request.full_url] = ledger.mapping(cast(object, json.loads(cast(bytes, request.data))))
                 return BytesIO()
             code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
             with (mock.patch('urllib.request.urlopen', side_effect=http),

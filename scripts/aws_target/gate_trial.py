@@ -105,18 +105,21 @@ try:
         try:
             sys.path.insert(0, str(repo))
             from scripts.production import merge_gate
+            merge_gate.merge_gate_governor_gib = lambda: links['governor_gib']
+            result['governor_gib'] = links['governor_gib']
             preparation = merge_gate.typecheck_python()
             if isinstance(preparation, str):
                 raise RuntimeError(preparation)
             result['tools_ready_at'] = time.time()
             result['gate_started_at'] = time.time()
+            result['max_running_jobs'] = os.cpu_count() or 1
             # Sample the whole machine because test scopes run outside amazon-init.service.
             sample_memory()
             memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
             memory_thread.start()
             with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
                 with merge_gate.rollback_signals():
-                    gate = merge_gate.run_suites(repo, type_dirs=['scripts'], full=True)
+                    gate = merge_gate.run_suites(repo, type_dirs=['scripts'], full=True, max_running_jobs=result['max_running_jobs'])
             result['gate_finished_at'] = time.time()
             result['gate_s'] = gate.seconds
             result['verdict'] = 'pass' if gate.passed else 'fail'
@@ -145,14 +148,33 @@ finally:
         memory_stop.set()
         memory_thread.join()
         sample_memory()
-    if log.exists():
-        try:
-            put(links['log'], log.read_bytes())
-        except Exception as error:
-            result['log_error'] = str(error)
+    try:
+        content = b''.join(path.read_bytes() for path in (root / 'boot.log', log) if path.exists())
+        content += time.strftime('\nUTC: %Y-%m-%dT%H:%M:%SZ\n', time.gmtime()).encode()
+        put(links['log'], content)
+    except Exception as error:
+        result['log_error'] = str(error)
     publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
     if links['step'] == 'start' and result['verdict'] == 'ready':
         (root / 'prepared').touch()
+'''
+
+
+def log_upload(links: dict[str, str]) -> str:
+    return f'''{{ cat /var/lib/gate-trial/boot.log /var/lib/gate-trial/gate.log 2>/dev/null || :
+    printf '\\n'
+    date -u '+UTC: %Y-%m-%dT%H:%M:%SZ'
+}} | curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(links['log'])} || :'''
+
+
+def log_push_loop(links: dict[str, str], interval_s: float) -> str:
+    return f'''push_logs() {{
+    while sleep {interval_s:g}; do
+        {log_upload(links)}
+    done
+}}
+push_logs &
+log_push_pid=$!
 '''
 
 
@@ -163,10 +185,11 @@ def boot_trap(links: dict[str, str]) -> str:
     return f'''boot_failed() {{
     status=$?
     trap - EXIT
+    if [ -n "${{log_push_pid:-}}" ]; then kill "$log_push_pid" 2>/dev/null || :; fi
     if [ "$status" -ne 0 ]; then
         destination={shlex.quote(cold)}
         if [ -e /var/lib/gate-trial/prepared ]; then destination={shlex.quote(warm)}; fi
-        curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @/var/lib/gate-trial/boot.log {shlex.quote(links['log'])} || :
+        {log_upload(links)}
         printf '{{"verdict":"error","error":"Tool preparation failed (exit %s)"}}' "$status" > /var/lib/gate-trial/boot-error.json
         curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @/var/lib/gate-trial/boot-error.json "$destination" || :
     fi
@@ -176,7 +199,7 @@ trap boot_failed EXIT
 '''
 
 
-def user_data(links: dict[str, str], release: str, lifetime_minutes: int) -> str:
+def user_data(links: dict[str, str], release: str, lifetime_minutes: int, log_push_s: float, governor_gib: float) -> str:
     """Run directly in amazon-init on each boot."""
     packages = ('git', 'python3', 'basedpyright', 'cargo', 'rustc', 'rustup', 'cargo-nextest',
                 'uv', 'curl', 'openssh', 'rsync', 'gnupg', 'ripgrep', 'jq', 'gcc', 'pkg-config', 'tmux')
@@ -188,8 +211,8 @@ umask 077
 mkdir -p /var/lib/gate-trial
 exec > /var/lib/gate-trial/boot.log 2>&1
 export PATH=/run/current-system/sw/bin:$PATH
-{boot_trap(links)}cat > /var/lib/gate-trial/links.json <<'GATE_LINKS'
-{json.dumps(links)}
+{log_push_loop(links, log_push_s)}{boot_trap(links)}cat > /var/lib/gate-trial/links.json <<'GATE_LINKS'
+{json.dumps({**links, 'governor_gib': governor_gib})}
 GATE_LINKS
 cat > /var/lib/gate-trial/guest.py <<'GATE_GUEST'
 {GUEST}
@@ -377,7 +400,8 @@ class GateTrial:
     def projection(self, prices: Prices, step: str) -> float:
         lifetime = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes') * 60
         return (prices.lifetime(lifetime, self.settings.root_gib) * (2 if step == 'start' else 1)
-                + prices.put * 4 + prices.get * (lifetime * 2 / self.option('poll_pause_s') + 100))
+                + prices.put * (4 + math.floor(lifetime / self.option('log_push_s')) * (2 if step == 'start' else 1))
+                + prices.get * (lifetime * 2 / self.option('poll_pause_s') + 100))
 
     def reserve_attempt(self, identity: tuple[int, int], projected: float, reserve: float) -> bool:
         with self.changed:
@@ -675,7 +699,8 @@ class GateTrial:
         with tempfile.TemporaryDirectory() as folder:
             data = Path(folder) / 'user-data'
             minutes = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes')
-            _ = data.write_text(user_data(self.links(key, step), self.settings.release, minutes))
+            _ = data.write_text(user_data(self.links(key, step), self.settings.release, minutes,
+                                         self.option('log_push_s'), attempt.size * self.option('governor_gib_per_vcpu')))
             lifetime = minutes * 60
             try:
                 for subnet, zone in self.subnets:
@@ -776,6 +801,8 @@ class GateTrial:
                     with self.changed:
                         self.spent += sum(row.dollars for row in rows)
                         self.puts += 2 if step == 'size' else 4
+                        self.puts += math.floor(lifetime / self.option('log_push_s')) * sum(
+                            bool(row.instance_id and row.request_at) for row in rows)
                         _ = self.reservations.pop(identity, None)
                         self.update_s3_cost()
                         for row in rows:
@@ -801,7 +828,8 @@ class GateTrial:
         times = ' | '.join('-' if (value := attempt.times.get(key)) is None else f'{value:.2f}' for key in (
             'request_to_running_s', 'running_to_tools_ready_s', 'tools_ready_to_gate_start_s', 'gate_s', 'teardown_s', 'request_to_ready_s'))
         return (f'{attempt.size} | {attempt.attempt} | {attempt.method} | {attempt.zone} | {times} | ${attempt.dollars:.4f} | '
-                + f'{attempt.result.get("tests", "-")} | {attempt.result.get("skips", "-")} | {attempt.memory_peak_bytes} | {attempt.verdict} | '
+                + f'{attempt.result.get("tests", "-")} | {attempt.result.get("skips", "-")} | {attempt.memory_peak_bytes} | '
+                + f'{attempt.result.get("max_running_jobs", "-")} | {attempt.verdict} | '
                 + f'{attempt.result.get("failed_modules", [])} | {attempt.error.replace(chr(10), "; ")} | {attempt.log_path} | '
                 + json.dumps(attempt.capacity_refusals))
 
@@ -823,7 +851,7 @@ class GateTrial:
                 'dollars': self.spent + self.s3_cost, 'cleanup_errors': self.cleanup_errors, 'interrupted': self.interrupted, 'remaining': self.remaining(),
                 'cost_basis': 'Read prices and observed seconds. Final rows share the S3 cost. Confirm costs with the AWS bill.'}
             text = ('Commit: ' + self.commit + '\nFamily: ' + self.settings.family + '\nsize | attempt | method | zone | request to running | running to tools ready | '
-                    + 'tools ready to gate start | gate | teardown | request to ready | dollars | tests | skips | peak machine memory bytes | verdict | failed modules | error | log | capacity refusals\n'
+                    + 'tools ready to gate start | gate | teardown | request to ready | dollars | tests | skips | peak machine memory bytes | max_running_jobs | verdict | failed modules | error | log | capacity refusals\n'
                     + '\n'.join(self.row(row) for row in self.attempts) + '\nMedians:\n'
                     + '\n'.join(name + ': ' + json.dumps(values, sort_keys=True) for name, values in medians.items())
                     + f'\nCheapest size at most {self.option("target_gate_s"):g} s: {report["cheapest_size"]}\nBatch: not measured\n'
