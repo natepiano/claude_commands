@@ -58,7 +58,9 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 ~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--session <id> | --production <slug>)
 ```
 
-[`board_json.py`](../../scripts/direct/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. An unreadable staff file also gives no boards and prints one line on stderr with the cause.
+[`board_json.py`](../../scripts/direct/board_json.py) reads the staff file to resolve each production. It writes each board atomically to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<showrunner-staff-id>.json`. It prints one line: `{"files": [...], "watch": [...]}`. The plugin reads these returned paths directly. A rename, transfer, or session replacement preserves the cache path. An unresolved production returns `"files": []` and exits 0. An unreadable staff file also prints its cause to stderr.
+
+Run `scripts/lib/py scripts/direct/board_json.py --migrate-cache` to migrate the board cache. The command maps each old slug through its recorded timer owner. It preserves cache contents and lists files without a recorded owner. It exits 1 when an owner is missing. A conflicting destination stops the migration without replacing either file. A repeated migration preserves completed files. The command also resumes after an interruption between the destination creation and the source removal.
 
 - Resolve: read one staff snapshot and use it for every board’s unit rows. Join the session to its newest pane launch’s `STAFF_ID`, then follow its staff parents to the first showrunner. Unit and worker sessions see that showrunner’s production and every showrunner production below it, nearest level first. `--production <slug>` selects the same subtree by its mapped staff row and takes precedence if both selectors are supplied. The shared `MemberSources.showrunner_members` mapping joins each showrunner row to its production; `showrunners.registered_showrunners()` supplies the doc and zone. Unmapped productions are left out. A session with no staff row or no showrunner above it gives no files.
 - `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
@@ -213,7 +215,9 @@ The build queue reads process memory every ten seconds while open.
   Each role has a separate row with its own counts.
   The first row shows all account values.
   Later rows show only the role and its counts.
-  The view sums the available entries in `role_counts_by_machine` without changing their separate JSON representation.
+  Python combines available machine counts once in `role_counts`, in role order.
+  The view reads these counts directly; `role_counts_by_machine` keeps the separate machine records.
+  A role with no reported members has zero counts; `spare` has no count.
   A totals row sums the known activity counts.
   Codex shell counts remain unknown; they do not become zero.
   The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
@@ -308,7 +312,7 @@ The accounts view uses `accounts.py status --json --stored` to read saved usage 
 It watches usage, group selection, worker selection, role-map cache, peer-count cache, and reported session inputs.
 When the generator reports session inputs, each open-pane tick refreshes local liveness counts.
 The stored read uses an existing peer-count cache without waiting for its refresh.
-The separate machine counts let the view sum available observations without hiding a missing peer.
+Python combines available observations in `role_counts`; the separate machine records and problem lines identify a missing peer.
 Aligned headers and complete facts keep the same contract readable in wide and narrow panes.
 
 

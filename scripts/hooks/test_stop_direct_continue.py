@@ -88,7 +88,11 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
 class DirectorStopTests(unittest.TestCase):
     def assert_blocked(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual((result.returncode, result.stdout), (2, ""))
-        self.assertIn("Compaction runs on the next request", result.stderr)
+        self.assertIn(
+            "Compaction runs when the context reaches 167,000 tokens. It does not run while the session is idle.\n"
+            + "Take the next workflow action now. Do not wait for compaction.\n"
+            + "Read ~/.claude/commands/unit/direct.md after compaction.\n"
+            + "If you need a user decision, state it in one line and end the turn.\n", result.stderr)
 
     def assert_allowed(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
@@ -166,10 +170,34 @@ class DirectorStopTests(unittest.TestCase):
             self.assertTrue((fixture.run / "turn_wait.json").is_file())
             self.assertIn('"WaitingForSupplier"', (fixture.root / "history/run.jsonl").read_text())
 
-    def test_continuation_after_a_block_allows_stop(self) -> None:
+    def test_continuation_above_the_threshold_wakes_again(self) -> None:
         with director_stop_fixture() as fixture:
             self.assert_blocked(fixture.call())
-            self.assert_allowed(fixture.call(stop_hook_active=True))
+            self.assert_blocked(fixture.call(stop_hook_active=True))
+
+    def test_holding_status_without_pause_above_the_threshold_wakes(self) -> None:
+        with director_stop_fixture() as fixture:
+            self.assert_blocked(fixture.call(last_assistant_message="Work is ready.\n  — holding: the next workflow action  \n"))
+
+    def test_blocked_status_without_pause_above_the_threshold_wakes(self) -> None:
+        with director_stop_fixture() as fixture:
+            self.assert_blocked(fixture.call(last_assistant_message="blocked: the next test needs a fixture"))
+            self.assertFalse((fixture.run / "turn_wait.json").exists())
+
+    def test_blocked_pause_order_above_the_threshold_allows_stop(self) -> None:
+        with director_stop_fixture() as fixture:
+            self.assert_allowed(fixture.call(last_assistant_message=(
+                "blocked: pause order from the user through the showrunner; only the showrunner restarts this work"
+            )))
+            self.assertFalse((fixture.run / "turn_wait.json").exists())
+
+    def test_paused_status_without_a_prefix_above_the_threshold_allows_stop(self) -> None:
+        with director_stop_fixture() as fixture:
+            self.assert_allowed(fixture.call(last_assistant_message="The production is PAUSED by the user."))
+
+    def test_blocked_within_a_sentence_above_the_threshold_wakes(self) -> None:
+        with director_stop_fixture() as fixture:
+            self.assert_blocked(fixture.call(last_assistant_message="The first test was blocked by a missing fixture."))
 
 
 if __name__ == "__main__":

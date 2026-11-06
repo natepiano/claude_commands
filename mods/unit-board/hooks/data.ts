@@ -81,6 +81,7 @@ export async function loadBoard(
   }
   watch({ kind: 'discovery', sources: response.watch, loadedAt });
   const boards: BoardData[] = [];
+  // The generator supplies staff-id paths from the staff record.
   for (const path of response.files) {
     ensureOpen();
     boards.push(JSON.parse(await calls.read(path)) as BoardData);
@@ -174,6 +175,7 @@ export async function loadAccounts(
       refreshLiveness = status.session_inputs.length > 0;
       await watchInputs(status.session_inputs);
     }
+    // Keep Python's combined role_counts and separate machine records unchanged.
     return status;
   } catch { throw new Error('Stored accounts status is invalid.'); }
 }

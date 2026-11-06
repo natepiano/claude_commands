@@ -24,7 +24,7 @@ import rules
 import style_ledger
 from issues import Issue, frontmatter
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
@@ -294,8 +294,7 @@ class StylePlanTests(StylePlanFixture):
         for path in files:
             finding = ledger.hold(rule, path, 1, "split", "restructure", "before", "after", blob, "outside")
             ledger.file_held(finding.finding_id, issue)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
-                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         self.proposals_field(folder)
         first_slice = style_plan.read_slices(self.repo, self.tip, files, style_plan.BatchLimits(6, 3000, 5))[0]
         with (mock.patch.object(berth_board, "read_board", return_value=self.board(*first_slice)),

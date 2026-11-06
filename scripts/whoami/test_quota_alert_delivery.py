@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import subprocess
 import sys
 import unittest
@@ -15,6 +16,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
+from scripts.accounts.home_test_support import scratch_accounts_config
+from scripts.message import send_budget
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 import review
@@ -25,6 +28,7 @@ from user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_TELL_USER, REFUSAL_ACTION, REGISTRY as REGISTRY
 
 setUpModule = support.setUpModule
+REAL_RELAY = quota_alert.relay
 
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
@@ -86,12 +90,27 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertEqual(float(command[command.index("--timeout") + 1]), review.user_send_seconds())
             self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 140)
             self.assertNotIn("input", run.call_args.kwargs)
-        self.assertEqual(quota_alert.RELAY_TIMEOUT, 40)
+            self.assertIsNone(REAL_RELAY("fixture", "message", None))
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[command.index("--timeout") + 1], "30")
+            self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(30))
+
+    def test_relay_reads_the_current_account_timeout(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        for name in ("send", "postmaster", "codex_daemon"):
+            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf", config.with_name(f"{name}.conf"))
+        original = config.read_text()
+        done = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
+        for limit in (40, 55):
+            _ = config.write_text(original.replace("quota_relay_timeout_seconds=40", f"quota_relay_timeout_seconds={limit}"))
+            with self.subTest(limit=limit), mock.patch.object(subprocess, "run", return_value=done) as run:
+                self.assertIsNone(REAL_RELAY("fixture", "message", None))
+                command = cast(list[str], run.call_args.args[0])
+                self.assertEqual(command[command.index("--timeout") + 1], str(limit - quota_alert.KILL_GRACE))
+                self.assertEqual(run.call_args.kwargs["timeout"], send_budget.seconds(limit - quota_alert.KILL_GRACE))
 
     def test_failed_codex_reminder_retries_phone_delivery_without_session_alerts(self) -> None:
-        config = quota_alert.load_config()
-        config["threshold_percent"] = 2
-        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        _ = quota_alert.CONFIG.write_text(quota_alert.CONFIG.read_text().replace("threshold_percent=1", "threshold_percent=2"))
         note = self.note("codex1.md", "active", "2")
         self.push_errors.append(quota_alert.PushFailed("fixture offline"))
         log = self.alert([note], self.now)

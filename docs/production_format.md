@@ -52,8 +52,6 @@ must not drift from it:
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
   named `trunk-unit`.
-- **Gate** — a unit phase that cannot start until another unit's checkpoint is on
-  the merge branch.
 - **Parent, child and root showrunner** — a production's showrunner may report
   to another production's (`/showrunner:attach`). The one at the top of a tree is
   the root: it shows every item that needs the user from the productions below
@@ -142,12 +140,6 @@ refuses a name that another session of the same account also has.
 | File | Owner unit | Other units that touch it |
 | --- | --- | --- |
 
-## Gates
-
-| Gate | Waiting | Waits on | Clears when |
-| --- | --- | --- | --- |
-| G1 | <unit> phase <N> | <unit> phase <M> | that checkpoint is on the merge branch |
-
 ## Close-out
 
 - <production-level work after the last merge: data or saved-state migrations,
@@ -162,7 +154,7 @@ refuses a name that another session of the same account also has.
 A production doc has no list of units. A unit is its staff row.
 The row gives its name, parent and worktree; git there gives the repository and branch.
 The units appear in staff.json row order. Untracked `.unit.toml` at the worktree root gives
-the plan, app port and responsibilities.
+the plan, app port and short duty names. Responsibilities do not limit changed paths.
 
 The unit id (`<name>-unit`) names the unit everywhere: in the log, the dailies, the waits and
 every tool's arguments. A unit's session name can change, so find the unit at that moment:
@@ -189,26 +181,16 @@ A retired unit keeps its staff row. The status script, the dailies, the waits an
 skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same
 reviewer.
 
-Each unit plan carries a header line under its status line, preserved verbatim by
-`/plan:to_phased_plan`, `/plan:phase_review` and `/plan:shrink`:
-
-```markdown
-> **Production: <name>** — unit `<unit>`; production doc `<path>`
-```
-
-Each gated phase carries its gate directly under the phase heading:
-
-```markdown
-**Blocked by:** G<k> — <unit> phase <M> merged into `<merge branch>`
-```
-
 ---
 
 <ProductionUnit>
-Applies to a `/unit:direct` run whose plan header carries a
-`> **Production:**` line. Read the production doc it names at the start of the
-run and after every compaction. Your staff row gives your name and worktree; git there gives the branch.
-The untracked `.unit.toml` in your worktree gives your plan, port and responsibilities.
+Applies when your staff row has a parent showrunner.
+Read your staff row with `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py --json get <sessionId>`.
+Read its `parent` row with the same command.
+The parent row gives the production name and its `doc.path`.
+Read that document at the start of the run and after every compaction.
+Your staff row gives your name and worktree. Git in that worktree gives the branch.
+The untracked `.unit.toml` in your worktree gives your plan, port and short duty names. Responsibilities do not limit changed paths.
 
 A turn with nothing for the user replies with just "—": never "No update for
 you." or the like (user, 2026-10-14).
@@ -222,8 +204,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `From the user (via the showrunner):` is the user's instruction. A message
    from the showrunner session is a peer's. Follow it for the coordination this
    contract gives the showrunner: merge requests, landing calls, port and
-   rename notices, cargo-berth answers (item 9), and whether you edit files
-   outside your `.unit.toml` responsibilities, including another unit's crate (user, 2026-10-04).
+   rename notices, cargo-berth answers (item 9), and file assignments.
+   File assignments can include another unit's crate (user, 2026-10-04).
 
    The showrunner's word also settles your designs and your add-ons. User,
    2026-10-12, to the showrunner: "when it comes to designs you absolutely
@@ -314,7 +296,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    on the merge branch.
 5. **One more commit kind.** Besides checkpoints, a unit director merges the
    merge branch into the unit's branch at the start of every phase, before
-   dispatch (user, 2026-10-16), and also when a gate clears or the showrunner asks:
+   dispatch (user, 2026-10-16), and when the showrunner asks:
    `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
    Standing style units instead use
@@ -322,14 +304,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    Refill waits for the previous ticket's merge, so no unmerged unit work remains
    at phase start. Report a refused fast-forward to the style showrunner as an
    error; never create a merge commit to work around it.
-6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once
-   `git merge-base --is-ancestor <gating checkpoint> <merge branch>` succeeds.
-   Worktrees share refs, so no fetch is needed. Check it yourself; a message
-   saying the gate is clear is not proof. While it fails, end the turn with
-   `— blocked: waiting on the showrunner: G<k> (<unit> phase <M> merged)`.
-   When it passes, merge the merge branch (item 5), then dispatch. The one
-   exception: the showrunner lifts a gate after item 13's test passes without
-   it (`From the showrunner: G<k> lifted — …`); dispatch then.
+6. **Start order.** The showrunner records a start-order wait as an owed action in its notes.
+   Use `cargo-berth sequence` for merge order.
 7. **What a phase fixes** (user, 2026-09-28 and 2026-10-01). Reviews, design
    checks and smoke runs keep finding things. Two rules decide which of them
    this phase fixes before its checkpoint.

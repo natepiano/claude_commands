@@ -541,8 +541,10 @@ The showrunner routed five rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep
 #### As-built
 
 - `scripts/hooks/stop-direct-continue.py` measures context before any wake-source check. Below the handoff threshold, or when context cannot be measured, the stop passes.
-- At or above the threshold, the only wake source is a live entry in the payload's `background_tasks` (`pending_background_tasks`). With none, the hook blocks once, so the next request runs compaction. The `heartbeat.log` age is not a wake source: a finished worker writes the heartbeat too. `workers_working` no longer exists in `direct_run.py`.
-- The other early returns keep their meaning: a subagent, no session id, no active run, a declared user or supplier wait (`record_turn_wait`), and `stop_hook_active` (block once only).
+- At or above the threshold, a live entry in `background_tasks` (`pending_background_tasks`) permits the stop. With none, the hook repeats the wake until compaction reduces the context. A finished worker also writes `heartbeat.log`, so its age does not supply a wake. `workers_working` no longer exists in `direct_run.py`.
+- The other early returns permit subagents, missing session ids, missing active runs, and declared user or supplier waits (`record_turn_wait`).
+- The hook permits a stop when the final status matches `paused_status_pattern`.
+- Holding and blocked prefixes alone do not prevent the wake.
 
 **Files:**
 - `scripts/hooks/stop-direct-continue.py` — context first, then background tasks

@@ -47,6 +47,7 @@ _ = (notes / "codex 1.md").write_text(f"---\nlogin: {login}\n---\n")
 accounts.set_role("workers", "codex1")
 PYTHON
 export CLAUDE_CONFIG_DIR="$HOME/.claude2"
+source "$SCRIPT_DIR/agent_exec.sh"
 
 export MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
 export CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
@@ -97,7 +98,7 @@ assert_equal() {
 }
 
 run_dry() {
-    AGENT_EXEC_DRY_RUN=1 bash "$SCRIPT_DIR/agent_exec.sh" \
+    AGENT_EXEC_DRY_RUN=1 agents_exec_main \
         "$1" "$2" "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 }
 
@@ -175,7 +176,7 @@ assert_equal "extra arguments were not appended" \
 
 MISSING_PROMPT="$TEST_DIR/missing.txt"
 MISSING_LOG="$TEST_DIR/missing.log"
-if AGENT_EXEC_DRY_RUN=1 bash "$SCRIPT_DIR/agent_exec.sh" \
+if AGENT_EXEC_DRY_RUN=1 agents_exec_main \
     codex_case.task write "$WORKING_DIR" "$MISSING_PROMPT" "$OUTPUT_FILE" "$MISSING_LOG" \
     > "$TEST_DIR/missing.stdout" 2> "$TEST_DIR/missing.stderr"; then
     fail "missing prompt unexpectedly succeeded"
@@ -196,7 +197,7 @@ export TEST_CODEX_PROMPT_FILE="$TEST_DIR/child-prompt"
 export PATH="$TEST_DIR/bin:$PATH"
 export AGENT_NOTES_DIR="$TEST_DIR/notes"
 
-CODEX_HOME="$TEST_DIR/caller" bash "$SCRIPT_DIR/agent_exec.sh" \
+CODEX_HOME="$TEST_DIR/caller" agents_exec_main \
     codex_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "fallback followed its caller instead of the workers role" "$HOME/.codex1" "$(cat "$TEST_CODEX_HOME_FILE")"
 
@@ -228,7 +229,7 @@ chmod +x "$TEST_DIR/bin/claude"
 export TEST_CLAUDE_HOME_FILE="$TEST_DIR/claude-home"
 export TEST_CLAUDE_PROMPT_FILE="$TEST_DIR/claude-prompt"
 export TEST_CLAUDE_BACKGROUND_FILE="$TEST_DIR/background-disabled"
-bash "$SCRIPT_DIR/agent_exec.sh" claude_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+agents_exec_main claude_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "workers ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "Claude worker lost its prompt" "test prompt" "$(cat "$TEST_CLAUDE_PROMPT_FILE")"
 
@@ -236,7 +237,7 @@ test_extraction_failure_preserves_the_task_exit_policy() {
     local task claude_exit expected actual
     while read -r task claude_exit expected; do
         actual=0
-        TEST_CLAUDE_EXIT_CODE="$claude_exit" bash "$SCRIPT_DIR/agent_exec.sh" \
+        TEST_CLAUDE_EXIT_CODE="$claude_exit" agents_exec_main \
             "$task" readonly "$WORKING_DIR" "$PROMPT_FILE" "$WORKING_DIR" "$LOG_FILE" \
             2> "$TEST_DIR/extraction.stderr" || actual=$?
         [[ "$(cat "$TEST_DIR/extraction.stderr")" == *IsADirectoryError* ]] \
@@ -257,7 +258,7 @@ test_every_claude_print_launch_keeps_agents_and_reports_errors() {
     for task in claude_case.task direct.simplify; do
         while IFS=$'\t' read -r event expected; do
             actual=0
-            TEST_CLAUDE_RESULT="$event" bash "$SCRIPT_DIR/agent_exec.sh" \
+            TEST_CLAUDE_RESULT="$event" agents_exec_main \
                 "$task" readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE" \
                 2> "$TEST_DIR/print-error.stderr" || actual=$?
             assert_equal "$task accepted a Claude error" 1 "$actual"
@@ -301,6 +302,18 @@ assert staff.by_id(staff.StaffId(os.environ["FAKE_CLAUDE_SESSION_ID"])) is not N
 print("SENT: fixture")
 PYTHON
 export AGENT_BG_SEND_SCRIPT="$TEST_DIR/send.py"
+run_background_fixture() {
+    "$SCRIPT_DIR/../lib/py" - "$TEST_DIR/assign-parent" "$SCRIPT_DIR/../.." "$@" <<'PYTHON'
+import os, subprocess, sys
+from pathlib import Path
+root = Path(sys.argv[2]).resolve()
+sys.path.insert(0, str(root))
+from scripts.direct.assign_launcher_test_support import backend_fixture_command
+command, environment = backend_fixture_command(
+    Path(sys.argv[1]), ["bash", str(root / "scripts/agents/agent_bg.sh"), *sys.argv[3:]], dict(os.environ))
+raise SystemExit(subprocess.call(command, env=environment))
+PYTHON
+}
 cat > "$TEST_DIR/bin/claude-bg" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
@@ -316,7 +329,7 @@ EOF
 chmod +x "$TEST_DIR/bin/claude-bg"
 export TEST_CLAUDE_WORKERS_FLAG_FILE="$TEST_DIR/claude-workers-flag"
 export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000001
-CLAUDE_BIN="$TEST_DIR/bin/claude-bg" AGENT_BG_WORKERS=1 AGENT_BG_DETACH=1 bash "$SCRIPT_DIR/agent_bg.sh" \
+CLAUDE_BIN="$TEST_DIR/bin/claude-bg" AGENT_BG_WORKERS=1 AGENT_BG_DETACH=1 run_background_fixture \
     --run "$WORKING_DIR" fixture-worker "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/summary" "$LOG_FILE"
 assert_equal "background worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "background worker did not launch" "$FAKE_CLAUDE_SESSION_ID" "$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../production/worker_fill.py" member --run "$WORKING_DIR" --name fixture-worker | cut -d " " -f2)"
@@ -324,7 +337,8 @@ assert_equal "background worker passed its route opt-in to its children" "" "$(c
 
 # A caller's helper does not opt in to the workers route.
 export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000002
-CLAUDE_BIN="$TEST_DIR/bin/claude-bg" AGENT_BG_DETACH=1 env -u AGENT_BG_WORKERS bash "$SCRIPT_DIR/agent_bg.sh" \
+unset AGENT_BG_WORKERS
+CLAUDE_BIN="$TEST_DIR/bin/claude-bg" AGENT_BG_DETACH=1 run_background_fixture \
     --run "$WORKING_DIR" fixture-friend "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/friend-summary" "$LOG_FILE"
 assert_equal "friend took the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "friend did not launch" "$FAKE_CLAUDE_SESSION_ID" "$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../production/worker_fill.py" member --run "$WORKING_DIR" --name fixture-friend | cut -d " " -f2)"
@@ -344,7 +358,7 @@ from datetime import datetime, timezone
 role_map.write_role_map(role_map.WorkersClaudeRouteChange(
     role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT, "Codex recovered", datetime.now(timezone.utc).isoformat()))
 PYTHON
-bash "$SCRIPT_DIR/agent_exec.sh" claude_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+agents_exec_main claude_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "a closed route still replaced the caller account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 
 echo "agent_exec tests passed"

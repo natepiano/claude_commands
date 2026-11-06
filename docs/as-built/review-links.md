@@ -118,7 +118,10 @@ This override never makes a list real.
 Lists outside this folder print the routing note without sending an alert or writing an alert record.
 It alerts only from the production staff record; a `STAFF_FILE` override never alerts.
 `unrouted_alert_recipient` starts at `natedev` in `config/review_links.conf`.
-A change goes to this root showrunner when its list has no staff showrunner or its production document is gone.
+A routed change goes to this root showrunner when its list has no staff showrunner or its production document is gone.
+An unknown producer id or a broken parent chain keeps the change unrouted.
+An unrouted change uses the list's document when available.
+Otherwise, it takes only the root showrunner's document and keeps its owner.
 The page, the verdict and the footer counts use the same owner.
 The router keeps an available document, including a document that an earlier verdict added to the list.
 Otherwise, the router uses the root showrunner's current document.
@@ -193,6 +196,15 @@ The page shows every row with its recorded kind or the missing-kind notice.
 The short URL ends in `/changes.html`.
 The page retains the plain, narrow layout and fits a phone.
 Each row shows its kind, description once, proof, and answer controls.
+How to check and Proof show text lines in preformatted blocks.
+Consecutive lines that start with `- ` form a bulleted list.
+Consecutive lines that start with a number, a dot, and a space form a numbered list.
+Text without list lines stays in one block with all whitespace unchanged.
+In text with list lines, blank lines separate blocks and leading spaces are dropped.
+The list file stores cell line breaks as `<br>` and reads them as line breaks.
+A typed `<br>` takes one more backslash in storage and reads back unchanged.
+Every line separator that Python's `splitlines` recognizes is a line break.
+Each row stays on one table line.
 The user can select Works, Not works, Validate yourself, Send feedback, or Ask a question.
 The feedback box is a textarea with `feedback_rows` rows.
 The setting starts at 5.
@@ -236,6 +248,9 @@ The same ID and answer text change nothing and exit 0 on a rerun.
 The same ID with different answer text is refused.
 The row returns to its tab's count and Next order after the answer saves.
 The page shows the question and answer below the change, with the usual answer buttons.
+Question and Answer show text lines in paragraphs and use the same list forms as How to check.
+The answer keeps its internal line breaks and strips only whitespace at its two ends.
+All text is escaped, including text in list items.
 The user can ask another question or save a verdict.
 
 Each answer uses a background `fetch` POST.
@@ -518,7 +533,9 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
 `unrouted_alert_recipient` selects the alert recipient and the root showrunner for changes that nobody can take.
-This rule applies when the list has no staff showrunner or its production document is gone.
+This owner rule applies to routed changes when the list has no staff showrunner or its production document is gone.
+An unknown producer id or a broken parent chain keeps the change unrouted.
+If the list has no document, the unrouted change takes only the root showrunner's document.
 If no document is available for the change or the root showrunner, the page shows the unavailable message.
 `unrouted_alert_retry_seconds` controls repeated alerts.
 

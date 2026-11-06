@@ -244,7 +244,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         _ = ready.write_text("", encoding="utf-8")
 
         result = self.run_review(session_dir, ready)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr + (session_dir / "review_agent_1.log").read_text())
 
         kinds = [
             (event["event_type"], event.get("pass_kind"))

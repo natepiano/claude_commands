@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import roles_audit as audit
 from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.test_names import NAMES_TOML
 from scripts.shutdown import remote
 
@@ -786,8 +787,9 @@ class SourceCheckTests(unittest.TestCase):
 class ProductionNameTests(unittest.TestCase):
     def test_reads_staff_units_and_finds_cross_role_collisions(self) -> None:
         doc = Path("/fixture/one.md")
-        first = audit.parse_production("one", doc, "# A\n- **Showrunner session:** alpha\n",
-                                       owned_units(doc, "render", "old", retired=("old",)))
+        timer = showrunners.Timer("one", "session:alpha", doc, "UTC")
+        with patch.object(showrunners, "timer_for", return_value=timer):
+            first = audit.parse_production("one", doc, owned_units(doc, "render", "old", retired=("old",)))
         second = audit.ProductionNames("two", "/fixture/two.md", "render-unit", ("tools-unit",))
         rows = audit.measure_production_names((first, second))
         self.assertEqual(first.units, ("render-unit", "old-unit"))
@@ -864,7 +866,8 @@ other_names = ["seat"]
             doc = root / "fixture-production.md"
             _ = doc.write_text("# Fixture\n", encoding="utf-8")
             at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-            with patch.object(showrunners, "timer_docs", return_value={"fixture": doc}), \
+            with isolated_staff_file(root / "staff.json", {}), \
+                    patch.object(showrunners, "timer_docs", return_value={"fixture": doc}), \
                     patch.object(staff, "snapshot", return_value=owned_units(doc, "render")), \
                     patch.object(Path, "home", return_value=root), \
                     patch.dict("os.environ", {"USER_ZONE": "America/New_York"}):

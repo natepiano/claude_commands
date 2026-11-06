@@ -32,7 +32,7 @@ import fake_fmt
 import rules
 import style_ledger
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
@@ -453,7 +453,7 @@ class StylePlanTests(StylePlanFixture):
         target = self.repo / self.sources[0]
         _ = target.write_text(target.read_text().replace("old module", "current module"))
         self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
-        _ = issue.write_text(issue.read_text().replace("plan: approved", 'plan: ""'))
+        _ = issue.write_text(re.sub(r"unit: [^\n]*\n", "", issue.read_text()))
         code, output = self.reference_gate(ticket)
         self.assertEqual(code, 1, output)
         self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
@@ -1028,7 +1028,7 @@ class StylePlanTests(StylePlanFixture):
             finding = ledger.hold(rule, self.sources[0], 1, "value", "type", "u32", "u64", blob, "outside")
             ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+                             + f'unit: {unit_staff_id("names-unit")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
         self.proposals_field(folder)
         with (mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])),
               mock.patch.object(style_proposals, "proposal_command") as start,
