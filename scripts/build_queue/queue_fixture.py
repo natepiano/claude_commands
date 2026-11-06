@@ -269,7 +269,7 @@ class QueueFixture(ExitStack):
         self.proc.mkdir()
         environment = fake_memory_readings(self.root, available_kib=int(24.5 * gate.GIB) // 1024,
                                             total_kib=60 * gate.GIB // 1024, full_avg10=7.7)
-        environment.update({"BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_PROC": str(self.proc),
+        environment.update({"BUILDLOG_QUEUE_RESERVATION": "", "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_PROC": str(self.proc),
                             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
                             "USER_ZONE": "America/New_York"})
         self.enter_context(mock.patch.dict(os.environ, environment))

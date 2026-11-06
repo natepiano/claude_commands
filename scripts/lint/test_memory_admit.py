@@ -365,6 +365,23 @@ class MemoryRoomRulesTests(unittest.TestCase):
                 self.assertEqual(after.state, state)
                 self.assertEqual(after, before)
 
+    def test_background_memory_counts_without_preventing_an_oversized_head_start(self) -> None:
+        policy = admission_policy_fixture()
+        waiter: gate.Waiter = {"pid": 200, "start_time": "200", "need": 40 * GIB, "since": NOW_EPOCH}
+        run = gate.RunningStep("run", "run", "background", "/run", 4 * GIB,
+            gate.MeasuredMemory(GIB, anonymous=gate.AnonymousRunUse(GIB)), pid=100)
+        reservation: gate.Reservation = {**fixture_reservation(100, 4 * GIB), "step": "background"}
+        inputs = gate.QueueInputs([(Path("200.waiting"), waiter)], (run,),
+            (reservation,), gate.HostMemory(10 * GIB, 64 * GIB), gate.NoPressureHold(),
+            gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), NOW_EPOCH)
+        result = gate.admission_pass(inputs, NOW_EPOCH, policy)
+        self.assertEqual(result.rows[0].decision.state, "admit")
+        room = gate.inputs_room(inputs, policy)
+        assert isinstance(room, gate.MemoryRoom)
+        self.assertEqual((room.used, room.kept, room.room), (GIB, 3 * GIB, 4 * GIB))
+        real = replace(inputs, reservations=({**reservation, "step": "cargo"},))
+        self.assertEqual(gate.admission_pass(real, NOW_EPOCH, policy).rows[0].decision.state, "hold")
+
     def test_ci_keep_aside_stays_separate_from_run_use_and_run_holds(self) -> None:
         reading = gate.memory_room(gate.HostMemory(20 * GIB, 64 * GIB), [gate.RunMemory("run", 8 * GIB, gate.AnonymousRunUse(3 * GIB))], admission_policy_fixture(), ci_keep_aside=gate.CIKeepAside(7 * GIB))
         assert isinstance(reading, gate.MemoryRoom)
@@ -4460,7 +4477,7 @@ class ProcessRunUseTests(unittest.TestCase):
             def sample_once(self) -> None:
                 stopped = threading.Event()
                 stopped.set()
-                self._sample(queue.ProgramTree(100), stopped)
+                self._sample(queue.ProgramTree(queue.ProgramGroup(100)), stopped)
 
         place = SingleSampleQueuePlace(path, sidecar, configuration=admission_configuration_fixture())
         with patch.object(queue, "program_members", return_value={100: "100", 101: "101"}):

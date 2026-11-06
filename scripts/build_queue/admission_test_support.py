@@ -344,7 +344,7 @@ class AdmissionFixture(ExitStack):
             "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
             "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.state_dir.parent),
             "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
-            "BUILDLOG_RUN": "",
+            "BUILDLOG_RUN": "", "BUILDLOG_QUEUE_RESERVATION": "",
             "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
             "HOME": str(self.root)}
@@ -806,6 +806,7 @@ _caller_services: dict[str, AdmissionFixture] = {}
 def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str],
                      *, skip_idle_spacing: bool = True) -> AdmissionFixture:
     """Use the one server for existing caller fixtures and their child processes."""
+    environment["BUILDLOG_QUEUE_RESERVATION"] = ""
     existing = _caller_services.get(environment.get("ADMISSION_SOCKET", ""))
     if existing is not None and existing.root == root and not existing.server.closed:
         if not skip_idle_spacing:

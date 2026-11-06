@@ -102,6 +102,23 @@ fi
         self.assertEqual(probe["run"], f"{expected.pid}:{expected.start_time}")
         return expected
 
+    def test_detached_verify_requests_a_supervisor_without_disabling_child_scopes(self) -> None:
+        with AdmissionFixture() as fixture:
+            script = self.script(fixture)
+            launcher = script.with_name("mesh-probe.py")
+            captured = fixture.root / "mesh-arguments.json"
+            _ = launcher.write_text("import json, os, sys\nfrom pathlib import Path\n"
+                + "Path(os.environ['MESH_ARGUMENTS']).write_text(json.dumps({'args': sys.argv[1:], "
+                + "'scope': os.environ.get('BUILDLOG_SCOPE', '1')}))\n")
+            process = self.start(script, "detached", CODEX_THREAD_ID="private-worker",
+                                 VERIFY_MESH_RUNS_SCRIPT=str(launcher), MESH_ARGUMENTS=str(captured),
+                                 BUILDLOG_SCOPE="1")
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            recorded = cast(dict[str, object], json.loads(captured.read_text()))
+            self.assertIn("--supervisor", cast(list[str], recorded["args"]))
+            self.assertEqual(recorded["scope"], "1")
+
     def test_nested_verify_keeps_the_outer_identity_and_queue_order(self) -> None:
         with AdmissionFixture() as fixture:
             process = self.start(self.script(fixture), "outer")

@@ -87,13 +87,9 @@ fi
 # of this may fail, print, or change a status: the begin and end calls sit
 # behind `|| true`, and the step's status is the step's own.
 #
-# fd 3 carries the step's stderr past systemd-run, whose own complaints go to
-# /dev/null. --expand-environment=no keeps the argv as given: by default
-# systemd-run rewrites $VAR, ${VAR} and $$ in it, as ExecStart= would. The
-# marker file is written inside the scope just before the step starts, so its
-# absence afterwards proves the scope never ran the step (no user manager, a
-# sandbox without its socket, a systemd older than 254 that rejects the
-# option), and run() runs it plainly.
+# fd 3 carries the step's stderr through the recording shell.
+# queue_place.py owns scope creation and reuses the step's accepted reservation.
+# A failed admission never starts the command through a second path.
 # The scope sets oom_score_adj from lint.conf, so earlyoom kills build steps before
 # CI (100) and sessions (200), the largest first.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
@@ -155,13 +151,11 @@ buildlog_exec() {
         return
     fi
     local status=0
-    systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- \
-        /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
+    BUILDLOG_QUEUE_RESERVATION="${BUILDLOG_QUEUE_RESERVATION:-${BUILDLOG_MEM_RESERVATION:-}}" \
+        buildlog_memory_python "${BUILDLOG_MEM_ADMIT_SCRIPT%/*}/queue_place.py" --scope-optional -- \
+        /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2
     status=$?
-    if [[ -e "$BUILDLOG_PEAK" ]]; then
-        return $status
-    fi
-    "$@"
+    return "$status"
 }
 
 buildlog_write_step() {

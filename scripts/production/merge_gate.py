@@ -29,6 +29,7 @@ import argparse
 from collections import deque
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -77,6 +78,8 @@ from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E40
 from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, defer_cleanup_signals, queue_place, suite_scope_prefix,
 )
+
+GATE_PROGRAM: ContextVar[str] = ContextVar("gate_program", default="merge-gate")
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
@@ -339,12 +342,12 @@ def merge_gate_governor_gib() -> float:
 
 @contextmanager
 def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
-                     type_dirs: Sequence[str] = ()) -> Generator[QueuePlace]:
+                     type_dirs: Sequence[str] = (), program: str = "merge-gate") -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
     try:
-        program: str | Sequence[str] = ("merge-gate", "--type-dirs", *type_dirs) if type_dirs else "merge-gate"
-        with queue_place(program, repo,
+        arguments: str | Sequence[str] = (program, "--type-dirs", *type_dirs) if type_dirs else program
+        with queue_place(arguments, repo,
                          before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
             yield place
     except QueuePlaceRefused as error:
@@ -1015,7 +1018,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with (record_on_abort(),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES["merge-gate"], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
-          gate_reservation(repo, temporary, hold, type_dirs=type_dirs) as reservation,
+          gate_reservation(repo, temporary, hold, type_dirs=type_dirs, program=GATE_PROGRAM.get()) as reservation,
           shared_cpu_pool() as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary)}
         types_python = typecheck_python() if type_dirs else ""
@@ -1673,8 +1676,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.nightly:
                 return nightly(args)
             if args.tests_only:
-                return 0 if run_suites(Path(str(args.repo)).resolve(), args.type_dirs,
-                                       module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
+                program_token = GATE_PROGRAM.set("full-tests")
+                try:
+                    return 0 if run_suites(Path(str(args.repo)).resolve(), args.type_dirs,
+                                           module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
+                finally:
+                    GATE_PROGRAM.reset(program_token)
             if args.promote_only:
                 promote(args)
                 return 0

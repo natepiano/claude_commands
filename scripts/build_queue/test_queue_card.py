@@ -17,6 +17,18 @@ from scripts.message.unit_labels import UnitLabels
 
 class QueueCardTests(QueueFixtureTests):
 
+    def test_full_tests_uses_the_shared_name_in_ahead_rows_and_running_evidence(self) -> None:
+        self.fixture.change(1, step="full-tests")
+        model = self.fixture.model()
+        text = plain(queue_card.render_card(model, [2], 400))
+        self.assertIn("full tests", text)
+        self.assertNotIn("full-tests", text)
+        row = model.reading.explanation.running[0]
+        row = replace(row, step=replace(row.step, step="full-tests"))
+        evidence = queue_evidence.running_text(row, model.reading.explanation, model.labels, model.zone)
+        self.assertIn(", full tests:", evidence)
+        self.assertNotIn("full-tests", evidence)
+
     def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
         model = self.fixture.model()
         for position in (1, 2, 4):

@@ -780,6 +780,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "code-version":
         print(LOADED_ADMISSION_CODE_VERSION)
         return 0
+    if (args.command in ("admit", "launch") and args.shell_state is not None
+            and os.environ.get("BUILDLOG_QUEUE_RESERVATION")):
+        _ = args.shell_state.write_text("BUILDLOG_MEM_OUTCOME=Granted\nBUILDLOG_MEM_WAIT_S=0\n"
+                                        + "BUILDLOG_MEM_RESERVATION=''\n")
+        return 0
     output = WaitOutput(on_event=(lambda event: print(event, flush=True))
                         if args.wait_events else lambda _event: None)
     launch_limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)

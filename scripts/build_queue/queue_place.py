@@ -2,16 +2,138 @@
 """Choose admission from command arguments and manage the program scope."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Sequence
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+def in_builds_slice() -> bool:
+    try:
+        return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
+    except OSError:
+        return False
+
+
+def scope_entry_prefix() -> list[str]:
+    """Enter the queue before a caller starts a build scope."""
+    return [sys.executable, str(Path(__file__).resolve()), "--scope-optional", "--"]
+
+
+def suite_scope_prefix() -> list[str]:
+    """Route each module through the entry point after the gate acquires its place."""
+    return scope_entry_prefix()
+
+
+def probe_scope_prefix() -> list[str]:
+    """Check whether the user manager can start a separate program scope."""
+    prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+              "--expand-environment=no", "--slice=builds.slice", "--"]
+    try:
+        probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"Module scope skipped: probe failed ({error})", flush=True)
+        return []
+    if probe.returncode:
+        print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
+        return []
+    print("Module scope: builds.slice", flush=True)
+    return prefix
+
+
+class EntryArguments(argparse.Namespace):
+    scope_optional: bool = False
+    command: list[str] = []
+
+
+def entry_arguments() -> EntryArguments:
+    parser = argparse.ArgumentParser(description=__doc__)
+    _ = parser.add_argument("--scope-optional", action="store_true")
+    _ = parser.add_argument("command", nargs=argparse.REMAINDER)
+    options = parser.parse_args(namespace=EntryArguments())
+    if options.command[:1] == ["--"]:
+        options.command = options.command[1:]
+    return options
+
+
+def exec_inherited(options: EntryArguments) -> None:
+    """Keep the caller's PID and process group for an inherited reservation."""
+    if not options.command:
+        print("queue place: the program command is empty", file=sys.stderr)
+        raise SystemExit(1)
+    prefix: list[str] = []
+    if os.environ.get("BUILDLOG_SCOPE") != "0" and not in_builds_slice():
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        available = bool(runtime and Path(runtime, "systemd", "private").is_socket()
+                         and shutil.which("systemd-run"))
+        if available or not options.scope_optional:
+            prefix = probe_scope_prefix()
+        if not prefix and not options.scope_optional:
+            print("queue place: the queued program requires a memory scope; "
+                  + "set BUILDLOG_SCOPE=0 only for tests", file=sys.stderr)
+            raise SystemExit(1)
+    exec_program([*prefix, *options.command])
+
+
+def exec_program(argv: Sequence[str]) -> None:
+    """Report execution errors with shell exit statuses."""
+    try:
+        os.execvp(argv[0], list(argv))
+    except OSError as error:
+        print(f"queue place: {argv[0]}: {error}", file=sys.stderr)
+        raise SystemExit(127 if isinstance(error, FileNotFoundError) else 126) from error
+
+
+PR_SET_PDEATHSIG = 1
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def become_child_subreaper() -> None:
+    """Adopt orphan descendants before an unscoped CLI program starts."""
+    if sys.platform == "linux":
+        import ctypes
+        from typing import cast
+
+        library = ctypes.CDLL(None, use_errno=True)
+        prctl = cast(Callable[[int, int, int, int, int], int], library.prctl)
+        if prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "cannot make the CLI holder a child subreaper")
+
+
+def parent_watch(parent: int, argv: Sequence[str]) -> None:
+    """Stop the CLI program if SIGKILL prevents its holder's cleanup."""
+    import ctypes
+    import signal
+    from typing import cast
+
+    if sys.platform == "linux":
+        library = ctypes.CDLL(None, use_errno=True)
+        prctl = cast(Callable[[int, int, int, int, int], int], library.prctl)
+        if prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "cannot set the program's parent-death signal")
+        if os.getppid() != parent:
+            os.kill(os.getpid(), signal.SIGKILL)
+    exec_program(argv)
+
+
+# The nested entry must exec before admission imports, threads, or signal handlers.
+if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--parent-watch":
+        parent_watch(int(sys.argv[2]), sys.argv[3:])
+    if os.environ.get("BUILDLOG_QUEUE_RESERVATION") and sys.argv[1:2] != ["--scope-start"]:
+        exec_inherited(entry_arguments())
+
+
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
-import os
-from pathlib import Path
 import signal
-import subprocess
-import sys
 import threading
 import time
 from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
@@ -102,39 +224,6 @@ def defer_start_signals() -> Generator[None]:
         signal.raise_signal(pending[0])
 
 
-def in_builds_slice() -> bool:
-    try:
-        return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
-    except OSError:
-        return False
-
-
-def suite_scope_prefix() -> list[str]:
-    if os.environ.get("BUILDLOG_SCOPE") == "0":
-        print("Module scope skipped: BUILDLOG_SCOPE=0", flush=True)
-        return []
-    if in_builds_slice():
-        print("Module scope skipped: gate already runs in builds.slice", flush=True)
-        return []
-    return probe_scope_prefix()
-
-
-def probe_scope_prefix() -> list[str]:
-    """Check whether the user manager can start a separate program scope."""
-    prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-              "--expand-environment=no", "--slice=builds.slice", "--"]
-    try:
-        probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
-                               capture_output=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"Module scope skipped: probe failed ({error})", flush=True)
-        return []
-    if probe.returncode:
-        print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
-        return []
-    print("Module scope: builds.slice", flush=True)
-    return prefix
-
 
 def wait_reasons(result: memory_admit.AdmissionWaitSnapshot) -> tuple[str, ...]:
     return admission_client.wait_reasons(result)
@@ -157,9 +246,21 @@ class ProgramNotStarted:
     pass
 
 
+@dataclass(frozen=True)
+class ProgramGroup:
+    group: int
+
+
+@dataclass(frozen=True)
+class HolderChildren:
+    holder: int
+    group: int
+    program_start: int
+
+
 @dataclass
 class ProgramTree:
-    group: int
+    membership: ProgramGroup | HolderChildren
     observed: dict[int, str] = field(default_factory=dict[int, str])
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -169,9 +270,14 @@ class ProgramTree:
             processes = memory_admit.process_table(Path("/proc"))
             members = memory_admit.process_tree(self.observed, processes)
             members.update(scope_members)
-            for pid in processes:
+            for pid, identity in processes.items():
                 try:
-                    if os.getpgid(pid) == self.group:
+                    if isinstance(self.membership, ProgramGroup):
+                        if os.getpgid(pid) == self.membership.group:
+                            members.add(pid)
+                    elif (identity.parent == self.membership.holder
+                          and os.getpgid(pid) == self.membership.group
+                          and int(identity.start) >= self.membership.program_start):
                         members.add(pid)
                 except ProcessLookupError:
                     continue
@@ -252,6 +358,8 @@ class QueuePlace:
     configuration: memory_admit.MemoryConfig = field(kw_only=True, repr=False)
     purpose: ProgramPurpose = field(default=ProgramPurpose.BATCH, kw_only=True)
     arguments: tuple[str, ...] = field(default=(), kw_only=True)
+    scope_optional: bool = field(default=False, kw_only=True)
+    stop_with_holder: bool = field(default=False, kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def observe(self, peak_bytes: int, current_bytes: int) -> None:
@@ -272,14 +380,20 @@ class QueuePlace:
             raise QueuePlaceRefused("a queue place can start only one program")
         if self.arguments and tuple(argv) != self.arguments:
             raise QueuePlaceRefused("the program arguments changed after the purpose decision")
-        if not popen_arguments.get("start_new_session", True):
+        if not self.stop_with_holder and not popen_arguments.get("start_new_session", True):
             raise QueuePlaceRefused("a queued program must start in its own process group")
-        popen_arguments["start_new_session"] = True
+        popen_arguments["start_new_session"] = not self.stop_with_holder
+        environment = dict(popen_arguments.get("env", os.environ))
         prefix: list[str] = []
-        if self.purpose != ProgramPurpose.PROBE and os.environ.get("BUILDLOG_SCOPE") != "0":
-            with redirect_stdout(sys.stderr):
-                prefix = probe_scope_prefix()
-            if not prefix:
+        if (self.purpose != ProgramPurpose.PROBE and environment.get("BUILDLOG_SCOPE") != "0"
+                and not in_builds_slice()):
+            runtime = environment.get("XDG_RUNTIME_DIR", "")
+            available = bool(runtime and Path(runtime, "systemd", "private").is_socket()
+                             and shutil.which("systemd-run", path=environment.get("PATH")))
+            if available or not self.scope_optional:
+                with redirect_stdout(sys.stderr):
+                    prefix = probe_scope_prefix()
+            if not prefix and not self.scope_optional:
                 raise QueuePlaceRefused(
                     "the queued program requires a memory scope; set BUILDLOG_SCOPE=0 only for tests")
         holder_pid = os.getpid()
@@ -289,12 +403,25 @@ class QueuePlace:
         command = ([*prefix, sys.executable, str(Path(__file__).resolve()), "--scope-start", str(self.sidecar),
                     str(holder_pid), holder_start, *argv]
                    if prefix else list(argv))
+        if "BUILDLOG_QUEUE_RESERVATION" in os.environ:
+            environment["BUILDLOG_QUEUE_RESERVATION"] = os.environ["BUILDLOG_QUEUE_RESERVATION"]
+        popen_arguments["env"] = environment
+        if self.stop_with_holder:
+            command = [sys.executable, str(Path(__file__).resolve()), "--parent-watch", str(holder_pid), *command]
         with defer_start_signals():
+            if self.stop_with_holder and not prefix:
+                become_child_subreaper()
             process = subprocess.Popen(command, **popen_arguments)
             stopped = threading.Event()
             tracking: ScopedProgram | ProgramTree = ScopedProgram()
             if not prefix:
-                tracking = ProgramTree(process.pid)
+                membership: ProgramGroup | HolderChildren = ProgramGroup(process.pid)
+                if self.stop_with_holder:
+                    # The unreaped program retains its start time even after it exits.
+                    stat = (Path("/proc") / str(process.pid) / "stat").read_text()
+                    program_start = int(stat.rsplit(") ", 1)[1].split()[19])
+                    membership = HolderChildren(holder_pid, os.getpgrp(), program_start)
+                tracking = ProgramTree(membership)
                 start = memory_admit.process_start_time(process.pid)
                 if start is not None:
                     tracking.observed[process.pid] = start
@@ -306,6 +433,13 @@ class QueuePlace:
             if prefix:
                 while not self.sidecar.read_text().strip():
                     if process.poll() is not None and not self.sidecar.read_text().strip():
+                        if self.scope_optional:
+                            stopped.set()
+                            if isinstance(sampler, threading.Thread):
+                                sampler.join()
+                            self.program = ProgramNotStarted()
+                            popen_arguments["env"] = {**environment, "BUILDLOG_SCOPE": "0"}
+                            return self.popen(argv, **popen_arguments)
                         raise QueuePlaceRefused("the program exited before it published its memory scope")
                     time.sleep(self.configuration.program_sample_seconds)
             self.on_started()
@@ -376,7 +510,8 @@ def _stop_holder(number: int, _frame: object) -> None:
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
                 sizing: memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
-                before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
+                before_check: Callable[[], None] = no_hold_wait,
+                scope_optional: bool = False, stop_with_holder: bool = False) -> Generator[QueuePlace]:
     """Use full commands for purpose selection; retain named batch reservations."""
     # A name requests a batch place. A complete command permits purpose selection.
     try:
@@ -390,8 +525,12 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         config = memory_admit.memory_config()
     except conf.Unusable as error:
         raise QueuePlaceRefused(str(error)) from error
-    if purpose == ProgramPurpose.BATCH and isinstance(sizing, ConfiguredFirstPeak):
+    nested = bool(os.environ.get("BUILDLOG_QUEUE_RESERVATION"))
+    if purpose == ProgramPurpose.BATCH and not nested and isinstance(sizing, ConfiguredFirstPeak):
         first = config.program_first_peaks.get(name)
+        if first is None and scope_optional:
+            name = memory_admit.BACKGROUND_STEP
+            first = config.program_first_peaks.get(name)
         if first is None:
             raise QueuePlaceRefused(f"no first peak for {name} in build_admission.conf [memory]; {conf.path('build_admission')}: program_first_peak_gib.{name} is missing or invalid")
         sizing = memory_admit.HistoryPeakSizing(first, memory_admit.FirstProgramPeak(first), 0.0)
@@ -405,7 +544,7 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                 _ = signal.signal(number, _stop_holder)
         try:
             grant: wire.Admitted | UnreservedProgram = UnreservedProgram()
-            if purpose == ProgramPurpose.BATCH:
+            if purpose == ProgramPurpose.BATCH and not nested:
                 assert not isinstance(sizing, ConfiguredFirstPeak)
                 profile = memory_admit.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
                 start = memory_admit.process_start_time(pid)
@@ -413,7 +552,8 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                     raise QueuePlaceRefused("owner no longer exists")
                 owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
                 def refresh() -> wire.AdmitRequest:
-                    return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
+                    return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile,
+                        run=admission_client.parse_run_identity(os.environ.get("BUILDLOG_RUN", "")))
                 output = admission_client.WaitOutput()
                 reply = admission_client.admit(refresh(), output, refresh, _attempt=before_check)
                 if isinstance(reply, wire.Refused):
@@ -423,7 +563,11 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                 grant = reply
                 output.finished()
             sample_path = Path(grant.max_path).with_suffix("") if isinstance(grant, wire.Admitted) else temporary / "program"
-            place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
+            place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments,
+                               scope_optional=scope_optional, stop_with_holder=stop_with_holder)
+            saved = os.environ.get("BUILDLOG_QUEUE_RESERVATION")
+            if isinstance(grant, wire.Admitted) and name in config.program_first_peaks and name != memory_admit.BACKGROUND_STEP:
+                os.environ["BUILDLOG_QUEUE_RESERVATION"] = grant.reservation
             failed = False
             try:
                 yield place
@@ -433,9 +577,15 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                 raise
             finally:
                 with defer_cleanup_signals():
-                    place.finish(failed=failed)
-                    if isinstance(grant, wire.Admitted):
-                        _ = admission_client.release(grant.reservation, place.status, place.configuration)
+                    try:
+                        place.finish(failed=failed)
+                        if isinstance(grant, wire.Admitted):
+                            _ = admission_client.release(grant.reservation, place.status, place.configuration)
+                    finally:
+                        if saved is None:
+                            _ = os.environ.pop("BUILDLOG_QUEUE_RESERVATION", None)
+                        else:
+                            os.environ["BUILDLOG_QUEUE_RESERVATION"] = saved
         finally:
             with defer_cleanup_signals():
                 for number, handler in handlers.items():
@@ -446,12 +596,11 @@ if __name__ == "__main__":
     if len(sys.argv) >= 6 and sys.argv[1] == "--scope-start":
         scope_start(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5:])
     else:
-        argv = sys.argv[1:]
-        if argv[:1] == ["--"]:
-            argv = argv[1:]
+        options = entry_arguments()
+        argv = options.command
         try:
-            with queue_place(argv, Path.cwd()) as place:
-                status = place.popen(argv).wait()
+            with queue_place(argv, Path.cwd(), scope_optional=options.scope_optional, stop_with_holder=True) as place:
+                status = place.popen(argv, close_fds=False).wait()
             raise SystemExit(status)
         except QueuePlaceRefused as error:
             print(f"queue place: {error}", file=sys.stderr)

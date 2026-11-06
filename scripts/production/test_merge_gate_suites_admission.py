@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import replace
@@ -25,6 +26,7 @@ from scripts.build_queue.admission_test_support import only_admitted, FakeClock,
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture
 from scripts.production.merge_gate_test_support import gate_suites, wait_for_file
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
@@ -37,6 +39,63 @@ class ServiceGateFixture(GateSuitesFixture):
 
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
+    @gate_suites("lib")
+    def test_tests_only_uses_full_tests_with_its_configured_need_and_type_shape(self) -> None:
+        self.configure_gate("program_first_peak_gib.full-tests=0.75\nprogram_first_peak_gib.merge-gate=0.25")
+        observed: list[tuple[str, int, str]] = []
+
+        def capture(snapshot: memory_admit.AdmissionWaitSnapshot) -> None:
+            _, row = self.reservation()
+            observed.append((row["step"], snapshot.peak.bytes, row.get("shape", "")))
+
+        with self.observing_admission(capture):
+            result = self.run_gate("--tests-only", "--type-dirs", "scripts")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(observed, [("full-tests", 3 * memory_admit.GIB // 4, memory_admit.MERGE_GATE_TYPES)])
+        row, = self.gate_history()
+        self.assertEqual(row["step"], "full-tests")
+        self.assert_gate_released()
+
+    @gate_suites("lib")
+    def test_gate_commands_inside_background_wrappers_own_their_need_and_progress_sidecar(self) -> None:
+        self.configure_gate("program_first_peak_gib.full-tests=0.75\nrunning_pass_seconds=0.01")
+        self.write(self.state / "concurrency-barrier", "held")
+        commands = ((sys.executable, str(Path(merge_gate.__file__)), "--tests-only"),
+                    (sys.executable, "-m", "scripts.production.merge_gate", "--tests-only"))
+        read = progress.read_counter
+        observed: list[tuple[str, str, int]] = []
+
+        def capture(sidecar: Path) -> progress.ProgressCounter | progress.NoCounter:
+            counter = read(sidecar)
+            if isinstance(counter, progress.ProgressCounter):
+                rows = [service.reservation_row(row) for row in self.admission.server.reservations.values()]
+                gate_row = next(row for row in rows if row["step"] == "full-tests")
+                wrapper = next(row for row in rows if row["step"] == "background")
+                observed.append((str(sidecar), wrapper["sidecar"], sum(row["need"] for row in rows)))
+                self.assertEqual(str(sidecar), gate_row["sidecar"])
+                for started in self.state.glob("*.started"):
+                    _ = started.with_suffix(".released").touch()
+            return counter
+
+        for command in commands:
+            with self.subTest(command=command), mock.patch.dict(os.environ, self.environment):
+                with queue.queue_place(command, self.checkout, scope_optional=True):
+                    self.assertFalse(os.environ.get("BUILDLOG_QUEUE_RESERVATION"))
+                    with self.admission.loop_turn():
+                        self.admission.allow_next_start()
+                    with mock.patch.object(progress, "read_counter", side_effect=capture):
+                        result = subprocess.run([*command, "--repo", str(self.checkout)],
+                            cwd=self.root, env=self.environment, capture_output=True, text=True,
+                            check=False, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_gate_released()
+                with self.admission.loop_turn():
+                    self.admission.allow_next_start()
+        self.assertTrue(observed)
+        for gate_sidecar, wrapper_sidecar, need in observed:
+            self.assertNotEqual(gate_sidecar, wrapper_sidecar)
+            self.assertEqual(need, memory_admit.GIB)
+
     @gate_suites("lib", "hooks")
     def test_suite_progress_counts_type_jobs_and_starts_a_new_phase_for_reruns(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
@@ -164,11 +223,13 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             reply, = fixture.server.handle_request(older)
         self.assertIsInstance(reply, wire.Wait)
         handle_request = fixture.server.handle_request
+        first_gate_request = threading.Event()
 
         def fit_older(request: wire.Request,
                       connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             with fixture.loop_turn():
-                if isinstance(request, wire.AdmitRequest) and request.owner != older.owner:
+                if isinstance(request, wire.AdmitRequest) and request.owner != older.owner and not first_gate_request.is_set():
+                    first_gate_request.set()
                     self.assertIn(older.episode, fixture.server.waiters)
                     fixture.free(23 * memory_admit.GIB // 2)
                 return handle_request(request, connection)
@@ -246,7 +307,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         with mock.patch.object(client, "admit", side_effect=acquire), \
              mock.patch.object(client, "CLOCK", fixture.clock), \
              mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("gate inferred cargo")):
-            result = self.run_gate("--tests-only")
+            result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(profiles), 3)
         self.assertEqual(len(set(identities)), 1)
@@ -313,7 +374,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 decisions.append("admit")
             return result
         with mock.patch.object(client, "admit", side_effect=acquire):
-            result = self.run_gate("--tests-only")
+            result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(decisions, ["hold", "admit"], result.stderr)
         self.assert_all_modules_started()
@@ -341,7 +402,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             return {pid: 123.0 for pid in roots}
         with mock.patch.object(client, "admit", side_effect=acquire), \
              mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample):
-            first = self.run_gate("--tests-only")
+            first = self.run_gate()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual((profiles[0].peak.bytes, profiles[0].peak.source), (512 * 1024 * 1024, "fallback"))
         self.assert_gate_released()
@@ -349,7 +410,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         self.assertEqual((row["step"], row["anon_peak_bytes"]), ("merge-gate", 123 * 1024 * 1024))
         self.clear_gate_events()
         with mock.patch.object(client, "admit", side_effect=acquire):
-            second = self.run_gate("--tests-only")
+            second = self.run_gate()
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual((profiles[-1].peak.bytes, profiles[-1].peak.source), (512 * 1024 * 1024, "fallback"))
         self.assert_gate_released()
@@ -378,7 +439,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             return release(reservation, status, configuration)
         with mock.patch.object(merge_gate, "start_gate_job", side_effect=start), \
              mock.patch.object(client, "release", side_effect=finish):
-            result = self.run_gate("--tests-only")
+            result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_all_modules_started()
         self.assertEqual(kinds.count(merge_gate.GateJobKind.TEST_MODULE), len(self.module_events()) // 2)
@@ -443,11 +504,10 @@ class MergeGateAdmissionTests(unittest.TestCase):
 
     def test_scope_probe_timeout_or_missing_command_runs_without_prefix(self) -> None:
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
-            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
-                    mock.patch.object(queue, "in_builds_slice", return_value=False), \
-                    mock.patch("scripts.production.merge_gate.subprocess.run", side_effect=error) as probe, \
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch("scripts.build_queue.queue_place.subprocess.run", side_effect=error) as probe, \
                     redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(queue.suite_scope_prefix(), [])
+                self.assertEqual(queue.probe_scope_prefix(), [])
                 self.assertEqual(probe.call_args.kwargs["timeout"], 10)
                 self.assertIn("Module scope skipped: probe failed", output.getvalue())
 

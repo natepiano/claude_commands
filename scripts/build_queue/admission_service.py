@@ -956,9 +956,9 @@ class AdmissionServer:
                 continue
             sidecar = Path(row["sidecar"])
             counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
-            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
+            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] not in ("merge-gate", "full-tests"):
                 counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
-            if isinstance(counter, progress.NoCounter) and row["step"] != "merge-gate" and self.boot_id:
+            if isinstance(counter, progress.NoCounter) and row["step"] not in ("merge-gate", "full-tests") and self.boot_id:
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
@@ -1195,7 +1195,7 @@ class AdmissionServer:
                 stem = stem.with_name(stem.name + "0")
             if profile.step == "build":
                 shape = build_shape(list(request.argv)).key
-            elif profile.step == "merge-gate":
+            elif profile.step in ("merge-gate", "full-tests"):
                 shape = gate.merge_gate_shape(request.argv)
             else:
                 shape = ""

@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING, cast
 from scripts.lib.nix_env_test_support import NixFixture
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from .memory_test_support import config_environment
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lint.memory_test_support import config_environment
 
 if TYPE_CHECKING:
     from ..buildlog.cgroup_test_support import write_cgroup
@@ -405,7 +407,7 @@ buildlog_sample_anon "$1" "$2" "$$"
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "UNIT_ACTIVE_DIR": str(root / "active"),
-                     "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                     "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "", "BUILDLOG_QUEUE_RESERVATION": "",
                      "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                      "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
             )
@@ -464,7 +466,8 @@ buildlog_sample_anon "$1" "$2" "$$"
             result = subprocess.run(
                 ["bash", "-c", shell, "sidecar-test", str(INVOKE), command],
                 capture_output=True, text=True, check=False,
-                env={**os.environ,
+                env={**os.environ, **config_environment(root),
+                     "BUILDLOG_QUEUE_RESERVATION": "outer-step-reservation", "BUILDLOG_SCOPE": "0",
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "UNIT_ACTIVE_DIR": str(root / "active"),
@@ -538,7 +541,7 @@ class BuildAdmissionTests(unittest.TestCase):
                  "BUILD_HOLD_DIR": str(root / "holders"),
                  "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                  "UNIT_ACTIVE_DIR": str(root / "active"),
-                 "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                 "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "", "BUILDLOG_QUEUE_RESERVATION": "",
                  "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                  "MAC_TEST_STATE_DIR": str(root / "mac-state"),
                  "LINT_CONFIG_READER": str(root / "missing-config")}

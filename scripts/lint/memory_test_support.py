@@ -122,7 +122,7 @@ def gate_isolation_environment(root: Path) -> dict[str, str]:
         "BUILD_HOLD_DIR": str(root / "holders"),
         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
         "UNIT_ACTIVE_DIR": str(root / "active"),
-        "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+        "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "", "BUILDLOG_QUEUE_RESERVATION": "",
         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
     }
 

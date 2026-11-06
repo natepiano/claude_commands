@@ -1856,12 +1856,12 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     return tuple(groups.values())
 
 
-PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "merge-gate", "cargo")
+PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "merge-gate", "full-tests", "cargo")
 
 
 def reservation_profile_key(row: Reservation, host: str) -> str:
     """Use the history identity for each step rather than its run owner."""
-    if row["step"] == "merge-gate":
+    if row["step"] in ("merge-gate", "full-tests"):
         return progress.profile_key((host, row["step"], row.get("shape", MERGE_GATE_TESTS)))
     width = row["test_threads"].threads if isinstance(row["test_threads"], RequestedTestWidth) else "unknown"
     return progress.profile_key((host, row.get("repo_identity", row["repo"]), row["step"],
@@ -1943,6 +1943,9 @@ def start_spacing_after(now: float, policy: AdmissionPolicy) -> NextStartAt:
     return NextStartAt(now + policy.timing.recovery_start_seconds)
 
 
+BACKGROUND_STEP = "background"
+
+
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    head: QueuedHead | NoQueuedHead, room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
@@ -1963,7 +1966,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     ordinary_owner = waiter_owner(ordinary_row) if not isinstance(ordinary_row, NoWaiter) else ""
     ordinary_need = ordinary_row["need"] if not isinstance(ordinary_row, NoWaiter) else 0
     has_override = not isinstance(inputs.override, NoHeadAdmissionOverride)
-    no_runs = not inputs.reservations and not inputs.slots
+    no_runs = all(row["step"] == BACKGROUND_STEP for row in inputs.reservations) and not inputs.slots
     new_started = False
     protected_extra = 0
     protected_claim: Waiter | NoWaiter = NoWaiter()

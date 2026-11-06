@@ -346,7 +346,7 @@ class MergeGateFixture(unittest.TestCase):
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
             "MERGE_GATE_PASSED_DIR": str(self.state / "passes"),
             "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
-            "BUILDLOG_SCOPE": "0",
+            "BUILDLOG_SCOPE": "0", "BUILDLOG_QUEUE_RESERVATION": "",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),

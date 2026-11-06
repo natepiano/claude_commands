@@ -256,7 +256,7 @@ def anonymous_history_rows(path: Path) -> Iterator[dict[str, object]]:
 def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
                           first_peak_bytes: int) -> MeasuredProgramPeak | FirstProgramPeak:
     """Read one program's peak history, without using cargo estimates."""
-    if program == "merge-gate":
+    if program in ("merge-gate", "full-tests"):
         return FirstProgramPeak(first_peak_bytes)
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []

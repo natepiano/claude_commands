@@ -340,8 +340,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0),
                         max((len(str(age(row.started_at, explanation.now))) for row in running if row.started_at), default=0))
     step_width = max(7, min(13, max(
-        max((terminal_width(row.step.step) for row in running), default=7),
-        max((terminal_width(step.step) for step in waiting), default=7))))
+        max((terminal_width(queue_evidence.step_text(row.step.step)) for row in running), default=7),
+        max((terminal_width(queue_evidence.step_text(step.step)) for step in waiting), default=7))))
     pids = [queue_evidence.step_pid_text(step) for step in waiting]
     running_pids = [queue_evidence.step_pid_text(row.step) for row in running]
     pid_width = max((len(text) for text in [*pids, *running_pids]), default=5)
@@ -426,13 +426,13 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         held_end = used + row.kept / gate.GIB
         bar = running_bar(min(used, bar_width), min(held_end, bar_width), cap)
         minutes = str(age(row.started_at, explanation.now)) if row.started_at else "—"
-        append_row((*identity_columns("run", row.step.step, pair, minutes,
+        append_row((*identity_columns("run", queue_evidence.step_text(row.step.step), pair, minutes,
                                         "▸" if (you and row.step.session_id == you
                                                 or selector and running_matches_selector(row.step, selector, model.labels)) else " "),
                       Span(column(running_pids[index], pid_width), "inactive"),
                       *bar, Span(text)))
     for index, (step, pair, bar, suffix) in enumerate(zip(waiting, waiting_names, bars, waiting_status)):
-        row = (*identity_columns(str(index + 1), step.step, pair, str(age(step.since, explanation.now)),
+        row = (*identity_columns(str(index + 1), queue_evidence.step_text(step.step), pair, str(age(step.since, explanation.now)),
                                 "▸" if you and step.session_id == you else " "),
                Span(column(pids[index], pid_width), "inactive"), Span(bar[:bar_width], "warning"), Span(f" {step.need / gate.GIB:.1f}", "warning" if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else "inactive"))
         append_row((*row, *suffix))

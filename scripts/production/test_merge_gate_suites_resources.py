@@ -12,6 +12,7 @@ import stat
 from pathlib import Path
 import resource
 import signal
+import socket
 import sys
 import time
 from typing import final
@@ -55,6 +56,39 @@ from scripts.lib import copy_record, scratch
 
 @final
 class MergeGateResourcesTests(GateSuitesFixture):
+    def inherited_module(self) -> tuple[merge_gate.RunningGateJob, int]:
+        ready = self.state / "inherited-module-pid"
+        source = ("import os,signal,sys; from pathlib import Path; "
+                  + "Path(sys.argv[1]).write_text(str(os.getpid())); signal.pause()")
+        environment = {**self.environment, "BUILDLOG_QUEUE_RESERVATION": "private-outer-reservation",
+                       "BUILDLOG_SCOPE": "0"}
+        job = merge_gate.start_gate_job(
+            "hooks", Path("test_inherited.py"),
+            [*queue_place.scope_entry_prefix(), sys.executable, "-c", source, str(ready)],
+            self.checkout, environment, self.state / "inherited-module.log")
+        self.addCleanup(job.output.close)
+        self.addCleanup(merge_gate.kill_job_group, job)
+        wait_for_file(ready)
+        module_pid = int(ready.read_text())
+        # This cleanup also stops the child when the old holder behavior fails.
+        def stop_module() -> None:
+            try:
+                os.kill(module_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(stop_module)
+        return job, module_pid
+
+    def test_inherited_reservation_keeps_the_module_pid_as_the_job_pid(self) -> None:
+        job, module_pid = self.inherited_module()
+        self.assertEqual(module_pid, job.process.pid)
+
+    def test_gate_group_kill_stops_the_module_with_an_inherited_reservation(self) -> None:
+        job, module_pid = self.inherited_module()
+        merge_gate.kill_job_group(job)
+        self.assert_process_stopped(module_pid)
+        self.assertEqual(job.process.returncode, -signal.SIGKILL)
+
     def test_interrupt_after_reaping_preserves_status_and_cpu_and_allows_cleanup(self) -> None:
         jobs: list[merge_gate.RunningGateJob] = []
         for name, source in (("finished", "raise SystemExit(7)"),
@@ -362,6 +396,30 @@ class MergeGateResourcesTests(GateSuitesFixture):
         cpu_path = self.state / "runner" / "module_cpu_seconds.json"
         merge_gate.save_measures(cpu_path, {"hooks/test_first.py": 12.0})
         self.environment["BUILDLOG_SCOPE"] = "1"
+        runtime = self.root / "scope-runtime"
+        (runtime / "systemd").mkdir(parents=True)
+        manager = self.enterContext(socket.socket(socket.AF_UNIX))
+        manager.bind(str(runtime / "systemd/private"))
+        self.environment["XDG_RUNTIME_DIR"] = str(runtime)
+        entry = self.root / "outside-scope-entry.py"
+        # The outer test runner can already occupy builds.slice.
+        # Give the child the same outside-scope input that this test requires.
+        self.write(entry, """import runpy, sys
+from pathlib import Path
+from unittest.mock import patch
+read_text = Path.read_text
+
+def outside_scope(path, *args, **kwargs):
+    if str(path) == "/proc/self/cgroup":
+        return "0::/private-test.scope\\n"
+    return read_text(path, *args, **kwargs)
+
+sys.argv = sys.argv[1:]
+with patch.object(Path, "read_text", outside_scope):
+    runpy.run_path(sys.argv[0], run_name="__main__")
+""")
+        entry_prefix = [sys.executable, str(entry), str(Path(queue_place.__file__).resolve()),
+                        "--scope-optional", "--"]
         output = io.StringIO()
         monotonic = time.monotonic
         deadline = monotonic() + TEST_HANG_GUARD_SECS
@@ -384,7 +442,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
             kill(job)
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(queue_place, "in_builds_slice", return_value=False), \
+                mock.patch.object(queue_place, "scope_entry_prefix", return_value=entry_prefix), \
                 mock.patch("scripts.production.merge_gate.time.monotonic", side_effect=module_clock), \
                 mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample), \
                 mock.patch.object(merge_gate, "kill_job_group", side_effect=kill_module), redirect_stdout(output):

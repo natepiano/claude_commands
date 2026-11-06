@@ -228,7 +228,7 @@ Queue views continue to use the service.
 ### Queue lifecycle and calibration
 
 The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
-The same record holds Cargo steps and `merge-gate` steps.
+The same record holds Cargo steps, `merge-gate` steps, and `full-tests` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
@@ -284,8 +284,11 @@ It preserves the first `since` and episode across refreshes and reconnects.
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
 The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+A `--tests-only` run uses `full-tests`, shown as "full tests", with `program_first_peak_gib.full-tests=4`.
+Both kinds use the configured first need instead of anonymous peak history.
+Their progress profiles remain separate. Each kind separates test-only profiles from profiles with types.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the look-ahead window.
-The merge-gate progress profile key includes `shape` (`tests` or `types`).
+The progress profile key for each gate kind includes `shape` (`tests` or `types`).
 Earlier profiles do not match, and nightly runs use separate profiles.
 It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
 The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
@@ -481,10 +484,57 @@ Exit 3 still means the caller is not a mesh worker; only that exit permits attac
 Stored `Admitted` replies without cleanup timing receive `PROTOCOL_CLEANUP_TIMING` before strict parsing.
 Existing stored timing and valid shell timing retain their values.
 The hook runs before each attempt and after a grant. An exception after a grant returns the reservation before program startup.
-`popen` starts the program in its own scope, nested when the holder already runs in `builds.slice`.
-Without a scope, it raises `QueuePlaceRefused` before the fork.
-Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
-`finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
+`queue_place.py` is the only entry point that creates `builds.slice` scopes.
+`mesh_runs.py`, merge-gate modules, `lint/invoke.sh`, and the Cargo wrapper call this entry point.
+Batch program places ask the queue before execution.
+Editor servers retain immediate startup without a batch reservation.
+Their measured scopes count once against later builds.
+Exact rust-analyzer probes create neither a reservation nor a scope.
+A small run starts immediately when the admission rules permit it.
+Other runs wait in the same queue.
+Generic commands without a named first peak use `program_first_peak_gib.background` through the scope entry point.
+Their queue step and history key are `background`.
+Their memory counts in room, but their reservations do not prevent an oversized head from starting alone.
+A held slot or a non-background reservation still prevents that start.
+Background reservations never set `BUILDLOG_QUEUE_RESERVATION` and never cover children.
+Inner verify steps, Cargo builds, and gates request their own need and publish their own sidecar.
+Only a configured program need or an explicit invoke step reservation covers children.
+`verify.sh` passes `--supervisor` to `mesh_runs.py start`.
+That supervisor stays outside `builds.slice` without a reservation.
+Its steps still create their scopes through `invoke.sh`.
+Explicit program places still require their configured first peak.
+
+`BUILDLOG_QUEUE_RESERVATION` identifies the outer reservation for nested calls.
+Nested places retain this charge and never release it.
+The CLI replaces itself with a nested program before it loads admission code.
+The nested program keeps the caller's PID and process group.
+The gate samples, signals, and reaps that same PID.
+Nested shell clients return permission with no owned reservation.
+A process already in `builds.slice` starts no second scope.
+Its place tracks only its own descendants for cleanup.
+The gate measures module memory and publishes the outer reservation's samples.
+Full tests share the runner's temporary-folder prefixes and retain their separate queue and history identity.
+
+`popen` requires a scope unless the caller selects `scope_optional` or `BUILDLOG_SCOPE=0`.
+The scope entry point permits direct execution when the user manager is unavailable.
+With `scope_optional`, a scope failure before program execution also permits one plain execution.
+Admission still precedes execution through that entry point.
+A command never retries through a direct path after an admission refusal.
+`finish()` stops owned descendants before release.
+For a scope, it sends TERM and then uses `cgroup.kill` after `program_stop_seconds`.
+A non-nested CLI retains its holder and keeps the program in the caller's process group.
+A group SIGKILL stops the holder, the program, and descendants that remain in that group.
+An unscoped CLI holder becomes a child subreaper on Linux before it starts the program.
+The holder tracks adopted children in its group with start times at or after the program's start time.
+It excludes older children and processes whose parent is not the holder, unless a sample already observed them as descendants.
+A descendant that moves to its own session between samples is not stopped.
+Other `popen` callers retain a separate session.
+TERM makes the holder stop its program before release.
+On Linux, the program also receives SIGKILL if its CLI holder dies.
+A holder-only SIGKILL can leave descendants alive. The parent-death signal reaches only the direct program.
+The entry restores the reservation marker even when `finish()` fails.
+A failed `finish()` prevents release, so the service retains its existing owner-exit cleanup.
+In-process places retain their existing owner-death accounting.
 The scoped wrapper requires a published sidecar and a live holder before program execution.
 
 ### Startup, cut-over, and rollback
@@ -533,7 +583,14 @@ The next cut-over imports the polling checker's current priority because the ret
 
 ### Cargo wrapper (natedev only)
 
-`scripts/build_hold/cargo` puts building cargo commands from shells, scripts and TUIs in a `builds.slice` scope. This includes `cargo mend`, which builds the workspace. It finds the first other cargo on PATH, keeps its arguments and exit status, and passes non-building commands such as `metadata`, `fmt` and `tree` through at once. A call already in `builds.slice` skips the hold check and a second scope. Other building calls check `hold_applies.py` when the hold directory has an entry: an applicable hold refuses the command; unreadable state prints a note and allows it. An empty hold directory starts no Python. Without a user bus or `systemd-run`, cargo runs directly.
+`scripts/build_hold/cargo` routes building Cargo commands through `queue_place.py` before scope startup.
+This includes `cargo mend`.
+The wrapper retains the command arguments and exit status.
+Non-building commands, including `metadata`, `fmt`, and `tree`, run directly.
+A call with an inherited reservation inside `builds.slice` starts no second scope or reservation.
+Other building calls retain the existing hold check before queue admission.
+Without a user bus or `systemd-run`, Cargo retains direct execution.
+
 
 Install on natedev from the repo root with `scripts/build_hold/install_cargo_wrapper.sh`. It links `~/.local/bin/cargo` to the wrapper and refuses to replace another file. `~/.local/bin` must precede `~/.cargo/bin` on PATH. On macOS, the installer makes no link and the wrapper calls cargo directly. Tests use `BUILD_HOLD_DIR`, `CARGO_WRAPPER_CGROUP_FILE` and `XDG_RUNTIME_DIR` to select temporary state.
 

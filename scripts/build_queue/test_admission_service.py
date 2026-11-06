@@ -344,6 +344,60 @@ class OutageClaimTests(unittest.TestCase):
 
 
 class ProgressProfileServiceTests(unittest.TestCase):
+    @staticmethod
+    def gate_request(fixture: AdmissionFixture, step: str, *, types: bool = False,
+                     worktree: str = "first-copy") -> wire.AdmitRequest:
+        owner = fixture.proc.spawn()
+        sidecar = fixture.scope(owner, folder=f"profile-{owner.pid}",
+                                current=GIB, anonymous=GIB)
+        request = fixture.request(owner=owner, step=step, need=4 * GIB)
+        return replace(request, argv=(step, "--type-dirs", "scripts") if types else (step,),
+                       sidecar=str(sidecar), profile=replace(request.profile, worktree=worktree))
+
+    def record_gate_profile(self, fixture: AdmissionFixture, step: str) -> None:
+        request = self.gate_request(fixture, step)
+        grant = only_admitted(fixture.server.handle_request(request))
+        for done in range(0, 101, 5):
+            progress.publish_counter(Path(request.sidecar), progress.ProgressCounter("suites:1", done, 100))
+            _ = fixture.run_pass()
+        fixture.release(grant)
+        fixture.allow_next_start()
+
+    def test_a_merge_gate_profile_does_not_reduce_a_full_tests_run(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            self.record_gate_profile(fixture, "merge-gate")
+            request = self.gate_request(fixture, "full-tests")
+            grant = only_admitted(fixture.server.handle_request(request))
+            progress.publish_counter(Path(request.sidecar), progress.ProgressCounter("suites:1", 80, 100))
+            _ = fixture.run_pass()
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, gate.QueueInputs)
+            room = gate.inputs_room(inputs, admission_policy_fixture())
+            assert isinstance(room, gate.MemoryRoom)
+            held, = room.runs
+            self.assertEqual(held.memory.need, 4 * GIB)
+            self.assertEqual(held.bytes, 3 * GIB)
+            fixture.release(grant)
+
+    def test_full_tests_profiles_share_copies_and_separate_type_jobs(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            self.record_gate_profile(fixture, "full-tests")
+            for types, expected_need in ((False, GIB), (True, 4 * GIB)):
+                with self.subTest(types=types):
+                    request = self.gate_request(fixture, "full-tests", types=types, worktree="another-copy")
+                    grant = only_admitted(fixture.server.handle_request(request))
+                    progress.publish_counter(Path(request.sidecar), progress.ProgressCounter("suites:1", 80, 100))
+                    _ = fixture.run_pass()
+                    inputs = fixture.server.last_inputs
+                    assert isinstance(inputs, gate.QueueInputs)
+                    room = gate.inputs_room(inputs, admission_policy_fixture())
+                    assert isinstance(room, gate.MemoryRoom)
+                    held, = room.runs
+                    self.assertEqual(held.memory.need, expected_need)
+                    self.assertEqual(held.bytes, expected_need - GIB)
+                    fixture.release(grant)
+                    fixture.allow_next_start()
+
     def test_a_version_four_snapshot_is_rejected_until_a_new_pass_publishes_current_evidence(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
             _ = fixture.run_pass()

@@ -511,7 +511,7 @@ only I can bump
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `commands/build/queue.md`, `scripts/build_queue/build_queue.py` and the view code that only it uses; `test` owns `scripts/build_queue/test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
 
-### Phase 10v — Every run in builds.slice asks the queue before it starts  · status: todo
+### Phase 10v — Every run in builds.slice asks the queue before it starts  · status: done
 
 **Depends on:** 10z and 10x (same admission files; 10v's code starts after 10x is checkpointed).
 

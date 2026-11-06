@@ -728,14 +728,29 @@ sys.exit(1)
             with socket.socket(socket.AF_UNIX) as manager:
                 manager.bind(str(runtime / "systemd" / "private"))
                 prefix = mesh_runs.scope_prefix(marker, on)
+                self.assertEqual(mesh_runs.scope_prefix(marker, on, supervisor=True), [])
                 self.assertEqual(mesh_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
-        self.assertEqual(prefix[:2], ["systemd-run", "--user"])
-        self.assertIn("--slice=builds.slice", prefix)
+        self.assertEqual(prefix[:4], [sys.executable,
+            str(Path(mesh_runs.__file__).resolve().parents[1] / "build_queue/queue_place.py"),
+            "--scope-optional", "--"])
         self.assertEqual(prefix[-4:], ["/bin/sh", "-c", mesh_runs.SCOPE_SCRIPT, str(marker)])
         with patch("shutil.which", return_value=None):
             self.assertEqual(mesh_runs.scope_prefix(marker, on), [])
 
-    def test_a_scope_runs_the_command_once_and_a_failed_scope_runs_it_plainly(self) -> None:
+    def test_supervisor_executes_without_an_entry_and_keeps_scope_enabled_for_children(self) -> None:
+        environment = self.root / "supervisor-environment"
+        command = [sys.executable, "-c",
+                   "import os,sys; from pathlib import Path; "
+                   + "Path(sys.argv[1]).write_text(os.environ.get('BUILDLOG_SCOPE', '1'))", str(environment)]
+        path = self.record(command)
+        with patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
+             patch.object(subprocess, "Popen", wraps=subprocess.Popen) as run:
+            self.assertEqual(mesh_runs.main(["supervise", str(path), "--supervisor"]), 0)
+        self.assertEqual(run.call_args.args[0], command)
+        self.assertEqual(environment.read_text(), "1")
+        self.assertNotIn("supervisor", cast(dict[str, object], json.loads(path.read_text())))
+
+    def test_a_scope_runs_once_and_a_failed_entry_does_not_run_the_command(self) -> None:
         count = self.root / "count"
         command = ["/bin/sh", "-c", f'echo run >> "{count}"']
         scope = self.session / codex_mesh.DETACHED_RUNS_DIR / "r1.scope"
@@ -749,7 +764,8 @@ sys.exit(1)
         # A scope that fails before the command starts leaves no marker.
         with patch.object(mesh_runs, "scope_prefix", return_value=["/bin/sh", "-c", "exit 1", "scope"]):
             record = self.supervise(self.record(command))
-        self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
+        self.assertEqual(record.get("exit_code"), 1)
+        self.assertFalse(count.exists())
 
     def test_failure_and_done_message_rules(self) -> None:
         path = self.record([sys.executable, "-c", "raise SystemExit(4)"])

@@ -113,8 +113,17 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.
 - Before any job starts it refuses (and the merge rolls back) if a `--type-dirs` path is absent from the checkout, the test list is empty, or `/dev/shm` is not writable.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
-- **Shared admission.** After the build hold ends, `gate_reservation` obtains one `merge-gate` reservation through `queue_place`.
-  It reads `program_first_peak_gib.merge-gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
+- **Shared admission.** After the build hold ends, `gate_reservation` obtains one reservation through `queue_place`.
+  A `--tests-only` command uses `full-tests`, shown as "full tests".
+  Merge and nightly commands retain `merge-gate`.
+  A wrapper with a configured program need supplies its existing reservation.
+  A `background` wrapper never covers the gate.
+  The gate then requests its own need and publishes progress through its own sidecar.
+  This rule also applies to `python3 -m scripts.production.merge_gate --tests-only`.
+  `verify.sh` uses `mesh_runs.py start --supervisor`, outside `builds.slice` and without a reservation.
+  It reads `program_first_peak_gib.merge-gate` or `program_first_peak_gib.full-tests` at use.
+  Both settings start at 4 GiB. Each kind has a separate progress profile.
+  A profile for one kind never sizes the other kind.
   The gate uses the first peak as its full need.
   A matching anonymous profile uses the progress window after admission.
   A missing or legacy profile keeps the full need.
@@ -125,7 +134,14 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
   Release writes the gate's `merge-gate` history row for reports.
   Admission does not use that history to size the gate.
 - **Shared CPU slots.** Every module and the `types` job takes one byte from `/dev/steve` before launch and returns that byte after its process group ends, including on a failure, kill or interruption. The pool accepts a FIFO or a character device, including steve's CUSE device. The launch loop checks readiness with a zero timeout before a non-blocking read, so a token wait still samples memory, reaps jobs and checks holds. An absent pool keeps the existing behavior; `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests. Launch and cleanup registration defer cancellation together; the child restores its signal mask before exec. The per-gate job limit still applies. Admission and token waits stay inside the checkout's shared busy lock. Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
-- **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
+- **CPU scope.** Each module enters through `queue_place.py` and retains the gate's outer reservation.
+  The entry point creates the `builds.slice` scope after admission.
+  A nested caller already in that slice starts no second scope.
+  The gate retains process groups, memory sampling, and module cleanup.
+  `BUILDLOG_SCOPE=0` disables scope creation.
+  An unavailable user manager permits direct execution after admission.
+  A scope failure before module execution permits one plain execution after admission.
+  A refusal never retries the module without admission.
 - Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*`; its output is read and its temp root is removed when the job ends.
 - Each test module gets a fresh `BUILDLOG_DIR` inside its temp root, so its log rows cannot reach the real build log.
 - Each test module starts with tripwires for `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH: any call, including lookup commands, exits 99 and fails the module with the tool and arguments; a module can put its own stubs first. Each module also gets a private `BUILDLOG_LIVE_MEMORY_TRIPWIRE` record path: a recorded read of `/proc/meminfo` or `/proc/pressure/memory` fails the module with `a test read live memory`, the path and the arguments, even if its tests pass. Neither kind of tripwire failure runs again, including after a signal during a natedev hold. An incomplete or invalid memory record also fails the module and prints `a test read live memory (unreadable record):` with the raw line. The types job gets no live memory tripwire.

@@ -13,6 +13,11 @@ from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
 
+def step_text(step: str) -> str:
+    """Keep the recorded kind and show its public name."""
+    return "full tests" if step == "full-tests" else step
+
+
 def step_labels(step: gate.WaitingStep | gate.RunningStep,
                 labels: Mapping[str, unit_labels.UnitLabels]) -> unit_labels.UnitLabels:
     identity = labels.get(step.session_id)
@@ -234,7 +239,7 @@ def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExpl
         observed = memory.peak_history
         phase = (f"; tests started: need {gib(gate.test_phase_charge(observed))} "
                  f"(test peak {gib(observed.peak_so_far)}, history {gib(observed.need.bytes)} x {observed.need.margin:g})")
-    return (f"{step_pid_text(running.step)} · {identity.showrunner} / {identity.unit} / {identity.session}, {running.step.step}: {started}; "
+    return (f"{step_pid_text(running.step)} · {identity.showrunner} / {identity.unit} / {identity.session}, {step_text(running.step.step)}: {started}; "
             + evidence + phase + swap)
 
 

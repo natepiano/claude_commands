@@ -93,12 +93,9 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-# On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
-# places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
-# Worker cargo builds ran at the panes' weight in herdr-agents.service (2026-10-20). The scope
-# writes the marker just before the command starts; a marker missing after the scope exits proves
-# the scope never ran it (no user manager, a systemd that rejects an option), so the command runs
-# plainly. BUILDLOG_SCOPE=0 turns the scope off, as it does for invoke.sh.
+# The shared entry point asks the queue before it starts a build scope.
+# The command writes its marker after admission. A refusal never runs it again.
+# BUILDLOG_SCOPE=0 keeps the existing direct execution path.
 SCOPE_SCRIPT = ': > "$0" || exit 125; exec "$@"'
 
 
@@ -394,7 +391,8 @@ def command_start(args: argparse.Namespace) -> int:
         _write_record(record_path, record)
         with log_path.open("ab") as log:
             supervisor = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "supervise", str(record_path)],
+                [sys.executable, str(Path(__file__).resolve()), "supervise", str(record_path),
+                 *(["--supervisor"] if bool(getattr(args, "supervisor", False)) else [])],
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True, cwd=cwd,
             )
@@ -579,14 +577,16 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
     return f"held for {name}'s next dispatch: no director was found"
 
 
-def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
+def scope_prefix(marker: Path, environment: dict[str, str], *, supervisor: bool = False) -> list[str]:
     """The argv that runs a command in a builds.slice scope, or nothing where no scope is possible."""
+    if supervisor:
+        return []
     runtime = environment.get("XDG_RUNTIME_DIR", "")
     if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
             or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
         return []
-    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-            "--slice=builds.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
+    from scripts.build_queue.queue_place import scope_entry_prefix
+    return [*scope_entry_prefix(), "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
 def _run(command: list[str], cwd: str, environment: dict[str, str], log: Path) -> int:
@@ -625,11 +625,9 @@ def command_supervise(args: argparse.Namespace) -> int:
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
-    prefix = scope_prefix(marker, environment)
+    prefix = scope_prefix(marker, environment, supervisor=bool(getattr(args, "supervisor", False)))
     cwd = str(session_staff.worker_directory(staff.local_snapshot(), staff.StaffId(record["staff_id"])))
     exit_code = _run(prefix + record["command"], cwd, environment, log)
-    if prefix and not marker.exists():
-        exit_code = _run(record["command"], cwd, environment, log)
     marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.
@@ -656,12 +654,14 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--session-dir", default="")
     _ = start.add_argument("--to", default="")
     _ = start.add_argument("--director-dir", default="", help="the run folder whose director hears results")
+    _ = start.add_argument("--supervisor", action="store_true", help="keep the supervisor outside builds.slice")
     _ = start.add_argument("--label", default="")
     _ = start.add_argument("--done-message-file", default="")
     _ = start.add_argument("command", nargs=argparse.REMAINDER)
     start.set_defaults(handler=command_start)
     supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")
     _ = supervise.add_argument("record")
+    _ = supervise.add_argument("--supervisor", action="store_true")
     supervise.set_defaults(handler=command_supervise)
     reap = verbs.add_parser("reap", help="end the running records whose supervisor is gone")
     _ = reap.add_argument("--session-dir", required=True)
