@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
+from threading import Event
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -294,17 +296,13 @@ def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr)
                 continue
             try:
                 activity = client.pane_activity(identity)
-                if isinstance(activity, herdr.PaneAtShell) and not scan.unknown:
+                if isinstance(activity, herdr.PaneAtShell):
                     states.append(StoppedWorker(row, identity, terminal))
-                elif isinstance(activity, herdr.PaneRunning):
-                    states.append(_uncertain(row, "labelled recovery pane runs other work"))
                 else:
-                    states.append(ProcessUnknownWorker(row, identity, terminal, "no stopped native session proof"))
+                    states.append(_uncertain(row, "labelled recovery pane runs other work"))
             except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: {row.name}: {error}", file=sys.stderr)
                 states.append(ProcessUnknownWorker(row, identity, terminal, str(error)))
-        elif scan.unknown:
-            states.append(_uncertain(row, "pane evidence is incomplete; absence is unproved"))
         else:
             states.append(ClosedWorker(row))
     return PaneEvidence(panes, scan, states)
@@ -424,20 +422,26 @@ def launch_policy(role: WorkerRole) -> LaunchPolicy:
     return LaunchPolicy(settings, sandbox, permission)
 
 
-def launch_arguments(policy: LaunchPolicy, identity: str) -> list[str]:
+def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     settings = policy.settings
     if settings.kind == "codex":
-        arguments = ["resume", identity] if identity else []
-        arguments += ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
+        arguments = ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
                       "-c", f'model_reasoning_effort="{settings.effort}"']
         if settings.service_tier:
             arguments += ["-c", f'service_tier="{settings.service_tier}"']
         return arguments
-    arguments = ["--resume", identity] if identity else []
-    arguments += ["--model", settings.model, "--permission-mode", policy.permission]
+    arguments = ["--model", settings.model, "--permission-mode", policy.permission]
     if settings.effort and settings.effort != "unset":
         arguments += ["--effort", settings.effort]
     return arguments
+
+
+def launch_arguments(policy: LaunchPolicy, identity: str) -> list[str]:
+    if policy.settings.kind == "codex":
+        launch = (["resume", identity] if identity else []) + ["--no-daemon"]
+    else:
+        launch = ["--resume", identity] if identity else []
+    return launch + _policy_arguments(policy)
 
 
 def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | DestinationWorkerAccount,
@@ -473,7 +477,7 @@ def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, 
         candidates = [args for args in arguments if any(Path(arg).name in ("codex", "claude") for arg in args)]
         if len(candidates) != 1:
             return _uncertain(worker.row, "running launch policy is unproved")
-        expected = launch_arguments(policy, "")
+        expected = _policy_arguments(policy)
         actual = candidates[0]
         required = ("--model", "--sandbox", "--ask-for-approval") if policy.settings.kind == "codex" else ("--model", "--permission-mode")
         if any(flag not in actual for flag in required):
@@ -504,8 +508,6 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
         if not isinstance(client.pane_activity(_text(pane, "pane_id")), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "labelled recovery pane is live")
         return herdr.ExistingPane(_text(pane, "pane_id"), _text(pane, "terminal_id"))
-    if evidence.scan.unknown:
-        return _uncertain(parent, "pane evidence is incomplete; new split retained")
     ratio = conf.read("direct").number("WORKER_SPLIT_RATIO")
     workers = {item.pane for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
                and any(_text(pane, "pane_id") == item.pane and _text(pane, "tab_id") == tab for pane in evidence.panes)}
@@ -558,6 +560,34 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
         return AdmissionRefused(str(error))
 
 
+def first_turn_session(client: herdr.Herdr, pane: str, terminal: str) -> str:
+    """Finish the first Codex turn before reading its session report."""
+    settings = conf.read("direct")
+    text = settings.text("WORKER_FIRST_TURN_TEXT")
+    seconds = settings.number("WORKER_FIRST_TURN_SECONDS")
+    deadline = time.monotonic() + seconds
+    client.prompt_terminal(pane, terminal, text)
+    if isinstance(client.wait_until(pane, "done", int(seconds * 1000)), herdr.WaitTimedOut):
+        raise herdr.HerdrFailure("first turn timed out; pane retained")
+    failure = "first turn timed out"
+    while time.monotonic() < deadline:
+        try:
+            return client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
+        except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            failure = str(error)
+        _ = Event().wait(max(0, min(0.1, deadline - time.monotonic())))
+    raise herdr.HerdrFailure(f"{failure}; pane retained")
+
+
+def _codex_start_session(client: herdr.Herdr, pane: str) -> str:
+    row = client.pane_row(pane)
+    if isinstance(row, herdr.NoPane):
+        raise herdr.HerdrFailure("Codex pane is missing; pane retained")
+    if row.get("session_id"):
+        return client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
+    return first_turn_session(client, pane, row.get("terminal_id", ""))
+
+
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold) -> WorkerStart:
@@ -579,17 +609,25 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             pane = retained[0]
             identity = _text(pane, "pane_id")
             unknown = next((item for item in evidence.scan.unknown if item.pane == identity), None)
-            if unknown is not None:
-                return ProcessUnknownWorker(owner, identity, _text(pane, "terminal_id"), unknown.reason)
             claimed = [key for key, found in evidence.scan.found.items() if pane in found]
             if claimed:
                 return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "labelled recovery pane holds another live staff session")
-            if not isinstance(client.pane_activity(identity), herdr.PaneAtShell):
+            try:
+                activity = client.pane_activity(identity)
+                if unknown is not None:
+                    info = herdr.json_object(client.result("pane", "process-info", "--pane", identity).get("process_info"),
+                                             "recovery process info")
+                    if not (policy.settings.kind == "codex" and herdr.codex_without_session(info)):
+                        return ProcessUnknownWorker(owner, identity, _text(pane, "terminal_id"), unknown.reason)
+            except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                return ProcessUnknownWorker(owner, identity, _text(pane, "terminal_id"), str(error))
+            if not isinstance(activity, herdr.PaneAtShell):
                 try:
-                    native = client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+                    native = (_codex_start_session(client, identity) if policy.settings.kind == "codex" else
+                              client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS))
                     row = worker_admission.publish(allowed, native).row
                     lock.bind(row)
-                except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError) as error:
+                except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     return UnpublishedWorker(identity, str(error))
                 recovered = _evidence(owner.id, staff.snapshot(), client)
                 state = next((item for item in recovered.states if item.row.id == row.id), None)
@@ -610,6 +648,10 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
+    try:
+        start_seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
+    except conf.Unusable as error:
+        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     environment = launch_environment(policy, account, row is not None)
     if isinstance(environment, StartRefused):
         return environment
@@ -647,17 +689,22 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     try:
         launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
             launch_arguments(policy, str(row.current_session) if row else ""), herdr.NoOpeningPrompt(),
-            int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000), agent=name.value)
+            int(start_seconds * 1000), agent=name.value)
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
     try:
-        identity = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
+        if row is None and policy.settings.kind == "codex":
+            if isinstance(launched.outcome, herdr.PromptNotSubmitted):
+                return UnpublishedWorker(launched.pane, launched.outcome.reason)
+            identity = _codex_start_session(client, launched.pane)
+        else:
+            identity = client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
         if row is not None and identity != row.current_session:
             return _uncertain(row, "launch proves another native session; pane retained")
         if row is None:
             row = worker_admission.publish(allowed, identity).row
             lock.bind(row)
-    except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError) as error:
+    except (worker_admission.AdmissionRefused, herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return (_uncertain(row, f"launch proof is incomplete: {error}") if row is not None
                 else UnpublishedWorker(launched.pane, str(error)))
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):

@@ -133,7 +133,7 @@ def open(label: str, *, question: str = "", cwd: Path | str = ".") -> SidePane:
         destination = herdr.SplitPane(caller.pane, "right", ratio, label)
     launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
         worker_panes.launch_arguments(policy, ""), herdr.NoOpeningPrompt(),
-        int(config.number("SIDE_PANE_OPEN_SECONDS") * 1000), agent=label)
+        int(config.number("PANE_AGENT_START_SECONDS") * 1000), agent=label)
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return _note(client, launched.pane, launched.outcome.reason)
     fresh = client.panes()

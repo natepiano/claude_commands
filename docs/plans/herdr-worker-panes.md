@@ -2555,6 +2555,26 @@ Keep complete move messages unchanged; test account-move recovery before publica
 
 **Ruled out:** Astra roles in `side_pane`, and a pane for an ad hoc Astra review, until the reply wait and close exist (sdlc); a native identity for a friend; a composer check before a friend's opening question.
 
+### Phase 12a — A process that exits during the worker scan drops out  · status: done
+
+**Depends on:** none
+
+**Spec:** sdlc [36919f96]: a defect here reds merge gates, so this small fix goes ahead of Phase 14a, built from sdlc faf2a074d. A Codex process that exits during the `staff_sources` scan leaves the scan. A process counts as exited when a new process table no longer lists its pid. A live process with an unreadable environment still marks the scan incomplete. The `test_remove_workers` fixture does not read the host's processes.
+
+**Files:** `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py`, `scripts/direct/test_remove_workers.py`.
+
+**Acceptance gate:** `test_staff_sources` proves both results of the scan; `test_remove_workers` runs with an empty process table; the production, direct, shutdown and message suites pass.
+
+### Phase 12b — One run with an unreadable owner does not stop worker removal  · status: done
+
+**Depends on:** Phase 12a
+
+**Spec:** sdlc [32b50fe2], defect from builds: `StaffUnreadable` is an `OSError`, and `remove_workers.removal_targets` catches only `ValueError`. One run whose owner row cannot be read stops the whole removal. Under "report anomalies, never block", that run prints one anomaly line and the removal goes on.
+
+**Files:** `scripts/direct/remove_workers.py`, `scripts/direct/test_remove_workers.py`.
+
+**Acceptance gate:** a test proves that a run with an unreadable owner prints its anomaly line, and that the workers of another run are removed. The direct suite passes.
+
 ### Phase 13 — Displays read workers through observe  · status: moved: hierarchies-unit (sdlc, 2026-11-05)
 
 **Depends on:** Phase 7, Phase 8, Phase 9. Shared gate with Phases 10/12/13 over the exact final batch.
@@ -2683,7 +2703,7 @@ Run the shared Phase 11/14 text-and-code gate.
 Regenerate changed command mirrors through `scripts/claude_to_codex/sync.py`.
 No Python or new rerun test is required for this text phase.
 
-### Phase 14a — A fresh Codex pane worker publishes from its session report  · status: todo
+### Phase 14a — A fresh Codex pane worker publishes from its session report  · status: done
 
 **Depends on:** Phase 7, Phase 8, Phase 12
 

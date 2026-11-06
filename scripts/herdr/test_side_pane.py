@@ -45,7 +45,7 @@ class SidePaneTests(StaffTestCase):
         self.caller_id = fixture_runtime_id("ad-hoc-caller")
         config = self.root / "conf"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n# range: 1..600\nSIDE_PANE_OPEN_SECONDS=90\n")
+        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "state"), "CONF_DIR": str(config),
@@ -103,7 +103,7 @@ class SidePaneTests(StaffTestCase):
         self.signals.append((pid, number))
         for pane, (agent_pid, _, _) in tuple(self.world.foreground.items()):
             if pid == agent_pid:
-                self.world.stops.append(self.world.processes[pid].current_identity)
+                self.world.stops.append(self.world.processes[pid].identity.id)
                 del self.world.foreground[pane]
 
     def command(self, *arguments: str) -> tuple[int, str, str]:
@@ -351,7 +351,7 @@ class SidePaneTests(StaffTestCase):
         self.assertIn("w1:p0", self.world.locations)
 
     def test_private_configuration_sets_the_split_and_a_dev_shell_environment(self) -> None:
-        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.4\n# range: 1..600\nSIDE_PANE_OPEN_SECONDS=125\n")
+        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.4\n# range: 1..600\nPANE_AGENT_START_SECONDS=125\n")
         environment = {"PRIVATE_DEV_SHELL": "loaded"}
         from scripts.lib import nix_env
 
@@ -373,7 +373,7 @@ class SidePaneTests(StaffTestCase):
         result = self.start()
         path = pane_launch.record_directory() / "agents.json"
         entry: pane_launch.PaneLaunch = {"kind": "codex", "pane_id": result.pane,
-            "session_id": self.world.processes[self.world.foreground[result.pane][0]].current_identity, "config_dir": str(self.root / "codex"),
+            "session_id": self.world.processes[self.world.foreground[result.pane][0]].identity.id, "config_dir": str(self.root / "codex"),
             "cwd": str(self.root), "name": "friend", "model": "fixture", "environment": {},
             "remote_control": False, "flags_read": True, "written_at": "fixture-generation"}
         pane_launch.write(path, entry)
@@ -492,7 +492,7 @@ class SidePaneTests(StaffTestCase):
 
     def test_open_uses_the_configured_ratio_range_and_reads_configuration_once(self) -> None:
         write_text_atomic(self.root / "conf/direct.conf",
-            "# range: 0..1\nWORKER_SPLIT_RATIO=0.95\n# range: 1..600\nSIDE_PANE_OPEN_SECONDS=90\n")
+            "# range: 0..1\nWORKER_SPLIT_RATIO=0.95\n# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         read = conf.read
         with patch.object(conf, "read", wraps=read) as readings:
             friend = self.start()
