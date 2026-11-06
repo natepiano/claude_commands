@@ -303,7 +303,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 4. **Token holder.** In `acquire_token` (`verify.sh:3039`, wait starts near 3072 and 3110) the holder is the board token owner, with kind `slot` and resource `cargo`. Read it in Bash on each pass of the wait loop. Call `wait-holder` only when it changes.
 5. **Build hold.** At `verify.sh:2797` and `:3401`, and in the SSH route (`route_test` at `:2294`, wait at `:2420`; `:3279` copies that body to `route_test_without_renewal`, and `:3280` wraps it with the token renewal), the holder is the hold's holder, with kind `slot` and the held target as the resource.
 6. **Mac busy.** For the Mac-only wait (`phase_wait_start hold "Mac busy"`), the holder is the session that holds the Mac claim, with kind `slot` and resource `mac`. Name it again on each poll.
-7. **Changes.** A changed holder calls `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags. A holder that goes away calls it with no flags. No watcher process runs beside a wait. A change during one blocking wait call shows at the next pass.
+7. **Changes.** A changed holder calls `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags. A holder that goes away calls it with no flags. No watcher process runs beside a wait. A change during one blocking wait call shows at the next pass. A routing pass that tries a reserved target closes its interval, as a refused Mac claim does in item 9, so the next interval's `start-wait` names the current holder; `wait-holder` applies while an interval stays open.
 8. **Recorder failure.** A failed `start-wait` or `wait-holder` prints the existing `NotRecorded` line. It never changes admission or the step's exit. The next `holder` event or pass tries again.
 9. **Queue age.** `mem_wait_s` and the waiting lines count from the first queued time in `BUILDLOG_MEM_WAIT_FIRST_FILE`, normally `$HOLD_WAIT_DIR/first-queued-at` (`verify.sh:1984-1989`). Step setup writes that file before routing, so a memory event never creates it. Each recorder interval runs from its own `first` line to its `done` or `left` line. A rejoin after a refused Mac claim opens a new interval and keeps the first queued time. A first check that admits opens no interval and makes no holder call.
 
@@ -331,6 +331,37 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 - Through the real event pipe, the recorded wait shows: a holder of each kind; a holder change; an explicit absence; a recorder failure and its retry; a rejoin after a refused Mac claim, with a new interval and the same first queued time; and an immediate admission with no interval and no holder call.
 - The recorded wait names the token owner, the hold's holder and the Mac claim's session, and a change on the next pass.
 - `test_verify_step_state.py`, `test_verify_tree_cancel_lint.py`, `test_verify_python_starts`, the verify token, memory-kill and Mac-step suites and `test_verify_lint_local_writes.py` pass.
+- basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
+
+### Phase 8a — Resolve the token holder from recorded identities  · status: todo
+
+**Depends on:** Phase 8.
+
+#### Work Order
+
+**Source:** Phase 8 review findings F009 and F010, routed under the landing rule at repair round 7, with the Astra review of 2026-11-06.
+
+**Goal:** a recorded token wait names the token owner on a current run, for the director and for each worker record form. Phase 8's acceptance line "the recorded wait names the token owner" stays open until this checkpoint: a director-held token and a slot with only a saved worker record do not name a session after Phase 8.
+
+**Spec:**
+
+1. **Run owner.** The `director` token owner and the unit fallback resolve through `unit_runs.run_owner` and the staff record. No production writer creates a `director` file, and `_set_owner` removes the state's `unit` field when it stores `owner_staff_id`. Remove both reads.
+2. **Worker identity.** Read the writers of `locks/cargo.d/holder`, `mesh_roster.json` and `impl_worker_*.json`, and state in the summary which forms they write. Resolve through the recorded `staff_id` and the staff record. An exact mapping wins: a roster key equal to the owner, then an `impl_worker_*` record whose `slot` or file stem equals the owner, then a roster entry whose `slot` equals the owner. Keep a `-<owner>` suffix match only if a production writer needs it; `fixture-first` in `verify_token_wait_test_support.py` is test setup, not that evidence. More than one match at one step gives no session.
+3. **Occupied slot, no answer.** A lookup that finds no holder for an occupied slot records no holder and tries again on the next pass. An absent holder and the slot `unknown` need no lookup. A steady named token wait starts no process.
+
+**Files:**
+- `scripts/direct/verify.sh` — the token branch of `phase_wait_holder_flags`, and `phase_wait_start`.
+- `scripts/direct/test_verify_wait_holder.py`.
+
+**Workers:** 1 integration writer + 1 tester.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- The constraints in Phase 8 apply. Token ownership and the step token boundary stay as they are.
+
+**Acceptance gate:**
+- Tests through the real `phase_wait_start`, in one fixture set: a director-held token with `owner_staff_id` and no `director` file; a saved worker record with no roster entry; an exact match beside a second suffix match; a worker with no session, which gives the owner row's unit; an occupied slot that resolves on a later pass.
+- `test_verify_python_starts`, the verify token suites and `test_verify_wait_holder.py` pass.
 - basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
 
 ### Phase 9 — Remove Phase 7's new Python starts  · status: done
@@ -983,3 +1014,74 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Ruled out:**
 - A test for the read in the `MAC_ONLY` loop: `register_mac_wait` repeats the same check.
+
+### Phase 41 — Test Mac arguments by direct calls, and measure the verify test set  · status: todo
+
+**Depends on:** Phase 8.
+
+#### Work Order
+
+**Source:** builds showrunner, 2026-11-06 11:21 EST. Queue measured `direct/test_verify_mac_arguments.py` at 1,890 processes for 4 tests. The 136 `test_verify*` files hold about 2% of all tests and used 2,113 of 5,610 CPU s in the 5 fastest full gates of 11-05.
+
+**Goal:** the argument and routing checks of this file run through direct calls of the functions they test. Each checked behavior stays checked. A few end-to-end `verify.sh` cases stay. The phase also records the baseline and the order for the other files.
+
+**Spec:**
+
+1. **Baseline.** Before any test edit, measure `test_verify_mac_arguments.py`: processes started, CPU s and wall s. Count processes with one method that follows every child, and name the method. Save the method with the numbers. Measure the whole `test_verify*` set from the gate records (`show.py`): median CPU s for each file, and the total. Write the list, largest CPU first, in `docs/plans/natedev-verify-test-cost.md`.
+2. **Behavior map.** List each behavior the 4 tests check, with its assertion. Each behavior gets one row: the test that checks it after the phase, and whether it is a direct call or an end-to-end run.
+3. **Direct calls.** Move the argument and routing checks onto direct calls of the Bash functions in `verify.sh` and the Python functions they use. Use `scripts/lib/shell_test_support.py` for Bash functions, and run many cases in one shell where the cases allow it. Make no second extractor. Replace a fake `cargo`, `git` or `rustc` with a direct call where the check does not need the tool.
+4. **End to end.** Keep the smallest set of real `verify.sh` runs that proves the path from the command line to the recorded call: one Mac decline that runs locally, and one real offload busy result. A further run stays only when it proves something that no direct call can prove. Say why in the map.
+5. **Production code.** Move a piece of `verify.sh` into a function only when a check has no function to call. Such a move changes no behavior.
+6. **Measure again.** Measure the file with the same method, and write before and after in `docs/plans/natedev-verify-test-cost.md`.
+
+**Files:**
+- `scripts/direct/test_verify_mac_arguments.py`, and `scripts/direct/verify_mac_offload_test_support.py` if the fixture needs a change.
+- `scripts/direct/verify.sh`, only under Spec item 5.
+- `docs/plans/natedev-verify-test-cost.md` (new).
+
+**Workers:** 1 integration writer + 1 measurer and reviewer of the behavior map.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test project is made in a tempdir at run time. No test commits one.
+- Point measurement work at a temporary hold folder. Live state stays out of worker prompts.
+- At most one detached run at a time, with at most 4 named test files.
+- `test_verify_wait_holder.py` belongs to Phases 8 and 8a. Do not change it here.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion of the 4 tests, and no row lacks a test. A reviewer reads the old assertions against the map.
+- For each moved check, breaking the function it calls makes the new test fail. Show this on a tempdir copy for each moved behavior.
+- The before and after numbers for this file are in the cost doc: processes, CPU s and wall s, by one named method. The observation is the drop in processes and in CPU s for this file.
+- `test_verify_python_starts.py` and the Mac offload suites pass; basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
+
+### Phase 41a — Test the other verify files by direct calls, largest CPU first  · status: todo
+
+**Depends on:** Phase 41.
+
+#### Work Order
+
+**Source:** builds showrunner, 2026-11-06 11:21 EST, steps 2 and 3.
+
+**Goal:** the method of Phase 41 applies to the other `test_verify*` files, in the order of the baseline list. The showrunner receives before and after CPU s for the whole set.
+
+**Spec:**
+
+1. **Batches.** Take the files from the baseline list, largest CPU first. Each batch has one checkpoint, and the plan gets one lettered phase for each further batch. Set the batch size at each phase end from the file sizes and the shared fixtures. This phase is the first batch.
+2. **Method.** Each file gets the behavior map, the direct calls and the kept end-to-end runs of Phase 41. A file is finished when each real `verify.sh` run left in it proves something that no direct call can prove.
+3. **Shared fixtures.** When files share a fake tool or a fixture, change the fixture once. Make no copy of a fixture.
+4. **Whole set.** After the last batch, measure the whole `test_verify*` set from the gate records, with the method of the baseline. Write before and after CPU s in the cost doc, and send the numbers to the showrunner.
+
+**Files:**
+- `scripts/direct/test_verify*.py` and `scripts/direct/verify_*_test_support.py`, named batch by batch.
+- `scripts/direct/verify.sh`, only under Phase 41's Spec item 5.
+- `docs/plans/natedev-verify-test-cost.md`.
+
+**Workers:** Set at each batch; one writer per file set that no other writer touches.
+
+**Constraints from prior phases:**
+- The constraints in Phase 41 apply.
+
+**Acceptance gate:**
+- Each changed file has a complete behavior map, and breaking a function makes its moved test fail, as in Phase 41.
+- The cost doc holds before and after CPU s for each changed file and, after the last batch, for the whole set.
+- basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
