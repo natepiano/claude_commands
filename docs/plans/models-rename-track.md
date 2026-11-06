@@ -347,3 +347,48 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - Shell tests set catalog times with `touch -t`, with the state newer than the sources.
 
 **Ruled out:** a sync-process hook in the inherited-editor test, because the read count already fails on the revert; a separate lock-read test, because the contention run covers it.
+
+### Phase 5c — Test fixtures stay out of the real account folders  · status: done
+
+**Owner:** models-unit. sdlc routed the defect here on 2026-11-05 ("5c is right"). The fixture path line came from phase 3o.
+
+**Depends on:** none. It stacks on 33826f783 and runs beside the wait for 3r.
+
+#### Work Order
+
+**Goal:** A test run never writes a fixture session file into a real account folder.
+
+**Spec:**
+
+1. Cause: `fixture_session` in `staff_test_support.py` touches `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/fixture/<id>.jsonl` and `<codex_home>/sessions/<id>.jsonl`. A test that keeps the inherited session environment gets the real account folder. `~/.claude/projects/fixture` holds 13 such files and the top level of `~/.codex/sessions` holds 593.
+2. A real account folder is a direct child of the login user's home folder (from `pwd`, not `HOME`) with a name that starts `.claude` or `.codex`.
+3. When `staff_test_support.py` is imported, it computes the folder for `CLAUDE_CONFIG_DIR` (else `HOME/.claude`) and for `CODEX_HOME` (else `HOME/.codex`). When a folder is a real account folder, it sets that variable to a folder inside one private temp folder. The import removes the temp folder at exit. Child processes inherit the variable. A value that is not a real account folder stays as it is.
+4. `_fixture_session_path` applies the same one function at call time, also to an explicit `backend.codex_home`, so a later `patch.dict(clear=True)` or a passed real home gets the private folder. The `CODEX_HOME` line in `fixture_session` stores the same result.
+5. Readers find the file: `sessions.transcript_locations`, the worker family reader and `staff.py` read through the variables that item 3 sets.
+6. Add no guard, refusal or check. The fixture path changes; nothing fails or stops because of a real path.
+7. A test module that still writes to a real account folder by another route gets a private folder at that test. Report any non-test writer to the director.
+8. The measure stays out of the repository: `${PHASE_DIR}/scratch/leak_probe/sitecustomize.py` is an audit hook that logs each write to `projects/fixture` or to the top level of `sessions` under the real account folders, with the first `scripts/` stack frame. The hook is not a new check.
+
+**Files:**
+- `scripts/production/staff_test_support.py` — the one function and the import step.
+- `scripts/production/test_staff_test_support.py` — new: regression tests.
+- `scripts/agents/test_codex_mesh.py`, `scripts/message/test_roster.py`, `scripts/accounts/test_moves.py`, `scripts/production/test_session_staff.py`, `scripts/direct/test_workers.py` — only where the measure names a write by another route, or a test relied on the real folder.
+
+**Workers:** `1 writer + 1 tester`
+
+- `impl` — `staff_test_support.py` and every existing test module. Runs the caller suites under the probe after its last edit.
+- `test` — `test_staff_test_support.py` and the probe.
+
+**State:** none. The phase changes test fixtures only.
+
+**Constraints from prior phases:**
+
+1. No unasked guards (user via sdlc, 2026-11-05).
+2. devtools 3t also edits `staff_test_support.py`. Keep the change small and in its own functions.
+3. Do not delete the existing files in the real folders. sdlc allowed the fixture folder after the merge. The director does that step.
+
+**Acceptance gate:**
+
+1. Observation: the full merge gate runs under the probe, and the probe log is empty. Real-path check: `scripts.message.test_roster` and `scripts.agents.test_codex_mesh`, the two named sources, write only to private folders.
+2. `test_staff_test_support.py` fails when `_fixture_session_path` is put back to its old form, for both backends. Each reader test finds the private file.
+3. The merge gate passes; basedpyright 0/0 on changed files and on caller modules.

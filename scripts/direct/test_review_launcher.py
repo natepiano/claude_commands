@@ -20,6 +20,7 @@ import os
 import hashlib
 from unittest.mock import patch
 import subprocess
+import shutil
 import sys
 import tempfile
 from typing import override
@@ -58,8 +59,13 @@ Path(os.environ["REVIEW_AGENT"]).write_text(json.dumps({"arguments": sys.argv[1:
 print(json.dumps({"type": "result", "result": "No findings."}))
 ''')
         backend.chmod(0o755)
-        agent_exec = Path(__file__).resolve().parents[1] / "agents/agent_exec.sh"
+        scripts = Path(__file__).resolve().parents[1]
         helper = self.root / "scripts/agents/agent_exec.sh"
+        agent_exec = helper.with_name("agent_exec_real.sh")
+        _ = shutil.copy2(scripts / "agents/agent_exec.sh", agent_exec)
+        for name in ("claude_account.sh", "claude_result.py"):
+            _ = shutil.copy2(scripts / "agents" / name, helper.with_name(name))
+        _ = shutil.copy2(scripts / "lib/nix_env.py", self.root / "scripts/lib/nix_env.py")
         _ = helper.write_text('''#!/usr/bin/env bash
 set -euo pipefail
 python3 - <<'EDIT'
