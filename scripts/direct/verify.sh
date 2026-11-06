@@ -411,6 +411,12 @@ HOLD_LINT=0
 STEP_DEFER_LOCAL=0
 STEP_FORCE_MAC=0
 
+# Status 101 permits repairs for lint findings and compile errors.
+# A kill or a lint hold prevents repairs.
+first_judgment_permits_repair() {
+    [[ "$HOLD_LINT" == 0 && "$1" == 101 && "${RUN_LAST_ATTEMPT_KILLED:-0}" == 0 ]] && ! grep -qE "process didn.t exit successfully:.*signal:" "$2"
+}
+
 publish_step_state() {
     local temporary
     if ! printf '%s' "$STEP_RECORD_TEXT" | cmp -s - "$STEP_RECORD_PATH"; then
@@ -3749,11 +3755,9 @@ case "$CMD" in
             else
                 clippy_status=$?
             fi
-            # Status 101 permits repairs for lint findings and compile errors.
-            # A kill or a lint hold prevents repairs.
             clippy_repair=0
             if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
-            if [[ "$HOLD_LINT" == 0 && "$clippy_status" == 101 && "${RUN_LAST_ATTEMPT_KILLED:-0}" == 0 ]] && ! grep -qE "process didn.t exit successfully:.*signal:" "$CLIPPY_LOG"; then
+            if first_judgment_permits_repair "$clippy_status" "$CLIPPY_LOG"; then
                 clippy_repair=1
             fi
             rm -f "$CLIPPY_LOG"

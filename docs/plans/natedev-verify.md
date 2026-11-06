@@ -941,7 +941,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - Editing the JSON record in Bash: a state file keeps the schema in `step_record.py` alone.
 - A check that a state file left by an old call overrides a new record: each record write gets a new call id.
 
-### Phase 39 — The first lint judgment's repair decision has one callable home · status: todo
+### Phase 39 — The first lint judgment's repair decision has one callable home · status: done
 
 **Depends on:** none
 
