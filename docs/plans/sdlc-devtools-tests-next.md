@@ -22,11 +22,11 @@
   - Why needed: `add_unit.py` already accepts and records both fields (`add_unit.py:1297`, `test_add_unit.py:216`). The documented launch command (`produce.md:420`) does not carry them from planning.
   - Completion condition: preserve both fields through the planning handoff. Pass `--port` and repeated `--responsibility` options to `add_unit.py`. Keep saved `.unit.toml` precedence. Test the handoff and final record.
   - Revealed by: herdr-unit (sdlc [16a2cfa0], [7694b0f3]); Phase 3y architect review.
-- [ ] **Name the active and idle worker resume states**
-  - Target: `scripts/shutdown/inventory.py` (`PausedSeat`, `codex_seats`), `scripts/lib/resume_message.py`, and their tests.
-  - Why needed: `turn_live` controls different resume behavior for active and idle workers. `codex_seats` returns both, and `stop_resume.py:517` passes the complete list.
-  - Completion condition: replace the boolean with named states. Preserve active-worker commands, idle-worker text, and existing threads. Test both states through `stop_resume`.
-  - Revealed by: models-unit Phase 3s simplify lens (sdlc [89f9ddb9]): do it in the next phase that touches `resume_worker_command`; leave 3t 738d508a3 as is.
+- [ ] **Use the existing active and idle worker resume states**
+  - Target: `scripts/shutdown/inventory.py` (`worker_resumes`), `scripts/lib/resume_message.py` (`PausedSeat`, `resume_worker_command`), and their tests.
+  - Why needed: `Resumable` and `Idle` already distinguish the states, but `PausedSeat.turn_live` repeats that distinction.
+  - Completion condition: remove `turn_live` and use the existing states. Preserve active-worker commands, idle-worker text, and existing threads. Test both states through `stop_resume`.
+  - Revealed by: models-unit Phase 3s simplify lens; target corrected by the Phase 8g architect review.
 - [ ] **Cut the Git process starts in fast_track and the copies refresh**
   - Target: `scripts/production/fast_track.py` (`reconcile` and its Git calls), `scripts/production/test_fast_track.py`, `scripts/copies/copies.py` (remote refresh).
   - Why needed: build speed is a top priority. The natest P33 profile measured: `test_fast_track.py` drives 2937 Git calls in `fast_track.py` (27.6 s). `reconcile` repeats `rev-parse` (898), `update-ref` (777) and `cat-file` (283). The `copies.py` remote refresh makes 403 fetches (870 calls, 10.1 s).
