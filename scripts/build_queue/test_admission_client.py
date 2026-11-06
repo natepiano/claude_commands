@@ -29,7 +29,7 @@ from scripts.build_queue.admission_test_support import admitted_reply, wait_repl
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, reply_bytes,
 )
-from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
 
 WAIT = wait_reply(gate.NeedsMemory(), 1, "head", "free memory")
@@ -38,20 +38,6 @@ GRANTED = admitted_reply("stem", GIB, "new-source", "stem.max", "stem.wave")
 
 
 class ClientTests(unittest.TestCase):
-    def test_unit_override_retries_a_strict_main_service_without_the_new_field(self) -> None:
-        with AdmissionFixture() as fixture:
-            request = fixture.request()
-            request = replace(request, identity=replace(request.identity, unit="queue-unit"))
-            transport = self.use_transport(fixture,
-                Exchange(reply_bytes(wire.Refused("invalid snapshot record fields"))), Exchange(reply_bytes(GRANTED)))
-            self.assertEqual(client.admit(request, lambda _reply: None, lambda: request), GRANTED)
-            first, second = transport.requests
-            assert isinstance(first, wire.AdmitRequest)
-            assert isinstance(second, wire.AdmitRequest)
-            self.assertEqual(first.identity.unit, "queue-unit")
-            self.assertEqual(second.identity.unit, "")
-            self.assertEqual(second.code_version, "")
-            self.assertEqual(replace(first, identity=second.identity, code_version=""), second)
 
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:
@@ -106,30 +92,12 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
             self.assertFalse(fixture.server.reservations)
 
-    def test_live_main_gate_grant_is_admitted_and_released(self) -> None:
-        # Capture: gate_reservation used the live main service on 2026-11-03.
-        grant_line, release_line = (Path(__file__).with_name("fixtures") / "live_main_gate.jsonl").read_bytes().splitlines(keepends=True)
-        with AdmissionFixture() as fixture:
-            request = replace(fixture.request(), profile=gate.ProgramProfile(
-                "merge-gate", "repo", str(fixture.root), gate.FixedCapSizing(1 << 20)))
-            transport = self.use_transport(fixture, Exchange(grant_line), Exchange(release_line))
-            waits: list[wire.Wait] = []
-            result = client.admit(request, waits.append, lambda: request)
-            self.assertIsInstance(result, wire.Admitted)
-            assert isinstance(result, wire.Admitted)
-            self.assertEqual((result.need, result.source), (1 << 20, "cap"))
-            self.assertEqual(waits, [])
-            self.assertIsInstance(client.release(result.reservation, 0, result.cleanup_timing), wire.Ok)
-            self.assertEqual(transport.requests[0], request)
-            release = transport.requests[1]
-            assert isinstance(release, wire.ReleaseRequest)
-            self.assertEqual((release.reservation, release.status), (result.reservation, 0))
 
-    def test_live_main_queue_replies_pass_the_client_query_paths(self) -> None:
-        directory = Path(__file__).with_name("fixtures")
-        view_reply = (directory / "live_main_view.json").read_bytes()
-        explain_reply = (directory / "live_main_explain.json").read_bytes()
-        with AdmissionFixture() as fixture:
+    def test_recorded_queue_replies_pass_the_client_query_paths(self) -> None:
+        with AdmissionFixture() as fixture, QueueFixture() as queue:
+            reading_reply = queue.read()
+            view_reply = reply_bytes(wire.ViewReply(reading_reply))
+            explain_reply = reply_bytes(wire.ExplainReply(reading_reply.explanation))
             transport = self.use_transport(fixture, Exchange(view_reply), Exchange(explain_reply))
             reading = client.view()
             explanation = client.explain()
@@ -139,12 +107,16 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(transport.requests, [wire.ViewRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION),
                                                   wire.ExplainRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION)])
 
-    def test_main_service_pressure_snapshot_waits_then_admits_without_inventing_condition(self) -> None:
-        # Main aeb936809630c8a539613d4b0def9dce0db040c0 produced this reply through wire.encode_reply.
-        main_reply = (Path(__file__).with_name("fixtures") / "main_pressure_wait.json").read_bytes()
+    def test_recorded_pressure_snapshot_waits_then_admits_without_inventing_condition(self) -> None:
+        pressure = gate.MemoryPressure(8, 15, 80)
+        captured = wait_reply(pressure)
+        captured = replace(captured, snapshot=replace(captured.snapshot,
+            running=tuple(gate.RunningStep("fixture", "worker", "check", "/tree", use,
+                gate.MeasuredMemory(use), pid=index) for index, use in enumerate((4 * GIB, GIB), 1)),
+            decision=replace(captured.snapshot.decision, pressure=pressure)))
         with AdmissionFixture() as fixture:
             request = fixture.request()
-            transport = self.use_transport(fixture, Exchange(main_reply, reply_bytes(GRANTED)))
+            transport = self.use_transport(fixture, Exchange(reply_bytes(captured), reply_bytes(GRANTED)))
             waits: list[wire.Wait] = []
             result = client.admit(request, waits.append, lambda: request)
             self.assertEqual(result, GRANTED)
@@ -164,34 +136,6 @@ class ClientTests(unittest.TestCase):
                              "memory pressure: full avg10 8.0%, some avg10 15.0%, swap used 80.0%; "
                              + "condition not recorded by service")
 
-    def test_main_schema_refusal_retries_admission_and_release_without_caller_version(self) -> None:
-        refused = reply_bytes(wire.Refused("invalid snapshot record fields"))
-        grant_line, release_line = (Path(__file__).with_name("fixtures") / "live_main_gate.jsonl").read_bytes().splitlines(keepends=True)
-        with AdmissionFixture() as fixture:
-            request = fixture.request()
-            transport = self.use_transport(fixture, Exchange(refused), Exchange(grant_line),
-                                           Exchange(refused), Exchange(release_line))
-            result = client.admit(request, lambda _reply: None, lambda: request)
-            assert isinstance(result, wire.Admitted)
-            self.assertIsInstance(client.release(result.reservation, 0, result.cleanup_timing), wire.Ok)
-            first, compatible, release, compatible_release = transport.requests
-            self.assertEqual(first, request)
-            self.assertEqual(compatible, replace(request, code_version=""))
-            assert isinstance(release, wire.ReleaseRequest)
-            self.assertEqual(release.code_version, client.LOADED_ADMISSION_CODE_VERSION)
-            self.assertEqual(compatible_release, replace(release, code_version=""))
-            self.assertEqual((release.reservation, release.status), (result.reservation, 0))
-
-    def test_main_schema_refusal_retries_queries_without_caller_version(self) -> None:
-        directory = Path(__file__).with_name("fixtures")
-        refused = reply_bytes(wire.Refused("invalid snapshot record fields"))
-        with AdmissionFixture() as fixture:
-            transport = self.use_transport(fixture, Exchange(refused), Exchange((directory / "live_main_view.json").read_bytes()),
-                                           Exchange(refused), Exchange((directory / "live_main_explain.json").read_bytes()))
-            self.assertTrue(client.view().view.running)
-            self.assertTrue(client.explain().running)
-            self.assertEqual(transport.requests, [wire.ViewRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION),
-                wire.ViewRequest(), wire.ExplainRequest(code_version=client.LOADED_ADMISSION_CODE_VERSION), wire.ExplainRequest()])
 
     def test_hold_after_grant_releases_before_waiting_and_uses_a_new_episode(self) -> None:
         with AdmissionFixture() as fixture:
@@ -230,7 +174,7 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             checkout = str(fixture.root / "other-checkout")
-            profile = gate.ProgramProfile("merge-gate", "repo", checkout, gate.FixedCapSizing(6 * GIB))
+            profile = gate.ProgramProfile("merge-gate", "repo", checkout, gate.HistoryPeakSizing(6 * GIB, gate.FirstProgramPeak(6 * GIB), fixture.clock.now()))
             with mock.patch.object(gate, "git_identity", side_effect=AssertionError("program inferred cargo")), \
                  mock.patch.object(client, "CLOCK", fixture.clock):
                 request = client.step_request([], str(fixture.root), original.owner, original.since,
@@ -238,8 +182,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(request.identity.folder, checkout)
             self.assertEqual(request.profile, profile)
             self.assertEqual(request.identity.step, "merge-gate")
-            self.assertEqual(request.profile.peak, gate.ExpectedPeak(6 * GIB, "cap", 0,
-                                                                   gate.ProgramMemoryCap("merge-gate")))
+            self.assertEqual(request.profile.peak, gate.ExpectedPeak(6 * GIB, "fallback", 0))
 
     def test_failed_grant_file_write_releases_the_reservation_before_refusing(self) -> None:
         from pathlib import Path

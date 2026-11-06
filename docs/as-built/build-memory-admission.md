@@ -116,10 +116,8 @@ After a restart, the service restores live run places and removes ended run plac
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
 
-Each admitted run keeps aside `max(0, accepted need − anonymous use)`, plus its held slots.
-Room equals host free memory minus the 3 GiB safety minus run keep-asides minus the CI keep-aside.
+[Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.
 The first two minutes use the same calculation. A run never counts its use twice.
-The cap equals admitted anonymous use plus host free memory minus the safety.
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
@@ -282,9 +280,15 @@ A refresh uses the open admission connection. An unregistered client uses a read
 A pass retries a retained finalization intent even while its owner remains alive.
 It preserves the first `since` and episode across refreshes and reconnects.
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
-A cap-source waiter never expires. A `FixedCapSizing` program holds its cap without a history estimate or refresh.
-The merge gate asks for its own `--memory-cap-mib`, default 6144 MiB.
-Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory cap` in explanations.
+A program uses its history estimate and refreshes it under the normal estimate policy.
+The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the look-ahead window.
+The merge-gate progress profile key includes `shape` (`tests` or `types`).
+Earlier profiles do not match, and nightly runs use separate profiles.
+It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
+The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
+Memory peaks do not kill jobs or fail the gate.
+The gate reports its first need as a fallback and explains any matching anonymous progress window.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -417,14 +421,16 @@ CI RAM and unowned scopes reduce host free memory. They do not create a run prom
 The service reads that value once with the other policy values.
 `AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
 `MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
+`MemoryRoom.ci_use` stores readable CI use separately from admitted anonymous use.
 `MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
 Idle CI and unavailable CI readings add no CI keep-aside.
 CI RAM already reduces host free memory. The room calculation never subtracts it again.
 The service does not require `memory.max` for admission.
-The cap remains anonymous use plus free memory minus safety.
+[Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the cap.
 The cap text names the CI keep-aside within kept memory.
-The page shows CI RAM outside the cap and the CI keep-aside beside it, before the cap.
-Neither CI part increases the page's taken total for admitted runs.
+The page shows CI use and the CI keep-aside inside the cap.
+The page and the queue text show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB.
+The page includes both CI amounts in its taken total. Room and admission do not change.
 `RunningServiceJob` and `IdleService` retain the CI job state.
 Anonymous scope counters use the same measure as the history peaks.
 Missing anonymous counters keep the full accepted need aside and make the cap unavailable.
@@ -967,7 +973,7 @@ The nix-darwin job is a separate deployment step.
 `memory_room` calculates room from one captured admission pass.
 For each admitted run, kept bytes equal `max(0, selected need − anonymous use)` plus held slot bytes.
 Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
-The cap equals our anonymous use plus free memory minus safety. It does not limit an estimate.
+The cap equals our anonymous use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
 The first eligible run follows queue priority, first run arrival, and PID.
@@ -1004,3 +1010,15 @@ The queue view and cards show captured process ids as `pid N` for each process r
 `HeadExplanation` retains that cause for the view and release advice.
 The formatters read the captured cause and room without a second room calculation.
 No adaptive controller, fixed admission limit, order window, CI growth promise, or test-phase estimate worker remains.
+
+### Progress memory profiles
+
+Cargo build, check, clippy, mend, nextest, and merge gates record attributed anonymous use in five-percent phase bins.
+The service applies each step's recorded headroom rule to the highest profile sample within its look-ahead window.
+`progress_lookahead_percent` is read at use; its initial value is 20.
+The window can cross a phase boundary. Each step has its own history key.
+Missing counters, profiles, or anonymous readings retain the full need.
+The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.
+CI keeps its configured margin until registered CI steps supply counters and profiles.
+`lint/invoke.sh` enables Cargo progress in its capture log. It removes redraw frames from worker output.
+Cargo-tile enables progress for its own captures. The cargo wrapper does not enable progress for other pipes.

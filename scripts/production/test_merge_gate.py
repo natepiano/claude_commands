@@ -104,7 +104,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture-unit")
                         if outcome == "exception":
                             raise GateRefused("injected suite failure")
-                        return merge_gate.GateRun((), 0, 0, memory_within_cap=outcome != "red", tests_reused=True)
+                        return merge_gate.GateRun(
+                            (merge_gate.GateJobResult("hooks", "test_first.py", int(outcome == "red"), 0, "fixture"),),
+                            0, 0, tests_reused=True)
 
                     def merge(arguments: merge_gate.GateArguments) -> int:
                         try:

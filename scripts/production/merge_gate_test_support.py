@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 import json
 import contextlib
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.lint import memory_admit
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 from scripts.production import merge_gate
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.wait_for_test_state import wait_until
@@ -61,7 +61,7 @@ if name == "basedpyright":
         # The parent publishes only after measuring this type job's real RSS.
         wait_until((state / "types-sampled").exists, state, timeout=TEST_HANG_GUARD_SECS)
     if (state / "types-red").exists():
-        print("fixture type error")
+        print("scripts/fixture.py:1: error: fixture type error")
         print("1 error, 0 warnings, 0 notes")
         raise SystemExit(1)
     print("0 errors, 0 warnings, 0 notes")
@@ -187,13 +187,6 @@ class FixtureTest(unittest.TestCase):
             os.replace(state / "module-held.tmp", state / "module-held")
             signal.alarm(TEST_HANG_GUARD_SECS)
             signal.pause()
-        if (state / "grow-memory").exists() and suite == "hooks":
-            # Grows until the runner kills it; past 2 GiB the cap failed to stop it.
-            blocks = []
-            while len(blocks) < 256:
-                blocks.append(b"x" * (8 << 20))
-                time.sleep(0.02)
-            self.fail("fixture grew to 2 GiB and was never killed")
         if (state / "barrier").exists() and suite == "lib":
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             while True:
@@ -324,6 +317,9 @@ class MergeGateFixture(unittest.TestCase):
     def module_count(self) -> int:
         return len(self.suites) + int("lib" in self.suites)
 
+    def configure_gate(self, overrides: str) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_admission.conf", overrides)
+
     def record_module_peaks(self, peaks: dict[str, float]) -> None:
         merge_gate.save_measures(self.state / "runner" / "module_peak_mib.json", peaks)
 
@@ -364,7 +360,7 @@ class MergeGateFixture(unittest.TestCase):
         readings.mkdir(exist_ok=True)
         self.environment.update(fake_memory_readings(readings))
         self.environment.update({
-            "BUILDLOG_DIR": str(root / "buildlog"), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+            "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "merge-gate",
             "NOTIFIER_SESSIONS_DIR": str(home / "sessions"),
@@ -523,19 +519,19 @@ class MergeGateFixture(unittest.TestCase):
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
                  ignored_signals: bool = False, callers_production: bool = False,
-                 own_process: bool = False) -> subprocess.CompletedProcess[str]:
+                 type_dirs: Sequence[str] = ("scripts/production",)) -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
              "--checkpoint", checkpoint or self.checkpoint,
              "--previous-checkpoint", previous or self.base,
              "--unit", "fixture-unit", "--phase", "phase-2",
-             "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
+             "--body", "Fixture checkpoint gate.",
+             *(["--type-dirs", *type_dirs] if type_dirs else []),
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
              *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
              *extra]
-        # The gate measures itself and descendants; cap assertions need their own gate process.
-        if own_process or ignored_signals:
+        if ignored_signals:
             return subprocess.run(
                 [*self.gate_command(ignored_signals=ignored_signals), *arguments], cwd=self.root,
                 env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
