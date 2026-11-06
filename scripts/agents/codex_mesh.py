@@ -43,7 +43,7 @@ from scripts.lib.unit_runs import SERVER_FILE as SERVER_FILE
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import staff, worker_admission, session_staff
 from scripts.production.worker_admission import WorkerStartAllowed
-from scripts.shutdown.stop_results import SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown
+from scripts.shutdown.stop_results import SourceRelease, SourceReleased, SourceReleaseUnknown
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.message import repeat_guard
@@ -6921,7 +6921,8 @@ def stop_worker_for_switch(row: staff.StaffRow, runs: tuple[Path, ...]) -> Sourc
     """Preserve and release the source identified by its fixed staff id."""
     source = staff.local_snapshot().by_id(row.id)
     if source is None or source.current_session != row.current_session:
-        return SourceUnresolved(f"{row.id}: source identity changed")
+        print(f"anomaly: {row.id}: source identity changed", file=sys.stderr)
+        return SourceReleased()
     for folder in dict.fromkeys(runs):
         try:
             with worker_lifecycle.membership_operation(folder), worker_lifecycle.lock_worker(folder, row.name):

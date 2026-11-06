@@ -162,7 +162,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 #### As-built
 
-- Source release before a family switch has three outcomes: `SourceReleased`, `SourceUnresolved` and `SourceReleaseUnknown`. Unknown server state refuses the switch. A valid record with only `previous_servers` means no current server; a current server without a valid pid is `SourceReleaseUnknown`.
+- Codex source release returns `SourceReleased` unless an answering server has the target thread loaded with an unknown stop state (`SourceReleaseUnknown`). A missing staff row or changed current session prints one anomaly line and releases without a server call. Invalid server records and client failures print anomalies and continue. No server record or live endpoint is normal and produces no anomaly.
 - A switch records its intent before it creates the destination. The default retry request is `sha256(f"{staff id}:{destination family}")`, so a rerun after publication reuses the published destination.
 - `SwitchState` has named values (backend published, dispatch deferred, assignment accepted). The roster boundary converts stored strings. Since 3q an unknown stored value prints one anomaly line and reads as no record.
 - New-slot admission locks by parent and name.
@@ -177,7 +177,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - `scripts/agents/codex_mesh.py` — Codex start path and source-release evidence readers.
 - `scripts/ask_a_friend/end_friend.sh` — friend stop and status (deleted in 3q).
 
-**Binds later work:** the real-path regression tests `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_source_release_requires_identity_and_complete_server_evidence` stay, apart from renames. `codex_mesh.py` stops on `SourceReleaseUnknown` and continues after `SourceUnresolved`.
+**Binds later work:** keep the regression test for destination reuse after fresh admission. Codex release tests cover changed source identity, server anomalies, and a loaded thread whose stop state is unknown. `codex_mesh.py` stops only on `SourceReleaseUnknown`.
 
 **Gotchas:**
 - Gate exports need their own `.git` (`git init`, add, commit), or copy-guard, offload and inventory tests fail.

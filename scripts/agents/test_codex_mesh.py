@@ -2374,14 +2374,19 @@ class StaffAdmissionTests(MeshCommandFixture):
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual(len(self.methods("thread/unsubscribe")), 1)
 
-    def test_source_release_refuses_a_changed_source_identity(self) -> None:
+    def test_source_release_skips_a_changed_source_identity(self) -> None:
         row = self.codex_switch_source()
         replaced = dataclasses.replace(row, current_session=staff.StaffId(fixture_runtime_id("replaced worker")))
-        result = codex_mesh.stop_worker_for_switch(replaced, (self.session_dir,))
-        self.assertIsInstance(result, stop_results.SourceUnresolved)
-        assert isinstance(result, stop_results.SourceUnresolved)
-        self.assertIn("source identity changed", result.reason)
-        self.assertEqual(self.methods("thread/loaded/list"), [])
+        for source in (row, None):
+            with (self.subTest(source=source),
+                  patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((source,) if source else ())),
+                  patch.object(codex_mesh, "_release_source_servers") as release,
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                result = codex_mesh.stop_worker_for_switch(replaced, (self.session_dir,))
+                self.assertIsInstance(result, stop_results.SourceReleased)
+                self.assertEqual(errors.getvalue(), f"anomaly: {row.id}: source identity changed\n")
+                release.assert_not_called()
+                self.assertEqual(self.methods("thread/loaded/list"), [])
 
     def test_only_active_records_belong_to_the_matching_launcher(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
