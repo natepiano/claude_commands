@@ -36,6 +36,7 @@
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
+        "scripts/herdr",
         "scripts/whoami",
         "scripts/lib"
       ]
