@@ -42,13 +42,14 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
                 (direct / source.name).symlink_to(source, target_is_directory=source.is_dir())
         observer = self.root / "observe-local-token.py"
         _ = observer.write_text('''
-import json
 import os
 from pathlib import Path
 import sys
 if sys.argv[1] == "acquire":
     records = Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json")
-    if any(json.loads(path.read_text())["runs_on"]["kind"] == "natedev_only" for path in records):
+    sys.path.insert(0, str(Path.home() / ".claude"))
+    from scripts.direct.test_verify_step_state import read_step_row
+    if any(read_step_row(path.stem)["runs_on"]["kind"] == "natedev_only" for path in records):
         (Path(os.environ["TEST_RUNNER_STATE"]) / "local-token-wait").touch()
 ''')
         self.write_executable(direct / "board.sh", '''#!/bin/bash

@@ -402,21 +402,40 @@ final_pass_finish() {
     FINAL_PASS_START=""
 }
 STEP_RECORD_ACTIVE=0
-STEP_RECORD_ARGS=()
+STEP_RECORD_PATH=""
+STEP_STATE_PATH=""
+STEP_RECORD_TEXT=""
 STEP_RUNS_ON=natedev_only
 STEP_TARGET_TABLE=""
 HOLD_LINT=0
 STEP_DEFER_LOCAL=0
 STEP_FORCE_MAC=0
 
+publish_step_state() {
+    local temporary
+    if ! printf '%s' "$STEP_RECORD_TEXT" | cmp -s - "$STEP_RECORD_PATH"; then
+        printf 'step record: cannot update step record: record missing or changed; step refused\n' >&2
+        return 2
+    fi
+    temporary="${STEP_STATE_PATH%/*}/.step-${STEP_STATE_PATH##*/}-$RANDOM"
+    if ! { printf '%s\n' "$*" > "$temporary" && mv -f -- "$temporary" "$STEP_STATE_PATH"; }; then
+        rm -f -- "$temporary"
+        return 2
+    fi
+}
+
 step_state() {
     [[ "$STEP_RECORD_ACTIVE" == 1 ]] || return 0
-    env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" state --call-id "$BUILDLOG_CALL_ID" "$1" || exit 2
+    if [[ "${STEP_WRITES_TREE:-0}" == 1 ]]; then
+        publish_step_state writes_tree "$@" || exit 2
+    else
+        publish_step_state "$@" || exit 2
+    fi
 }
 
 remove_step_record() {
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
-        env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" remove --call-id "$BUILDLOG_CALL_ID" || true
+        rm -f -- "$STEP_RECORD_PATH" "$STEP_STATE_PATH" "${STEP_STATE_PATH%/*}/.step-${STEP_STATE_PATH##*/}-"* || true
         STEP_RECORD_ACTIVE=0
     fi
 }
@@ -473,7 +492,7 @@ run() {
     run_step "$@" || status=$?
     finish_step_token "$held_before" "$status" || status=$?
     if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]] && step_writes_tree "$@"; then
-        env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" --state local_noncompiling || exit 2
+        step_state local_noncompiling
     fi
     if [[ "$status" != 0 && -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         exit "$status"
@@ -492,8 +511,7 @@ run_step() {
         STEP_WRITES_TREE=1
         # Keep the call's decision for the next step.
         if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]]; then
-            env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${STEP_RECORD_ARGS[@]}" \
-                --runs-on natedev_only --reason 'step writes the tree' --state local_noncompiling || exit 2
+            step_state local_noncompiling
         fi
         # Both queue hooks must keep this step in the original tree.
         local LINT_QUEUE_LEAVE_HOOK=false BUILDLOG_MAC_IDLE_HOOK=false
@@ -1716,8 +1734,7 @@ try_mac_test() {
     fi
     MAC_LOG_FILE="$(mktemp)"
     if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
-        env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" state --call-id "$BUILDLOG_CALL_ID" \
-            --target "$selected_target" on_ssh || exit 2
+        step_state on_ssh "$selected_target"
     fi
     # Apply forwarded values in Python. Bash can make these names readonly or arrays.
     # The pipe preserves bytes and keeps values outside argv.
@@ -1941,16 +1958,22 @@ initialize_step_record() {
             fi
         done <<< "$table"
     fi
-    STEP_RECORD_ARGS=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
+    local record_args=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
         --repo "$(git rev-parse --show-toplevel)" --kind "$CMD"
         --runs-on "$STEP_RUNS_ON" --reason "$decision_reason" --state waiting_hold)
     if [[ "$STEP_RUNS_ON" == ssh_allowed ]]; then
-        STEP_RECORD_ARGS+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
+        record_args+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
     fi
-    if [[ -n "$PINNED_TARGET" ]]; then STEP_RECORD_ARGS+=(--pinned-target "$PINNED_TARGET"); fi
-    if [[ "$CMD" == test ]]; then STEP_RECORD_ARGS+=(--package "$PKG"); fi
-    VERIFY_MONOTONIC_OFFSET_US="$(env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" \
-        "${STEP_RECORD_ARGS[@]}" --clock-offset)" || exit 2
+    if [[ -n "$PINNED_TARGET" ]]; then record_args+=(--pinned-target "$PINNED_TARGET"); fi
+    if [[ "$CMD" == test ]]; then record_args+=(--package "$PKG"); fi
+    local report
+    report=$(env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${record_args[@]}" --report) || exit 2
+    {
+        IFS= read -r VERIFY_MONOTONIC_OFFSET_US
+        IFS= read -r STEP_RECORD_PATH
+        IFS= read -r STEP_STATE_PATH
+    } <<< "$report"
+    STEP_RECORD_TEXT=$(< "$STEP_RECORD_PATH")
     STEP_RECORD_ACTIVE=1
     export BUILDLOG_MEM_WAIT_FIRST_FILE="${BUILDLOG_MEM_WAIT_FIRST_FILE:-$HOLD_WAIT_DIR/first-queued-at}"
     if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
@@ -3475,7 +3498,7 @@ verify_cleanup() {
     [[ -z "$TREE_WATCH_DIR" ]] || rm -rf "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
-        env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" state --call-id "$BUILDLOG_CALL_ID" waiting_hold || true
+        publish_step_state waiting_hold || true
     fi
     stop_copy_watch || true
     if [[ "$status" != interrupted ]]; then interrupt_hold_wait; fi
