@@ -941,7 +941,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - Editing the JSON record in Bash: a state file keeps the schema in `step_record.py` alone.
 - A check that a state file left by an old call overrides a new record: each record write gets a new call id.
 
-### Phase 39 — The first lint judgment's repair decision has one callable home · status: todo
+### Phase 39 — The first lint judgment's repair decision has one callable home · status: done
 
 **Depends on:** none
 
@@ -970,7 +970,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Invariants:** `verify.sh` output, exit codes, cache records and build-log records stay the same for every verb. Fix, format, final judgment and `clippy_fix_pass_limit` behavior do not change. Add no other guard, refusal or check.
 
-**Test changes approved:** only the reduction of the status table in `test_first_judgment_nonlint_status_never_repairs`, as item 4 says.
+**Test changes approved:** only the reduction of the status table in `test_first_judgment_nonlint_status_never_repairs`, as item 4 says. Also the total in `test_verify_python_starts.py::test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper`, 60 to 24, because Phase 38 removed those starts and its checkpoint left the total stale.
 
 **Acceptance:**
 
