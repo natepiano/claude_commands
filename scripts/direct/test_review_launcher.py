@@ -11,6 +11,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
 from scripts.direct import review_launcher_test_support as support
+from scripts.direct.test_implement_launcher import configure_transport, install_worker_command, configure_pane_account
+from scripts.lib.test_models_registry import write_registry
 from contextlib import ExitStack
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from pathlib import Path
@@ -28,6 +30,63 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        configure_transport(self.root)
+
+    def test_herdr_simplify_keeps_the_claude_launch_path(self) -> None:
+        run = self.start_implementation("pane-simplify")
+        self.finish_implementation(run)
+        _ = (run / "worker_transport").write_text("herdr\n")
+        source = Path(__file__).resolve().parents[1]
+        (self.root / "scripts/direct/simplify_result.py").symlink_to(source / "direct/simplify_result.py")
+        usage = self.root / "scripts/usage"
+        usage.mkdir()
+        (usage / "agents_log.py").symlink_to(source / "usage/agents_log.py")
+        template = self.root / "review"
+        template.mkdir()
+        _ = (template / "simplify.md").write_text("Report only. Edit no file.\n")
+        _ = write_registry(self.root / ".claude/config/models.conf", {"assignments": {"direct.simplify": "claude"},
+                           "direct.claude": {"simplify": "opus:xhigh"}},
+                           update=True)
+        diff = self.root / "phase.diff"
+        _ = diff.write_text("diff --git a/worker.py b/worker.py\n-old\n+new\n")
+        agent = self.root / "scripts/agents/agent_exec.sh"
+        _ = agent.write_text(agent.read_text().replace("No findings.", "Pass"))
+        environment = self.environment()
+        environment["HERDR_BIN"] = "/nonexistent/herdr"
+        before = (self.root / "staff.json").read_bytes()
+        command = self.review_command(run, "simplify", "")
+        command[5] = "simplify"
+        command[2:2] = ["--diff", str(diff)]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((run / "review_findings_1_simplify.txt").read_text(), "Pass\n")
+        self.assertEqual((run / "review_status_simplify").read_text(), "reviewed\n")
+        self.assertIn("task=direct.simplify\nfamily=claude\n", (run / "review_agent_simplify").read_text())
+        self.assertEqual((run / "worker_transport").read_text(), "herdr\n")
+        self.assertEqual((self.root / "staff.json").read_bytes(), before)
+
+    def test_herdr_review_keeps_unknown_evidence_without_a_mesh_claim(self) -> None:
+        run = self.start_implementation("pane-unknown")
+        self.finish_implementation(run)
+        _ = (run / "worker_transport").write_text("herdr\n")
+        install_worker_command(self.root)
+        _ = self.open_worker(run)
+        environment = self.environment()
+        environment["HERDR_BIN"] = "/nonexistent/herdr"
+        environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
+        configure_pane_account(self.root, Path(environment["AGENT_NOTES_DIR"]))
+        before = (self.root / "staff.json").read_bytes()
+        result = subprocess.run(self.review_command(run, "contract", ""), env=environment,
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual((run / "review_status_contract").read_text(), "error\n")
+        self.assertEqual((self.root / "staff.json").read_bytes(), before)
+        self.assertIn("/nonexistent/herdr", (run / "review_agent_1_contract.log").read_text())
+
     def test_own_claim_refusal_removes_a_stale_review_slot(self) -> None:
         session = self.start_implementation("stale-review-slot")
         self.finish_implementation(session)
