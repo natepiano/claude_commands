@@ -1166,41 +1166,19 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41f — Keep the offload settings tests off the live Mac lease  · status: done
 
-**Depends on:** Phase 41c.
+#### As-built
 
-#### Work Order
-
-**Source:** builds showrunner, 2026-11-06: `test_probe_that_cannot_start_reports_its_limit_through_run` failed in the sdlc merge gate with "busy" in place of "unreachable", in the batch and alone. "Fix the cause under load, not the timing."
-
-**Cause, measured:** the test takes the real lease at `~/worktrees/gates/.remote-mirrors/<hash>.lease` for the hana Mac mirror. `copies.config_settings` reads `COPIES_CONFIG` or the repository's `config/copies.conf`, and that file sets `root=~/worktrees/gates`. The test environment sets neither. A live hana Mac run that holds the lease makes `leases` empty, so the answer is busy before the probe starts. The test can also make a live hana run answer busy.
-
-**Goal:** no test in `scripts/mac_test` takes a lease in the live gates root. The test gives its own answer while a live run holds the lease.
-
-**Spec:**
-
-1. Point the copies root of `OffloadSettingsTests` at a folder under its temporary root, through `COPIES_CONFIG`. Use the existing fixture in `scripts/copies/copies_test_support.py` when it fits.
-2. Find each other test in `scripts/mac_test` that reaches `copies.remote_lease` with a path outside its temporary root. On a tempdir copy of `scripts` and `config`, first set `config/copies.conf` to `root=<temporary pretend live root>`, so this run takes no live lease. Make `remote_lease_path` append each path it returns to a file, run the modules, and read the file. A path under the pretend root is a test that leaks. Move each test found to the same fixture.
-3. Add one test that reads `copies.remote_lease_path` for the mirror of the flaky test. It asserts that the path lies under the temporary root.
-4. Change no production file. Change no timing and add no retry.
+- `OffloadSettingsTests`, `OffloadCommandFixture` and `RepositorySlotTests` use `copies_environment`, so each has a private copies root. No test in `scripts/mac_test` takes a lease in the live gates root.
+- `test_probe_mirror_lease_stays_under_the_temporary_root` reads the lease path of the mirror of the flaky test.
+- Proof on a tempdir copy with a pretend live root: with the lease held, the flaky test fails with `busy` when the fixture is removed, and passes with the fixture. 0 of 185 lease paths lie under the pretend root.
 
 **Files:**
-- `scripts/mac_test/test_offload.py`
-- `scripts/mac_test/offload_test_support.py`
-- `scripts/mac_test/test_target_slots.py`
+- `scripts/mac_test/test_offload.py` — the `OffloadSettingsTests` fixture and the new test.
+- `scripts/mac_test/offload_test_support.py` — `OffloadCommandFixture`.
+- `scripts/mac_test/test_target_slots.py` — `RepositorySlotTests`.
 
-**Workers:** 1 writer: merge16.
-
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- No proof holds the live lease or touches live state.
-- A test project is made in a tempdir at run time. No test commits one.
-- Importing `offload.py` loads no build coordination modules. Resources Phase 67 tests this.
-- This phase lands on `verify-plain`. Send builds the hash.
-
-**Acceptance gate:**
-- On a tempdir copy with `config/copies.conf` set to `root=<temporary pretend live root>`, hold the lease of the hana mirror under that pretend root. The flaky test fails with "busy" when the fixture of step 1 is removed. It passes with the fixture.
-- The path list of step 2 holds no path under the pretend root after the fix. Each path lies under the temporary root of its test.
-- `test_offload.py` and the other `scripts/mac_test` modules that step 2 changes pass. basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+**Gotchas:**
+- `copies.config_settings` reads `COPIES_CONFIG`, else the repository's `config/copies.conf`. `CONF_DIR` does not reach it, and a `Path.home` patch does not reach `Path.expanduser`. A test that reaches a lease needs `COPIES_CONFIG`.
 
 ### Phase 41d — Move the test argument parser to one function  · status: todo
 
