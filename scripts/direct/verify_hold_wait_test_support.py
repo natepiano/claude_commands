@@ -30,6 +30,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB, wait_for_marker_exit
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -247,6 +248,37 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             "BUILDLOG_HOLD_WAIT_FILE": "",
             "BUILDLOG_HOLD_WAITER_FILE": "",
         })
+
+    def run_unblocked_step(self, command: str) -> subprocess.CompletedProcess[str]:
+        """Call the real hold checks, command launcher, and call recorder."""
+        script = self.fixture.root / "unblocked-step.sh"
+        _ = script.write_text('set -eo pipefail\nsource "$1"\n'
+            + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
+            + shell_functions(VERIFY, "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
+                              "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
+            + '''
+PY=$CLAUDE_PYTHON
+CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
+STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
+TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
+HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
+mkdir -p "$HOLD_WAIT_DIR"
+export BUILDLOG_CALL_ID="direct-hold-$$" BUILDLOG_CALLER=verify BUILDLOG_SYNC=1
+export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds" BUILDLOG_HOLD_WAIT_S=0
+BUILDLOG_MAC="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S=""
+BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
+status=0
+if [[ "$CMD" == check ]]; then
+    run_once cargo check || status=$?
+else
+    run_once cargo nextest run || status=$?
+fi
+note_event ran 0 0 0 0 "$status"
+exit "$status"
+''')
+        return subprocess.run(["bash", str(script), str(INVOKE), command], cwd=self.fixture.root,
+            env={**self.fixture.environment, "TEST_HOLD_DIRECTORY": str(self.fixture.root / "direct-hold")},
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
 
     def hold(self, key: str = "hana") -> None:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])

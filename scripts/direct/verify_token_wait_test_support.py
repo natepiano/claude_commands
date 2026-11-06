@@ -17,6 +17,7 @@ import shlex
 import shutil
 import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -29,6 +30,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -474,6 +476,39 @@ if sys.argv[1] == "wait-local":
                                        stderr=subprocess.STDOUT, start_new_session=True)
         self.started_groups.add(process.pid)
         self.wait_for_running(self.root / "hold-waiting", process)
+        return process
+
+    def start_owned_step(self, environment: dict[str, str]) -> subprocess.Popen[str]:
+        """Run the real command guard and renewer with a real board lease."""
+        source = VERIFY.read_text()
+        start = source.index("STEP_OWNER_PY='\n")
+        end = source.index("\nrelease_token() {", start)
+        script = self.root / "owned-step.sh"
+        _ = script.write_text('set -eo pipefail\nsource "$1"\n'
+            + source[start:end] + shell_functions(VERIFY, "release_token") + '''
+BOARD_HELPER=$TEST_BOARD_HELPER BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=$UNIT_TEAM_ROLE
+STEP_RECORD_SCRIPT=$TEST_STEP_RECORD_SCRIPT
+PY=$TEST_REAL_PYTHON
+source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
+TOKEN_HOLD_S=$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)
+TOKEN_RENEW_S=$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)
+TOKEN_HELD=0 TOKEN_WAIT_FILE=""
+HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
+mkdir -p "$HOLD_WAIT_DIR"
+trap 'status=$?; release_token || true; exit "$status"' EXIT
+bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold "$TOKEN_HOLD_S"
+TOKEN_HELD=1
+status=0
+buildlog_exec cargo check > "$HOLD_WAIT_DIR/command-output" 2>&1 || status=$?
+cat -- "$HOLD_WAIT_DIR/command-output"
+exit "$status"
+''')
+        process = subprocess.Popen(["bash", str(script), str(VERIFY.parent.parent / "lint/invoke.sh")],
+            cwd=self.root, env={**environment, "TEST_BOARD_HELPER": str(BOARD),
+                "TEST_STEP_RECORD_SCRIPT": str(VERIFY.with_name("step_record.py")),
+                "TEST_REAL_PYTHON": sys.executable, "TEST_HOLD_DIRECTORY": str(self.root / "owned-step-hold")},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.started_groups.add(process.pid)
         return process
 
     def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:
