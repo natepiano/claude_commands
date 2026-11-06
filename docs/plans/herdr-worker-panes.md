@@ -2240,7 +2240,7 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
    Phase 8 reads the transcript before submission.
    It finishes a completed pass, continues a live pass, or types once when the line was never submitted.
    Include that dispatch id in the busy worker's resume text and final `DONE` line.
-4. Shutdown, moves, and launchers use the one builder, `resume_message` in `scripts/lib/resume_message.py`. Its `workers: ResumeWorkers` gains the pane workers: `PaneWorkerResume(staff_id: StaffId, turn: BusyPass | IdleWorker)`, where `BusyPass(dispatch_id)` makes the text name that dispatch id. Keep the existing `PausedSeat` branch for mesh-pinned runs through Phase 18.
+4. Shutdown, moves, and launchers use the one builder, `resume_message` in `scripts/lib/resume_message.py`. `PaneWorkerResume`, `BusyPass` and `AccountMove` already exist there, and account moves already use them. Connect shutdown and restore to these types, and do not make new ones. Keep the existing `PausedSeat` branch for mesh-pinned runs through Phase 18.
    Add no second resume-text builder.
    Reuse `Herdr.sort_tabs` for multi-pane tab order.
 5. **Resumable worker stop.** `stop_resume.stop_unit_workers(unit: StaffId, record: staff.StaffSnapshot) -> list[str]` uses the shared per-member stop, proves each agent stopped or reports its uncertainty, and keeps every worker row and native backend identity. A stopped pane can stay at its shell; a pane may close only after fresh terminal and shell proof. Retire, wrap and promote call this resumable operation, so unit resume or the surviving holder can call `worker.py restore` on the same sessions. They never call worker end or `staff.retire` on these workers. A proved live target or structural fault blocks destructive worktree removal; unknown process evidence prints the named note.
@@ -2256,8 +2256,8 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
 
 - `scripts/shutdown/inventory.py`, `scripts/shutdown/stop_resume.py`, `scripts/shutdown/shutdown_record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/pane_restore.py` — stop, record, restart and restore; delete their superseded pane-worker paths; `stop_unit_workers` (new) and the config read of `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, `START_SECONDS`, `STAY_SECONDS` and `RESUME_ATTEMPTS` in `stop_resume.py`.
 - `scripts/shutdown/session_types.py` — retain only the mesh-pinned server and paused-worker types until Phase 18.
-- `scripts/lib/resume_message.py`, `scripts/lib/test_resume_message.py` — the shared builder, pane workers, and complete account-move values; delete superseded pane resume-text branches.
-- `config/shutdown.conf` — new: `STOP_GRACE_SECONDS=2`, `KILL_GRACE_SECONDS=5`, `START_SECONDS=20`, `STAY_SECONDS=10`, `RESUME_ATTEMPTS=3`, with matching `# range:` and `# whole:` limits.
+- `scripts/lib/resume_message.py`, `scripts/lib/test_resume_message.py` — the shared builder, with shutdown and restore through the existing pane-worker and account-move types; delete superseded pane resume-text branches.
+- `config/shutdown.conf` — update the existing file. Add `START_SECONDS=20`, `STAY_SECONDS=10`, `RESUME_ATTEMPTS=3`, with matching `# range:` and `# whole:` limits. Keep `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS` and `MOVE_STOP_MARGIN_SECONDS` and their limits: `scripts/accounts/pane_moves.py` requires the last key, and the account-move tests stay green.
 - `scripts/production/retire_unit.py`, `scripts/production/production_lifecycle.py`, `scripts/production/promote_showrunner.py` — resumable worker stop; delete replaced pane lifecycle branches.
 - `scripts/production/resume_unit.py`, `scripts/production/worker.py`, `scripts/production/test_resume_unit.py`, `scripts/production/test_worker.py` — shared restore and permanent-end integration.
 - `scripts/production/test_retire_unit.py`, `scripts/production/test_production_lifecycle.py`, `scripts/production/test_promote_showrunner.py` — their tests.
@@ -2752,31 +2752,23 @@ Only Spec items 13 and 14 need Python: a test shows the option and the configure
 
 **Depends on:** Phase 9, Phase 14d.
 
-#### Work Order
+#### As-built
 
-**Goal:** the pane pilot's remaining send and delivery defects are gone before the default switch, and a refused pass keeps its role.
-
-**Spec:**
-
-1. `send.py --help` and the module usage name `worker:<unit>/<worker>` for a pane worker. They name `worker:<run id>/<worker>` only for a worker in a mesh-pinned run. The cause: `roster.py` publishes pane workers as `worker:<parent>/<row>`, and `membership.by_path` does not match a run id.
-2. A local address that resolves to a staff worker in a pane-pinned run takes `PaneWorkerRecipient`, with or without the `worker:` prefix. The route at `send.py:1996` selects from the resolved row and the run pin, so `codex:<thread id>` reaches the pane. A mesh-pinned worker keeps `CodexWorkerRecipient`, and a named machine scope keeps its route.
-3. `herdr._open_codex_rollouts` skips a descriptor that closes between the listing and `os.readlink`. `codex_rollout_threads` reads the selected rollouts again when one closes, inside the existing deadline. The identity checks stay. An unproved target stays refused. Add no check.
-4. `progress_history.last_dispatch` includes a `refused` pass. A worker whose newest pass is refused keeps that pass's role and id. Phase 11 keeps a refused pass open for recovery; the 14d reader lost its role.
+- `send.py --help` and the module usage name `worker:<unit>/<worker>` for a pane worker, and `worker:<run id>/<worker>` only for a worker in a mesh-pinned run.
+- `send.resolve_recipient` selects from the resolved row and the run pin. A staff worker in a pane-pinned run, held on this machine, takes `PaneWorkerRecipient` with or without the `worker:` prefix, so `codex:<thread id>` reaches the pane. A mesh-pinned worker keeps `CodexWorkerRecipient`. A holder on the other machine keeps `RemoteDelivery`.
+- `worker_panes.worker_run(parent, *, record=RunStaffAtUse.LOCAL)` takes a staff snapshot and reads `ROSTER_RUN_ROOT`, so `send.py` holds no copy of that read.
+- `herdr._open_codex_rollouts` skips a descriptor that closes during the listing. `codex_rollout_threads` reads the rollouts again when one closes, inside `PROGRAM_TIMEOUT_SECONDS`. A pane with another session stays refused.
+- `progress_history.last_dispatch` includes a `refused` pass, so a worker whose newest pass is refused keeps that pass's role and id.
 
 **Files:**
-- `scripts/message/send.py`, `scripts/message/test_send.py`, `scripts/herdr/worker_panes.py` — Spec items 1 and 2.
-- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — Spec item 3.
-- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — Spec item 4.
+- `scripts/message/send.py`, `scripts/message/test_send.py` — the route and the help text.
+- `scripts/herdr/worker_panes.py` — `worker_run`.
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — the rollout proof.
+- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — `last_dispatch`.
 
-**Workers:** `2 writers`
-- `impl`: Spec items 3 and 4.
-- `impl2`: Spec items 1 and 2.
+**Gotchas:** The final listing may differ from the listing that was read only as a strict subset. A new or replaced descriptor refuses.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 14d: `last_dispatch` is the one reader of a worker's role, and `worker_panes.dispatch_role` reads through it. Pilot defect 9: the saved log reads `target evidence is unknown: [Errno 2] No such file or directory: '/proc/<pid>/fd/36'`. The log does not name the failed operation, so cover both the listing and the read. Pilot defect 3 and 4 probes: a run id address returns `NoStaffRecipient`; a thread address returns `CodexWorkerRecipient` for a pane worker.
-
-**Acceptance gate:** A test sends through `send.py` routing with a `codex:<thread id>` address to a pane-pinned worker and selects `PaneWorkerRecipient`; the same address for a mesh-pinned worker keeps `CodexWorkerRecipient`. A test makes one descriptor disappear during the listing and one during the read, and the session proof still passes; a pane with another session stays refused. A test records a refused `fix` pass after a completed `review` pass, and `last_dispatch` returns `fix` with the refused pass's id. Require basedpyright 0/0 on changed files and caller modules, and the full gate.
+**Ruled out:** A retry of every changed listing, because a new descriptor must refuse.
 
 ### Phase 15 — Pilot and default switch  · status: todo
 
@@ -2786,7 +2778,7 @@ Only Spec items 13 and 14 need Python: a test shows the option and the configure
 
 **Goal:** herdr-unit's own next run works on panes, then the default becomes `herdr` and units switch at their run boundaries, Mac units after a Mac probe of Phases 6-7.
 
-**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. At the switch, the director ends each open pane worker of the pilot. Those workers predate the compaction option, and a same-role dispatch keeps a running process so that a rerun can recover an active pass (showrunner ruling, 2026-11-06: no pane worker runs after the switch without the option). Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
+**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. At the switch, end each open pane worker that predates the compaction option, under any holder. Read `worker.py list` for each holder. The director ends its own workers, and asks each other holder's owner to end that holder's workers. End a worker only when its pass is complete, because a same-role dispatch keeps a running process so that a rerun can recover an active pass (showrunner ruling, 2026-11-06: no pane worker runs after the switch without the option). Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
 
 **Files:**
 - `config/direct.conf` — `WORKER_TRANSPORT=herdr`.
@@ -2799,7 +2791,10 @@ Only Spec items 13 and 14 need Python: a test shows the option and the configure
 - Phase 14a (herdr-unit, 2026-11-06): the pilot's director is Claude, so the pilot does not exercise a Codex parent. The Phase 14a tests and its live proof from a worker's environment cover TERM and COLORTERM at the pane boundary. A failed fresh start prints `publication failed: ...` and keeps the pane; the same launcher command publishes once from that pane.
 - Phase 3h review (2026-11-01): the pilot and default switch gate only the pane track, not the rename track.
 
-**Acceptance gate:** A pane worker opened after the switch shows `model_auto_compact_token_limit` in its process arguments. Require shutdown `b76d3b028` on sdlc and its worker-stop integration before the default switch.
+**Acceptance gate:** Run these checks on the installed Phase 14 and Phase 14f code, with current command mirrors.
+A pane worker opened after the switch shows `model_auto_compact_token_limit` in its process arguments. `worker.py list` for each holder shows no open pane worker from before the option.
+Resume a pane worker whose recorded folder differs from the current worktree. Require the same conversation, and the current worktree as its working folder.
+Require shutdown `b76d3b028` on sdlc and its worker-stop integration before the default switch.
 After Phase 12 reaches main, the director runs the installed Stop-hook friend proof for both families.
 Require the pilot run's phases to finish on panes.
 Require a live proof on the installed Phase 14d tree: a live detached result, a delayed pane status, a review Stage 2, a quiet wait that returns `NO_DONE`, and recovery through the saved launcher command.
@@ -2898,7 +2893,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
   Phase 13 owns the other display deletions; retain its historical transcript reads.
 - `docs/as-built/long-lived-workers.md`, `docs/as-built/herdr-adoption.md`, `docs/as-built/session-roster.md`, `docs/as-built/agent-registry.md`, `docs/as-built/shutdown-and-restart.md`, `docs/as-built/unit-board.md`, `docs/as-built/usage-ledger.md` — Reference → Cleanup list docs.
 
-**Workers:** `2 writers` — `impl`: Astra and friend routing, callers and tests, with `assign.py` and the launcher tests as one owner; `test` (opens as impl): remaining cleanup code, the detached helpers and their callers, tests and docs.
+**Workers:** `2 writers` — `impl`: Astra and friend routing, callers and tests, with `assign.py` and the launcher tests as one owner; `test` (opens as impl): remaining cleanup code, the detached helpers and their callers, tests and docs. `impl` owns `scripts/herdr/worker_panes.py` and `scripts/herdr/test_worker_panes.py`. In these two files, make the helper changes of Spec item 14.4 first, then remove the mesh dependencies. `test` sends its changes to these two files through `impl`.
 
 **State:** deletes state on disk (listed).
 
