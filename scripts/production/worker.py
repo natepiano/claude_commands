@@ -14,9 +14,6 @@ import subprocess
 import sys
 from typing import cast, final
 
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from scripts.agents import codex_mesh
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
@@ -24,7 +21,7 @@ from scripts.lib import atomic_file
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import staff, worker_admission
 
-import herdr
+from scripts.herdr import herdr
 
 StaffId = staff.StaffId
 WorkerName = staff.WorkerName

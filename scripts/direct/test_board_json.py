@@ -24,7 +24,12 @@ from scripts.direct import board_json
 from scripts.lib import unit_runs
 from scripts.production import fake_showrunner, showrunner_parent, staff, showrunners
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import isolated_staff_file, production_membership, showrunner_launch
+from scripts.production.staff_test_support import StaffTestCase, fixture_worker, isolated_staff_file, production_membership, showrunner_launch
+from scripts.lib.atomic_file import write_text_atomic
+from contextlib import redirect_stderr
+import io
+from scripts.herdr import worker_panes
+from scripts.herdr import herdr
 from scripts.shutdown import pane_record
 import display_cells
 
@@ -55,6 +60,35 @@ class ProductionFixture:
 
 
 class BoardJsonTests(unittest.TestCase):
+    def test_invalid_run_pin_keeps_build_and_main_available_with_a_problem_worker(self) -> None:
+        fixture = self.production()
+        history = self.write_run(fixture, self.delivery_events())
+        run = self.session_files()
+        parent = self.unit_member(fixture.name)
+        worker = fixture_worker("reader", parent.id)
+        assert isinstance(worker.parent, staff.ReportsTo)
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: worker.parent.id}))
+        write_text_atomic(run / "worker_transport", "junk\n")
+        error = io.StringIO()
+        with self.source_readers(), patch.dict(os.environ, self.environment), patch.object(
+                unit_runs, "run_roots", return_value=(self.run_root, self.former_root)), redirect_stderr(error):
+            subtree = board_json.resolve(fixture.name)
+            self.assertIsInstance(subtree, board_json.BoardSubtree)
+            assert isinstance(subtree, board_json.BoardSubtree)
+            document = board_json.build(subtree.runners[0].runner, record=subtree.record)
+        units = array_items(document["units"])
+        rows = array_items(object_fields(units[0])["workers"])
+        self.assertEqual(object_fields(rows[0])["state"], "incomplete")
+        self.assertIn("invalid worker transport: junk", str(object_fields(rows[0])["doing"]))
+        self.assertIn(str(run / "worker_transport"), error.getvalue())
+        self.assertIn(str(history), array_items(document["sources"]))
+        result = self.invoke("--production", fixture.name)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("invalid worker transport: junk", result.stderr)
+        cached = object_fields(cast(object, json.loads(self.cache_path(fixture.name).read_text())))
+        cached_rows = array_items(object_fields(array_items(cached["units"])[0])["workers"])
+        self.assertEqual(object_fields(cached_rows[0])["state"], "incomplete")
+
     def test_wrapped_child_is_not_a_board_descendant_even_when_its_timer_and_parent_remain(self) -> None:
         root = self.production("root")
         child = self.production("wrapped", running=False)
@@ -1889,6 +1923,139 @@ class BoardJsonTests(unittest.TestCase):
 
         for sample in samples:
             check_fields(sample, "board")
+
+
+class PaneBoardTests(StaffTestCase):
+    def pane_run(self) -> tuple[Path, staff.StaffRow, staff.StaffRow]:
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.root))
+        worker = fixture_worker("reader", parent.id)
+        run = self.root / "run"
+        run.mkdir()
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
+        write_text_atomic(run / "worker_transport", "herdr\n")
+        return run, parent, worker
+
+    def test_pane_worker_sources_include_posts_and_launcher_writes(self) -> None:
+        run, parent, worker = self.pane_run()
+        write_text_atomic(run / "board.log", "reader status: reading\n")
+        record = staff.snapshot()
+        sources: set[Path] = set()
+        with patch.object(unit_runs, "held", return_value=[str(run)]), patch.object(
+                worker_panes, "observe_parents", return_value={parent.id: [worker_panes.ClosedWorker(worker)]}):
+            rows = board_json.workers(run, sources, record=record)
+        self.assertEqual(rows[0]["state"], "closed")
+        self.assertIn(run, sources)
+        self.assertIn(run / "board.log", sources)
+
+    def test_named_read_states_and_supplied_rows_use_the_selected_record(self) -> None:
+        run, parent, worker = self.pane_run()
+        state = worker_panes.OpenWorker(worker, "pane-live", "terminal", herdr.AgentStatus.WORKING)
+        with patch.object(unit_runs, "held", return_value=[str(run)]), patch.object(
+                worker_panes, "observe_parents", return_value={parent.id: [state]}), patch.object(
+                staff, "snapshot", wraps=staff.snapshot) as snapshot:
+            rows = board_json.workers(run, set(), record=unit_runs.RunStaffAtUse.LOCAL,
+                                      pane_rows=board_json.ReadPaneRows.CURRENT)
+        self.assertEqual((rows[0]["state"], rows[0]["doing"]), ("working", "pane-live"))
+        self.assertEqual(snapshot.call_count, 1)
+        record = staff.snapshot()
+        with patch.object(staff, "snapshot", side_effect=AssertionError("extra staff read")), patch.object(
+                worker_panes, "observe_parents", side_effect=AssertionError("extra pane read")):
+            supplied = board_json.workers(run, set(), record=record, pane_rows={parent.id: rows})
+        self.assertEqual(supplied, rows)
+
+    def test_unreadable_pin_names_the_cause_and_keeps_a_problem_worker(self) -> None:
+        run = self.pane_run()[0]
+        pin = run / "worker_transport"
+        pin.unlink()
+        pin.mkdir()
+        error = io.StringIO()
+        with patch.object(unit_runs, "held", return_value=[str(run)]), redirect_stderr(error):
+            rows = board_json.workers(run, set())
+        self.assertEqual(rows[0]["state"], "incomplete")
+        self.assertIn(str(pin), str(rows[0]["doing"]))
+        self.assertIn(str(pin), error.getvalue())
+
+    def test_five_pane_states_keep_the_pane_and_the_reason(self) -> None:
+        run, parent, worker = self.pane_run()
+        cases: tuple[tuple[worker_panes.WorkerPane, str, str], ...] = (
+            (worker_panes.OpenWorker(worker, "pane-live", "terminal", herdr.AgentStatus.WORKING), "working", "pane-live"),
+            (worker_panes.StoppedWorker(worker, "pane-stop", "terminal"), "stopped", "pane-stop"),
+            (worker_panes.ClosedWorker(worker), "closed", ""),
+            (worker_panes.ProcessUnknownWorker(worker, "pane-unknown", "terminal", "process unreadable"), "unknown", "process unreadable"),
+            (worker_panes.UncertainWorker(worker, "pane read incomplete"), "incomplete", "pane read incomplete"),
+        )
+        for state, expected, detail in cases:
+            with self.subTest(state=expected), patch.object(unit_runs, "held", return_value=[str(run)]), patch.object(
+                    worker_panes, "observe_parents", return_value={parent.id: [state]}), patch.object(
+                    staff, "snapshot", wraps=staff.snapshot) as snapshot:
+                rows = board_json.workers(run, set())
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["slot"], "reader")
+            self.assertEqual(rows[0]["state"], expected)
+            if detail:
+                self.assertIn(detail, str(rows[0]["doing"]))
+            self.assertEqual(snapshot.call_count, 1)
+
+    def test_many_parents_use_one_pane_read_without_a_pin_write(self) -> None:
+        from scripts.herdr.test_worker_panes import PaneWorld
+
+        runner = fixture_member("showrunner", name="runner")
+        world = PaneWorld()
+        for index in range(2):
+            parent = fixture_member("unit", name=f"unit-{index}", parent=runner.id,
+                                    worktree=staff.PresentWorktree("natedev", self.root / str(index)))
+            worker = fixture_worker("reader", parent.id)
+            world.add(worker, f"w1:p{index}")
+            world.locations[f"w1:p{index}"]["agent_status"] = herdr.AgentStatus.WORKING
+        record = staff.snapshot()
+        with patch.object(unit_runs, "parent_transport", return_value="herdr"), patch.object(
+                worker_panes, "_client", return_value=world), patch.object(
+                herdr, "native_process", side_effect=world.native_process), patch.object(world, "panes", wraps=world.panes) as panes:
+            rows = board_json.pane_worker_rows(record)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({str(row["doing"]) for group in rows.values() for row in group}, {"w1:p0", "w1:p1"})
+        self.assertEqual({str(row["state"]) for group in rows.values() for row in group}, {"working"})
+        self.assertEqual(panes.call_count, 1)
+        self.assertEqual(list(self.root.rglob("worker_transport")), [])
+
+    def test_mesh_run_does_not_observe_panes_or_write_a_pin(self) -> None:
+        write_text_atomic(self.staff_file, '{"schema": 2, "rows": []}')
+        run = self.root / "run"
+        run.mkdir()
+        write_text_atomic(run / "mesh_roster.json", json.dumps({"reader": {"status": "paused", "role": "test"}}))
+        with patch.object(worker_panes, "observe_parents", side_effect=AssertionError("mesh pane read")):
+            rows = board_json.workers(run, set())
+        self.assertEqual([(row["slot"], row["state"]) for row in rows], [("reader", "paused")])
+        self.assertFalse((run / "worker_transport").exists())
+
+    def test_unreachable_owner_gives_a_problem_worker(self) -> None:
+        run = self.pane_run()[0]
+        error = io.StringIO()
+        with self.machine("mac"), patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}), redirect_stderr(error):
+            rows = board_json.workers(run, set())
+        self.assertIn("natedev not reached", error.getvalue())
+        self.assertEqual(rows[0]["state"], "incomplete")
+        self.assertIn("natedev not reached", str(rows[0]["doing"]))
+
+    def test_malformed_staff_gives_a_problem_worker(self) -> None:
+        run = self.root / "run"
+        write_text_atomic(self.staff_file, "not json")
+        error = io.StringIO()
+        with redirect_stderr(error):
+            rows = board_json.workers(run, set())
+        self.assertIn("staff", error.getvalue())
+        self.assertEqual(rows[0]["state"], "incomplete")
+
+    def test_missing_run_member_names_the_reference(self) -> None:
+        run = self.pane_run()[0]
+        missing = fixture_runtime_id("missing-board-parent")
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: missing}))
+        error = io.StringIO()
+        with patch.object(unit_runs, "held", return_value=[str(run)]), redirect_stderr(error):
+            rows = board_json.workers(run, set())
+        self.assertIn(missing, error.getvalue())
+        self.assertEqual(rows[0]["state"], "incomplete")
+        self.assertIn(missing, str(rows[0]["doing"]))
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from collections import Counter
 from unittest import mock
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
@@ -26,8 +26,11 @@ from scripts.production import codex_winddown
 from scripts.production import fake_unit_host
 from scripts.production import fake_showrunner
 from scripts.production import showrunners, staff
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
-from scripts.message import roster
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker
+from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr import herdr, worker_panes
+from scripts.message import process_table, roster
 from scripts.message.process_table import Process
 from scripts.message.sessions import SessionRecord
 from scripts.production.showrunners import Showrunner
@@ -685,6 +688,76 @@ class MessageTests(unittest.TestCase):
         self.assertIn("Wind-down: off", self.run_script("status").stdout)
         _ = self.run_script("start", "--from", "natedev")
         self.assertIn("Wind-down: on for hana", self.run_script("status").stdout)
+
+
+class PaneCountTests(StaffTestCase):
+    def test_five_states_count_only_working_codex_and_name_uncertainty(self) -> None:
+        parent = fixture_member("unit", name="pane-unit", parent=fixture_member("showrunner", name="pane-runner").id, worktree=staff.PresentWorktree("natedev", self.root))
+        worker = fixture_worker("reader", parent.id, backend=staff.CodexBackend(self.root / "codex"))
+        cases: tuple[tuple[worker_panes.WorkerPane, int, str], ...] = (
+            (worker_panes.OpenWorker(worker, "p1", "t1", herdr.AgentStatus.WORKING), 1, ""),
+            (worker_panes.StoppedWorker(worker, "p1", "t1"), 0, ""),
+            (worker_panes.ClosedWorker(worker), 0, ""),
+            (worker_panes.ProcessUnknownWorker(worker, "p1", "t1", "process unreadable"), 0, "unknown: process unreadable"),
+            (worker_panes.UncertainWorker(worker, "pane read incomplete"), 0, "incomplete: pane read incomplete"),
+            (worker_panes.OpenWorker(worker, "p1", "t1", herdr.AgentStatus.IDLE), 0, ""),
+        )
+        for state, expected, reason in cases:
+            error = io.StringIO()
+            with self.subTest(state=state), mock.patch.object(unit_runs, "parent_transport", return_value="herdr"), mock.patch.object(
+                    worker_panes, "observe_parents", return_value={parent.id: [state]}), mock.patch.object(
+                    codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
+                    process_table, "snapshot", return_value={}), mock.patch.object(
+                    staff, "snapshot", wraps=staff.snapshot) as snapshot, redirect_stderr(error):
+                counts = codex_winddown.current_counts()
+            self.assertEqual(counts[parent.name], expected)
+            self.assertEqual(snapshot.call_count, 1)
+            if reason:
+                self.assertIn("reader", error.getvalue())
+                self.assertIn(reason, error.getvalue())
+
+    def test_mesh_counts_keep_process_ownership_without_a_pane_read(self) -> None:
+        parent = fixture_member("unit", name="mesh-unit", parent=fixture_member("showrunner", name="mesh-runner").id, worktree=staff.PresentWorktree("natedev", self.root))
+        worker = fixture_worker("reader", parent.id)
+        table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "codex", "codex exec task")}
+        with mock.patch.object(unit_runs, "parent_transport", return_value="mesh"), mock.patch.object(
+                worker_panes, "observe_parents", side_effect=AssertionError("mesh pane read")), mock.patch.object(
+                codex_winddown, "live_sessions", return_value=[{"pid": 10, "name": "mesh-unit"}]), mock.patch.object(
+                process_table, "snapshot", return_value=table):
+            counts = codex_winddown.current_counts()
+        self.assertEqual(counts, {"mesh-unit": 1})
+        self.assertFalse((self.root / "worker_transport").exists())
+        self.assertNotIn(worker.name, counts)
+
+    def test_unreachable_owner_names_the_cause(self) -> None:
+        error = io.StringIO()
+        with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}), mock.patch.object(
+                codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
+                process_table, "snapshot", return_value={}), redirect_stderr(error):
+            counts = codex_winddown.current_counts()
+        self.assertIn("natedev not reached", error.getvalue())
+        self.assertEqual(counts.total(), 0)
+
+    def test_malformed_staff_names_the_cause(self) -> None:
+        write_text_atomic(self.staff_file, "not json")
+        error = io.StringIO()
+        with mock.patch.object(codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
+                process_table, "snapshot", return_value={}), redirect_stderr(error):
+            counts = codex_winddown.current_counts()
+        self.assertIn("staff", error.getvalue())
+        self.assertEqual(counts.total(), 0)
+
+    def test_missing_parent_names_the_worker_and_member(self) -> None:
+        missing = staff.native_id(fixture_runtime_id("absent-count-parent"))
+        worker = staff.StaffRow(staff.native_id(fixture_runtime_id("count-orphan")), "worker", "reader", staff.ReportsTo(missing), current_session=staff.native_id(fixture_runtime_id("count-orphan")))
+        error = io.StringIO()
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((worker,))), mock.patch.object(
+                codex_winddown, "live_sessions", return_value=[]), mock.patch.object(
+                process_table, "snapshot", return_value={}), redirect_stderr(error):
+            counts = codex_winddown.current_counts()
+        self.assertIn("reader", error.getvalue())
+        self.assertIn(missing, error.getvalue())
+        self.assertEqual(counts.total(), 0)
 
 
 if __name__ == "__main__":

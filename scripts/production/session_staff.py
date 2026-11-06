@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import fcntl
 import json
+import os
 import shlex
 import subprocess
 import tomllib
@@ -106,6 +107,26 @@ def worker_run_index(record: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[P
         except (OSError, ValueError) as error:
             print(f"anomaly: {run}: {error}".replace("\n", " "), file=sys.stderr)
     return {identity: tuple(runs) for identity, runs in found.items()}
+
+
+def pane_parents(record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+    """Select local parents whose workers use panes."""
+    from scripts.lib import unit_runs
+
+    parents = {row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo)}
+    found: list[staff.StaffRow] = []
+    for row in record.rows:
+        if row.id not in parents:
+            continue
+        location = row.doc if row.kind == "showrunner" else row.worktree
+        if (isinstance(location, (staff.LiveDoc, staff.WrappedDoc, staff.PresentWorktree, staff.RemovedWorktree))
+                and location.machine == remote.local_machine()):
+            found.append(row)
+    if not found:
+        return []
+    scanned = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record)
+    return [row for row in found
+            if unit_runs.parent_transport(row.current_session, scanned=scanned, record=record) == "herdr"]
 
 
 def worker_name(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:

@@ -22,7 +22,7 @@ from scripts.lib import atomic_file
 from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
 
-import herdr
+from scripts.herdr import herdr
 
 
 @final

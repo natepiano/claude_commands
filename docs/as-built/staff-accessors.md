@@ -79,6 +79,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
 | `scripts/production/change_review.py` | read | snapshot |
 | `scripts/production/change_routing.py` | read | staff.json path |
+| `scripts/production/codex_winddown.py` | read | snapshot |
 | `scripts/production/completion_receipt.py` | read | native_id |
 | `scripts/production/dailies_input.py` | read | snapshot |
 | `scripts/production/dailies_input_test_support.py` | write | rename, snapshot |

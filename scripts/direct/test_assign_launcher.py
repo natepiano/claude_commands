@@ -15,7 +15,7 @@ from scripts.agents import test_codex_mesh as mesh_fixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
 from scripts.direct import assign
 from scripts.direct.findings_test_support import invoke_findings
-import herdr
+from scripts.herdr import herdr
 
 from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
 from scripts.production.cli_fixture import invoke_cli
