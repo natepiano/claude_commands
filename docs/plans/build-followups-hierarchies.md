@@ -681,3 +681,46 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `test_tidy_wrapped.py` now proves that a wrap removes `alpha-unit` and retired `beta-unit` copies and keeps a `live-unit` copy.
 - A rename removes nothing: `remove_trees` would end a live worker's copy. Queue re-keys copy owners by staff row id, and the rename call joins that work.
 - Copy owners on disk are `<name>-unit`, and staff names are bare.
+
+### Phase 29 — A staff row keeps a field that its code does not know  · status: done
+
+#### Work Order
+
+**Goal:** A process that runs for hours reads rows that a newer `staff.py` wrote, and its writes keep the new fields.
+
+**Spec:**
+
+Cause: at 16:54 EST on 2026-11-06, launchers with `staff.py` from before 810931239 failed in `StaffRow.from_json`. That code refuses any field it does not know, and hana had just written `paused` on 8 rows.
+
+1. `StaffRow.from_json` keeps each field that it does not know. `to_json` writes each kept field back unchanged.
+2. Delete the unknown-field half of the refusal in `StaffRow.from_json`. The missing-field half stays, with its message.
+3. `_row_locations` follows the same rule. It requires `machine`, `path` and `state`, and the location object keeps any other field. `to_json` writes those fields back.
+4. `Paused.from_json` follows the same rule. It requires `since`, `by` and `why` as strings, and keeps any other field. `to_json` writes those fields back.
+5. Kept fields go on one keyword-only dataclass field, `unknown_fields`, with an empty default and `compare=False`. One helper in `staff.py` finds them.
+6. `dataclasses.replace` keeps `unknown_fields`, so a change to a row keeps them. A change to a location that the row already holds keeps its `unknown_fields`: a new path or state, a retirement, and a restore. The owner applies this in the setter, so a change sent from the Mac gives the same result. A new pause record starts with none, because it replaces the old record.
+7. A row with an unknown field prints no anomaly line. It is a normal state during a deploy.
+8. These stay as they are:
+   - the anomaly and retention path for a row of an unknown `kind`;
+   - the refusal of `worktree` or `doc` on a row kind that cannot hold it;
+   - the `schema` check. A change that old code cannot read safely still takes a new schema number;
+   - `_seed_fields`, which reads input and not rows.
+9. Tests in `scripts/production/test_staff.py`, with `STAFF_FILE` in a tempdir:
+   - a row with an unknown field at the row, the location and the pause level reads;
+   - a write through a public `staff` function on another row keeps all three fields in the file;
+   - a change to that row itself keeps its row-level field;
+   - a row with no `kind`, `id`, `name` or `parent` is still refused.
+10. `docs/as-built/staff-accessors.md` says that `StaffRow` also holds `paused` and `unknown_fields`, and states rule 1 and the schema rule.
+
+Limit: this protects only processes that start after the fix lands.
+
+**Files:**
+
+- `scripts/production/staff.py`
+- `scripts/production/test_staff.py`
+- `docs/as-built/staff-accessors.md`
+
+**Workers:** 1 writer, slot impl2.
+
+**State:** none. The file format stays at schema 2, and no row changes until a newer `staff.py` adds a field.
+
+**Acceptance gate:** `scripts/production/test_staff.py`, `scripts/production/test_session_staff.py` and `scripts/production/test_staff_accessors.py` pass. `basedpyright` on the changed Python files ends `0 errors, 0 warnings, 0 notes`.
