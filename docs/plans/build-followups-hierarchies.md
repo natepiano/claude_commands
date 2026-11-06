@@ -640,33 +640,11 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 25 — A new tab takes its place past saved worker tabs  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+- `herdr.tab_order` places a tab that is not saved after the last placed tab with an equal or lower rule. With no such tab, it goes at `start`. Saved tabs keep their order, and the first tab stays first.
+- `_bind_row_tab` and `order_tabs` both use `tab_order`, so one change corrects a transfer, a new tab and a full reorder.
+- Tests: `test_a_new_unit_takes_its_place_past_a_saved_worker_tab` and `test_moved_unit_takes_its_place_past_a_saved_worker_tab`. The second test checks the live order and the saved order. Both fail on the old scan. `assert_moved_unit_order` holds the shared setup and assertions for the two move tests.
+- No check, guard or refusal is added.
 
-**Goal:** the user's fault of 2026-11-06. `/showrunner:transfer_unit` moved unit-board into sdlc, and its tab stopped after herdr instead of after style. After this phase, a moved or new tab takes its place in the showrunner, units A-Z, other tabs A-Z order, also when saved worker tabs sit between the units.
-
-**Cause (found and reproduced by the unit director):**
-- `herdr.tab_order` in `scripts/herdr/herdr.py` puts a tab that is not saved before the first placed tab whose rule is greater.
-- The saved sdlc tabs are `sdlc, devtools, fix-rounds, herdr, review, impl, review2, hierarchies, ... style`. The review, impl and review2 tabs are herdr's workers.
-- The rule of a worker tab is greater than the rule of each unit tab. So unit-board stopped before `review`, and it went before hierarchies.
-- `_bind_row_tab` and `order_tabs` both use `tab_order`, so one change corrects both.
-
-**Spec:**
-1. `tab_order`: a tab that is not saved goes after the last placed tab whose rule is not greater than its own. With no such tab, it goes at `start`. Saved tabs keep their saved order. The first tab stays first.
-2. Update the `tab_order` docstring if it no longer states the behavior.
-3. Tests in `scripts/herdr/test_herdr.py`:
-   - `tab_order`: saved `boss, a-unit, worker, m-unit` with a new `z-unit` gives `boss, a-unit, worker, m-unit, z-unit`.
-   - `move_row_tabs` on the fixture client: a unit that moves into a production whose saved order has a worker tab between units takes its A-Z place, live and in the saved layout. This test fails without item 1.
-4. Add no check, guard or refusal. Tests never act on a live unit or a live herdr session.
-
-**Files:**
-- `scripts/herdr/herdr.py`
-- `scripts/herdr/test_herdr.py`
-
-**Workers:** 1 writer, slot impl2.
-
-**Acceptance gate:**
-- basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
-- These modules pass: `scripts/herdr/test_herdr.py`, `scripts/production/test_unit_lookup.py`, `scripts/production/test_unit_move.py`, `scripts/production/test_transfer_unit.py`, and each caller module of a changed function.
-- The merge gate on the merged tree is green.
+**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
