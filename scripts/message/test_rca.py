@@ -65,8 +65,8 @@ ALERTED = HANDLER._replace(waits="The cargo-handler release waits for it", sourc
 CAUSE = "a helper ran a build command that needs your permission"
 FIX = "helpers use the build command that is always allowed"
 # The reviewer's refusal of a fixed text: what failed, a question, and its own rewrite.
-REWRITE = review.Draft("cargo-liner", "0", "cargo-liner: fixed why handler stopped", NoActionRequired(),
-                       "The handler session stopped when it asked you to allow a build.\n"
+REWRITE = review.Draft("cargo-liner", "0", "cargo-liner: fixed why handler hit a check", NoActionRequired(),
+                       "In the handler session, the session asked you to allow a build.\n"
                        + "Why: a helper ran a build that needs your permission.\nNow: helpers use the allowed build.", False)
 REFUSED = review.Failed(REWRITE, ["plain-words"], failures=(review.RuleFailure("plain-words", "verify.sh"),),
                         questions=("What does the fix change for the user?",))
@@ -362,7 +362,7 @@ subprocess.run([sys.executable, '-c',
             _ = rca.open_case(HANDLER._replace(session="gone-unit", transcript=""), OPENED)
         self.assertEqual(self.case("261023-1")["transcript"], "")
         text = flags(self.sends()[0])["--text"]
-        self.assertIn("Commands: cargo build -p cargo-handler\nFind why it stopped", text)
+        self.assertIn("Commands: cargo build -p cargo-handler\nFind why this happened", text)
         self.assertNotIn("Transcript", text)
 
     def test_open_never_fails_its_caller(self) -> None:
@@ -393,10 +393,21 @@ subprocess.run([sys.executable, '-c',
             with self.subTest(commands=commands):
                 self.assertEqual(rca.action_of(commands), action)
 
+    def test_auto_mode_owner_message_and_story_describe_a_refused_command_without_a_session_stop(self) -> None:
+        case_id = rca.open_case(HANDLER._replace(kind="auto_mode", commands=("write progress.json",)), OPENED).split()[-1]
+        case = self.case(case_id)
+        delivered = flags(self.sends()[0])["--text"]
+        self.assertIn("handler-unit on natedev had a command refused by auto mode.", delivered)
+        self.assertIn("Find why this happened and fix the source.", delivered)
+        for text in (delivered, rca.owner_message(case, reminder=True), *rca.story(case).values()):
+            with self.subTest(text=text):
+                self.assertNotIn("stopped", text)
+        self.assertEqual(rca.story(case)["stop"], "auto mode refused a file change")
+
     def test_start_sends_the_started_push_in_plain_words_with_the_case_key(self) -> None:
         stopped = OPENED - timedelta(minutes=2)
         for report, stop, waits in (
-                (ALERTED._replace(stopped=stopped.isoformat()), "it asked you to allow a shell command",
+                (ALERTED._replace(stopped=stopped.isoformat()), "the session asked you to allow a shell command",
                  " The cargo-handler release waits for it."),
                 (HANDLER._replace(kind="auto_mode", commands=("write a.json", "edit b.py")),
                  "auto mode refused 2 file changes", "")):
@@ -413,9 +424,9 @@ subprocess.run([sys.executable, '-c',
                 self.assertEqual(self.values(self.sends()[-1]), {"sender": "cargo-liner", "session": "handler",
                                                                   "time": time, "stop": stop, "waits_line": waits})
                 rendered = push_texts.render("permission.rca_started", **self.values(self.sends()[-1]))
-                self.assertEqual(rendered.title, "cargo-liner: finding why handler stopped")
-                self.assertEqual(rendered.body, f"The handler session stopped at {time} when {stop}.{waits} A session"
-                                 + " now finds the cause and fixes it, so it does not stop there again."
+                self.assertEqual(rendered.title, "cargo-liner: finding why handler hit a check")
+                self.assertEqual(rendered.body, f"At {time} in the handler session, {stop}.{waits} A session"
+                                 + " now finds the cause and fixes it, so this does not happen again."
                                  + " A second push comes when the fix is in.")
                 # The owner, who the user does not need, stays in the case.
                 self.assertEqual((self.case(case_id)["status"], self.case(case_id)["owner"]), ("started", "builds-unit"))
@@ -432,9 +443,9 @@ subprocess.run([sys.executable, '-c',
         sent = flags(fixed_push)
         self.assertEqual((sent["--text-id"], sent["--from"], sent["--key"]), ("permission.rca_fixed", "messaging", "rca-261023-1"))
         rendered = push_texts.render("permission.rca_fixed", **self.values(fixed_push))
-        self.assertEqual(rendered.title, "messaging: fixed why handler stopped")
+        self.assertEqual(rendered.title, "messaging: fixed why handler hit a check")
         # The waits sentence is in the present tense: the fixed push leaves it out.
-        self.assertEqual(rendered.body, f"The handler session stopped at {silence.shown(OPENED)} when it asked you to"
+        self.assertEqual(rendered.body, f"At {silence.shown(OPENED)} in the handler session, the session asked you to"
                          + f" allow a shell command.\nWhy: {CAUSE}.\nNow: {FIX}.")
         # The push review read the whole fixed text once and approved it.
         self.assertEqual([(draft.title, draft.body) for draft in self.reviewed], [(rendered.title, rendered.body)])
@@ -553,7 +564,7 @@ subprocess.run([sys.executable, '-c',
         with redirect_stdout(io.StringIO()):
             self.assertEqual(silence.release(*claimed, lambda _argv: 0, post, "silence off"), 0)
         self.assertEqual([(push["source"], push["key"], push["title"]) for push in delivered],
-                         [(sender, "rca-261023-1", "cargo-liner: fixed why handler stopped")])
+                         [(sender, "rca-261023-1", "cargo-liner: fixed why handler hit a check")])
         self.assertTrue(delivered[0]["message"].endswith(f"Now: {FIX}."))
 
     def test_a_failed_push_exits_1_and_keeps_the_new_status(self) -> None:

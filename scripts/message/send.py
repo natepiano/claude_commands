@@ -209,15 +209,18 @@ NEEDS_GO_HELD = ("not sent: this push asks the user to type a go. Send it with t
 SESSION_TEMPLATES = {
     "decision.choices": "a decision with structured choices and a recommendation; see review.py show decision.choices.",
     "review_watch.acknowledge": "a reminder to acknowledge a review report; see review.py show review_watch.acknowledge.",
-    AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
+    AUTO_MODE_TEXT: ("auto mode refused a command; the session continues its other work. "
+                     + "Send auto_mode.refused only when the refused step holds work and the user has no step for it yet. "
+                     + "If the user already has one, send nothing. "
+                     + "With other work to run, go on with it and leave out --need blocked. " + AUTO_MODE_CALL),
     PAID_CREDITS_TEXT: ("an account now spends paid credits; a script with no Claude session names itself with --from. "
                         + PAID_CREDITS_CALL),
     PAID_CREDITS_QUEUED_TEXT: ("an account now spends paid credits and the user queued a workers move; workers wait for"
                                + " the move, never go to Claude. " + PAID_CREDITS_QUEUED_CALL),
     NEEDS_GO_TEXT: "a session is stopped until the user types a go in its pane. " + NEEDS_GO_CALL,
-    rca.STARTED_TEXT: ("a unit starts to fix why a session stopped for a permission. Sent by rca.py start;"
+    rca.STARTED_TEXT: ("a unit starts to fix the cause of a permission stop or refusal. Sent by rca.py start;"
                        + " sessions run rca.py, not this: " + rca.CALL + " start <id> --owner <unit>"),
-    rca.FIXED_TEXT: ("the fix merged and the session does not stop for that permission again. Sent by rca.py fixed;"
+    rca.FIXED_TEXT: ("the fix merged; that permission does not stop or refuse the session again. Sent by rca.py fixed;"
                      + " sessions run rca.py, not this: " + rca.CALL
                      + ' fixed <id> --cause "<cause>" --fix "<fix>" --commit <sha>'),
     rca.REWRITTEN_TEXT: ("the push review's rewrite of a fixed text it refused twice. Sent by rca.py fixed;"
@@ -226,7 +229,7 @@ SESSION_TEMPLATES = {
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
 AUTO_MODE_REFUSAL = re.compile(r"\b(refused|denied|stopped)\b", re.IGNORECASE)
-# The rca.py pushes tell of a session that stopped, and a cause can say auto mode refused a command.
+# The rca.py pushes describe permission stops or refusals. A cause can name an auto-mode refusal.
 RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
@@ -2537,8 +2540,7 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 
 def refusal_report(options: Options) -> rca.Report:
-    """The facts of an auto_mode.refused push: rca.py opens a case for the stopped session with them,
-    with the waits sentence the alert showed and the alert's sender and key."""
+    """Open a case for the session with refused commands, the waits sentence, and the alert's sender and key."""
     values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
     return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
                       waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
