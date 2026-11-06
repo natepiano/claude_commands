@@ -966,7 +966,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
    - status 101 with `HOLD_LINT=1`: no repair;
    - status 101 with `RUN_LAST_ATTEMPT_KILLED=1`: no repair;
    - status 101 with the signal text in the log: no repair.
-4. **End-to-end runs.** `test_first_judgment_nonlint_status_never_repairs` keeps its assertions and runs one status, 1, with no `subTest`. Read `run` in `scripts/lint/invoke.sh` first. When a table status takes its own path through `run`, keep one end-to-end status for each such path, and name them in the summary. All other tests in the file stay as they are.
+4. **End-to-end runs.** `test_first_judgment_nonlint_status_never_repairs` keeps its assertions and runs two statuses. Status 1 takes the plain failure path. Status 143 also enters `step_stopped_by_hold` in `run_step` in `scripts/direct/verify.sh`, because that check runs only for a status above 128. All other tests in the file stay as they are.
 
 **Invariants:** `verify.sh` output, exit codes, cache records and build-log records stay the same for every verb. Fix, format, final judgment and `clippy_fix_pass_limit` behavior do not change. Add no other guard, refusal or check.
 
