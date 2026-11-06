@@ -359,7 +359,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(found[parent.id], [worker_panes.ProcessUnknownWorker(
             other, "w2:p1", "terminal-w2:p1", "process permission denied")])
         self.assertIsInstance(next(item for item in found[self.parent.id] if item.row.id == absent.id),
-                              worker_panes.UncertainWorker)
+                              worker_panes.ClosedWorker)
         self.world.unreadable = True
         found = worker_panes.observe_parents([self.parent, parent], record)
         self.assertTrue(all(isinstance(item, worker_panes.UncertainWorker) for states in found.values() for item in states))
@@ -1048,6 +1048,25 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.staff_state(), before)
         self.assertEqual((self.world.closed, self.world.stops), ([], []))
 
+    def test_refused_pass_keeps_a_stopped_worker_and_prevents_a_role_change(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        self.dispatch(row, "impl")
+        path = self.root / "run/progress_history_state.json"
+        _ = path.write_text(path.read_text().replace('"active"', '"refused"'))
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.StoppedWorker)
+        result = worker_panes.can_close(observed)
+        self.assertIsInstance(result, worker_panes.Kept)
+        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Kept)
+        self.assertEqual(self.world.closed, [])
+        self.world.add(row, "w1:p1")
+        changed = self.start(row.name, role="review")
+        self.assertIsInstance(changed, worker_panes.StartRefused)
+        assert isinstance(changed, worker_panes.StartRefused)
+        self.assertEqual(changed.reason, worker_panes.StartRefusal.BUSY_ROLE_CHANGE)
+        self.assertEqual(self.world.launches, [])
+
     def test_close_rerun_after_agent_stop_closes_only_that_terminal_once(self) -> None:
         row = self.worker()
         sibling = self.worker("sibling")
@@ -1324,6 +1343,19 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(found[known.id], worker_panes.OpenWorker)
         self.assertIsInstance(found[absent.id], worker_panes.ClosedWorker)
         self.assertEqual(self.world.commands, [])
+
+    def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
+        absent = self.worker("absent")
+        self.world.add(self.parent, "w1:p9", live=False, label="foreign")
+        self.world.unknown["w1:p9"] = "unreadable pane in the parent's tab"
+        found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
+
+    def test_unreadable_parent_pane_leaves_an_absent_worker_uncertain(self) -> None:
+        absent = self.worker("absent")
+        self.world.unknown["w1:p0"] = "unreadable parent pane"
+        found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
 
     def test_unrelated_unknown_pane_in_another_tab_allows_a_new_worker(self) -> None:
         self.world.add(self.parent, "w2:p9", live=False, label="foreign", workspace="w2", tab="w2:t2")

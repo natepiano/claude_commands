@@ -2366,152 +2366,76 @@ The stop writer owns `scripts/lib/resume_message.py` and its tests; the restore 
 
 ### Phase 11 — Account moves for pane workers (accounts unit)  · status: todo
 
-**Depends on:** Phase 3n, Phase 7, Phase 8, Phase 9, Phase 10. Shared final-batch gate with Phase 14; consume the existing atomic bytes writer.
+**Depends on:** Phase 3n, Phase 7, Phase 8, Phase 9, Phase 10.
 
 #### Work Order
 
-**Goal:** an account move relaunches each worker on the new account in its own pane, without a lost or forked conversation.
+**Goal:** Resume each worker on the destination account in its own pane with the same conversation.
 
-**Spec:** Each worker move has a move id and one entry in the moves log, keyed by staff id and move id, that names its last finished step and the worker's `terminal`. Under the worker's dispatch lock:
-1. Wait for or interrupt the worker's turn.
-   Stop it through `restart.stop_row` and `stop_resume.stop` with `deadline=<monotonic>` from shutdown-unit.
-   Keep the pane open at its shell.
-   Prove `StoppedWorker` on the same terminal through fresh Phase 7 observation.
-   An uncertain or unknown worker supplies no stopped proof; leave its copy and restart steps unchanged.
-   Print its reason and continue unrelated proved moves.
-2. Read each conversation file from the source home, with its size and hash.
-3. Publish each file in the target home with `atomic_file.write_bytes_atomic(path, data)`, then check the published file's size and hash against the source. The move makes no staging folder and calls no `os.replace` of its own. A file is never seen half copied.
-4. Call `start_or_resume(parent, name, role, account=DestinationWorkerAccount(target))` from Phase 7.
-   Read the role through `progress_history.last_dispatch(worker_id)` with the worker's fixed staff id.
-   Pass that role explicitly to selection, destination resume, and source rollback.
-   Return `WorkerRoleUnavailable(reason)` when the dispatch role is unavailable; do not guess a role.
-   Reuse the stopped pane through `ExistingPane` and prove the same current session and terminal on the target account.
-   Record success only after that proof.
-Keep the same pane through every move step.
-Before source rollback, prove that no target process owns the conversation through fresh observation.
-Resume once through `DestinationWorkerAccount(source)` in that same pane.
-Report the failure and source resume result.
-Continue a rerun from its last finished step.
-Keep a published file unchanged when its size and hash match the source.
-Keep a target that already runs the conversation; start no source beside it.
-Read each run's pin through `unit_runs.worker_transport(run)`.
-Keep only the named mesh-pinned account paths until Phase 18.
+1. Keep the `accounts.move_workers` signature and its callers.
+2. Check the family through `restart_refusal`.
+3. Read the role through `progress_history.last_dispatch` when available, or `worker_panes.dispatch_role` on this tree.
+4. Leave a worker with no recorded role unchanged, with one line.
+5. Acquire `worker_panes.worker_lock` without blocking.
+6. Leave a `Kept` worker unchanged, with one line, and continue other workers.
+7. Read fresh evidence through `observe`.
+8. Leave `UncertainWorker` and `ProcessUnknownWorker` unchanged, with one anomaly line.
+9. Keep an `OpenWorker` already on the target and record success.
+10. Stop an `OpenWorker` on the source through `restart.stop_row`.
+11. Use the deadline from `config/shutdown.conf`.
+12. Require fresh `StoppedWorker` evidence on the same terminal before the destination launch.
+13. Resume a `StoppedWorker` through `start_or_resume` with the destination account and the held lock.
+14. Resume a `ClosedWorker` only when `start_or_resume` keeps its conversation.
+15. Report a closed worker as not moved if that API cannot keep its conversation.
+16. Send `resume_message` through the shared target check only for an open worker with an active pass.
+17. Include `AccountMove(source, target)` and `ResumeWorkers(panes=[PaneWorkerResume(staff_id, BusyPass(dispatch_id))])`.
+18. Send no text to an idle worker.
+19. On another start result, read fresh evidence before recovery.
+20. Resume the source once in the same pane only with proof that no target process owns the conversation.
+21. Report the destination result and the source recovery result.
 
-**The bytes writer.** Reuse the existing `atomic_file.write_bytes_atomic` and its shared publication step; add no writer implementation.
+Numbered homes share `sessions`, `archived_sessions`, `session_index.jsonl`, and `projects`.
+The move copies no conversation files and publishes no duplicate file.
+It uses no byte writer, size comparison, or hash comparison.
+It creates no step record and performs no post-move check.
+A rerun uses fresh evidence and keeps a target that already runs the conversation.
+`ClosedWorker` retains its staff row and current session; `start_or_resume` resumes that session in a new worker pane.
 
-5. **Delete replaced paths.** Replace `accounts.move_workers`' stop-and-pending restart path with the proved pane move in this phase.
-   Delete superseded worker server retirement and restart branches that have no pinned consumers.
-   Retain only mesh-pinned server handling, server display lines, and `codex_mesh.leftover_server_lines` until Phase 18.
-   Only those retained paths join the group ending at Phase 18.
+**Log:** Use the existing requested, confirmed, and failed entries in `scripts/accounts/moves.py`.
+The subject is the staff id; requested entries also name the terminal.
 
-**Files:**
+**Refused pass:** Mark a pass `refused` when `refusal_watch.transcript_refusal` classifies its transcript as refused.
+Keep its pass id and leave the pass open for redispatch after the account move.
+A refused pass prevents pane closure and a role change.
+Do not use `finish-pass` for this mark.
+The existing account notice remains the user surface.
 
-- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py` — the worker move; delete the replaced stop-and-pending restart path and superseded account-move code.
-- `scripts/accounts/next_moves.py`, `scripts/accounts/test_next_moves.py`, `scripts/whoami/quota_alert.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py` — the move callers.
-- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — the `refused` pass mark, with the same pass id; a test from the classifier to the move.
-- `scripts/direct/recorder_state.py` — read only: the last dispatch role and existing pass state.
-- `scripts/lib/atomic_file.py` — read only: the existing `write_bytes_atomic` with its publication failure contract.
-- `scripts/herdr/worker_panes.py`, `scripts/shutdown/stop_resume.py`, `scripts/shutdown/restart.py`, `scripts/lib/resume_message.py` — consume pane, stop, restart, and resume-message APIs.
-  Phase 7 owns account selection; this phase leaves these source files unchanged.
+**Readers:** Use the shared live-account readers for both Claude and Codex.
+Correct `accounts.session_on_account` and `stop_resume.running_on_account` where they miss Codex.
+Add no second live-account reader.
 
-**Workers:** `1 writer + 1 tester` — split by source and test lane.
-- `impl` — `scripts/accounts/accounts.py`, `scripts/accounts/next_moves.py`, `scripts/whoami/quota_alert.py`; hub: `scripts/accounts/accounts.py` (the account move).
-- `test` — `scripts/accounts/test_accounts.py`, `scripts/accounts/test_next_moves.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`.
-  Write tests from the Spec and own their process-info fixture changes.
+**Deletes:** Remove the stop-and-pending path and server retirement from pane-worker moves.
+Keep `ResumePending` while normal moves or mesh-pinned workers still produce it.
+Runs pinned through `unit_runs.worker_transport(run)` retain their mesh path until Phase 18.
+Change `worker_panes.py` only through a plain public rename when needed.
+Keep the explicit role for the destination and for source recovery.
 
-**State:** account homes; moves log.
+**Tests:** Use fake processes, fake panes, temporary projects, and a temporary `HOME`.
+Cover all five `WorkerPane` variants: `OpenWorker`, `StoppedWorker`, `ClosedWorker`, `ProcessUnknownWorker`, and `UncertainWorker`.
+Cover all seven `WorkerStart` variants: `OpenWorker`, `IncompleteStart`, `AdmissionRefused`, `UnpublishedWorker`, `ProcessUnknownWorker`, `UncertainWorker`, and `StartRefused`.
+Check `StartRefused.reason`, `StartRefused.detail`, exit 2, no prompt delivery, and no row deletion.
+Check the busy pass message and the idle worker's lack of input.
+Check source recovery with no live target, changed dispatch roles, missing roles, and a held worker lock.
+Check a completed rerun, a mesh-pinned run, sibling panes, the director pane, and the Codex account reader.
+Test the route from transcript refusal to the pass mark and the move.
+Remove the copy, publication, and atomic failure tests for this move.
+Keep the shared bytes-writer tests unchanged.
+Record added and deleted source lines; explain retained mesh code until Phase 18.
+Require basedpyright with zero errors and zero warnings on changed files and callers.
 
-**Constraints from prior phases:** Phases 7–9 provide native admission, explicit role arguments, and last-dispatch restore.
-- Phase 14a (herdr-unit, 2026-11-06): a resumed Codex reports no `agent_session` before its first prompt, and `Herdr.pane_native_process` reads that state as `UnreportedResume`. Preserve this pane proof through destination resume and source rollback. The destination and rollback tests cover a resumed Codex before its next prompt.
-- Phase 9 (herdr-unit, 2026-11-05): mark a pass that `refusal_watch.transcript_refusal` classes as refused `refused`, and keep the open pass for redispatch after the account move. Phase 9 left this out because no caller of the classifier exists. `finish-pass` has no `refused` status and closes the pass, so this phase adds the mark to `scripts/direct/progress_history.py` with the same pass id. Test the route from the classifier to the move. The existing account notice is the user surface.
-- The recorder API is merged; `worker_panes.dispatch_role` still uses the temporary by-name reader. Read the role through `worker_panes.dispatch_role`. herdr-unit switches it to `last_dispatch(row.id)` in Phase 14d.
-Phase 7 owns `start_or_resume(parent, name, role, account=DestinationWorkerAccount(target)) -> WorkerStart`.
-Use `observe(parent, record)` with all five `WorkerPane` variants.
-Reuse a stopped pane through `ExistingPane`.
-Phase 10 owns the shared `resume_message` builder and `PaneWorkerResume`.
-Prove the worker process stopped and its pane reached the shell through fresh observation.
-Use `atomic_file.write_text_atomic` or `write_bytes_atomic` for every added or changed file write.
-Use `sync_folder` only for the folder step.
-Add no private temporary-file, `fsync`, or replace sequence.
-Keep `accounts.py`'s private `_atomic_write` outside the worker move.
-- Phase 4r (review, 2026-11-04): a Claude launch writes no pane launch record; only `Herdr.start_agent` still writes the Codex compatibility record. Assert `current_session`, the process generation, the terminal and a confirmed close, not a launch publication. Keep a compatibility-record test only where a caller still reads that record.
-- Phase 4r (review, 2026-11-04): a missing terminal, an unreadable pane list or a duplicate pane is not an operation refusal. Each destructive action goes through `herdr.check_target`; an unproved target is left alone with one anomaly line, and unrelated known work continues. Test that case.
-- Phase 4r (review, 2026-11-04): pane input and close take the current-session target: `Herdr.prompt(pane, text, *, target)`, `Herdr.send_keys(pane, *keys, target)`, `Herdr.close_pane(pane, *, target) -> bool`. Carry the target through each operation. Test a changed `current_session`, a reused pane and sibling protection.
-- Phase 3h review (2026-11-01): `atomic_file.write_bytes_atomic` and the shared publish step exist, with distinct pre-publication and post-replacement failures; do not build them again. The hub is the accounts move; test move recovery against those failures.
-
-**Constraints from Phase 5b:**
-`Herdr.record_layout` in `scripts/herdr/herdr.py` reads `pane process-info` for every listed pane.
-Every fake herdr used by this phase answers that command for each listed pane.
-Use native agent facts for rows that must retain saved bindings; use known shell facts for panes without agents.
-Use `pane_process_reply` in `scripts/herdr/test_herdr_sessions.py` as the fixture model.
-Keep saved rows and existing assertions unchanged.
-Each test owner makes the fixture changes in that owner's test files.
-
-**Constraints from shutdown and account integration:**
-Use `stop_resume.stop`, `restart.stop_row`, and `restart.start_row` for member lifecycle operations.
-Pass `deadline=<monotonic>` through their shutdown-unit integration, commit `b76d3b028`.
-Require Phase 4l's shared `LiveConversation | StoppedConversation | UnknownConversation` reader before dispatch.
-Unknown evidence prints one anomaly line and supplies no stopped proof.
-The `unit_move.py` deadline next item remains separate.
-Phase 3n stores no role and admits workers through `staff.ensure_worker(identity, name, parent)`.
-Pass the role explicitly to `start_or_resume` and every worker selection call.
-Read the role through `progress_history.last_dispatch(worker_id)` with the worker's fixed staff id.
-The reader returns the role, phase, and pass id from existing pass state and history.
-`scripts/direct/progress_history.py` owns that pass and its `instance_id` in `progress_history_state.json`.
-Phase 8 or devtools 3t owns this reader; add no role store.
-Keep the staff specification at seven fields; add no role to `StaffRow`, `ensure_worker`, or admission.
-Return `WorkerRoleUnavailable(reason)` when restore cannot find a dispatch record with a role.
-Keep that result distinct from admission refusal and backend-unavailable results.
-Never derive a role from a worker name.
-Phase 7 owns `ConfiguredWorkerAccount.CURRENT | DestinationWorkerAccount(label)` and `--account`.
-Use the explicit destination for target resume and the explicit source for rollback.
-Never use the normal account selector to choose a move destination.
-
-**Acceptance gate (outcomes):**
-Test all five `WorkerPane` variants: `OpenWorker`, `StoppedWorker`, `ClosedWorker`, `ProcessUnknownWorker`, and `UncertainWorker`.
-Unknown process evidence supplies no stopped or absent proof.
-A structural fault leaves that worker unchanged and permits unrelated proved work.
-Test all seven `WorkerStart` variants: `OpenWorker`, `IncompleteStart`, `AdmissionRefused`, `UnpublishedWorker`, `ProcessUnknownWorker`, `UncertainWorker`, and `StartRefused`.
-Test `StartRefused.reason` and `StartRefused.detail`, exit 2, no prompt delivery, and no row deletion.
-Only `OpenWorker` permits prompt delivery.
-An incomplete start keeps its pane and sends no work.
-Admission refusal preserves its exact refusal line and exit 2.
-Failed publication keeps the backend and makes no replacement row or pane.
-Unknown process evidence prints one anomaly line and supplies no stopped or absent proof.
-A structural fault leaves that worker unchanged and permits unrelated proved work.
-Test each family on the explicit destination account and preserve its current session, pane, and terminal.
-Unknown evidence proves neither a stopped source nor an absent target.
-Fallback starts no source while the target owns the conversation.
-
-**Acceptance gate:**
-
-Record added and deleted source lines for this phase in its checkpoint message.
-Require a source decrease here unless the named pinned paths require the group ending at Phase 18.
-Do not delete unrelated code to meet a count.
-Test destination resume and source rollback with the last dispatch role, including a role changed between dispatches.
-Test missing dispatch roles without copying files or starting a worker.
-
-- basedpyright 0/0 on changed files and every caller module.
-- Move tests: busy, idle, and the failure fallback, which starts no source while a target process owns the conversation; an `UncertainWorker` leaves that worker unchanged before any copy.
-- Account-move tests cover both existing atomic failure outcomes: before publication and after replacement.
-  Keep the existing bytes-writer mode and publication tests unchanged.
-- Real proofs (Invariants → Lifecycle reruns keep the pane), in a probe tab of `agents` with a real worker pane: a real move keeps the same tab, pane id and `terminal_id`; a rerun of the finished move changes nothing and exits 0; one real move stopped after its publish step finishes on rerun in the same pane.
-- Rerun tests (Invariants → Rerun-safe tools), each ending on the new account with the same pane and terminal and one conversation, as one clean move: `test_move_rerun_mid_copy` (stopped inside a `write_bytes_atomic` call: no partial file is published; the rerun writes the file once); `test_move_rerun_after_publish` (stopped before the target starts); `test_move_rerun_after_target_resume` (stopped before the success record: the rerun keeps the target and starts no source); a rerun of a finished move reports done and changes nothing.
-- Full gate green.
-
-**Pane close contract:** use Phase 6's confirmed pane close and `pane_launch.retire_launch`.
-Preserve the director and sibling panes; test one retained launch after replacement and recovery after failed closure.
-
-**Process anomaly rule:** Unknown process evidence prints one anomaly line and supplies no stopped or absent proof.
-Use the herdr tab name, session name, or pid to identify the process, in that order.
-A failed name read does not refuse the operation.
-Leave an unproved worker unchanged and continue unrelated proved work.
-Signal or close only through the shared target check.
-Refuse destructive work only when the required target is proved live.
-Test named output, continued known work, and protection of sibling panes.
-
-**Resume-message contract:** consume Phase 10's `NoAccountMove | AccountMove(source, destination)` read-only.
-Keep complete move messages unchanged; test account-move recovery before publication and after replacement.
+**Real proof:** The user moves a worker in a probe tab.
+The move keeps the conversation and the stopped pane's terminal.
+A rerun of a finished move starts no process and changes nothing.
 
 ### Phase 12 — Astra and ask-a-friend in panes  · status: done
 
@@ -2762,7 +2686,7 @@ No Python or new rerun test is required for this text phase.
 
 **Ruled out:** a second start path through worker add in `astra_review.py`; a retire fix in this plan, because hierarchies Phase 23 prints an anomaly for an unrelated Codex process.
 
-### Phase 14e — An unknown pane in another tab leaves a parent's workers alone  · status: todo
+### Phase 14e — An unknown pane in another tab leaves a parent's workers alone  · status: done
 
 **Depends on:** Phase 14b
 
@@ -2770,7 +2694,7 @@ No Python or new rerun test is required for this text phase.
 
 **Goal:** Morty's bare panes do not make every worker uncertain, and 1bd733716's red on sdlc ends. Showrunner ruling, 2026-11-06: "a pane that is not the parent's cannot make the parent's workers uncertain; evidence that touches the parent's own workers still can."
 
-**Spec:** In `worker_panes._parent_evidence`, a worker with no native match and no labelled pane is `UncertainWorker("pane evidence is incomplete; absence is unproved")` when an unknown pane's tab is one of the parent's tabs. Otherwise it is `ClosedWorker`. Phase 14a removed this branch, which made the three Hierarchies Phase 22 tests red on the merged tree. An unknown pane in another tab changes nothing for this parent.
+**Spec:** In `worker_panes._parent_evidence`, a worker with no native match and no labelled pane is `UncertainWorker("pane evidence is incomplete; absence is unproved")` when an unknown pane's tab is one of the parent's tabs. Otherwise it is `ClosedWorker`. Phase 14a removed this branch, which made the three Hierarchies Phase 22 tests red on the merged tree. An unknown pane in another tab changes nothing for this parent. An unknown pane that carries the parent's name as its label adds its tab to the parent's tabs. So a parent whose own pane read fails keeps its absent workers uncertain (showrunner ruling, 2026-11-06). A pane with a worker's label in another tab does not count, because worker names repeat across parents.
 
 **Files:**
 - `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — the rule, and the one assertion that changes under the ruling.
@@ -2781,7 +2705,7 @@ No Python or new rerun test is required for this text phase.
 
 **Constraints from prior phases:** Phase 14d follows this phase. The tree for this phase is a private clone, because Phase 14d's writers hold the unit worktree.
 
-**Acceptance gate:** `test_observe_parents_shares_one_read_and_keeps_each_parents_worker_states` shows an unknown pane in another parent's tab leaves this parent's absent worker closed. `test_roster.PaneRosterTests.test_pane_workers_keep_five_states_and_replace_native_session_entries` and `test_staff_sources.StaffSourcesTests.test_live_pane_workers_keep_all_five_states_and_report_unknown_evidence` stay as written, because their unknown pane is in the parent's tab. Live, read only: `worker_panes.observe` shows no worker uncertain from Morty's unknown panes. The full gate passes before the hash goes to the showrunner.
+**Acceptance gate:** `test_observe_parents_shares_one_read_and_keeps_each_parents_worker_states` shows an unknown pane in another parent's tab leaves this parent's absent worker closed. `test_roster.PaneRosterTests.test_pane_workers_keep_five_states_and_replace_native_session_entries` and `test_staff_sources.StaffSourcesTests.test_live_pane_workers_keep_all_five_states_and_report_unknown_evidence` stay as written, because their unknown pane is in the parent's tab. Live, read only: `worker_panes.observe` shows no worker uncertain from Morty's unknown panes. The full gate passes before the hash goes to the showrunner. `test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain` and `test_unreadable_parent_pane_leaves_an_absent_worker_uncertain` pin the two cases that stay uncertain.
 
 ### Phase 14d — The worker list reads a mesh-pinned run  · status: todo
 
@@ -2895,7 +2819,10 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
     7. One start path for held design roles and friends (sdlc, 2026-11-06). Phase 14b makes `assign.sh` the one start path for an Astra review. Held design roles still start through `worker add` in `design_roles.py`, and friends through `side_pane.py`. Move both behind the pane transport of `assign.sh`. Preserve non-staff consultations and durable design recovery.
 15. **Keep the launcher fixture (builds, via sdlc, 2026-11-06).** `scripts/agents/test_codex_mesh.py` also supplies the fixture of other test modules: `setUpModule`, `THREAD_ID`, `FixtureLoopBudget`, `LifecycleTestClock` and `StubAppServer`. Before you delete that file, move each name that a kept test still reads into a kept test support file, and update each importer. Importers today: `scripts/direct/test_assign_launcher_reuse.py`, `test_assign_launcher_identity.py`, `test_assign_launcher.py`, `test_assign_launcher_review.py`, `test_assign_gate.py`, `test_assign_claude_door.py`, `test_launcher_waits.py`, `test_implement_launcher_compaction.py`, `test_workers.py`, `assign_launcher_test_support.py`, and `scripts/astra/test_astra_review.py`.
 
+16. **A worker never types its run folder (hierarchies, via sdlc, 2026-11-06).** Codex workers that retyped the path made 4 wrong folders under `/tmp/claude/unit`. `detached_runs.py start` and `board.sh` read, post and role find the folder from the worker's identity or environment, and take no folder argument from a pane worker. Check that a retained pane does not carry an older run's `UNIT_RUN_DIR`. Worker prompts stop naming the path. Add no new check.
+
 **Files:**
+- `scripts/direct/board.sh` — find the run folder from the worker's identity or environment (Spec item 16).
 
 - `scripts/production/worker_fill.py`, `scripts/production/test_worker_fill.py`, `scripts/production/migrate_staff_ids.py`, `scripts/production/test_migrate_staff_ids.py` — delete one-time tools after completeness and history proofs.
   Remove their command callers and collector imports.

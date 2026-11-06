@@ -435,16 +435,22 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role worker
 
 A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
-It retires each run's current server and tells each affected unit director once.
+Pane workers stop and resume the same conversation on the target account in their own panes.
+A stopped pane keeps its terminal; a closed pane resumes the same conversation in a new worker pane.
+An active pass receives one resume message; an idle worker receives no text.
+A held worker lock or unknown process leaves that worker unchanged while other workers continue.
+A failed target launch permits one source resume only after fresh evidence proves that no target process owns the conversation.
+Mesh-pinned runs keep their server release path until Phase 18.
 A running worker resumes the same thread on the new account.
 Held messages move with it.
-The move confirms that the old server released the thread before the new server resumes it.
+A mesh-pinned move confirms the old server released the thread before the new server resumes it.
 An unreadable thread state or unconfirmed release starts no replacement turn.
 A failed resume names the worker, the failed step, and the manual resume command.
 
 A swap prints `Workers moving <source> → <target>:` and one showrunner · unit · worker → target line per worker. A worker that was mid-turn adds `, interrupted and resumed`. An interrupt or resume failure names that worker, the failed step and its manual resume command; other workers still move and the selected role stays changed. `--dry-run` uses `Workers would move` with the same worker lines and interrupts nothing, with no role or history write. `set-role workers codexN` selects future turns directly, without the swap's usage check or notices. Each authoritative role write preserves the other selections; `unit` and `workers` history share `~/.local/state/accounts/roles.jsonl`.
 
-Swaps and sign-in changes leave ended sessions' workers alone, even when their launchers survive. A run stays live while any holder session is running, with or without a messaging socket; a run with no holder stays live only while a worker launcher is alive. Ended runs have no worker rows or holder notices. Their outgoing servers are checked for safe shutdown, and the output says `N leftover servers from ended sessions, M stopped`. Busy servers stay running and get a `left running: <pid> on port <port> (<run folder>): <reason>` line. A preview stops nothing and says `N leftover servers from ended sessions: M can be stopped, K would stay`, with a `would stay:` line for each busy server.
+Mesh-pinned swaps and sign-in changes leave workers unchanged when their sessions end.
+This rule also applies when their launchers survive. A run stays live while any holder session is running, with or without a messaging socket; a run with no holder stays live only while a worker launcher is alive. Ended runs have no worker rows or holder notices. Their outgoing servers are checked for safe shutdown, and the output says `N leftover servers from ended sessions, M stopped`. Busy servers stay running and get a `left running: <pid> on port <port> (<run folder>): <reason>` line. A preview stops nothing and says `N leftover servers from ended sessions: M can be stopped, K would stay`, with a `would stay:` line for each busy server.
 
 Worker rows name the holder session, or the session that launched the run when it has no holder marker. They fold by that session and slot, across plans and run folders. A folded row shows ` ×N`, followed by `, K interrupted and resumed` when K entries were mid-turn. Every failed entry retains its own row, reason and manual resume command.
 
@@ -530,7 +536,8 @@ The selected account needs a fresh reading at or below the entry's percentage.
 A Codex target needs a fresh reading above that threshold and no unresolved quota refusal.
 A failed move keeps the entry queued and delays later entries.
 The watcher tells showrunners once when the failure reason changes.
-Successful moves record cause `auto` and reason `auto: <id>` in both histories.
+Automatic moves record cause `auto` and reason `auto: <id>` in the group history and the moves log.
+Each session attempt has its own `move_id`, with a request and one confirmed or failed outcome.
 
 A workers move to Claude needs a known source weekly reset and holds its work routing on Claude until that reset, even if Codex has room earlier. Status detail shows it under `Codex work routing:` with cause `auto`. While any workers entry is queued, default, provider-refusal and credits-off moves wait. With no workers entry, weekly zero first moves workers to included Codex usage when it is available. With credits on and no included room, workers stay and spend their paid credits. With credits off, or after a refusal, workers use the Codex account with room whose weekly reset is soonest, else Claude.
 
@@ -572,7 +579,17 @@ A known 5-hour reset in less than 20 minutes waits once per session and reset. W
 
 `scripts/accounts/refusal_watch.py --dry-run` reports decisions without changing anything. For a live proof, `--assume-refused '<session id or name>' weekly|five-hour [--reset-in <minutes>]` holds a refusal in memory for that owner and runs once. The proof changes neither the account refusal nor other sessions’ picks. The optional reset affects its wait decision, not stored account usage. Add `--proof-group <probe id>…` to move exactly those probes together, without touching real groups. The stop-and-resume API returns the resumed account and pane, or one failure reason.
 
-Account status with `--detail` also shows live sessions' accounts, the Codex workers account and its destination on refusal, workers still owing a continuation, and the last ten move entries with outcomes and their `refusal`, `credits off`, `auto` or `by hand` cause. Hand moves never inherit a stored refusal. Group selections keep their transition and reason across member retries; member moves have no shutdown request ID. `Codex work routing:` lists assignment fallbacks separately, paired by their start time, as open, routed back, or not restored (partial or failed). Recovery is recorded only after all assignments are restored or kept because they were reassigned. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
+Account status with `--detail` shows session accounts, the workers account, pending continuations, and the last ten move entries.
+Each entry shows its outcome and its `refusal`, `credits off`, `auto` or `by hand` cause.
+Hand moves never inherit a stored refusal.
+Group selections keep their transition and reason across member retries.
+Each session attempt has its own `move_id` and cause.
+A session already on the target writes no move entry.
+`Codex work routing:` lists assignment fallbacks separately, paired by their start time, as open, routed back, or not restored.
+Recovery is recorded only after all assignments are restored or kept because they were reassigned.
+The first line names both groups.
+Table role cells show their selected accounts.
+A member still on its old account shows as `moving`.
 
 ## Low-quota alerts
 
