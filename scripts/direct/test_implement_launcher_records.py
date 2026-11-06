@@ -58,11 +58,9 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
             self.assertIn(expected, line)
 
     def test_failed_follow_up_abandons_round_and_posts_blocked(self) -> None:
-        session_dir = self.start_phase("abandoned")
-        first = self.worker_launch(session_dir)
+        session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
         name = self.recorded_worker(session_dir).name
-        self.open_repair_round(session_dir)
 
         result = self.worker_launch(
             session_dir, to=name, kind="fix", behavior="queued", resolves_round=True
@@ -80,11 +78,9 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertIn("blocked:", board)
 
     def test_failed_landed_record_leaves_error_status(self) -> None:
-        session_dir = self.start_phase("status-landed-fails")
-        first = self.worker_launch(session_dir)
+        session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
         name = self.recorded_worker(session_dir).name
-        self.open_repair_round(session_dir)
         self.observe_status_at_records(fail_landed=True)
 
         result = self.worker_launch(
@@ -100,8 +96,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertIn("blocked:", (session_dir / "board.log").read_text(encoding="utf-8"))
 
     def test_failed_pass_write_posts_blocked_and_does_not_send(self) -> None:
-        session_dir = self.start_phase("ledger-error")
-        first = self.worker_launch(session_dir)
+        session_dir, first = self.first_worker_launch()
         self.assertEqual(first.returncode, 0, first.stderr)
         name = self.recorded_worker(session_dir).name
         _ = (session_dir / "progress_history_state.json").write_text(
@@ -120,11 +115,9 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertIn("blocked:", board)
 
     def test_follow_up_records_pass_and_lands_its_repair_round(self) -> None:
-        session_dir = self.start_phase("landed")
-        first = self.worker_launch(session_dir)
+        session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
         name = self.recorded_worker(session_dir).name
-        self.open_repair_round(session_dir)
 
         result = self.worker_launch(
             session_dir, to=name, kind="fix", resolves_round=True
@@ -156,11 +149,9 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(check["fix_cause"], "retry tests fail after integration")
 
     def test_success_status_follows_pass_and_landed_records(self) -> None:
-        session_dir = self.start_phase("status-after-landed")
-        first = self.worker_launch(session_dir)
+        session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
         name = self.recorded_worker(session_dir).name
-        self.open_repair_round(session_dir)
         self.observe_status_at_records()
 
         result = self.worker_launch(
@@ -176,11 +167,9 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         )
 
     def test_worker_error_status_follows_pass_and_abandon_records(self) -> None:
-        session_dir = self.start_phase("status-after-abandon")
-        first = self.worker_launch(session_dir)
+        session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
         name = self.recorded_worker(session_dir).name
-        self.open_repair_round(session_dir)
         self.observe_status_at_records()
 
         result = self.worker_launch(

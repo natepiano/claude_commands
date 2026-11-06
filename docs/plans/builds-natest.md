@@ -1133,7 +1133,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 
 **Ruled out:** In-process launcher calls: the identity check needs the real process chain.
 
-### Phase 55 — The Claude launcher records test uses half its CPU  · status: todo
+### Phase 55 — The Claude launcher records test uses half its CPU  · status: done
 **Depends on:** Phase 54
 
 #### Work Order
@@ -1142,9 +1142,10 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 
 **Spec:** Follow the Speed method.
 1. Take a new baseline with `module_cost.py --tests 10 --commands 10`. Name the test count, and each real launcher process that each test starts.
-2. Test launcher logic by direct calls. Keep a few real dispatches, each for a path that no direct call can prove.
-3. A cut in a production file goes to the director first, with the measured gain.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+2. Six tests start the same first launch as setup, and only the second launch carries their proof. Run that first launch once per class, and copy its state for each test, in the form of `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. Shared setup needs no direct call, and all decisions stay on the real launch.
+3. Test launcher logic by direct calls where a function exists. Keep a few real dispatches, each for a path that no direct call can prove.
+4. A cut in a production file goes to the director first, with the measured gain.
+5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
 
 **Files:**
 - `scripts/direct/test_implement_launcher_records.py` — 43.6 CPU s
@@ -1523,4 +1524,111 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - each changed file green; the behavior map has one row per assertion; for each moved check, breaking the function fails the new test on a tempdir copy
 - CPU s, processes, execs and wall s before and after for each file, in the checkpoint notice
 - the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 69 — The remote copies review test uses half its CPU  · status: todo
+**Depends on:** Phase 64
+
+#### Work Order
+
+**Source:** `show.py top` on 2026-11-06, ranked by median CPU. This module reached builds with verify's Phase 41 and is now the top live module that no phase holds.
+
+**Goal:** `scripts/copies/test_review_remote_copies.py` (215.4 CPU s, 306.4 s wall, 28 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count.
+2. Look first for repeated expensive setup. Lesson from Phase 55: cuts add up, so a cut that cannot reach half alone still counts, and a floor comes only after the available cuts.
+3. Cut in the Speed method's order, direct calls first. Keep the real process runs that prove what no direct call can, such as a slot shell child that keeps a lease after both parents end.
+4. A cut in a production file goes to the director first, with the measured gain. Phase 44 changes `scripts/copies/copies.py`, which this module calls. Measure against this phase's base, and do not repeat Phase 44's cut.
+5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/copies/test_review_remote_copies.py` — the module
+- `scripts/copies/remote_test_support.py` — its transport fixture
+
+**Workers:** 1 writer on slot `impl3` (one module and its fixture)
+- `impl3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Phase 56: an event wait uses one held descriptor and bounded reads. Same-load pairs run after the last repair lands.
+- Phase 64: `module_cost.py --tests 10 --commands 10` names the tests and the commands with the most CPU.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- the module green under `module_run.py`; every other module that imports a changed support file green; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after, in the checkpoint notice
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 70 — The token order test stops hanging  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the showrunner, 2026-11-06. In its queue 20c gate at about 18:00 EST, `test_the_token_goes_to_the_call_that_waited_longest` hit its hang guard at 609 s and passed on the rerun alone. The module median is 14 s.
+
+**Goal:** `scripts/direct/test_verify_token_fifo.py` passes at gate load with no hang, and the cause is named from evidence, with every checked behavior kept.
+
+**Spec:**
+1. Reproduce first, at gate load and with forced delays on a tempdir copy. Quote the failing line and the source line before any fix. The gate log holds the traceback only, because the hang raises before `output.read_text()` is printed.
+2. Name what the call waits on when it hangs: the token queue, the memory queue, or another wait.
+3. A cause in the test is fixed in the test. A cause in `verify.sh` or another production file goes to verify, with the failing line, the source line and a reproduction.
+4. Add no guard, refusal or check (user rule, 2026-11-05).
+5. The hang did not reproduce in ten runs and five forced stops, so the cause stays open. A hang now reports the call's output and the queue files, so the next one names the wait.
+
+**Files:**
+- `scripts/direct/test_verify_token_fifo.py` — the module
+
+**Workers:** 1 writer on slot `test` (one module)
+- `test` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 63: a flake fix states what is proved and what is not. A forced case fails before the fix and passes after it.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- the module passes 5 runs under `module_run.py`; a forced hang on a tempdir copy prints the call's output and the queue files
+- the targeted test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 71 — Index refreshes leave reads and unchanged indexes alone  · status: todo
+**Depends on:** Phase 65
+
+#### Work Order
+
+**Source:** the Phase 55 targeted test, 2026-11-06. Phase 65 aeaa5ad53 turned `buildlog/test_gate_index.py` line 147 and 16 tests in `buildlog/test_aws_report.py` red. Both pass on 5897bb390 and fail on 0b24c5375. The showrunner took Phases 65, 64 and 66 out of its chain until this fix passes.
+
+**Goal:** an unchanged index update writes nothing, a read leaves no side file, and the first list still appears in under a second during a refresh.
+
+**Spec:**
+1. Remove `PRAGMA journal_mode = WAL` from `open_for_update()`. The index uses the rollback journal again, so a read leaves no side file.
+2. `open_for_update()` sets `PRAGMA cache_spill` from a new key `INDEX_SPILL_PAGES=65536` in `config/buildlog.conf`. A transaction takes the exclusive lock only at commit up to that size, so a list reads during a normal refresh. A full build still spills, and its memory stays bounded.
+3. `update_in()` writes the `meta` key `updated_at` only when the transaction changed rows or the key is absent. Remove `previous_stamp`, `touch_due`'s restore and `data_changed`'s mtime path if the unchanged update no longer changes the file.
+4. `complete_gate_index_in()` and the `show.py` reader wait up to a new key `INDEX_READ_WAIT_SECONDS=1` on a lock, so a commit in progress does not drop the current index. After that wait the search continues as it does now.
+5. `rows as of` now names the last update that changed rows. Correct `commands/test_times.md` where the text differs.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/buildlog/index.py` — journal mode, spill size, the key write, the read wait; owner report-unit
+- `scripts/buildlog/test_index.py` — the index cases
+- `scripts/test_times/show.py` — the read wait
+- `scripts/test_times/test_show.py` — the real-process case
+- `commands/test_times.md` — the time line
+- `config/buildlog.conf` — the two keys
+
+**Workers:** 1 writer on slot `impl4` (one change)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 65: `show.py` reads first and refreshes after the print. Its as-built names WAL. Correct that text at this phase's shrink.
+- The index is about 2.2 GB, so unbounded spill memory is not acceptable.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `buildlog/test_gate_index.py` and `buildlog/test_aws_report.py` pass with no edit to either file
+- a new real-process test: a writer holds an open transaction with more than 5 MiB of changed rows, and `show.py top` prints the old rows. It fails when the `cache_spill` line is removed on a tempdir copy
+- every accepted Phase 65 behavior stays: first list from the index, an older compatible index, one read transaction, the detached refresh
+- a list during a refresh on a scratch history keeps the Phase 65 result: about 0.12 CPU s and under 1 s wall
+- the targeted test green on the phase commit; only load flakes that pass alone on the base may differ
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
