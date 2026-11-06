@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.production import staff
+from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
@@ -113,6 +114,7 @@ def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
     manager = staff.runtime_id()
     caller = staff.snapshot().by_current_session(manager) if manager else None
     if caller is not None and caller.kind in ("unit", "showrunner"):
+        write_text_atomic(log.parent / "worker_transport", unit_runs.parent_transport(caller.current_session) + "\n")
         write_text_atomic(log.parent / "prompt.md", prompt)
         return _managed_review(review, log)
     with log.open("w", encoding="utf-8") as output:

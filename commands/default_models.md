@@ -12,7 +12,7 @@ Run:
 bash ~/.claude/scripts/agents/default_models.sh $ARGUMENTS
 ```
 
-**Always run `default_models.sh` with `dangerouslyDisableSandbox: true`.** Edits atomically update shared `config/models.conf`, then commit only that file as `config(agents): …` and push to origin. The writer fetches and fast-forwards before editing; a rejected push replays the row change, up to three tries. Unrelated work stays in place. Status can also publish catalog additions. There is no local override file.
+**Always run `default_models.sh` with `dangerouslyDisableSandbox: true`.** Edits atomically update shared `config/models.conf`, then commit only that file as `config(models): …` and push to origin. The writer fetches and fast-forwards before editing; a rejected push replays the row change, up to three tries. Unrelated work stays in place. Status can also publish catalog additions. There is no local override file.
 
 Relay the script's stdout and stderr exactly, except status output — see below. If it exits non-zero, stop; do not invent a correction.
 

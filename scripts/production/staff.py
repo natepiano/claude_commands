@@ -636,8 +636,10 @@ def is_owner() -> bool:
 
 
 def child_environment(environment: Mapping[str, str]) -> dict[str, str]:
-    """Remove row lock proofs and retired staff hints from child environments."""
-    return {key: value for key, value in environment.items()
+    """Remove row lock proofs, staff hints, and operation state from agent environments."""
+    from scripts.lib.models_registry import agent_environment
+
+    return {key: value for key, value in agent_environment(environment).items()
             if not key.startswith("STAFF_ROW_FD_") and key != "STAFF_ID"}
 
 
@@ -923,8 +925,10 @@ def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | C
                         _ = found.setdefault(identity, CodexBackend(home))
         except OSError as error:
             print(f"anomaly: {home}: {error}", file=sys.stderr)
+    running = ({record["sessionId"] for record in sessions.running_sessions()}
+               if any(identity not in found for identity in wanted.values()) else set[str]())
     for current, identity in wanted.items():
-        if identity not in found and bool(sessions.transcript_locations(current)):
+        if identity not in found and (current in running or bool(sessions.transcript_locations(current))):
             found[identity] = ClaudeBackend()
     return found
 

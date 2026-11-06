@@ -179,3 +179,106 @@ class StatusDiscoveryTests(StaffTestCase):
             _ = labels.group_labeled_sessions(observed, record=record, sources=labels.MemberSources(()))
         self.assertEqual(len(lines), 2)
         self.assertTrue(all("no showrunner staff parent" in line for line in lines))
+
+
+class WorkerRunDiscoveryTests(StaffTestCase):
+    def test_run_index_keeps_the_owner_marker_without_a_worker_record(self) -> None:
+        owner = unit_membership("show", "owner")
+        worker = fixture_worker("worker", owner.id)
+        runs = self.root / "runs"
+        run = runs / "marker-run"
+        run.mkdir(parents=True)
+        with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
+              mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
+            unit_runs.activate(run, owner.current_session)
+            record = staff.local_snapshot()
+            found = labels.worker_run_index(record)
+            entries = labels.worker_run_entries(record, (worker,))
+        self.assertEqual(found[worker.id], (run,))
+        self.assertNotIn(worker.id, entries)
+
+    def test_release_finds_a_loaded_source_thread_through_the_owner_marker(self) -> None:
+        from scripts.agents.test_codex_mesh import StubAppServer, select_fixture_workers
+        from scripts.shutdown import stop_resume
+        from scripts.shutdown.stop_results import SourceReleased
+
+        owner = unit_membership("show", "owner")
+        home = Path.home()
+        home.mkdir(parents=True, exist_ok=True)
+        notes = self.root / "notes"
+        select_fixture_workers(home, notes=notes)
+        backend = staff.CodexBackend(home / ".codex")
+        worker = fixture_worker("worker", owner.id, backend=backend)
+        loaded = {worker.current_session}
+
+        def reply(request: dict[str, object]) -> list[dict[str, object]]:
+            result: dict[str, object] = {}
+            match request.get("method"):
+                case "initialize":
+                    pass
+                case "thread/loaded/list":
+                    result = {"data": sorted(loaded), "nextCursor": None}
+                case "thread/queue/list":
+                    result = {"data": []}
+                case "thread/read":
+                    result = {"thread": {"id": worker.current_session, "status": {"type": "idle"}}}
+                case "thread/unsubscribe":
+                    self.assertEqual(request["params"], {"threadId": worker.current_session})
+                    loaded.remove(worker.current_session)
+                    result = {"status": "notLoaded"}
+                case _:
+                    self.fail(f"Unexpected server request: {request!r}")
+            return [{"id": request["id"], "result": result}]
+
+        server = StubAppServer(reply)
+        self.addCleanup(server.close)
+        runs = self.root / "runs"
+        run = runs / "marker-run"
+        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": server.port})
+        with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
+              mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "", "AGENT_NOTES_DIR": str(notes)}),
+              mock.patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(worker.current_session))):
+            unit_runs.activate(run, owner.current_session)
+            record = staff.local_snapshot()
+            result = stop_resume.release_source(worker, lambda: labels.worker_run_index(record).get(worker.id, ()), backend)
+        self.assertIsInstance(result, SourceReleased)
+        self.assertFalse(loaded)
+        self.assertEqual([request["method"] for request in server.requests].count("thread/unsubscribe"), 1)
+
+    def test_run_index_reads_workers_without_writing_to_the_marker_folder(self) -> None:
+        owner = unit_membership("show", "owner")
+        worker = fixture_worker("worker", owner.id)
+        runs = self.root / "runs"
+        run = runs / "worker-run"
+        run.mkdir(parents=True)
+        self.write_json(run / "mesh_roster.json", {worker.name: {"staff_id": worker.id, "status": "running"}})
+        with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
+              mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
+            unit_runs.activate(run, owner.current_session)
+            markers = runs / "active"
+            before = {path.name: path.read_bytes() for path in markers.iterdir()}
+            found = labels.worker_run_index(staff.local_snapshot())
+            after = {path.name: path.read_bytes() for path in markers.iterdir()}
+        self.assertEqual(found[worker.id], (run,))
+        self.assertEqual(after, before)
+
+    def test_unreadable_owner_marker_reports_one_anomaly_and_keeps_other_workers_runs(self) -> None:
+        broken = unit_membership("show", "broken")
+        healthy = unit_membership("show", "healthy")
+        first = fixture_worker("broken-worker", broken.id)
+        second = fixture_worker("healthy-worker", healthy.id)
+        runs = self.root / "runs"
+        run = runs / "healthy-run"
+        run.mkdir(parents=True)
+        self.write_json(run / "mesh_roster.json", {second.name: {"staff_id": second.id, "status": "running"}})
+        errors = StringIO()
+        with (mock.patch.object(unit_runs, "run_roots", return_value=(runs,)),
+              mock.patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})):
+            unit_runs.activate(run, healthy.current_session)
+            _ = unit_runs.marker(broken.current_session).write_bytes(b"\xff")
+            with redirect_stderr(errors):
+                found = labels.worker_run_index(staff.local_snapshot())
+        self.assertEqual(found[second.id], (run,))
+        self.assertNotIn(first.id, found)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(f"anomaly: {broken.name}:", errors.getvalue())
