@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, role_map, worker_names
+from scripts.lib import unit_runs
 from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import (
     StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id,
@@ -678,6 +679,10 @@ class WorkerGroupPendingTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(unit_runs, "worker_transport", return_value="mesh"))
+        _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
+        _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""})))
         home = Path(os.environ["HOME"])
         home.mkdir(parents=True, exist_ok=True)
         _ = self.enterContext(scratch_account_home(home, {}, clear=False))
