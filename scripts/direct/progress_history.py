@@ -1056,7 +1056,7 @@ def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
     return {
         slot: record
         for slot, record in _pass_slots(state).items()
-        if _string(record.get("status")) == "active"
+        if _string(record.get("status")) in ("active", "refused")
     }
 
 
@@ -1345,7 +1345,7 @@ def _event(
     # worker happened to run before it. A pass lifecycle event names its own
     # record instead: several slots are open at once, and the launcher that
     # closes a stale pass is not always the one that opened it.
-    if current_pass is not None and _string(current_pass.get("status")) == "active":
+    if current_pass is not None and _string(current_pass.get("status")) in ("active", "refused"):
         event.update(
             {
                 "pass_instance_id": _string(current_pass.get("instance_id")),
@@ -1804,7 +1804,7 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
     if not all(active.get(key, "") == value for key, value in fields.items()
                if key != "prompt_file" or not (allow_stage_two and same_launcher)):
         return NoMatchedDispatch()
-    if active.get("status") != "active" and not (
+    if active.get("status") not in ("active", "refused") and not (
             dispatch_owned and active.get("status") == "completed" and same_launcher):
         return NoMatchedDispatch()
     return MatchedDispatch(_string(active.get("worker_name")), _string(active.get("instance_id")))
@@ -1910,14 +1910,14 @@ def _launcher_arguments(text: str) -> list[str]:
 
 
 def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
-                   worker_name: str, launcher_command: list[str], prompt: Path, kind: str, lens: str,
+                   worker_name: str, worker_id: staff.StaffId, launcher_command: list[str], prompt: Path, kind: str, lens: str,
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "") -> str:
     """Record a published worker's dispatch and return its durable pass id."""
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
     args = argparse.Namespace(
         session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role,
-        worker_name=worker_name, launcher_command=json.dumps(launcher_command) if launcher_command else "",
+        worker_name=worker_name, worker_id=worker_id, launcher_command=json.dumps(launcher_command) if launcher_command else "",
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family="unknown", called_model="unknown", called_effort="unset",
         fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens, dispatch_owned=True,
@@ -1930,6 +1930,20 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
             return _string(_pass_slots(_read_state(session_dir))[slot]["instance_id"])
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
+    """Mark the open pass without closing it or changing its dispatch id."""
+    if not _state_path(session_dir).is_file():
+        return
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        for passed in _open_passes(state).values():
+            if passed.get("worker_name") == worker_name and passed.get("status") != "refused":
+                passed["status"] = "refused"
+                _write_state(session_dir, state)
+                _append_event(state, _event(state, "pass_refused", plan_history.now_epoch(), passed))
 
 
 def _finish_pass(args: argparse.Namespace) -> None:
@@ -5334,11 +5348,11 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
                 except (OSError, UnicodeError) as error:
                     return ProductionNotRecorded(f"phase plan cannot be read: {error}")
             return ProductionNotRecorded("the run has no matching unit staff row")
-        parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
+        parent = record.parent_of(row)
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
-        name = parent.name
-        return ProductionUnitIdentity(name, row.name) if state.get(unit_runs.OWNER_FIELD) else ProductionUnitIdentity(production or name, unit or row.name)
+        return (ProductionUnitIdentity(parent.name, row.name) if state.get(unit_runs.OWNER_FIELD)
+                else ProductionUnitIdentity(production or parent.name, unit or row.name))
     except (OSError, ValueError) as error:
         return ProductionNotRecorded(str(error))
 
@@ -5764,8 +5778,7 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         production = identity.removeprefix("showrunner:")
         records = {item["sessionId"]: item for item in sessions.live_sessions()}
         for row in staff.active(resolver.record, "showrunner"):
-            name = row.name
-            if name == production and row.current_session in records:
+            if row.name == production and row.current_session in records:
                 return NamedSupplier("uds:" + records[row.current_session]["messagingSocketPath"])
         return NoNamedSupplier("showrunner has no current address")
     if identity.startswith(("uds:/", "codex:")):

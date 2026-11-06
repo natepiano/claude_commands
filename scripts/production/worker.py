@@ -154,7 +154,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if not isinstance(started, worker_panes.OpenWorker):
             return _startup_result(name, started)
         instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
-            worker_name=name.value, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
+            worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
             fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)

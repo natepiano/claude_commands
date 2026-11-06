@@ -576,7 +576,7 @@ class PromptSubmissionTests(unittest.TestCase):
         self.ready_panes.append(pane)
         ready = pane == "sibling:p1" or self.elapsed >= self.ready_at
         status = herdr.AgentStatus.WORKING if self.elapsed < self.working_until else herdr.AgentStatus.IDLE
-        return {"agent_status": status if ready else herdr.AgentStatus.STARTING}
+        return {"agent_status": status if ready else herdr.AgentStatus.STARTING, "interactive_ready": ready}
 
     def read_screen(self, *arguments: str) -> str:
         self.assertIn(arguments, {("pane", "read", "destination:p1", "--source", "visible"),
@@ -953,6 +953,13 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
+    def test_ready_session_still_requires_a_visible_empty_composer(self) -> None:
+        self.screen = "Restoring conversation"
+        self.events.append((2, lambda: setattr(self, "screen", "────────\n❯ \n────────")))
+        self.submit_on_type = True
+        self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertGreaterEqual(self.typed[0][2], 2)
+
     def test_idle_pane_waits_for_a_visible_empty_composer(self) -> None:
         self.screen = "Restoring conversation"
         self.events.append((2, lambda: setattr(self, "screen", "────────\n❯ \n────────")))
@@ -1287,13 +1294,21 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
+
     def test_done_recipient_can_retype_a_lost_prompt(self) -> None:
         self.drop_before = 7
         self.submit_on_type = True
-        with patch.object(self.client, "readiness", return_value={"agent_status": herdr.AgentStatus.DONE}):
+        with patch.object(self.client, "readiness", return_value={"agent_status": herdr.AgentStatus.DONE, "interactive_ready": True}):
             self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
         self.assertEqual(len(self.typed), 2)
         self.assertGreaterEqual(self.typed[1][2], herdr.PROMPT_SETTLE_SECONDS)
+
+    def test_remote_control_turn_does_not_make_a_loading_destination_ready(self) -> None:
+        self.ready_at = 60
+        self.write_turn("/remote-control is active", kind="system")
+        self.submit_on_type = True
+        self.assertIsInstance(self.submit(timeout_ms=1_000), herdr.PromptNotSubmitted)
+        self.assertEqual((self.typed, self.enters), ([], []))
 
     def test_promptless_codex_restart_needs_no_transcript_or_submit(self) -> None:
         with (codex_launch_evidence(self.root, ["codex"]) as process_info,
@@ -3928,9 +3943,53 @@ class HerdrTests(unittest.TestCase):
             client.prompt("pane-1", "work", target="fixture-submission")
         self.assertEqual(len(self.commands()), 1)
 
+    def test_untracked_idle_pane_with_an_empty_composer_is_ready_without_a_transcript_turn(self) -> None:
+        self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+        self.configure_herdr(["pane", "read", "pane-1", "--source", "visible", "--format", "ansi"], "────────\n❯ \n────────")
+        transcript = herdr.SessionTranscript(self.root / "home/.claude", "untracked-session")
+        path = transcript.config_dir / "projects/project/untracked-session.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("")
+        with redirect_stderr(io.StringIO()) as output:
+            state = self.herdr.prompt_input_state("pane-1")
+        self.assertIsInstance(state, herdr.PromptInputReady)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(path.read_text(), "")
+
+    def test_untracked_pane_with_text_in_the_composer_is_not_ready(self) -> None:
+        self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+        self.configure_herdr(["pane", "read", "pane-1", "--source", "visible", "--format", "ansi"], "────────\n❯ keep this draft\n────────")
+        state = self.herdr.prompt_input_state("pane-1")
+        self.assertIsInstance(state, herdr.PromptInputNotReady)
+        self.assertEqual(cast(herdr.PromptInputNotReady, state).reason, "destination has no empty composer")
+
+    def test_untracked_blocked_pane_is_not_ready(self) -> None:
+        self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "blocked"}}}))
+        self.configure_herdr(["pane", "read", "pane-1", "--source", "visible", "--format", "ansi"], "────────\n❯ \n────────")
+        state = self.herdr.prompt_input_state("pane-1")
+        self.assertIsInstance(state, herdr.PromptInputNotReady)
+        self.assertEqual(cast(herdr.PromptInputNotReady, state).reason, "destination session is still loading")
+
+    def test_explicit_false_readiness_keeps_an_idle_pane_not_ready(self) -> None:
+        self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {
+            "agent_status": "idle", "interactive_ready": False}}}))
+        self.configure_herdr(["pane", "read", "pane-1", "--source", "visible", "--format", "ansi"], "────────\n❯ \n────────")
+        state = self.herdr.prompt_input_state("pane-1")
+        self.assertIsInstance(state, herdr.PromptInputNotReady)
+        self.assertEqual(cast(herdr.PromptInputNotReady, state).reason, "destination session is still loading")
+
+    def test_non_boolean_readiness_stays_unknown(self) -> None:
+        for value in (None, "true", 1):
+            with self.subTest(value=value):
+                self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {
+                    "agent_status": "idle", "interactive_ready": value}}}))
+                with redirect_stderr(io.StringIO()) as output:
+                    self.assertFalse(self.herdr.readiness("pane-1")["interactive_ready"])
+                self.assertEqual(output.getvalue(), "herdr fixture:pane-1: readiness is unknown\n")
+
     def test_readiness_and_wait_states(self) -> None:
         self.configure_herdr(["agent", "get", "pane-1"], json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
-        self.assertEqual(self.herdr.readiness("pane-1"), {"agent_status": "idle"})
+        self.assertEqual(self.herdr.readiness("pane-1"), {"agent_status": "idle", "interactive_ready": True})
         arguments = ["agent", "wait", "pane-1", "--until", "done", "--timeout", "20"]
         self.configure_herdr(arguments, json.dumps({"result": {"agent": {"agent_status": "done"}}}))
         self.assertEqual(self.herdr.wait_until("pane-1", "done", 20), herdr.ObservedAgentState(herdr.AgentStatus.DONE))

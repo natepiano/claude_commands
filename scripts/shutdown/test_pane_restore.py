@@ -230,7 +230,7 @@ class PaneRestoreTests(unittest.TestCase):
                         mock.patch.object(runtime_sessions, "session_liveness", side_effect=conversation_liveness),
                         mock.patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
                         mock.patch.object(sessions, "running_sessions", list),
-                        mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+                        mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
                         mock.patch.object(herdr, "open_tab", self.open_tab)):
             _ = cast(object, self.enterContext(patcher))
 
@@ -527,7 +527,7 @@ class RestoreStaffNamesTests(StaffTestCase):
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
               mock.patch.object(sessions, "running_sessions", return_value=[]),
-              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=True), 0)
         commands = self.ssh_commands()
@@ -643,7 +643,7 @@ class RestoreStaffNamesTests(StaffTestCase):
               mock.patch.object(client, "native_session", side_effect=native),
               mock.patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
               mock.patch.object(sessions, "running_sessions", return_value=[]),
-              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(len(pane_record.read("agents")), 3)

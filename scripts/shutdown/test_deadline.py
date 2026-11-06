@@ -6,11 +6,12 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import herdr
 import restart
-from scripts.lib import conf, operation_deadline
+from scripts.lib import atomic_file, conf, operation_deadline
 from scripts.production import staff
 from scripts.shutdown import stop_resume
 
@@ -29,6 +30,10 @@ class DeadlineTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.now = 100.0
+        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        atomic_file.write_text_atomic(config / "shutdown.conf",
+            "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(patch.object(time, "monotonic", lambda: self.now))
         _ = self.enterContext(patch.object(stop_resume, "monotonic", lambda: self.now))
 
@@ -76,7 +81,7 @@ class DeadlineTests(unittest.TestCase):
 
     def test_expired_deadline_sends_no_signal(self) -> None:
         with (operation_deadline.within(99),
-              patch.dict(os.environ, {}, clear=True),
+              patch.dict(os.environ, {"CONF_DIR": os.environ["CONF_DIR"]}, clear=True),
               patch.object(os, "kill") as send):
             for number in (signal.SIGTERM, signal.SIGKILL):
                 with self.subTest(number=number):
@@ -93,7 +98,7 @@ class DeadlineTests(unittest.TestCase):
                   herdr.EnvironmentThread("session"), "started", {})),
               patch.object(stop_resume, "_same_process", return_value=True),
               patch.object(herdr, "check_native_target", return_value=True),
-              patch.dict(os.environ, {}, clear=True), patch.object(os, "kill") as send):
+              patch.dict(os.environ, {"CONF_DIR": os.environ["CONF_DIR"]}, clear=True), patch.object(os, "kill") as send):
             result = stop_resume.stop("session", deadline=99)
         self.assertIsInstance(result, stop_resume.StopFailed)
         self.assertIn("deadline passed", str(result))
@@ -154,8 +159,8 @@ class DeadlineTests(unittest.TestCase):
                 _ = herdr.run_program(["fake"])
         self.assertEqual(self.now, 110)
         with operation_deadline.within(math.inf):
-            self.assertEqual(operation_deadline.remaining(conf.read("shutdown").number("STOP_GRACE_SECONDS")), 2)
-            self.assertEqual(operation_deadline.remaining(conf.read("shutdown").number("KILL_GRACE_SECONDS")), 5)
+            self.assertEqual(operation_deadline.remaining(float(conf.read("shutdown").text("STOP_GRACE_SECONDS"))), 2)
+            self.assertEqual(operation_deadline.remaining(float(conf.read("shutdown").text("KILL_GRACE_SECONDS"))), 5)
 
 
 if __name__ == "__main__":

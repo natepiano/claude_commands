@@ -15,10 +15,10 @@ from typing import IO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production import rename, session_staff, staff
+from scripts.production import rename, session_staff, staff, showrunners
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
-from scripts.production.staff_test_support import fixture_member, fixture_showrunner_name, showrunner_relationship
+from scripts.production.staff_test_support import fixture_member, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
 
 import dailies_input
@@ -167,7 +167,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
         self.timer("example")
-        parent = showrunner_relationship(fixture_showrunner_name("example", self.doc))
+        parent = showrunner_relationship("example")
         self.asker_id = fixture_member("unit", name="alpha", parent=parent.id,
                                        worktree=staff.PresentWorktree("natedev", self.root / "alpha")).id
 
@@ -289,7 +289,8 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         self.migrate()
         production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                                                  showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
+                                                  showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED,
+                                                  showrunners.owner_for("example"))
         with self.forbid_legacy_question_access():
             self.assertEqual(showrunner_footer.open_questions([production]), 1)
 
@@ -470,8 +471,12 @@ class QuestionIdentityTests(RegistrationFixture):
         _ = staff.set_doc(owner.parent.id, staff.LiveDoc("macbook", self.doc))
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                            showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
-            self.assertEqual(showrunner_footer.open_questions([production]), 0)
+                            showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED,
+                                                  showrunners.owner_for("example"))
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(showrunner_footer.open_questions([production]), 0)
+            self.assertIn("questions: unavailable", errors.getvalue())
             self.assertEqual(dailies_render.read_outstanding(self.outstanding()), [])
             self.assertIn(self.doc, footer_counts.sources(self.doc))
         refused = self.run_command("ask", "--text", "Choose the compiler", "--question", "Use it?")
@@ -642,8 +647,8 @@ class QuestionIdentityTests(RegistrationFixture):
         _ = staff.rename(owner.id, "different-display-name")
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             identities = registration.QuestionStaff.read()
-            self.assertNotIn("example", identities.sources.productions)
-            self.assertEqual(identities.documents()["different-display-name"], self.doc)
+            self.assertEqual(identities.owner(self.doc).name, "different-display-name")
+            self.assertEqual(identities.documents()["different-display-name"].doc, owner.doc)
             self.assertEqual(registration.outstanding_file("different-display-name", identities=identities),
                              self.state / "showrunner/outstanding" / f"{owner.id}.json")
         listed = self.run_command("open")

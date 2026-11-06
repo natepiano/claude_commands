@@ -48,7 +48,7 @@ class ShowrunnerCompactionTests(unittest.TestCase):
         timer = self.root / "notifier" / "showrunner-example"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_text(
-            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh example\n", encoding="utf-8")
         self.fake = self.root / "update_registration.py"
         _ = self.fake.write_text(FAKE_LOG, encoding="utf-8")
         self.calls = self.root / "calls.jsonl"

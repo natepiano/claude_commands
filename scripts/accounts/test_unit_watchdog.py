@@ -636,7 +636,7 @@ class UnitWatchdogTests(unittest.TestCase):
               herdr.process_snapshot()):
             self.assertEqual(herdr.herdr_processes(), [])
             processes.append(fresh)
-            self.assertEqual(unit_watchdog._live_account(self.doc, "unit"), "claude4")  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(unit_watchdog._live_account("fixture", "unit"), "claude4")  # pyright: ignore[reportPrivateUsage]
 
     def test_live_unit_report_reuses_the_scan_without_starting_recovery(self) -> None:
         owner = self.add_unit("unit")

@@ -22,6 +22,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, NamedTuple, cast
@@ -120,12 +121,46 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]:
             selected = pin.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             selected = conf.read("direct").text("WORKER_TRANSPORT")
-            if selected not in ("mesh", "herdr"):
-                raise ValueError(f"{run}: invalid worker transport: {selected}")
+            selected = _transport(selected, run)
             write_text_atomic(pin, selected + "\n")
-        if selected not in ("mesh", "herdr"):
-            raise ValueError(f"{pin}: invalid worker transport: {selected}")
-        return selected
+        return _transport(selected, pin)
+
+
+def _transport(selected: str, source: str | Path) -> Literal["mesh", "herdr"]:
+    if selected not in ("mesh", "herdr"):
+        raise ValueError(f"{source}: invalid worker transport: {selected}")
+    return selected
+
+
+class NoRunPin(Enum):
+    ABSENT = "the run has no transport pin"
+
+
+def run_pin(run: Path) -> Literal["mesh", "herdr"] | NoRunPin:
+    """Read a run's transport pin without writing it."""
+    pin = run / "worker_transport"
+    try:
+        return _transport(pin.read_text(encoding="utf-8").strip(), pin)
+    except FileNotFoundError:
+        return NoRunPin.ABSENT
+
+
+class RunStaffAtUse(Enum):
+    LOCAL = "read the local staff record"
+
+
+def parent_transport(session_id: str, *, scanned: dict[str, list[str]] | None = None,
+                     record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL
+                     ) -> Literal["mesh", "herdr"]:
+    """Read the first held run's pin, or current configuration, without writing."""
+    from scripts.lib import conf
+
+    runs = held(session_id, os.environ.get("ROSTER_RUN_ROOT"), scanned=scanned, record=record)
+    if runs:
+        selected = run_pin(Path(runs[0]))
+        if not isinstance(selected, NoRunPin):
+            return selected
+    return _transport(conf.read("direct").text("WORKER_TRANSPORT"), "config/direct.conf")
 
 
 def activate(run: Path, session_id: str) -> None:
@@ -184,7 +219,8 @@ def marker_must_stay(path: Path) -> bool:
     return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
 
 
-def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
+def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
+             record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> str:
     """Read the run owner's current session from staff."""
     from scripts.production import staff
 
@@ -193,13 +229,14 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -
         dependencies(run / STATE_FILE)
     try:
         find_parent = cast(Callable[..., staff.StaffRow], import_module("scripts.production.worker_admission").parent)
-        return find_parent(staff.local_snapshot(), run=run).current_session
+        return find_parent(staff.local_snapshot() if isinstance(record, RunStaffAtUse) else record, run=run).current_session
     except (OSError, ValueError) as error:
         print(f"anomaly: {run}: {error}", file=sys.stderr)
         return ""
 
 
-def held_by_session(root_override: str | Path | None = None) -> dict[str, list[str]]:
+def held_by_session(root_override: str | Path | None = None, *,
+                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
     """Read each folder's director once, in root order and then name order."""
     found: dict[str, list[str]] = {}
     seen: set[Path] = set()
@@ -210,19 +247,21 @@ def held_by_session(root_override: str | Path | None = None) -> dict[str, list[s
             continue
         for folder in folders:
             resolved = folder.resolve()
-            if folder.is_dir() and resolved not in seen:
+            if (folder.is_dir() and resolved not in seen
+                    and any((folder / name).is_file() for name in (STATE_FILE, "mesh_roster.json"))):
                 seen.add(resolved)
-                found.setdefault(director(folder), []).append(str(folder))
+                found.setdefault(director(folder, record=record), []).append(str(folder))
     return found
 
 
 def held(session_id: str, root_override: str | Path | None = None,
          active_override: str | Path | None = None, *,
-         scanned: dict[str, list[str]] | None = None) -> list[str]:
+         scanned: dict[str, list[str]] | None = None,
+         record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> list[str]:
     """List directed folders with the verified marker first, then the shared scan's order."""
     if not session_id:
         return []
-    folders = held_by_session(root_override) if scanned is None else scanned
+    folders = held_by_session(root_override, record=record) if scanned is None else scanned
     try:
         lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
@@ -233,7 +272,7 @@ def held(session_id: str, root_override: str | Path | None = None,
         owner = next((session for session, paths in folders.items()
                       if any(Path(path).resolve() == resolved for path in paths)), None)
         if owner is None:
-            owner = director(Path(target))
+            owner = director(Path(target), record=record)
             if owner == session_id:
                 # Cache an outside target only after its marker owner matches its director.
                 folders.setdefault(owner, []).append(target)

@@ -89,7 +89,9 @@ class HerdrLaunchTests(NixFixture):
         _ = self.continued(lambda: herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture"))
 
     def production(self) -> Production:
-        return Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
+        return Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"),
+                          staff.StaffRow(staff.StaffId(""), "showrunner", "child", staff.StaffRoot(),
+                                         current_session=staff.StaffId("")))
 
     def test_choke_point_keeps_the_new_tab_when_agent_start_fails(self) -> None:
         with (patch.object(nix_env, "ensure", return_value=nix_env.NoEnvrc(self.env)),

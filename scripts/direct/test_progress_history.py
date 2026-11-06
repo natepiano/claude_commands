@@ -3777,6 +3777,25 @@ with patch.object(fcntl, "flock", admission):
         self.start_slot_pass(session, "review", "review", 41_050, worker_name="review2")
         self.assertNotEqual(self.pass_slots(session)["review"]["instance_id"], active["instance_id"])
 
+    def test_refused_pass_keeps_its_id_for_redispatch_and_finish(self) -> None:
+        session = self.start_run("refused-pass", 41_000)
+        self.start_phase(session, 41_010)
+        self.start_slot_pass(session, "impl", "impl", 41_020, worker_name="implementer")
+        identity = self.pass_slots(session)["impl"]["instance_id"]
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            progress_history.mark_pass_refused(session, "implementer")
+        self.assertEqual(self.pass_slots(session)["impl"]["status"], "refused")
+        self.assertNotIn("finished_at", self.pass_slots(session)["impl"])
+        report = self.run_progress(session, at=41_025)
+        self.assertNotIn("No pass or activity is open.", report)
+        self.assertIn("impl 5s running", report)
+        self.start_slot_pass(session, "impl", "impl", 41_030, worker_name="implementer")
+        self.assertEqual(self.pass_slots(session)["impl"]["instance_id"], identity)
+        self.assertEqual(len(self.pass_events("refused-pass", "pass_started")), 1)
+        self.finish_slot_pass(session, "impl", "completed", 41_040)
+        self.assertEqual(self.pass_slots(session)["impl"]["status"], "completed")
+        self.assertEqual(len(self.pass_events("refused-pass", "pass_finished")), 1)
+
     def test_invalid_launcher_arguments_leave_the_active_pass_unchanged(self) -> None:
         session = self.start_run("invalid-launcher", 41_000)
         self.start_phase(session, 41_010)
@@ -3802,12 +3821,14 @@ with patch.object(fcntl, "flock", admission):
                                      "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
             first = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
             path = session / "progress_history_state.json"
             before = (path.read_bytes(), path.stat().st_mtime_ns)
             resumed = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
             self.assertEqual(resumed, first)
@@ -3816,6 +3837,7 @@ with patch.object(fcntl, "flock", admission):
             _ = stage_two.write_text("Phase 3 — Retry handling\nComplete the second review stage.\n")
             second_stage = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=stage_two, kind="broad", lens="contract",
             )
             self.assertEqual(second_stage, first)
@@ -3824,6 +3846,7 @@ with patch.object(fcntl, "flock", admission):
             before = (path.read_bytes(), path.stat().st_mtime_ns)
             finished = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
             self.assertEqual(finished, first)
@@ -3844,6 +3867,7 @@ with patch.object(fcntl, "flock", admission):
                                      "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
             instance = progress_history.begin_dispatch(
                 session, slot="test", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="broad", lens="contract",
             )
             for status in ("active", "completed"):
@@ -3885,11 +3909,13 @@ with patch.object(fcntl, "flock", admission):
             with self.assertRaisesRegex(SystemExit, "Fix launch has no ledger round"):
                 _ = progress_history.begin_dispatch(
                     session, slot="test", phase="3", role="fix", worker_name="fix",
+                    worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                     launcher_command=command, prompt=prompt, kind="implementation", lens="",
                 )
             self.assertEqual(self.pass_slots(session), {})
             instance = progress_history.begin_dispatch(
                 session, slot="test", phase="3", role="fix", worker_name="fix",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
                 launcher_command=command, prompt=prompt, kind="implementation", lens="",
                 fix_cause="The recorder gate failed", fix_pass=2, activity="repair the recorder gate",
             )

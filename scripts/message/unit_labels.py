@@ -297,6 +297,8 @@ def production_places(
     places: dict[str, ProductionPlace] = {}
     resolver = resolver if resolver is not None else session_staff.RowResolver(record)
     by_id = {item["sessionId"]: item for item in records}
+    readable_parents: set[staff.StaffId] = set()
+    unreadable_parents: set[staff.StaffId] = set()
     for row in staff.active(record, "unit"):
         identity = row.current_session
         if identity in ledger_workers or not isinstance(row.parent, staff.ReportsTo):
@@ -311,11 +313,16 @@ def production_places(
         if not isinstance(doc, session_staff.ProductionDoc):
             diagnostics.document(row, doc)
             continue
-        try:
-            _ = showrunners.timer_for(parent, record)
-        except (OSError, ValueError) as error:
-            problem(diagnostics.problems, parent.name, error)
+        if parent.id in unreadable_parents:
             continue
+        if parent.id not in readable_parents:
+            try:
+                _ = showrunners.timer_for(parent, record)
+            except (OSError, ValueError) as error:
+                problem(diagnostics.problems, parent.name, error)
+                unreadable_parents.add(parent.id)
+                continue
+            readable_parents.add(parent.id)
         name = parent.name
         owner = by_id.get(parent.current_session)
         relationship: UnderShowrunner | ProductionWithoutRunningShowrunner = (
@@ -418,7 +425,7 @@ def live_runs(
     ]
 
 
-def stopped_run_place(run: Path) -> RunPlace:
+def stopped_run_place(run: Path, record: staff.StaffSnapshot) -> RunPlace:
     """Keep a worker's recorded unit without claiming that its director is live."""
     try:
         state = read_object(run / unit_runs.STATE_FILE)
@@ -426,13 +433,13 @@ def stopped_run_place(run: Path) -> RunPlace:
         return RunPlace(NoDirector(), NoShowrunner(), "")
     from scripts.direct import plan_history
     if state.get(unit_runs.OWNER_FIELD):
-        state = plan_history.staff_directory(state, staff.snapshot())
+        state = plan_history.staff_directory(state, record)
     cwd = as_string(state.get("working_dir"))
     # Older runs may keep their identity only in the plan. Import the history
     # reader for that fallback, not for every lookup of recorded labels.
     from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
 
-    identity = resolve_production_unit(state)
+    identity = resolve_production_unit(state, resolver=session_staff.RowResolver(record))
     if isinstance(identity, ProductionUnitIdentity):
         return RunPlace(UnitWithoutRunningDirector(identity.unit),
                          ProductionWithoutRunningShowrunner(identity.production), cwd)

@@ -30,7 +30,7 @@ from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
-    fixture_member, fixture_showrunner_name, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
+    fixture_member, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
 )
 
 if TYPE_CHECKING:
@@ -177,7 +177,7 @@ class RegistrationFixture(unittest.TestCase):
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes",
             f"- **Proposals:** `{self.root / 'issues'}`", "",
         )), encoding="utf-8")
-        runner = recorded_showrunner(fixture_showrunner_name("example", self.doc), self.doc)
+        runner = recorded_showrunner("example", self.doc)
         self.owner_id = runner.id
         _ = fixture_member("unit", name="alpha", parent=runner.id,
                            worktree=staff.PresentWorktree("natedev", alpha))
@@ -286,7 +286,7 @@ class RegistrationFixture(unittest.TestCase):
         showrunner_launch(row, row.id, self.env)
 
     def attach(self, child: str, parent: str) -> None:
-        _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
+        _ = showrunner_relationship(child, parent)
 
     def document_for(self, name: str) -> Path:
         if name == "example":
@@ -301,7 +301,6 @@ class RegistrationFixture(unittest.TestCase):
         fixed = record.by_id(staff.StaffId(reference)) if reference else None
         if fixed is not None:
             return fixed.id
-        name = fixture_showrunner_name(name, self.doc)
         matches = [row for row in record.find(kind="showrunner") if row.name == name]
         owner = matches[0] if matches else fixture_member("showrunner", name=name)
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.document_for(name)))

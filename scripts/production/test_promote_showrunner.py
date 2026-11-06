@@ -32,7 +32,7 @@ import unit_effort
 import unit_lookup
 import herdr
 import sessions
-from scripts.production.production_doc import Production, Refusal, read_new_production, read_production
+from scripts.production.production_doc import ProductionDocument, Refusal, read_new_production, read_production
 from scripts.accounts import accounts
 from scripts.herdr import herdr as trust_reader, worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
@@ -329,7 +329,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
 
 
-    def child_checked(self, _child: Production, caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path | None = None) -> None:
+    def child_checked(self, _child: ProductionDocument, caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path | None = None) -> None:
         self.events.append(f"check child for {caller}, ending {ending}, starting in {start_in}")
         self.assertEqual(config_dir, self.unit_account.dir)
         if self.child_refusal:
@@ -378,7 +378,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         unit = self.staff_unit()
         original_ensure = staff_sources.ensure_staff_showrunner
         for after_ensure in (False, True):
-            def interrupted_ensure(production: Production, caller: str = "", *,
+            def interrupted_ensure(production: ProductionDocument, caller: str = "", *,
                                    runtime_id: str = "") -> staff.StaffRow:
                 self.assertEqual(production.doc, self.parent_doc)
                 if after_ensure:
@@ -451,7 +451,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_started_child_without_timer_finishes_registration_without_second_start(self) -> None:
         submitted = herdr.PromptSubmitted(datetime.now(UTC))
 
-        def start_child(_child: Production, _model: str, _effort: str, resume: str | None,
+        def start_child(_child: ProductionDocument, _model: str, _effort: str, resume: str | None,
                         cwd: Path, _selected: accounts.ClaudeLaunchAccount,
                         *, identity: add_showrunner.ShowrunnerLaunch,
                         before_prompt: Callable[[herdr.SessionTranscript], object]) -> herdr.PromptSubmitted:
@@ -651,7 +651,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_promotion_uses_showrunners_group_instead_of_retained_unit_account(self) -> None:
         selected = self.ready_showrunner_account()
         directory = selected.dir
-        def checked(_child: Production, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
+        def checked(_child: ProductionDocument, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> None:
             self.assertEqual(config_dir, directory)
             self.assertEqual((ending, start_in), (add_showrunner.EndingUnitTab(PANE), self.worktree))
@@ -678,7 +678,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
             self.events.append("resolve " + role)
             return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude2")
-        def checked(_child: Production, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
+        def checked(_child: ProductionDocument, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> None:
             self.assertEqual(config_dir, selected.dir)
             self.assertEqual((ending, start_in), (add_showrunner.EndingUnitTab(PANE), self.worktree))
@@ -697,7 +697,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         """F004: returning to unit work also obeys units configuration."""
         selected = self.ready_showrunner_account()
         self.started = 2
-        def checked(_child: Production, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
+        def checked(_child: ProductionDocument, _caller: str, ending: add_showrunner.EndingTab = add_showrunner.NO_ENDING_TAB, start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> None:
             self.assertEqual(config_dir, selected.dir)
             self.assertEqual((ending, start_in), (add_showrunner.EndingUnitTab(PANE), self.worktree))
@@ -803,7 +803,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py --production "
                       + f"parent demo --plan docs/demo.md --resume {SESSION} --cwd {self.worktree}", out)
 
-    def child_with_open_tabs(self, panes: list[herdr.PaneIdentity]) -> Production:
+    def child_with_open_tabs(self, panes: list[herdr.PaneIdentity]) -> ProductionDocument:
         child_doc = self.worktree / "builds-production.md"
         _ = child_doc.write_text(doc_text(self.worktree))
         child = read_new_production(child_doc, "child")

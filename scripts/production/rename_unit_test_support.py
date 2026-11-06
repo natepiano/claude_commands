@@ -146,7 +146,7 @@ class UnitRenameFixture(StaffTestCase):
             _ = self.git("push", "origin", f"demo-{stem}")
         self.write(self.root / "state/notifier/showrunner-demo/conf",
                    "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
-                   + shlex.join(["zsh", "/scripts/production_check.sh", str(self.doc)]) + "\n")
+                   + shlex.join(["zsh", "/scripts/production_check.sh", fixture_runtime_id(f"showrunner::{SLUG}")]) + "\n")
         # A merge-branch commit the unit has not taken yet: the rename merges it first.
         self.write(self.checkout / "NOTES.md", "after the unit branched\n")
         _ = self.git("add", "NOTES.md")

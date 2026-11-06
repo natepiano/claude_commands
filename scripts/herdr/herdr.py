@@ -261,9 +261,6 @@ class UnspecifiedPromptTranscript:
     """The caller has not identified the conversation that must receive the prompt."""
 
 
-UNSPECIFIED_PROMPT_TRANSCRIPT = UnspecifiedPromptTranscript()
-
-
 @dataclass(frozen=True)
 class PromptScreenNotRead:
     """No visible screen has been read for this submission."""
@@ -897,6 +894,7 @@ class AgentWaitResult(TypedDict):
 
 class WorkerReadiness(TypedDict):
     agent_status: AgentStatus
+    interactive_ready: bool
 
 
 class AgentGetResult(TypedDict):
@@ -2051,14 +2049,20 @@ class Herdr:
 
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")
-        return {"agent_status": AgentStatus.decode(agent.get("agent_status"))}
+        status = AgentStatus.decode(agent.get("agent_status"))
+        ready = agent.get("interactive_ready", True)
+        if not isinstance(ready, bool):
+            print(f"herdr {self.session}:{pane}: readiness is unknown", file=sys.stderr)
+            ready = False
+        return {"agent_status": status, "interactive_ready": ready}
 
     def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputNotReady:
         ready, idle = False, False
         try:
-            status = self.readiness(pane)["agent_status"]
+            observation = self.readiness(pane)
+            status = observation["agent_status"]
             idle = status.idle
-            ready = status == AgentStatus.WORKING or idle
+            ready = observation["interactive_ready"] and (status == AgentStatus.WORKING or idle)
         except (OSError, subprocess.SubprocessError, HerdrFailure):
             pass
         if not ready:
@@ -2174,7 +2178,8 @@ class Herdr:
                     if time.monotonic() >= deadline:
                         return deadline_failure()
                     if isinstance(cursor.readability, TranscriptReadable):
-                        ready = self.wait_for_prompt_input(pane, max(0, int((deadline - time.monotonic()) * 1000)))
+                        ready = self.wait_for_prompt_input(pane,
+                            max(0, int((deadline - time.monotonic()) * 1000)))
                         if isinstance(ready.screen, str):
                             screen = ready.screen
                         if isinstance(ready, PromptInputTimedOut):
@@ -2264,7 +2269,8 @@ class Herdr:
                         continue
                     if typings == 3:
                         return failure("no user turn after three typings")
-                    ready = self.wait_for_prompt_input(pane, max(0, int((deadline - time.monotonic()) * 1000)))
+                    ready = self.wait_for_prompt_input(pane,
+                        max(0, int((deadline - time.monotonic()) * 1000)))
                     if isinstance(ready.screen, str):
                         screen = ready.screen
                     if isinstance(ready, PromptInputTimedOut):
