@@ -6459,9 +6459,6 @@ def end_worker_locked(args: argparse.Namespace) -> int:
                 print(f"codex_mesh: {target}: thread changed; nothing ended", file=sys.stderr)
                 return 2
             status = _as_str(record.get("status")) or "unknown"
-            if _attr(args, "cleanup_only") and status != "ended":
-                print(f"codex_mesh: {target}: worker is {status}, not ended; nothing cleaned", file=sys.stderr)
-                return 2
             if status == "ended" and not thread_id and record.get("staff_id"):
                 print("unchanged")
                 return 0
@@ -9589,10 +9586,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = end.add_argument("--session-dir", required=True)
     _ = end.add_argument("--to", required=True)
     _ = end.add_argument("--expected-thread-id", default="", help="refuse if this worker now names another thread")
-    end_filter = end.add_mutually_exclusive_group()
-    _ = end_filter.add_argument("--idle-only", action="store_true", help="refuse a running worker without changing it")
-    _ = end_filter.add_argument("--cleanup-only", action="store_true",
-                               help="only retry server cleanup for a worker already ended; refuse any other status without changing it")
+    _ = end.add_argument("--idle-only", action="store_true", help="refuse a running worker without changing it")
     end.set_defaults(handler=command_end)
 
     stop = subparsers.add_parser("stop", help="stop the session app-server")

@@ -13517,7 +13517,7 @@ class GuardedWorkerEndTests(MeshCommandFixture):
             self.assertEqual(self.worker_record()["status"], "ended")
             clock_offset = 0
             code, output, errors = self.run_mesh(["end", "--to", "worker",
-                "--expected-thread-id", THREAD_ID, "--cleanup-only"])
+                "--expected-thread-id", THREAD_ID])
         self.assertEqual(code, 0, output + errors)
         self.assertEqual(self.queued, [])
         self.assertEqual(self.live_turn, "")
