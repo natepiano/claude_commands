@@ -63,6 +63,213 @@ def setUpModule() -> None:
     forbid_real_sender()
 
 
+class RunnerAuthorizationTests(unittest.TestCase):
+    def test_refused_socket_request_keeps_saved_versions_and_state_unchanged(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.persist()
+            saved = fixture.state_dir / "state.json"
+            before = saved.read_bytes()
+            versions = dict(fixture.server.caller_versions)
+            forbidden = wire.PrioritySetRequest("runner-priority", "unit", "why", "runner",
+                code_version="runner-version")
+            with fixture.peer_account(os.getuid() + 10000):
+                reply, = fixture.connect(forbidden).replies()
+            self.assertIsInstance(reply, wire.Refused)
+            self.assertEqual(fixture.server.caller_versions, versions)
+            self.assertEqual(saved.read_bytes(), before)
+            allowed = wire.BuildHistoryRequest(code_version="allowed-version")
+            reply, = fixture.connect(allowed).replies()
+            self.assertIsInstance(reply, wire.BuildHistoryReply)
+            start = gate.process_start_time(os.getpid())
+            self.assertEqual(fixture.server.caller_versions[gate.run_owner(os.getpid(), str(start))], "allowed-version")
+            self.assertEqual(service.read_state(fixture.state_dir).caller_versions, fixture.server.caller_versions)
+
+    def test_invalid_ci_label_uses_committed_configuration_and_keeps_serving(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            write_memory_config(config, ci_label="CI {runner} {job}")
+            commit_config_fixture(config)
+            for label in ("CI {unknown}", "CI {", "CI {}", "CI {runner.missing}"):
+                with self.subTest(label=label):
+                    write_memory_config(config, ci_label=label)
+                    resolved = records.read_memory_config(report=False)
+                    self.assertEqual(resolved.ci_label, "CI {runner} {job}")
+                    self.assertTrue(any("ci_label" in item.diagnostic for item in resolved.diagnostics))
+                    fixture.allow_next_start()
+                    request = fixture.service_request()
+                    grant = only_admitted(fixture.connect(request).replies())
+                    self.assertEqual(fixture.server.reservations[request.episode].queue_waiter.get("session_name", ""),
+                        f"CI {request.runner} {request.job}")
+                    self.assertIsInstance(fixture.connect(wire.BuildHistoryRequest()).replies()[0], wire.BuildHistoryReply)
+                    fixture.release(grant)
+
+    def test_release_completes_when_the_runner_owns_a_read_only_sample_folder(self) -> None:
+        with AdmissionFixture() as fixture:
+            folder = fixture.root / "runner-samples"
+            folder.mkdir()
+            sidecar = folder / "cargo.cgroup"
+            _ = sidecar.write_text("")
+            samples = (progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"), sidecar)
+            for sample in samples[:-1]:
+                _ = sample.write_text("")
+            request = replace(fixture.service_request(), sidecar=str(sidecar))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant)
+            folder.chmod(0o555)
+            try:
+                reply, = fixture.server.handle_request(wire.ReleaseRequest("read-only-release", grant.reservation, 0))
+                self.assertEqual(reply, wire.Ok())
+                self.assertFalse(fixture.server.reservations)
+                row, = fixture.history()
+                self.assertEqual(row["status"], 0)
+                self.assertTrue(all(sample.is_file() for sample in samples))
+            finally:
+                folder.chmod(0o755)
+
+    def test_service_estimate_refreshes_history_and_replays_without_a_caller_run(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            fixture.configure(**{"program_first_peak_gib.cargo": 4})
+            first = fixture.service_request()
+            first_grant = only_admitted(fixture.server.handle_request(first))
+            self.assertIsInstance(fixture.server.reservations[first.episode].run, wire.NoRun)
+            fixture.allow_next_start()
+            fixture.free(7 * GIB)
+            second = fixture.service_request()
+            waiting, = fixture.server.handle_request(second)
+            self.assertIsInstance(waiting, wire.Wait)
+            before = fixture.server.waiters[second.episode].row.copy()
+            generation = fixture.server.build_history_generation
+            fixture.scoped_peak(first_grant, 16 * GIB)
+            self.assertEqual(fixture.server.handle_request(
+                wire.ReleaseRequest("failed-runner", first_grant.reservation, 137)), [wire.Ok()])
+            self.assertFalse(fixture.server.slots)
+            self.assertGreater(fixture.server.build_history_generation, generation)
+            fixture.free(60 * GIB)
+            fixture.allow_next_start()
+            second_grant = only_admitted(fixture.server.handle_request(second))
+            self.assertGreater(second_grant.need, first_grant.need)
+            record = fixture.server.reservations[second.episode]
+            self.assertEqual(record.queue_waiter["since"], before["since"])
+            fixture.restart()
+            self.assertEqual(only_admitted(fixture.server.handle_request(second)), second_grant)
+            self.assertEqual(set(fixture.server.reservations), {second.episode})
+            fixture.release(second_grant)
+
+    def test_runner_counter_selects_the_history_window_instead_of_the_full_need(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            uid = os.getuid() + 10000
+            owner = fixture.account_owner(uid)
+            write_process(fixture.proc.path, owner.pid, 2 * GIB, start=owner.start_time)
+            status = fixture.proc.path / str(owner.pid) / "status"
+            _ = status.write_text(status.read_text() + f"Uid: {uid} {uid} {uid} {uid}\n")
+            sidecar = fixture.root / "runner-counter/cargo.cgroup"
+            sidecar.parent.mkdir(mode=0o755)
+            _ = sidecar.write_text("")
+            sidecar.chmod(0o644)
+            request = replace(fixture.service_request(owner=owner), episode=f"uid:{uid}:progress", sidecar=str(sidecar))
+            with fixture.peer_account(uid):
+                grant = only_admitted(fixture.server.handle_request(request))
+            record = fixture.server.reservations[request.episode]
+            row = service.reservation_row(record)
+            key = gate.reservation_profile_key(row, fixture.server.host)
+            counter = progress.ProgressCounter("build:1", 40, 100)
+            progress.publish_counter(sidecar, counter)
+            _ = fixture.run_pass()
+            without_profile, = fixture.server.handle_request(wire.ViewRequest())
+            self.assertIsInstance(without_profile, wire.ViewReply)
+            if isinstance(without_profile, wire.ViewReply):
+                room = without_profile.reading.explanation.room
+                self.assertIsInstance(room, records.MemoryRoom)
+                if isinstance(room, records.MemoryRoom):
+                    hold, = room.runs
+                    self.assertEqual((hold.memory.need, hold.bytes), (grant.need, grant.need - 2 * GIB))
+            progress.progress_path(sidecar, "json").unlink()
+            for done in range(0, 100, 5):
+                fixture.server.progress_history.observe("previous-ci", key,
+                    progress.ProgressCounter("build:1", done, 100), 6 * GIB, fixture.clock.now())
+            fixture.server.progress_history.finish("previous-ci", fixture.clock.now(), fixture.clock.now() - 86400)
+            _ = fixture.run_pass()
+            without_counter, = fixture.server.handle_request(wire.ViewRequest())
+            self.assertIsInstance(without_counter, wire.ViewReply)
+            if isinstance(without_counter, wire.ViewReply):
+                room = without_counter.reading.explanation.room
+                self.assertIsInstance(room, records.MemoryRoom)
+                if isinstance(room, records.MemoryRoom):
+                    hold, = room.runs
+                    self.assertEqual((hold.memory.need, hold.bytes), (grant.need, grant.need - 2 * GIB))
+            progress.publish_counter(sidecar, counter)
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            self.assertIsInstance(reply, wire.ViewReply)
+            if isinstance(reply, wire.ViewReply):
+                room = reply.reading.explanation.room
+                self.assertIsInstance(room, records.MemoryRoom)
+                if isinstance(room, records.MemoryRoom):
+                    hold, = room.runs
+                    self.assertEqual(hold.memory.use, records.AnonymousRunUse(2 * GIB))
+                    self.assertEqual(hold.memory.need, 6 * GIB)
+                    self.assertEqual(hold.bytes, 4 * GIB)
+                    self.assertLess(hold.bytes, grant.need - 2 * GIB)
+                measured = reply.reading.view.running[0].measured
+                self.assertIsInstance(measured, records.ProgressAdjustedMemory)
+                if isinstance(measured, records.ProgressAdjustedMemory):
+                    self.assertEqual(measured.counter, counter)
+            fixture.release(grant)
+
+    def test_runner_cannot_change_priority_or_admit_the_head(self) -> None:
+        with AdmissionFixture() as fixture, fixture.peer_account(os.getuid() + 10000):
+            for request in (wire.PrioritySetRequest("set", "unit", "why", "director"),
+                            wire.PriorityClearRequest("clear", "director"),
+                            wire.AdmitHeadRequest("head", "why", "director")):
+                with self.subTest(request=type(request).__name__):
+                    replies = fixture.completed_queue_change(request)
+                    self.assertEqual(len(replies), 1)
+                    self.assertIsInstance(replies[0], wire.Refused)
+                    self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
+                    self.assertIsInstance(fixture.server.override, records.NoHeadAdmissionOverride)
+
+    def test_runner_cannot_use_another_accounts_owner_run_or_replay(self) -> None:
+        with AdmissionFixture() as fixture:
+            uid = os.getuid() + 10000
+            owner = fixture.account_owner(uid)
+            foreign = fixture.account_owner(uid + 1)
+            request = replace(fixture.request(owner=owner), episode=f"uid:{uid}:own")
+            grant = only_admitted(fixture.server.handle_request(request))
+            run = wire.RunIdentity(foreign.pid, foreign.start_time)
+            attempts: tuple[wire.Request, ...] = (
+                replace(request, episode=f"uid:{uid}:foreign-owner", owner=foreign),
+                replace(request, episode=f"uid:{uid}:foreign-run", owner=fixture.account_owner(uid), run=run),
+                request,
+                wire.ReleaseRequest(f"uid:{uid + 1}:release", grant.reservation, 137),
+                wire.WidthRequest(f"uid:{uid + 1}:width", grant.reservation, 1),
+                wire.TokenWaitRequest(f"uid:{uid + 1}:token", grant.reservation),
+            )
+            for index, attempt in enumerate(attempts):
+                peer_uid = uid if index < 2 else uid + 1
+                with self.subTest(request=attempt), fixture.peer_account(peer_uid), fixture.loop_turn():
+                    reply, = fixture.server.handle_request(attempt)
+                    self.assertIsInstance(reply, wire.Refused)
+                    self.assertEqual(set(fixture.server.reservations), {request.episode})
+                    self.assertFalse(fixture.server.waiters)
+            self.assertEqual(fixture.server.reservations[request.episode].test_width, request.test_width)
+            fixture.release(grant)
+
+    def test_runner_owner_identity_reads_the_private_process_start_and_account(self) -> None:
+        with AdmissionFixture() as fixture:
+            uid = os.getuid() + 10000
+            owner = fixture.account_owner(uid)
+            request = replace(fixture.request(owner=owner), episode=f"uid:{uid}:start")
+            with fixture.peer_account(uid):
+                granted = only_admitted(fixture.connect(request).replies())
+            self.assertEqual(service.process_uid(owner.pid, fixture.proc.path), uid)
+            self.assertEqual(fixture.proc.owner_start(owner.pid), service.LiveOwnerIdentity(owner.start_time))
+            self.assertEqual(fixture.server.reservations[request.episode].owner, owner)
+            with fixture.peer_account(uid + 1):
+                refused, = fixture.connect(replace(request, owner=replace(owner, start_time="reused"))).replies()
+            self.assertIsInstance(refused, wire.Refused)
+            fixture.release(granted)
+
+
 class AdmissionCallerPersistenceTests(unittest.TestCase):
 
     def test_serving_rejects_direct_calls_without_loop_turn(self) -> None:
@@ -92,6 +299,26 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
 
 
 class PendingPriorityTests(unittest.TestCase):
+    def test_runner_retry_cannot_attach_to_a_pending_priority_request(self) -> None:
+        with AdmissionFixture() as fixture, self.delayed_roster() as (entered, finish), fixture.serving():
+            try:
+                request = wire.PrioritySetRequest("pending-owner", "chosen", "urgent", "director")
+                first = self.connect(fixture, request)
+                self.assertTrue(entered.wait(timeout=3))
+                with fixture.peer_account(os.getuid() + 10000):
+                    reply, = fixture.completed_queue_change(request)
+                self.assertIsInstance(reply, wire.Refused)
+                with fixture.loop_turn():
+                    pending = fixture.server.pending_priority
+                    self.assertIsInstance(pending, service.PendingPriorityRoster)
+                    if isinstance(pending, service.PendingPriorityRoster):
+                        self.assertEqual(len(pending.change.connections), 1)
+                finish.set()
+                self.assertEqual(self.reply(first), wire.Ok())
+                self.assertEqual(fixture.completed_queue_change(request), [wire.Ok()])
+            finally:
+                finish.set()
+
     def connect(self, fixture: AdmissionFixture, request: wire.Request) -> socket.socket:
         peer = self.enterContext(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
         peer.connect(str(fixture.socket_path))

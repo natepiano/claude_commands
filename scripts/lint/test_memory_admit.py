@@ -5664,6 +5664,39 @@ class CiSliceMemoryTests(unittest.TestCase):
         _ = (self.proc / "234/comm").write_text("Runner.Worker\n")
         _ = (self.ci / "cgroup.procs").write_text("123\n234\n")
 
+    def test_registered_and_unregistered_jobs_each_enter_the_cap_once(self) -> None:
+        for pid, parent, used, program in (
+                (234, 1, 0, "Runner.Worker"), (235, 234, 2 * GIB, "cargo"),
+                (345, 1, 0, "Runner.Worker"), (346, 345, 4 * GIB, "cargo")):
+            write_process(self.proc, pid, used, parent=parent)
+            _ = (self.proc / str(pid) / "comm").write_text(program + "\n")
+        _ = (self.ci / "cgroup.procs").write_text("123\n234\n235\n345\n346\n")
+        _ = (self.ci / "memory.current").write_text(str(6 * GIB))
+        _ = (self.ci / "memory.stat").write_text(f"anon {6 * GIB}\ninactive_file 0\n")
+        processes = gate.process_table(self.proc)
+        policy = records.read_memory_config().policy
+        for registered, margin, registered_use, unregistered_use in (
+                ((), 7, 0, 6), ((235,), 7, 2, 4), ((235, 346), 0, 6, 0)):
+            with self.subTest(registered=registered):
+                reservations = [fixture_reservation(pid, 8 * GIB) for pid in registered]
+                runs = [gate.RunningStep(str(pid), "CI", "build", str(self.root), 8 * GIB,
+                            gate.process_memory(gate.process_tree({pid: str(pid)}, processes), self.proc), pid=pid)
+                        for pid in registered]
+                readings = gate.unowned_slice_memory(reservations, processes, self.proc,
+                    ci_memory_slice=records.read_memory_config().ci_memory_slice)
+                runs.extend(gate.RunningStep("CI slice", "CI", "service", str(self.ci), 0, reading,
+                    pid=reading.pid) for reading in readings)
+                inputs = gate.QueueInputs([], tuple(runs), tuple(reservations), gate.HostMemory(20 * GIB, 64 * GIB),
+                    gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), NOW_EPOCH)
+                room = gate.inputs_room(inputs, policy)
+                self.assertIsInstance(room, records.MemoryRoom)
+                if isinstance(room, records.MemoryRoom):
+                    self.assertEqual(room.ci_keep_aside.bytes, margin * GIB)
+                    self.assertEqual(room.used, registered_use * GIB)
+                    self.assertEqual(room.ci_use, unregistered_use * GIB)
+                    self.assertEqual(room.cap, 23 * GIB)
+                    self.assertEqual(room.kept, (8 * len(registered) - registered_use + margin) * GIB)
+
     def queue_with_ci(self, reading: gate.StepMemory, available: int = 20 * GIB) -> gate.QueueRead:
         config = gate.read_memory_config()
         step = gate.RunningStep("ci", "ci", "service", "/ci", 0, reading,

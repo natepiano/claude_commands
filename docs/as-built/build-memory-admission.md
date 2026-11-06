@@ -1024,3 +1024,87 @@ The nextest test phase keeps its frozen baseline and margin as the fallback. Its
 CI keeps its configured margin until registered CI steps supply counters and profiles.
 `lint/invoke.sh` enables Cargo progress in its capture log. It removes redraw frames from worker output.
 Cargo-tile enables progress for its own captures. The cargo wrapper does not enable progress for other pipes.
+
+
+### CI cargo admission
+
+The pinned client entry is `scripts/build_queue/ci_cargo_front.py`.
+The runner package exposes this entry as `bin/cargo` from the pinned source tree.
+The package wrapper passes `--front "$0"` before the cargo arguments.
+Its PATH entry precedes the cargo-tile shim, which precedes the real cargo.
+The front excludes that wrapper and removes its directory from the child's PATH.
+An explicit `--cargo <shim> -- <arguments>` entry also selects the next shim.
+Building calls hold one reservation until the child and its descendants end.
+Non-building calls execute the next cargo without admission.
+A direct call to a cargo executable outside this front bypasses admission.
+Calls inside the admitted child tree retain the same reservation.
+
+`ServiceEstimateRequest` carries the owner, repository, worktree, arguments, runner, and job.
+The service reads configuration and history with its own account.
+It uses `step_estimator.step_estimate` with a recorded repository location.
+The service refreshes the estimate on each acquisition retry.
+Build estimates use the current service history generation.
+CI uses `NoRun`, so it claims no run place or continuation slot.
+The configured `ci_label` expands `RUNNER_NAME` and `GITHUB_JOB`.
+The configuration reader validates the template before the service uses it.
+An invalid template uses a committed value through the normal configuration reader.
+Without a usable committed value, configuration resolution fails as for other invalid values.
+The queue records this label as the session name.
+
+`SO_PEERCRED` supplies the connecting account before replay lookup.
+Authorization also precedes caller version records and saved state changes.
+Runner request ids start with `uid:<account>:`.
+The service checks the owner's account and process start time.
+It also checks a caller-named run's account and process start time.
+Runner accounts cannot change priority or admit the head.
+Cleanup and width changes require a reservation from the same account.
+The account prefix also binds replay and pending priority access.
+Saved reservation and ledger records retain their existing shapes.
+The service wraps saved grants as `RunnerAdmitted` only when it sends them.
+
+The runner owns its child process tree; it creates no user-manager scope.
+The front adopts orphaned descendants before it starts cargo.
+The cargo child sets a parent death signal before exec.
+SIGKILL of the front also kills that cargo process.
+Cargo descendants do not inherit that signal and can survive a SIGKILL of the front.
+`QueuePlace` tracks descendants and terminates surviving descendants before release.
+The runner samples anonymous use in its process tree.
+The service also samples anonymous use during each admission pass.
+The service reads the runner's peak and wave files beside its sidecar.
+It copies the maximum into its own peak files before finalization.
+The service writes completed and failed peaks through the normal history path.
+The runner creates its sidecar and progress counter in a temporary directory.
+The directory mode is `0755`; the sidecar, counter, peak, and wave modes are `0644`.
+The runner account owns these files; the service reads them without group write access.
+The service completes release when sample deletion fails with `PermissionError`.
+The front removes its temporary directory after release.
+A front killed by SIGKILL leaves that directory for the existing sweep.
+The service reads the counter through the sidecar path in the reservation.
+The child alone receives `CARGO_TERM_PROGRESS_WHEN=always` and `CARGO_TERM_PROGRESS_WIDTH=80`.
+The shared progress reader and profile history apply the existing look-ahead rule.
+A missing counter or profile retains the full need.
+
+Acquisition uses named protocol timing without a local configuration read.
+The deadline covers closed connections and connections without replies.
+A valid reply renews the deadline.
+Cleanup uses the separate timing from the grant.
+
+CI memory keeps the mixed accounting rule during activation.
+Registered process trees count through their reservations.
+The CI slice reading subtracts their anonymous use.
+The CI keep-aside remains while any busy runner has no registered tree.
+The keep-aside applies once to a mix of registered and unregistered jobs.
+`ci_memory_margin_gib` remains in configuration until the approved activation step.
+
+NixOS activation remains natedev's work.
+The socket uses group `build-admission` and mode `0660`.
+The group includes natepiano and the hana runner accounts.
+Runner sandboxes need `BindPaths=/run/build-admission` when `/run` is hidden.
+`ADMISSION_SOCKET` is needed only for a nondefault socket path.
+The package must contain the pinned source tree and a Python interpreter.
+No client code is copied into `/etc/nixos`.
+The service must read runner `/proc` records and runner temporary counter files.
+Set `TMPDIR` to a shared runner-owned directory if `PrivateTmp` hides the default directory.
+For example, `/run/build-admission/ci/<uid>` uses mode `0755` and the runner's ownership.
+The fixed slice limits remain `MemoryMax=34G` and `MemorySwapMax=2G`.
+The service authorization and protocol must be live before runner socket access starts.

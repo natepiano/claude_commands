@@ -847,10 +847,25 @@ def no_build_history_generation() -> NoBuildHistoryGeneration:
     return NoBuildHistoryGeneration()
 
 
+@dataclass(frozen=True)
+class RepositoryLocation:
+    repository: Repository
+    worktree: str
+
+
+@dataclass(frozen=True)
+class ReadRepositoryAtUse:
+    pass
+
+
+READ_REPOSITORY_AT_USE = ReadRepositoryAtUse()
+
+
 def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfile | ProgramProfile,
                   now: datetime | Callable[[], datetime], root: Path, policy: AdmissionPolicy, *,
                   first_peak_bytes: int,
-                  build_history_generation: Callable[[], BuildHistoryGeneration | NoBuildHistoryGeneration] = no_build_history_generation
+                  build_history_generation: Callable[[], BuildHistoryGeneration | NoBuildHistoryGeneration] = no_build_history_generation,
+                  location: RepositoryLocation | ReadRepositoryAtUse = READ_REPOSITORY_AT_USE
                   ) -> StepEstimate:
     """Resolve one estimate before admission connects."""
     estimate_time = now() if callable(now) else now
@@ -866,7 +881,8 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
     elif isinstance(profile, StepProfile) and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= policy.timing.estimate_refresh_seconds:
         profile = InferFromArgv()
     if isinstance(profile, InferFromArgv):
-        repository, worktree = git_identity(argv, cwd)
+        repository, worktree = (git_identity(argv, cwd) if isinstance(location, ReadRepositoryAtUse)
+                                else (location.repository, location.worktree))
         repo = repository.name if isinstance(repository, RepositoryIdentity) else ""
         scope = test_scope(argv)
         step = parse.step_name(argv) if argv else "build"

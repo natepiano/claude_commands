@@ -45,6 +45,23 @@ class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
 
 class QueueViewTests(QueueFixtureTests):
 
+    def test_ci_reservation_label_comes_from_configuration_and_runner_identity(self) -> None:
+        with AdmissionFixture() as admission:
+            write_memory_config(admission.root / "build_admission.conf", ci_label="CI {runner} {job}")
+            request = admission.service_request(runner="a", job="job")
+            grant = only_admitted(admission.server.handle_request(request))
+            _ = admission.run_pass()
+            reply, = admission.server.handle_request(wire.ViewRequest())
+            self.assertIsInstance(reply, wire.ViewReply)
+            if isinstance(reply, wire.ViewReply):
+                row, = [row for row in reply.reading.view.running if row.pid == request.owner.pid]
+                self.assertEqual(row.session_name, "CI a job")
+                model = replace(self.fixture.model(), reading=reply.reading,
+                    facts=head_facts.read_head_facts(reply.reading))
+                text = plain(queue_view.render_view(model, 140))
+                self.assertIn("CI a job", text)
+            admission.release(grant)
+
     @override
     def setUp(self) -> None:
         super().setUp()

@@ -24,6 +24,25 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NO
 
 class ProtocolTests(unittest.TestCase):
 
+    def test_service_estimate_request_carries_identity_without_a_client_estimate(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.service_request()
+            encoded = wire.encode_request(request)
+            decoded = wire.parse_request(encoded)
+            self.assertEqual(decoded, request)
+            envelope = cast(dict[str, object], json.loads(encoded))
+            fields = cast(dict[str, object], envelope["data"])
+            self.assertNotIn("profile", fields)
+            self.assertNotIn("history", fields)
+            self.assertEqual(wire.parse_reply(wire.encode_reply(admitted_reply()), request), admitted_reply())
+            grant = admitted_reply()
+            runner = wire.RunnerAdmitted(grant.reservation, grant.need, grant.source,
+                grant.max_path, grant.wave_path, grant.sampling_context, grant.cleanup_timing,
+                execution=wire.RunnerExecutionTiming(0.1, 0.2, 1.0))
+            self.assertEqual(wire.parse_reply(wire.encode_reply(runner), request), runner)
+            with self.assertRaises(ValueError):
+                _ = wire.parse_reply(wire.encode_reply(wire.LaunchAdmitted(GIB, "wrong outcome")), request)
+
 
     def test_room_cap_and_unavailable_pressure_survive_the_service_reply(self) -> None:
         from scripts.build_queue.queue_fixture import QueueFixture

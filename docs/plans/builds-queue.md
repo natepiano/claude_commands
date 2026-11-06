@@ -970,7 +970,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Ruled out:** Optional profile fields for a missing key; an alias for `ConfigFallback`; config reads in release or cleanup.
 
-### Phase 10d — hana CI builds wait in the build admission queue  · status: todo
+### Phase 10d — hana CI builds wait in the build admission queue  · status: done
 **Depends on:** Phase 10 (the admission client); Phase 10c (the CI admission reads build_admission.conf)
 
 **Why.** Showrunner decision, 2026-11-02 (builds): hana CI on natedev ran out of memory at 13:50 EST. The Test Suite and "Linux: Compile and Production Wiring" jobs built hana at the same time inside `hana-ci.slice` (`MemoryMax=18G`), and the kernel killed a 6.7 GB rustc. CI memory sits outside the 24 GiB admission budget, so two budgets split one machine. CI runner builds go through build admission, as every other build does, so one budget holds all build memory.

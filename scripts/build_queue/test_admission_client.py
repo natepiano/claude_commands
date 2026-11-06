@@ -27,7 +27,7 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue import admission_records as records, queue_evidence, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
-    AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, reply_bytes,
+    AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
@@ -38,6 +38,59 @@ GRANTED = admitted_reply("stem", GIB, "new-source", "stem.max", "stem.wave")
 
 
 class ClientTests(unittest.TestCase):
+    def test_runner_width_change_uses_its_account_and_changes_its_reservation(self) -> None:
+        with AdmissionFixture() as fixture:
+            uid = os.getuid() + 10000
+            owner = fixture.account_owner(uid)
+            request = replace(fixture.request(owner=owner), episode=f"uid:{uid}:width-owner")
+            with fixture.peer_account(uid):
+                grant = only_admitted(fixture.server.handle_request(request))
+                with fixture.serving(), mock.patch.object(client, "os", wraps=os) as runner_os, \
+                     mock.patch.object(runner_os, "getuid", return_value=uid):
+                    self.assertEqual(client.width(grant.reservation, 3), wire.Ok())
+                self.assertEqual(fixture.server.reservations[request.episode].test_width, records.RequestedTestWidth(3))
+            fixture.release(grant)
+
+
+    def test_runner_closed_connections_reach_the_acquisition_deadline_without_home_reads(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.service_request()
+            transport = self.use_transport(fixture,
+                *(Exchange(TimedChunk(0.125, b"")) for _ in range(8)))
+            with mock.patch.object(records, "read_memory_config", side_effect=PermissionError("runner home")), \
+                 mock.patch.object(step_estimator, "step_estimate", side_effect=PermissionError("runner history")), \
+                 redirect_stderr(io.StringIO()) as output:
+                result = client.service_admit(request, lambda _wait: None,
+                    wire.AcquisitionTiming(1, 0.1, 0.3))
+            self.assertIsInstance(result, wire.Refused)
+            self.assertIn("build queue unreachable for 0.3 s", output.getvalue())
+            self.assertGreaterEqual(fixture.clock.monotonic(), 0.3)
+            self.assertGreater(len(transport.requests), 1)
+            self.assertEqual(transport.requests, [request] * len(transport.requests))
+
+    def test_runner_wait_recovers_and_cleanup_uses_its_own_timing_without_home_reads(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.service_request()
+            granted = replace(GRANTED, cleanup_timing=wire.CleanupTiming(7, 2))
+            transport = self.use_transport(fixture,
+                Exchange(TimedChunk(0.1, b"")),
+                Exchange(TimedChunk(0.1, reply_bytes(WAIT)), TimedChunk(0.2, b"")),
+                Exchange(reply_bytes(granted)), Exchange(reply_bytes(wire.Ok())))
+            waits: list[wire.Wait] = []
+            with mock.patch.object(records, "read_memory_config", side_effect=PermissionError("runner home")), \
+                 mock.patch.object(step_estimator, "step_estimate", side_effect=PermissionError("runner history")), \
+                 redirect_stderr(io.StringIO()) as output:
+                result = client.service_admit(request, waits.append, wire.AcquisitionTiming(1, 0.1, 0.3))
+                self.assertEqual(result, granted)
+                self.assertEqual(client.release(granted.reservation, 137, granted.cleanup_timing), wire.Ok())
+            self.assertEqual(waits, [WAIT])
+            self.assertEqual(transport.requests[:3], [request] * 3)
+            release = transport.requests[-1]
+            self.assertIsInstance(release, wire.ReleaseRequest)
+            if isinstance(release, wire.ReleaseRequest):
+                self.assertEqual((release.reservation, release.status), (granted.reservation, 137))
+            self.assertEqual(transport.timeouts[-1], 7)
+            self.assertNotIn("step stopped", output.getvalue())
 
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:

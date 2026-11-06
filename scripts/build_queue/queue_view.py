@@ -321,7 +321,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
 
     def names(step: gate.WaitingStep | gate.RunningStep) -> tuple[str, str, bool]:
         identity = step_labels(step, model.labels)
-        show = field(identity.showrunner) or "—"
+        show = field(step.session_name if not step.session_id and step.unit else identity.showrunner) or "—"
         unit = field(identity.unit).removeprefix(show + "-")
         unit = unit or "—"
         return show, unit, bool(bumped_unit and identity.unit == bumped_unit)

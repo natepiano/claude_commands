@@ -25,6 +25,7 @@ from scripts.lint import memory_admit as gate
 
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import LauncherHangGuard
@@ -149,7 +150,7 @@ class ObservedAdmissionServer(service.AdmissionServer):
     def handle_request(self, request: wire.Request,
                        connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
         self.check_access("handle_request")
-        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
+        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
             self.before_admission()
             if isinstance(self.proc, TestProcesses):
                 self.proc.register(request.owner)
@@ -538,6 +539,32 @@ class AdmissionFixture(ExitStack):
         request = self.request(need=need, since=since)
         return wire.LaunchRequest(request.episode, request.owner, request.since,
                                   request.identity, request.profile, code_version=request.code_version)
+
+    def service_request(self, *, runner: str = "runner-a", job: str = "compile",
+                        owner: wire.Owner | None = None) -> wire.ServiceEstimateRequest:
+        """Request a service estimate without a client profile or history read."""
+        from scripts.build_queue.admission_client import LOADED_ADMISSION_CODE_VERSION
+
+        owner = owner or self.proc.spawn()
+        sidecar = self.root / f"runner-{owner.pid}.cgroup"
+        _ = sidecar.write_text("")
+        return wire.ServiceEstimateRequest(f"uid:{os.getuid()}:ci-{owner.pid}", owner,
+            ("cargo", "build"), str(self.root), self.clock.now(), str(sidecar),
+            records.RepositoryIdentity("fixture-repository", "fixture"), str(self.root), runner, job,
+            code_version=LOADED_ADMISSION_CODE_VERSION)
+
+    def account_owner(self, uid: int) -> wire.Owner:
+        """Supply an account identity through the private process status reader."""
+        owner = self.proc.spawn()
+        status = self.proc.path / str(owner.pid) / "status"
+        _ = status.write_text(status.read_text() + f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+        return owner
+
+    @contextmanager
+    def peer_account(self, uid: int) -> Generator[None]:
+        """Select credentials at the socket boundary without a real runner account."""
+        with mock.patch.object(service, "peer_uid", return_value=uid):
+            yield
 
     def connect(self, request: wire.Request | str) -> SocketPeer:
         peer = SocketPeer(self, request)

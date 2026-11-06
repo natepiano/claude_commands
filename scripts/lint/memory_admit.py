@@ -2445,9 +2445,12 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
     maximum.unlink(missing_ok=True)
     path.with_suffix(".wave").unlink(missing_ok=True)
     if row["sidecar"]:
-        for suffix in ("json", "log"):
-            progress.progress_path(Path(row["sidecar"]), suffix).unlink(missing_ok=True)
-        Path(row["sidecar"]).unlink(missing_ok=True)
+        sidecar = Path(row["sidecar"])
+        for sample in (progress.progress_path(sidecar, "json"), progress.progress_path(sidecar, "log"), sidecar):
+            try:
+                sample.unlink(missing_ok=True)
+            except PermissionError:
+                pass
     intents.clear(row)
     return result
 
@@ -2606,7 +2609,9 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             swapped = working_set.swap_bytes
             members = scope_members(child)
             duplicate = process_memory(members & tree_pids, proc)
-            amount = max(0, amount - duplicate.bytes)
+            duplicate_use = (duplicate.anonymous.bytes if required
+                and isinstance(duplicate.anonymous, AnonymousRunUse) else duplicate.bytes)
+            amount = max(0, amount - duplicate_use)
             swapped = max(0, swapped - duplicate.swap_bytes)
             promise: MemoryPromise = NoPromise()
             activity = activity_reader.scope(members, child.name)
@@ -2623,7 +2628,11 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                     oldest = min(candidates, key=lambda pid: (int(processes[pid].start), pid))
                     row_pid = oldest
                     if workers:
-                        job_state = RunningServiceJob(activity_reader.started_at(oldest))
+                        unregistered = [pid for pid in workers
+                            if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids)]
+                        if unregistered:
+                            first = min(unregistered, key=lambda pid: (int(processes[pid].start), pid))
+                            job_state = RunningServiceJob(activity_reader.started_at(first))
             if required or amount or members:
                 result.append(UnownedSliceMemory(amount, promise=promise,
                                                  swap_bytes=swapped,

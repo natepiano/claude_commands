@@ -1088,6 +1088,7 @@ TEST_PHASE_MARGIN_FALLBACK = 1.2
 class MemoryConfig:
     policy: AdmissionPolicy
     ci_memory_slice: str
+    ci_label: str = field(kw_only=True)
     test_phase_margin: float
     dev_size_factor: float
     dev_size_margin_bytes: int
@@ -1120,6 +1121,14 @@ def _gib_bytes(value: float) -> int:
 def _ci_slice_name(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.slice", value) is None:
         raise ValueError("expected a systemd slice name")
+    return value
+
+
+def _ci_label(value: str) -> str:
+    try:
+        _ = value.format(runner="runner", job="job")
+    except (KeyError, IndexError, AttributeError, TypeError, ValueError) as error:
+        raise ValueError("expected a CI label with only {runner} and {job} fields") from error
     return value
 
 
@@ -1181,6 +1190,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                                        ci_memory_margin_bytes=value("ci_memory_margin_gib", lambda raw: int(float(raw) * GIB)),
                                        progress_lookahead_percent=number("progress_lookahead_percent")),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
+                ci_label=value("ci_label", _ci_label),
                 test_phase_margin=test_margin(),
                 dev_size_factor=number("dev_size_factor"),
                 dev_size_margin_bytes=value("dev_size_margin_gib", lambda raw: math.ceil(float(raw) * GIB)),
