@@ -6635,7 +6635,6 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         for result, reason, action in (
             (stop_resume.SessionNotFound(worker.id), "could not resolve the staff reference", "check the staff row and retry"),
             (stop_resume.StopFailed(worker.id, "fixture stop failed"), "fixture stop failed", "inspect the source session and retry"),
-            (stop_resume.NotRunning(worker.current_session), "source thread stop is unresolved", "inspect the source session and retry"),
         ):
             with self.subTest(reason=reason), patch.object(stop_resume, "stop", return_value=result) as stopped:
                 code, output, errors = self.run_cli("move", "workers", "codex1")
@@ -6646,6 +6645,18 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertIn(action, errors)
                 stopped.assert_called_once_with(worker.id)
                 self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+
+    def test_worker_release_when_not_running_leaves_resume_pending(self) -> None:
+        _ = self.workers_fixture()
+        worker = self.workers_member()
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        with patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(worker.current_session)) as stopped:
+            code, output, errors = self.run_cli("move", "workers", "codex1")
+        self.assertEqual((code, output), (1, ""))
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn(f"{worker.id}: stopped, resume pending on codex1:", errors)
+        stopped.assert_called_once_with(worker.id)
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
 
     def test_numbered_workers_targets_keep_the_selected_home_with_real_or_shared_entries(self) -> None:
         target = "codex2"
