@@ -136,7 +136,7 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
 
 
 def _move_locked(move: WorkerMove, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
-    role = worker_panes.dispatch_role(move.row)
+    role = worker_panes.dispatch_role(move.row, move.run)
     if isinstance(role, worker_panes.WorkerRoleUnavailable):
         return accounts.SessionMoveRefused(move.row.id, role.reason)
     state = _observe(move)
