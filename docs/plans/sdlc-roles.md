@@ -408,28 +408,15 @@ Superseded 2026-11-05 (sdlc showrunner). `review_pool.py` is gone from sdlc thro
 **Acceptance gate:** each live row has its stop-then-rerun test passing. The `astra`, `message`, `direct` and `production` suites pass. basedpyright on the changed files and their caller modules reports 0 errors, 0 warnings, 0 notes. Then the full merge gate.
 
 ### Phase 14 — Close-out: the roles measure is gone  · status: done
-**Depends on:** Phase 4b
-
-#### Work Order
-
-**Goal:** the `baseline` measure and the code and tests only it uses are deleted. The retired-name check stays.
-
-**Spec:**
-- Source: sdlc showrunner, 2026-11-05. The user asked of C924 "is this still necessary?". natedev answered yes only while this plan runs, and Phase 9 is dropped.
-- Delete the `baseline` action of `scripts/production/roles_audit.py`, the code paths only it uses, and their tests.
-- Keep the `check` action, its tests and `scripts/production/role_terms.toml`. A merge gate runs that check.
-- Correct what the change makes wrong: `docs/plans/sdlc-roles.md` Delegation Context and the design doc's measure section.
-- Add no guard, refusal or check the plan item did not ask for.
+#### As-built
+- `roles_audit.py` has only the `check` action and its `--prose` option. The `baseline` action, its options, the code paths only it uses and their tests are gone. As-built blocks of earlier phases describe the measure as it was then.
+- `check` and `check --prose` print the same bytes as before the removal.
+- `role_terms.toml` is unchanged. `parse_terms` validates `kind`, `defined_in` and `other_meaning_files` in the prior order and keeps none of them, so each error message stays.
 
 **Files:**
-- `scripts/production/roles_audit.py` — remove the measure
-- `scripts/production/test_roles_audit.py` — remove the measure's tests
-- `docs/plans/sdlc-roles-design.md` — the measure section
-- `docs/as-built/staff-accessors.md` — the `roles_audit.py` row, when the staff read leaves with the measure
+- `scripts/production/roles_audit.py` — the retired-name check
+- `scripts/production/test_roles_audit.py` — tests of the check
+- `docs/plans/sdlc-roles-design.md` — states that the baseline measure is retired
+- `docs/as-built/staff-accessors.md` — the `roles_audit.py` row is gone
 
-**Workers:** `1 writer`.
-- `review3` as writer — both files
-
-**State:** none
-
-**Acceptance gate:** `grep -n baseline scripts/production/roles_audit.py` finds no measure code. `roles_audit.py check` output stays byte-equal. `python3 -m unittest scripts.production.test_roles_audit` passes. basedpyright on both files reports 0 errors, 0 warnings, 0 notes. Then the full merge gate.
+**Ruled out:** deleting the check or `role_terms.toml`, because a merge gate runs the check.
