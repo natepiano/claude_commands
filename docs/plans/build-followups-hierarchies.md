@@ -664,30 +664,46 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 27 — A worker list numbers each row  · status: done
 
+#### As-built
+
+- Each text row of `worker.py list` starts with its number, right-aligned to the width of the count. The last number is the count.
+- `list --json`, the row order and the other fields do not change. An empty list prints nothing.
+- No code reads the text rows. `design_roles.py` reads the JSON.
+- This closes the feedback on change C1142.
+
+**Files:** `scripts/production/worker.py`, `scripts/production/test_worker.py`, `commands/unit/worker.md`.
+
+### Phase 28 — A retired or renamed unit leaves no gate copies  · status: todo
+
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** the user's words via the showrunner, 2026-11-06: "i asked for a # number as a first column to more readily read the count". This closes the feedback on change C1142. `/unit:worker list` and `/showrunner:worker list` number each worker row, so the last number is the count.
+**Goal:** sdlc's request of 2026-11-06. The user sees many leftover folders in cargo-port. `copies.remove_trees` runs only in `tidy_wrapped`, so `retire_unit` and `rename_unit` leave the unit's gate copies in `~/worktrees/gates`. Copies are keyed by name, so a rename leaves the old-name folder.
 
 **Spec:**
-1. In `scripts/production/worker.py`, the first column of each text row of `list` is its number, 1 to n, right-aligned to the width of n. A space and the existing fields follow. Row order and the other fields do not change.
-2. `list --json` does not change.
-3. An empty list prints nothing, as it does now.
-4. Update `commands/unit/worker.md` where it states what `list` shows.
-5. In `scripts/production/test_worker.py`, add one test of the text output: rows carry 1 to n and the existing fields. Update each existing assertion that reads a text row, and report it.
-6. Find each reader of the text output of `worker.py list`. Update a reader that the number breaks. Add no check, guard or refusal. Tests never act on a live unit.
+1. `retire_unit.retire`: after the worktree is removed and `staff.set_worktree` is done, call `copies.remove_trees(unit.name)`. Print each `copies.CopyError`, `OSError` or `scratch.ScratchError` as one `anomaly:` line. The retire still exits 0.
+2. `rename_unit.apply`: after the rename and the folder move end, and outside `staff.row_operation`, call `copies.remove_trees(old)`. A removal does not depend on `changed`, so a rerun also removes. Print each of the same errors as one `anomaly:` line. The rename still ends as it does now. The next gate clones again under the new name.
+3. Do not change `scripts/copies/copies.py` and do not copy its logic. Do not change `tidy_wrapped.py`.
+4. Tests in `scripts/production/test_retire_unit.py` and `scripts/production/test_rename_unit.py`. Each test makes its gate root in a tempdir through `COPIES_CONFIG`:
+   - a retire removes the unit's copies, and another owner's copy stays;
+   - a rename removes the old-name copies, and another owner's copy stays;
+   - a busy copy prints one anomaly line, and the retire or rename ends as normal.
+5. Add no check, guard or refusal. Tests never act on a live unit.
 
 **Files:**
-- `scripts/production/worker.py`
-- `scripts/production/test_worker.py`
-- `commands/unit/worker.md`
+- `scripts/production/retire_unit.py`
+- `scripts/production/rename_unit.py`
+- `scripts/production/test_retire_unit.py`
+- `scripts/production/test_rename_unit.py`
 
 **Workers:** 1 writer, slot impl2.
 
 **State:** none
 
+**Deploy one-off (the director's, not the writer's):** list each leftover, send sdlc the list, and delete only after sdlc answers. `~/worktrees/gates/.claude` joins the list only after builds says queue 18a is on main.
+
 **Acceptance gate:**
 - basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
-- `scripts/production/test_worker.py` and each caller module of the text output pass.
-- The showrunner's merge test on the merged tree is green. The unit runs the modules above, not the full gate (55 minutes at this load).
+- `scripts/production/test_retire_unit.py`, `scripts/production/test_rename_unit.py` and `scripts/production/test_tidy_wrapped.py` pass.
+- The showrunner's merge test on the merged tree is green.
