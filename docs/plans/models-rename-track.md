@@ -250,54 +250,30 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 ### Phase 3r — Live family-switch proofs through assign.sh  · status: done
 
-**Owner:** models-unit. 3p Milestone 2 (Spec items 10-11) moved here so that 3p could land Milestone 1.
+#### As-built
 
-**Depends on:** 3p, 3q, 5a, and the devtools one-launch-path change (assign.sh starts a Claude worker). sdlc tells models-unit when it lands. The proofs run on the final launcher code; a later launcher edit repeats the affected proof.
-
-**Order (sdlc, 2026-11-05):** "Start 3r item 7 now. Run the live switch proofs after I tell you the devtools main hash." Devtools hash 37faa1a05 removes the Codex-only exit at `assign.py:206`.
-
-#### Work Order
-
-**Goal:** Prove a real worker family switch in both directions through assign.sh.
-
-**Spec:**
-
-1. Make a throwaway fixture unit with its own state folder. Start a Codex worker in it with assign.sh.
-2. Switch that worker to Claude with assign.sh. Write the exact command at 3r start from the devtools one-launch-path interface as it landed.
-3. Assign the same Claude worker again with assign.sh. Record that its destination identity does not change. Then switch it back to Codex with assign.sh, and assign it again the same way.
-4. For each switch, save the staff row before and after, the transcript extract path, and the destination's first-turn log. Put the evidence under `${PHASE_DIR}/proofs/`.
-5. Stop the worker and remove the fixture unit after the proofs.
-6. A switch defect the proofs find is fixed at its cause, with a real-path regression test. The director assigns that repair.
-7. Done in the 3s checkpoint df2a08345: `worker_admission.admit` has no `role` parameter (`worker_admission.py:167`), and the `AGENT_BG_ROLE` assignments are gone. Ledger 3q F027 and F028.
+- A worker switches family through the real `assign.sh` in both directions on the real worker models, gpt-6.1-sol and claude-opus-5-5. The staff id stays fixed, one destination opens, and the destination reads the transcript extract before its assignment.
+- `stop_resume.StopUnproved` is a subclass of `StopFailed`. Unproved stop evidence never refuses a release: only proof that the source itself is live refuses. A source with no server record counts as released for a row that the roster identifies.
+- `staff._found_backends` reads the running registry record, so a live Claude session with no transcript is a `ClaudeBackend`. `roster._unit_workers` omits the mesh row of a Claude-backed worker, so `send.py` finds one recipient with the worker role.
+- `_roster_role` in `codex_mesh.py` returns `RolelessThread` for a recorded role outside the worker roles. `_worker_role` still refuses a roleless action.
+- `assign.py` sends a dispatch whose worker has a different current family through `implement.sh` to the switch coordinator. A worker in the requested Codex family keeps the `follow` path. `agent_bg.sh` records the dispatch role for the destination session before delivery, and a call with no role records nothing.
+- `worker_admission.admit` has no `role` parameter.
 
 **Files:**
-- `scripts/production/worker_admission.py`
-- `scripts/production/worker_fill.py`
-- `scripts/agents/agent_bg.sh`
-- `scripts/agents/codex_mesh.py`
-- `scripts/production/test_worker_admission.py`
-- `scripts/agents/test_agent_bg.py`
-- `scripts/direct/assign.py`, `scripts/direct/implement.sh`, `scripts/astra/design_roles.py`, `scripts/ask_a_friend/launch_friend.sh`, `scripts/direct/workers.py` — the launch path the proofs drive
-- `scripts/agents/test_codex_mesh.py`, `scripts/production/test_worker_fill.py`, `scripts/production/staff_test_support.py` — regression tests for a switch defect
+- `scripts/shutdown/stop_resume.py`, `scripts/shutdown/stop_results.py` — source release.
+- `scripts/production/staff.py`, `scripts/production/worker_fill.py` — backend read and retry attach.
+- `scripts/message/roster.py` — one row for a switched worker.
+- `scripts/agents/codex_mesh.py`, `scripts/agents/agent_bg.sh`, `scripts/direct/assign.py`, `scripts/direct/implement.sh` — routing and the role record.
 
-**Workers:** `1 writer + 1 tester`
+**Binds later work:** The dispatch record stays `sending` after a failed delivery until the next dispatch. A retry after a failed delivery finds a live destination that reads the requested family, so that pending record is the only evidence of the retry.
 
-- `impl` — Any switch defect the director assigns: the source repair only.
-- `test` — Run both live switches through assign.sh on a fixture unit, record the evidence paths, and write the regression tests and fixtures for each defect. Hand any defect to the director.
+**Gotchas:**
+- `stop_resume._signal_process` refuses a signal from a proof with isolated records. A fixture stops a live Claude source itself, so a live Claude source signal stays unproved in the fixture.
+- `claude stop` takes the 8-character job id, not the full session id.
+- gpt-6-luna at low effort does not read the extract. claude-haiku-5-5 reads it, then refuses the assignment as a peer request.
+- The session-start hook logs the role `interactive` for each Claude session. A worker that holds only that row has no recorded role until its next dispatch, and `recover_arguments` refuses recovery for it.
 
-**Constraints from prior phases:**
-
-1. 3q lands first; both phases edit the switch code.
-2. Live proofs use a throwaway fixture unit and never the live roster of a real unit.
-3. 5a: `codex_mesh.py` launch functions take a `models_registry.LaunchModelConfiguration` (`codex_mesh.py:6802`), and each later submission reads a fresh one. A fresh read runs catalog sync first; an inherited snapshot does not. Agent starts remove the operation variables after the environment loads. A switch repair keeps these, and the 5a lifetime and environment tests stay green.
-4. 3s: `admit` takes no `role` argument, and slot status comes from `worker_state.worker_status_path` (run root, then `phases/*`). The devtools revision 37faa1a05 still passes `role` to `admit` (`assign.py:831-834`) and reads the root-only status path (`assign.py:540`). At the merge that brings it in, keep the 3s forms: no `role`, `worker_status_path`, roster record over slot record, and marker-only runs in `session_staff.worker_run_index`. The 3s suites (`test_session_staff.py`, `test_inventory.py`, `test_unit_runs.py`, `test_worker_state.py`) pass on the merged tree before the proofs.
-
-**Acceptance gate:**
-
-1. Both switches keep the worker's fixed staff id and open no second destination.
-2. Each destination reads the extract before its first assignment.
-3. `test_worker_admission.py`, `test_worker_fill.py`, `test_codex_mesh.py`, `test_agent_bg.py` and the 3s suites pass; basedpyright 0/0 on changed files and caller modules. `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch` stay.
-4. Both outcomes go to sdlc with the evidence paths.
+**Ruled out:** Weakening `_signal_process` for proofs: it is another unit's safety rule.
 
 ### Phase 3t — A retry after a failed delivery restores the handoff  · status: todo
 
@@ -319,6 +295,8 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 **Files:**
 - `scripts/direct/implement.sh` — the switch check.
 - `scripts/direct/test_implement_launcher_claude_follow.py` — real-path regression tests.
+- `scripts/production/worker_admission.py` — read only: `assignment_id` and the dispatch record (lines 307-415).
+- `scripts/production/worker_fill.py` — read only: `coordinate_claude` (lines 18-91).
 
 **Workers:** `1 writer`
 
@@ -328,6 +306,8 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 1. 3r: the dispatch role goes to `agent_bg.sh` as `AGENT_BG_ROLE`, and a live Claude session with no transcript reads `ClaudeBackend`.
 2. No unasked guards (user via sdlc, 2026-11-05).
+3. Use the existing `assignment_id` and dispatch record helpers. Keep the original prompt file: its identity includes its path, modification time and contents.
+4. A test that needs a project makes it in a tempdir at run time (user via sdlc, 2026-11-05).
 
 **Acceptance gate:**
 
