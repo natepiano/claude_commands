@@ -101,8 +101,11 @@ kind's script (below).
 ## change
 
 The next change for the user to check, from its current and earlier lists.
-A row belongs to the production its Production cell names; without one, to
-its list's production. Mark: `change_review.py mark-important --row <id>`.
+A row follows the staff id in its Producer cell. With no Producer and no verdict,
+it follows a staff id in its Production cell. A unit id gives that unit's current
+production, and a showrunner id gives that showrunner's production. A Producer id
+with no staff row is unrouted. Any other row belongs to its list's production.
+Mark: `change_review.py mark-important --row <id>`.
 Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`. Say
 what changed, how to try it and what the user sees, in plain words. Record the
 user's verdict through `/change_review` → verdict.

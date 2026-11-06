@@ -19,6 +19,7 @@ from typing import final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -26,6 +27,7 @@ import proposal_issue
 from issues import Issue
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.style import rules
 from user_zone import user_zone
 
 ISSUE = """---
@@ -94,6 +96,12 @@ class ProposalIssueTests(unittest.TestCase):
         row = next(member for member in staff.snapshot().rows if member.name == "names")
         self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {"unit": [row.id]})), "names")
         self.assertEqual(proposal_issue.proposal_unit(Issue(self.issue, {})), "")
+
+    def test_a_stored_unit_name_does_not_select_a_staff_row(self) -> None:
+        issue = Issue(self.issue, {"unit": ["retired-types"]})
+        result = proposal_issue.proposal_unit(issue)
+        self.assertEqual(result, "")
+        self.assertIsInstance(rules.style_family(result), rules.NotStyleUnit)
 
     def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
         code, out, _ = self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")
