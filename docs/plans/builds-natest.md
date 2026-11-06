@@ -1434,53 +1434,31 @@ Measure: a first list on a scratch history took 0.116 CPU s and 0.166 s wall at 
 ### Phase 66 — The four SSH target test files use half their CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 61 measure, 2026-11-06. Direct calls removed 52% of the process starts in these files, and their CPU did not fall.
+No test file changes. The four files keep their real `verify.sh` runs. The measured floor is 146.1 CPU s at same load, against the 102 CPU s target.
 
-| File | CPU s before, after | Processes before, after | Wall s before, after |
-| --- | --- | --- | --- |
-| `test_verify_ssh_targets_routing.py` | 82.4, 95.4 | 2,672, 1,772 | 103.7, 116.2 |
-| `test_verify_ssh_targets_results.py` | 53.0, 69.9 (both red, see below) | 3,297, 1,136 | 67.9, 86.6 |
-| `test_verify_ssh_targets_retry.py` | 34.2, 32.5 | 1,302, 588 | 43.9, 46.4 |
-| `test_verify_ssh_targets_retained.py` | 34.4, 38.0 | 1,268, 529 | 45.0, 48.4 |
+| File | CPU s, same-load median | Wall s | Processes |
+| --- | ---: | ---: | ---: |
+| `test_verify_ssh_targets_routing.py` | 66.56 | 82.7 | 2,672 |
+| `test_verify_ssh_targets_results.py` | 41.64 | 47.6 | 3,297 |
+| `test_verify_ssh_targets_retry.py` | 16.02 | 17.4 | 1,302 |
+| `test_verify_ssh_targets_retained.py` | 21.87 | 22.9 | 1,268 |
+| Total | 146.10 | | 8,539 |
 
-**Goal:** these four files use half their CPU, 204 to 102 CPU s, or a measured floor shows why they cannot, with every checked behavior kept.
+Cost breakdown, from one traced measure of 249.6 CPU s: child commands use 228.2. `build_targets.py` uses 128.4 of that, over 270 starts, and a cold import costs about 0.83 CPU s per start. Admission threads use 8.0, cleanup scans 6.0, and inventory 0.2.
 
-**Spec:**
-1. The worktree holds this work's first step, uncommitted: 22 cases moved to `route()`, real launcher starts 32 to 7, a behavior map at `phases/61/slots/impl4/behavior_map.md` and a mutation proof. The F001 fix is in the tree: `verify_ssh_targets_test_support.py` uses `${EPOCHREALTIME:-$(date +%s)}`, the form of `verify.sh:1169`.
-2. Measure where the CPU goes, before any other edit. Report CPU by command across the module, from `strace -f` rusage or an equal count, and CPU for each test. Name the share of Python starts by script, Bash, the admission server thread in the test process, and `setUp`.
-3. Suspects: `caller_admission` serves one real admission server for each test, in the test process, with a `running_pass_seconds=0.25` pass. The real target commands import through `build_hold.py`. `refresh_inventory` writes the ledger for two targets in each test. `VerifyMacOffloadFixture.setUp()` starts admission for every test, and that server's loop calls `run_once(0.01)` through each test. The inherited cleanup scans `/proc/*/environ`.
-4. The measure is `phases/66/slots/impl4/measure/findings.md`. Child commands use 228.2 of 249.6 CPU s. `build_targets.py` uses 128.4 CPU s, and its 120 `eligible`, `reserve` and `release-wait` starts cost about 0.96 CPU s each. Admission threads, cleanup scans and inventory use 14.2 CPU s together, so those fixture parts stay. The cut:
-   a. Match the fixture's EXIT order to production: `finish_hold_wait` before `release_wait_claim`. This removes about 15 heavy starts.
-   b. Replace the `run_route` form and `ROUTING_INPUTS` with narrow calls, in the test process, of the real Python decision functions. Read each value where its consumer receives it. A result word with its own branch keeps a check that the next step ran.
-   c. Keep the seven real `verify.sh` starts. They use 41.3 CPU s and prove the command-line boundaries. A case with no usable function goes back to a real run, or verify-unit gets a request for the function.
-   d. The production cuts belong to their owners: cold imports, platform starts and cleanup scans to verify-unit, the admission loop to queue-unit. This phase does not wait for them.
-   A move stays only if it cuts CPU, or another proof of the same behavior needs it. A move that gains nothing and loses an end-to-end path goes back.
-5. Report why `test_verify_ssh_targets_results.py` went red in both measured runs: `test_linux_loss_keeps_the_attempt_and_queue_age_after_local_success` and `test_interruption_preserves_queue_age_and_records_local_state_before_compilation` after, `test_sigterm_runner_output_preserves_the_sender_interruption_result` and `test_interruption_from_another_generation_remains_an_unconfirmed_loss` before. Those runs had SIGINT ignored. Prove or refute that with a run that has SIGINT at its default.
-6. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+The one operation that limits the floor is a cold start of a `build_targets.py` command. The cut belongs to verify-unit. It joins verify's item "Each verify run starts fewer helper processes", after its Phase 8. Requests sent to verify-unit: an eligibility consumer from `initialize_step_record`, a result consumer from `try_mac_test` with the next step of `route_test`, and reservation and retry orchestration around `command_reserve`. Revisit when verify's hash arrives: same-load pairs of the four files. The gain is an estimate until then, with an upper limit of the 128.4 CPU s share.
 
-**Files:**
-- `scripts/direct/test_verify_ssh_targets_routing.py`
-- `scripts/direct/test_verify_ssh_targets_results.py`
-- `scripts/direct/test_verify_ssh_targets_retry.py`
-- `scripts/direct/test_verify_ssh_targets_retained.py`
-- `scripts/direct/verify_ssh_targets_test_support.py` — the SSH fixture
+SIGINT at its default did not prove the cause of any failure in Spec step 5. `event, = self.ssh_events()` received several events once on the base and once in the measure; a full-context rerun did not reproduce it, so the cause stays uncertain.
 
-**Workers:** 1 writer on slot `impl4` (one fixture and its four files)
-- `impl4` — all files above, role impl
+**Files:** none changed.
 
-**Constraints from prior phases:**
-- Phase 56: the SSH fixture holds one read-write descriptor for its event wait.
-- Phase 61: a process count does not rank CPU. A Python start through `build_hold.py` costs far more than a Bash start.
-- Verify's batch a36296ed2 is on builds. `verify_mac_offload_test_support.py` now has `call_mac_functions`, a direct call of the real result and retry functions. Use one change to the parent fixture, and make no copy.
-- Builds changed three of these files, so the edit turn starts from the merged tree.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Binds later work:** a direct call keeps the decision that the test proves. `route_test` and the queue-age handoff are Bash decisions with no narrow function, so their tests stay real until verify's functions land.
 
-**Acceptance gate:**
-- The behavior map has a row for each assertion. For each moved check, breaking the function fails the new test, shown on a tempdir copy.
-- CPU s, processes, execs and wall s before and after for each file, from `module_cost.py` and same-load pairs with SIGINT at its default, in the checkpoint notice. The whole-group CPU is at most 102 s, or the floor is stated.
-- The four files, `test_verify_ssh_targets.py` and every importer of a changed fixture pass. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
+**Ruled out:**
+- The `route()` form of Phase 61: 52% fewer process starts and no CPU gain, with command-line paths lost.
+- The `offload_result` fixture: 41.64 to 14.39 CPU s in the results file, but it calls each target itself and precomputes each attempt. A stop after a busy result and a lost `BUILDLOG_MEM_WAIT_SINCE` pass unseen. The two tests that could stay save about 8 CPU s, against a 90-line fixture that patches global state beside the admission thread.
 
 ### Phase 67 — The lint judgment and parser cases move onto verify's new functions  · status: todo
 **Depends on:** Phase 61

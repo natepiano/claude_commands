@@ -6,14 +6,13 @@ The phase backlog of natest-unit. At each phase end, rank modules by median CPU 
 
 Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed phases confirm their targets at dispatch.
 
-1. Phase 65, now: the first test time list after a gap.
-2. Phase 66, now: the four SSH target files, 204 CPU s, where direct calls did not cut CPU. Measure CPU by command first. Phase 67, after verify's two function moves: lint judgment and the parser cases, 231 CPU s.
-3. Phase 63, now: three flaky verify files. Phase 64, now: `module_cost.py` names the tests with the most CPU.
-4. Further `test_verify*` batches follow CPU rank. Measure command, admission-thread, setup and cleanup CPU before direct moves, because the Mac, lint, doc, token, hold and cancellation groups share a fixture that starts admission. Group ownership by shared fixture. Each batch has one phase and one bumped checkpoint. Verify's cost doc lists the rest; its list has 122 files.
+1. Phase 67, after verify's two function moves: lint judgment and the parser cases, 231 CPU s. The four SSH target files, 146.1 CPU s, wait for verify's cold import cut and functions (Phase 66 floor).
+2. Phase 63: three flaky verify files.
+3. Phase 44, now: `copies.py` Git work and `style/test_crate_run.py`, 68.5 CPU s.
+4. Further `test_verify*` batches follow CPU rank. Measure with `module_cost.py --commands 10` before direct moves. A file whose CPU is in `build_targets.py` commands waits for verify's cold import cut (Phase 66). Also read admission-thread, setup and cleanup CPU, because the Mac, lint, doc, token, hold and cancellation groups share a fixture that starts admission. Group ownership by shared fixture. Each batch has one phase and one bumped checkpoint. Verify's cost doc lists the rest; its list has 122 files.
 5. Phase 55, now: the assign launcher group, 344 CPU s.
-6. Phase 44, now: `copies.py` Git work and `style/test_crate_run.py`, 68.5 CPU s.
-7. Phase 59: `style/test_style_proposals.py`, 60.8 CPU s.
-8. New phases by rank: `production/test_add_unit.py` 59.8, `production/test_fast_track.py` 55.1, `production/test_staff.py` 53.7, `style/test_add_style.py` 51.0.
+6. Phase 59: `style/test_style_proposals.py`, 60.8 CPU s.
+7. New phases by rank: `production/test_add_unit.py` 59.8, `production/test_fast_track.py` 55.1, `production/test_staff.py` 53.7, `style/test_add_style.py` 51.0.
 
 Held: `style/test_style_sync.py`, 66.6 CPU s; devtools holds it. Never: `types/basedpyright`, 238.4 CPU s; `agents/test_codex_mesh.py`, 232.6 CPU s, retires.
 
