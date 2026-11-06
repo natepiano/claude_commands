@@ -293,20 +293,20 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Spec:**
 
-1. **Flags.** `phase_wait_start` (`verify.sh:1254`) passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | build target | memory> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none. None records `HolderNotNamed`.
-2. **Memory holder.** `scripts/lint/memory_gate.sh` (near line 178) pipes each line of `scripts/build_queue/admission_client.py --wait-events` to `buildlog_memory_event` (`verify.sh:1296`). Add a `holder <json>` case there. No change goes into `memory_gate.sh` or the admission client.
+1. **Flags.** `phase_wait_start` (`verify.sh:1260`) passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | build target | memory> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none. None records `HolderNotNamed`.
+2. **Memory holder.** `scripts/lint/memory_gate.sh` (near line 178) pipes each line of `scripts/build_queue/admission_client.py --wait-events` to `buildlog_memory_event` (`verify.sh:1302`). Add a `holder <json>` case there. No change goes into `memory_gate.sh` or the admission client.
    - The client prints `holder` after `first`, and again only when the holder changes.
    - `{"kind":"session","session_id":…,"session_name":…}` gives `--holder-resource-kind memory --holder-resource memory --holder-session <session_id>`.
    - `{"kind":"unit","unit":…}` gives `--holder-resource-kind memory --holder-resource memory --holder-unit <unit>`.
    - `{"kind":"none"}` is an explicit absence: `wait-holder` with no flags.
    - An unchanged holder prints no event, so a steady wait starts no process.
 3. **Same shell.** The event loop runs in the pipe's subshell, and each wait id is in `$HOLD_WAIT_DIR/phase-wait.<BASHPID>.<key>`. `first`, `holder`, `done` and `left` for one client run use that one subshell. Keep the holder state in that subshell.
-4. **Token holder.** In `acquire_token` (`verify.sh:3031`, wait starts near 3064 and 3102) the holder is the board token owner, with kind `slot` and resource `cargo`. Read it in Bash on each pass of the wait loop. Call `wait-holder` only when it changes.
-5. **Build hold.** At `verify.sh:2789` and `:3393`, and in the SSH route (`route_test` at `:2286`, wait at `:2412`; `:3271` copies that body to `route_test_without_renewal`, and `:3272` wraps it with the token renewal), the holder is the hold's holder, with kind `slot` and the held target as the resource.
+4. **Token holder.** In `acquire_token` (`verify.sh:3039`, wait starts near 3072 and 3110) the holder is the board token owner, with kind `slot` and resource `cargo`. Read it in Bash on each pass of the wait loop. Call `wait-holder` only when it changes.
+5. **Build hold.** At `verify.sh:2797` and `:3401`, and in the SSH route (`route_test` at `:2294`, wait at `:2420`; `:3279` copies that body to `route_test_without_renewal`, and `:3280` wraps it with the token renewal), the holder is the hold's holder, with kind `slot` and the held target as the resource.
 6. **Mac busy.** For the Mac-only wait (`phase_wait_start hold "Mac busy"`), the holder is the session that holds the Mac claim, with kind `slot` and resource `mac`. Name it again on each poll.
 7. **Changes.** A changed holder calls `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags. A holder that goes away calls it with no flags. No watcher process runs beside a wait. A change during one blocking wait call shows at the next pass.
 8. **Recorder failure.** A failed `start-wait` or `wait-holder` prints the existing `NotRecorded` line. It never changes admission or the step's exit. The next `holder` event or pass tries again.
-9. **Queue age.** `mem_wait_s` and the waiting lines count from the first queued time in `BUILDLOG_MEM_WAIT_FIRST_FILE`, normally `$HOLD_WAIT_DIR/first-queued-at` (`verify.sh:1978-1983`). Step setup writes that file before routing, so a memory event never creates it. Each recorder interval runs from its own `first` line to its `done` or `left` line. A rejoin after a refused Mac claim opens a new interval and keeps the first queued time. A first check that admits opens no interval and makes no holder call.
+9. **Queue age.** `mem_wait_s` and the waiting lines count from the first queued time in `BUILDLOG_MEM_WAIT_FIRST_FILE`, normally `$HOLD_WAIT_DIR/first-queued-at` (`verify.sh:1984-1989`). Step setup writes that file before routing, so a memory event never creates it. Each recorder interval runs from its own `first` line to its `done` or `left` line. A rejoin after a refused Mac claim opens a new interval and keeps the first queued time. A first check that admits opens no interval and makes no holder call.
 
 **Files:**
 - `scripts/direct/verify.sh` — the `holder` case, the lookups and the `wait-holder` calls.
@@ -963,49 +963,24 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 40 — A verify step reads each target's platform from the eligibility answer · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Source:** natest, routed by builds 2026-11-05 (next item "Platform column in build_targets.py eligible").
-
-**Goal:** `verify.sh` gets each target's platform from the `eligible` answer, so a routed step starts no `build_targets.py platform` interpreter.
-
-**Spec:**
-
-1. **The answer.** `print_eligible_target` in `scripts/build_targets/build_targets.py` prints a fifth tab-separated field: the target's platform for an `SshTarget`, `-` for a local target. Every `eligible` form prints it: plain, `--kind` and `--target`.
-2. **Every reader.** Each `read -r name eligibility reason settings` loop over the table in `scripts/direct/verify.sh` reads a fifth field, `platform`, so `settings` stays one field. The validation loop in `initialize_step_record` also reads a sixth name, `extra`, and `-n "$extra"` replaces its `"$settings" == *$'\t'*` test, so a settings path that holds a tab still takes the same refusal. There are 9 loops today, in `step_can_retry`, `initialize_step_record`, `target_for_settings`, `ssh_retry_hook`, `route_test` and others. Find each with grep.
-3. **Loops use the field.** A loop that calls `target_platform "$name"` for its own row reads `$platform`.
-4. **`target_platform`.** It scans `STEP_TARGET_TABLE` in Bash and starts no process. A row for the name with `macos` or `linux` gives that word. With no such answer, the last line stays as it is today: `[[ "$STEP_RUNS_ON" == mac_allowed && "$1" == mac ]] && printf '%s\n' macos`. `target_for_settings` does not change other than its read.
-5. **Remove the command.** `verify.sh` is the only caller of `build_targets.py platform`. Remove `command_platform`, the `platform` subparser, the `main` branch and the early `sys.argv[1:2] == ["platform"]` block. Keep `target_config.configured_ssh_target`, which other code calls.
-6. **Fixtures.** Each fake `eligible` answer prints the fifth field. Each fake `platform` branch goes, at `test_verify_ssh_targets.py:221` and `test_verify_step_state.py:142`, among others.
-7. **New tests.** `scripts/direct/test_verify_target_platform.py` extracts `target_platform` with `shell_functions` from `scripts/lib/shell_test_support.py` and runs it in `bash`, with `build_targets.py` not on any path it can reach. Cases: a `macos` row; a `linux` row; a `-` row; no row with `mac_allowed` and the name `mac`; no row with `ssh_allowed`. `scripts/build_targets/test_build_targets.py` states the fifth field for an SSH target and for a local target.
-
-**Invariants:** target selection, refusals, fallbacks, reservations, step records, `verify.sh` output and exit codes stay the same for every verb. A step that today reads `macos` for a target reads `macos` after this phase. `verify.sh` runs under bash 3.2. Add no other guard, refusal or check; the `invalid targets` check does not read `platform`.
-
-**Test changes approved:**
-- Each fixture row and each expected `eligible` line gains the fifth field.
-- Each fake `platform` branch goes.
-- The total in `test_verify_python_starts.py::test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper` falls by exactly the `platform` starts that its trace held, if any.
-
-**Acceptance:**
-
-- Observation: the count of `build_targets.py platform` starts and the wall and CPU seconds of `python3 ~/.claude/scripts/test_times/module_run.py scripts/direct test_verify_ssh_targets_routing.py`. The director measures the tree before and after this phase.
-- Comparison: the count falls to 0. The numbers go in the notice, with the load noted.
-- Real path: `test_verify_ssh_targets*.py`, `test_verify_step_routes*.py`, `test_verify_mac*.py`, `test_verify_token*.py`, `test_verify_python_starts.py` and `scripts/build_targets`.
+- `build_targets.py eligible` prints a fifth tab-separated field, `platform`, on each target row. The `platform` command does not exist.
+- `verify.sh` reads `platform` in each row loop. `target_platform` reads `STEP_TARGET_TABLE` in the same shell, and starts no process. When no row answers, it prints `macos` for a target named `mac` under `mac_allowed`, and otherwise prints nothing.
+- The validation loop in `initialize_step_record` reads a sixth name, `extra`, and takes the `invalid targets` refusal when `extra` is not empty. So a settings path that holds a tab takes the same refusal, exit 2.
+- Measured `test_verify_ssh_targets_routing.py` over two runs: `build_targets.py platform` starts 69 to 0, CPU 73.6 to 68.3 s, wall 93.7 s to 96.7 and 152.5 s, with noise from a load of 47 to 57.
 
 **Files:**
-- `scripts/build_targets/build_targets.py` — the fifth field; the `platform` command goes.
-- `scripts/direct/verify.sh` — the readers and `target_platform`.
-- `docs/as-built/build-targets.md` — the `eligible` row and any `platform` row.
-- `scripts/direct/test_verify_target_platform.py` — new direct tests.
-- `scripts/build_targets/test_build_targets.py`, `scripts/build_targets/test_ssh_eligibility.py` — the expected lines.
-- `scripts/direct/test_verify_ssh_targets.py`, `scripts/direct/test_verify_step_state.py`, `scripts/direct/test_verify_mac_lint_token.py`, `scripts/direct/test_verify_mac_disk_leave.py`, `scripts/direct/verify_step_routes_test_support.py`, `scripts/direct/verify_token_wait_test_support.py` — fixture rows and fake commands. A fixture that the suites show also prints a row joins this set.
+- `scripts/build_targets/build_targets.py` — the fifth field.
+- `scripts/direct/verify.sh` — the row loops, `target_platform` and the validation loop.
+- `scripts/direct/test_verify_target_platform.py` — direct tests of `target_platform`.
+- `scripts/direct/test_verify_checks_fail_closed.py` — the tabbed settings path refusal.
+- `scripts/direct/test_verify_step_state.py` — the initial record's `mac_targets` list from a `macos` row and a `linux` row.
+- `docs/as-built/build-targets.md`, `docs/as-built/mac-test-offload.md` — the row form.
 
-**Workers:** 1 writer + 1 tester
-- `merge16` (impl): `scripts/build_targets/build_targets.py`, `scripts/direct/verify.sh`, `docs/as-built/build-targets.md`.
-- `fix16` (test): every test and fixture file.
+**Gotchas:**
+- `read` with five names puts the second part of a tabbed settings path in `platform`, so `settings` holds no tab. Only a sixth name can detect the extra field.
+- `STEP_TARGET_TABLE` is not exported, so `target_platform` answers only in `verify.sh`'s own process. Pinned routing replaces the table with a pinned-only table at `route_test`.
 
-**State:** none.
-
-**Verification:** the Real path modules through `scripts/test_times/module_run.py`; `basedpyright` over each changed Python file; `bash -n scripts/direct/verify.sh` and `shellcheck scripts/direct/verify.sh`; the merge gate before the checkpoint.
+**Ruled out:**
+- A test for the read in the `MAC_ONLY` loop: `register_mac_wait` repeats the same check.
