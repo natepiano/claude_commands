@@ -191,7 +191,7 @@ class ScratchTests(unittest.TestCase):
                                        {"source.txt": "style source\n"})
         started = time.time()
         with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
-            with copies.standing("style", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
             # Supply build output, but let copies supply every cache marker.
             fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
@@ -867,6 +867,49 @@ print(scratch.target('gate:proof', 'tree', False))
                 assert isinstance(state, scratch.Live)
                 self.assertIn("has not ended", state.why)
                 self.assertNotIn("landed", state.why)
+
+    def test_same_until_value_gives_each_folder_a_task_that_ends_only_that_folder(self) -> None:
+        first = scratch.new(scratch.parsed_until("2099-01-01 09:30"))
+        second = scratch.new(scratch.parsed_until("2099-01-01 09:30"))
+        _ = (first / "work").write_text("first work")
+        _ = (second / "work").write_text("second work")
+        first_record = scratch.task_of(first)
+        second_record = scratch.task_of(second)
+        assert isinstance(first_record, copy_record.Registered)
+        assert isinstance(second_record, copy_record.Registered)
+        self.assertNotEqual(first_record.task, second_record.task)
+        bare_task = first_record.task.partition("/")[0]
+        self.assertEqual(second_record.task.partition("/")[0], bare_task)
+
+        self.assertEqual(scratch.end(bare_task), [])
+        self.assertEqual((first / "work").read_text(), "first work")
+        self.assertEqual((second / "work").read_text(), "second work")
+        self.assertEqual(scratch.end(first_record.task), [first])
+        self.assertFalse(first.exists())
+        self.assertEqual((second / "work").read_text(), "second work")
+        self.assertEqual(scratch.task_of(second), second_record)
+
+    def test_default_folders_created_at_the_same_time_have_different_tasks(self) -> None:
+        first = scratch.task_of(scratch.new(now=1_000_020.0))
+        second = scratch.task_of(scratch.new(now=1_000_020.0))
+        assert isinstance(first, copy_record.Registered)
+        assert isinstance(second, copy_record.Registered)
+        self.assertNotEqual(first.task, second.task)
+
+    def test_until_task_with_an_id_keeps_the_deadline_of_the_bare_task(self) -> None:
+        bare = "until:2099-01-01T0930Z"
+        bare_end = scratch.task_end(bare, now=9e12)
+        assert isinstance(bare_end, scratch.Ended)
+        task = bare + "/private-task"
+        self.assertIsInstance(scratch.task_end(task, now=bare_end.at - 1), scratch.Live)
+        ended = scratch.task_end(task, now=bare_end.at)
+        assert isinstance(ended, scratch.Ended)
+        self.assertEqual(ended.at, bare_end.at)
+        self.assertIsInstance(scratch.task_end("until:bad/private-task"), scratch.Unknown)
+
+    def test_until_folder_name_contains_the_stamp_without_the_task_id(self) -> None:
+        path = scratch.new("until:2099-01-01T0930Z/private-task", word="proof")
+        self.assertRegex(path.name, r"^until-2099-01-01T0930Z-proof-[a-z0-9]+$")
 
     def test_no_task_lasts_a_day_and_until_ends_at_its_time(self) -> None:
         path = scratch.new(now=1_000_000.0)

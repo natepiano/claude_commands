@@ -22,6 +22,7 @@ from scripts.lib import build_folders
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import progress_profile as progress, step_estimator
+from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply, snapshot_with_head_cause
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture
@@ -39,24 +40,55 @@ class ServiceGateFixture(GateSuitesFixture):
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
     @gate_suites("lib", "hooks")
-    def test_suite_progress_counts_type_jobs_and_starts_a_new_phase_for_reruns(self) -> None:
+    def test_suite_progress_counts_type_jobs_and_clears_the_counter_for_reruns(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
         counters: list[progress.ProgressCounter] = []
+        sidecars: list[Path] = []
+        starts: set[Path] = set()
+        reruns: list[Path] = []
         publish = progress.publish_counter
+        start = merge_gate.start_gate_job
 
         def record(sidecar: Path, counter: progress.ProgressCounter) -> None:
             publish(sidecar, counter)
             self.assertEqual(progress.read_counter(sidecar), counter)
             counters.append(counter)
+            sidecars.append(sidecar)
 
-        with mock.patch.object(progress, "publish_counter", side_effect=record):
+        def start_job(suite: str, path: Path, argv: list[str], repo: Path,
+                      environment: dict[str, str], log: Path, *,
+                      kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+            if path in starts:
+                reruns.append(path)
+                self.assertFalse(progress.progress_path(sidecars[-1], "json").exists())
+            starts.add(path)
+            return start(suite, path, argv, repo, environment, log, kind=kind)
+
+        with mock.patch.object(progress, "publish_counter", side_effect=record), \
+             mock.patch.object(merge_gate, "start_gate_job", side_effect=start_job):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         initial_total = self.module_count + 1
         self.assertEqual([counter for counter in counters if counter.phase == "suites:1"],
             [progress.ProgressCounter("suites:1", done, initial_total) for done in range(initial_total + 1)])
-        self.assertEqual([counter for counter in counters if counter.phase == "suites:2"],
-            [progress.ProgressCounter("suites:2", done, 2) for done in range(3)])
+        self.assertEqual([counter for counter in counters if counter.phase != "suites:1"], [])
+        self.assertEqual(len(reruns), 2)
+        recorder = progress.ProfileRecorder()
+        recorded_use = memory_admit.GIB // 20
+        for counter in counters:
+            _ = recorder.observe(counter, recorded_use)
+        near_end = progress.ProgressCounter("suites:1", 99, 100)
+        window = progress.window_peak(recorder.profile(), near_end, 20)
+        self.assertIsInstance(window, progress.WindowPeak)
+        assert isinstance(window, progress.WindowPeak)
+        self.assertEqual(window.bytes, recorded_use)
+        row = fixture_reservation(123, 4 * memory_admit.GIB, step="merge-gate")
+        reading = memory_admit.MeasuredMemory(recorded_use,
+            anonymous=memory_admit.AnonymousRunUse(recorded_use))
+        adjusted = memory_admit.progress_memory(row, reading,
+            memory_admit.AttributedStepUse(reading.anonymous, True), near_end, recorder.profile(),
+            admission_policy_fixture())
+        self.assertEqual(adjusted.remaining_need, recorded_use)
         self.assert_gate_released()
 
     def test_suites_refuse_unwritable_memory_parent_before_admission(self) -> None:

@@ -363,7 +363,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
     # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, tip) as snapshot, signal_mask(signal.SIG_BLOCK):
+    with stop_signals_raise(), copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip)) as snapshot, signal_mask(signal.SIG_BLOCK):
         directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
             lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent())))
         try:

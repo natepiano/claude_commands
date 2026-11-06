@@ -142,6 +142,7 @@ class RosterTests(unittest.TestCase):
         self.environment = {
             **os.environ,
             "HOME": str(self.home),
+            "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "SSH_RECORD": str(self.ssh_log),
@@ -997,6 +998,54 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(late_worker.director, worker.director)
         self.assertFalse(current.exists())
         self.assertEqual((previous.read_bytes(), previous.stat().st_mtime_ns), modified)
+
+    def test_switched_worker_resolves_once_before_and_after_a_transcript_and_after_returning_to_codex(self) -> None:
+        from scripts.production import broadcast
+
+        native = staff.native_id(fixture_runtime_id("switched-claude-session"))
+        unit = unit_membership("alpha", "unit-one")
+        worker = staff.ensure_worker(native, "switched", unit.id)
+        self._write_session("switched", "switched-claude", native, self.home / "switched")
+        mesh = self.director_run / "mesh_roster.json"
+        _ = mesh.write_text(json.dumps({worker.name: {"staff_id": worker.id, "status": "done"}}))
+        saved = mesh.read_bytes()
+        self.assertEqual(sessions.transcript_locations(native), [])
+        for transcript in (False, True):
+            with self.subTest(transcript=transcript):
+                if transcript:
+                    fixture_session(native, staff.ClaudeBackend())
+                with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+                    observed = roster.roster(os.environ, roster.ThisMachine())
+                membership = staff.snapshot()
+                matches = send.matching_recipients(f"session:{native}", send.LocalOnly(), observed,
+                                                   membership=membership)
+                self.assertIsInstance(matches, send.RecipientMatches)
+                assert isinstance(matches, send.RecipientMatches)
+                self.assertEqual(len(matches.entries), 1)
+                recipient = matches.entries[0]
+                self.assertEqual((recipient.kind, recipient.role, recipient.session),
+                                 ("claude", "worker", roster.ClaudeSession(native)))
+                self.assertEqual(recipient.reach, roster.Messageable(f"session:{native}"))
+                route = send.resolve_recipient(f"session:{native}", send.LocalOnly(), observed,
+                                               membership=membership)
+                self.assertEqual(route, send.ClaudeRecipient(f"session:{native}"))
+                self.assertTrue(broadcast.selects(broadcast.Workers(), recipient))
+                self.assertTrue(broadcast.selects(broadcast.WorkersOfUnit(
+                    "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b", unit.name, recipient.machine), recipient))
+                self.assertFalse(roster.is_top_level(recipient))
+                self.assertEqual(mesh.read_bytes(), saved)
+        codex = staff.native_id(fixture_runtime_id("switched-back-to-codex"))
+        _ = staff.update_current_session(native, codex)
+        fixture_session(codex, staff.CodexBackend(self.root / "return-codex"))
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            observed = roster.roster(os.environ, roster.ThisMachine())
+        matches = send.matching_recipients(f"session:{codex}", send.LocalOnly(), observed, membership=staff.snapshot())
+        self.assertIsInstance(matches, send.RecipientMatches)
+        assert isinstance(matches, send.RecipientMatches)
+        self.assertEqual(len(matches.entries), 1)
+        self.assertEqual((matches.entries[0].kind, matches.entries[0].role, matches.entries[0].thread),
+                         ("codex", "worker", roster.CodexThread(codex)))
+        self.assertEqual(mesh.read_bytes(), saved)
 
     def test_background_id_prefix_places_claude_worker_in_its_run(self) -> None:
         worker = self._entries()["claude-worker"]
@@ -2463,6 +2512,21 @@ class RosterTests(unittest.TestCase):
 
 
 class PaneRosterTests(StaffTestCase):
+    def test_missing_herdr_keeps_session_entries_and_reports_pane_workers(self) -> None:
+        fixture = self.row_production()
+        _ = self.session_record(fixture.unit.current_session, "director")
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
+             mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), \
+             mock.patch.object(account, "process_config_dir", return_value=None), \
+             mock.patch.object(codex_daemon, "read_daemons", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual([problem for problem in found.problems if problem.startswith("pane workers:")],
+            ["pane workers: herdr is not installed"])
+        self.assertIn("director", [entry.name for entry in found.entries])
+
     def test_pane_workers_keep_five_states_and_replace_native_session_entries(self) -> None:
         fixture = self.row_production()
         rows = [fixture_worker(name, fixture.unit.id,

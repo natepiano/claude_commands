@@ -317,6 +317,26 @@ only I can bump
 **Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, and the wall time and token answer in the notice.
 
 **Change-Review:** a hana clippy fix step no longer holds the build tokens.
+### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
+
+#### As-built
+
+- `scripts/message/roster.py:1286` also catches `herdr.HerdrFailure`, so `send.py` keeps the session entries and delivers from a service with no herdr on its PATH.
+- `down_alert`'s phone push reads "The builds session did not take the message. Builds wait until the service answers."
+- A merge gate rerun sets `progress_total = 0`, so `publish_progress` publishes nothing, and `progress_profile.clear_counter` removes the counter file. The rerun keeps the full need. `progress_phase` is gone, and the first pass counter is `suites:1`.
+
+**Files:**
+- `scripts/message/roster.py`, `scripts/message/test_roster.py` — the catch
+- `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py` — the push text, the proof with no herdr
+- `scripts/build_queue/progress_profile.py` — `clear_counter`
+- `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate_suites_admission.py` — the rerun
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/merge-gate-and-test-speed.md` — the rerun rule
+
+**Binds later work:** a module that names `session_send_argv` installs `forbid_real_sender` in `setUpModule`, because `scripts/message/test_session_send.py` requires it.
+
+**Gotchas:** the installed `merge_gate.py` runs for every `--checkout` gate, so `suites:2` records keep arriving until this phase is installed. Stored `suites:2` records stay until removed.
+
+**Ruled out:** a reader in main code that skips stored `suites:2` records.
 
 ### Phase 21 — Each moved admission name has one import path  · status: todo
 

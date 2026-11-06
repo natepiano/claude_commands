@@ -15,6 +15,30 @@ def mac_idle_reservation(holder: str, detail: str) -> str:
 
 
 ENTRIES = (
+    PushText("nightly.result", "nightly", "note", "Nightly check {outcome}", NoActionNeeded(),
+        "The nightly check of {branch} finished at {time}.\nType check: {types}.\nFull tests: {tests}.",
+        (PushExample("passed", {"branch": "main", "time": "03:53 EST", "outcome": "passed",
+                               "types": "passed", "tests": "passed"}),
+         PushExample("tests_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "passed", "tests": "failed in direct/test_simplify_lens.py, production/test_staff.py"}),
+         PushExample("types_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "failed with 3 errors, 1 warning, 0 notes", "tests": "passed"}),
+         PushExample("many_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+             "types": "passed", "tests": "failed in direct/test_assign.py, direct/test_board.py, "
+             + "message/test_send.py, notify/test_review.py, production/test_staff.py, "
+             + "shutdown/test_restart.py, settings/test_settings.py, whoami/test_usage.py and 12 more"}),
+         PushExample("did_not_finish", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
+                                       "types": "did not run", "tests": "did not finish"})),
+        purpose="The nightly check finished. It says which parts passed."),
+    PushText("nightly.not_run", "nightly", "note", "Nightly check did not run", ActionTemplate("{action}"),
+        "The nightly check of {branch} did not run at {time}.\nWhy: {reason}.",
+        (PushExample("fetch_failed", {"branch": "main", "time": "03:53 EST",
+             "reason": "git fetch of main failed: ssh connection timed out",
+             "action": "None. The next nightly run tries again."}),
+         PushExample("cold_credentials", {"branch": "main", "time": "03:53 EST",
+             "reason": "GitHub credentials are cold",
+             "action": "In a terminal on natedev, run github-warmup"})),
+        purpose="The nightly check did not run. It says why."),
     PushText("decision.choices", "{sender}", "decision", "{title}",
         ActionTemplate("On {machine}, reply in the {session} terminal: {choice_labels}."),
         "Situation: {situation}\n\nChoices:\n{choices}\n\n"
