@@ -788,11 +788,11 @@ class ProductionNameTests(unittest.TestCase):
     def test_reads_staff_units_and_finds_cross_role_collisions(self) -> None:
         doc = Path("/fixture/one.md")
         first = audit.parse_production("one", doc, owned_units(doc, "render", "old", retired=("old",), production_name="one"))
-        second = audit.ProductionNames("two", "/fixture/two.md", "render-unit", ("tools-unit",))
+        second = audit.ProductionNames("render-unit", "/fixture/two.md", ("tools-unit",))
         rows = audit.measure_production_names((first, second))
         self.assertEqual(first.units, ("render-unit", "old-unit"))
         self.assertEqual(rows, (
-            audit.ProductionNameFinding("shared name", "render-unit", ("one", "two"), ("/fixture/one.md", "/fixture/two.md")),
+            audit.ProductionNameFinding("shared name", "render-unit", ("one", "render-unit"), ("/fixture/one.md", "/fixture/two.md")),
         ))
 
 
@@ -1055,8 +1055,8 @@ other_names = []
         at = datetime(2026, 10, 1, tzinfo=timezone.utc)
         result = audit.report(
             (term("worker", defined_in=("docs/a.md#Words", "docs/b.md#Words")),), (),
-            (audit.ProductionNames("one", "one.md", "runner-one", ("shared-unit",)),
-             audit.ProductionNames("two", "two.md", "runner-two", ("shared-unit",))),
+            (audit.ProductionNames("one", "one.md", ("shared-unit",)),
+             audit.ProductionNames("two", "two.md", ("shared-unit",))),
             audit.parse_messages(""), audit.AuditWindow(at, at + timedelta(days=1)), (),
             source_result=audit.SourceCheck((), (), (), ()), unread_production_docs=())
         self.assertIn("Definitions: n=1 findings across n=1 terms.", result)

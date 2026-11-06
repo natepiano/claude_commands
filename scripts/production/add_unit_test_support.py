@@ -178,7 +178,7 @@ def configure_test_zone() -> None:
 
 
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, unit_membership,
+    StaffTestCase, fixture_runtime_id, unit_membership,
 )
 
 
@@ -519,7 +519,7 @@ class AddUnitTestCase(ShutdownTestCase):
                 record = cast(dict[str, object], json.loads(registry.read_text()))
                 record["bridgeSessionId"] = "session_bridge" if (self.state / "ready").exists() else ""
                 _ = registry.write_text(json.dumps(record))
-            parent = fixture_runtime_id("showrunner::" + fixture_showrunner_name(request.production.name, request.production.doc))
+            parent = fixture_runtime_id("showrunner::" + request.production.name)
             self.env["FAKE_CLAUDE_SESSION_ID"] = (request.session.session_id
                 if isinstance(request.session, add_unit.ResumedSession)
                 else fixture_runtime_id("unit:" + parent + ":" + request.identity.session))

@@ -140,9 +140,8 @@ def main(arguments: list[str]) -> int:
     unit = cast(str, args.unit)
     try:
         record = staff.snapshot()
-        sources = unit_lookup.member_sources()
         production_name = cast(str, args.production)
-        worktree = str(unit_lookup.local_worktree(sources.member(
+        worktree = str(unit_lookup.local_worktree(staff_sources.member(
             staff_sources.UnitMember(production_name, unit), record)).path)
     except (staff.StaffUnreadable, staff.StaffRefused) as error:
         print(f"unit_run: {error}", file=sys.stderr)

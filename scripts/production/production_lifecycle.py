@@ -14,7 +14,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import session_staff, staff, staff_sources, unit_config, unit_names
+from scripts.production import session_staff, staff, unit_config, unit_names
 from scripts.shutdown.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -176,7 +176,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         return
     owed: tuple[str, ...] = ()
     try:
-        owed = judgment_state(showrunners.session_state_dir(showrunner_id(production.name)) / "showrunner_state.json", "load").owed
+        owed = judgment_state(showrunners.session_state_dir(production.owner.id) / "showrunner_state.json", "load").owed
     except FileNotFoundError:
         pass
     except (RegistrationFailure, OSError, ValueError, UnicodeError) as error:
@@ -188,7 +188,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         marked = unit_lookup.labeled_sessions(production.name)
     except OSError as error:
         raise LifecycleStop("session", "failed", str(error)) from error
-    for row in unit_lookup.doc_units(production.doc, staff.snapshot()):
+    for row in staff.snapshot().find(kind="unit", parent=production.owner.id):
         name = unit_names.unit_id(row.name)
         last: MergeEntry | NoMerge = history.last_code_for_unit(name) if history else NoMerge()
         detail = (f"phase {last.phase} at {last.merge_hash}" if isinstance(last, MergeEntry)
@@ -210,7 +210,7 @@ def open_production(production: Production, lines: list[str]) -> None:
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
     record = staff.snapshot()
-    rows = unit_lookup.doc_units(production.doc, record)
+    rows = tuple(record.find(kind="unit", parent=production.owner.id))
     resolver = session_staff.RowResolver(record)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
@@ -366,10 +366,11 @@ def wrap_production(name: str) -> Production:
                           "--diff-filter=R", "--find-renames", "-z").split("\0")
         for before, after in zip(renames[1::3], renames[2::3]):
             if checkout / before == source:
-                production = production_doc.read_new_production(checkout / after, owner.name)
-                if archived_doc(production._replace(doc=source)) == production.doc:
+                document = production_doc.read_new_production(checkout / after, owner.name)
+                production = document.for_owner(owner)
+                if archived_doc(replace(production, doc=source)) == production.doc:
                     return production
-    return read_production(owner.name, record=record)
+    return read_production(owner)
 
 
 def retire_reservations(worktree: Path) -> None:
@@ -437,7 +438,7 @@ def capture_release(production_name: str, *, record: staff.StaffSnapshot | None 
     if (parent is not None and not isinstance(parent, str)) or not isinstance(children, list) or not isinstance(told, list):
         raise ValueError(f"{path}: invalid release capture")
     if not all(isinstance(item, str) for item in [*cast(list[object], children), *cast(list[object], told)]):
-        raise ValueError(f"{path}: release production_names must be strings")
+        raise ValueError(f"{path}: release production names must be strings")
     return showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(parent) if isinstance(parent, str) else showrunner_tree.Root(),
                                    tuple(cast(list[str], children)), tuple(cast(list[str], told)))
 
@@ -546,15 +547,8 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
-    sources = unit_lookup.member_sources()
-    productions = dict(sources.productions)
-    productions[production.name] = showrunners.ShowrunnerSource(
-        showrunners.Timer(production.name, "session:unrecorded", production.doc, ""), "\n".join(lines))
-    sources = replace(sources, productions=productions)
-    runner = sources.member(staff_sources.ShowrunnerMember(production.name), record)
-    if isinstance(runner, staff_sources.NoSuchMember):
-        raise LifecycleStop("staff", "held", "no showrunner staff row")
-    rows = units(runner.row, record)
+    runner = production.owner
+    rows = units(runner, record)
     if isinstance(status, ProductionRunning):
         for item in close_out_items(lines):
             if item not in done:
@@ -612,7 +606,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             report("retire", "ok", f"deleted origin/{unit.branch}")
         elif remote.returncode != 2:
             raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
-    held = retire_wrap_rows(rows, record, runner.row) or held
+    held = retire_wrap_rows(rows, record, runner) or held
     if isinstance(status, ProductionRunning):
         release_edges(production.name, record=record)
         archived = command(
@@ -653,7 +647,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     final_doc = archive if archive is not None else production.doc
     if not final_doc.is_file():
         raise LifecycleStop("staff", "held", f"wrapped production doc is missing: {final_doc}")
-    wrapped_runner = staff.set_doc(runner.row.id, staff.WrappedDoc(local_machine(), final_doc))
+    wrapped_runner = staff.set_doc(runner.id, staff.WrappedDoc(local_machine(), final_doc))
     record = replace(record, rows=tuple(wrapped_runner if row.id == wrapped_runner.id else row for row in record.rows))
     if record.pending_retire:
         _ = staff.retire_pending()
@@ -695,7 +689,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     print(f"| Main | {main_result} |")
     print("| Next | close herdr sessions |")
     if not held:
-        tidy_state(production.name, final_doc, identities=QuestionStaff.for_record(record, sources))
+        tidy_state(production.name, final_doc, identities=QuestionStaff.for_record(record))
     return 1 if held else 0
 
 

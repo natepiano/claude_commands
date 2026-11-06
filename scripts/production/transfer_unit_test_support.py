@@ -19,7 +19,7 @@ from scripts.herdr import fake_herdr
 from scripts.production import showrunners
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.production.staff_test_support import StaffTestCase, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import transfer_unit
@@ -72,7 +72,7 @@ class UnitTransferFixture(StaffTestCase):
         })
         self.write(self.root / "state/notifier/showrunner-other/conf",
                    "TARGET=session:cc9c5b71-6f71-5499-a4bb-e6ad5d02930d\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
-                   str(self.receiving / "docs/plans/other-production.md")]) + "\n")
+                   fixture_runtime_id("showrunner::other")]) + "\n")
         for module, name, value in (
             (showrunners, "SEND", self.root / "fake_send.py"),
             (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
@@ -155,7 +155,7 @@ class UnitTransferFixture(StaffTestCase):
         self.write(self.root / "state/notifier/showrunner-demo/conf",
                    "EVERY=15\nTARGET=session:8f83b18e-2d35-5935-a408-9f483d34afff\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh",
-                                 str(self.giving / "docs/plans/demo-production.md")]) + "\n")
+                                 fixture_runtime_id("showrunner::demo")]) + "\n")
 
     def production_doc(self, production_name: str, checkout: Path) -> str:
         return "\n".join(["# Production — " + production_name, "", "## Production Context", "",

@@ -380,7 +380,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.parent.id}"
         timer.mkdir(parents=True)
         self.write(timer / "conf", f"TARGET=session:{runner.parent.id}\n"
-                   + f"CHECK=bash /scripts/production/production_check.sh {doc}\n")
+                   + f"CHECK=bash /scripts/production/production_check.sh {runner.parent.id}\n")
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
                                             + "Change-Review: The sky dims | Run `hana` in a natedev terminal | The sky turns darker")

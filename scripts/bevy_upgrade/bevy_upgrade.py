@@ -15,7 +15,6 @@ from typing import TypedDict, cast
 from scripts.production.production_doc import Production, Refusal, read_production
 import pins
 from scripts.production import staff
-from scripts.production.store_owner import document_id
 import upstream
 import upgrade_check
 import upgrade_record
@@ -62,16 +61,17 @@ def _production(args: argparse.Namespace, record: staff.StaffSnapshot) -> Produc
         row = record.by_id(staff.StaffId(identity))
         if row is None or row.kind != "showrunner":
             raise Refusal(f"{identity}: showrunner ownership evidence is unavailable")
-        return read_production(row.name, record)
-    name = cast(str | None, args.production)
-    if name is None:
+    else:
+        name = cast(str | None, args.production)
+        if name is not None:
+            return read_production(name, record)
         runtime = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         row = record.by_current_session(runtime)
-        if row is not None and row.kind == "showrunner":
-            name = row.name
-    if name is None:
-        raise Refusal("this session runs no production; pass --production <name>")
-    return read_production(name, record)
+        if row is None or row.kind != "showrunner":
+            raise Refusal("this session runs no production; pass --production <name>")
+    if isinstance(row.doc, staff.DocUnfilled):
+        raise Refusal(f"cannot read production doc: {row.name}: no production document")
+    return read_production(row)
 
 
 def _baseline(record: upgrade_record.Record) -> None:
@@ -231,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         record = staff.snapshot()
         production = _production(args, record)
-        identity = document_id(production.doc, record=record)
+        identity = production.owner.id
         return _run(args, production, datetime.now(timezone.utc), identity)
     except (upgrade_record.RecordFailure, pins.PinsFailure, Refusal, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"bevy_upgrade: {error}", file=sys.stderr)

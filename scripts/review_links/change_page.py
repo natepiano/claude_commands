@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import change_review as change_review
 from scripts.production import unit_lookup
-from scripts.production import unrouted_alert, change_routing, delivery_state, next_item, showrunners, showrunner_tree, staff
+from scripts.production import unrouted_alert, change_routing, delivery_state, next_item, showrunners, staff
 from scripts.production.delivery_state import (
     AnsweredQuestion as AnsweredQuestion, DeliveryIntent as DeliveryIntent, DeliverySlots as DeliverySlots,
     NoDelivery as NoDelivery, NoQuestion as NoQuestion, OpenQuestion as OpenQuestion,
@@ -566,7 +566,7 @@ def row_production(page: ReviewPage, row: dict[str, str]) -> Path:
         if isinstance(assignment.production, Path):
             return assignment.production
         raise AnswerRefused(assignment.production.reason)
-    root = showrunner_tree.root_of(unit_lookup.doc_owner(page.production, record).name, record=record)
+    root = change_review.showrunner_of(page.production, record=record)
     owner = row.get(change_review.PRODUCTION) or root
     found = showrunners.owner_for(owner, record)
     if isinstance(found.doc, (staff.LiveDoc, staff.WrappedDoc)):

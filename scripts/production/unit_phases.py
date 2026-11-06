@@ -124,7 +124,7 @@ def main(arguments: list[str]) -> int:
         doc = read_production(name).doc
         style = is_style_production(doc)
         with ThreadPoolExecutor(max_workers=2) as reads:
-            sessions = reads.submit(live_units.units_of_doc, doc)
+            sessions = reads.submit(live_units.units_of, name)
             if style:
                 import style_units
             records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))

@@ -389,12 +389,6 @@ def production_membership(showrunner: str, *units: str) -> None:
         _ = unit_membership(showrunner, unit)
 
 
-def fixture_showrunner_name(production_name: str, doc: Path) -> str:
-    """Return the supplied staff name without reading the document."""
-    del doc
-    return production_name
-
-
 def source_environment(source: Path) -> dict[str, str]:
     return {key: str(source / folder) for key, folder in (
         ("NOTIFIER_STATE_DIR", "notifier"), ("SHOWRUNNER_STATE_DIR", "showrunners"),
@@ -691,7 +685,7 @@ class StaffTestCase(unittest.TestCase):
 
     def record_production(self, production_name: str, doc: Path) -> staff.StaffRow:
         """Register the timer and record its private owner document."""
-        row = recorded_showrunner(fixture_showrunner_name(production_name, doc), doc)
+        row = recorded_showrunner(production_name, doc)
         self.register_production(production_name, doc, name=row.name)
         return row
 

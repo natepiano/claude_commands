@@ -86,7 +86,7 @@ def production_of(production_name: str, *, record: staff.StaffSnapshot) -> Produ
         raise ValueError(f"{production_name}: no showrunner staff document")
     if found.row.doc.machine != local_machine():
         raise ValueError(f"{production_name}: run retire on {found.row.doc.machine}")
-    return read_production(found.row.name, record=record)
+    return read_production(found.row)
 
 
 def _git(unit: Unit, *arguments: str, settings: conf.ConfigRead) -> subprocess.CompletedProcess[str]:

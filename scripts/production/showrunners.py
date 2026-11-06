@@ -134,9 +134,7 @@ def _registration(instance: Path, record: staff.StaffSnapshot, *,
     target = fields["TARGET"]
     if not target.startswith("session:") or not target[8:]:
         raise ValueError("invalid TARGET")
-    owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
-    if owner is None or owner.kind != "showrunner":
-        raise ValueError(f"{instance}: no showrunner staff row")
+    owner = owner_for_timer(instance, record)
     return TimerRegistration(owner.name, f"session:{owner.id}", user_zone_name())
 
 
@@ -161,6 +159,15 @@ def owner_for(reference: str, record: staff.StaffSnapshot | None = None) -> staf
 def timer_name(reference: str, record: staff.StaffSnapshot | None = None) -> str:
     """Return the timer folder name for the fixed staff owner."""
     return f"showrunner-{owner_for(reference, record).id}"
+
+
+def owner_for_timer(instance: Path, record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
+    """Read the owner identified by the timer folder's staff id."""
+    record = record if record is not None else staff.snapshot()
+    owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
+    if owner is None or owner.kind != "showrunner":
+        raise ValueError(f"{instance}: no showrunner staff row")
+    return owner
 
 
 @dataclass(frozen=True)
@@ -232,21 +239,16 @@ def _session_name(session_id: str) -> str:
 
 
 def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = None,
-            expected_document: Path | None = None,
             record: staff.StaffSnapshot | DiscoverMembership = DISCOVER_MEMBERSHIP) -> ShowrunnerSource:
     fields = _fields(instance / "conf", dependencies=dependencies)
     target = fields["TARGET"]
     if not target.startswith("session:") or not target[8:]:
         raise ValueError("invalid TARGET")
     record = staff.snapshot() if isinstance(record, DiscoverMembership) else record
-    owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
-    if owner is None or owner.kind != "showrunner":
-        raise ValueError(f"{instance}: no showrunner staff row")
+    owner = owner_for_timer(instance, record)
     if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
         raise ValueError(f"{owner.name}: no production document")
     path = owner.doc.path
-    if expected_document is not None and path.resolve() != expected_document.resolve():
-        raise ValueError(f"{instance}: timer document differs from stored document {expected_document}")
     if dependencies is not None:
         dependencies(path)
     try:
@@ -255,11 +257,6 @@ def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = Non
         raise ValueError(f"production doc could not be read: {error}") from error
     timer = Timer(owner.name, f"session:{owner.id}", path, user_zone_name())
     return ShowrunnerSource(timer, document)
-
-
-def read_bound_source(instance: Path, document: Path) -> ShowrunnerSource:
-    """Read a timer only when its document agrees with the caller's stored owner."""
-    return _source(instance, expected_document=document)
 
 
 class UnreadableTimerPolicy(Enum):
@@ -402,11 +399,11 @@ def copy_session_state(staff_id: str, scratch: Path) -> list[str]:
     return copied
 
 
-def timer_scratch(production_name: str, record: staff.StaffSnapshot | None = None) -> Path | None:
+def timer_scratch(staff_id: str, record: staff.StaffSnapshot | None = None) -> Path | None:
     """Find the scratchpad for the session that receives the production update timer."""
     record = record if record is not None else staff.snapshot()
     try:
-        target = _fields(NOTIFIER_STATE_DIR / timer_name(production_name, record) / "conf").get("TARGET", "")
+        target = _fields(NOTIFIER_STATE_DIR / f"showrunner-{staff_id}" / "conf").get("TARGET", "")
     except (OSError, UnicodeError):
         return None
     owner = record.by_id(staff.StaffId(target.removeprefix("session:")))
@@ -417,13 +414,12 @@ def timer_scratch(production_name: str, record: staff.StaffSnapshot | None = Non
                  if path.is_dir()), None)
 
 
-def adopt_session_state(production_name: str, staff_id: str,
-                        record: staff.StaffSnapshot | None = None) -> list[str]:
+def adopt_session_state(staff_id: str, record: staff.StaffSnapshot | None = None) -> list[str]:
     """Copy missing scratchpad state to the fixed owner's folder."""
     target = session_state_dir(staff_id)
     if all((target / name).exists() for name in SESSION_STATE):
         return []
-    scratch = timer_scratch(production_name, record)
+    scratch = timer_scratch(staff_id, record)
     return copy_session_state(staff_id, scratch) if scratch is not None else []
 
 
@@ -464,7 +460,7 @@ def named(showrunner: str) -> Showrunner:
 
 
 def timer_docs(state_dir: Path | None = None) -> dict[str, Path]:
-    """Each production with a complete update timer, by production_name, with its doc, whether or not its showrunner runs."""
+    """Map each production name to its document when its update timer is complete."""
     found: dict[str, Path] = {}
     for instance in (state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*"):
         try:
@@ -487,16 +483,12 @@ def own_name() -> str:
 
 
 def name_refusal(production_name: str, name: str) -> str:
-    """Why a showrunner session called `name` cannot run production `production_name`; empty when it can.
-
-    One name per production (user, 2026-10-27): the production_name is the showrunner's name, so a production
-    whose showrunner has another name is renamed first.
-    """
+    """Return the reason when the production name differs from its showrunner's session name."""
     if name == production_name:
         return ""
     if not name:
         return f"the showrunner of {production_name} has no session name; name the session {production_name}"
-    return (f"production {production_name} has showrunner {name}, and a production's production_name must be its showrunner's name; "
+    return (f"production {production_name} has showrunner {name}, and a production's name must be its showrunner's name; "
             + f"rename the production first: `/showrunner:rename plan {production_name} {name}`")
 
 

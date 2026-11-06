@@ -371,18 +371,17 @@ class NoBoardSubtree:
 def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree:
     try:
         record = staff.snapshot()
-        members: dict[str, staff.StaffRow] = {}
-        by_name: dict[str, showrunners.Showrunner] = {}
+        runners: dict[staff.StaffId, showrunners.Showrunner] = {}
         for owner in staff.active(record, "showrunner"):
             timer = showrunners.timer_for(owner, record)
             if isinstance(timer, showrunners.NoTimer):
                 continue
-            members[owner.name] = owner
-            by_name[owner.name] = showrunners.Showrunner(
+            runners[owner.id] = showrunners.Showrunner(
                 name=owner.name, session=owner.name, socket="", doc=(str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""),
                 zone=timer.zone)
         if production:
-            root = members.get(production)
+            root = next((row for row in staff.active(record, "showrunner")
+                         if row.name == production and row.id in runners), None)
         else:
             root = record.by_current_session(session)
             while root is not None and root.kind != "showrunner":
@@ -390,19 +389,16 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
     except staff.StaffUnreadable as error:
         print(f"board_json: {error}", file=sys.stderr)
         return NoBoardSubtree()
-    names = {row.id: name for name, row in members.items()}
-    if root is None or root.id not in names:
+    if root is None or root.id not in runners:
         return NoBoardSubtree()
     boards: list[BoardProduction] = []
     level = [root]
     while level:
         for row in level:
-            name = names.get(row.id, "")
-            if name in by_name:
-                boards.append(BoardProduction(row, by_name[name]))
+            boards.append(BoardProduction(row, runners[row.id]))
         level = sorted((child for row in level for child in staff.active(record, "showrunner")
-                        if child.parent == staff.ReportsTo(row.id) and child.id in names),
-                       key=lambda row: names.get(row.id, row.name))
+                        if child.parent == staff.ReportsTo(row.id) and child.id in runners),
+                       key=lambda row: row.name)
     return BoardSubtree(record, tuple(boards))
 
 

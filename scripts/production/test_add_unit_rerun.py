@@ -22,7 +22,7 @@ import retire_unit
 import atomic_file
 from scripts.production.production_doc import Refusal, read_production
 from scripts.production import staff, unit_config
-from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
+from scripts.production.staff_test_support import unit_membership
 
 
 def setUpModule() -> None:
@@ -92,7 +92,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         marked = unit_lookup.LabeledSession(
             "alpha-unit", unit_lookup.LiveClaude("alpha", self.env["FAKE_CLAUDE_SESSION_ID"], "/fixture", 1234),
             herdr.HerdrPlace("agents", "w1:p1"),
-            identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+            identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
         with (patch.dict(os.environ, self.env),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
               patch.object(unit_lookup, "labeled_session", return_value=marked) as lookup):
@@ -199,7 +199,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             stopped = self.cli(*arguments)
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
         unit = resume_unit.RetiredUnitRecovery(read_production(self.production_name), "alpha-unit", self.root / "project-alpha",
             "alpha-unit", unit_config.PlanFile(Path("docs/plans/given.md")), "62ccbd64-f22e-5647-b20e-7899aa39d766")
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
@@ -233,7 +233,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             stopped = self.cli(*arguments)
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(1234)),
               patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
@@ -250,7 +250,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "replacement", "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
         before = len(self.herdr_calls())
         with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked),
@@ -267,7 +267,7 @@ class AddUnitRerunTests(AddUnitTestCase):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", "replacement", "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
         with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(5678))):
             refused = self.cli("alpha", "--plan", "docs/plans/given.md")
@@ -283,7 +283,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         session_id = self.env["FAKE_CLAUDE_SESSION_ID"]
         self.assertNotIn("--session-id", self.agent_arguments())
         marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", session_id, "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
         with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked)):
             with patch.object(herdr.Herdr, "submit_opening_prompt", return_value=herdr.PromptNotSubmitted("pane busy")):
@@ -324,7 +324,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         session_id = self.env["FAKE_CLAUDE_SESSION_ID"]
         self.assertNotIn("--session-id", self.agent_arguments())
         marked = unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", session_id, "/fixture", 1234),
-                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+                                       herdr.HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         submitted: list[herdr.OpeningPrompt] = []
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
+from scripts.production.staff_test_support import unit_membership, fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -382,7 +382,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_new_row_with_a_running_labeled_session_refuses_before_any_write(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        owner = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        owner = unit_membership("build-followups", "alpha-unit")
         owner = staff.update_current_session(owner.current_session,
             staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         owner = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", prior), expected=owner.worktree)
@@ -856,7 +856,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         prompts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]]
         marked = unit_lookup.LabeledSession("alpha-unit",
             unit_lookup.LiveClaude("alpha", "plan-session-id", "/fixture/socket", 4242),
-            HerdrPlace("plan-host", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+            HerdrPlace("plan-host", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
 
         with patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)), \
                 patch.object(add_unit, "wait_for_remote_control", return_value=marked):
@@ -885,7 +885,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_running_brief_refuses_plan_mode_before_any_write(self) -> None:
         stub = self.commit_brief_row()
         worktree = self.root / "project-alpha"
-        owner = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        owner = unit_membership("build-followups", "alpha-unit")
         owner = staff.update_current_session(owner.current_session,
             staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         owner = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", worktree), expected=owner.worktree)

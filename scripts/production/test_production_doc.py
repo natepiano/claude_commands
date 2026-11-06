@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from scripts.production import production_doc, staff
+from scripts.lib.user_zone import user_zone
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 
 
@@ -24,10 +26,11 @@ class ProductionDocumentTests(StaffTestCase):
         _ = document.write_text(f"- **Merge branch:** `release`\n"
                                 + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `nested/log.md`\n")
         row = fixture_member("showrunner", name="retained-name", doc=staff.LiveDoc("natedev", document))
-        expected = production_doc.read_new_production(document, row.name)
+        expected = production_doc.Production(document, row.name, "release", self.root,
+                                             self.root / "nested/log.md", user_zone(), row)
         self.assertEqual(production_doc.read_production(row.name, staff.snapshot()), expected)
-        _ = staff.set_doc(row.id, staff.WrappedDoc("natedev", document))
-        self.assertEqual(production_doc.read_production(row.name, staff.snapshot()), expected)
+        wrapped = staff.set_doc(row.id, staff.WrappedDoc("natedev", document))
+        self.assertEqual(production_doc.read_production(row.name, staff.snapshot()), replace(expected, owner=wrapped))
 
     def test_both_readers_refuse_an_absolute_log_path(self) -> None:
         document = self.root / "different-production.md"

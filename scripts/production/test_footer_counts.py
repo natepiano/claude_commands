@@ -20,6 +20,7 @@ import footer_counts
 import next_item
 import proposal_issue
 import proposals_folder
+from update_registration import QuestionStaff
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
@@ -102,9 +103,6 @@ class FooterCountsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(change_review, "lists_directory", return_value=self.root))
         self.production = fixture_member("showrunner", name="production",
             doc=staff.LiveDoc("natedev", self.root / "production.md")).id
-        # The doc's own line names the list; no live showrunner's list is looked up.
-        _ = self.enterContext(mock.patch.object(change_review, "showrunner_of",
-                                                side_effect=change_review.ChangeReviewError("not running")))
         # No live update timer names a production below this one, unless a test says so.
         self.tree = {}
         self.below = {}
@@ -131,7 +129,7 @@ class FooterCountsTests(unittest.TestCase):
         return path
 
     def test_a_footer_count_uses_one_staff_snapshot_for_scope_and_routing(self) -> None:
-        listing = self.root / "change-review.md"
+        listing = self.root / "change-review - production.md"
         _ = listing.write_text(LIST, encoding="utf-8")
         doc = self.doc(f"- **Change review:** `{listing}`")
         record = staff.snapshot()
@@ -139,7 +137,7 @@ class FooterCountsTests(unittest.TestCase):
             self.assertEqual(footer_counts.changes(doc), 2)
 
     def test_one_count_read_routes_once_with_the_supplied_staff_snapshot(self) -> None:
-        listing = self.root / "change-review.md"
+        listing = self.root / "change-review - production.md"
         _ = listing.write_text(LIST, encoding="utf-8")
         doc = self.doc(f"- **Change review:** `{listing}`")
         record = staff.snapshot()
@@ -166,7 +164,7 @@ class FooterCountsTests(unittest.TestCase):
         instance = self.root / f"notifier/showrunner-{owner.id}"
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(state), "USER_ZONE": "UTC"}):
             line, due, sources = counts_row.row(instance)
         self.assertEqual(line, "For you: 1 question")
@@ -174,6 +172,16 @@ class FooterCountsTests(unittest.TestCase):
         self.assertIn(folder, sources)
         self.assertIn(record, sources)
         self.assertFalse((state / "outstanding/example.json").exists())
+
+    def test_sources_use_the_supplied_staff_snapshot_for_lists_and_questions(self) -> None:
+        listing = self.root / "change-review - production.md"
+        _ = listing.write_text(LIST)
+        doc = self.doc(f"- **Change review:** {listing}")
+        identities = QuestionStaff.read()
+        owner = identities.owner(doc)
+        questions = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / owner.id / "questions"
+        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("use the supplied snapshot")):
+            self.assertEqual(footer_counts.sources(doc, identities=identities), [doc, listing, questions])
 
     def test_sources_keep_the_document_when_the_proposals_folder_is_unreadable(self) -> None:
         folder = self.root / "issues"
@@ -192,7 +200,7 @@ class FooterCountsTests(unittest.TestCase):
         self.assertIn(folder, sources)
 
     def test_each_count_is_read_from_the_source_its_doc_line_names(self) -> None:
-        listing = self.root / "change-review.md"
+        listing = self.root / "change-review - production.md"
         _ = listing.write_text(LIST, encoding="utf-8")
         folder = self.root / "issues"
         folder.mkdir()
@@ -284,7 +292,7 @@ class FooterCountsTests(unittest.TestCase):
         self.assertIn(ledger, footer_counts.sources(doc))
 
     def test_sources_name_each_file_a_count_reads_and_each_open_proposal(self) -> None:
-        listing = self.root / "change-review.md"
+        listing = self.root / "change-review - production.md"
         folder = self.root / "issues"
         folder.mkdir()
         issue(folder, "wanted", "open", "proposal", self.production)

@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TextIO, cast, final, override
@@ -329,7 +330,7 @@ class WaitingTests(unittest.TestCase):
         producer_log = self.root / "launch-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         request = add_unit.UnitLaunch(
-            production=production._replace(log=producer_log),
+            production=replace(production, log=producer_log),
             identity=add_unit.UnitIdentity(ALPHA, session),
             branch="alpha-branch",
             worktree=self.alpha,
@@ -351,7 +352,7 @@ class WaitingTests(unittest.TestCase):
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
                                      "alpha-branch")
         request = merge_checkpoint.MergeRequest(
-            production._replace(log=producer_log), unit, phase, unit_tip,
+            replace(production, log=producer_log), unit, phase, unit_tip,
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
             production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",

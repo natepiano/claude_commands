@@ -1850,14 +1850,14 @@ def _launcher_arguments(text: str) -> list[str]:
 
 
 def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
-                   worker_name: str, launcher_command: list[str], prompt: Path, kind: str, lens: str,
+                   worker_name: str, worker_id: staff.StaffId, launcher_command: list[str], prompt: Path, kind: str, lens: str,
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "") -> str:
     """Record a published worker's dispatch and return its durable pass id."""
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
     args = argparse.Namespace(
         session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role,
-        worker_name=worker_name, launcher_command=json.dumps(launcher_command) if launcher_command else "",
+        worker_name=worker_name, worker_id=worker_id, launcher_command=json.dumps(launcher_command) if launcher_command else "",
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family="unknown", called_model="unknown", called_effort="unset",
         fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens, dispatch_owned=True,
@@ -5263,11 +5263,11 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
                 except (OSError, UnicodeError) as error:
                     return ProductionNotRecorded(f"phase plan cannot be read: {error}")
             return ProductionNotRecorded("the run has no matching unit staff row")
-        parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
+        parent = record.parent_of(row)
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
-        name = parent.name
-        return ProductionUnitIdentity(name, row.name) if state.get(unit_runs.OWNER_FIELD) else ProductionUnitIdentity(production or name, unit or row.name)
+        return (ProductionUnitIdentity(parent.name, row.name) if state.get(unit_runs.OWNER_FIELD)
+                else ProductionUnitIdentity(production or parent.name, unit or row.name))
     except (OSError, ValueError) as error:
         return ProductionNotRecorded(str(error))
 
@@ -5691,8 +5691,7 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         production = identity.removeprefix("showrunner:")
         records = {item["sessionId"]: item for item in sessions.live_sessions()}
         for row in staff.active(resolver.record, "showrunner"):
-            name = row.name
-            if name == production and row.current_session in records:
+            if row.name == production and row.current_session in records:
                 return NamedSupplier("uds:" + records[row.current_session]["messagingSocketPath"])
         return NoNamedSupplier("showrunner has no current address")
     if identity.startswith(("uds:/", "codex:")):

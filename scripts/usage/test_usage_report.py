@@ -893,8 +893,9 @@ from scripts.usage import usage_report
 class BranchUsageLocationTests(StaffTestCase):
     def test_usage_attribution_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        self.assertEqual(usage_report.document_units(fixture.doc),
-                         (usage_report.UnitWorktree("member", fixture.worktree),))
+        with mock.patch.object(staff.StaffSnapshot, "by_doc", side_effect=AssertionError("repeated owner lookup")):
+            self.assertEqual(usage_report.unit_worktrees(fixture.doc.parent),
+                             (usage_report.UnitWorktree("member", fixture.worktree),))
 
     def test_unfilled_unit_reports_its_fact_and_keeps_the_other_units(self) -> None:
         fixture = self.separated_unit_folders()
@@ -903,7 +904,7 @@ class BranchUsageLocationTests(StaffTestCase):
         import io
         from contextlib import redirect_stderr
         with redirect_stderr(io.StringIO()) as errors:
-            rows = usage_report.document_units(fixture.doc)
+            rows = usage_report.document_units(fixture.runner)
         self.assertEqual(rows, (usage_report.UnitWorktree("member", fixture.worktree),))
         self.assertIn("unfilled", errors.getvalue())
 

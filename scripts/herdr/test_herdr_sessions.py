@@ -173,7 +173,7 @@ class HerdrSessionsTests(unittest.TestCase):
         instance = self.state / f"showrunner-{owner.id}"
         instance.mkdir()
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{owner.id}\nCHECK=/fake/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=/fake/production_check.sh {owner.id}\n")
 
     def call(self, *arguments: str) -> tuple[int, str, str]:
         stdout, stderr = io.StringIO(), io.StringIO()

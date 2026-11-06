@@ -266,7 +266,7 @@ class ProducerWriterTests(ProducerFixture):
     def test_merge_publication_uses_the_exact_branch_producer_before_an_alias(self) -> None:
         second = self.colliding_units()
         merged = self.merge("branch-b")
-        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
         with mock.patch.object(change_review, "drift", return_value=[]):
             merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], second.id)
@@ -279,7 +279,7 @@ class ProducerWriterTests(ProducerFixture):
         _ = self.git("checkout", "main")
         _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge all")
         merged = self.git("rev-parse", "HEAD")
-        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
         with mock.patch.object(change_review, "drift", return_value=[]):
             merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
         rows = change_review.pending(self.listing)
@@ -317,7 +317,7 @@ class ProducerWriterTests(ProducerFixture):
     def test_merge_publication_writes_the_units_staff_id(self) -> None:
         merge = self.merge()
         commits = change_review.merge_commits(self.repo, merge)
-        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
         with mock.patch.object(change_review, "drift", return_value=[]):
             merge_checkpoint.record_publication_changes(production, commits, merge)
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
@@ -326,7 +326,7 @@ class ProducerWriterTests(ProducerFixture):
     def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
         merge = self.merge()
         commits = change_review.merge_commits(self.repo, merge)
-        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"))
+        production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
         output = io.StringIO()
         with (mock.patch.object(change_review, "drift", return_value=[]),
               mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(
@@ -488,6 +488,31 @@ class StaffProductionNameTests(unittest.TestCase):
                                    doc=staff.LiveDoc(remote.local_machine(), doc))
                 self.assertEqual(change_review.showrunner_of(doc), "hana")
                 self.assertEqual(change_review.production_doc("child"), doc)
+
+
+    def test_inherited_list_uses_one_staff_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with isolated_staff_file(root / "staff.json", {}):
+                listing = root / "change-review - hana.md"
+                parent_doc = root / "parent-settings.md"
+                _ = parent_doc.write_text(f"- **Change review:** {listing}\n")
+                parent = fixture_member("showrunner", name="hana",
+                    doc=staff.LiveDoc(remote.local_machine(), parent_doc))
+                child_doc = root / "child-settings.md"
+                _ = child_doc.write_text("# Child\n")
+                _ = fixture_member("showrunner", name="child", parent=parent.id,
+                    doc=staff.LiveDoc(remote.local_machine(), child_doc))
+                record = staff.snapshot()
+                with (mock.patch.object(change_review, "lists_directory", return_value=root),
+                      mock.patch.object(staff, "snapshot", side_effect=[record]) as reads):
+                    self.assertEqual(change_review.scope_list(child_doc), listing)
+                reads.assert_called_once_with()
+                child_doc.unlink()
+                with (mock.patch.object(change_review, "lists_directory", return_value=root),
+                      mock.patch.object(staff, "snapshot", side_effect=AssertionError("use the supplied snapshot"))):
+                    self.assertEqual(change_review.scope_list(child_doc, record=record),
+                                     root / "change-review - child.md")
 
 
 class AttachedListTest(unittest.TestCase):

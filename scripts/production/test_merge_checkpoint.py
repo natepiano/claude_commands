@@ -41,7 +41,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             package = checkout / "scripts/aws_target/proof_crate"
             package.mkdir(parents=True)
             _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
-            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+            production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
             steps = merge_checkpoint.test_steps(production, ("scripts/aws_target/proof_crate/src/lib.rs",), ())
             self.assertEqual(len(steps), 1)
@@ -55,7 +55,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             package = checkout / "crates/proof_crate"
             package.mkdir(parents=True)
             _ = (package / "Cargo.toml").write_text('[package]\nname = "aws-routing-proof"\nversion = "0.1.0"\n')
-            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+            production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
             steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
             self.assertEqual(len(steps), 2)
@@ -67,7 +67,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary)
             _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
-            production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+            production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                   checkout / "production.log", ZoneInfo("UTC"))
             steps = merge_checkpoint.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
             self.assertEqual(steps, [])
@@ -93,7 +93,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
                         + ("if sys.argv[1] == 'test' and not Path('retried').exists():\n"
                            + "    Path('retried').touch()\n    sys.exit(1)\n" if retry else ""))
                     verify.chmod(0o755)
-                    production = production_doc.Production(checkout / "production.md", "fixture", "merge", checkout,
+                    production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                           checkout / "production.log", ZoneInfo("UTC"))
                     log = checkout / "test.log"
                     merge_tests = ((sys.executable, "-c", "from pathlib import Path; print(f'merge={Path.cwd()}')"),)

@@ -127,7 +127,6 @@ class RetiredUse:
 class ProductionNames:
     name: str
     doc: str
-    showrunner: str
     units: tuple[str, ...]
 
 
@@ -444,14 +443,14 @@ def measure_definitions(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) ->
 def parse_production(production_name: str, doc: Path, record: staff.StaffSnapshot) -> ProductionNames:
     row = showrunners.owner_for(production_name, record=record)
     units = tuple(unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, record))
-    return ProductionNames(row.name, str(doc), row.name, units)
+    return ProductionNames(row.name, str(doc), units)
 
 
 def measure_production_names(productions: tuple[ProductionNames, ...]) -> tuple[ProductionNameFinding, ...]:
     result: list[ProductionNameFinding] = []
     uses: dict[str, set[int]] = defaultdict(set)
     for index, production in enumerate(productions):
-        for name in {production.name, production.showrunner, *production.units}:
+        for name in {production.name, *production.units}:
             uses[name].add(index)
     for name, indices in sorted(uses.items()):
         if len(indices) > 1:

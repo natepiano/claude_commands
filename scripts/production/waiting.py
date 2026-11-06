@@ -147,7 +147,7 @@ def units_from_doc(production: Production) -> tuple[Unit, ...]:
     """The active units in staff row order; a unit with no readable folder or branch is reported and left out."""
     try:
         record = staff.snapshot()
-        rows = unit_lookup.doc_units(production.doc, record)
+        rows = record.find(kind="unit", parent=production.owner.id)
         marked = unit_lookup.labeled_sessions(production.name, record=record)
     except (OSError, staff.StaffRefused) as error:
         raise WaitingFailure("production", f"the unit sessions could not be looked up: {error}") from error
@@ -391,7 +391,7 @@ def waits(production: Production) -> None:
     board = run_command("waits", ["cargo-berth", "board", "--json"])
     overlaps = berth_board(board)
     now = datetime.now(production.zone)
-    retired = {unit_names.unit_id(row.name) for row in unit_lookup.doc_units(production.doc, staff.snapshot())
+    retired = {unit_names.unit_id(row.name) for row in staff.snapshot().find(kind="unit", parent=production.owner.id)
                if isinstance(row.worktree, staff.RemovedWorktree)}
     active: dict[str, WaitOpen | WaitCleared] = {}
     clears: dict[str, str] = {}

@@ -23,7 +23,7 @@ from scripts.accounts import accounts
 
 from add_unit_test_support import AddUnitTestCase, configure_test_zone
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
+from scripts.production.staff_test_support import unit_membership
 
 
 def setUpModule() -> None:
@@ -78,7 +78,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         # The pane mark joins its unit only through the unit's staff row.
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        row = unit_membership("build-followups", "alpha-unit")
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         self.persist_herdr_unit("alpha", prior)
         transcript = Path(self.env["HOME"]) / ".claude/projects/project/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"

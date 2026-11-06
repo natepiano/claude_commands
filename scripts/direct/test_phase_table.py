@@ -3406,6 +3406,23 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
 
+    def test_owned_notes_reuses_the_staff_record_after_the_file_disappears(self) -> None:
+        notes = [self.write_phase_note("runner", f"table-{index:02}", "show", "table-unit")
+                 for index in range(35)]
+        _ = self.write_phase_note("runner", "foreign", "other", "other-unit")
+        snapshot = staff.snapshot
+        staff_file = Path(os.environ["STAFF_FILE"])
+        saved = staff_file.read_bytes()
+        self.addCleanup(staff_file.write_bytes, saved)
+
+        def read_and_remove_staff() -> staff.StaffSnapshot:
+            record = snapshot()
+            staff_file.unlink()
+            return record
+
+        with patch.dict(os.environ, self.environment()), patch.object(staff, "snapshot", read_and_remove_staff):
+            self.assertEqual(phase_table.owned_notes("show", "table"), notes)
+
     def test_archive_moves_owned_notes_with_bytes_and_modes_unchanged(
         self,
     ) -> None:
