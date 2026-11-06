@@ -19,6 +19,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.test_times.gate_record import ModuleTimes
@@ -519,7 +520,7 @@ class InheritedSignal(unittest.TestCase):
         descriptor = os.pidfd_open(int(line))
         self.addCleanup(os.close, descriptor)
         if terminate:
-            os.killpg(process.pid, signal.SIGTERM)
+            send_process_group(process.pid, signal.SIGTERM)
         stdout, stderr = process.communicate(input="x", timeout=TEST_HANG_GUARD_SECS)
         expected = -signal.SIGTERM if terminate else 1 if fail else 0
         self.assertEqual(process.returncode, expected, stdout + stderr)

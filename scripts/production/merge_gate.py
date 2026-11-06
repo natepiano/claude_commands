@@ -1692,6 +1692,7 @@ def nightly(args: GateArguments) -> int:
                                             kind=GateJobKind.RUNNER_FAILURE),), 0, 0)
             marker = gate_state_dir() / "full-required"
             if run.passed:
+                marker.unlink(missing_ok=True)
                 result_sent = True
                 push_nightly_result(args, run)
                 return 0

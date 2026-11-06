@@ -198,29 +198,16 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         director = self.session_dir.parent / family
         if not director.exists():
             director.symlink_to(sys.executable)
-        completion = self.session_dir.parent / "launcher-exit"
         script = "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))"
-        if isolate_ancestors:
-            completion.unlink(missing_ok=True)
-            script = "\n".join((
-                "import os, select, subprocess, sys",
-                "from pathlib import Path",
-                "starter = os.pidfd_open(os.getpid())",
-                "if os.fork(): os._exit(0)",
-                # The pidfd becomes readable after the kernel reparents the child.
-                "select.select([starter], [], [])",
-                "os.close(starter)",
-                f"Path({str(completion)!r}).write_text(str(subprocess.call(sys.argv[1:])))",
-            ))
         command = [str(director), "-c", script, *arguments]
+        if isolate_ancestors:
+            command = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount-proc",
+                       str(director), "-c", script, *arguments]
         with subprocess.Popen(command, env=os.environ.copy(), cwd=ROOT, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               start_new_session=True) as child:
             output, errors = communicate_launcher(child)
-            if isolate_ancestors:
-                self.assertTrue(completion.exists(), output + errors)
-            code = int(completion.read_text()) if isolate_ancestors else child.returncode
-            return subprocess.CompletedProcess(arguments, code, output, errors)
+            return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
 
     def successful(self, role: str = "implement", *options: str,
                    execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
