@@ -483,7 +483,8 @@ class StopResumeTests(unittest.TestCase):
         result, _launch, _prompt, _label, errors = self.resume_codex_staff(herdr.UnknownConversation("pid unreadable"))
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         self.detach.assert_not_called()
-        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertEqual(len(errors.splitlines()), 2)
+        self.assertIn("anomaly: pid unreadable; not blocking", errors)
         self.assertIn("observer anomaly:", errors)
 
     def test_resume_codex_name_uses_the_workers_account_and_the_rollout_folder(self) -> None:
@@ -515,6 +516,54 @@ class StopResumeTests(unittest.TestCase):
                     role.assert_called_once_with("workers")
                 else:
                     role.assert_not_called()
+
+    def test_unknown_codex_process_does_not_block_a_stopped_thread_without_a_pane(self) -> None:
+        identity = self.saved_codex_name()
+        unknown = herdr.CodexConversations({}, ("other-session (Codex thread unknown)",))
+        with (patch.dict(os.environ, {"CODEX_HOME": str(self.root / ".codex2")}),
+              patch.object(herdr, "codex_conversations", side_effect=[unknown, herdr.CodexConversations({identity: (456,)}, ())]),
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.root / ".codex1")),
+              patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.root / ".codex1")),
+              patch.object(accounts, "codex_home_label", return_value="codex1"),
+              patch.object(self.client, "open_tab", return_value="w1:p2") as opened,
+              patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
+              patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                  self.root / "project", {"CODEX_HOME": str(self.root / ".codex1")})),
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p2", herdr.PromptSubmissionNotRequired())) as launch,
+              redirect_stderr(io.StringIO()) as errors):
+            result = stop_resume.resume("saved-worker")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(result.start_state, ClaudeStartState.STARTED)
+        opened.assert_called_once()
+        launch.assert_called_once()
+        self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
+        self.assertIn("other-session (Codex thread unknown)", errors.getvalue())
+        self.assertIn("not blocking", errors.getvalue())
+
+    def test_unknown_codex_thread_in_a_running_pane_does_not_start_again(self) -> None:
+        identity = self.saved_codex_name()
+        self.client.rows.append({"pane_id": "w1:p2", "label": "saved-worker", "workspace_id": "w1",
+                                 "terminal_id": "worker-terminal", "session_id": identity})
+        with (patch.dict(os.environ, {"CODEX_HOME": str(self.root / ".codex2")}),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
+                  {}, ("other-session (Codex thread unknown)",))),
+              patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))) as activity,
+              patch.object(self.client, "open_tab") as opened,
+              patch.object(herdr, "launch_prepared_agent") as launch,
+              redirect_stderr(io.StringIO()) as errors):
+            result = stop_resume.resume("saved-worker", to="codex1")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)
+        self.assertEqual((result.session_id, result.pane_id), (identity, "w1:p2"))
+        activity.assert_called_once_with("w1:p2")
+        opened.assert_not_called()
+        launch.assert_not_called()
+        self.detach.assert_not_called()
+        self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
+        self.assertIn("other-session (Codex thread unknown)", errors.getvalue())
 
     def test_resume_of_a_running_codex_name_keeps_its_current_account(self) -> None:
         identity = self.saved_codex_name()

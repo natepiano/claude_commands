@@ -29,6 +29,10 @@ Ambiguous names return status 1 with up to five matching members.
 A remote member returns status 1 with its machine name.
 A running session returns status 0 with an `unchanged` line that names its current account.
 Resume does not stop or move a running session.
+Unknown Codex process evidence prints an anomaly and does not block resume.
+A pane with the session id and a foreground program counts as already running.
+Without process evidence, its account remains unknown.
+A pane at its shell does not prevent resume.
 The default reason is `resumed by name`.
 
 The shared resume path reads the saved environment, arguments, and folder.

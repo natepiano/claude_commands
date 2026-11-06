@@ -470,7 +470,12 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
         if isinstance(observed, herdr.StoppedConversation):
             return sessions.SessionNotLive()
         if isinstance(observed, herdr.UnknownConversation):
-            return ResumeFailed(identity, observed.reason)
+            herdr.conversation_note(observed)
+            client = herdr.Herdr(herdr.shared_session())
+            for tab in client.tab_sessions():
+                if tab.session_id == identity and not isinstance(client.pane_activity(tab.pane_id), herdr.PaneAtShell):
+                    return ClaudeUp(identity, tab.pane_id, "unknown account", start_state=ClaudeStartState.ALREADY_RUNNING)
+            return sessions.SessionNotLive()
         if not observed.pids:
             return ResumeFailed(identity, "live Codex thread has no process account proof")
         return _codex_running_on_account(identity, pane_id, observed.pids[0])
