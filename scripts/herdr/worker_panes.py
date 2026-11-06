@@ -435,6 +435,8 @@ def stage_two_completion_id(dispatch_id: str) -> str:
 def can_close(worker: OpenWorker | StoppedWorker, *,
               run: DispatchRun | HolderRun = HolderRun.CURRENT,
               lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+    from scripts.direct import progress_history
+
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
@@ -446,7 +448,13 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         return Kept(f"agent state is {worker.status.value}")
     passed = worker_pass(worker.row, directory)
-    if passed.get("status") != "completed":
+    if passed:
+        status, dispatch = passed.get("status"), passed.get("instance_id")
+    else:
+        latest = progress_history.last_dispatch(worker.row.id)
+        status, dispatch = ((latest.status, latest.instance_id)
+                            if isinstance(latest, progress_history.RecordedDispatch) else ("", ""))
+    if status != "completed":
         return Kept("launcher has not recorded a completed pass")
     try:
         backend = staff.backend(worker.row)
@@ -457,7 +465,6 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
         if any(isinstance(entry, worker_admission.TornTranscriptRecord) for entry in entries):
             return Kept("worker transcript has incomplete records")
         messages = [entry for entry in entries if isinstance(entry, str) and entry]
-        dispatch = passed.get("dispatch_id", passed.get("instance_id"))
         if (not isinstance(dispatch, str) or not dispatch or not messages
                 or not messages[-1].startswith("assistant:\n")
                 or messages[-1].rstrip().splitlines()[-1] not in
