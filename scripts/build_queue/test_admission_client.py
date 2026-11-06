@@ -21,6 +21,7 @@ from scripts.accounts import outage_alerts
 from scripts.message import send_result
 from scripts.message import roster
 from scripts.message.session_send import session_send_argv
+from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
@@ -43,6 +44,10 @@ from scripts.lint.memory_test_support import commit_config_fixture, config_envir
 WAIT = wait_reply(gate.NeedsMemory(), 1, "head", "free memory")
 EXPIRED = wait_reply(gate.EstimateExpired(1), 1, "head", "estimate expired")
 GRANTED = admitted_reply("stem", GIB, "new-source", "stem.max", "stem.wave")
+
+
+def setUpModule() -> None:
+    forbid_real_sender()
 
 
 class ClientTests(unittest.TestCase):
