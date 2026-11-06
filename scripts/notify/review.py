@@ -762,7 +762,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         loaded = nix_env.ensure(Path.cwd(), environment)
         if isinstance(loaded, nix_env.Refused):
             return Unreviewed(loaded.reason, details())
-        environment = loaded.env
+        from models_registry import agent_environment
+
+        environment = agent_environment(loaded.env)
         result = runner(command, timeout=remaining(), env=environment)
         if result.returncode != 0:
             return Unreviewed(f"reviewer exit {result.returncode}", details())

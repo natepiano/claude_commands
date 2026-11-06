@@ -165,6 +165,7 @@ set_tier() {
     fi
 }
 
+default_models_main() {
 if [[ "$#" -eq 0 ]]; then
     agents_list_assignments
     echo ""
@@ -248,3 +249,7 @@ else
     usage >&2
     exit 1
 fi
+
+}
+
+models_registry_edit default_models_main "$@"

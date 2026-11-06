@@ -177,7 +177,6 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",
-            "BUILDLOG_BUILD_BUDGET_GIB": "64",
         }
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)

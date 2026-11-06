@@ -6,10 +6,12 @@ import json
 import fcntl
 import math
 import os
+import time
 import subprocess
 from copy import deepcopy
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import patch
@@ -45,6 +47,7 @@ class PaneWorld(herdr.Herdr):
         self.launches: list[herdr.ExistingPane | herdr.SplitPane] = []
         self.launch_timeouts: list[int] = []
         self.stops: list[str] = []
+        self.stop_deadlines: list[float] = []
         self.closed: list[tuple[str, str]] = []
         self.requests: list[tuple[str, list[str], dict[str, str]]] = []
         self.outcome: herdr.PromptSubmissionNotRequired | herdr.PromptNotSubmitted = herdr.PromptSubmissionNotRequired()
@@ -197,9 +200,10 @@ class PaneWorld(herdr.Herdr):
             del self.locations[pane]
         return herdr.AgentLaunched(pane, self.outcome)
 
-    def stop(self, row: staff.StaffRow, client: herdr.Herdr) -> bool:
+    def stop(self, row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf) -> bool:
         if client is not self:
             raise AssertionError("stop uses another client")
+        self.stop_deadlines.append(deadline)
         self.stops.append(str(row.current_session))
         for pane, (pid, _, _) in tuple(self.foreground.items()):
             if self.processes[pid].current_identity == row.current_session:
@@ -308,7 +312,7 @@ class WorkerPaneTests(StaffTestCase):
             "XDG_STATE_HOME": str(self.root / "state"), "CONF_DIR": str(config),
             "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
             "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(self.root),
-            "UNIT_RUN_DIR": str(self.root / "run"),
+            "UNIT_RUN_DIR": str(self.root / "run"), "ROSTER_RUN_ROOT": str(self.root),
         })))
         self.world = PaneWorld()
         self.world.add(self.parent, "w1:p0")
@@ -381,9 +385,10 @@ class WorkerPaneTests(StaffTestCase):
     def dispatch(self, row: staff.StaffRow, role: staff.WorkerRole, *, completed: bool = False) -> None:
         run = self.root / "run"
         run.mkdir(exist_ok=True)
-        write_text_atomic(run / "progress_history_state.json", json.dumps({"pass": {
+        write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": str(self.parent.id), "pass": {
             row.name: {"instance_id": "dispatch-" + row.name, "worker_name": row.name,
                        "team_slot": row.name, "kind": role, "status": "completed" if completed else "active"}}}))
+        write_text_atomic(run / "worker_transport", "herdr\n")
 
     def completed_dispatch(self, row: staff.StaffRow, role: staff.WorkerRole) -> None:
         self.dispatch(row, role, completed=True)
@@ -460,6 +465,81 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.stops, [opened.row.current_session])
         self.assertEqual(self.world.closed, [])
         self.assertEqual(self.world.requests[-1][1][self.world.requests[-1][1].index("--sandbox") + 1], "read-only")
+
+    def test_policy_change_passes_the_configured_monotonic_deadline_to_stop(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.completed_dispatch(opened.row, "impl")
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=37"))
+        before = time.monotonic()
+        changed = self.start(role="review")
+        after = time.monotonic()
+        self.assertIsInstance(changed, worker_panes.OpenWorker)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertGreaterEqual(self.world.stop_deadlines[-1], before + 37)
+        self.assertLessEqual(self.world.stop_deadlines[-1], after + 37)
+
+    def test_close_passes_the_configured_monotonic_deadline_to_stop(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.completed_dispatch(opened.row, "impl")
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=29"))
+        before = time.monotonic()
+        closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        after = time.monotonic()
+        self.assertIsInstance(closed, worker_panes.Closed)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertGreaterEqual(self.world.stop_deadlines[-1], before + 29)
+        self.assertLessEqual(self.world.stop_deadlines[-1], after + 29)
+
+    def test_close_keeps_the_worker_when_its_stop_budget_is_unusable(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.completed_dispatch(opened.row, "impl")
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=invalid"))
+        with redirect_stderr(io.StringIO()):
+            result = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        self.assertIsInstance(result, worker_panes.Kept)
+        assert isinstance(result, worker_panes.Kept)
+        self.assertIn("PANE_AGENT_START_SECONDS", result.blocker)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_close_starts_its_stop_budget_after_both_locks_are_acquired(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.completed_dispatch(opened.row, "impl")
+        monotonic = time.monotonic
+        bind = worker_panes.WorkerLockHold.bind
+        row_operation = staff.row_operation
+        elapsed = 0.0
+
+        def bind_after_delay(hold: worker_panes.WorkerLockHold, row: staff.StaffRow) -> None:
+            nonlocal elapsed
+            bind(hold, row)
+            elapsed += 120
+
+        @contextmanager
+        def row_after_delay(reference: str) -> Generator[None]:
+            nonlocal elapsed
+            with row_operation(reference):
+                elapsed += 180
+                yield
+
+        before = monotonic()
+        with patch.object(worker_panes.WorkerLockHold, "bind", bind_after_delay), \
+                patch.object(staff, "row_operation", row_after_delay), \
+                patch.object(time, "monotonic", side_effect=lambda: monotonic() + elapsed):
+            closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        after = monotonic()
+        self.assertIsInstance(closed, worker_panes.Closed)
+        self.assertEqual(elapsed, 300)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertGreaterEqual(self.world.stop_deadlines[-1], before + elapsed + 90)
+        self.assertLessEqual(self.world.stop_deadlines[-1], after + elapsed + 90)
 
     def test_close_permission_leaves_the_pane_open_until_close_completes(self) -> None:
         row = self.worker()
