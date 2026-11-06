@@ -458,7 +458,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
         self.assertEqual(self.calls("clippy"), [[*scope, "--", "-D", "warnings"]] + [
-            ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
+            ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
              *scope, "--", "-D", "warnings"],
         ] * fix_passes + [[*scope, "--", "-D", "warnings"]])
 
