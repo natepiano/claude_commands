@@ -8,7 +8,7 @@ import sys
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, TypedDict, cast, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
@@ -21,6 +21,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import fixture_worker_records
+from scripts.whoami import agent_accounts
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -284,3 +285,82 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             "assign.call = call",
         )))
         return prepared
+
+
+@dataclass(frozen=True)
+class FirstDispatchArtifact:
+    """A completed first dispatch publishes this file."""
+
+    relative: Path
+    content: bytes
+    mode: int
+
+
+class FirstDispatchObservations(TypedDict):
+    requests: list[dict[str, object]]
+    turn_starts: int
+    turn_inputs: list[str]
+    started_turns: dict[str, str]
+    claims: list[dict[str, object]]
+    reservations: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class CompletedFirstDispatch:
+    """Keep the real first dispatch output for later independent tests."""
+
+    root: Path
+    artifacts: tuple[FirstDispatchArtifact, ...]
+    observations: str
+
+
+class FirstDispatchFixture(AssignLauncherFixture):
+    """Copy completed first dispatch state before testing a later dispatch."""
+
+    first_dispatches: ClassVar[dict[tuple[str, ...], CompletedFirstDispatch]] = {}
+    turn_starts: int
+    turn_inputs: list[str]
+    started_turns: dict[str, str]
+    claims: list[dict[str, object]]
+    reservations: list[dict[str, object]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.first_dispatches = {}
+        cls.addClassCleanup(cls.first_dispatches.clear)
+
+    def first_assignment(self, role: str = "implement", *options: str) -> None:
+        root = self.session_dir.parent
+        key = (role, *options)
+        if key not in self.first_dispatches:
+            before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
+                      if path.is_file() and not path.is_symlink()}
+            _ = self.successful(role, *options)
+            artifacts = tuple(FirstDispatchArtifact(path.relative_to(root), path.read_bytes(), path.stat().st_mode)
+                              for path in root.rglob("*")
+                              if path.is_file() and not path.is_symlink()
+                              and before.get(path.relative_to(root)) != path.read_bytes())
+            observations: FirstDispatchObservations = {
+                "requests": self.server.requests, "turn_starts": self.turn_starts,
+                "turn_inputs": self.turn_inputs, "started_turns": self.started_turns,
+                "claims": self.claims, "reservations": self.reservations,
+            }
+            self.first_dispatches[key] = CompletedFirstDispatch(root, artifacts, json.dumps(observations))
+            return
+        completed = self.first_dispatches[key]
+        for artifact in completed.artifacts:
+            path = root / artifact.relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_bytes(artifact.content.replace(os.fsencode(completed.root), os.fsencode(root)))
+            path.chmod(artifact.mode)
+        saved = cast(FirstDispatchObservations, json.loads(
+            completed.observations.replace(str(completed.root), str(root))))
+        self.server.requests = saved["requests"]
+        self.turn_starts = saved["turn_starts"]
+        self.turn_inputs = saved["turn_inputs"]
+        self.started_turns = saved["started_turns"]
+        self.claims = saved["claims"]
+        self.reservations = saved["reservations"]
+        _ = self.start_stub_server(str(self.session_dir), agent_accounts.workers_home())

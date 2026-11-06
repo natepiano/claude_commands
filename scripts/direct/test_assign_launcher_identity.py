@@ -15,9 +15,9 @@ setUpModule = mesh_fixture.setUpModule
 
 
 @final
-class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
+class AssignIdentityTests(launcher_fixture.FirstDispatchFixture):
     def test_review_assignments_resume_the_same_read_only_reviewer_across_phases(self) -> None:
-        _ = self.successful("review", "--lens", "contract", "--pass", "1")
+        self.first_assignment("review", "--lens", "contract", "--pass", "1")
         review_prompt = (self.session_dir / "phases/7/dispatch_1_prompt.txt").read_text()
         self.assertIn("Return the complete review result in your final reply", review_prompt)
         self.assertNotIn("write your summary to", review_prompt)
@@ -66,7 +66,7 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
         self.assertTrue(all(turn["arm"] == "own" for turn in turns))
 
     def test_a_review_worker_dispatched_for_implementation_keeps_one_durable_identity(self) -> None:
-        _ = self.successful("review", "--lens", "contract", "--pass", "1")
+        self.first_assignment("review", "--lens", "contract", "--pass", "1")
         name, original = next(iter(self.assignment_records().items()))
         _ = self.successful("implement", "--to", name)
         identities = [read_object(path) for path in self.session_dir.rglob("impl_worker_*.json")]
@@ -78,7 +78,7 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(len(self.methods("thread/start")), 1)
 
     def test_a_replacement_after_review_to_implementation_keeps_writable_access(self) -> None:
-        _ = self.successful("review", "--lens", "contract", "--pass", "1")
+        self.first_assignment("review", "--lens", "contract", "--pass", "1")
         name, before = next(iter(self.assignment_records().items()))
         self.failing_method = "thread/resume"
         self.next_thread_id = fixture_runtime_id("replacement-implementation-thread")
@@ -137,7 +137,7 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
             self.assertIn("fixture-production · fixture ·", matched[0])
 
     def test_a_busy_named_worker_refuses_without_creating_another_dispatch_or_pass(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, record = next(iter(self.assignment_records().items()))
         record.update({"status": "running", "launcher_pid": os.getpid(), "turn_id": "busy-turn"})
         self.write_pool_roster({name: record})
@@ -151,7 +151,7 @@ class AssignIdentityTests(launcher_fixture.AssignLauncherFixture):
         self.assertFalse((self.session_dir / "phases/7/dispatch_2_paths.json").exists())
 
     def test_reactivating_a_named_finished_run_keeps_its_original_thread(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         self.record("finish-run", "--status", "completed")
         _ = self.successful("implement", "--to", name)

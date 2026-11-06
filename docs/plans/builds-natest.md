@@ -1168,7 +1168,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/direct/verify_lint_scope_test_support.py` (owner verify) — the fixture tool list
 - `scripts/direct/test_board_start.py` — one test per start form, each posts one board line
 
-### Phase 54 — The assign launcher reuse and identity tests run in half their time  · status: todo
+### Phase 54 — The assign launcher reuse and identity tests run in half their time  · status: done
 **Depends on:** none
 
 #### Work Order
