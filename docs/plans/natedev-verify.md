@@ -1037,61 +1037,142 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41a — Test the other verify files by direct calls, largest CPU first  · status: done
 
-**Depends on:** Phase 41.
+#### As-built
+
+- Six of ten test files call real functions directly for checks that do not need a full `verify.sh` run. The batch fell from 340.7 to 313.5 CPU s, measured once each on a copy. Wall s did not fall.
+- `call_mac_functions` calls the real result and retry functions with private tools and records.
+- `run_unblocked_step`, `invoke_taplo_at` and `start_owned_step` call their real steps directly.
+- Largest savings in CPU s: `test_verify_lint_taplo.py` 9.0, `test_verify_hold_wait.py` 8.5, `test_verify_mac_retry_clock.py` 7.7.
+- Four files keep all their real runs, because each run proves something that no direct call can.
+
+**Files:**
+- `scripts/direct/verify_mac_offload_test_support.py` — `call_mac_functions`, `check_routing_idle_hook`.
+- `scripts/direct/verify_token_wait_test_support.py` — `start_owned_step`.
+- `scripts/direct/verify_hold_wait_test_support.py` — `run_unblocked_step`.
+- `scripts/direct/verify_lint_scope_test_support.py` — `invoke_taplo_at`.
+- `scripts/direct/test_verify_hold_wait.py`, `test_verify_lint_taplo.py`, `test_verify_mac_results.py`, `test_verify_mac_retry_clock.py`, `test_verify_mac_retry_hold.py`, `test_verify_token_renew.py` — the moved checks.
+- `docs/plans/natedev-verify-test-cost.md` — the per-file table of the batch.
+
+**Binds later work:** natest owns the other `test_verify*` files. A new test for a production change goes in its own new file.
+
+**Gotchas:**
+- `check_temporary_mac_decline` and the memory and token idle checks keep their full `verify.sh` runs. A direct call of the deadline check passed with the check removed from `route_test`.
+- A mutation that removes a retry deadline ends in the 600 s hang guard, not in an assertion.
+- Phases 35, 35b, 38, 39 and 40 landed inside the phase 41 commit `0ed5b347f` and have no separate phase records.
+
+**Ruled out:**
+- A direct call of the retry deadline check: it does not pass through `route_test`.
+
+### Phase 41b — Run verify.sh check on a workspace with no library, and name the lasting tree path in the refusal  · status: todo
+
+**Depends on:** none.
 
 #### Work Order
 
-**Source:** builds showrunner, 2026-11-06 11:21 EST, steps 2 and 3.
+**Source:** builds showrunner, 2026-11-06: two defects from the hana showrunner, in one small checkpoint.
 
-**Goal:** the method of Phase 41 applies to the other `test_verify*` files, in the order of the baseline list. The showrunner receives before and after CPU s for the whole set.
+**Goal:** `verify.sh check` passes on a workspace with no library target. A session that runs a bare `git worktree add` reads the path it needs in the refusal.
 
 **Spec:**
 
-1. **Batches.** Take the files from the baseline list, largest CPU first. Each batch has one checkpoint, and the plan gets one lettered phase for each further batch. Set the batch size at each phase end from the file sizes and the shared fixtures. This phase is the first batch.
-2. **Method.** Each file gets the behavior map, the direct calls and the kept end-to-end runs of Phase 41. A file is finished when each real `verify.sh` run left in it proves something that no direct call can prove.
-3. **Shared fixtures.** When files share a fake tool or a fixture, change the fixture once. Make no copy of a fixture.
-4. **Whole set.** After the last batch, measure the whole `test_verify*` set from the gate records, with the method of the baseline. Write before and after CPU s in the cost doc, and send the numbers to the showrunner.
-5. **Checks stay at the consumer.** A direct test reads a value where its consumer receives it, not only where it is composed. Each result word with its own branch in `route_test` or `remember_mac_retry` keeps a check that the following step ran. A test uses no stand-in for the decision that it exists to prove. Phase 41's first version lost two checks in this way.
-6. **This batch is the last in this plan.** The builds showrunner, 2026-11-06 12:20 EST, relays the user's ruling: natest does the test work. This unit finishes this batch of ten files, and sends it as a bumped checkpoint. natest takes the other `test_verify*` files, and it measures the whole set. It also takes three flaky files: `test_verify_token_mac_step.py`, `test_verify_mac_copy_ownership.py` and `test_verify_example_edits.py`. A cut in `verify.sh` or another production file stays with this unit. Spec items 1 and 4 now describe natest's work.
-7. **The batch.** Ten files, largest CPU first, about 322 median CPU s. A file with few lines and high CPU s has its work in the support file: `test_verify_mac_retry_hold.py` spends its CPU in `VerifyMacOffloadFixture.check_temporary_mac_decline`.
+1. **One library decision.** `verify_metadata.py` `test_targets` computes `has_lib` for one package. Move that test to one function. A new metadata request answers the `check` selection for the whole workspace: `--lib` when any workspace member has a library target, and `--bins` always. Cargo refuses `--lib` only when no selected package has a library, so a mixed workspace keeps `--lib`.
+2. **The check verb.** `verify.sh` `check` takes its selection from that request, in the way `take_test_targets` reads its answer. A workspace with a library sends the same command as before. Add the request to the metadata the `check` verb already loads, and start no further Python process.
+3. **The refusal text.** `REFUSAL` in `scripts/copies/copy_guard.py` keeps its `copies.py run` example, and adds the lasting tree path: `A lasting phase tree: bash ~/.claude/scripts/worktree/make_worktree.sh <path> <branch>, from the source repository.` The guard already allows that script. Do not change a guard decision or the allow list. The builds showrunner ruled that the guard part of this phase is this text and the line in item 4 only.
+4. **The /unit:direct line.** In `commands/unit/direct.md`, the `<CoreContract/>` sentence on a worktree for the director's own workers names `scripts/worktree/make_worktree.sh` as the way to make that tree.
+5. **Docs.** Update the sentence on the refusal in `docs/as-built/gate-checkouts.md`.
 
 **Files:**
-- `scripts/direct/test_verify_mac_retry_hold.py`
-- `scripts/direct/test_verify_mac_lifecycle.py`
-- `scripts/direct/test_verify_mac_results.py`
-- `scripts/direct/test_verify_mac_retry_clock.py`
-- `scripts/direct/test_verify_token_renew.py`
-- `scripts/direct/test_verify_token_memory_history.py`
-- `scripts/direct/test_verify_hold_wait.py`
-- `scripts/direct/test_verify_tree_cancel_lint.py`
-- `scripts/direct/test_verify_lint_taplo.py`
-- `scripts/direct/test_verify_lint_scope.py`
-- `scripts/direct/verify_mac_offload_test_support.py`
-- `scripts/direct/verify_token_wait_test_support.py`
-- `scripts/direct/verify_hold_wait_test_support.py`
-- `scripts/direct/verify_tree_cancel_test_support.py`
-- `scripts/direct/verify_lint_scope_test_support.py`
-- `scripts/direct/verify_lint_cache_test_support.py`
-- `docs/plans/natedev-verify-test-cost.md`
+- `scripts/direct/verify.sh`
+- `scripts/direct/verify_metadata.py`
+- `scripts/direct/test_verify_check_no_library.py` (new)
+- `scripts/copies/copy_guard.py`
+- `scripts/copies/test_copy_guard.py`
+- `commands/unit/direct.md`
+- `docs/as-built/gate-checkouts.md`
 
-**Workers:** 3 writers. Each support file has one owner. A support file that a slot does not own is read-only for that slot.
-- merge16: the four `test_verify_mac_*` files above; owns `verify_mac_offload_test_support.py`.
-- fix16: `test_verify_token_renew.py`, `test_verify_token_memory_history.py`, `test_verify_hold_wait.py`; owns `verify_token_wait_test_support.py` and `verify_hold_wait_test_support.py`.
-- symlinkfix: `test_verify_tree_cancel_lint.py`, `test_verify_lint_taplo.py`, `test_verify_lint_scope.py`; owns `verify_tree_cancel_test_support.py`, `verify_lint_scope_test_support.py` and `verify_lint_cache_test_support.py`.
-- The director measures and writes the cost doc. Set the next batch's Workers at this phase's end.
+**Workers:** 1 writer: merge16 holds all files. The director runs the live check.
 
 **Constraints from prior phases:**
 - Add no guard, refusal or check that this Spec does not ask for.
 - A test project is made in a tempdir at run time. No test commits one.
-- Point measurement work at a temporary hold folder. Live state stays out of worker prompts.
-- At most one detached run at a time per writer, with at most 4 named test files.
-- `test_verify_wait_holder.py` belongs to Phases 8 and 8a. Do not change it here.
-- `verify.sh` is read-only in this batch, because three writers cannot share it. A check that needs a production move stays unmoved, and the summary names it.
-- A shared helper keeps its behavior for its other consumers. Add a helper before changing one. A writer that changes one names its consumers, and the director runs them.
-- natest Phase 53 removes `readlink` from `isolate_path_without_taplo` in `verify_lint_scope_test_support.py`. Do not change that function.
+- natest owns the other `test_verify*` files. Put a new test in its own new file.
+- This phase lands on `verify-plain`. A merge commit on this branch carries no visible Change-Review line.
+- Natest Phase 49 edits only `verify.sh` line 259, the `CLAUDE_PYTHON` default.
 
 **Acceptance gate:**
-- Each changed file has a complete behavior map: one row for each old assertion, and no row lacks a test. A reviewer reads the old assertions against the map.
-- For each moved check, breaking the step that the check names makes its test fail. The proof breaks the consumer or the routing branch, not only the function that composes the value. Show this on a tempdir copy for each moved behavior.
-- The cost doc holds before and after CPU s for each changed file and, after the last batch, for the whole set. The observation is the drop in CPU s for each file.
-- The changed test files pass; basedpyright 0/0/0 on the changed Python files; no full suite: the bump (builds showrunner, 2026-11-06 11:24 EST) runs lint and the tests of the changed files only, and the merge gate runs all modules.
+- A regression test on a tempdir workspace with no library shows the recorded command `check --workspace --bins`. It fails without the fix. `test_verify_dev_features.py`, `test_verify_dev_features_defaults.py` and `test_verify_token_check.py` still pass with `check --workspace --lib --bins`.
+- Live check by the director, real `cargo` on a tempdir workspace with no library: the old `verify.sh check` exits non-zero with `no library targets found`, and the new one exits 0.
+- `test_copy_guard.py` passes, and it asserts that the hook refusal of a bare `git worktree add` holds both `copies.py run` and `make_worktree.sh`. `test_verify_python_starts.py` passes.
+- basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+
+### Phase 41c — Send a lint that waits for memory to a free Mac  · status: todo
+
+**Depends on:** Phase 41b.
+
+#### Work Order
+
+**Source:** builds showrunner, 2026-11-06: the accepted lint item, and natest request d76b7136.
+
+**Goal:** a lint that waits for memory at its first step uses a free Mac and does not wait on natedev. The lint sequence becomes functions that a test can call.
+
+**Spec:**
+
+1. **Function move first.** Move the lint judgment block and the main lint sequence of the `lint` case in `verify.sh` into functions callable through `shell_functions`. The move changes no behavior. natest's `test_verify_lint_judgment.py` and `test_verify_lint_scope.py` use these functions.
+2. **Leave the mend wait for a free Mac.** At the memory wait of the `mend --fix` step, a free Mac takes the lint onto the path that it takes under a hold: `lint-held`, `HOLD_LINT=1`, local fmt, then `mend --fail-on-warn` and clippy judgment on the Mac. Use the existing hold path and the existing retry hook. Add no new decision point. `step_writes_tree` still keeps every writing step on natedev.
+3. **A clean tree ends there.** The lint exits 0 with no `mend --fix` run.
+4. **A finding returns to natedev.** On a finding from the Mac, the lint returns to the natedev queue, and runs `mend --fix`, as a clippy finding does now.
+5. **Linux-only repositories stay.** A repository under `linux_only.<repo>` in `config/mac_test.conf`, hana for one, keeps its natedev path.
+6. **Docs.** Update `docs/as-built/mac-test-offload.md`: its text says that lint steps keep their local path outside a hold.
+
+**Risk accepted by the builds showrunner:** a Linux-only lint error can appear later, at the merge gate. The user accepted this on 2026-10-28 for a lint during a hold, and this item widens it.
+
+**Files:**
+- `scripts/direct/verify.sh`
+- `scripts/direct/test_verify_lint_free_mac.py` (new)
+- `docs/as-built/mac-test-offload.md`
+
+**Workers:** 1 writer: merge16. The director measures the Mac-idle minutes from the build index.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test project is made in a tempdir at run time. No test commits one.
+- natest owns the other `test_verify*` files and may edit the support files after a36296ed2 lands. Put new tests in the new file, and import the support files. Name in the notice any support file that this phase must change.
+- A direct test reads a value where its consumer receives it. A retry or hold transition keeps a real `verify.sh` run.
+- This phase lands on `verify-plain`. A merge commit on this branch carries no visible Change-Review line.
+
+**Acceptance gate:**
+- Real `verify.sh lint` runs with the existing fake tools, in `test_verify_lint_free_mac.py`: a memory wait with a free Mac and a clean tree runs no `mend --fix` and exits 0; a Mac finding runs `mend --fix` on natedev; no free Mac leaves the path as it is; a `linux_only` repository never leaves. Each case fails when the matching code is removed. Show this on a tempdir copy.
+- `test_verify_lint_judgment.py`, `test_verify_lint_scope.py`, `test_verify_tree_cancel_lint.py` and `test_verify_python_starts.py` pass.
+- The notice names the Mac-idle minutes this could have saved, measured from the `mac_idle` and `steps` tables, or says why they cannot be measured.
+- basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+
+### Phase 41d — Move the test argument parser to one function  · status: todo
+
+**Depends on:** Phase 41c.
+
+#### Work Order
+
+**Source:** natest request 4537b50f, 2026-11-06, for `test_verify_mac_only.py` (38 policy cases).
+
+**Goal:** a test can call the `test` argument parser of `verify.sh` through `shell_functions`.
+
+**Spec:**
+
+1. Move the routing-flag loop at the top of `verify.sh` (it starts under `# Remove routing flags before constructing command words and records.`) to one function. The function keeps each refusal text and each exit status.
+2. The move starts no process and changes no behavior.
+3. Add one test that calls the function through `shell_functions` for one accepted form and one refused form, with the exit status.
+
+**Files:**
+- `scripts/direct/verify.sh`
+- `scripts/direct/test_verify_argument_parser.py` (new)
+
+**Workers:** 1 writer: merge16.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- natest changes `test_verify_mac_only.py`. Do not change it here.
+- This phase lands on `verify-plain`. After its checkpoint, send natest the hashes of Phases 41c and 41d in one message.
+
+**Acceptance gate:**
+- `test_verify_mac_only.py`, `test_verify_mac_arguments.py` and `test_verify_argument_parser.py` pass with no change to the first two.
+- basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
