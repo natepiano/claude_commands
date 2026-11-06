@@ -1110,7 +1110,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 2. **A failed reach is per target.** A new file `failed_probe` in `state_directory(target)`, beside `unreachable_until`, holds no time. Read it through a typed function in the form of `read_backoff`, with a state type in the form of `BackoffState`.
 3. **The probe owns the target mark.** `probe_mac` is the one writer. An `UnavailableProbe` result with no `detail` writes the mark, from each of its return points. A good `ProbeSnapshot` removes it. `UnresolvedSlotStartup` and `InterruptedTargetStatus` leave it as it is.
 4. **`free_now` answers not free.** Add `"bad"` to `FreeNowAnswer`. `free_now` returns `"bad"` where it would return `"free"` when the target mark exists, or when the record for this repository exists. The record's age does not matter: only a match removes it. Each earlier answer keeps its place, and the function stays local: no SSH, no lock. `free-now` exits 1 on `"bad"`, so each leave hook and the `reserve` form of the retry hook answer no.
-5. **A new step still tries, and a waiting step does not leave.** A new step's own try is the existing probe path that clears the marks. `ssh_target_eligibility` accepts `"bad"` as it accepts `"free"`. The `reserve` command refuses `"bad"` unless it receives a new flag `--new-step`. `ssh_retry_hook` calls `reserve` directly for an `ssh_allowed` route, so its command never carries the flag. The first pass of `route_test` (`retry` 0) adds the flag to its own `reserve` call, and no later pass adds it. The timed backoff keeps its current effect on new steps.
+5. **A new step still tries, and a waiting step does not leave.** A new step's own try is the existing probe path that clears the marks. `ssh_target_eligibility` accepts `"bad"` as it accepts `"free"`. The `reserve` command refuses `"bad"` unless it receives a new flag `--new-step`. `ssh_retry_hook` calls `reserve` directly for a route that allows SSH (`ssh_allowed`, or `any_target` after Phase 41h), so its command never carries the flag. The first pass of `route_test` (`retry` 0) adds the flag to its own `reserve` call, and no later pass adds it. The timed backoff keeps its current effect on new steps.
 6. **One line in the log.** The `could not reach` reason is the last non-empty line of the remote stderr. A traceback never reaches the log.
 7. **Status tells the truth.** `/build:status` (`targets.py` `target_state`) and `mac_test.py status` report a target with the mark as unreachable, not free.
 8. **Docs.** Update `docs/as-built/mac-test-offload.md`: the probe, the decline list and the two records.
@@ -1140,7 +1140,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Acceptance gate:**
 - The hana sequence, in `test_failed_probe_mark.py`, through the real `probe_mac`, `free_now`, `free-now` and `reserve` with a fake SSH: a mismatch probe, then the end of the timed backoff, then `free-now` still exits 1 with `bad` for that repository and exits 0 for another. A failed reach, then the end of the timed backoff, then `free-now` exits 1 with `bad` for each repository. A good probe by a new step removes the mark, and `free-now` exits 0 with no waiting step involved.
-- With the mark set, the command that `ssh_retry_hook` prints for an `ssh_allowed` route takes no reservation, and `reserve --new-step` goes on to its reach check and claim.
+- With the mark set, the command that `ssh_retry_hook` prints for a route that allows SSH takes no reservation, and `reserve --new-step` goes on to its reach check and claim.
 - `busy`, `blocked` and `off` keep their answers with the mark set. A remote stderr with a traceback prints one `could not reach` line that holds no `Traceback`.
 - Each case fails when the matching code is removed. Show this on a tempdir copy.
 - `test_mac_test.py`, `test_offload.py`, `test_ssh_eligibility.py`, `test_build_targets.py`, `test_targets.py`, `test_verify_ssh_targets.py` and `scripts/aws_target/test_control.py` pass.
@@ -1182,34 +1182,19 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41d — Move the test argument parser to one function  · status: done
 
-**Depends on:** Phase 41c, Phase 41f.
+#### As-built
 
-#### Work Order
-
-**Source:** natest request 4537b50f, 2026-11-06, for `test_verify_mac_only.py` (38 policy cases).
-
-**Goal:** a test can call the `test` argument parser of `verify.sh` through `shell_functions`.
-
-**Spec:**
-
-1. Move the routing-flag loop at the top of `verify.sh` (it starts under `# Remove routing flags before constructing command words and records.`) to one function. The function keeps each refusal text and each exit status.
-2. The move starts no process and changes no behavior.
-3. Add one test that calls the function through `shell_functions` for one accepted form and one refused form, with the exit status.
+- `parse_routing_arguments` in `verify.sh` holds the routing-flag loop. The call is `parse_routing_arguments "$@"`, then `set -- "${ARGS[@]}"`.
+- Inputs: the arguments, `CMD`, `VERIFY_CALL_ENVIRONMENT`. Outputs: `ARGS`, `NO_CACHE`, `LOCAL_ONLY`, `LOCAL_REASON`, `MAC_ONLY`, `MAC_REASON`, `MAC_ENV_NAMES`, `VERIFY_MAC_ENVIRONMENT`, `MAC_FETCH`, `MAC_FETCH_GIVEN`, `PINNED_TARGET`. It exports `BUILDLOG_PINNED_TARGET`.
+- A refusal writes its text to stderr and exits 2. The move starts no process.
+- A reviewer compared 51 calls of the old and new forms and found no difference.
 
 **Files:**
-- `scripts/direct/verify.sh`
-- `scripts/direct/test_verify_argument_parser.py`
+- `scripts/direct/verify.sh` — `parse_routing_arguments`.
+- `scripts/direct/test_verify_argument_parser.py` — calls the function through `shell_functions`, with one accepted form and one refused form.
 
-**Workers:** 1 writer: merge16.
-
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- natest changes `test_verify_mac_only.py`. Do not change it here.
-- This phase lands on `verify-plain`. After its checkpoint, send natest the hashes of Phases 41c and 41d in one message.
-
-**Acceptance gate:**
-- `test_verify_mac_only.py`, `test_verify_mac_arguments.py` and `test_verify_argument_parser.py` pass with no change to the first two.
-- basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+**Gotchas:**
+- The loop ran at the top level, so `exit` and `set --` acted on the script. The caller restores the positional arguments from `ARGS`.
 
 ### Phase 41g — One form for every verify command  · status: todo
 
@@ -1233,12 +1218,19 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
    - `example [<package>] [--name <name>]`: `--name` replaces the positional name. With no name, Clippy runs on all examples of the package, or of the workspace when no package is given. With a name and no package, the member that has the example supplies its required features.
    - `final [<package>] [--saved] [--tree <tree>]`: with a package, the check stays whole-workspace and nextest runs that package, and no pass is saved. `--saved` replaces `final-pass`, with the same answer and exit status. `--tree` is valid only with `--saved`.
 4. Remove `final-pass`, `lint --workspace`, the positional example name and the positional integration test. Add no alias. An old form exits 2 and prints a usage line that names the new form, so a worker with a stale prompt corrects itself in one step (builds, 2026-11-06).
-5. A record with no package names `workspace` as its package. `scripts/buildlog/index.py`, `scripts/buildlog/report.py`, `scripts/buildlog/mac_outcome.py` and `scripts/build_queue/step_estimator.py` read that word. A `test` with no package counts as a gate run in memory admission, and the estimator uses the workspace figure.
-6. Update `verify --help` and `verify help <command>` to the form, under 80 columns.
-7. Switch every caller in the Files list, and each further caller that a search finds. A doc that states a form states the new form, also `<package>` as `[<package>]`. Do not change `docs/plans`. Search `~/rust/nate_style` also, and name each hit outside this repository in the summary. Keep the script path `~/.claude/scripts/direct/verify.sh`: the permission rules name it.
+5. A record with no package names `workspace` as its package. `scripts/buildlog/record.py` writes the record: it reads the package from the parsed form, not from the first word, so `check --features foo` records `workspace` and `final <package>` records its package. `scripts/buildlog/index.py`, `scripts/buildlog/report.py`, `scripts/buildlog/mac_outcome.py` and `scripts/build_queue/step_estimator.py` read that word. Select through the existing `WorkspacePackages` and `NamedPackage` types of `scripts/direct/step_record.py`. Keep the display words apart from the Cargo and cache selectors. A `test` with no package counts as a gate run in memory admission, and the estimator uses the workspace figure.
+6. `scripts/direct/verify_metadata.py` answers for a whole workspace: `test-targets` and `build-targets` with no package read every member, and `example-features` with no package finds the member that has the example. `require_package` stays for a named package.
+7. A workspace `test` with a `linux_only` member does not run on the Mac. The check at `scripts/mac_test/offload.py:2178` uses the existing `workspace_has_linux_only` when the package is empty, as the other verbs do. A regression test holds this.
+8. Update `verify --help` and `verify help <command>` to the form, under 80 columns.
+9. Switch every caller in the Files list, and each further caller that a search finds. A doc that states a form states the new form, also `<package>` as `[<package>]`. Do not change `docs/plans`. Search `~/rust/nate_style` also, and name each hit outside this repository in the summary. Keep the script path `~/.claude/scripts/direct/verify.sh`: the permission rules name it.
 
 **Files:**
 - `scripts/direct/verify.sh`
+- `scripts/direct/verify_metadata.py`
+- `scripts/mac_test/offload.py`
+- `scripts/mac_test/test_offload.py`
+- `scripts/production/merge_checkpoint.py`
+- `scripts/buildlog/record.py`
 - `scripts/buildlog/index.py`
 - `scripts/buildlog/mac_outcome.py`
 - `scripts/buildlog/report.py`
@@ -1325,6 +1317,8 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Acceptance gate:**
 - A real `verify.sh` call on a tempdir workspace with no package runs `check`, `test` and `lint` over the workspace, and `test_verify_verbs.py` holds each removed form with exit 2.
+- `check --features foo` records `workspace`, and `final <package>` records that package and saves no pass.
+- A workspace `test` with a `linux_only` member answers `linux_only` from `mac_step_eligibility`.
 - Each removed form exits 2 and prints its new form.
 - `final --saved` gives the same answer and status as `final-pass` gave, in the `test_verify_final_pass*` modules.
 - A search of the repository, outside `docs/plans`, finds none of the removed forms.
@@ -1342,25 +1336,58 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Spec:**
 
-1. One function holds the rule. A step that writes the tree runs on natedev. `build` runs on natedev unless a flag pins it, because this machine uses the binary. Each other step runs on the first eligible target in `config/build_targets.conf` order. Today's default order is Mac, natedev, AWS.
-2. `check`, `doc`, `example`, the `lint` judgment and `final` now use that order, as `test` does. A `STEP_RUNS_ON` value of `ssh_allowed` and a value of `mac_allowed` become one value. `natedev_only` stays for the two cases in item 1.
+1. One function holds the rule. A step that writes the tree runs on natedev. `build` and `final` run on natedev unless a flag pins them, because this machine uses the binary and the saved pass. Each other step runs on the first eligible target in `config/build_targets.conf` order. Today's default order is Mac, natedev, AWS.
+2. `check`, `doc`, `example` and the `lint` judgment now use that order from their first step, as `test` does. Today `check`, `doc` and the `lint` judgment move only from a wait, and `example` stays on natedev. The answers `ssh_allowed` and `mac_allowed` become one value, `any_target`, with the type `AnyTarget` in `scripts/direct/step_record.py`. Where `verify.sh` branches on the old values, it reads the platform in the target table. `natedev_only` stays for the cases in item 1. Saved step records convert once at deploy, by a program outside the repository; no old-value reader stays, and the notice names the deploy steps.
 3. `parse_routing_arguments` accepts the flags on every command, with one meaning:
    - `--target <name>` pins each movable step to that target and waits for it.
    - `--mac "<reason>"` pins each movable step to the Mac and never uses natedev.
    - `--local "<reason>"` pins each step to natedev. The existing refusal of a reason that names a reservation applies on every command.
    - A step that writes the tree stays on natedev under each flag. `lint --mac` repairs on natedev and judges on the Mac.
-4. `offload.py` adds the verbs that `build`, `example` and `final` need. `config/build_targets.conf` lists them in each target's `kinds`. `linux_only` keeps its effect on every kind.
+4. Each routed step has one remote command, on the Mac and on a Linux target. `linux_only` keeps its effect on every kind.
+
+   | Step | Remote verb | Kind |
+   | --- | --- | --- |
+   | `test` | `nextest` | `test` |
+   | `check` | `check` | `check` |
+   | `doc` | `doc` | `doc` |
+   | `lint` judgment | `clippy`, `mend-check` | `lint` |
+   | `example` | `clippy` with the example words | `example` |
+   | `build` | `build` (new) | `build` |
+   | `final` | `check`, `nextest` | `check`, `test` |
+
+   `offload.py` and `scripts/lint/lint` add the `build` verb. `execute_slot` in `scripts/mac_test/linux_runner.py` and `linux_kind_permitted` in `offload.py` accept the verbs and kinds of this table. `config/aws_target.conf` adds `lint`, `example` and `build` to `kinds`, and `config/README.md` states the new list. `test_build_targets.py` changes: `example` answers `any_target`, and `final` stays local.
 5. `build` on another target prints `binary: <target>:<path>`.
-6. A saved pass from another target follows the rule that `doc` uses today. Name the rule in the as-built.
+6. A pinned `final` runs both steps on the target, keeps the clean tree check, and saves no pass: a saved pass answers only for this machine. An unpinned `final` keeps `final_pass.py` unchanged, with its clean tree and compiler identity. Name this rule in the as-built.
 7. Update `verify help <command>`, `docs/as-built/build-targets.md` and `docs/as-built/mac-test-offload.md`.
 8. Before the checkpoint, measure a mid-edit `check` on the Mac against natedev, with the sync time included, and put the numbers in the notice (builds, 2026-11-06). The measure uses one real package after a one-line edit, and names the method.
 
 **Files:**
 - `scripts/direct/verify.sh`
+- `scripts/direct/step_record.py`
 - `scripts/mac_test/offload.py`
+- `scripts/mac_test/linux_runner.py`
+- `scripts/lint/lint`
 - `scripts/build_targets/build_targets.py`
 - `config/build_targets.conf`
+- `config/aws_target.conf`
+- `config/README.md`
 - `scripts/direct/test_verify_routing_rule.py`
+- `scripts/build_targets/test_build_targets.py`
+- `scripts/build_targets/test_ssh_eligibility.py`
+- `scripts/buildlog/test_mac_idle.py`
+- `scripts/direct/test_step_record.py`
+- `scripts/direct/test_step_record_cli.py`
+- `scripts/direct/test_verify_checks_fail_closed.py`
+- `scripts/direct/test_verify_hold_mac.py`
+- `scripts/direct/test_verify_mac_lint_token.py`
+- `scripts/direct/test_verify_ssh_targets.py`
+- `scripts/direct/test_verify_step_routes.py`
+- `scripts/direct/test_verify_step_state.py`
+- `scripts/direct/test_verify_target_platform.py`
+- `scripts/direct/verify_doc_test_support.py`
+- `scripts/direct/verify_hold_wait_test_support.py`
+- `scripts/direct/verify_mac_offload_test_support.py`
+- `scripts/direct/verify_step_routes_test_support.py`
 - `docs/as-built/build-targets.md`
 - `docs/as-built/mac-test-offload.md`
 
@@ -1375,4 +1402,4 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Acceptance gate:**
 - `test_verify_routing_rule.py` calls the rule function for each command with no flag, `--target`, `--mac` and `--local`, and reads the route of each step.
 - A real `verify.sh` call with a fake SSH runner reaches the target for `check`, `example` and `build`, and repairs on natedev under `lint --mac`.
-- The modules that read routing pass with no change to what they assert, except for the two merged `STEP_RUNS_ON` values. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+- The modules that read routing pass. An assertion changes only where this Spec changes a route, and the summary names each one. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
