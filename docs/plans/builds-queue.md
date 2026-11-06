@@ -287,36 +287,24 @@ only I can bump
 
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
-**Depends on:** nothing. Source: builds showrunner, 2026-11-06 08:50 and 09:1x EST.
+#### As-built
 
-#### Work Order
-
-**Goal:** The outage alert reaches the builds session from a service with no herdr on its PATH. A merge gate past 85% done keeps the value its profile records, not the full need.
-
-**Spec:**
-
-1. **Roster.** `scripts/message/roster.py:1286` also catches `herdr.HerdrFailure`, as line 1392 does. Owner natedev messaging, by builds' ruling.
-2. **Push text.** `down_alert`'s phone push says the builds session did not take the message. It no longer says no session is live.
-3. **Rerun.** A merge gate rerun publishes no progress counter and clears the counter file. No `suites:2` phase reaches a profile. The rerun keeps the full need.
-4. **Stored record.** The director removed the one `suites:2` record from the live store, with a copy in the phase folder.
-5. **Proof.** The real send.py as a subprocess, with no `HERDR_BIN` and no herdr on PATH, delivers to a fixture builds session. A gate that reran leaves a profile where 99% done gives the last bin's value.
+- `scripts/message/roster.py:1286` also catches `herdr.HerdrFailure`, so `send.py` keeps the session entries and delivers from a service with no herdr on its PATH.
+- `down_alert`'s phone push reads "The builds session did not take the message. Builds wait until the service answers."
+- A merge gate rerun sets `progress_total = 0`, so `publish_progress` publishes nothing, and `progress_profile.clear_counter` removes the counter file. The rerun keeps the full need. `progress_phase` is gone, and the first pass counter is `suites:1`.
 
 **Files:**
-- `scripts/message/roster.py`
-- `scripts/message/test_roster.py`
-- `scripts/build_queue/admission_client.py`
-- `scripts/build_queue/test_admission_client.py`
-- `scripts/build_queue/progress_profile.py`
-- `scripts/production/merge_gate.py`
-- `scripts/production/test_merge_gate_suites_admission.py`
+- `scripts/message/roster.py`, `scripts/message/test_roster.py` — the catch
+- `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py` — the push text, the proof with no herdr
+- `scripts/build_queue/progress_profile.py` — `clear_counter`
+- `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate_suites_admission.py` — the rerun
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/merge-gate-and-test-speed.md` — the rerun rule
 
-**Workers:** `1 writer + 1 tester`
-- `impl2` — production files.
-- `test2` — test files.
+**Binds later work:** a module that names `session_send_argv` installs `forbid_real_sender` in `setUpModule`, because `scripts/message/test_session_send.py` requires it.
 
-**Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file.
+**Gotchas:** the installed `merge_gate.py` runs for every `--checkout` gate, so `suites:2` records keep arriving until this phase is installed. Stored `suites:2` records stay until removed.
 
-**Change-Review:** outage alert reaches the builds session; a gate near its end keeps less memory.
+**Ruled out:** a reader in main code that skips stored `suites:2` records.
 
 ### Phase 21 — Each moved admission name has one import path  · status: todo
 
