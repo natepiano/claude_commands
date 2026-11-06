@@ -38,8 +38,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import conf
 import treekey
 if TYPE_CHECKING:
+    from ..lib import build_folders
     from .mirror_root import MacMirrorRoot
 else:
+    from scripts.lib import build_folders
     from scripts.mac_test.mirror_root import MacMirrorRoot
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
 if TYPE_CHECKING:
@@ -1136,7 +1138,9 @@ def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 
         return f"{mac_mirror_root().relative}/{repository.legacy_mirror_name}"
     if slot < 1:
         raise ValueError("slot must be positive")
-    return f"{linux_mirror_root()}/{repository.path_key}/{slot}"
+    name = build_folders.repository_key_for(repository.policy_name, repository.key or repository.name)
+    return str(build_folders.build_folder_path(build_folders.BuildFolderSpec(
+        kind="mirror", parent=linux_mirror_root(), repository=name, owner=target, slot=slot, suffix_length=0)))
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:

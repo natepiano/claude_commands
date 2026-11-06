@@ -526,7 +526,7 @@ class LinuxShellTests(unittest.TestCase):
         _ = self.settings.write_text(self.settings.read_text().replace("target_budget_gib.hana=31", "target_budget_gib.hana=0.0001"))
         old = self.build_output("target", "old", 1, 196608)
         recent = self.build_output("target", "recent", 1_793_570_400, 8192)
-        other = self.mirror.parent / "1/target/retained"
+        other = self.root / offload.remote_mirror(self.identity, "aws", 1) / "target/retained"
         other.parent.mkdir(parents=True)
         _ = other.write_text("another slot\n")
 
@@ -545,7 +545,7 @@ class LinuxShellTests(unittest.TestCase):
             "target_budget_gib.hana=31", "target_budget_gib.hana=0.0001"))
         old = self.build_output("target", "old", 1, 196608)
         recent = self.build_output("target", "recent", 1_793_570_400, 8192)
-        neighbor = self.mirror.parent / "1/target/recent-output"
+        neighbor = self.root / offload.remote_mirror(self.identity, "aws", 1) / "target/recent-output"
         neighbor.parent.mkdir(parents=True)
         _ = neighbor.write_text("another slot\n")
 
@@ -583,10 +583,10 @@ class LinuxShellTests(unittest.TestCase):
         self.assertEqual((self.mirror / "target/retained").read_text(), "default folder\n")
 
     def test_explicit_build_folder_cannot_escape_the_selected_slot(self) -> None:
-        neighbor = self.mirror.parent / "1/target/retained"
+        neighbor = self.root / offload.remote_mirror(self.identity, "aws", 1) / "target/retained"
         neighbor.parent.mkdir(parents=True)
         _ = neighbor.write_text("another slot\n")
-        for words in (("--target-dir", "../1/target"), (f"--target-dir={neighbor.parent}",)):
+        for words in (("--target-dir", f"../{neighbor.parent.parent.name}/target"), (f"--target-dir={neighbor.parent}",)):
             with self.subTest(words=words):
                 result = self.execute(self.request(words=words))
 

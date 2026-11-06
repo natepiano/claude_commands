@@ -245,6 +245,10 @@ The [AWS EBS device guide](https://docs.aws.amazon.com/ebs/latest/userguide/iden
 Its remote service requires the `/home` mount.
 A missing mount must not create mirrors on the root filesystem.
 SSM remains available for mount recovery.
+Linux mirrors use `~/.local/state/build-target/mirror/<repository>/<target>-s<slot>`, from the build queue rule.
+The repository folder joins the policy name and the identity hash.
+Worktrees and gate copies with the same policy name and identity share one mirror per target and slot.
+The Mac keeps its source folder name rule.
 Repeat the idle-stop check after bootstrap or lifecycle changes.
 
 ## Tailscale policy and box configuration
