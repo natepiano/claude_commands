@@ -622,41 +622,50 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 24 — A worker list prints each run anomaly once  · status: done
 
+#### As-built
+
+- `unit_runs.report_anomaly` prints each anomaly line once per process. `unit_runs.director` and `worker_admission.parent` use it.
+- `unit_runs` and `scripts.lib.unit_runs` are one module through `sys.modules.setdefault`, so both names share that record.
+- `worker_panes.dispatch_role` takes the run as an argument. `worker.py` reads `worker_run(parent)` once before each loop, so one list makes one scan. `pane_moves._move_locked` passes `move.run`.
+- `worker_lifecycle.locked_state`: a shared read of a missing folder creates nothing. A writer still creates its folder and lock.
+- `worker_admission.parent` looks up a showrunner only when a production name is known. With no name, the error is a whole sentence that names what is missing.
+- No folder is deleted by code, and no check, guard or refusal is added. The cause of the mangled folder names is workers that retype a run path. sdlc gave herdr that design note.
+
+**Files:** `scripts/lib/unit_runs.py`, `scripts/herdr/worker_panes.py`, `scripts/production/worker.py`, `scripts/production/worker_admission.py`, `scripts/agents/worker_lifecycle.py`, `scripts/accounts/pane_moves.py` and their test modules.
+
+**Gotchas:**
+- Do not run 223 test modules in one process. That run gave 214 failures and 60 errors from tests that interfere. Use `merge_gate.py --checkout <tree> --tests-only`.
+- A merge can bring a new caller of a changed signature. The sdlc merge brought `pane_moves.py`, and only the full gate found it.
+
+### Phase 25 — A new tab takes its place past saved worker tabs  · status: todo
+
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** the user's fault of 2026-11-06 06:2x, the warning part. One `/unit:worker list` printed about 15 copies of one block of nine `no showrunner staff row` lines. After this phase, one command prints each anomaly once, and one list scans the run folders once. herdr owns the other part of that fault: Morty's bare panes make every worker uncertain.
+**Goal:** the user's fault of 2026-11-06. `/showrunner:transfer_unit` moved unit-board into sdlc, and its tab stopped after herdr instead of after style. After this phase, a moved or new tab takes its place in the showrunner, units A-Z, other tabs A-Z order, also when saved worker tabs sit between the units.
 
-**Cause (found by the unit director, on sdlc 5918b1e28):**
-- `worker.py list_workers` calls `worker_panes.dispatch_role(row)` per worker. That calls `worker_run(parent)`, `unit_runs.held` with no `scanned`, and a full `held_by_session` scan. `unit_runs.director` prints one line per ownerless folder in each scan. So the block repeats once per worker. Each scan also costs about 0.5 s. The other `dispatch_role` loops in `worker.py` do the same.
-- A read creates a run folder. `session_staff.read_worker_roster` goes through `worker_lifecycle.locked_state`, which makes the folder and a `mesh_roster.json.lock`. So a read with a wrong run path leaves a new folder behind.
-- The anomaly line has an empty name. Every `send.py` call prints `anomaly: <run>: no showrunner staff row for ` for each run that names no owner. `worker_admission.parent` found no unit, no production and no staffed worker, and its last step looks up a showrunner named "". sdlc added this on 2026-11-06.
+**Cause (found and reproduced by the unit director):**
+- `herdr.tab_order` in `scripts/herdr/herdr.py` puts a tab that is not saved before the first placed tab whose rule is greater.
+- The saved sdlc tabs are `sdlc, devtools, fix-rounds, herdr, review, impl, review2, hierarchies, ... style`. The review, impl and review2 tabs are herdr's workers.
+- The rule of a worker tab is greater than the rule of each unit tab. So unit-board stopped before `review`, and it went before hierarchies.
+- `_bind_row_tab` and `order_tabs` both use `tab_order`, so one change corrects both.
 
 **Spec:**
-1. `scripts/lib/unit_runs.py` `director`: print each anomaly line once per process.
-2. `scripts/herdr/worker_panes.py` `dispatch_role`: take the run as an argument. Do not rescan for each worker. `scripts/production/worker.py`: each loop over a parent's workers reads `worker_run(parent)` once and passes it in. Do not change `observe`, `_parent_evidence` or any `scan.unknown` reader: herdr owns them.
-3. A read of a worker roster in a folder that does not exist reads as a missing roster and creates nothing. A write still creates its folder.
-4. Tests: one `worker.py list` over several workers and an ownerless folder prints each anomaly line once and makes one `held_by_session` scan. A roster read of a missing folder leaves no folder.
-5. Delete no folder under `/tmp/claude`. Add no check, guard or refusal.
-6. `scripts/production/worker_admission.py` `parent`: when no unit and no production name is known, the error is a whole sentence that names what is missing. With a run: `this run has no owner because progress_history_state.json and mesh_roster.json name no unit, production or staff row`. With no run: `the caller has no staff row and names no unit or production`. The state-file read anomaly in `parent` also prints once per process, through `unit_runs.report_anomaly`. Tests expect the new text.
+1. `tab_order`: a tab that is not saved goes after the last placed tab whose rule is not greater than its own. With no such tab, it goes at `start`. Saved tabs keep their saved order. The first tab stays first.
+2. Update the `tab_order` docstring if it no longer states the behavior.
+3. Tests in `scripts/herdr/test_herdr.py`:
+   - `tab_order`: saved `boss, a-unit, worker, m-unit` with a new `z-unit` gives `boss, a-unit, worker, m-unit, z-unit`.
+   - `move_row_tabs` on the fixture client: a unit that moves into a production whose saved order has a worker tab between units takes its A-Z place, live and in the saved layout. This test fails without item 1.
+4. Add no check, guard or refusal. Tests never act on a live unit or a live herdr session.
 
 **Files:**
-- `scripts/lib/unit_runs.py`
-- `scripts/herdr/worker_panes.py`
-- `scripts/production/worker.py`
-- `scripts/production/session_staff.py`
-- `scripts/production/worker_admission.py`
-- `scripts/agents/worker_lifecycle.py`
-- `scripts/lib/test_unit_runs.py`
-- `scripts/herdr/test_worker_panes.py`
-- `scripts/production/test_worker.py`
-- `scripts/production/test_worker_admission.py`
-- `scripts/production/test_session_staff.py`
+- `scripts/herdr/herdr.py`
+- `scripts/herdr/test_herdr.py`
 
 **Workers:** 1 writer, slot impl2.
 
 **Acceptance gate:**
 - basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
-- These modules pass: `scripts.lib.test_unit_runs`, `scripts.herdr.test_worker_panes`, `scripts.production.test_worker`, `scripts.production.test_session_staff`, `scripts.direct.test_workers`, and each caller module of a changed function.
-- Live, read only: `worker.py list` from this checkout prints each anomaly line once.
+- These modules pass: `scripts/herdr/test_herdr.py`, `scripts/production/test_unit_lookup.py`, `scripts/production/test_unit_move.py`, `scripts/production/test_transfer_unit.py`, and each caller module of a changed function.
+- The merge gate on the merged tree is green.
