@@ -242,7 +242,7 @@ else:
     with open(filename, "rb") as script:
         source = script.read()
     sys.argv = arguments
-    sys.path[0] = os.path.dirname(os.path.abspath(filename))
+    sys.path.insert(0, os.path.dirname(os.path.abspath(filename)))
 module = types.ModuleType("__main__")
 module.__file__ = filename
 sys.modules["__main__"] = module

@@ -354,9 +354,9 @@ class DurableRolesTests(unittest.TestCase):
             if isinstance(instance.lifecycle, design_roles.RoleOpen):
                 row = cast(staff.StaffRow, staff.by_id(instance.lifecycle.staff_id))
                 world.add(row, f"w1:p{index}", family="codex")
-        _ = self.enterContext(patch("herdr.Herdr", return_value=world))
-        _ = self.enterContext(patch("herdr.native_process", side_effect=world.native_process))
-        _ = self.enterContext(patch("herdr._startup_processes", side_effect=world.descendants))
+        _ = self.enterContext(patch("scripts.herdr.herdr.Herdr", return_value=world))
+        _ = self.enterContext(patch("scripts.herdr.herdr.native_process", side_effect=world.native_process))
+        _ = self.enterContext(patch("scripts.herdr.herdr._startup_processes", side_effect=world.descendants))
 
         def command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
             self.pane_commands.append(arguments.copy())
@@ -383,7 +383,7 @@ class DurableRolesTests(unittest.TestCase):
         parent = staff.by_path("demo/design")
         assert parent is not None
         world.add(parent, "w1:p0", family="codex")
-        _ = self.enterContext(patch("herdr.launch_prepared_agent", side_effect=world.launch))
+        _ = self.enterContext(patch("scripts.herdr.herdr.launch_prepared_agent", side_effect=world.launch))
         _ = self.enterContext(patch.object(restart, "stop_row", side_effect=world.stop))
         _ = self.enterContext(patch.object(accounts, "role_account", return_value=
             accounts.CodexWorkersAccount("codex1", Path.home() / ".codex")))
