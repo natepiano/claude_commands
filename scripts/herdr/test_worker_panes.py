@@ -43,6 +43,7 @@ class PaneWorld(herdr.Herdr):
         self.commands: list[tuple[str, ...]] = []
         self.process_reads: list[str] = []
         self.launches: list[herdr.ExistingPane | herdr.SplitPane] = []
+        self.launch_timeouts: list[int] = []
         self.stops: list[str] = []
         self.closed: list[tuple[str, str]] = []
         self.requests: list[tuple[str, list[str], dict[str, str]]] = []
@@ -51,6 +52,9 @@ class PaneWorld(herdr.Herdr):
         self.layouts: dict[str, dict[str, object]] = {}
         self.layout_changes: list[tuple[str, float]] = []
         self.unreadable = False
+        self.first_turn_timeout = False
+        self.report_reads_before_publish = 0
+        self.disappear_after_launch = False
 
     def add(self, row: staff.StaffRow, pane: str, *, live: bool = True,
             family: Literal["claude", "codex"] = "claude", terminal: str = "",
@@ -115,10 +119,15 @@ class PaneWorld(herdr.Herdr):
         self.processes[pid] = herdr.NativeAgentProcess(native, "fixture-generation", {})
         self.foreground[pane] = pid, family, [family, "--resume" if family == "claude" else "resume", identity]
 
-    def native_process(self, pid: int, kind: str) -> herdr.NativeAgentProcess:
+    def native_process(self, pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
         if self.foreground and kind not in ("claude", "codex"):
             raise AssertionError(f"unexpected family {kind}")
-        return self.processes[pid]
+        process = self.processes[pid]
+        if isinstance(process.identity, herdr.LaunchArgument):
+            if not reported:
+                raise ValueError("Codex launch identity is unavailable")
+            return herdr.NativeAgentProcess(herdr.PaneSessionReport(reported), process.started, process.environment)
+        return process
 
     def descendants(self, shell: herdr.PaneShell, kind: str,
                     tracked: set[herdr.AgentProcessIdentity]) -> herdr.AgentProcessPresent | herdr.PaneAtShell | herdr.PaneRunning | herdr.PaneProcessesUnreadable:
@@ -136,19 +145,25 @@ class PaneWorld(herdr.Herdr):
     @override
     def native_pane_process(self, pane: str, kind: str, timeout: float) -> herdr.NativeAgentProcess:
         del timeout
-        pid, family, _ = self.foreground[pane]
-        if kind != family:
-            raise herdr.HerdrFailure("wrong native family")
-        return self.processes[pid]
+        if self.report_reads_before_publish and self.locations[pane].get("agent_status") == "done":
+            self.report_reads_before_publish -= 1
+            if self.report_reads_before_publish == 0:
+                process = self.processes[self.foreground[pane][0]]
+                self.locations[pane]["agent_session"] = {"value": process.identity.id}
+                self.processes[self.foreground[pane][0]] = herdr.NativeAgentProcess(
+                    herdr.PaneSessionReport(process.identity.id), process.started, process.environment)
+        info = herdr.json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"), "fixture processes")
+        return herdr.pane_native_process(info, kind, self.locations[pane])
 
     def launch(self, name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                prepared: herdr.PreparedAgentEnvironment, kind: str, agent_arguments: list[str],
                opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
                reported_unknown: str = "") -> herdr.AgentLaunched:
-        del name, opening, timeout_ms, reported_unknown
+        del name, opening, reported_unknown
         if isinstance(destination, herdr.NewTab):
             raise AssertionError("a worker must not create a tab")
         self.launches.append(destination)
+        self.launch_timeouts.append(timeout_ms)
         self.requests.append((kind, agent_arguments.copy(), prepared.env.copy()))
         if isinstance(destination, herdr.SplitPane):
             pane = "w1:p" + str(1 + max((int(identity.split(":p")[-1]) for identity in self.locations
@@ -156,6 +171,7 @@ class PaneWorld(herdr.Herdr):
             anchor = self.locations[destination.of_pane]
             self.locations[pane] = {**anchor, "pane_id": pane, "label": destination.label,
                                     "terminal_id": "terminal-" + pane, "focused": False}
+            _ = self.locations[pane].pop("agent_session", None)
             self.split_leaf(destination.of_pane, pane, destination.direction, destination.ratio)
         else:
             pane = destination.pane
@@ -169,11 +185,16 @@ class PaneWorld(herdr.Herdr):
         self.activate(identity, pane, cast(Literal["claude", "codex"], kind))
         pid, family, _ = self.foreground[pane]
         self.foreground[pane] = pid, family, [kind, *agent_arguments]
+        if kind == "codex" and "resume" not in agent_arguments:
+            process = self.processes[pid]
+            self.processes[pid] = herdr.NativeAgentProcess(herdr.LaunchArgument(process.identity.id), process.started, process.environment)
         fixture_session(identity, staff.ClaudeBackend() if kind == "claude" else
                         staff.CodexBackend(Path(prepared.env["CODEX_HOME"])))
         if self.interrupt == "agent":
             self.interrupt = ""
             raise OSError("interrupted after agent start")
+        if self.disappear_after_launch:
+            del self.locations[pane]
         return herdr.AgentLaunched(pane, self.outcome)
 
     def stop(self, row: staff.StaffRow, client: herdr.Herdr) -> bool:
@@ -241,7 +262,23 @@ class PaneWorld(herdr.Herdr):
             self.remove_leaf(arguments[2])
             _ = self.locations.pop(arguments[2])
             _ = self.foreground.pop(arguments[2], None)
+        elif arguments[:2] == ("agent", "prompt") and arguments[2] in self.foreground:
+            pane = arguments[2]
+            pid = self.foreground[pane][0]
+            process = self.processes[pid]
+            if not self.report_reads_before_publish:
+                self.locations[pane]["agent_session"] = {"value": process.identity.id}
+                self.processes[pid] = herdr.NativeAgentProcess(
+                    herdr.PaneSessionReport(process.identity.id), process.started, process.environment)
         return ""
+
+    @override
+    def wait_until(self, pane: str, state: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+        self.commands.append(("agent", "wait", pane, "--until", state, "--timeout", str(timeout_ms)))
+        if self.first_turn_timeout:
+            return herdr.WaitTimedOut()
+        self.locations[pane]["agent_status"] = "done"
+        return herdr.ObservedAgentState(herdr.AgentStatus.DONE)
 
 
 class WorkerPaneTests(StaffTestCase):
@@ -262,7 +299,10 @@ class WorkerPaneTests(StaffTestCase):
                                         worktree=staff.PresentWorktree("natedev", self.root)).id
         config = self.root / "conf"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n")
+        write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
+                          + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
+                          + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
+                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "state"), "CONF_DIR": str(config),
@@ -319,7 +359,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(found[parent.id], [worker_panes.ProcessUnknownWorker(
             other, "w2:p1", "terminal-w2:p1", "process permission denied")])
         self.assertIsInstance(next(item for item in found[self.parent.id] if item.row.id == absent.id),
-                              worker_panes.UncertainWorker)
+                              worker_panes.ClosedWorker)
         self.world.unreadable = True
         found = worker_panes.observe_parents([self.parent, parent], record)
         self.assertTrue(all(isinstance(item, worker_panes.UncertainWorker) for states in found.values() for item in states))
@@ -355,6 +395,9 @@ class WorkerPaneTests(StaffTestCase):
                  if isinstance(backend, staff.CodexBackend) else
                  {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": message}]}})
         write_text_atomic(source, json.dumps(entry) + "\n")
+
+    def prompts(self) -> list[tuple[str, ...]]:
+        return [command for command in self.world.commands if command[:2] == ("agent", "prompt")]
 
     def test_dispatch_holder_starts_its_worker_and_keeps_other_operations_out(self) -> None:
         row = self.worker()
@@ -514,6 +557,159 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.world.stops, [])
 
+    def test_fresh_codex_publishes_the_first_turn_report_and_sends_no_second_turn(self) -> None:
+        first = self.start("reviewer", "review")
+        self.assertIsInstance(first, worker_panes.OpenWorker)
+        assert isinstance(first, worker_panes.OpenWorker)
+        report = cast(dict[str, str], self.world.locations[first.pane]["agent_session"])
+        self.assertEqual(first.row.current_session, report["value"])
+        self.assertIn("--no-daemon", self.world.requests[0][1])
+        prompts = self.prompts()
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("Reply with ready. Do not use tools.", prompts[0][-1])
+        before = self.staff_state()
+        again = self.start("reviewer", "review")
+        self.assertEqual(again, first)
+        self.assertEqual(self.staff_state(), before)
+        self.assertEqual(self.prompts(), prompts)
+        self.assertEqual(len(self.world.launches), 1)
+
+    def test_codex_start_interrupted_before_the_first_turn_reuses_the_same_terminal(self) -> None:
+        self.world.interrupt = "agent"
+        _ = self.start("reviewer", "review")
+        terminal = self.world.locations["w1:p1"]["terminal_id"]
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual((result.pane, result.terminal), ("w1:p1", terminal))
+        self.assertEqual(len(self.world.launches), 1)
+        self.assertEqual(len(self.prompts()), 1)
+
+    def test_codex_start_interrupted_after_the_first_turn_publishes_without_another_turn(self) -> None:
+        with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("publication interrupted")):
+            result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        prompts = self.prompts()
+        terminal = self.world.locations["w1:p1"]["terminal_id"]
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual((result.pane, result.terminal), ("w1:p1", terminal))
+        self.assertEqual(self.prompts(), prompts)
+        self.assertEqual(len(self.world.launches), 1)
+
+    def test_first_turn_timeout_retains_the_unpublished_codex_pane(self) -> None:
+        self.world.first_turn_timeout = True
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertIn("timed out", result.cause)
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+        self.assertEqual(set(self.world.locations), {"w1:p0", result.pane})
+        self.assertEqual(self.world.closed, [])
+
+    def test_first_turn_reads_its_text_and_wait_limit_from_configuration(self) -> None:
+        path = self.root / "conf/direct.conf"
+        write_text_atomic(path, path.read_text().replace("Reply with ready. Do not use tools.", "Reply with configured-ready.")
+                          .replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=45"))
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        prompt = self.prompts()[0]
+        self.assertIn("Reply with configured-ready.", prompt[-1])
+        wait = next(command for command in self.world.commands if command[:2] == ("agent", "wait"))
+        self.assertEqual(wait[-4:], ("--until", "done", "--timeout", "45000"))
+
+    def test_configured_launch_timeout_applies_to_fresh_start_and_resume(self) -> None:
+        path = self.root / "conf/direct.conf"
+        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=37"))
+        opened = self.start("reviewer", "review")
+        self.assertIsInstance(opened, worker_panes.OpenWorker)
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.assertTrue(self.world.stop(opened.row, self.world))
+        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=37", "PANE_AGENT_START_SECONDS=61"))
+        resumed = self.start("reviewer", "review")
+        self.assertIsInstance(resumed, worker_panes.OpenWorker)
+        self.assertEqual(self.world.launch_timeouts, [37000, 61000])
+
+    def test_unusable_launch_timeout_refuses_start_without_a_split(self) -> None:
+        path = self.root / "conf/direct.conf"
+        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=invalid"))
+        result = self.start()
+        self.assertIsInstance(result, worker_panes.StartRefused)
+        assert isinstance(result, worker_panes.StartRefused)
+        self.assertEqual(result.reason, worker_panes.StartRefusal.INVALID_ROLE_CONFIGURATION)
+        self.assertEqual(self.world.launches, [])
+
+    def test_codex_resume_in_a_new_pane_without_a_report_needs_no_first_turn(self) -> None:
+        row = self.worker("reviewer", family="codex")
+        before = self.staff_state()
+
+        def resumed_process(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
+            process = self.world.native_process(pid, kind, reported)
+            if kind == "codex" and process.identity.id == row.current_session:
+                return herdr.NativeAgentProcess(herdr.LaunchArgument(row.current_session), process.started, process.environment)
+            return process
+
+        with patch.object(herdr, "native_process", side_effect=resumed_process):
+            opened = self.start("reviewer", "review")
+        self.assertIsInstance(opened, worker_panes.OpenWorker)
+        assert isinstance(opened, worker_panes.OpenWorker)
+        self.assertEqual(opened.row, row)
+        self.assertEqual(self.staff_state(), before)
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.667, "reviewer")])
+        self.assertEqual(self.prompts(), [])
+        self.assertEqual(self.world.requests[0][1][:3], ["resume", row.current_session, "--no-daemon"])
+
+    def test_fresh_codex_not_ready_keeps_the_pane_without_a_first_turn(self) -> None:
+        self.world.outcome = herdr.PromptNotSubmitted("agent_not_ready")
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertEqual(result.cause, "agent_not_ready")
+        self.assertEqual(self.prompts(), [])
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+        self.assertEqual(set(self.world.locations), {"w1:p0", result.pane})
+
+    def test_report_after_done_publishes_before_the_first_turn_deadline(self) -> None:
+        self.world.report_reads_before_publish = 2
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.row.current_session,
+                         cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
+        self.assertEqual(len(self.prompts()), 1)
+
+    def test_missing_report_at_the_first_turn_deadline_keeps_the_pane_unpublished(self) -> None:
+        path = self.root / "conf/direct.conf"
+        write_text_atomic(path, path.read_text().replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=1"))
+        self.world.report_reads_before_publish = 1000000
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertIn("pane retained", result.cause)
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+        self.assertEqual(set(self.world.locations), {"w1:p0", result.pane})
+
+    def test_unreadable_activity_during_recovery_returns_unknown_without_input(self) -> None:
+        self.world.interrupt = "agent"
+        _ = self.start("reviewer", "review")
+        self.world.unknown["w1:p1"] = "activity is unreadable"
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.ProcessUnknownWorker)
+        assert isinstance(result, worker_panes.ProcessUnknownWorker)
+        self.assertEqual(result.pane, "w1:p1")
+        self.assertIn("activity is unreadable", result.reason)
+        self.assertEqual(self.prompts(), [])
+
+    def test_fresh_codex_pane_missing_before_the_first_turn_stays_unpublished(self) -> None:
+        self.world.disappear_after_launch = True
+        result = self.start("reviewer", "review")
+        self.assertIsInstance(result, worker_panes.UnpublishedWorker)
+        assert isinstance(result, worker_panes.UnpublishedWorker)
+        self.assertIn("pane is missing", result.cause)
+        self.assertEqual(self.prompts(), [])
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+
     def test_worker_name_does_not_select_the_dispatch_role(self) -> None:
         result = self.start("impl2", "review")
         self.assertIsInstance(result, worker_panes.OpenWorker)
@@ -547,12 +743,13 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual([request[2]["UNIT_TEAM_ROLE"] for request in self.world.requests], ["left", "right"])
 
     def test_first_split_uses_the_private_live_ratio_and_the_next_split_is_below_it(self) -> None:
-        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.25\n")
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("WORKER_SPLIT_RATIO=0.667", "WORKER_SPLIT_RATIO=0.25"))
         first = self.start("first")
         self.assertIsInstance(first, worker_panes.OpenWorker)
         assert isinstance(first, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches[0], herdr.SplitPane("w1:p0", "right", 0.25, "first"))
-        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.75\n")
+        write_text_atomic(config, config.read_text().replace("WORKER_SPLIT_RATIO=0.25", "WORKER_SPLIT_RATIO=0.75"))
         second = self.start("second")
         self.assertIsInstance(second, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches[1], herdr.SplitPane(first.pane, "down", 0.75, "second"))
@@ -567,9 +764,12 @@ class WorkerPaneTests(StaffTestCase):
                          (row.id, row.current_session, "w1:p1", "terminal-w1:p1"))
         self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
         self.assertEqual(self.world.requests[0][1][:2], ["resume", row.current_session])
+        self.assertIn("--no-daemon", self.world.requests[0][1])
+        self.assertEqual(self.prompts(), [])
         self.assertEqual(self.world.closed, [])
 
     def test_incomplete_start_keeps_the_agent_and_does_not_launch_twice(self) -> None:
+        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}}, update=True)
         self.world.outcome = herdr.PromptNotSubmitted("startup prompt not submitted")
         result = self.start()
         self.assertIsInstance(result, worker_panes.IncompleteStart)
@@ -612,7 +812,7 @@ class WorkerPaneTests(StaffTestCase):
             _ = self.start()
         except OSError:
             pass
-        identity = self.world.processes[self.world.foreground["w1:p1"][0]].current_identity
+        identity = self.world.processes[self.world.foreground["w1:p1"][0]].identity.id
         result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)
         assert isinstance(result, worker_panes.OpenWorker)
@@ -738,12 +938,20 @@ class WorkerPaneTests(StaffTestCase):
     def test_unusable_configuration_opens_no_split(self) -> None:
         for value in ("0.01", "0.99", "invalid"):
             with self.subTest(value=value):
-                write_text_atomic(self.root / "conf/direct.conf", f"WORKER_SPLIT_RATIO={value}\n")
+                write_text_atomic(self.root / "conf/direct.conf", f"# range: 0.1..0.9\nWORKER_SPLIT_RATIO={value}\n")
                 result = self.start()
                 self.assertIsInstance(result, worker_panes.StartRefused)
                 assert isinstance(result, worker_panes.StartRefused)
                 self.assertEqual(result.reason, worker_panes.StartRefusal.INVALID_ROLE_CONFIGURATION)
                 self.assertEqual(self.world.launches, [])
+
+    def test_split_uses_the_range_from_configuration(self) -> None:
+        path = self.root / "conf/direct.conf"
+        write_text_atomic(path, path.read_text().replace("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667",
+                                                          "# range: 0.05..0.95\nWORKER_SPLIT_RATIO=0.95"))
+        result = self.start()
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.95, "impl2")])
 
     def test_invalid_live_ratio_uses_the_committed_ratio_and_prints_a_warning(self) -> None:
         for arguments in (("init", "-q"), ("add", "conf/direct.conf"),
@@ -839,6 +1047,25 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIn("completed pass", errors)
         self.assertEqual(self.staff_state(), before)
         self.assertEqual((self.world.closed, self.world.stops), ([], []))
+
+    def test_refused_pass_keeps_a_stopped_worker_and_prevents_a_role_change(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        self.dispatch(row, "impl")
+        path = self.root / "run/progress_history_state.json"
+        _ = path.write_text(path.read_text().replace('"active"', '"refused"'))
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.StoppedWorker)
+        result = worker_panes.can_close(observed)
+        self.assertIsInstance(result, worker_panes.Kept)
+        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Kept)
+        self.assertEqual(self.world.closed, [])
+        self.world.add(row, "w1:p1")
+        changed = self.start(row.name, role="review")
+        self.assertIsInstance(changed, worker_panes.StartRefused)
+        assert isinstance(changed, worker_panes.StartRefused)
+        self.assertEqual(changed.reason, worker_panes.StartRefusal.BUSY_ROLE_CHANGE)
+        self.assertEqual(self.world.launches, [])
 
     def test_close_rerun_after_agent_stop_closes_only_that_terminal_once(self) -> None:
         row = self.worker()
@@ -1114,8 +1341,31 @@ class WorkerPaneTests(StaffTestCase):
         self.world.unknown["w2:p9"] = "foreign process unreadable"
         found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
         self.assertIsInstance(found[known.id], worker_panes.OpenWorker)
-        self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
+        self.assertIsInstance(found[absent.id], worker_panes.ClosedWorker)
         self.assertEqual(self.world.commands, [])
+
+    def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
+        absent = self.worker("absent")
+        self.world.add(self.parent, "w1:p9", live=False, label="foreign")
+        self.world.unknown["w1:p9"] = "unreadable pane in the parent's tab"
+        found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
+
+    def test_unreadable_parent_pane_leaves_an_absent_worker_uncertain(self) -> None:
+        absent = self.worker("absent")
+        self.world.unknown["w1:p0"] = "unreadable parent pane"
+        found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
+
+    def test_unrelated_unknown_pane_in_another_tab_allows_a_new_worker(self) -> None:
+        self.world.add(self.parent, "w2:p9", live=False, label="foreign", workspace="w2", tab="w2:t2")
+        self.world.unknown["w2:p9"] = "foreign process unreadable"
+        with redirect_stderr(io.StringIO()) as errors:
+            result = self.start()
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(self.world.locations[result.pane]["tab_id"], "w1:t1")
+        self.assertIn("foreign process unreadable", errors.getvalue())
 
     def test_unreadable_pane_inventory_never_proves_absence(self) -> None:
         row = self.worker()

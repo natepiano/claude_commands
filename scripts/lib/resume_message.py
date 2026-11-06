@@ -12,24 +12,62 @@ from scripts.production import staff
 
 if TYPE_CHECKING:
     from scripts.shutdown.inventory import PausedSeat
+    from scripts.production.staff import StaffId
+
+
+@dataclass(frozen=True)
+class NoAccountMove:
+    """The resume does not change accounts."""
+
+
+@dataclass(frozen=True)
+class AccountMove:
+    source: str
+    destination: str
+
+
+@dataclass(frozen=True)
+class BusyPass:
+    dispatch_id: str
+
+
+@dataclass(frozen=True)
+class IdleWorker:
+    """The worker has no open pass to continue."""
+
+
+@dataclass(frozen=True)
+class PaneWorkerResume:
+    staff_id: StaffId
+    turn: BusyPass | IdleWorker
 
 
 @dataclass(frozen=True)
 class ResumeWorkers:
     """Existing worker threads and their work directory, for the opening message."""
-    seats: Sequence[PausedSeat]
-    cwd: str
+    seats: Sequence[PausedSeat] = ()
+    cwd: str = ""
+    panes: Sequence[PaneWorkerResume] = ()
 
 
 NO_WORKERS = ResumeWorkers((), "")
+NO_ACCOUNT_MOVE = NoAccountMove()
 
 
-def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | None = None,
+def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_MOVE,
                    workers: ResumeWorkers = NO_WORKERS, context: str = "") -> str:
     lines: list[str] = []
+    move_text = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
+    if workers.panes:
+        busy = [worker.turn for worker in workers.panes if isinstance(worker.turn, BusyPass)]
+        if not busy:
+            return ""
+        lines.append(context or f"You were stopped and resumed because {why}.{move_text}")
+        for turn in busy:
+            lines.append(f"Continue pass {turn.dispatch_id} in this conversation. Keep the same pass id.")
+        return script_prompt("\n".join(lines))
     if why or context:
-        move = f" You were moved from {moved_from} to {moved_to}." if moved_to else ""
-        opening = context or f"You were stopped and resumed because {why}.{move} Continue where you stopped."
+        opening = context or f"You were stopped and resumed because {why}.{move_text} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
                      + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
     if workers.seats:

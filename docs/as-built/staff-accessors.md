@@ -25,6 +25,7 @@ Both commands are safe to repeat. They stop no process. Rename, move, retire and
 | `docs/as-built/showrunner-automation.md` | write | staff.py pause, resume (shell) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
+| `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/agent_bg.sh` | read | runtime_id |
@@ -58,6 +59,7 @@ Both commands are safe to repeat. They stop no process. Rename, move, retire and
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
+| `scripts/herdr/side_pane.py` | read | runtime_id |
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation, ReportsTo, StaffId |
 | `scripts/hooks/conversation_pause.py` | read | LiveDoc, WrappedDoc (types only) |
@@ -176,7 +178,7 @@ Both commands are safe to repeat. They stop no process. Rename, move, retire and
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-153 accessors: 30 write, 122 read, 1 owner.
+155 accessors: 30 write, 124 read, 1 owner.
 
 ## Approved copies
 
