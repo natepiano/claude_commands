@@ -32,7 +32,7 @@ class StatusDiscoveryTests(StaffTestCase):
                 with mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]), redirect_stderr(errors):
                     observed = tuple(unit_lookup._herdr_labeled({}, unit_lookup.UnreadAt({}, unit_lookup.RecordsRead()), processes))  # pyright: ignore[reportPrivateUsage]
                     grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(),
-                                                            sources=labels.MemberSources({}, (launch,)))
+                                                            sources=labels.MemberSources((launch,)))
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
                 self.assertIn("anomaly:", errors.getvalue())
                 states = grouped.status_units("show")
@@ -52,7 +52,7 @@ class StatusDiscoveryTests(StaffTestCase):
                 errors = StringIO()
                 with redirect_stderr(errors):
                     grouped = labels.group_labeled_sessions([*children, agent], record=staff.snapshot(),
-                                                            sources=labels.MemberSources({}, ()))
+                                                            sources=labels.MemberSources(()))
                 self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(grouped.units, {"show": {row.name: replace(agent, unit=row.name)}})
 

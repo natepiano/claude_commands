@@ -177,7 +177,7 @@ class UnitPhasesTests(unittest.TestCase):
             return "phase table"
 
         output = io.StringIO()
-        with (patch.object(live_units, "units_of_doc", return_value=[unit("one-unit", live("one"))]),
+        with (patch.object(live_units, "units_of", return_value=[unit("one-unit", live("one"))]),
               patch.object(phase_table, "show_production", side_effect=records),
               patch.object(unit_phases, "table", side_effect=render),
               contextlib.redirect_stdout(output)):
@@ -195,7 +195,7 @@ class UnitPhasesTests(unittest.TestCase):
         out = io.StringIO()
         with (patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "caller"}),
               patch.object(showrunners, "own_name", return_value="show") as found,
-              patch.object(live_units, "units_of_doc", return_value=[unit("a", live("a"))]),
+              patch.object(live_units, "units_of", return_value=[unit("a", live("a"))]),
               patch.object(phase_table, "show_production", return_value="{}"),
               contextlib.redirect_stdout(out)):
             self.assertEqual(unit_phases.main([]), 0)
@@ -221,7 +221,7 @@ class UnitPhasesTests(unittest.TestCase):
         units = [unit("names", live("names"))]
         records: dict[str, object] = {"names": {"plan": "/tmp/claude/names.md"}}
         output = io.StringIO()
-        with (patch.object(live_units, "units_of_doc", return_value=units),
+        with (patch.object(live_units, "units_of", return_value=units),
               patch.object(phase_table, "show_production", return_value=json.dumps(records)),
               patch.object(style_units, "table", return_value="ticket table") as tickets,
               patch.object(style_ledger, "ledger_location", return_value=style_ledger.LedgerLocation(
@@ -242,7 +242,7 @@ class UnitPhasesTests(unittest.TestCase):
                 self.production_document(doc)
                 units = [unit("a", live("a"))]
                 output = io.StringIO()
-                with (patch.object(live_units, "units_of_doc", return_value=units),
+                with (patch.object(live_units, "units_of", return_value=units),
                       patch.object(phase_table, "show_production", return_value="{}"),
                       patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
                     self.assertEqual(unit_phases.main(["--production", "show"]), 0)
@@ -277,7 +277,7 @@ class UnitPhasesTests(unittest.TestCase):
                 + "'global:rust/read.md','alpha','[]','[]','[]','[\"one\"]','assigned','2026-10-01')", (str(names.id),))
             _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','12','')", (str(decision),))
         output = io.StringIO()
-        with (patch.object(live_units, "units_of_doc", return_value=[unit("names", live("names")),
+        with (patch.object(live_units, "units_of", return_value=[unit("names", live("names")),
                                                                         unit("types", live("types"))]),
               patch.object(phase_table, "show_production", return_value=json.dumps({
                   "names": {"unavailable": "plan cannot be read"},
@@ -293,7 +293,7 @@ class UnitPhasesTests(unittest.TestCase):
             directory = self.root / name
             directory.mkdir()
             _ = (directory / "conf").write_text(
-                f"TARGET={target}\nCHECK=zsh /opt/production_check.sh {doc}\n", encoding="utf-8")
+                f"TARGET={target}\nCHECK=zsh /opt/production_check.sh show\n", encoding="utf-8")
         caller = fixture_runtime_id("unit-phases-caller")
         _ = fixture_member("showrunner", name="show", runtime_id=caller, doc=staff.LiveDoc("natedev", doc))
         self.assertEqual(showrunners.production_of(caller, self.root), doc)

@@ -85,7 +85,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         document = root / "wait-production.md"
         _ = document.write_text("Fixture production\n")
         _ = (notifier / "conf").write_text(
-            f"TARGET=session:{SHOWRUNNER_SESSION}\nCHECK=zsh /scripts/production_check.sh {document}\n")
+            f"TARGET=session:{SHOWRUNNER_SESSION}\nCHECK=zsh /scripts/production_check.sh expected-showrunner\n")
         staff_environment: dict[str, str] = {}
         resources.enter_context(isolated_staff_file(root / "staff.json", staff_environment))
         _ = fixture_member("showrunner", name="expected-showrunner",

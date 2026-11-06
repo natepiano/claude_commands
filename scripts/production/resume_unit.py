@@ -64,7 +64,7 @@ def find_unit(production_name: str, given: str, *, record: staff.StaffSnapshot |
     production = retire_unit.production_of(production_name, record=record)
     row = record.by_id(staff.StaffId(given))
     member = (staff_sources.MemberFound(row) if row is not None and row.kind == "unit" else
-              unit_lookup.member_sources().member(staff_sources.UnitMember(production.name, given), record))
+              staff_sources.member(staff_sources.UnitMember(production.name, given), record))
     name = member.row.name if isinstance(member, staff_sources.MemberFound) else given
     if isinstance(member, staff_sources.NoSuchMember):
         raise Refused(f"{name}: no staff row")

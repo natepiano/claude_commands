@@ -13,7 +13,7 @@ from scripts.production import showrunners
 
 
 def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
-    """Join showrunner parent ids from one snapshot to their production production_names."""
+    """Map showrunner parent ids to production names from one snapshot."""
     record = staff.snapshot() if record is None else record
     names = {row.id: row.name for row in staff.active(record, "showrunner")}
     return {names[row.id]: names[row.parent.id] for row in staff.active(record, "showrunner")
@@ -21,7 +21,7 @@ def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]
 
 
 def edges(production_names: set[str] | None = None, *, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
-    """Each recorded showrunner's parent, optionally restricted to the displayed production_names."""
+    """Return each showrunner's parent, optionally limited to the displayed production names."""
     tree = parent_edges(record=record)
     return tree if production_names is None else {child: parent for child, parent in tree.items()
                                       if child in production_names and parent in production_names}
@@ -114,8 +114,6 @@ class ParentCycle(ValueError):
 
 def check_attach(child: str, parent: str, *, record: staff.StaffSnapshot | None = None) -> None:
     """Check the source-side attach rules before either record changes."""
-
-
     known = showrunners.timer_names()
     for production_name in (child, parent):
         if production_name not in known:
@@ -173,7 +171,6 @@ def main(action: str, production_name: str) -> int:
             print(line)
         _ = showrunners.require_complete(runners)
     else:
-
         if production_name not in showrunners.timer_names():
             raise ValueError(f"{production_name} has no update timer")
         # A root prints no parent and no children: an empty answer is the answer.

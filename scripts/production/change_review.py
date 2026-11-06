@@ -291,10 +291,10 @@ def _line_value(doc: Path) -> str | None:
 
 def list_path(doc: Path, *,
               record: staff.StaffSnapshot | None = None) -> Path | None:
-    """The production's list, or None when its doc has no Change review line.
+    """Return the root showrunner's list, or the document's path when its owner cannot be resolved.
 
-    The list is named for the top-level showrunner while it runs; otherwise it is the path the
-    line names. A line naming another path than the showrunner's list is warned about.
+    Return None when the document has no Change review line.
+    Report a different path in that line.
     """
     value = _line_value(doc)
     if value is None:
@@ -635,25 +635,23 @@ def pending(path: Path) -> list[dict[str, str]]:
     return _review_table(path, lines, SECTION)
 
 
-def scope_list(doc: Path) -> Path:
+def scope_list(doc: Path, *, record: staff.StaffSnapshot | None = None) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
     import showrunner_tree
 
     if doc.is_file() and (value := _line_value(doc)):
         return Path(value).expanduser()
+    record = staff.snapshot() if record is None else record
+    name = unit_lookup.doc_owner(doc, record).name
     if not doc.is_file():
-        for member in staff.snapshot().rows:
-            if (member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
-                    and member.doc.path == doc):
-                return list_file(member.name)
-    name = unit_lookup.doc_owner(doc, staff.snapshot()).name
-    root = showrunner_tree.root_of(name)
+        return list_file(name)
+    root = showrunner_tree.root_of(name, record=record)
     try:
-        return production_list(unit_lookup.doc_owner(doc, staff.snapshot()).name)
+        return production_list(name, record=record)
     except ChangeReviewError:
         if name == root:
             raise
-        return production_list(root)
+        return production_list(root, record=record)
 
 
 @dataclass(frozen=True)
@@ -671,11 +669,8 @@ class ScopedReviewEntry:
 def scope_lists(path: Path, doc: Path, below: bool = False, *,
                 record: staff.StaffSnapshot | None = None) -> tuple[ProductionReviewList, ...]:
     """The current list and each scoped production's own earlier list, once per path."""
-    import showrunner_tree
-
     record = staff.snapshot() if record is None else record
-    owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_tree.root_of(
-        unit_lookup.doc_owner(doc, record).name, record=record)
+    owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_of(doc, record=record)
     lists = {path.absolute(): ProductionReviewList(path, owner)}
     for production in scope_docs(doc, below, record=record):
         name = unit_lookup.doc_owner(production, record).name
@@ -791,8 +786,9 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
         return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
     import showrunner_tree
 
-    name = unit_lookup.doc_owner(scope, staff.snapshot()).name
-    name = queue(path) if name == showrunner_tree.root_of(name) else f"{queue(path)}-{name}"
+    record = staff.snapshot()
+    name = unit_lookup.doc_owner(scope, record).name
+    name = queue(path) if name == showrunner_tree.root_of(name, record=record) else f"{queue(path)}-{name}"
     return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
@@ -1054,14 +1050,15 @@ def list_tree(path: Path, docs: Iterable[Path]) -> Tree:
     import showrunner_tree
 
     owned: list[Path] = []
+    record = staff.snapshot()
     for doc in docs:
-        name = unit_lookup.doc_owner(doc, staff.snapshot()).name
+        name = unit_lookup.doc_owner(doc, record).name
         try:
-            if showrunner_tree.root_of(name) != name or list_path(doc) != path:
+            if showrunner_tree.root_of(name, record=record) != name or list_path(doc, record=record) != path:
                 continue
         except OSError:
             continue
-        owned.extend(owner_docs(doc))
+        owned.extend(owner_docs(doc, record=record))
     return Tree(owned)
 
 
@@ -1363,12 +1360,12 @@ def hold_for_row(path: Path, row: str, folders: list[str]) -> list[str]:
     return lines
 
 
-def production_doc(production: str) -> Path:
+def production_doc(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
     """The production doc given; without one, the calling showrunner's."""
     from scripts.production import showrunners
 
     if production:
-        row = showrunners.owner_for(production)
+        row = showrunners.owner_for(production, record)
         if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
             return row.doc.path
         raise ChangeReviewError(f"{row.name}: no production document")
@@ -1388,10 +1385,10 @@ def showrunner_of(doc: Path, *,
     return showrunner_tree.root_of(row.name, record=record)
 
 
-def production_list(production: str) -> Path:
-    """The list the production doc names; without a doc, the calling showrunner's production."""
-    doc = production_doc(production)
-    path = list_path(doc)
+def production_list(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
+    """Return the review list for the staff name, or for the calling showrunner when the name is empty."""
+    doc = production_doc(production, record=record)
+    path = list_path(doc, record=record)
     if path is None:
         raise ChangeReviewError(f"{doc} has no `{LIST_HEADER}` line")
     return path
@@ -1438,14 +1435,12 @@ def foreign_units(production: Path, *,
     Empty when the productions cannot be read: drift then counts every checkpoint.
     """
     from scripts.production import showrunners
-    import showrunner_tree
-
     try:
         record = staff.snapshot() if record is None else record
-        docs = list(showrunners.timer_docs().values())
-        root = showrunner_tree.root_of(unit_lookup.doc_owner(production, record).name, record=record)
-        top = next((doc for doc in docs if unit_lookup.doc_owner(doc, record).name == root), production)
-        return {name for name, source in _unit_branches(docs, record).items()
+        docs_by_name = showrunners.timer_docs()
+        root = showrunner_of(production, record=record)
+        top = docs_by_name.get(root, production)
+        return {name for name, source in _unit_branches(docs_by_name.values(), record).items()
                 if source.production not in set(_publication_docs(top, record))}
     except (OSError, ValueError, Refusal):
         return set()

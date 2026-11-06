@@ -121,7 +121,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 - **any other nonzero**: skip, logged as `skip check exit <rc>`.
 - Not finished within `TIMEOUT`: killed, logged as `skip check timeout`.
 
-`production_check.sh <staff id>` finds the document through the showrunner's staff row and reads its `Status: PRODUCTION — <word>` line: `running` 0, `wrapped` 2, anything else (or no such line, or no file) 1. For a running production it first runs `log_backup.py <showrunner name>`, which keeps dated copies of the production's LOG (LOG backups in `docs/as-built/showrunner-automation.md`). A failed copy prints to stderr and does not change the exit code.
+`production_check.sh <staff id>` reads the document through the showrunner's staff row. It reads `Status: PRODUCTION — <word>` and exits 0 for `running`, 2 for `wrapped`, or 1 otherwise. A missing document or status line also exits 1. For a running production, the check first runs `log_backup.py <staff id>` with the same argument. That command keeps dated copies of the production's LOG; see LOG backups in `docs/as-built/showrunner-automation.md`. A failed copy prints to stderr and does not change the check's exit code.
 
 `direct_run.py check <claude_session_id> <session_dir>` exits 2 when the marker `/tmp/claude/unit/active/<id>` (or `/tmp/claude/delegate/active/<id>` for a run started before the folder rename) is missing or names another directory (the run ended, or a new run in the same session replaced it); 0 when `running_work()` finds work in flight; 1 when the unit is idle; 3 on a usage error. Work in flight includes a worker's `*_status*` file with `running`, `implementing`, or `reviewing`.
 The reader checks the run directory and each phase directory.

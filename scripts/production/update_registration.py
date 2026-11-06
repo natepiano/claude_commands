@@ -29,7 +29,7 @@ from merge_checkpoint import merged_checkpoints, report
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from proposals_folder import issues_folder
-from scripts.production.store_owner import document_id, showrunner_id
+from scripts.production.store_owner import showrunner_id
 from issues import Issue, frontmatter
 import urgency
 from urgency import Urgency, UrgencyError
@@ -287,18 +287,18 @@ class QuestionStaff:
                    sources: session_staff.MemberSources | None = None) -> QuestionStaff:
         if sources is None:
             dependencies = staff.RecordInputs()
-            sources = session_staff.member_sources(dependencies=dependencies, record=record)
+            sources = session_staff.member_sources(dependencies=dependencies)
         return cls(record, sources)
 
     def owner(self, document: Path) -> staff.StaffRow:
         """Select the production owner from the command's staff snapshot."""
-        row = self.record.by_doc(local_machine(), document)
-        if row is None or row.kind != "showrunner":
-            raise RegistrationFailure("questions", f"{document}: no showrunner staff row")
-        return row
+        try:
+            return unit_lookup.doc_owner(document, self.record)
+        except staff.StaffUnreadable as error:
+            raise RegistrationFailure("questions", str(error)) from error
 
     def asker(self, production: Production, unit: str = "") -> staff.StaffRow:
-        parent = self.owner(production.doc)
+        parent = production.owner
         if not unit:
             return parent
         row = self.record.by_member_reference(unit)
@@ -316,9 +316,9 @@ class QuestionStaff:
         parent = row if row.kind == "showrunner" else self.record.parent_of(row)
         return parent.name if parent else "", row.name
 
-    def documents(self) -> dict[str, Path]:
-        """Return local documents from the showrunner staff rows."""
-        return {row.name: row.doc.path for row in self.record.rows
+    def documents(self) -> dict[str, staff.StaffRow]:
+        """Return local showrunner rows by name."""
+        return {row.name: row for row in self.record.rows
                 if row.kind == "showrunner" and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
                 and row.doc.machine == local_machine()}
 
@@ -329,7 +329,7 @@ class QuestionStaff:
 
     def names(self, name: str, below: bool = False) -> list[str]:
         """Select descendants through fixed parent ids, including owners without timers."""
-        return [name, *showrunner_tree.descendants_of(name, record=self.record)] if below else [name]
+        return showrunner_tree.user_facing(name, below, record=self.record)
 
 
 QuestionAsker = StaffAsker | UnitAsker | ShowrunnerAsker | AskerNotRecorded | OpenItemWithoutAsker
@@ -362,7 +362,7 @@ def relay_line(production: Production, name: str, asker: QuestionAsker,
         row = identities.record.by_member_reference(asker.member_id)
         if row is None:
             return f"relay: none; staff member {asker.member_id} is unavailable"
-        current_owner = identities.owner(production.doc)
+        current_owner = production.owner
         current_name, label = identities.display(row)
         if row.kind == "showrunner":
             if row.id == current_owner.id:
@@ -541,7 +541,7 @@ def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     return ScheduledUpdates(minutes, "on the hour" in line)
 
 
-def scheduled_prompt(minutes: int, zone: str, production: Production, *, record: staff.StaffSnapshot | None = None) -> str:
+def scheduled_prompt(minutes: int, production: Production) -> str:
     source = Path(__file__).resolve().parents[2] / "commands/showrunner/produce.md"
     document = source.read_text(encoding="utf-8")
     if "The prompt:\n" not in document:
@@ -551,8 +551,8 @@ def scheduled_prompt(minutes: int, zone: str, production: Production, *, record:
         raise RegistrationFailure("register", "**A tick** marker is missing")
     template = tail.split("\n**A tick**", 1)[0]
     prompt = "\n".join(line.removeprefix("> ").removeprefix(">") for line in template.strip().splitlines())
-    prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", zone).replace("<showrunner name>", production.name)
-    prompt = prompt.replace("<STATE_DIR>", str(showrunners.session_state_dir(document_id(production.doc, record=record))))
+    prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", str(production.zone)).replace("<showrunner name>", production.name)
+    prompt = prompt.replace("<STATE_DIR>", str(showrunners.session_state_dir(production.owner.id)))
     return prompt
 
 
@@ -561,8 +561,8 @@ def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | N
     done: list[str] = []
     try:
         record = staff.snapshot() if record is None else record
-        identity = document_id(production.doc, record=record)
-        copied = showrunners.adopt_session_state(production.name, identity, record=record)
+        identity = production.owner.id
+        copied = showrunners.adopt_session_state(identity, record=record)
         if copied:
             done.append(f"copied {', '.join(copied)} to {showrunners.session_state_dir(identity)}")
         prompt_file = showrunners.SHOWRUNNER_STATE_DIR / identity / "prompt.txt"
@@ -570,7 +570,7 @@ def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | N
             return done
         schedule = update_schedule(production.doc.read_text(encoding="utf-8").splitlines())
         minutes = schedule.minutes if isinstance(schedule, ScheduledUpdates) else DEFAULT_MINUTES
-        prompt = scheduled_prompt(minutes, str(production.zone), production, record=record)
+        prompt = scheduled_prompt(minutes, production)
         if prompt_file.read_text(encoding="utf-8") != prompt:
             write_text_atomic(prompt_file, prompt)
             done.append(f"rewrote {prompt_file} from produce.md")
@@ -597,14 +597,14 @@ def register(production: Production) -> None:
     # An on-demand timer is made at the default interval and stopped, so it stays the showrunner's record.
     minutes, aligned = ((schedule.minutes, schedule.aligned) if isinstance(schedule, ScheduledUpdates)
                         else (DEFAULT_MINUTES, False))
-    prompt = scheduled_prompt(minutes, str(production.zone), production)
+    prompt = scheduled_prompt(minutes, production)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
         raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
     # The staff row owns the timer.
-    owner = QuestionStaff.read().owner(production.doc)
-    state_root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+    owner = production.owner
+    state_root = _showrunner_state_root()
     prompt_file = state_root / owner.id / "prompt.txt"
     updates = f"showrunner-{owner.id}"
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
@@ -768,18 +768,21 @@ def report_items(fields: dict[str, object], path: Path, step: str) -> KeepReport
     return ReplaceReports(tuple(reports))
 
 
+def _showrunner_state_root() -> Path:
+    return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+
+
 def outstanding_file(reference: str, *, identities: QuestionStaff | None = None) -> Path:
-    root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+    root = _showrunner_state_root()
     identities = identities if identities is not None else QuestionStaff.read()
-    document = identities.documents().get(reference)
-    identity = (document_id(document, record=identities.record) if document is not None else
-                showrunner_id(reference, record=identities.record, sources=identities.sources))
+    identity = showrunner_id(reference, record=identities.record)
     return root / "outstanding" / f"{identity}.json"
 
 
-def outstanding_path(production: Production, *, identities: QuestionStaff | None = None) -> Path:
-    identities = identities if identities is not None else QuestionStaff.read()
-    return outstanding_file(identities.owner(production.doc).id, identities=identities)
+def outstanding_path(production: Production) -> Path:
+    root = _showrunner_state_root()
+    owner = production.owner
+    return root / "outstanding" / f"{owner.id}.json"
 
 
 @dataclass(frozen=True)
@@ -804,7 +807,7 @@ def question_folder(document: Path, identities: QuestionStaff) -> QuestionFolder
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
     folder = issues_folder(owner.doc.path)
-    root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+    root = _showrunner_state_root()
     return QuestionFolder(folder if folder is not None else root / owner.id / "questions", owner.id)
 
 
@@ -916,7 +919,7 @@ def question_member(production: Production, item: OutstandingItem, identities: Q
 def migrate_questions(production: Production, *, identities: QuestionStaff | None = None) -> None:
     """Move legacy question identities into issue records without changing queue keys."""
     identities = identities if identities is not None else QuestionStaff.read()
-    path = outstanding_path(production, identities=identities)
+    path = outstanding_path(production)
     with outstanding_lock(path):
         legacy = legacy_entries(path)
         existing = open_entries(production, identities)
@@ -992,7 +995,7 @@ def stored_entries(outstanding: Path) -> list[OutstandingItem]:
 
 def open_entries(production: Production, identities: QuestionStaff) -> list[OutstandingItem]:
     """Read reminders and open question records from their owning stores."""
-    return [*stored_entries(outstanding_path(production, identities=identities)),
+    return [*stored_entries(outstanding_path(production)),
             *(record.item.copy() for record in question_records(production, identities) if record.status == "open")]
 
 
@@ -1032,14 +1035,15 @@ def read_open_items(path: Path | None, *, production: Production | None = None,
 
 def read_all_open_fields() -> list[OutstandingItem]:
     """Read local open fields with one staff context and skip unreadable stores."""
-    root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+    root = _showrunner_state_root()
     paths = {path.stem: path for path in (root / "outstanding").glob("*.json")}
     fields: list[OutstandingItem] = []
     identities = QuestionStaff.for_record(staff.initial_snapshot())
-    documents: dict[str, Path] = {identities.owner(doc).id: doc for doc in identities.documents().values()}
-    for name in sorted(set(paths) | set(documents)):
+    documents: dict[str, Path] = {row.id: cast(staff.LiveDoc | staff.WrappedDoc, row.doc).path
+                                  for row in identities.documents().values()}
+    for identity in sorted(set(paths) | set(documents)):
         try:
-            fields.extend(read_open_fields(paths.get(name), document=documents.get(name), identities=identities))
+            fields.extend(read_open_fields(paths.get(identity), document=documents.get(identity), identities=identities))
         except (OSError, ValueError):
             continue
     return fields
@@ -1047,7 +1051,7 @@ def read_all_open_fields() -> list[OutstandingItem]:
 
 def write_open_entries(production: Production, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
     """Keep unrecorded legacy questions before replacing their JSON list."""
-    path = outstanding_path(production, identities=identities)
+    path = outstanding_path(production)
     legacy = [entry for entry in legacy_entries(path) if "question" in entry]
     if legacy:
         recorded = {(record.asker, record.item["text"]) for record in question_records(production, identities)}
@@ -1090,10 +1094,9 @@ class OpenLists(NamedTuple):
     unreadable: list[str]
 
 
-def question_queue(production: Production, below: bool = False, *, identities: QuestionStaff | None = None) -> str:
-    """The name urgency.py pins the question /next showed under."""
-    identities = identities if identities is not None else QuestionStaff.read()
-    return urgency.scope_queue(f"question-{identities.owner(production.doc).id}", below)
+def question_queue(production: Production, below: bool = False) -> str:
+    """The queue name for the production question that /next displayed."""
+    return urgency.scope_queue(f"question-{production.owner.id}", below)
 
 
 def item_key(name: str, text: str) -> str:
@@ -1128,11 +1131,11 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
             if isinstance(item.timing, DeferredUntil) and item.timing.at > now:
                 deferred.append(opened)
             else:
-                owner = identities.owner(documents[name]).id
+                owner = documents[name].id
                 due.append(urgency.Entry(item_key(owner, item.text), opened, item.rank.urgency,
                                          item.since, after=item_key(owner, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.name))
-    return OpenLists(urgency.queue_order(due, question_queue(production, below, identities=identities)), deferred, unreadable)
+    return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable)
 
 
 def open_items(production: Production) -> None:
@@ -1181,8 +1184,7 @@ def mark_important(production: Production, words: str) -> None:
         raise RegistrationFailure("mark-important", f"{len(found)} open items match {wanted!r}; name one by its text")
     path, text = found[0]
     with outstanding_lock(path):
-        owner = production if path == outstanding_path(production, identities=identities) else read_production(next(name for name, doc in identities.documents().items()
-                if identities.owner(doc).id == path.stem), identities.record)
+        owner = production if path == outstanding_path(production) else read_production(path.stem, identities.record)
         entries = open_entries(owner, identities)
         entry = next(entry for entry in entries if entry.get("text") == text)
         for key in ("urgency", "due", "marked"):
@@ -1208,7 +1210,7 @@ def ask(production: Production, text: str, question: str, unit: str, rank: Ranki
     problem = plumbing(text)
     if problem is not None:
         raise RegistrationFailure("ask", f"{text}: {problem}")
-    outstanding = outstanding_path(production, identities=identities)
+    outstanding = outstanding_path(production)
     if any(entry["text"] == text for entry in open_entries(production, identities)):
         raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
     # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
@@ -1311,9 +1313,9 @@ def withdraw(production: Production, words: str, *, identities: QuestionStaff | 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
     judgments = {unit.unit: unit for unit in state.units}
     unit_lines: list[str] = []
-    checkpoints = {entry.unit: entry for entry in merged_checkpoints(production)}
     record = staff.snapshot()
-    for row in unit_lookup.doc_units(production.doc, record):
+    checkpoints = {entry.unit: entry for entry in merged_checkpoints(production, record=record)}
+    for row in record.find(kind="unit", parent=production.owner.id):
         name = row.name
         judgment = judgments.get(row.id)
         entry = checkpoints.get(name)
@@ -1449,7 +1451,7 @@ def review_open_question(name: str, item: QuestionForReview) -> AcceptedQuestion
 def questions(production: Production, path: Path | None, *, identities: QuestionStaff | None = None) -> None:
     """Record what waits on the user and review each new question before the reply asks it."""
     state = judgment_state(path, "questions")
-    outstanding = outstanding_path(production, identities=identities)
+    outstanding = outstanding_path(production)
     if isinstance(state.outstanding, ReplaceOutstanding):
         with outstanding_lock(outstanding):
             replace_outstanding(production, outstanding, state.outstanding, identities=identities)
