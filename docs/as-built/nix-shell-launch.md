@@ -139,6 +139,12 @@ excluded from each body's scan, and methods and other-module attribute calls
 do not establish module guards. Shell scripts must reference the helper.
 No file is exempt.
 
+## Agent operation environment
+
+`nix_env.py exec` filters its final environment immediately before `os.execvpe`.
+The [model registry boundary](agent-registry.md#agent-environment-boundary) defines which operation values the filter removes.
+Helpers retain these values until the agent starts.
+
 ## Existing sessions
 
 `scripts/nix_env/heal.py` reads each `~/.claude*/sessions` registry through
