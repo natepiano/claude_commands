@@ -541,9 +541,7 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
     try:
-        copies.remove_trees(unit.name)
-        if row.name != unit.name:
-            copies.remove_trees(row.name)
+        copies.remove_trees(copies.unit_owner(row.name))
     except (copies.CopyError, OSError) as error:
         print(f"refused: {error}")
         return 1

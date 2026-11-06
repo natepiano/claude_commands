@@ -568,6 +568,14 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(self.worktree.exists())
         self.assertEqual(self.unit_worktree(), staff.RemovedWorktree("natedev", self.worktree))
 
+    def test_retirement_removes_the_gate_copy_owned_by_the_unit_worktree(self) -> None:
+        owner = copies.source_owner(self.worktree)
+        with copies.standing(owner, self.worktree, copies.CommittedSource("HEAD")) as checkout:
+            self.assertTrue(checkout.exists())
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(checkout.exists())
+
     def test_retirement_removes_only_its_remote_mirrors(self) -> None:
         mine = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
         other = copies.RemoteMirror("beta-unit", copies.SelectedRepository("hana"), "mac", "mirror/beta", "beta-session")
