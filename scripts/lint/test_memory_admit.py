@@ -37,7 +37,7 @@ import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted
-from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, write_process
+from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, ci_step
 import nextest_budget as budget
 from build_shape import BuildShape, build_shape
 from memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
@@ -62,6 +62,16 @@ class SnapshotCompatibilityTests(unittest.TestCase):
         self.assertEqual(gate.parse_snapshot_value(
             {"kind": "MeasuredMemory", "bytes": 12}, gate.MeasuredMemory),
             gate.MeasuredMemory(12))
+
+    def test_memory_room_without_ci_use_decodes_with_zero_ci_use(self) -> None:
+        room = gate.memory_room(gate.HostMemory(20 * GIB, 64 * GIB), (), admission_policy_fixture())
+        assert isinstance(room, gate.MemoryRoom)
+        record = cast(dict[str, object], gate.snapshot_value(room))
+        del record["ci_use"]
+        decoded = gate.parse_snapshot_value(record, gate.MemoryRoom)
+        assert isinstance(decoded, gate.MemoryRoom)
+        self.assertEqual(decoded.ci_use, 0)
+        self.assertEqual(decoded, room)
 
     def test_newer_record_ignores_unknown_field(self) -> None:
         self.assertEqual(gate.parse_snapshot_value(
@@ -330,6 +340,27 @@ class MemoryRoomRulesTests(unittest.TestCase):
         self.assertEqual(reading.kept, 9 * GIB)
         self.assertEqual(reading.room, 8 * GIB)
         self.assertEqual(reading.cap, 22 * GIB)
+
+    def test_ci_use_increases_the_cap_without_changing_room_or_admission(self) -> None:
+        policy = admission_policy_fixture()
+        run = gate.RunningStep("run", "run", "check", "/run", 8 * GIB,
+            gate.MeasuredMemory(3 * GIB, anonymous=gate.AnonymousRunUse(3 * GIB)), pid=100)
+        ci = ci_step(4 * GIB, RunningServiceJob(NOW_EPOCH - 60))
+        reading = ci.measured
+        assert isinstance(reading, gate.UnownedSliceMemory)
+        baseline_ci = replace(ci, measured=replace(reading, bytes=0))
+        for need, state in ((5, "admit"), (6, "hold")):
+            with self.subTest(need=need):
+                waiter: gate.Waiter = {"pid": 200, "start_time": "200", "need": need * GIB,
+                                       "since": NOW_EPOCH}
+                inputs = gate.QueueInputs([(Path("200.waiting"), waiter)], (run, ci),
+                    (fixture_reservation(100, 8 * GIB),), gate.HostMemory(20 * GIB, 64 * GIB),
+                    gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), NOW_EPOCH)
+                baseline = replace(inputs, running=(run, baseline_ci))
+                before = gate.admission_pass(baseline, NOW_EPOCH, policy).rows[0].decision
+                after = gate.admission_pass(inputs, NOW_EPOCH, policy).rows[0].decision
+                self.assertEqual(after.state, state)
+                self.assertEqual(after, before)
 
     def test_ci_keep_aside_stays_separate_from_run_use_and_run_holds(self) -> None:
         reading = gate.memory_room(gate.HostMemory(20 * GIB, 64 * GIB), [gate.RunMemory("run", 8 * GIB, gate.AnonymousRunUse(3 * GIB))], admission_policy_fixture(), ci_keep_aside=gate.CIKeepAside(7 * GIB))
@@ -4704,7 +4735,6 @@ class QueueLeaveTests(unittest.TestCase):
 
 
     def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:
-        self.admission.allow_next_start()
         self.admission.free(0)
         self.admission.hold_starts()
         environment = dict(self.environment)
@@ -5491,12 +5521,26 @@ class CiSliceMemoryTests(unittest.TestCase):
         _ = (self.proc / "234/comm").write_text("Runner.Worker\n")
         _ = (self.ci / "cgroup.procs").write_text("123\n234\n")
 
-    def queue_with_ci(self, reading: gate.UnownedSliceMemory, available: int = 20 * GIB) -> gate.QueueRead:
+    def queue_with_ci(self, reading: gate.StepMemory, available: int = 20 * GIB) -> gate.QueueRead:
         config = gate.read_memory_config()
-        step = gate.RunningStep("ci", "ci", "service", "/ci", 0, reading, pid=reading.pid)
+        step = gate.RunningStep("ci", "ci", "service", "/ci", 0, reading,
+            pid=reading.pid if isinstance(reading, (gate.UnownedSliceMemory, gate.CompilerServiceMemory)) else gate.PidNotRecorded())
         inputs = gate.QueueInputs([], (step,), (), gate.HostMemory(available, 64 * GIB),
             gate.NoPressureHold(), gate.ReadyToStart(), gate.NoHeadAdmissionOverride(), NOW_EPOCH)
         return gate.queue_read_from(inputs, config.policy)
+
+    def test_ci_use_counts_only_readable_service_slice_evidence(self) -> None:
+        readings = (
+            (gate.UnownedSliceMemory(4 * GIB, pid=gate.PidNotRecorded(), job_state=IdleService()), 4 * GIB),
+            (gate.UnownedSliceMemory(4 * GIB, pid=gate.PidNotRecorded()), 0),
+            (gate.CompilerServiceMemory(4 * GIB, pid=gate.PidNotRecorded()), 0),
+        )
+        for reading, expected in readings:
+            with self.subTest(reading=reading):
+                room = self.queue_with_ci(reading).explanation.room
+                assert isinstance(room, gate.MemoryRoom)
+                self.assertEqual(room.ci_use, expected)
+                self.assertEqual(room.cap, 17 * GIB + expected)
 
     def test_running_ci_job_keeps_one_margin_and_reduces_room_by_seven_gib(self) -> None:
         idle = self.queue_with_ci(self.reading()).explanation.room
@@ -5530,7 +5574,7 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(room.used, 0)
                 self.assertEqual(room.kept, 7 * GIB)
                 self.assertEqual(room.runs, ())
-                self.assertEqual(room.cap, (available - 3) * GIB)
+                self.assertEqual(room.cap, (resident + available - 3) * GIB)
                 self.assertEqual(room.room, (available - 10) * GIB)
 
     def test_idle_ci_charges_resident_memory_and_records_swap_separately(self) -> None:

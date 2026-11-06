@@ -23,7 +23,7 @@ from unittest import mock
 
 from scripts.build_queue import queue_evidence, head_facts, build_queue, queue_card, queue_view
 from scripts.build_queue.queue_lines import Line, plain
-from scripts.build_queue.queue_fixture import write_process, write_scope, fixture_queue_read
+from scripts.build_queue.queue_fixture import write_process, write_scope, fixture_queue_read, ci_step
 from scripts.build_queue.queue_fixture import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
 
@@ -48,6 +48,21 @@ def gib(value: float) -> int:
 class FinishedTokenGapTimes(TypedDict):
     token_left_at: float
     token_back_at: float
+
+
+class RoomTextTests(unittest.TestCase):
+    def test_cap_text_names_ci_use_and_its_printed_terms_sum_to_the_cap(self) -> None:
+        for ci_use, text in (
+            (0, "Cap 20.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
+            (4 * GIB, "Cap 24.0 GiB; anonymous use 3.0 GiB + CI use 4.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
+        ):
+            with self.subTest(ci_use=ci_use):
+                room = gate.memory_room(gate.HostMemory(20 * GIB, 64 * GIB),
+                    (gate.RunMemory("run", 8 * GIB, gate.AnonymousRunUse(3 * GIB)),),
+                    admission_policy_fixture(), ci_use=ci_use)
+                assert isinstance(room, gate.MemoryRoom)
+                self.assertEqual(queue_evidence.room_text(room), text)
+
 
 
 class QueueEvidenceTests(unittest.TestCase):
@@ -434,8 +449,7 @@ class QueueEvidenceTests(unittest.TestCase):
         for job, expected in ((IdleService(), gate.HeadAdmitsAfterEnd),
                               (RunningServiceJob(NOW - 120), gate.HeadStillHeld)):
             with self.subTest(job=job):
-                ci = gate.RunningStep("ci", "ci", "service", "/ci", 0,
-                    gate.UnownedSliceMemory(4 * GIB, owner="hana-ci.slice", job_state=job, pid=gate.PidNotRecorded()), pid=gate.PidNotRecorded())
+                ci = ci_step(4 * GIB, job)
                 captured = replace(inputs, running=(*inputs.running, ci))
                 explanation = gate.queue_read_from(captured, config.policy).explanation
                 outcome = gate.head_after_steps_end(explanation, (ending,))

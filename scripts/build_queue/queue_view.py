@@ -224,13 +224,14 @@ def cap_bar(room: gate.MemoryRoom | gate.ReadingUnavailable, width: int, *, colo
     cells = max(1, min(width, (total + gate.GIB - 1) // gate.GIB))
     scale = total / cells
     cap_at = min(cells - 1, max(0, int(room.cap / scale)))
-    kept_end = min(room.cap, room.used + room.kept)
+    used = room.cap_use
+    kept_end = min(room.cap, used + room.kept)
     result: list[Span] = []
     for cell in range(cells):
         point = (cell + 0.5) * scale
         if cell == cap_at:
             result.append(Span("│", "error"))
-        elif point < min(room.used, room.cap):
+        elif point < min(used, room.cap):
             result.append(Span("█", "suggestion"))
         elif point < kept_end:
             result.append(Span("░", "warning"))

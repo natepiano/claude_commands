@@ -103,7 +103,8 @@ def room_text(room: gate.MemoryRoom | gate.ReadingUnavailable) -> str:
     if isinstance(room, gate.ReadingUnavailable):
         return "Cap unavailable: " + room.reason
     if isinstance(room.cap, int):
-        calculation = f"Cap {gib(room.cap)}; anonymous use {gib(room.used)} + free {gib(room.available)}"
+        ci_use = f" + CI use {gib(room.ci_use)}" if room.ci_use else ""
+        calculation = f"Cap {gib(room.cap)}; anonymous use {gib(room.used)}{ci_use} + free {gib(room.available)}"
     else:
         missing = "; ".join(f"{run.owner}: {run.use.reason}" for run in room.cap.runs
                             if isinstance(run.use, gate.RunUseUnavailable))

@@ -1118,6 +1118,12 @@ class MemoryRoom:
     runs: tuple[RunKeepAside, ...]
     total: int | UnknownHostTotal = field(default_factory=UnknownHostTotal, kw_only=True)
     ci_keep_aside: CIKeepAside = field(default_factory=CIKeepAside, kw_only=True)
+    ci_use: int = field(default=0, kw_only=True)
+
+    @property
+    def cap_use(self) -> int:
+        """Return the anonymous use and CI use shown inside the cap."""
+        return self.used + self.ci_use
 
     @property
     def room(self) -> int:
@@ -1851,7 +1857,8 @@ def memory_config() -> MemoryConfig:
 
 def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory],
                 policy: AdmissionPolicy, *,
-                ci_keep_aside: CIKeepAside = NO_CI_KEEP_ASIDE) -> MemoryRoom | ReadingUnavailable:
+                ci_keep_aside: CIKeepAside = NO_CI_KEEP_ASIDE,
+                ci_use: int = 0) -> MemoryRoom | ReadingUnavailable:
     """Calculate room once from anonymous use and accepted promises."""
     if isinstance(host, ReadingUnavailable):
         return host
@@ -1863,9 +1870,10 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     kept = sum(run.bytes for run in holds) + ci_keep_aside.bytes
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
-                                 else max(0, used + host.available - safety))
+                                 else max(0, used + ci_use + host.available - safety))
     return MemoryRoom(host.available, safety, used, kept,
-                      host.available - safety - kept, cap, holds, total=host.total, ci_keep_aside=ci_keep_aside)
+                      host.available - safety - kept, cap, holds, total=host.total,
+                      ci_keep_aside=ci_keep_aside, ci_use=ci_use)
 
 
 def ci_keep_aside(readings: Iterable[StepMemory], margin: int) -> CIKeepAside:
@@ -3671,8 +3679,12 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
 
 def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | ReadingUnavailable:
     """Calculate room from the captured run and CI readings."""
+    readings = tuple(step.measured for step in inputs.running)
+    ci_use = sum(reading.bytes for reading in readings
+                 if isinstance(reading, UnownedSliceMemory)
+                 and not isinstance(reading.job_state, NotServiceSlice))
     return memory_room(inputs.host, run_memories(inputs), policy,
-        ci_keep_aside=ci_keep_aside((step.measured for step in inputs.running), policy.ci_memory_margin_bytes))
+        ci_keep_aside=ci_keep_aside(readings, policy.ci_memory_margin_bytes), ci_use=ci_use)
 
 
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
