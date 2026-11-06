@@ -980,36 +980,19 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - A per-class seed: an earlier phase gained nothing (128 s to 126 s).
 
-### Phase 41 — `build_targets.py` loads only what its command needs  · status: todo
+### Phase 41 — `build_targets.py` loads only what its command needs  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a `verify.sh` run spends less CPU in `build_targets.py` starts, with the same behavior. Phase 39 measured 366 starts and 51.5 CPU s in `test_verify_mac_only.py`, and Phases 24 and 31 report the same floor. The showrunner approved this on 2026-11-05.
+- No repository change. The phase ended at a measured floor, and the trial did not land.
+- The trial moved about 60 imports inside functions in `build_targets.py`. Its 430 caller tests passed and `basedpyright` was clean.
+- Same-load pairs of `test_verify_mac_only.py`, 17 tests, load 60-75: median 212.0 to 207.7 s wall (2%) and 182.9 to 181.1 CPU s (1%). The Phase 39 estimate of 54-62 CPU s was not met. The pair ended the trial, so the real `verify.sh` measure did not run.
+- Floor: `platform` already had its early path (246 of 366 starts). `eligible` and `reserve` still load `targets` and `build_hold`, at 345-384 ms per start. `build_hold.py` is frozen, and queue-unit owns its lazy import.
 
-**Spec:**
-1. Before any edit, measure each `build_targets.py` command: its start count in a real `test_verify_mac_only.py` run (the `VERIFY_PY_TRACE` feature), and its import cost (`python3 -X importtime`).
-2. Each command imports only what it uses. Start with the commands that have the most starts. `platform` already has an early path at `build_targets.py:104`, so do not count it as a gain. A command that reads `build_hold`, `offload`, `mac_test` or the `aws_target` modules keeps that import.
-3. Do not edit `scripts/build_hold/build_hold.py`. Its import chain goes to the showrunner as a follow-up, with the measured cost.
-4. Where `verify.sh` makes read-only queries back to back, one start answers them. Change `verify.sh` only for that, and only when the measure shows a gain. Keep each state read, claim, release and signal behavior.
-5. Behavior does not change: same output, exit status and arguments for each command. Add no guard, refusal or check (user rule, 2026-11-05).
-
-**Files:**
-- `scripts/build_targets/build_targets.py` — imports for each command
-- `scripts/direct/verify.sh` — only for spec item 4; owner verify-unit, told in one line before the edit
-
-**Workers:** 1 writer on slot `review3` (one script and one call site; the files do not split)
-- `review3` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 34: test modules import from the repo root with no PYTHONPATH.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- Measured CPU before and after in the checkpoint notice: `test_verify_mac_only.py` in same-load pairs (`pairs.sh`), and one real `verify.sh` run.
-- Each `scripts/build_targets/test_*.py`, `scripts/build_hold/test_build_hold.py`, `scripts/build_hold/test_hold_applies.py`, `scripts/build_hold/test_override_guard.py` and each `scripts/direct/test_verify_*.py` that starts `build_targets.py` green, with the same test names and assertions.
-- the full test green on the phase commit merged with `origin/builds`.
-- `basedpyright` on the changed Python file prints `0 errors, 0 warnings, 0 notes`.
+**Ruled out:**
+- Function-local imports in `build_targets.py` alone: 1% CPU does not pay for about 60 imports inside functions.
+- One start for adjacent `eligible` and `platform` queries in `verify.sh`: about 1.6 CPU s.
 
 ### Phase 42 — `mac_idle.py` loads only what its command needs  · status: todo
 **Depends on:** Phase 41
@@ -1020,8 +1003,9 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Goal:** a `verify.sh` run spends less CPU in `mac_idle.py` starts, with the same behavior. Phase 39 measured 82 starts and 25.9 CPU s in `test_verify_mac_only.py`.
 
 **Spec:**
-1. Apply the method of Phase 41 to `scripts/buildlog/mac_idle.py`: measure each command, then each command imports only what it uses (`mac_idle.py:25-53`).
-2. Behavior does not change. Add no guard, refusal or check (user rule, 2026-11-05).
+1. Measure each command of `scripts/buildlog/mac_idle.py`, then make a trial where each command imports only what it uses (`mac_idle.py:25-53`).
+2. Pair the trial before any review. The whole cost is 25.9 of 182.9 CPU s. Land only when the pair median falls by at least 5% CPU; otherwise end at a floor with no repository change (Phase 41 gained 1% with this method).
+3. Behavior does not change. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
 - `scripts/buildlog/mac_idle.py` — imports for each command
@@ -1030,7 +1014,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `review3` — all files above, role impl
 
 **Constraints from prior phases:**
-- Phase 41: the same method for `build_targets.py`.
+- Phase 41: the same method for `build_targets.py` gained 1% CPU and did not land. Function-local imports pay only when a whole heavy chain leaves the command.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
@@ -1055,8 +1039,8 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Files:**
 - `scripts/direct/test_verify_token_renew.py` — the module
 
-**Workers:** 1 writer on slot `impl3` (one module; the file does not split; slot `test` holds the Phase 36 repair)
-- `impl3` — all files above, role impl
+**Workers:** 1 writer on slot `impl` (one module; the file does not split; slot `test` holds the Phase 36 repair)
+- `impl` — all files above, role impl
 
 **Constraints from prior phases:**
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
@@ -1097,3 +1081,32 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - measured before and after for `style/test_crate_run.py` and one `copies.py run`, in the checkpoint notice
 - the full test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 45 — `direct/test_verify_lint_cache_versions.py` runs in half its time  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_verify_lint_cache_versions.py` (rank 9 in `test_times top` at 139 s median, 91.4 CPU s, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method. Ranks 1 and 5 are excluded. Ranks 2, 3, 4, 6, 8 are floors whose CPU has not risen, and rank 7 is Phase 43.
+1. Profile before any edit. It has 7 tests at about 13 CPU s each, so name what each test spends that CPU on.
+2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
+3. A cut in a production file or a support file goes to the director first, with the measured gain.
+4. Keep every test name and assertion. Add no guard, refusal or check that this Work Order does not name (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_verify_lint_cache_versions.py` — the module
+
+**Workers:** 1 writer on slot `review3` (one module; the file does not split; other slots hold other phases)
+- `review3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 31: the `verify.sh lint` route costs 3.1 s per run with no repair (step-record and admission client Python starts).
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/direct -p 'test_verify_lint_cache_versions.py'` green, with the same test names and assertions
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`

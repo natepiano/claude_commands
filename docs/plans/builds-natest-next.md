@@ -102,6 +102,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Target: `scripts/build_hold/build_hold.py` (owner resources; queue-unit takes the cut), `scripts/build_targets/build_targets.py` `eligible` answer (owner verify-unit)
   - Why needed: after Phase 24, `eligible` and `reserve` set the floor of `test_verify_ssh_targets_routing.py`: they import `build_hold`, which imports `admission_service` and `memory_admit` at once (`build_hold.py:40-46`). `eligible` runs 24 times (23.4 traced s).
   - Owners (showrunner, 2026-11-05): the lazy `admission_service` import in `build_hold.py` goes to queue-unit with the admission client start, after the `build_hold.py` freeze (measured 9.6 s on this module). A platform column in the `eligible` answer goes to verify-unit as its next item 3.
+  - Phase 41 result, 2026-11-05: lazy imports in `build_targets.py` alone gain 1% CPU in `test_verify_mac_only.py`, so they did not land. The gain needs `build_hold`'s chain to leave `eligible` and `reserve`.
   - Completion condition: natest measures `test_verify_ssh_targets_routing.py` again in same-load pairs when each change is on builds.
   - Revealed by: Phase 24, 2026-11-05.
 
@@ -115,5 +116,5 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | `production/test_fast_track.py` | 97.9 | production Git, CLI children, blocked-hook deadlines and promotion retries | 33 |
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | Python start-up of `eligible` and `reserve` (`build_hold` -> `admission_service` -> `memory_admit`) | 24 |
 | `style/test_crate_run.py` | 257.2 (clean rounds, no pairs) | production Git work: `copies.refresh_remotes` 803 calls, 99.7 s of a 325 s profiled run; Phase 44 cuts it | 40 |
-| `direct/test_verify_mac_only.py` | 156.5 (clean rounds, no pairs) | `build_targets.py` and `mac_idle.py` process starts: 77.5 of 127.5 CPU s | 39 |
+| `direct/test_verify_mac_only.py` | 212.0 (load 60-75; 156.5 in clean rounds) | `build_targets.py` and `mac_idle.py` process starts; lazy imports in `build_targets.py` alone gain 1% CPU | 39, 41 |
 | `direct/test_verify_lint_judgment.py` | 198.6 | production `verify.sh lint` route: 3.1 s per run with no repair, 5.2 s with repair (step-record and admission client Python starts) plus admission start spacing | 31 |
