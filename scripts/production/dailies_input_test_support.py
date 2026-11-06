@@ -27,7 +27,7 @@ from unit_lookup import UnitState
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
-    fixture_showrunner_name, isolated_staff_file, recorded_showrunner, recorded_unit, showrunner_launch, showrunner_relationship,
+    isolated_staff_file, recorded_showrunner, recorded_unit, showrunner_launch, showrunner_relationship,
     unit_membership,
 )
 
@@ -254,7 +254,7 @@ class DailiesInputFixture(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         (self.root / "sessions").mkdir()
         self.production_doc()
-        _ = showrunner_relationship(fixture_showrunner_name("example", self.doc))
+        _ = showrunner_relationship("example")
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
 
@@ -328,7 +328,7 @@ class DailiesInputFixture(unittest.TestCase):
         _ = self.doc.write_text("\n".join(rows), encoding="utf-8")
         self.timer("example")
         for unit, name in ((ALPHA, "alpha"), (BETA, "beta")) if beta else ((ALPHA, "alpha"),):
-            _ = recorded_unit(fixture_showrunner_name("example", self.doc), unit, self.root / name, self.doc,
+            _ = recorded_unit("example", unit, self.root / name, self.doc,
                               plan=f"docs/{name}.md")
 
     def status_lines(self, *lines: str) -> None:
@@ -336,7 +336,7 @@ class DailiesInputFixture(unittest.TestCase):
 
     def unit_id(self, name: str = ALPHA) -> staff.StaffId:
         if name not in self.unit_ids:
-            self.unit_ids[name] = unit_membership(fixture_showrunner_name("example", self.doc), name).id
+            self.unit_ids[name] = unit_membership("example", name).id
         return self.unit_ids[name]
 
     def judgment_file(self, *, beta: bool = False, alpha: dict[str, object] | None = None) -> None:
@@ -487,7 +487,7 @@ class DailiesInputFixture(unittest.TestCase):
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def rename_unit(self, name: str) -> None:
-        row = unit_membership(fixture_showrunner_name("example", self.doc), ALPHA)
+        row = unit_membership("example", ALPHA)
         _ = staff.rename(row.id, unit_names.name(name))
         for path in (self.status, self.judgment):
             _ = path.write_text(path.read_text(encoding="utf-8").replace(ALPHA, name), encoding="utf-8")
@@ -535,7 +535,7 @@ class DailiesInputFixture(unittest.TestCase):
         document = self.doc if name == "example" else self.root / f"{name}-production.md"
         if not document.exists():
             _ = document.write_text(f"# Production — {name}\n", encoding="utf-8")
-        row = recorded_showrunner(fixture_showrunner_name(name, self.doc), document)
+        row = recorded_showrunner(name, document)
         instance = self.root / "notifier-state" / f"showrunner-{row.id}"
         instance.mkdir(parents=True, exist_ok=True)
         _ = (instance / "conf").write_text(
@@ -545,7 +545,7 @@ class DailiesInputFixture(unittest.TestCase):
     def attach(self, child: str, parent: str) -> None:
         for name in (child, parent):
             self.timer(name)
-        _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
+        _ = showrunner_relationship(child, parent)
 
     def saved_report(self, name: str) -> Path:
         return self.showrunner_state / self.production_id(name) / "dailies_last.json"

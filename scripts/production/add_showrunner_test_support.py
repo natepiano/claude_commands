@@ -248,7 +248,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         return self.root / "notifier" / f"showrunner-{identity}" / "conf"
 
     def timer_text(self, production_name: str, session: str) -> str:
-        return f"TARGET=session:{session}\nCHECK=zsh /x/production_check.sh {self.doc(production_name)}\n"
+        return f"TARGET=session:{session}\nCHECK=zsh /x/production_check.sh {production_name}\n"
 
     def timer(self, production_name: str, session: str) -> None:
         _ = fixture_member("showrunner", name=production_name, runtime_id=session,

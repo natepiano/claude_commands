@@ -51,7 +51,7 @@ class WorkerAdmissionTests(StaffTestCase):
         journal.parent.mkdir(parents=True)
         _ = journal.write_text(json.dumps({"old": "old", "new": owner.name}))
         with mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state):
-            found = session_staff.MemberSources({}, ()).member(
+            found = session_staff.MemberSources(()).member(
                 session_staff.ShowrunnerMember("old"), staff.snapshot(),
             )
         self.assertIsInstance(found, session_staff.NoSuchMember)

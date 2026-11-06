@@ -2226,7 +2226,7 @@ class ChangePageTests(unittest.TestCase):
             timer = notifier / f"showrunner-{name}"
             timer.mkdir(parents=True)
             _ = (timer / "conf").write_text(f"EVERY=15\nTARGET=session:test\nPROMPT_FILE={timer / 'prompt'}\n"
-                                           + f"CHECK=zsh /unused/production_check.sh {doc}\n")
+                                           + f"CHECK=zsh /unused/production_check.sh {name}\n")
             if doc != root_doc:
                 _ = fixture_member("showrunner", name=name, parent=root.id, doc=staff.LiveDoc("natedev", doc))
         owner = staff.snapshot().by_path("page-owner")

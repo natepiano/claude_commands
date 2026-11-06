@@ -297,6 +297,8 @@ def production_places(
     places: dict[str, ProductionPlace] = {}
     resolver = resolver if resolver is not None else session_staff.RowResolver(record)
     by_id = {item["sessionId"]: item for item in records}
+    readable_parents: set[staff.StaffId] = set()
+    unreadable_parents: set[staff.StaffId] = set()
     for row in staff.active(record, "unit"):
         identity = row.current_session
         if identity in ledger_workers or not isinstance(row.parent, staff.ReportsTo):
@@ -311,11 +313,16 @@ def production_places(
         if not isinstance(doc, session_staff.ProductionDoc):
             diagnostics.document(row, doc)
             continue
-        try:
-            _ = showrunners.timer_for(parent, record)
-        except (OSError, ValueError) as error:
-            problem(diagnostics.problems, parent.name, error)
+        if parent.id in unreadable_parents:
             continue
+        if parent.id not in readable_parents:
+            try:
+                _ = showrunners.timer_for(parent, record)
+            except (OSError, ValueError) as error:
+                problem(diagnostics.problems, parent.name, error)
+                unreadable_parents.add(parent.id)
+                continue
+            readable_parents.add(parent.id)
         name = parent.name
         owner = by_id.get(parent.current_session)
         relationship: UnderShowrunner | ProductionWithoutRunningShowrunner = (

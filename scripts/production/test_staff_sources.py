@@ -133,13 +133,14 @@ class StaffSourcesTests(StaffTestCase):
         self.assertIn("not reached", errors.getvalue())
         self.assertTrue(document["problems"])
 
-    def test_live_names_a_timer_with_an_unreadable_document_and_keeps_its_members(self) -> None:
+    def test_live_names_an_unreadable_production_document_and_keeps_its_members(self) -> None:
         fixture = self.row_production()
         _ = self.session_record(fixture.unit.current_session, fixture.unit.name)
         _ = staff.set_doc(fixture.runner.id, staff.LiveDoc("natedev", self.root / "other-production.md"))
         with redirect_stderr(io.StringIO()) as errors:
             document = staff_sources.live()
-        self.assertIn(f"showrunners: skipping showrunner-{fixture.runner.id}: production doc could not be read", errors.getvalue())
+        self.assertFalse(document["complete"])
+        self.assertIn("production doc could not be read", errors.getvalue())
         self.assertIn(fixture.unit.id, [value["id"] for value in cast(list[dict[str, object]], document["members"])])
 
     def test_live_keeps_the_unit_and_reports_unreadable_branch_or_missing_configuration(self) -> None:
@@ -331,7 +332,7 @@ class StaffSourcesTests(StaffTestCase):
         _ = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("pane-unit-current")))
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         record = staff.snapshot()
-        sources = MemberSources({}, (launch,))
+        sources = MemberSources((launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
             evidence = staff_sources.observe_workers(record, sources)
@@ -350,7 +351,7 @@ class StaffSourcesTests(StaffTestCase):
                   mock.patch.object(process_table, "snapshot", side_effect=[table, {}]),
                   mock.patch.object(herdr, "process_environment", side_effect=failure),
                   redirect_stderr(io.StringIO()) as errors):
-                evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+                evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
             self.assertEqual(evidence.diagnostics, ())
             self.assertEqual(errors.getvalue(), "")
 
@@ -361,7 +362,7 @@ class StaffSourcesTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", side_effect=[table, table]),
               mock.patch.object(herdr, "process_environment", side_effect=PermissionError("permission denied"))):
-            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
         self.assertIn("staff sources: Codex processes: permission denied", evidence.diagnostics)
 
 
@@ -378,7 +379,7 @@ class StaffSourcesTests(StaffTestCase):
             with (self.subTest(recorded=unowned in launches),
                   mock.patch.object(process_table, "snapshot", return_value=table),
                   mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-                evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, launches))
+                evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(launches))
             self.assertEqual(evidence.diagnostics, (
                 "staff sources: Codex process 42401: pane holds no staff member; not staff",))
 
@@ -394,7 +395,7 @@ class StaffSourcesTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
+            evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources((launch,)))
         self.assertEqual(evidence.diagnostics, (
             "staff sources: Codex process 42401: native thread identity is unavailable",))
 
@@ -426,7 +427,7 @@ class StaffSourcesTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "/local/bin/codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={})):
-            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
         self.assertEqual(evidence.diagnostics, (
             "staff sources: Codex process 42401: not in a herdr pane; not staff",))
 
@@ -438,7 +439,7 @@ class StaffSourcesTests(StaffTestCase):
             42401, 1, "node", 'node /modules/@openai/codex/bin/codex.js --config "unfinished')}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment") as environment):
-            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
         environment.assert_not_called()
         self.assertEqual(evidence.diagnostics,
                          ("staff sources: Codex process scan: pid 42401: No closing quotation",))
@@ -448,7 +449,7 @@ class StaffSourcesTests(StaffTestCase):
         from scripts.message import process_table
 
         with mock.patch.object(process_table, "snapshot", side_effect=OSError("process table unavailable")):
-            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
         self.assertEqual(evidence.diagnostics, ("staff sources: Codex processes: process table unavailable",))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
@@ -878,7 +879,7 @@ class NonLocalMemberReferenceTests(unittest.TestCase):
                     "environment": {('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"},
                     "flags_read": True, "written_at": "2026-11-01T12:00:00Z",
                 }
-                sources = session_staff.MemberSources({}, (launch,))
+                sources = session_staff.MemberSources((launch,))
                 with mock.patch.object(staff, "snapshot", side_effect=AssertionError("unexpected staff read")):
                     found = sources.member(selector, record)
                 expected = session_staff.MemberFound(unit)
@@ -893,7 +894,7 @@ class StaffWorkerIdentityTests(StaffTestCase):
         worker = fixture_member("worker", name="impl", parent=owner.id)
         worker = staff.rename(worker.id, "review")
         before = self.staff_file.read_bytes()
-        evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, ()))
+        evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(()))
         self.assertEqual(len(evidence.workers), 1)
         observed = evidence.workers[0]
         self.assertEqual(observed.row, worker)
@@ -905,7 +906,7 @@ class StaffWorkerIdentityTests(StaffTestCase):
         runner = fixture_member("showrunner", name="runner")
         owner = fixture_member("unit", name="unit", parent=runner.id)
         worker = fixture_member("worker", name="impl", parent=owner.id)
-        evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, ()), current_only=True)
+        evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(()), current_only=True)
         self.assertEqual(evidence.workers, ())
         staff_sources.require_worker_stopped(staff.snapshot(), worker.id)
 
@@ -917,7 +918,7 @@ class StaffWorkerIdentityTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"}),
-              mock.patch.object(session_staff, "member_sources", return_value=MemberSources({}, (launch,))),
+              mock.patch.object(session_staff, "member_sources", return_value=MemberSources((launch,))),
               redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(staff.retire(worker.id), worker)
         self.assertIsNone(staff.by_id(worker.id))

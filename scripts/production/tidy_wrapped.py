@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import showrunners, staff, unit_lookup  # noqa: E402
-from scripts.shutdown import remote
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
@@ -91,9 +90,7 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
 
 def wrapped_owner(doc: Path, record: staff.StaffSnapshot) -> staff.StaffRow:
     """Read the wrapped owner's staff name and require no update timer."""
-    owner = record.by_doc(remote.local_machine(), doc.resolve())
-    if owner is None or owner.kind != "showrunner":
-        raise TidyRefused(f"{doc}: no showrunner staff row")
+    owner = unit_lookup.doc_owner(doc, record)
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
     if not status.startswith(WRAPPED):
@@ -116,16 +113,15 @@ def main(argv: list[str]) -> int:
             if identities is None:
                 identities = QuestionStaff.read()
             owner = wrapped_owner(Path(name), identities.record)
-            production_name = owner.name
-            removed = tidy(production_name, Path(name), identities=identities)
+            removed = tidy(owner.name, Path(name), identities=identities)
         except (TidyRefused, RegistrationFailure, staff.StaffRefused, staff.StaffUnreadable,
                 OSError, UnicodeError, ValueError) as error:
             print(f"kept: {error}", file=sys.stderr)
             failed = True
             continue
         count = len(removed)
-        print(f"{production_name}: removed {count} state file{'' if count == 1 else 's'}" if count
-              else f"{production_name}: no state files")
+        print(f"{owner.name}: removed {count} state file{'' if count == 1 else 's'}" if count
+              else f"{owner.name}: no state files")
     return 1 if failed else 0
 
 

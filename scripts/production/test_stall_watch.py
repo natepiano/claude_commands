@@ -775,24 +775,34 @@ always=natedev
                 marked[production_name][name] = lookup.LabeledSession(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
                                                      identity=lookup.LiveSession(row.current_session))
 
-        def labeled_sessions(production_name: str, *, record: staff.StaffSnapshot) -> dict[str, lookup.LabeledSession]:
-            del record
-            return marked[production_name]
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(stall_watch, "processes", return_value=[]),
               mock.patch.object(stall_watch, "STATE_DIR", self.state),
               mock.patch.object(showrunners, "load_settings", return_value={}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery(runners)),
-              mock.patch.object(lookup, "labeled_sessions", side_effect=labeled_sessions),
+              mock.patch.object(lookup, "every_labeled_session", return_value=lookup.LabeledProductions(marked)) as scans,
               mock.patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as reads,
               mock.patch.object(stall_watch, "forget", return_value=None) as forget,
               mock.patch.object(stall_watch, "send_all") as send):
             _ = stall_watch.tick(START)
+            scans.assert_called_once_with(record=mock.ANY)
             reads.assert_called_once_with()
             self.assertEqual(forget.call_count, 4)
             send.assert_called_once_with(
                 [], START, deadline=mock.ANY,
                 limits=stall_watch.sender_limits(stall_watch.watch_config(packaged_only=True)))
+
+    def test_a_failed_session_scan_ends_the_tick_and_the_next_tick_scans_again(self) -> None:
+        with (mock.patch.object(unit_lookup, "every_labeled_session", side_effect=OSError("fixture scan failed")) as scans,
+              mock.patch.object(showrunners, "registered_showrunners") as discovery):
+            first = self.tick(START)
+            second = self.tick(START + 60)
+        self.assertEqual(scans.call_count, 2)
+        discovery.assert_not_called()
+        for result in (first, second):
+            self.assertIn("fixture scan failed", result.stderr)
+            self.assertNotIn("inspected ", result.stdout)
+        self.assertEqual(self.sent(), [])
 
     def test_a_stalled_discovery_keeps_prompt_work_and_returns_by_the_pass_deadline(self) -> None:
         self.panes["unit-one"]["agent_status"] = "blocked"
@@ -1850,14 +1860,14 @@ always=natedev
         _ = transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
         os.utime(transcript, (START - 3600, START - 3600))
 
-    def test_near_compaction_waits_bump_except_holds_naming_outside_parties(self) -> None:
+    def test_only_blocked_turns_bump_near_compaction_and_other_waits_reset_the_stretch(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         blocked = "— blocked: my context is full; it compacts on the next turn"
         window = 283_800
         trigger = context_usage.trigger_tokens(window)
         threshold = context_usage.handoff_threshold(window)
         self.assertEqual(trigger, 250_800)
-        # The shared boundary, the real accounts reading, the trigger and over it; every waiting kind.
+        # Blocked turns wake at the threshold, the accounts reading, the trigger and above the trigger.
         for status, tokens in [(blocked, tokens) for tokens in (threshold, 245_621, trigger, trigger + 1)] + [
                 (f"— {kind}: waiting", threshold) for kind in ("done", "gate", "decision")] + [
                 ("— holding: until 18:00", threshold),
@@ -1872,12 +1882,12 @@ always=natedev
                     bump_sent=False, tell_sent=False, reported_status="")
                 _ = path.write_text(json.dumps(stretch))
                 self.assertEqual(self.tick(START).returncode, 0)
-                holding = "your" in status
-                self.assertEqual(len(self.sent()), 0 if holding else 2)
+                wakes = status == blocked
+                self.assertEqual(len(self.sent()), 2 if wakes else 0)
                 self.assertEqual(self.tick(START + 600).returncode, 0)
                 sent = self.sent()
-                self.assertEqual(len(sent), 0 if holding else 2)
-                if holding:
+                self.assertEqual(len(sent), 2 if wakes else 0)
+                if not wakes:
                     self.assertEqual(sent, [])
                 else:
                     tell, = [item for item in sent if item["key"].endswith(":tell")]
@@ -1888,10 +1898,10 @@ always=natedev
                     self.assertIn("54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock", tell["to"])
                     self.assertIn(f"Last status: {status}", tell["text"])
                 saved = cast(stall_watch.Stretch, json.loads(path.read_text()))
-                self.assertEqual(saved["since"], START - 601)
-                self.assertEqual(saved["reported_status"], status)
-                self.assertEqual(saved["bump_sent"], not holding)
-                self.assertEqual(saved["tell_sent"], not holding)
+                self.assertEqual(saved["since"], START - 601 if wakes else START + 600)
+                self.assertEqual(saved["reported_status"], status if wakes else "")
+                self.assertEqual(saved["bump_sent"], wakes)
+                self.assertEqual(saved["tell_sent"], wakes)
                 self.send_log.unlink(missing_ok=True)
                 path.unlink()
 

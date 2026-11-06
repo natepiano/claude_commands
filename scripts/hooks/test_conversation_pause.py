@@ -210,13 +210,13 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_typed_prompt_in_a_showrunner_or_unit_director_records_activity(self) -> None:
         self.environment["HERDR_PANE_ID"] = "w0:p6"
         self.record_activity()
-        _ = self.create_instance("showrunner-demo")
+        _ = self.create_instance(self.showrunner_timer("demo"))
         self.assertEqual(self.run_prompt("hello").returncode, 0)
         expected = [["active", "--source", "UserTypedPrompt", "--session-id", SESSION,
                      "--pane-id", "w0:p6", "--prompt-hash", hashlib.sha256(b"hello").hexdigest()]]
         self.assertEqual(self.activity_calls(1), expected)
         self.activity_log.unlink()
-        _ = (self.notifier_root / "showrunner-demo" / "conf").write_text("TARGET=session:other\nEVERY=5\nCOMMAND=report\n")
+        _ = (self.notifier_root / self.showrunner_timer("demo") / "conf").write_text("TARGET=session:other\nEVERY=5\nCOMMAND=report\n")
         _ = (self.unit_active_root / SESSION).write_text("/tmp/claude/unit/run-1\n")
         self.assertEqual(self.run_prompt("hello").returncode, 0)
         self.assertEqual(self.activity_calls(1), expected)
@@ -225,7 +225,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.record_activity()
         plain = self.run_prompt("hello")
         self.assertEqual((plain.returncode, plain.stderr), (0, ""))
-        _ = self.create_instance("showrunner-demo")
+        _ = self.create_instance(self.showrunner_timer("demo"))
         for prompt in (cross_session("natedev", "continue"), "<task-notification>done</task-notification>",
                        "<system-reminder>hook output</system-reminder>"):
             self.assertEqual(self.run_prompt(prompt).returncode, 0)
@@ -241,7 +241,7 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_only_the_users_own_prompt_ends_auto_silence(self) -> None:
         """A mover's resume prompt, a pane typed by session_pane.py and Claude Code's notices are not the user."""
         self.record_activity()
-        _ = self.create_instance("showrunner-demo")
+        _ = self.create_instance(self.showrunner_timer("demo"))
         pane = "w1:p7"
         self.environment["HERDR_PANE_ID"] = pane
         resume = ("You are now messaging-unit in production demo (doc demo.md), under the showrunner. "
@@ -286,7 +286,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_typed_showrunner_prompt_pauses_dailies_once(self) -> None:
-        instance = self.create_instance("showrunner-demo")
+        instance = self.create_instance(self.showrunner_timer("demo"))
         first = self.parsed_reply(self.run_prompt("hello", now=100))
         self.assertEqual(first, {
             "systemMessage": (
@@ -301,7 +301,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.showrunner_root / "footers-off").exists())
         self.assertEqual(self.record(), {
             "session_id": SESSION,
-            "instances": ["showrunner-demo"],
+            "instances": [self.showrunner_timer("demo")],
             "phase": {"kind": "replying", "user_wrote_at": 100},
         })
         calls_after_first = self.calls(self.notifier_log)
@@ -357,7 +357,7 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_a_stopped_showrunner_timer_is_never_recorded_or_resumed(self) -> None:
         # A production on demand keeps its showrunner timer stopped. The pause has nothing to stop,
         # so it writes no record, and a resume leaves the timer stopped.
-        showrunner = self.create_instance("showrunner-show", enabled=False)
+        showrunner = self.create_instance(self.showrunner_timer("show"), enabled=False)
         result = self.run_prompt("hello")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
@@ -503,7 +503,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_peer_prompt_does_not_pause_a_showrunner_session(self) -> None:
-        instance = self.create_instance("showrunner-demo")
+        instance = self.create_instance(self.showrunner_timer("demo"))
         result = self.run_prompt(cross_session("natedev", "continue"))
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
@@ -551,7 +551,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.escalate_root / "typed").exists())
 
     def test_subagent_hand_back_does_not_pause_reports(self) -> None:
-        instance = self.create_instance("showrunner-demo")
+        instance = self.create_instance(self.showrunner_timer("demo"))
         hand_back = (
             '<agent-message from="a715bbb613f1bc07c">\n'
             "[Subagent hand-back] fixed the recorder</agent-message>"
@@ -660,20 +660,20 @@ class ConversationPauseTests(ConversationPauseFixture):
             self.assertIsInstance(context, conversation_pause.ContextOnly)
 
     def test_cli_resume_skips_missing_instance_and_deletes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False, paused=True)
         record_path = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
-            instances=("showrunner-demo", "unit-gone"), scheduled=False,
+            instances=(self.showrunner_timer("demo"), "unit-gone"), scheduled=False,
         )
         result = self.run_cli("resume")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "automatic updates on: dailies\n")
-        self.assertEqual(self.calls(self.notifier_log), [["unpause", "showrunner-demo"]])
+        self.assertEqual(self.calls(self.notifier_log), [["unpause", self.showrunner_timer("demo")]])
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse(record_path.exists())
 
     def test_a_timer_stopped_during_the_pause_stay_stopped_at_resume(self) -> None:
-        dailies = self.create_instance("showrunner-demo")
+        dailies = self.create_instance(self.showrunner_timer("demo"))
         unit_report = self.create_instance("unit-abc")
         _ = self.run_prompt("hello", now=100)
         # The showrunner stops its dailies on purpose while the user talks.
@@ -688,7 +688,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_a_timer_stopped_before_the_pause_stay_stopped_at_resume(self) -> None:
-        dailies = self.create_instance("showrunner-demo", enabled=False)
+        dailies = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         unit_report = self.create_instance("unit-abc")
         _ = self.run_prompt("hello", now=100)
         self.assertEqual(self.record()["instances"], ["unit-abc"])
@@ -701,11 +701,11 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_the_timeout_return_leaves_what_was_stopped_during_the_pause(self) -> None:
-        dailies = self.create_instance("showrunner-demo", enabled=False)
+        dailies = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         unit_report = self.create_instance("unit-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
-            asked_read(100, 1), instances=("showrunner-demo", "unit-abc"),
+            asked_read(100, 1), instances=(self.showrunner_timer("demo"), "unit-abc"),
         )
 
         tick = self.run_cli("tick", now=400)
@@ -716,7 +716,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_a_tick_drops_what_was_stopped_by_hand_from_the_pause_record(self) -> None:
-        dailies = self.create_instance("showrunner-demo")
+        dailies = self.create_instance(self.showrunner_timer("demo"))
         _ = self.create_instance("unit-abc")
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.run_prompt("hello", now=100)
@@ -730,9 +730,9 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_a_record_from_before_the_pause_marks_restarts_nothing(self) -> None:
         # Records written before `notifier.sh pause` existed name timers stopped with no mark;
         # nothing tells them from ones stopped on purpose.
-        instance = self.create_instance("showrunner-demo", enabled=False)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         record_path = self.write_record(
-            {"kind": "replying", "user_wrote_at": 1}, instances=("showrunner-demo",),
+            {"kind": "replying", "user_wrote_at": 1}, instances=(self.showrunner_timer("demo"),),
         )
 
         result = self.run_cli("resume")
@@ -774,7 +774,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(self.run_cli("status").stdout, "not paused\n")
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
-            instances=("unit-abc", "showrunner-demo"),
+            instances=("unit-abc", self.showrunner_timer("demo")),
         )
         self.assertEqual(
             self.run_cli("status").stdout,
@@ -935,7 +935,7 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_tick_asks_nothing_when_no_paused_schedule_still_exists(self) -> None:
         path = self.write_record(
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
-            instances=("showrunner-example",), scheduled=False,
+            instances=(self.showrunner_timer("example"),), scheduled=False,
         )
         result = self.run_cli("tick", now=1_000)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1414,12 +1414,12 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_question_timeout_returns_updates_and_late_yes_removes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False, paused=True)
         unit_report = self.create_instance("unit-abc", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
             asked_read(100, 1),
-            instances=("showrunner-demo", "unit-abc"),
+            instances=(self.showrunner_timer("demo"), "unit-abc"),
         )
         tick = self.run_cli("tick", now=400)
         self.assertEqual(tick.returncode, 0, tick.stderr)
@@ -1433,7 +1433,7 @@ print("SENT: delivered")
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertIn(["unpause", "showrunner-demo"], self.calls(self.notifier_log))
+        self.assertIn(["unpause", self.showrunner_timer("demo")], self.calls(self.notifier_log))
         self.assertIn(["unpause", "unit-abc"], self.calls(self.notifier_log))
         self.assertNotIn(["remove", "conversation-pause"], self.calls(self.notifier_log))
         self.assertTrue(watcher.exists())
@@ -1507,11 +1507,11 @@ print("SENT: delivered")
         )
 
     def test_kept_off_session_end_restores_items_and_removes_watcher(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         record_path = self.write_record(
             {"kind": "kept_off"},
-            instances=("showrunner-demo",),
+            instances=(self.showrunner_timer("demo"),),
         )
         running = self.run_cli("tick", now=100)
         self.assertEqual(running.returncode, 0, running.stderr)
@@ -1557,10 +1557,10 @@ print("SENT: delivered")
         self.assertEqual(calls.count(["unpause", restored.name]), 1)
 
     def test_missing_session_returns_updates_and_deletes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False, paused=True)
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 10},
-            instances=("showrunner-demo",),
+            instances=(self.showrunner_timer("demo"),),
         )
         result = self.run_cli(
             "tick", now=20, extra_env={"SESSION_RUNNING": "0"}
@@ -1686,13 +1686,13 @@ print("SENT: delivered")
 
     def test_open_reviews_leave_all_phases_byte_identical(self) -> None:
         asked_instance = self.create_instance(
-            "showrunner-asked", session_id="asked-session", enabled=False, paused=True
+            self.showrunner_timer("asked"), session_id="asked-session", enabled=False, paused=True
         )
         quiet_instance = self.create_instance(
-            "showrunner-quiet", session_id="quiet-session", enabled=False, paused=True
+            self.showrunner_timer("quiet"), session_id="quiet-session", enabled=False, paused=True
         )
         returned_instance = self.create_instance(
-            "showrunner-returned", session_id="returned-session", enabled=False, paused=True
+            self.showrunner_timer("returned"), session_id="returned-session", enabled=False, paused=True
         )
         _ = self.create_instance("conversation-pause", run="tick")
         paths = {
@@ -1811,7 +1811,7 @@ print("SENT: delivered")
 
     def test_release_leaves_out_what_was_stopped_by_hand_since_the_pause(self) -> None:
         paused = self.create_instance("unit-abc", enabled=False, paused=True)
-        stopped = self.create_instance("showrunner-demo", enabled=False)
+        stopped = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
             instances=(paused.name, stopped.name),

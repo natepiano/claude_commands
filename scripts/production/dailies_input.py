@@ -25,7 +25,7 @@ from scripts.production import staff, unit_names
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
-from scripts.production.store_owner import document_id, showrunner_id
+from scripts.production.store_owner import showrunner_id
 from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
@@ -304,20 +304,20 @@ def bounded_bevy_update(text: str) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def report_units(doc: Path, name: str, record: staff.StaffSnapshot) -> tuple[UnitRow, ...]:
-    rows = unit_lookup.doc_units(doc, record)
+def report_units(owner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow, ...]:
+    rows = tuple(record.find(kind="unit", parent=owner.id))
     live = [row for row in rows if not isinstance(row.worktree, staff.RemovedWorktree)]
     if rows and not live:
         raise DailiesFailure("production", "no live units: every unit is retired")
     try:
         marked = {unit_names.name(name): place
-                  for name, place in unit_lookup.labeled_sessions(name, record=record).items()}
+                  for name, place in unit_lookup.labeled_sessions(owner.name, record=record).items()}
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     try:
         runs = unit_lookup.read_run_states(record=record)
     except OSError as error:
-        raise DailiesFailure("production", f"the run records of {name} could not be read: {error}") from error
+        raise DailiesFailure("production", f"the run records of {owner.name} could not be read: {error}") from error
     units: list[UnitRow] = []
     for row in live:
         found = marked.get(row.name)
@@ -767,8 +767,7 @@ def next_due(output: str, now: datetime, zone: ZoneInfo) -> str:
 def last_report_path(name: str, *, identities: QuestionStaff | None = None) -> Path:
     """Where a production saves what the showrunner above it shows of it."""
     return showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(
-        name, record=identities.record if identities else None,
-        sources=identities.sources if identities else None) / LAST_REPORT
+        name, record=identities.record if identities else None) / LAST_REPORT
 
 
 def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool, record: staff.StaffSnapshot | None = None) -> JsonMap:
@@ -879,7 +878,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"state-dir: ok — {line}", file=sys.stderr)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units = report_units(production.doc, production.name, staff_record)
+    units = report_units(production.owner, staff_record)
     table_state = phase_tables(production.doc, production.zone)
     if isinstance(table_state, PhaseTablesAvailable):
         table_state = PhaseTablesAvailable(
@@ -924,7 +923,7 @@ def run(args: argparse.Namespace) -> int:
     judgment = as_map(raw, str(judgment_path))
     supplied_units = as_list(judgment.get("units"), f"{judgment_path}.units")
     by_session: dict[str, JsonMap] = {}
-    owner_id = document_id(production.doc, record=staff_record)
+    owner_id = production.owner.id
     for index, supplied in enumerate(supplied_units):
         fields = as_map(supplied, f"{judgment_path}.units[{index}]")
         unit_id = fields.get("unit")

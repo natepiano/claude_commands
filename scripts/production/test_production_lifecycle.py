@@ -128,7 +128,7 @@ class LifecycleTests(LifecycleFixture):
     def reports_to(self, child: str, parent: str) -> Path:
         if "example" in (child, parent):
             self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
-                       f"TARGET=session:{self.owner_id()}\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+                       f"TARGET=session:{self.owner_id()}\nCHECK=zsh /x/production_check.sh {self.owner_id()}\n")
         rows = {row.name: row for row in staff.find(kind="showrunner")}
         parent_name = parent
         child_name = child
@@ -1185,7 +1185,7 @@ class LifecycleTests(LifecycleFixture):
         self.write(ledger, "saved ledger and pending hand-offs\n")
         self.showrunner("kid", live=True)
         timer = self.state / "notifier" / f"showrunner-{self.owner_id('kid')}" / "conf"
-        self.write(timer, f"TARGET=session:{self.owner_id("kid")}\nCHECK=zsh /x/production_check.sh {style_doc}\n")
+        self.write(timer, f"TARGET=session:{self.owner_id("kid")}\nCHECK=zsh /x/production_check.sh {self.owner_id('kid')}\n")
         _ = staff.set_doc(self.owner_id("kid"), staff.LiveDoc("natedev", style_doc))
         _ = self.reports_to("kid", "example")
         child_state = self.state / "showrunner" / self.owner_id("kid") / "prompt.txt"
