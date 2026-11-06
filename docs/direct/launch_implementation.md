@@ -68,16 +68,19 @@ completes.
    resolves, in `models.conf` or in the ledger.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
    apply <DispatchContract/> once for the whole team.
-7. On completion, read `${PHASE_DIR}/impl_status_impl` and `impl_status_test`; the phase is
-   done only when both are terminal. `implemented` on `impl` loads
-   `impl_summary_impl.txt` into `${IMPL_SUMMARY}`; read `impl_summary_test.txt`
-   for what it completed and for findings it posted. If `impl` errors, apply <WorkerLaunchFailure/>
-   first — a worker that died in seconds is resolved there, not reported. A
-   genuine error then cancels any early-launched
-   reviewer per <EarlyReviewArm/>, applies <RetainPhaseReservation/>,
-   reports `impl_agent_impl.log`, records
-   `finish-run --status error`, runs `end_session.sh`, and stops; multi-phase
-   runs also emit <RunSummary/>.
+7. Read `${PHASE_DIR}/impl_status_impl` and `impl_status_test` after completion. Both statuses must be terminal.
+   Load `impl_summary_impl.txt` into `${IMPL_SUMMARY}` when `impl` reports `implemented`.
+   Read `impl_summary_test.txt` for the test results and findings.
+   Apply <WorkerLaunchFailure/> first when `impl` reports an error.
+   `assign.py` ends a run when its only worker command fails and no pass completed.
+   Each recorder slot counts as one worker. A Claude launch must add a `pass_started` event for its slot.
+   The director must hold only that run. A launcher signal does not trigger this path.
+   For herdr, only exit 2 qualifies. Exits 3 through 8 retain the run.
+   The launcher calls `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`.
+   It keeps the launch exit code and the phase reservation. A failed cleanup child reports its error.
+   For other genuine errors, cancel the early reviewer per <EarlyReviewArm/> and apply <RetainPhaseReservation/>.
+   Report `impl_agent_impl.log`, record `finish-run --status error`, run `end_session.sh`, and stop.
+   Emit <RunSummary/> for a run with multiple phases.
 8. `implemented` is the worker's claim, not a passed gate. Read
    `${IMPL_SUMMARY}` for a verification line it left running, unread, or
    unmentioned — "still running", "I'll report once it completes", a listed

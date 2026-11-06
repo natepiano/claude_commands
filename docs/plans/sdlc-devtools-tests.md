@@ -1296,7 +1296,7 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 3. Every running showrunner's timer fires once on the landed tree; dailies and the status line show it. sdlc's migration output is cited in the notice.
 4. Keep the lookup, requested-checkpoint, and partial-report tests. basedpyright `0 errors, 0 warnings, 0 notes`. The full gate passes.
 
-### Phase 8f — A run whose only worker dies at launch ends itself  · status: todo
+### Phase 8f — A run whose only worker dies at launch ends itself  · status: done
 
 Source: sdlc [6d2745c7], [68b227b5]. Only `end_session.sh` removes a run's marker, and only a director's run summary or a hand calls it. When a launch fails, `assign.py` records `blocked` and exits. A session that then goes on without the run leaves the marker open. The evidence is run 6a628840: launcher up 08:34:14, worker down 08:34:17, marker still open days later. This phase covers that case only. Hierarchies removes the other cases after its Phase 24.
 

@@ -269,6 +269,14 @@ See `unit-rename.md`.
 
 ## Invariants
 
+- `assign.py` ends a failed launch's run when no pass completed, no other worker exists, and the director holds only that run.
+  The worker command must have started and returned an error. A launcher signal does not trigger this path.
+  Each recorder slot counts as one worker, even without a worker name. A Claude launch must add its slot's `pass_started` event.
+  Herdr exit 2 qualifies; exits 3 through 8 retain the run.
+  The launcher calls `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`, through `call(check=False)`.
+  Cleanup errors preserve the launch exit code. The phase reservation stays until a checkpoint releases it.
+  `prepare_session.sh` and `end_session.sh` select `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, as `staff.runtime_id()` does.
+  A retry without `--session-dir` starts a new run. An explicit run folder retains its existing retry behavior.
 - Codex workers open once per run and end only at `end_session.sh`. A held design role is not a run worker: run end unbinds it and never ends its thread. Phase cleanup never ends a Codex thread. A new worker opens only when no open worker can take the work.
 - Claude workers keep their per-phase lifecycle; this design covers Codex workers only.
 - Only the unit director starts a finished Codex worker's next turn through `assign.sh --role <role> --to <worker>`. The turn receives held peer messages before its dispatch prompt. Claude workers keep `implement.sh`.

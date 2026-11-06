@@ -357,6 +357,14 @@ only to complete a report.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
+`assign.py` ends a failed launch's run when no pass completed, no other worker exists, and the director holds only that run.
+Each recorder slot counts as one worker, even when its pass records no worker name.
+For Claude, this slot must record a new `pass_started` event during the launch.
+The launcher keeps the phase reservation and the launch exit code.
+After this end, omit `--session-dir` to start a new run on retry.
+An explicit `--session-dir` retains the existing retry behavior for that folder.
+For herdr, this end applies only to exit 2. Exits 3 through 8 retain the run.
+
 For `herdr`, inspect `worker.py list` and the named pane.
 Keep incomplete, unpublished, busy, and unknown workers unchanged.
 Resume the same pass through its saved launcher command.
