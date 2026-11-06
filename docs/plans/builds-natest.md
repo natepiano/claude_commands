@@ -926,9 +926,8 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Function-local imports in `build_targets.py` alone: 1% CPU does not pay for about 60 imports inside functions.
 - One start for adjacent `eligible` and `platform` queries in `verify.sh`: about 1.6 CPU s.
 
-### Phase 42 — `mac_idle.py` loads only what its command needs  · status: todo
+### Phase 42 — `mac_idle.py` loads only what its command needs  · status: done
 **Depends on:** Phase 41
-**Blocked by:** the `send.py` freeze end; the showrunner says when.
 
 #### Work Order
 
