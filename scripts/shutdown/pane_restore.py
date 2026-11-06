@@ -66,7 +66,7 @@ def restore(session: str, *, dry_run: bool) -> int:
         print(f"pane_restore: retained launch repair failed: {error}", file=sys.stderr)
         failures += 1
     selected: dict[staff.StaffId, staff.StaffRow] = {}
-    target_accounts: dict[staff.StaffId, str] = {}
+    target_accounts: dict[staff.StaffId, accounts.AccountSelection] = {}
     saved_panes: list[herdr.TabSession] = []
     entries = pane_record.read(session)
     live: set[str] = set()
@@ -85,8 +85,8 @@ def restore(session: str, *, dry_run: bool) -> int:
         selected[holder.id] = holder
         if saved is not None and holder.id == row.id:
             home = Path(saved["config_dir"])
-            target_accounts[holder.id] = (agent_accounts.codex_home_role_label(home) if pane_launch.agent_kind(saved) == "codex"
-                                          else accounts.claude_config_label(home))
+            target_accounts[holder.id] = (accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(home), home)
+                if pane_launch.agent_kind(saved) == "codex" else accounts.NamedAccount(accounts.claude_config_label(home), home))
         if dry_run:
             entry = names.resume(saved) if saved is not None else None
             account = entry["config_dir"] if entry is not None else "retained account"

@@ -351,17 +351,25 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(output.count("pane close anomaly:"), 1)
                 self.assertIn("w1:p2", pane_record.read("agents"))
 
-    def test_server_restore_keeps_the_saved_codex_account(self) -> None:
-        saved = self.root / ".codex2"
-        self.entry(kind="codex", config_dir=str(saved), environment={"CODEX_HOME": str(saved)})
-        client = self.restored()
-        with (mock.patch.object(agent_accounts, "codex_home_role_label", return_value="codex2"),
-              mock.patch.object(agent_accounts, "codex_account_home",
-                  return_value=agent_accounts.CodexHomeHoldingLogin("codex2", saved, "private@example.test")),
-              mock.patch.object(restart, "start_row", return_value="w1:p3") as start):
-            code, output = self.run_restore(client)
-        self.assertEqual(code, 0, output)
-        self.assertEqual(start.call_args.kwargs["target_account"], "codex2")
+    def test_server_restore_keeps_numbered_and_unnamed_codex_homes_through_start_row(self) -> None:
+        for name, label in ((".codex2", "codex2"), ("saved-home", "~/.codex")):
+            with self.subTest(home=name):
+                saved = self.root / name
+                self.entry(kind="codex", config_dir=str(saved), environment={"CODEX_HOME": str(saved)})
+                client = self.restored()
+                with (mock.patch.object(agent_accounts, "codex_home_role_label", return_value=label),
+                      mock.patch.object(agent_accounts, "codex_account_home",
+                          return_value=agent_accounts.CodexHomeHoldingLogin("codex2", saved, "private@example.test"),
+                          side_effect=ValueError("no numbered note") if name == "saved-home" else None) as numbered,
+                      mock.patch.object(accounts, "role_account", side_effect=AssertionError("keep the saved home")),
+                      mock.patch.object(restart, "start_row", wraps=restart.start_row) as start,
+                      mock.patch.object(herdr, "prepare_session_environment", wraps=herdr.prepare_session_environment) as prepare,
+                      mock.patch.object(client, "run_in_pane")):
+                    code, output = self.run_restore(client)
+                self.assertEqual(code, 0, output)
+                self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(saved))
+                self.assertEqual(start.call_args.kwargs["target_account"], accounts.CodexWorkersAccount(label, saved))
+                numbered.assert_not_called()
 
     def test_restore_of_a_unit_uses_the_saved_account(self) -> None:
         self.row = replace(self.row, kind="unit")

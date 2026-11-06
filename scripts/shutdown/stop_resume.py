@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 
 class RowStarter(Protocol):
     def start_row(self, row: StaffRow, record: StaffSnapshot, client: herdr.Herdr, *,
-                  target_account: str) -> str: ...
+                  target_account: str | accounts.AccountSelection) -> str: ...
     def session_launch(self, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
 
 
@@ -73,7 +73,9 @@ _UNREAD_NAMES = LaunchNamesNotRead()
 
 
 def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_NAMES) -> herdr.TabSession | SessionNotFound:
-    """Find an existing pane, retaining its saved conversation when herdr's id is stale."""
+    """Find an existing pane and retain its saved conversation when the herdr id is stale."""
+    from scripts.production import staff
+
     client = herdr.Herdr(herdr.shared_session())
     entries = pane_record.read(client.session)
     membership = (LaunchNames.read() if isinstance(names, LaunchNamesNotRead) else names).tab_record
@@ -94,7 +96,12 @@ def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_N
                     continue  # A saved entry cannot displace another running conversation.
             identity = saved_identity
         tabs.append(herdr.TabSession(pane["pane_id"], label, pane["workspace_id"], identity))
-    matches = [tab for tab in tabs if tab.session_id == session] or [tab for tab in tabs if tab.label == session]
+    matches = [tab for tab in tabs if tab.session_id == session]
+    if not matches:
+        try:
+            _ = staff.native_id(session)
+        except staff.StaffRefused:
+            matches = [tab for tab in tabs if tab.label == session]
     if len(matches) > 1:
         raise ValueError(f"{session}: several tabs match")
     return matches[0] if matches and matches[0].session_id else SessionNotFound(session)
@@ -472,9 +479,9 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
         if isinstance(observed, herdr.UnknownConversation):
             herdr.conversation_note(observed)
             client = herdr.Herdr(herdr.shared_session())
-            for tab in client.tab_sessions():
-                if tab.session_id == identity and not isinstance(client.pane_activity(tab.pane_id), herdr.PaneAtShell):
-                    return ClaudeUp(identity, tab.pane_id, "unknown account", start_state=ClaudeStartState.ALREADY_RUNNING)
+            for pane in client.panes():
+                if pane["session_id"] == identity and not isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
+                    return ClaudeUp(identity, pane["pane_id"], "unknown account", start_state=ClaudeStartState.ALREADY_RUNNING)
             return sessions.SessionNotLive()
         if not observed.pids:
             return ResumeFailed(identity, "live Codex thread has no process account proof")
@@ -531,12 +538,18 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
 
 
 def _codex_name_ids(name: str) -> list[str]:
-    """Read exact names from one copy of the shared Codex index."""
+    """Keep a UUID or read exact names from the shared Codex index."""
+    from scripts.production import staff
+
+    try:
+        _ = staff.native_id(name)
+        return [name]
+    except staff.StaffRefused:
+        pass
     try:
         entries = [cast(dict[str, str], json.loads(line))
                    for line in (agent_accounts.codex_home() / "session_index.jsonl").read_text().splitlines() if line.strip()]
-        return ([name] if any(entry.get("id") == name for entry in entries) else
-                sorted({entry["id"] for entry in entries if entry.get("thread_name") == name}))
+        return sorted({entry["id"] for entry in entries if entry.get("thread_name") == name})
     except FileNotFoundError:
         return []
     except (OSError, ValueError) as error:
@@ -545,8 +558,10 @@ def _codex_name_ids(name: str) -> list[str]:
 
 
 def resume_account(kind: Literal["claude", "codex"], row: StaffRow | NoRoleAccount = NO_ROLE_ACCOUNT,
-                   *, to: str = "") -> accounts.AccountSelection | NoRoleAccount:
-    """Select the requested account or read the recipient's role account."""
+                   *, to: str | accounts.AccountSelection = "") -> accounts.AccountSelection | NoRoleAccount:
+    """Keep an account selection or select the requested label or role account."""
+    if isinstance(to, (accounts.NamedAccount, accounts.CodexWorkersAccount)):
+        return to
     if to:
         return (accounts.CodexWorkersAccount(to, agent_accounts.codex_account_home(to).home)
                 if kind == "codex" else accounts.NamedAccount(to, accounts.account_dir(to)))

@@ -104,10 +104,10 @@ MoveResult = ResumeResult | MoveHandedOff | StopFailed | ResumePending
 
 def claude_up_line(result: ClaudeUp) -> str:
     label = note_file.parse_account_label(result.account)
-    agent = "Codex" if isinstance(label, note_file.NumberedAccountLabel) and label.tool == "codex" else "Claude"
+    agent = f"{label.tool.capitalize()} " if isinstance(label, note_file.NumberedAccountLabel) else ""
     if result.start_state is ClaudeStartState.ALREADY_RUNNING:
-        return f"{result.session_id}: unchanged; {agent} runs on {result.account} in {result.pane_id}"
-    return (f"{result.session_id}: {agent} is up on {result.account} in {result.pane_id} "
+        return f"{result.session_id}: unchanged; {agent}runs on {result.account} in {result.pane_id}"
+    return (f"{result.session_id}: {agent + 'is ' if agent else ''}up on {result.account} in {result.pane_id} "
             + f"({result.elapsed_seconds:.1f} s)"
             + (f"; copied folder trust from {result.trust_copied_from}" if result.trust_copied_from else ""))
 

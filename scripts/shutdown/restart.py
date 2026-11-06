@@ -46,7 +46,7 @@ class WorkerRestore(Protocol):
 
 class MemberLifecycle(Protocol):
     def resume_account(self, kind: Literal["claude", "codex"], row: staff.StaffRow,
-                       *, to: str = "") -> accounts.AccountSelection | NoRoleAccount: ...
+                       *, to: str | accounts.AccountSelection = "") -> accounts.AccountSelection | NoRoleAccount: ...
     def stop(self, session: str, *, deadline: float) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
     def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
@@ -161,7 +161,7 @@ def pane_holds_other_work(client: herdr.Herdr, pane_id: str, identity: str) -> b
 
 
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
-              present: bool = False, target_account: str = "", deadline: float = math.inf,
+              present: bool = False, target_account: str | accounts.AccountSelection = "", deadline: float = math.inf,
               resolver: session_staff.RowResolver | None = None) -> str:
     with operation_deadline.within(deadline):
         if row.kind == "worker":

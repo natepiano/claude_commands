@@ -349,7 +349,7 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(output.getvalue().splitlines(), [f"launch names: staff is unavailable: {error}; saved names retained"])
 
     def test_up_lines_name_the_agent_from_the_account(self) -> None:
-        for label, agent in (("codex1", "Codex"), ("claude1", "Claude"), ("default", "Claude")):
+        for label, agent in (("codex1", "Codex"), ("claude1", "Claude")):
             with self.subTest(account=label):
                 started = stop_results.ClaudeUp("worker", "w1:p2", label, elapsed_seconds=2.5)
                 running = stop_results.ClaudeUp("worker", "w1:p2", label,
@@ -359,6 +359,14 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(stop_results.claude_up_line(running),
                                  f"worker: unchanged; {agent} runs on {label} in w1:p2")
 
+
+    def test_unnumbered_accounts_name_no_agent_in_either_result_state(self) -> None:
+        for label in ("default", "unknown account", "~/.codex"):
+            for state, text in ((ClaudeStartState.STARTED, f"up on {label} in w1:p2 (2.5 s)"),
+                                (ClaudeStartState.ALREADY_RUNNING, f"unchanged; runs on {label} in w1:p2")):
+                with self.subTest(account=label, state=state):
+                    result = stop_results.ClaudeUp("worker", "w1:p2", label, elapsed_seconds=2.5, start_state=state)
+                    self.assertEqual(stop_results.claude_up_line(result), f"worker: {text}")
 
     def test_resume_uses_the_group_account_unless_the_target_is_explicit(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
@@ -434,6 +442,24 @@ class StopResumeTests(unittest.TestCase):
               patch.object(stop_resume, "_resume_once", return_value=stop_resume.SessionNotFound(identity)) as once):
             _ = stop_resume.resume(identity)
         self.assertEqual(once.call_args.args[0], identity)
+
+    def test_claude_uuid_is_not_replaced_by_a_codex_thread_name(self) -> None:
+        identity = self.entry["session_id"]
+        other = self.saved_codex_name(identity)
+        self.assertNotEqual(identity, other)
+        with (patch.dict(os.environ, {"CODEX_HOME": str(self.root / ".codex2")}),
+              patch.object(stop_resume, "_resume_once", return_value=stop_resume.SessionNotFound(identity)) as once):
+            _ = stop_resume.resume(identity)
+        self.assertEqual(once.call_args.args[0], identity)
+        with patch.object(agent_accounts, "codex_home", side_effect=AssertionError("an id needs no index")):
+            self.assertEqual(stop_resume._codex_name_ids(identity), [identity])  # pyright: ignore[reportPrivateUsage]
+
+    def test_uuid_does_not_match_another_conversations_pane_label(self) -> None:
+        identity = self.entry["session_id"]
+        pane_record.save("agents", {})
+        self.client.rows[0].update(label=identity, agent_session={"kind": "id", "value": "another-conversation"})
+        tab = stop_resume._tab_of(identity, names=LaunchNames(staff.StaffSnapshot(())))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(tab, stop_resume.SessionNotFound(identity))
 
     def resume_codex_staff(self, observed: herdr.LiveConversation | herdr.UnknownConversation) -> tuple[stop_resume.ResumeResult, Mock, Mock, Mock, str]:
         identity = self.entry["session_id"]
@@ -544,26 +570,29 @@ class StopResumeTests(unittest.TestCase):
 
     def test_unknown_codex_thread_in_a_running_pane_does_not_start_again(self) -> None:
         identity = self.saved_codex_name()
-        self.client.rows.append({"pane_id": "w1:p2", "label": "saved-worker", "workspace_id": "w1",
-                                 "terminal_id": "worker-terminal", "session_id": identity})
-        with (patch.dict(os.environ, {"CODEX_HOME": str(self.root / ".codex2")}),
-              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
-                  {}, ("other-session (Codex thread unknown)",))),
-              patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))) as activity,
-              patch.object(self.client, "open_tab") as opened,
-              patch.object(herdr, "launch_prepared_agent") as launch,
-              redirect_stderr(io.StringIO()) as errors):
-            result = stop_resume.resume("saved-worker", to="codex1")
-        self.assertIsInstance(result, stop_resume.ClaudeUp)
-        assert isinstance(result, stop_resume.ClaudeUp)
-        self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)
-        self.assertEqual((result.session_id, result.pane_id), (identity, "w1:p2"))
-        activity.assert_called_once_with("w1:p2")
-        opened.assert_not_called()
-        launch.assert_not_called()
-        self.detach.assert_not_called()
-        self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
-        self.assertIn("other-session (Codex thread unknown)", errors.getvalue())
+        labels: tuple[dict[str, str | None], ...] = ({"label": "saved-worker"}, {}, {"label": None})
+        for label in labels:
+            with self.subTest(label=label):
+                self.client.rows[:] = [{"pane_id": "w1:p2", "workspace_id": "w1",
+                                        "terminal_id": "worker-terminal", "session_id": identity, **label}]
+                with (patch.dict(os.environ, {"CODEX_HOME": str(self.root / ".codex2")}),
+                      patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
+                          {}, ("other-session (Codex thread unknown)",))),
+                      patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))) as activity,
+                      patch.object(self.client, "open_tab") as opened,
+                      patch.object(herdr, "launch_prepared_agent") as launch,
+                      redirect_stderr(io.StringIO()) as errors):
+                    result = stop_resume.resume("saved-worker", to="codex1")
+                self.assertIsInstance(result, stop_resume.ClaudeUp)
+                assert isinstance(result, stop_resume.ClaudeUp)
+                self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)
+                self.assertEqual((result.session_id, result.pane_id), (identity, "w1:p2"))
+                activity.assert_called_once_with("w1:p2")
+                opened.assert_not_called()
+                launch.assert_not_called()
+                self.detach.assert_not_called()
+                self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
+                self.assertIn("other-session (Codex thread unknown)", errors.getvalue())
 
     def test_resume_of_a_running_codex_name_keeps_its_current_account(self) -> None:
         identity = self.saved_codex_name()
