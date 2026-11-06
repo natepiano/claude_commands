@@ -1164,7 +1164,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - A Linux-only lint error can appear later, at the merge gate. Builds accepted this risk.
 - `verify_cleanup` does not remove `MEND_LOG`, so each exit path of the mend loop removes it.
 
-### Phase 41f — Keep the offload settings tests off the live Mac lease  · status: todo
+### Phase 41f — Keep the offload settings tests off the live Mac lease  · status: done
 
 **Depends on:** Phase 41c.
 
@@ -1186,6 +1186,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Files:**
 - `scripts/mac_test/test_offload.py`
 - `scripts/mac_test/offload_test_support.py`
+- `scripts/mac_test/test_target_slots.py`
 
 **Workers:** 1 writer: merge16.
 
