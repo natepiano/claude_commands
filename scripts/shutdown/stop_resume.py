@@ -31,6 +31,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 
 import herdr
 from scripts.accounts import accounts, moves
+from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, operation_deadline
 from scripts.message import session_send
@@ -677,10 +678,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError) as error:
                 print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         if isinstance(tab, SessionNotFound):
-            workspace = row
-            while workspace is not None and workspace.kind != "showrunner":
-                workspace = names.tab_record.parent_of(workspace)
-            space = workspace.name if workspace is not None else entry["name"] or "agents"
+            space = herdr.row_workspace(row or STAFF_ROOT, names.tab_record, entry["name"])
             with herdr.restore_staff(names.tab_record, labels=names.labels):
                 pane = client.open_tab(space,
                     entry["name"] or identity, entry["cwd"], entry["environment"])

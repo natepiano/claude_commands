@@ -197,7 +197,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             environment = {"CODEX_HOME": str(selected.home)}
         if projected is not None:
             environment = {**names.environment(projected), **environment}
-        destination = client.saved_row_tab(str(row.id), row.name)
+        destination = client.saved_row_tab(str(row.id), row.name, herdr.row_workspace(row, record, row.name))
         prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
                                                       herdr.NO_ENVIRONMENT_REMOVALS)
         if isinstance(prepared, nix_env.Refused):

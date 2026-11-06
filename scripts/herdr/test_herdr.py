@@ -5824,7 +5824,7 @@ class RowTabTests(StaffTestCase):
             saved = herdr.layout_path("fixture").read_bytes()
             self.assertFalse(self.client.move_row_tabs(self.rows["unit"].id))
             self.assertEqual(herdr.layout_path("fixture").read_bytes(), saved)
-        self.assertEqual(self.client.saved_row_tab(self.rows["stopped"].id, self.rows["stopped"].name),
+        self.assertEqual(self.client.saved_row_tab(self.rows["stopped"].id, self.rows["stopped"].name, "fallback"),
                          herdr.NewTab(self.rows["parent"].name, self.rows["stopped"].name))
 
     def test_retitle_row_uses_native_sessions_despite_stale_marks_and_duplicate_titles(self) -> None:
@@ -6009,6 +6009,11 @@ class SavedLayoutTests(unittest.TestCase):
                 _ = client.open_tab(space, title, "/repo", {})
         return client
 
+    def test_saved_row_tab_uses_the_supplied_fallback_workspace(self) -> None:
+        client = LayoutHerdr()
+        self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
+                         herdr.NewTab("production", "unit"))
+
     def test_remember_row_tab_moves_its_saved_binding_to_the_new_workspace(self) -> None:
         client = LayoutHerdr()
         client.spaces = [("w-a", "workspace-a"), ("w-b", "workspace-b")]
@@ -6025,7 +6030,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual([(space["name"], tab["name"])
                           for space in herdr.saved_layout("fixture")["workspaces"] for tab in space["tabs"]],
                          [("workspace-b", row_id)])
-        self.assertEqual(client.saved_row_tab(row_id, "moving-row"),
+        self.assertEqual(client.saved_row_tab(row_id, "moving-row", "fallback"),
                          herdr.ExistingPane("pane-b", "terminal-p2"))
 
     def test_remember_row_tab_keeps_a_pending_row_before_the_restarted_row(self) -> None:

@@ -1487,7 +1487,7 @@ class Herdr:
             _ = _bind_row_tab(saved, workspace, row_id, target, max(0, index - 1))
             _write_layout(self.session, saved)
 
-    def saved_row_tab(self, row_id: str, title: str) -> NewTab | SplitPane | ExistingPane:
+    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str) -> NewTab | SplitPane | ExistingPane:
         """Find the saved row position and reuse only its terminal's shell."""
         saved = saved_layout(self.session)
         for space in saved["workspaces"]:
@@ -1510,7 +1510,7 @@ class Herdr:
                 if sibling is not None:
                     return SplitPane(json_text(sibling.get("pane_id"), "pane id"), "right", 0.5, title)
                 return NewTab(space["name"], title)
-        return NewTab(shared_session(), title)
+        return NewTab(fallback_workspace, title)
 
     def _retitle(self, row: dict[str, object], title: str, *, tab: bool) -> bool:
         changed = row.get("label") != title
@@ -2986,6 +2986,15 @@ def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str
     except FileNotFoundError:
         return SHARED_SESSION
     return name
+
+
+def row_workspace(row: staff.StaffRow | staff.StaffRoot, record: staff.StaffSnapshot, name: str) -> str:
+    """Use the showrunner workspace, then the supplied name, then the shared session."""
+    while isinstance(row, staff.StaffRow):
+        if row.kind == "showrunner":
+            return row.name
+        row = record.parent_of(row) or staff.STAFF_ROOT
+    return name or shared_session()
 
 
 def attach_hint(space: str, tab: str) -> str:

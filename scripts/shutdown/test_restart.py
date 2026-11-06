@@ -856,6 +856,29 @@ class RestartTests(ShutdownTestCase):
         self.assertIn(str(self.rows[0].current_session), self.running)
         self.assertEqual(errors.getvalue(), f"{self.rows[0].name}: restart anomaly: layout unavailable\n")
 
+    def test_unit_without_a_saved_tab_opens_in_its_parent_workspace(self) -> None:
+        self.running.clear()
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "production", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("parent-session"))
+        owner = staff.StaffRow(staff.StaffId("owner"), "agent", "owner", staff.ReportsTo(parent.id),
+                               current_session=staff.StaffId("owner-session"))
+        row = replace(self.rows[0], parent=staff.ReportsTo(owner.id))
+        record = staff.StaffSnapshot((parent, owner, row))
+        with (patch.object(pane_record, "publication_for_session", return_value=None),
+              patch.object(herdr, "saved_layout", return_value=herdr.SavedLayout(at=1, workspaces=[]))):
+            self.assertEqual(restart.start_row(row, record, herdr.Herdr("agents")), "w1:p0")
+        self.assertEqual(self.launches, [(row.name, herdr.NewTab(parent.name, row.name))])
+
+    def test_unit_with_a_saved_tab_keeps_its_saved_workspace(self) -> None:
+        self.running.clear()
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "production", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("parent-session"))
+        row = replace(self.rows[0], parent=staff.ReportsTo(parent.id))
+        with patch.object(pane_record, "publication_for_session", return_value=None):
+            self.assertEqual(restart.start_row(row, staff.StaffSnapshot((parent, row)),
+                                             herdr.Herdr("agents")), "w1:p0")
+        self.assertEqual(self.launches, [(row.name, herdr.NewTab("saved", row.name))])
+
     def test_saved_tab_reuses_only_the_targets_shell_and_splits_beside_a_sibling(self) -> None:
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"name": "unit-0", "seen": 1, "row_id": "row-0", "terminal_id": "own-terminal"}]}]}
@@ -874,13 +897,13 @@ class RestartTests(ShutdownTestCase):
         with (patch.object(herdr, "saved_layout", return_value=layout),
               patch.object(client, "result", side_effect=result),
               patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()) as activity):
-            self.assertEqual(client.saved_row_tab("row-0", "unit-0"), herdr.ExistingPane("w1:own", "own-terminal"))
+            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.ExistingPane("w1:own", "own-terminal"))
             activity.assert_called_once_with("w1:own")
             activity.return_value = herdr.PaneRunning(("codex",))
-            self.assertEqual(client.saved_row_tab("row-0", "unit-0"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
+            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
             layout["workspaces"][0]["tabs"][0]["terminal_id"] = "missing-terminal"
             activity.reset_mock()
-            self.assertEqual(client.saved_row_tab("row-0", "unit-0"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
+            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
             activity.assert_not_called()
 
     def test_held_sessions_saves_live_rows_and_tabs_and_keeps_pending_rows(self) -> None:

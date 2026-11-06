@@ -433,8 +433,8 @@ class RestoreStaffNamesTests(StaffTestCase):
             _ = directory
             return herdr.nix_env.NoEnvrc(dict(environment))
 
-        def saved_tab(identity: str, name: str) -> herdr.NewTab:
-            _ = identity
+        def saved_tab(identity: str, name: str, fallback_workspace: str) -> herdr.NewTab:
+            _ = identity, fallback_workspace
             return herdr.NewTab("demo", name)
 
         _ = self.enterContext(mock.patch.object(herdr.nix_env, "ensure", side_effect=no_envrc))
