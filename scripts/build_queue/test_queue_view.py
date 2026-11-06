@@ -11,12 +11,13 @@ import unittest
 from typing import Self, cast, override
 from unittest import mock
 
-from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun, IdleService, NotServiceSlice
+from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, LiveBuildRun, IdleService, RunningServiceJob, NotServiceSlice
 from scripts.build_queue import head_facts, queue_card, queue_view, queue_evidence
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import (
+    ci_step,
     ASKING_SESSION, GOLDEN, NOW, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
 from scripts.build_queue.queue_lines import json_form, plain, wrap
@@ -957,6 +958,27 @@ class CapViewTests(QueueFixtureTests):
             "Cap 22.0 GiB; anonymous use 5.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB")
         self.assertEqual(queue_evidence.keep_aside_text(room.runs[0]),
             "need 10.0 GiB; anonymous use 5.0 GiB; held slot 0.0 GiB; kept aside 5.0 GiB")
+
+    def test_view_and_cap_bar_include_ci_use_in_the_shared_cap(self) -> None:
+        model = self.fixture.cap_model()
+        policy = admission_policy_fixture()
+        inputs = self.fixture.inputs(policy=policy)
+        run = replace(inputs.running[0], promise=10 * gate.GIB,
+                      measured=gate.MeasuredMemory(5 * gate.GIB, anonymous=gate.AnonymousRunUse(5 * gate.GIB)))
+        ci = ci_step(4 * gate.GIB, RunningServiceJob(NOW - 60))
+        inputs = replace(inputs, running=(run, ci),
+            reservations=({**inputs.reservations[0], "need": 10 * gate.GIB},),
+            host=gate.HostMemory(20 * gate.GIB, 60 * gate.GIB))
+        reading = gate.queue_read_from(inputs, policy)
+        room = reading.explanation.room
+        assert isinstance(room, gate.MemoryRoom)
+        shown = plain(queue_view.render_view(replace(model, reading=reading), 140))
+        self.assertIn("cap 26.0", shown)
+        self.assertIn("Cap 26.0 GiB", queue_evidence.room_text(room))
+        bar = queue_view.cap_bar(room, 60, colour=True)
+        self.assertEqual(plain([bar[:9]]), "█" * 9)
+        self.assertEqual([span.tone for span in bar],
+            ["suggestion"] * 9 + ["warning"] * 12 + ["success"] * 5 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
 
     def test_unreadable_meminfo_reports_no_reading_instead_of_low_memory(self) -> None:
         _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)

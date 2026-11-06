@@ -136,9 +136,9 @@ only I can bump
 - Pressure (full avg10 > 5, or swap > 85% with some avg10 > 25) holds starts while it lasts. An unreadable reading also holds starts. The head line then says "pressure unreadable: <path>", and after `reading_alert_seconds` one message goes to the natedev session. The alert clears when readings return.
 - When a step of a running run (BUILDLOG_RUN identity) ends, its charge stays as the run's slot for `slot_gap_seconds`. The next step takes the slot at once, with no spacing and no order. A larger next step gets its extra before any waiting run when the extra fits the room with no pressure. A restart drops held slots; state.json holds no slot fields.
 - At most one new start each `recovery_start_seconds`, at all times; slot reuse is not a start. Estimate refresh uses `estimate_refresh_seconds`.
-- The queue view, card, build-why and memory page show used, kept aside, room, safety and other, and the **cap** (our use + free − safety), with the numbers of the last admission pass. The word "budget" is gone.
+- The queue view, card, build-why and memory page show used, kept aside, room, safety and other, and the **cap** (anonymous use + CI use + free − safety), with the numbers of the last admission pass. The word "budget" is gone.
 - `session_send_argv` lives in `scripts/message/session_send.py`. `SEND_SCRIPT` is its one patch point, and a sender test fails if it starts the real `send.py`. Admission code never imports `sweep`: that edge made an import cycle.
-- Outside test fixtures use `AdmissionFixture.occupy_host` for a host with a run of ours, `allow_next_start()` under `loop_turn()` between launches, and a complete calm pressure reading. An admission rule change runs every caller suite (direct `test_verify_*`, buildlog, hooks, merge admission) before the full gate.
+- Outside test fixtures use `AdmissionFixture.occupy_host` for a host with a run of ours and a complete calm pressure reading. An admission rule change runs every caller suite (direct `test_verify_*`, buildlog, hooks, merge admission) before the full gate.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — room, keep-aside, order, head protection, slots, spacing.
@@ -238,7 +238,7 @@ only I can bump
 
 **Ruled out:** one key for both uses; a `--memory-cap-mib` override beside config.
 
-### Phase 13 — A caller test's fake clock skips the start spacing when no caller run is live  · status: todo
+### Phase 13 — A caller test's fake clock skips the start spacing when no caller run is live  · status: done
 
 **Asked by:** the builds showrunner, 2026-11-05, from natest's simplify review. First item after 10x, before 10o.
 
@@ -246,12 +246,13 @@ only I can bump
 
 **Work:**
 1. First check: do the steps of one `verify.sh` run keep a live reservation or between-steps slot from step to step (Phase 11)? Record the answer with its evidence. If they do not, the rule in item 2 also removes the spacing inside one run; then stop and report to the director before you build item 2.
-2. In `ObservedAdmissionServer.handle_request` and `caller_admission` (`scripts/build_queue/admission_test_support.py`): when a caller fixture gets an `AdmitRequest` or `LaunchRequest` and no caller reservation, waiter or between-steps slot in force is live, move the fake clock to `NextStartAt.at`. The service keeps a slot after a caller's release while its run lives (`admission_service.py:1170`), so a slot counts as a live caller; test another request during that interval. Scenery reservations do not count as live callers.
+2. In `ObservedAdmissionServer.handle_request` and `caller_admission` (`scripts/build_queue/admission_test_support.py`): when a caller fixture gets an `AdmitRequest` or `LaunchRequest` and no caller reservation, waiter or between-steps slot in force is live, skip the spacing with `ReadyToStart()` without moving the fake clock. The service keeps a slot after a caller's release while its run lives (`admission_service.py:1170`), so a slot counts as a live caller; test another request during that interval. Scenery reservations do not count as live callers.
 3. `caller_admission` gets an opt-out for tests that check the spacing. Name each test that uses it.
 4. `allow_next_start()` takes `loop_turn()` itself (`loop_access` is an RLock). Delete every `with loop_turn(): allow_next_start()` copy (4 today). `test_record.py:845` and `test_memory_admit.py:4574` call it without the lock today; they now get it.
 5. Do not set `recovery_start_seconds=0`. Do not mock the admission result.
+6. **One cap number (builds ruling, 2026-11-05).** The queue's own text (build-why, `/build:queue`, page text) and its cap bar use the same cap as the page bar, the one that includes CI use. `MemoryRoom` gets `ci_use`. Cap = anonymous use + CI use + free - safety. Room, shortfall, kept memory and admission do not change. The CI term is left out of the text at 0, and output with no CI use stays byte-identical.
 
-**Proof:** measure `test_verify_lint_judgment.py`, `test_verify_cache_versions.py` and `test_verify_token_loss.py` before and after, on the same load. natest's manual advance measured 219.8 -> 204.5 s, 116.3 -> 112.8 s and 11.8 -> 9.5 s. Run every `caller_admission()` caller suite.
+**Proof:** measure `test_verify_lint_judgment.py`, `test_verify_lint_cache_versions.py` and `test_verify_lint_cache_token_loss.py` before and after, on the same load. natest's manual advance measured 219.8 -> 204.5 s, 116.3 -> 112.8 s and 11.8 -> 9.5 s. Run every `caller_admission()` caller suite.
 
 **Overlap:** natest's plan (`docs/plans/builds-natest.md` step 7) puts one `allow_next_start()` advance in `merge_gate_test_support.run_gate`. After 13, that advance is not needed; tell natest the builds commit.
 
@@ -383,26 +384,25 @@ only I can bump
 
 **Acceptance gate:** copies and hook suites pass; basedpyright 0/0/0. Change-Review: a command that the guard refused now runs.
 
-### Phase 17 — copies.py list shows remote mirrors, and copies.py starts without an object scan  · status: todo
+### Phase 17 — copies.py list shows remote mirrors  · status: todo
 
-**Depends on:** 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items.
+**Depends on:** 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items. The copy start object scan moved to natest's copies.py Git-work speed phase (builds, 2026-11-05). On `copies.py` the second lander resolves.
 
 #### Work Order
 
-**Goal:** `copies.py list` answers who holds a mirror, and a copy start does no full object scan.
+**Goal:** `copies.py list` answers who holds a mirror.
 
 **Spec:**
 1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
-2. **Start.** Remove the initial `git rev-list --objects --all` scan (0.39 s per `verify.sh doc`). Rebuild `.git` once when fetch or checkout reports object damage. Preserve the exclusive checkout lease and the damaged-index recovery tests.
-3. **Proof.** List tests for remote-only records and mixed local and remote records. Measure the documentation-run cost before and after, and state both numbers in the summary.
+2. **Proof.** List tests for remote-only records and mixed local and remote records.
 
 **Files:**
-- `scripts/copies/copies.py` — the list and the start.
+- `scripts/copies/copies.py` — the list.
 - `scripts/copies/test_copies.py` — the tests.
 
 **Workers:** `1 writer + 1 tester`.
 
-**Acceptance gate:** copies and verify documentation suites pass; basedpyright 0/0/0. Change-Review: `copies.py list` output.
+**Acceptance gate:** copies suites pass; basedpyright 0/0/0. Change-Review: `copies.py list` output.
 
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 

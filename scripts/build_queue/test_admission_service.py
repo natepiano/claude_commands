@@ -79,7 +79,7 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             requests = [fixture.request(owner=fixture.fixture_owner(1000 + index, str(index)))
                         for index in range(64)]
-            with fixture.serving(), fixture.loop_turn():
+            with fixture.loop_turn():
                 for request in requests:
                     _ = fixture.server.handle_request(request)
                 fixture.server.persist()

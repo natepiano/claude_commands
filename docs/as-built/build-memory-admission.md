@@ -116,10 +116,8 @@ After a restart, the service restores live run places and removes ended run plac
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
 
-Each admitted run keeps aside `max(0, accepted need − anonymous use)`, plus its held slots.
-Room equals host free memory minus the 3 GiB safety minus run keep-asides minus the CI keep-aside.
+[Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.
 The first two minutes use the same calculation. A run never counts its use twice.
-The cap equals admitted anonymous use plus host free memory minus the safety.
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
@@ -421,14 +419,15 @@ CI RAM and unowned scopes reduce host free memory. They do not create a run prom
 The service reads that value once with the other policy values.
 `AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
 `MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
+`MemoryRoom.ci_use` stores readable CI use separately from admitted anonymous use.
 `MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
 Idle CI and unavailable CI readings add no CI keep-aside.
 CI RAM already reduces host free memory. The room calculation never subtracts it again.
 The service does not require `memory.max` for admission.
-The cap remains anonymous use plus free memory minus safety.
+[Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the cap.
 The cap text names the CI keep-aside within kept memory.
-The page shows CI RAM outside the cap and the CI keep-aside beside it, before the cap.
-Neither CI part increases the page's taken total for admitted runs.
+The page shows CI use and the CI keep-aside inside the cap.
+The page includes both CI amounts in its taken total. Room and admission do not change.
 `RunningServiceJob` and `IdleService` retain the CI job state.
 Anonymous scope counters use the same measure as the history peaks.
 Missing anonymous counters keep the full accepted need aside and make the cap unavailable.
@@ -960,7 +959,7 @@ The nix-darwin job is a separate deployment step.
 `memory_room` calculates room from one captured admission pass.
 For each admitted run, kept bytes equal `max(0, selected need − anonymous use)` plus held slot bytes.
 Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
-The cap equals our anonymous use plus free memory minus safety. It does not limit an estimate.
+The cap equals our anonymous use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
 The first eligible run follows queue priority, first run arrival, and PID.

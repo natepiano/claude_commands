@@ -4,7 +4,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission
 
 from scripts.lint import memory_admit as gate
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
@@ -15,7 +15,6 @@ import os
 import signal
 import shlex
 import shutil
-import sys
 import select
 import subprocess
 import tempfile
@@ -174,9 +173,7 @@ esac
         write_pressure_reading(pressure)
         # Interpreter selection is independent of token ownership. Seed the
         # shim's normal cache once rather than rediscovering Python per test.
-        interpreter = self.root / "cache" / "claude" / cache_file_name()
-        interpreter.parent.mkdir()
-        _ = interpreter.write_text(sys.executable + "\n")
+        seed_interpreter_cache(self.root / "cache")
         memory_event = self.root / "memory-event.py"
         _ = memory_event.write_text(
             "import os, sys\nfrom pathlib import Path\n"
