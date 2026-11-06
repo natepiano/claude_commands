@@ -990,7 +990,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
 
         parent = fixture_member("showrunner", name="receiving")
         production = Production(self.checkout / "receiving-production.md", "receiving", "main",
-                                self.checkout, self.checkout / "production.log", ZoneInfo("UTC"))
+                                self.checkout, self.checkout / "production.log", ZoneInfo("UTC"), parent)
         request = transfer_unit.UnitTransfer(self.owner, parent, production, "source")
         lock = self.staff_file.parent / "rows" / f"{self.owner.id}.lock"
         def move_projection(*_arguments: object, **_options: object) -> None:

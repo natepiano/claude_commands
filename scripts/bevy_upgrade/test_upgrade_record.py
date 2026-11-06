@@ -43,7 +43,9 @@ class RecordTests(unittest.TestCase):
     @override
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.production = Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"))
+        self.production = Production(Path(), "demo", "demo", Path(), Path(), ZoneInfo("UTC"),
+                                     staff.StaffRow(staff.StaffId(""), "showrunner", "demo", staff.StaffRoot(),
+                                                    current_session=staff.StaffId("")))
         self.current_pins = pins.Pins((), frozenset(), ())
 
     @override

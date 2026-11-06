@@ -135,6 +135,11 @@ class LogBackupTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(len(self.names()), copied)
 
+    def test_an_unknown_staff_id_keeps_the_check_unsuccessful(self) -> None:
+        result = self.run_script(["zsh", str(CHECK), "00000000-0000-4000-8000-000000000000"])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.names(), [])
+
     def test_a_failed_copy_never_changes_the_check_s_answer(self) -> None:
         self.write_doc("running", log_field=False)
         result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])

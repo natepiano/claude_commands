@@ -909,7 +909,7 @@ def _review_names(record: PauseRecord) -> frozenset[str]:
     names: set[str] = set()
     for name in record.instances:
         if name.startswith("showrunner-"):
-            owner = showrunners.owner_for(name.removeprefix("showrunner-"))
+            owner = showrunners.owner_for_timer(notifier_root() / name)
             if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
                 names.add(owner.name)
     return frozenset(names)

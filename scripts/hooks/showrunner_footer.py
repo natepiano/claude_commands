@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from update_registration import ReportItem as ReportItem, reports_path as reports_path
 from update_registration import QuestionStaff
 from scripts.production import showrunners, staff
+from scripts.shutdown.remote import local_machine
 
 DAILIES = Path(__file__).resolve().parent.parent / "production" / "dailies_render.py"
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
@@ -46,6 +47,7 @@ class Production:
     doc: Path
     zone: str
     schedule: ScheduledDailies | NoDailiesSchedule
+    owner: staff.StaffRow
 
 
 def key_values(path: Path) -> dict[str, str]:
@@ -92,15 +94,16 @@ def targeted_instances(session_id: str) -> list[Path]:
 
 def production_doc(instance_dir: Path) -> Path | None:
     """Read the timer owner's document from staff."""
-    owner = showrunners.owner_for(key_values(instance_dir / "conf")["TARGET"].removeprefix("session:"))
+    owner = showrunners.owner_for_timer(instance_dir)
     return owner.doc.path if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else None
 
 
 def read_production(instance_dir: Path) -> Production | None:
     try:
-        doc = production_doc(instance_dir)
-        if doc is None:
+        owner = showrunners.owner_for_timer(instance_dir)
+        if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
             return None
+        doc = owner.doc.path
         lines = doc.read_text().splitlines()
         status = next((match.group(1) for line in lines if (match := STATUS.search(line))), None)
         if status != "running":
@@ -113,7 +116,7 @@ def read_production(instance_dir: Path) -> Production | None:
             state = {}
         schedule = (ScheduledDailies(int(state["NEXT_DUE"])) if state.get("ENABLED") == "1"
                     else NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
-        return Production(showrunners.owner_for(key_values(instance_dir / "conf")["TARGET"].removeprefix("session:")).name, doc, zone, schedule)
+        return Production(owner.name, doc, zone, schedule, owner)
     except (OSError, ValueError, ZoneInfoNotFoundError, KeyError):
         return None
 
@@ -131,14 +134,10 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
         return None
     count = 0
     for production in {production.name: production for production in productions}.values():
-        try:
-            owner = identities.owner(production.doc)
-        except RegistrationFailure as error:
-            print(f"questions: unavailable — {error}", file=sys.stderr)
+        owner = production.owner
+        if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) or owner.doc.machine != local_machine():
+            print(f"questions: unavailable — {production.doc}: no showrunner staff row", file=sys.stderr)
             continue
-        except staff.StaffRefused as error:
-            print(f"questions: unavailable — {error}", file=sys.stderr)
-            return None
         try:
             items = read_open_items(outstanding_path(owner.id, identities=identities),
                                     document=production.doc, identities=identities)

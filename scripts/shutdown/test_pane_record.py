@@ -450,7 +450,7 @@ class PaneRecordTests(unittest.TestCase):
             self.records.mkdir(parents=True, exist_ok=True)
             path = self.records / "agents.json"
             _ = path.write_text(json.dumps({"old": old, "new": retained}))
-            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, new)))
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources((old, new)))
             with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
                   mock.patch.object(sessions, "running_sessions", return_value=[])):
                 self.assertEqual(len(session_staff.repair_marks()), 1)
@@ -508,7 +508,7 @@ class PaneRecordTests(unittest.TestCase):
             damaged = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", {}, ["claude"])
             self.records.mkdir(parents=True)
             _ = (self.records / "agents.json").write_text(json.dumps({"old": old, "w1:p2": damaged}))
-            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, damaged)))
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources((old, damaged)))
             with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
                   mock.patch.object(sessions, "running_sessions", return_value=[])):
                 self.assertEqual(len(session_staff.repair_marks()), 1)
@@ -525,27 +525,23 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
     def test_restored_unit_id_comes_from_the_staff_row(self) -> None:
-        from scripts.production import staff, session_staff, showrunners
+        from scripts.production import staff, session_staff
 
         parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
         owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", staff.ReportsTo(parent.id), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
-        source = showrunners.ShowrunnerSource(
-            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), "# Production — demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {"CLAUDE_CODE_SESSION_ID": owner.current_session}, ["claude"])
         membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
-            session_staff.MemberSources({"demo": source}, ()))
+            session_staff.MemberSources(()))
         self.assertEqual(membership.environment(entry), {"CLAUDE_CODE_SESSION_ID": owner.current_session})
 
     def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
-        from scripts.production import staff, session_staff, showrunners
+        from scripts.production import staff, session_staff
 
         owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
-        source = showrunners.ShowrunnerSource(
-            showrunners.Timer("demo", "session:019b3a40-4250-7000-8000-000000000102", self.root / "demo.md", "UTC"), "# demo\n")
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {
             ('' + 'SHOWRUNNER_' + 'UNIT'): "former", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "demo"}, ["claude"])
         membership = session_staff.LaunchMembership(staff.StaffSnapshot((owner,)),
-            session_staff.MemberSources({"demo": source}, ()))
+            session_staff.MemberSources(()))
         repaired = membership.environment(entry)
         self.assertEqual(repaired, {"CLAUDE_CODE_SESSION_ID": owner.current_session})
         entry["environment"] = {**entry["environment"], **repaired}
