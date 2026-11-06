@@ -213,6 +213,7 @@ hold_before_mend_check() {
             ;;
     esac
 }
+set -o functrace
 trap hold_before_mend_check DEBUG
 ''')
         self.write_executable(self.runner, RUNNER_STUB.replace(
