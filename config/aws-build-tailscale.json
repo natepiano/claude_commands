@@ -2,5 +2,5 @@
   "devices": {"$natedev": "natedev", "$mac": "nates-macbook-pro-2023"},
   "tagOwners": {"tag:build-aws": ["autogroup:admin"]},
   "acls": [{"action": "accept", "src": ["$natedev", "$mac"], "dst": ["tag:build-aws:22"]}],
-  "ssh": [{"action": "accept", "src": ["autogroup:member"], "dst": ["tag:build-aws"], "users": ["natepiano"]}]
+  "ssh": [{"action": "accept", "src": ["autogroup:member"], "dst": ["tag:build-aws"], "users": ["natepiano", "root"]}]
 }
