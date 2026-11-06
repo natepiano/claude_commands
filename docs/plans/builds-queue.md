@@ -317,6 +317,35 @@ only I can bump
 
 **Change-Review:** none — the notice carries the measured start times.
 
+### Phase 21 — Each moved admission name has one import path  · status: todo
+
+**Depends on:** 10o, and resources 0dfe65382 on the builds branch, because that branch conflicts in `memory_admit.py`. Source: builds showrunner, 2026-11-06 02:2x EST (design call).
+
+#### Work Order
+
+**Goal:** A name that phase 10o moved has one import path, its defining module. No caller reads it through `memory_admit`.
+
+**Spec:**
+
+1. **The rule (builds, 2026-11-06).** "The owner of a move switches every caller, and the old path goes." Phase 10o left 230 names re-exported from `memory_admit`, so one name has two import paths.
+2. **Callers.** A static walk on `136497f98` found 39 files that read a moved name through `memory_admit`. Each one imports it from `scripts/build_queue/admission_records.py`, `scripts/build_queue/step_estimator.py`, `scripts/build_queue/system_clock.py` or `scripts/lib/test_phase.py`. Run the walk again on the phase's merged tree; other units' landings change the list.
+3. **Test patches.** A `mock.patch` target on a moved name names the defining module. A patch that changes a name the code reads through another module keeps its effect; the tests prove it.
+4. **`memory_admit`.** Each `from x import A as A` form goes. `memory_admit` imports only the names it uses. A name it does not use leaves its import.
+5. **The frozen file.** `scripts/buildlog/mac_idle.py` gets the one import change, by builds' ruling on 2026-11-06. The notice names it on its also-touches line.
+6. **Behavior.** Replies, wire shapes, stored records, config keys and printed text do not change. No assertion changes.
+7. **Proof.** A one-off walk in the phase's folder prints no caller of a moved name through `memory_admit`, and the notice carries that result. Add no new import test: a new check goes to the user first. All caller suites pass. The client start measurement stays: `release` still loads no `memory_admit`.
+
+**Files:** the 39 files of item 2, as the walk lists them on the merged tree, and:
+- `scripts/lint/memory_admit.py`
+
+**Workers:** `1 writer + 1 tester`
+- `impl2` — production callers and `memory_admit.py`.
+- `test2` — test files and test support, patch targets, and the walk.
+
+**Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file and each caller module.
+
+**Change-Review:** none — no behavior changes.
+
 ### Phase 10h — A memory wait names what holds it  · status: todo
 
 **Depends on:** 10z and 10x (it rewrites the admission client and service).
@@ -326,12 +355,12 @@ only I can bump
 3. **The JSON.** One tagged form: `{"kind":"session","session_id":…,"session_name":…}`, `{"kind":"unit","unit":…}` or `{"kind":"none"}`.
 4. **The holder.** A step that waits behind the protected waiter names that waiter, from the order hold the pass records. A continuation that asks for extra memory can stand before the ordinary first in line; then it is the protected waiter. The first in line, waiting for room, names the running run with the largest charge (use plus keep-aside), counted over grouped runs (`MemoryRoom.runs`) and held slots. Read the charge the pass records: `RunKeepAside.memory` holds 10k's look-ahead value, not a frozen need. CI use (`MemoryRoom.ci_use`, Phase 13) is in the cap, not in the room or the runs, so an unregistered CI job is never a holder.
 5. **Causes that name no holder.** Pressure, an unreadable reading, start spacing and estimate refresh name `{"kind":"none"}`, never an unrelated running run.
-6. **Recorded holder.** The pass picks a tagged holder and records it. `AdmissionWaitSnapshot` holds only running steps today, so the holder is a new tagged field. `AdmissionWaitSnapshot` goes to the client on the wire (`Wait.snapshot`, `admission_protocol.py:174`), and `queue.json` version 5 covers only `QueueInputs` and policy (`queue_snapshot.py:28`), so a disk version does not protect a waiting client. The holder is a defaulted field, as `MemoryRoom.ci_use` is: a reply from a service that has not restarted decodes as `{"kind":"none"}`. Tests: a new client reads a reply with no holder field; a client from the installed code keeps its wait through a reply with the field, and the notice names what a running waiter does at the service restart. When `QueueInputs` also changes shape, raise the `queue.json` version; an old version reads as `NoQueueSnapshot` until the next pass, so it needs no conversion program.
+6. **Recorded holder.** The pass picks a tagged holder and records it. Define the tagged holder beside `AdmissionWaitSnapshot` in `scripts/build_queue/admission_records.py:1267` (Phase 10o moved it from `memory_admit.py`; architect review of 15 and 10o, 2026-11-06). `AdmissionWaitSnapshot` holds only running steps today, so the holder is a new tagged field. `AdmissionWaitSnapshot` goes to the client on the wire (`Wait.snapshot`, `admission_protocol.py:174`), and `queue.json` version 5 covers only `QueueInputs` and policy (`queue_snapshot.py:28`), so a disk version does not protect a waiting client. The holder is a defaulted field, as `MemoryRoom.ci_use` is: a reply from a service that has not restarted decodes as `{"kind":"none"}`. Tests: a new client reads a reply with no holder field; a client from the installed code keeps its wait through a reply with the field, and the notice names what a running waiter does at the service restart. When `QueueInputs` also changes shape, raise the `queue.json` version; an old version reads as `NoQueueSnapshot` until the next pass, so it needs no conversion program.
 7. **Proof.** Client and service tests for each kind, for grouped reservations and held slots, for each no-holder cause and for no repeat on an unchanged holder. verify-unit builds the reader in verify.sh.
-8. **Holder from the counted use (architect review of 10s, 2026-11-05).** Pick the holder from the recorded `MemoryRoom.runs`, which carry the use `run_memories` attributes (`memory_admit.py:3603`: a shared process counts once), never from raw reservation readings. A run whose `RunKeepAside.memory.use` is unavailable is charged its full keep-aside, the same rule the room uses; never count it as zero use. That state is not an unreadable host or pressure reading, which names `{"kind":"none"}`. Tests: overlapping process trees in both reservation orders give the same holder; a run with unavailable use and the largest full keep-aside is the holder.
+8. **Holder from the counted use (architect review of 10s, 2026-11-05).** Pick the holder from the recorded `MemoryRoom.runs`, which carry the use `run_memories` attributes (`memory_admit.py:1835`: a shared process counts once), never from raw reservation readings. A run whose `RunKeepAside.memory.use` is unavailable is charged its full keep-aside, the same rule the room uses; never count it as zero use. That state is not an unreadable host or pressure reading, which names `{"kind":"none"}`. Tests: overlapping process trees in both reservation orders give the same holder; a run with unavailable use and the largest full keep-aside is the holder.
 9. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:420` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `admission_client.py`, `admission_service.py`, the pass record in `memory_admit.py`; `test` owns their tests.
+**Workers:** `1 writer + 1 tester` — `impl` owns `admission_client.py`, `admission_service.py`, `admission_records.py`, `admission_protocol.py`, the pass record in `memory_admit.py`; `test` owns their tests.
 
 ### Phase 10k — Rust runs and merge gates keep aside memory by percent done  · status: done
 
@@ -403,27 +432,21 @@ only I can bump
 
 ### Phase 15 — A queue priority change stops blocking other queue requests while it reads the roster  · status: done
 
-**Depends on:** 14. Source: the 10x architect review; builds ruling, 2026-11-05: one small phase after 14.
+#### As-built
 
-#### Work Order
-
-**Goal:** Queue queries and releases stay responsive while a priority change reads the roster.
-
-**Spec:**
-1. **Cause.** `handle_request` builds a whole priority roster inside the service loop for each `PrioritySetRequest`. That read took 3.9 s after the roster fix and 28 s at the 2026-11-05 outage.
-2. **Fix.** The roster read does not hold the service loop. One loop thread still changes service state (Phase 10k item 9). Validation and replies stay the same.
-3. **Order (architect review of 13, 10k and 19, 2026-11-05; director call, one-line revert).** Today the handler saves the priority, the replay reply and the transition together (`admission_service.py:1336`). An asynchronous set must not finish after a later clear and restore the cleared priority. A roster read has a named pending state. Priority set, priority clear and head admission run one at a time, in the order they arrive; a later one waits behind the pending one. Queries and releases do not wait. Nothing about a pending request is saved, so a restart during the read leaves the priority unchanged, and the client retries with the same key.
-4. **Proof.** A test delays the roster read. A queue query and a release get their replies during the delay, and the priority change then gets today's reply. Tests: a clear that arrives during a set's read ends with no priority; a retry with the same key gets one reply; a restart during the read leaves the priority unchanged and the retry applies it.
+- A priority set reads the session roster on the daemon thread `priority-roster`. The service loop keeps serving queries and releases during the read. One loop thread still changes service state, and an eventfd (`priority_events`) in the epoll set wakes the loop when the read ends.
+- `QueueChange` covers priority set, priority clear and head admission. `handle_request` sends each one, after its replay check, to `_submit_queue_change`. `OrderedQueueChange(request, connections)` keeps arrival order, and a later change waits behind the pending one. Queries and releases do not wait.
+- `PendingPriorityRoster(change, result: Future)` or `NoPendingPriorityRoster` holds the pending state. `_finish_priority_roster` runs in `run_once` after the ready loop. A retry with the same key joins the pending change and gets one reply.
+- Nothing about a pending change is saved, so a restart during the read leaves the priority unchanged, and the client retries. `_complete_queue_change` refuses all clients of the change on `ValueError` or `TypeError`, with no replay record.
 
 **Files:**
-- `scripts/build_queue/admission_service.py` — the priority request path.
-- `scripts/build_queue/admission_test_support.py` — `completed_queue_change`.
-- `scripts/build_queue/test_admission_service.py` — the tests.
-- `scripts/build_queue/test_queue_view.py`, `scripts/lint/test_memory_admit.py` — callers of a priority change take the socket reply.
+- `scripts/build_queue/admission_service.py` — the pending change, the roster thread and the wake
+- `scripts/build_queue/admission_test_support.py` — `AdmissionFixture.completed_queue_change(request)`
+- `scripts/build_queue/test_admission_service.py` (`PendingPriorityTests`), `scripts/build_queue/test_queue_view.py`, `scripts/lint/test_memory_admit.py`
 
-**Workers:** `1 writer + 1 tester`.
+**Binds later work:** a retry connection attaches to a pending change before the roster read ends, so authorization covers `_submit_queue_change`. A test of a queue change uses `completed_queue_change`, because the reply comes after the loop finishes the read.
 
-**Acceptance gate:** queue and caller suites pass; basedpyright 0/0/0. Change-Review: none (the tests show it).
+**Ruled out:** a service lock; saving a pending change.
 
 ### Phase 16 — The copy guard refuses only what makes a repository tree  · status: todo
 
@@ -438,6 +461,7 @@ only I can bump
 2. **Fix.** Parse valid Python whose string holds nested quotes. A form with no tree-making operation passes. An input the guard cannot read gets a message that names what it cannot read, and the message names `copies.py` only for a tree-making operation.
 3. **Keep.** Each tree-making form in `test_copy_guard.py` stays refused. Change an assertion only for a form item 1 names, and state why in the summary.
 4. **Proof.** One regression test for each form in item 1, with the real hook command text.
+5. **Command list (architect review of 15 and 10o, 2026-11-06).** Before dispatch, the director writes `<phase folder>/refused_commands.md`: each complete command and its expected result, with the failing Python bodies, the expanded heredoc and the `sed` loop. Today the corpus has only a simple `sed` read (`test_copy_guard.py:145`). The prompt names this file.
 
 **Files:**
 - `scripts/copies/copy_guard.py`, `scripts/copies/shell_syntax.py` — the parser and the messages.
@@ -513,7 +537,7 @@ only I can bump
 **Depends on:** 10m.
 
 1. **The ask.** C959 (above): retire /build:queue once the page covers it.
-2. **The change.** List what /build:queue shows and confirm the page shows each item, the 10m wait states included. Then remove the command and the view code that only it uses. Shared formatters stay: `admission_service.py` imports `queue_view.reason_phrase`, and the card uses other queue_view formatters. The queue card and the unit-board queue pane stay unless the user says otherwise.
+2. **The change.** List what /build:queue shows and confirm the page shows each item, the 10m wait states included. Then remove the command and the view code that only it uses. Keep each formatter that a current caller uses: the card uses queue_view formatters. `admission_service.py:32` imports `reason_phrase` from `admission_records`, and `queue_view.py:10` only re-exports it, so that re-export is no reason to keep view code (architect review of 15 and 10o, 2026-11-06). The queue card and the unit-board queue pane stay unless the user says otherwise.
 3. **Proof.** No caller of the removed code remains; the suites pass.
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `commands/build/queue.md`, `scripts/build_queue/build_queue.py` and the view code that only it uses; `test` owns `scripts/build_queue/test_build_queue.py`, the golden files it alone reads and the suites of the shared formatters.
@@ -525,14 +549,14 @@ only I can bump
 1. **The ask (user, 2026-11-04; builds assigned it to queue-unit).** "do they actually still follow the queue rules and they just get in because they're so small? i don't recall ever seeing one waiting in line." They do not: Python test runs and scripts in `builds.slice` never ask the queue. The queue counts them only after they start.
 2. **Evidence.** At 11:30 EST on 2026-11-04 the memory page showed 56 such runs holding 3.1 GiB, 27.0 of a 24.0 GiB budget taken, while startup's nextest waited.
 3. **The change.** One entry point starts every run in `builds.slice`, and it asks the queue first. A small run gets in at once when room exists and waits when it does not. No other code starts a `builds.slice` scope.
-4. **Callers.** Find each place that starts a run in `builds.slice` (today: `mesh_runs.py`, `merge_gate.py`, `lint/invoke.sh`, `build_hold/cargo`, `memory_admit.py` popen, and others the design finds). Switch every caller in the same change. Name each outside owner in the notice's also-touches line; `merge_gate.py` is sdlc devtools-unit's.
-5. **Full tests (user, 2026-11-04: "seems like they deserve different names - the one that unit runs is not the merge gate"; "go full tests").** `merge_gate.py --tests-only`, a unit's run on its own copy, is one caller of the entry point with step `full-tests`, shown as "full tests". A showrunner's merge, test and push stays `merge-gate`. Every place keyed by the `merge-gate` kind (config keys, build folder prefixes, need history, views, reports) handles `full-tests`; `program_peak_estimate` takes a merge gate's first need from config and never from history (`memory_admit.py:1656`), so `full-tests` gets the same branch and a new key `program_first_peak_gib.full-tests`, at 4 GiB; a new key needs no user go. `reservation_profile_key` (`:3697`) gives `merge-gate` its own key form with the gate shape (`merge_gate_shape`, `:209`, reads `--type-dirs` in the argv), and `full-tests` takes the same form. No profile moves to `full-tests` (director call, one-line revert): until a `full-tests` profile has samples, the run keeps the full need. Tests: a first `full-tests` run gets the configured need; a `merge-gate` profile does not size a `full-tests` run; a test-only run and a run with types keep separate profiles. Renaming or deleting a `merge-gate` config key needs the user's approval, so `program_first_peak_gib.merge-gate` and `peak_hold_seconds.merge-gate` stay. A default gate has no type job; `--nightly` runs it. Builds, 2026-11-04: build it on sdlc devtools-unit Phase 7p once 7p is on main, and trial-merge origin/sdlc before the notice.
+4. **Callers.** Find each place that starts a run in `builds.slice` (today: `mesh_runs.py`, `merge_gate.py`, `lint/invoke.sh`, `build_hold/cargo`, `QueuePlace.popen` (`queue_place.py:270`), and others the design finds). Switch every caller in the same change. Name each outside owner in the notice's also-touches line; `merge_gate.py` is sdlc devtools-unit's.
+5. **Full tests (user, 2026-11-04: "seems like they deserve different names - the one that unit runs is not the merge gate"; "go full tests").** `merge_gate.py --tests-only`, a unit's run on its own copy, is one caller of the entry point with step `full-tests`, shown as "full tests". A showrunner's merge, test and push stays `merge-gate`. Every place keyed by the `merge-gate` kind (config keys, build folder prefixes, need history, views, reports) handles `full-tests`; `program_peak_estimate` takes a merge gate's first need from config and never from history (`step_estimator.py:256`, moved by Phase 10o; architect review of 15 and 10o, 2026-11-06), so extend that first-peak branch: `full-tests` gets the same branch and a new key `program_first_peak_gib.full-tests`, at 4 GiB; a new key needs no user go. `reservation_profile_key` (`memory_admit.py:1862`) gives `merge-gate` its own key form with the gate shape (`merge_gate_shape`, `memory_admit.py:289`, reads `--type-dirs` in the argv), and `full-tests` takes the same form. No profile moves to `full-tests` (director call, one-line revert): until a `full-tests` profile has samples, the run keeps the full need. Tests: a first `full-tests` run gets the configured need; a `merge-gate` profile does not size a `full-tests` run; a test-only run and a run with types keep separate profiles. Renaming or deleting a `merge-gate` config key needs the user's approval, so `program_first_peak_gib.merge-gate` and `peak_hold_seconds.merge-gate` stay. A default gate has no type job; `--nightly` runs it. Builds, 2026-11-04: build it on sdlc devtools-unit Phase 7p once 7p is on main, and trial-merge origin/sdlc before the notice.
 6. **Nested calls.** Some callers are wrappers around programs that already ask the queue. A nested call reuses the reservation of the call around it: one run gets one charge and never waits on its own request.
 7. **Proof.** Tests: with another admitted run or a held slot present, a run with no room waits in line and shows on the queue (on an empty host an oversized run starts alone, so that case proves nothing); a small run with room starts at once; a nested call gets no second charge and does not block itself; no caller starts a `builds.slice` scope outside the entry point. Live check: the memory page shows no "worker background runs" row that skipped the line.
 
 8. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:420` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 
-**Workers:** `1 writer + 1 tester` — `impl` owns the entry point, `memory_admit.py`, `scripts/agents/mesh_runs.py` and the shared `scripts/build_queue/queue_place.py` entry path; outside callers by owner: sdlc devtools-unit (`merge_gate.py`), verify-unit (`verify.sh` paths), aws-unit (target paths); `test` owns the tests.
+**Workers:** `1 writer + 1 tester` — `impl` owns the entry point, `memory_admit.py`, `scripts/build_queue/step_estimator.py`, `scripts/agents/mesh_runs.py` and the shared `scripts/build_queue/queue_place.py` entry path; outside callers by owner: sdlc devtools-unit (`merge_gate.py`), verify-unit (`verify.sh` paths), aws-unit (target paths); `test` owns the tests.
 
 ### Phase 1 — /build:queue answers in under a second, one line per step, and says why each step waits  · status: done
 
@@ -1014,19 +1038,24 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **CI look-ahead (user, 2026-11-05, via builds; see 10k item 12).** The CI cargo front sets `CARGO_TERM_PROGRESS_WHEN=always` and `CARGO_TERM_PROGRESS_WIDTH` and feeds the counter, so each CI reservation keeps aside by the 10k look-ahead rule. Set them on the child only, as `buildlog_exec_with_progress` does (`scripts/lint/invoke.sh:316`): `scripts/direct/tree_watch.py:235` puts every `CARGO_*` name into the build key, so a shell export changes the CI build key. A CI call with no counter or no profile keeps its full need. `CaptureReader.counter` skips an unreadable registration and returns `NoCounter` (`progress_profile.py:301`, `:327`), so name the owner and permissions of the counter files. The account-boundary test proves that a runner account's counter reaches the service and that its profile is used. Test: a CI reservation with a profile keeps aside only the use inside the look-ahead window.
 
-**CI accounting transition (architect review of 10q, 2026-11-05).** Today `ci_keep_aside` (`memory_admit.py:1884`) adds the configured margin whenever any CI job runs, and it does not look at reservations. Before any key deletion or `MemoryMax` change:
+**CI accounting transition (architect review of 10q, 2026-11-05).** Today `ci_keep_aside` (`memory_admit.py:729`) adds the configured margin whenever any CI job runs, and it does not look at reservations. Before any key deletion or `MemoryMax` change:
 1. A running CI job with a registered reservation is charged only through its reservation.
 2. The CI keep-aside applies only while a running CI job has no registered reservation.
 3. Tests: registered jobs only (no keep-aside), unregistered jobs only (keep-aside as today), and a mix (the keep-aside once, plus each registered reservation).
-   **One count in the cap (Phase 13).** `MemoryRoom.ci_use` sums readable `UnownedSliceMemory` service rows (`inputs_room`, `memory_admit.py:3747`), and `used` holds anonymous use. A registered job's use counts once in the cap: `ci_use` holds only unregistered CI use. Test: a registered CI job and an unregistered CI job give one cap, with each job's use counted once.
+   **One count in the cap (Phase 13).** `MemoryRoom.ci_use` sums readable `UnownedSliceMemory` service rows (`inputs_room`, `memory_admit.py:1912`), and `used` holds anonymous use. A registered job's use counts once in the cap: `ci_use` holds only unregistered CI use. Test: a registered CI job and an unregistered CI job give one cap, with each job's use counted once.
 4. **Order of the deletion (director call, one-line revert).** 10d keeps `ci_memory_margin_gib` and this mixed rule until natedev confirms the runner activation, because a CI job has no reservation before that. The key deletion is 10d's last change, after that confirmation. Name it in the 10d notice: builds asks the user before the merge, because a config key deletion needs the user's approval (builds, 2026-11-05). A job the front cannot cover then has no keep-aside, and `MemoryMax=34G` is its limit.
 
 **Current references (architect review of 10q).** `CleanupTiming` exists (`admission_protocol.py:178`), and `admission_client.py:507` accepts it for release with no config read. Authorization targets today: `_run_place()` (`admission_service.py:765`), replay lookup (`admission_service.py:1267`) and peer credentials (`admission_service.py:1468`, where the UID is read and then discarded). These replace the older line numbers in the constraints above. Keep the tests that deny every local config and history read through the whole runner acquisition.
 
+**Current references (architect review of 15 and 10o, 2026-11-06).** Phase 10o moved the estimate and configuration code, and Phase 15 added a pending priority path.
+1. The client calls `step_estimator.step_estimate` (`step_estimator.py:850`). `admission_records.read_memory_config` (`admission_records.py:1130`) owns configuration reads. A test patches each name in its defining module.
+2. **Acquisition timing.** The unreachable deadline starts only with `MemoryConfig` (`admission_client.py:465`). `CleanupTiming` (`admission_protocol.py:178`) has no unreachable limit, so a fixed transport option built on it can wait forever through accepted connections that send no reply. Add named acquisition timing, separate from cleanup timing. Tests: repeated closed connections reach the deadline; a valid reply recovers; cleanup timing stays separate.
+3. **Pending priority authorization.** `_submit_queue_change` (`admission_service.py:1361`) matches a pending request id and attaches a retry connection before the roster read ends. The authorization constraint above covers this path. Test: another account's retry against a pending request is refused. Priority tests use `completed_queue_change` (`admission_test_support.py:547`). Keep arrival order and restart behavior.
+
 **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:420` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 
 **Workers:** `1 writer + 1 tester` (natedev owns the NixOS activation)
-- `impl` — the CI cargo front, the service authorization and estimate path, the client package entry; hub: `scripts/build_queue/admission_service.py`
+- `impl` — the CI cargo front, the service authorization and estimate path, the client package entry, `scripts/build_queue/step_estimator.py`, `scripts/build_queue/admission_records.py`; hub: `scripts/build_queue/admission_service.py`
 - `test` — the runner-account fixtures, the authorization denial tests, the estimate-without-home test and the two-job ordering test
 
 **Acceptance.** Two hana CI jobs that cannot fit together under the admission checks run one after the other, and two that fit run at the same time, shown in `/build:queue` with the CI label; no CI rustc dies at the slice cap. Change-Review: in the Build queue pane during a hana CI run, the CI step shows as "hana CI · <runner> · <job>" and waits behind a session build when memory is short.
