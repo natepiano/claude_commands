@@ -1,35 +1,30 @@
 #!/usr/bin/env python3
-"""Promote a running unit director to the showrunner of its own production, under this showrunner.
+"""Promote a unit director and restore its retained workers under the same staff id.
 
-Usage: promote_showrunner.py <unit> --production <child production doc> --model <id> --effort <level> [--check]
-
-The parent showrunner runs it, once the unit has written the child's production doc and committed it.
-The unit gets `/exit`; once its Claude is gone its herdr tab is closed, and add_showrunner.py resumes
-the same conversation as the child's showrunner: in a tab of the shared herdr session, with no unit mark, on the configured showrunners account,
-attached to this showrunner's production. Its staff row becomes the child's showrunner row.
---check runs every refusal and stops nothing.
-
-Exit 0 when the promoted session runs as the child's showrunner and is attached; 1 when the unit was
-stopped and the promotion did not finish, with what to run printed; 2 on a refusal, with nothing stopped.
+The parent showrunner runs this command after the unit commits the child production document.
+The shared stop keeps conversations and worker rows for restore.
+The configured showrunner account resumes the director as the child's showrunner.
+The completion receipt follows worker restore.
+Use --check to inspect the promotion without stopping sessions.
 """
 from __future__ import annotations
 
 
 import argparse
 import json
-import os
 import shlex
 import subprocess
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import completion_receipt, staff, staff_sources, unit_config
-from scripts.shutdown import remote
+from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
+from scripts.shutdown import remote, stop_resume
+from scripts.lib import conf, operation_deadline
+from time import monotonic
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -42,11 +37,9 @@ import unit_lookup
 import sessions
 import unit_runs
 import herdr
-from session_pane import HerdrFailure, read_place, type_place, where_place
+from session_pane import HerdrFailure, read_place
 from scripts.production.production_doc import Production, Refusal, read_production
 
-STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
-POLL_S = 0.5
 
 
 class Promotion(NamedTuple):
@@ -204,36 +197,16 @@ def finish_child(promotion: Promotion, target: Path, pending: Path, pid: int) ->
     return showrunners.main(["attach", promotion.child.slug, promotion.parent.slug])
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def stop(promotion: Promotion) -> bool:
-    """Type `/exit` and end its host session once Claude is gone; False when it outlived STOP_WAIT_S.
-
-    Two processes on one session corrupt it, so nothing may resume it while this one runs.
-    """
-    place = promotion.marked.place
-    try:
-        type_place(place, "/exit", target=promotion.claude.session_id)
-    except (OSError, HerdrFailure) as error:
-        raise Refusal(f"cannot type /exit into {promotion.unit}'s pane: {error}") from error
-    deadline = time.monotonic() + STOP_WAIT_S
-    while _alive(promotion.claude.pid):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(POLL_S)
-    try:
-        herdr.close_agent(place.session, place.pane)
-    except HerdrFailure as error:
-        raise Refusal(f"cannot end {promotion.unit}'s session: {error}") from error
-    return True
+    """Stop the director and retain its workers for the promoted holder."""
+    record = staff.snapshot()
+    row = record.by_member_reference(promotion.claude.session_id)
+    settings = conf.read("shutdown")
+    deadline = monotonic() + settings.number("STOP_GRACE_SECONDS") + settings.number("KILL_GRACE_SECONDS")
+    with operation_deadline.within(deadline):
+        _ = stop_resume.stop_unit_workers(row.id, record) if row is not None else []
+        result = stop_resume.stop(promotion.claude.session_id, deadline=deadline)
+    return isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning))
 
 
 def showrunner_account_directory() -> Path:
@@ -301,7 +274,6 @@ def _main(argv: list[str]) -> int:
         print(f"check: ok — would stop {unit} (herdr {promotion.marked.place.session}), resume it as the showrunner of "
               + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and preserve its native row; {moved}")
         return 0
-    old_member = staff_sources.member(staff_sources.UnitMember(promotion.parent.slug, promotion.unit), record)
     parent_member = staff_sources.member(staff_sources.ShowrunnerMember(promotion.parent.slug), record)
     parent_row = parent_member.row if isinstance(parent_member, staff_sources.MemberFound) else None
     if parent_row is None:
@@ -313,23 +285,15 @@ def _main(argv: list[str]) -> int:
         save_promotion(promotion, target_directory)
     try:
         current = unit_lookup.labeled_session(promotion.parent.slug, unit) if was_pending else promotion.marked
-        if current is not None and isinstance(current.claude, unit_lookup.ClaudeUnknown):
-            raise Refusal(f"cannot tell whether {unit} still runs: {current.claude.reason}")
-        if current is not None and isinstance(current.claude, unit_lookup.LiveClaude):
-            if current.claude.session_id != promotion.claude.session_id:
-                raise Refusal(f"{unit} now runs a different conversation; kept its promotion record")
-            stopped = stop(promotion._replace(marked=current, claude=current.claude))
-        else:
-            if current is not None:
-                herdr.close_agent(current.place.session, current.place.pane)
-            stopped = True
+        if current is not None and isinstance(current.claude, unit_lookup.LiveClaude) and current.claude.session_id != promotion.claude.session_id:
+            raise Refusal(f"{unit} now runs a different conversation; kept its promotion record")
+        stopped = stop(promotion._replace(marked=current, claude=current.claude)
+            if current is not None and isinstance(current.claude, unit_lookup.LiveClaude) else promotion)
     except Refusal as refusal:
         print(f"promote_showrunner: {refusal}", file=sys.stderr)
         return 2
     if not stopped:
-        print(f"{unit}'s Claude (pid {promotion.claude.pid}) still runs {STOP_WAIT_S:g} s after /exit, so nothing "
-              + f"was restarted. Its pane is {where_place(promotion.marked.place)}; read it with "
-              + f"`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read session {promotion.claude.session_id}`.")
+        print(f"{unit}: stop is not proved; promotion remains pending")
         return 1
     native = staff.native_id(promotion.claude.session_id)
     name = showrunners.herdr_space(slug, str(promotion.child.doc))
@@ -367,12 +331,8 @@ def _main(argv: list[str]) -> int:
               + f"Bring it back as the unit it was with: {restore_line(promotion)}")
         return 1
     code = finish(promotion, started, moved)
-    if isinstance(old_member, staff_sources.MemberFound):
-        workers = staff.find(kind="worker", parent=old_member.row.id)
-        for worker in workers:
-            print(f"kept worker {worker.id} {worker.name} under {old_member.row.name}")
-        if workers:
-            return 1
+    if code == 0:
+        code = int(worker.restore(new_member.row.id))
     if code == 0:
         fields = cast(dict[str, object], json.loads(pending.read_text(encoding="utf-8")))
         completion_receipt.write_receipt(pending.with_suffix(".done.json"), new_member.row.id, fields)

@@ -14,28 +14,60 @@ from scripts.usage import agents_log
 
 if TYPE_CHECKING:
     from scripts.shutdown.inventory import PausedSeat
+    from scripts.production import staff
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
+class NoAccountMove:
+    """Keep the current account."""
+
+
+@dataclass(frozen=True)
+class AccountMove:
+    source: str
+    destination: str
+
+
+@dataclass(frozen=True)
+class IdleWorker:
+    """The worker has no active dispatch."""
+
+
+@dataclass(frozen=True)
+class BusyPass:
+    dispatch_id: str
+
+
+@dataclass(frozen=True)
+class PaneWorkerResume:
+    staff_id: staff.StaffId
+    turn: BusyPass | IdleWorker
+
+
+@dataclass(frozen=True)
 class ResumeWorkers:
-    """Existing worker threads and their work directory, for the opening message."""
-    seats: Sequence[PausedSeat]
-    cwd: str
+    seats: Sequence[PausedSeat] = ()
+    cwd: str = ""
+    panes: Sequence[PaneWorkerResume] = ()
 
 
-NO_WORKERS = ResumeWorkers((), "")
+NO_ACCOUNT_MOVE = NoAccountMove()
+NO_WORKERS = ResumeWorkers()
 
 
-def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | None = None,
+def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_MOVE,
                    workers: ResumeWorkers = NO_WORKERS, context: str = "") -> str:
     lines: list[str] = []
     if why or context:
-        move = f" You were moved from {moved_from} to {moved_to}." if moved_to else ""
-        opening = context or f"You were stopped and resumed because {why}.{move} Continue where you stopped."
+        moved = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
+        opening = context or f"You were stopped and resumed because {why}.{moved} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
-                     + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
+                     + "for retained messages. Continue the work. If you waited for the user, continue to wait.")
+    for pane in workers.panes:
+        turn = f"busy dispatch {pane.turn.dispatch_id}" if isinstance(pane.turn, BusyPass) else "idle"
+        lines.append(f"Worker {pane.staff_id}: {turn}. Continue with this worker's existing conversation.")
     if workers.seats:
         lines.append("Resume your Codex workers; do not open new ones.")
         for seat in workers.seats:
@@ -46,11 +78,7 @@ def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | N
                              + f"Your next dispatch with --to {seat['seat']} resumes it.")
         lines.append("Each command resumes the worker's existing thread.")
         lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
-    elif why:
-        lines.append("Codex workers keep their existing threads. Use implement.sh --to <worker> or "
-                     + "codex_mesh.py resume for a paused worker; do not open a replacement thread.")
-    text = ("\n" if workers.seats else " ").join(lines)
-    return script_prompt(text)
+    return script_prompt(("\n" if workers.seats or workers.panes else " ").join(lines))
 
 
 def _resume_phase_id(seat: PausedSeat) -> str:

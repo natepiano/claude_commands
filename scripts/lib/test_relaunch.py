@@ -116,6 +116,18 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(stdout.count("restarting fixture on its target account\n"), 1)
         self.assertFalse(request.exists(), "a consumed request could launch twice")
 
+    def test_resume_message_names_busy_dispatch(self) -> None:
+        from scripts.lib.resume_message import AccountMove, BusyPass, IdleWorker, PaneWorkerResume, ResumeWorkers, resume_message
+        from scripts.production import staff
+
+        workers = ResumeWorkers(panes=(PaneWorkerResume(staff.StaffId("busy-id"), BusyPass("dispatch-id")),
+                                      PaneWorkerResume(staff.StaffId("idle-id"), IdleWorker())))
+        text = resume_message("a shutdown", move=AccountMove("source", "destination"), workers=workers)
+        self.assertIn("moved from source to destination", text)
+        self.assertEqual(text.count("Worker busy-id: busy dispatch dispatch-id"), 1)
+        self.assertEqual(text.count("Worker idle-id: idle"), 1)
+        self.assertNotIn("implement.sh", resume_message("a shutdown"))
+
     def test_child_environment_marks_supervision_without_changing_the_parent(self) -> None:
         program = self.root / ".local/bin/claude"
         program.parent.mkdir(parents=True)

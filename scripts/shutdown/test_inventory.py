@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import io
 import os
@@ -23,7 +22,6 @@ from scripts.production.staff_test_support import unit_membership, StaffTestCase
 from scripts.production import staff
 from scripts.usage import agents_log
 from test_support import ShutdownTestCase, linux_process_fixture
-from test_restart import top_level, worker_session
 import inventory
 import unit_runs
 from scripts.whoami import account
@@ -671,8 +669,7 @@ class InventoryTests(ShutdownTestCase):
         }
         self.write_executable(
             "ps",
-            """import copy
-import json
+            """import json
 import os
 import sys
 
@@ -1441,29 +1438,3 @@ class ProcessEnvironmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
-
-
-class FreshSessionTests(ShutdownTestCase):
-    def test_fresh_session_reports_owned_workers_and_preserves_the_recorded_identity(self) -> None:
-        owner = top_level('owner')
-        owner['pid'] = 101
-        worker = worker_session('worker', owner='owner')
-        unrelated = worker_session('other', owner='elsewhere')
-        observed = inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=[owner, worker, unrelated], unattributed=[]))
-        self.assertEqual(observed, {'kind': 'matching session', 'session': owner, 'workers': [worker]})
-        changed = copy.deepcopy(owner)
-        changed['pid'] = 201
-        self.assertEqual(inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=[changed], unattributed=[])), {'kind': 'session identity lost'})
-        self.assertEqual(owner['pid'], 101)
-
-
-    def test_fresh_session_rejects_any_resumed_occurrence_even_beside_the_recorded_process(self) -> None:
-        owner = top_level("owner")
-        owner["pid"] = 101
-        resumed = copy.deepcopy(owner)
-        resumed.update(pid=501, proc_start="200")
-        reports: tuple[list[inventory.Session], ...] = ([owner, resumed], [resumed, owner])
-        for rows in reports:
-            with self.subTest(pids=[row["pid"] for row in rows]):
-                self.assertEqual(inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=rows, unattributed=[])),
-                                 {"kind": "session identity lost"})

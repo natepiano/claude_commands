@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import herdr
 import restart
-from scripts.lib import operation_deadline
+from scripts.lib import conf, operation_deadline
 from scripts.production import staff
 from scripts.shutdown import stop_resume
 
@@ -139,8 +139,8 @@ class DeadlineTests(unittest.TestCase):
                 _ = herdr.run_program(["fake"])
         self.assertEqual(self.now, 110)
         with operation_deadline.within(math.inf):
-            self.assertEqual(operation_deadline.remaining(stop_resume.STOP_GRACE_SECONDS), 2)
-            self.assertEqual(operation_deadline.remaining(stop_resume.KILL_GRACE_SECONDS), 5)
+            self.assertEqual(operation_deadline.remaining(conf.read("shutdown").number("STOP_GRACE_SECONDS")), 2)
+            self.assertEqual(operation_deadline.remaining(conf.read("shutdown").number("KILL_GRACE_SECONDS")), 5)
 
 
 if __name__ == "__main__":

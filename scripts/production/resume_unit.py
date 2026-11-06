@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production import completion_receipt, staff, staff_sources, unit_config
+from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote
 from scripts.lib import conf
 from scripts.message import sessions
@@ -216,6 +216,9 @@ def resume(unit: RetiredUnit, record: staff.StaffSnapshot) -> int:
     launch(unit)
     if not resumed_session_proven(unit.production.slug, unit.name, unit.session_id, row):
         raise Refused(f"{unit.name}: resumed native session identity is not proven; parked facts kept")
+    code = worker.restore(row.id)
+    if code != worker.ExitCode.OK:
+        return int(code)
     print(f"{unit.name} resumed")
     completed = resume_record(unit.production, unit.name).with_suffix(".done")
     completion_receipt.write_receipt(completed, row.id, {"session_id": unit.session_id,
@@ -242,6 +245,9 @@ def _main(argv: list[str]) -> int:
                 and isinstance(completed.fields.get("session_id"), str)
                 and resumed_session_proven(unit.production.slug, unit.name,
                     cast(str, completed.fields["session_id"]), completed.owner)):
+            code = worker.restore(completed.owner.id)
+            if code != worker.ExitCode.OK:
+                return int(code)
             print(f"{unit.name} already resumed")
             return 0
         return dry_run(unit) if cast(bool, options.dry_run) else resume(unit, record)

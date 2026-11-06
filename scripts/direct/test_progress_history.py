@@ -116,6 +116,25 @@ class ProgressHistoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_active_dispatch_returns_saved_launcher(self) -> None:
+        from scripts.lib.atomic_file import write_text_atomic
+
+        parent = fixture_member("unit", name="active-holder", parent=fixture_member("showrunner", name="active-owner").id)
+        worker = fixture_worker("impl", parent.id)
+        run = self.root / "active-run"
+        path = run / "progress_history_state.json"
+        command = ["bash", "assign.sh", "a path with spaces"]
+        fields = {"pass": {"impl": {"status": "active", "instance_id": "same-pass", "worker_name": "impl", "launcher_command": command}}}
+        write_text_atomic(path, json.dumps(fields))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertEqual(progress_history.active_dispatch(worker.id, run), progress_history.ActiveDispatch("same-pass", tuple(command)))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        fields["pass"]["impl"]["status"] = "completed"
+        write_text_atomic(path, json.dumps(fields))
+        self.assertIsInstance(progress_history.active_dispatch(worker.id, run), progress_history.NoActiveDispatch)
+        write_text_atomic(path, "{broken")
+        self.assertIsInstance(progress_history.active_dispatch(worker.id, run), progress_history.ActiveDispatchUnavailable)
+
     def test_review_trial_counts_rerun_findings_as_code(self) -> None:
         self.write_full_config()
         session = self.start_run("rerun-findings", 71_000)

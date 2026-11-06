@@ -11,14 +11,14 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, final, override
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import worker_panes
 from scripts.direct import progress_history
 from scripts.production import staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
 
@@ -112,10 +112,12 @@ class WorkerCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = pane_fixtures.WorkerPaneTests("runTest")
         self.fixture.setUp()
+        self.fixture.world.binary = "/nonexistent/herdr"
         self.addCleanup(self.fixture.doCleanups)
         self.agent = DispatchAgent(self.fixture)
         self.run_dir = self.fixture.root / "run"
         self.run_dir.mkdir(exist_ok=True)
+        atomic_file.write_text_atomic(self.run_dir / "worker_transport", "herdr\n")
         self.prompt = self.run_dir / "prompt.md"
         atomic_file.write_text_atomic(self.prompt, "Read the source and preserve its behavior.\n")
         self.reply = self.run_dir / "reply.md"
@@ -145,6 +147,62 @@ class WorkerCommandTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = worker.main(list(args))
         return code, output.getvalue(), errors.getvalue()
+
+    def test_restore_rerun_after_agent_resume(self) -> None:
+        opened = self.opened()
+        _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+            worker_name="impl", launcher_command=["bash", "assign.sh", "saved argument"], prompt=self.prompt, kind="impl", lens="")
+        active = progress_history.active_dispatch(opened.row.id, self.run_dir)
+        self.assertIsInstance(active, progress_history.ActiveDispatch)
+        assert isinstance(active, progress_history.ActiveDispatch)
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
+        with patch.object(worker, "_resume_launcher", side_effect=OSError("interrupted before launcher")):
+            self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.UNCERTAIN)
+        launches = len(self.fixture.world.launches)
+        with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
+            self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
+        resume.assert_called_once_with(opened.row, self.run_dir, active)
+        self.assertEqual(len(self.fixture.world.launches), launches)
+        self.assertEqual(self.agent.submitted, [])
+        self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
+
+    def test_launcher_recovery_runs_the_saved_command_from_the_restored_director(self) -> None:
+        opened = self.opened()
+        active = progress_history.ActiveDispatch("saved-pass", ("bash", "assign.sh", "argument with spaces"))
+        client = worker._client()  # pyright: ignore[reportPrivateUsage]
+        director = herdr.TabSession("director-pane", "unit", "workspace", str(self.fixture.parent.current_session))
+        with (patch.object(self.fixture.world, "tab_sessions", return_value=[director]),
+              patch.object(herdr, "check_target", return_value=True) as target,
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as start):
+            self.assertEqual(worker._resume_launcher(opened.row, self.run_dir, active), worker.ExitCode.OK)  # pyright: ignore[reportPrivateUsage]
+        args = cast(list[str], start.call_args.args[0])
+        self.assertIn("mesh_runs.py", args[1])
+        self.assertEqual(args[2:7], ["start", "--session-dir", str(self.run_dir), "--to", opened.row.name])
+        prompt = args[-2]
+        self.assertIn("Run this saved command from your session shell: bash assign.sh 'argument with spaces'", prompt)
+        self.assertIn("saved-pass", prompt)
+        self.assertIn("director-pane", args)
+        self.assertNotIn(opened.pane, args)
+        target.assert_called_once_with(str(self.fixture.parent.current_session), action="keys",
+            place=herdr.HerdrPlace(client.session, director.pane_id), text=prompt, client=ANY)
+        with (patch.object(self.fixture.world, "tab_sessions", return_value=[]), patch.object(subprocess, "run") as start):
+            self.assertEqual(worker._resume_launcher(opened.row, self.run_dir, active), worker.ExitCode.UNCERTAIN)  # pyright: ignore[reportPrivateUsage]
+        start.assert_not_called()
+
+    def test_resume_workers_names_the_active_pass_and_idle_worker(self) -> None:
+        from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume
+
+        busy = self.opened()
+        idle = self.opened("review", "review")
+        self.fixture.dispatch(busy.row, "impl")
+        path = self.run_dir / "progress_history_state.json"
+        fields = {"pass": {"impl": {"status": "active", "instance_id": "dispatch-impl", "worker_name": "impl", "launcher_command": ["assign.sh", "same command"]}}}
+        atomic_file.write_text_atomic(path, json.dumps(fields))
+        with patch.object(unit_runs, "held", return_value=[str(self.run_dir)]):
+            result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
+        self.assertEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
+                                       PaneWorkerResume(idle.row.id, IdleWorker())])
+        self.assertEqual(result.seats, [])
 
     def test_later_user_message_keeps_the_submitted_assignment_receipt(self) -> None:
         self.agent.interrupt = "prompt"
@@ -223,7 +281,7 @@ class WorkerCommandTests(unittest.TestCase):
                 failed = True
                 raise herdr.HerdrFailure("restore layout unavailable")
             return request(method, **params)
-        with patch.object(self.fixture.world, "socket_request", side_effect=fail_one_layout):
+        with patch.object(self.fixture.world, "socket_request", side_effect=fail_one_layout), patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK):
             with redirect_stderr(io.StringIO()) as errors:
                 code = worker.restore(self.fixture.parent.id)
         self.assertEqual(code, worker.ExitCode.UNCERTAIN)
@@ -232,7 +290,8 @@ class WorkerCommandTests(unittest.TestCase):
                    if isinstance(state, worker_panes.OpenWorker)}
         self.assertIn(second.row.id, resumed)
         before = len(self.fixture.world.launches)
-        self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
+        with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK):
+            self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
         self.assertEqual(len(self.fixture.world.launches), before)
 
     def test_fast_dispatch_writes_reply_without_changing_the_prompt(self) -> None:
@@ -441,12 +500,13 @@ class WorkerCommandTests(unittest.TestCase):
     def test_start_refusal_retains_the_active_role_and_worker(self) -> None:
         opened = self.opened()
         self.fixture.dispatch(opened.row, "impl")
+        before = self.fixture.staff_state()
         with redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(self.dispatch(role="review"), worker.ExitCode.REFUSED)
-        self.assertIn("role change blocked by active work", errors.getvalue())
-        self.assertIn("active dispatch has another role", errors.getvalue())
+            code = self.dispatch(role="review")
+        self.assertEqual(int(code), 2)
+        self.assertEqual(errors.getvalue(), "role change blocked by active work: active dispatch has another role\n")
         self.assertEqual(self.agent.submitted, [])
-        self.assertIsNotNone(staff.by_id(opened.row.id))
+        self.assertEqual(self.fixture.staff_state(), before)
 
     def test_dispatch_follows_the_current_native_session_after_replacement(self) -> None:
         row = self.fixture.worker("impl")

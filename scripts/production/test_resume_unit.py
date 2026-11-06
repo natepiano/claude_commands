@@ -57,6 +57,14 @@ def git(where: Path, *arguments: str) -> str:
 
 @final
 class ResumeUnitTests(unittest.TestCase):
+    def test_resume_restores_retained_workers(self) -> None:
+        from scripts.production import worker
+
+        with mock.patch.object(worker, "restore", return_value=worker.ExitCode.OK) as restore:
+            code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        restore.assert_called_once()
+
     def test_resume_restores_the_staff_location(self) -> None:
         code, output = self.resume()
         self.assertEqual(code, 0, output)
@@ -111,6 +119,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        write_text_atomic(self.root / "shutdown.conf", (CHECKOUT / "config/shutdown.conf").read_text())
         _ = (self.root / "production.conf").write_text((CHECKOUT / "config/production.conf").read_text())
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         origin = self.root / "origin.git"

@@ -21,6 +21,7 @@ from unittest.mock import Mock, patch
 
 from test_support import ShutdownSendLeaf, ShutdownTestCase
 import shutdown
+from scripts.shutdown import restart, shutdown_record
 import inventory
 from scripts.production import staff
 from scripts.agents import codex_mesh
@@ -85,6 +86,17 @@ def setUpModule() -> None:
 
 @final
 class ShutdownStatusTests(ShutdownTestCase):
+    def test_record_precedes_worker_window(self) -> None:
+        row = staff.StaffRow(staff.StaffId("retained-worker"), "worker", "impl", staff.STAFF_ROOT,
+                             current_session=staff.StaffId("native-worker"))
+        record = staff.StaffSnapshot((row,))
+        def window(selected: staff.StaffSnapshot) -> None:
+            self.assertIs(selected, record)
+            self.assertEqual(shutdown_record.read(), [row.id])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(restart, "live_rows", return_value=[row]), patch.object(shutdown, "wait_for_workers", side_effect=window)):
+            self.assertEqual(shutdown.main(["held-sessions"]), 0)
+
     def test_readiness_names_a_running_worker_and_waits_until_its_turn_ends(self) -> None:
         row = staff.StaffRow(staff.StaffId("worker-row"), "worker", "test-worker", staff.StaffRoot(),
                              current_session=staff.StaffId("current-thread"))

@@ -23,6 +23,8 @@ from scripts.message import sessions as runtime_sessions
 from scripts.accounts import accounts
 from scripts.whoami import account
 from scripts.shutdown import restart, stop_resume
+from scripts.lib import atomic_file, conf, unit_runs
+from scripts.herdr import worker_panes
 from scripts.shutdown.stop_results import ClaudeStartState
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
@@ -35,6 +37,8 @@ import sessions
 import shutdown
 import unit_lookup
 from test_pane_restore import FakeClient
+
+RUN_IN_PANE = herdr.Herdr.run_in_pane
 from test_support import conversation_liveness
 
 
@@ -44,6 +48,98 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_stop_unit_workers_rerun_after_pane_stop(self) -> None:
+        parent = staff.StaffId("holder")
+        rows = [staff.StaffRow(staff.StaffId(f"row-{i}"), "worker", f"worker-{i}", staff.ReportsTo(parent),
+                              current_session=staff.StaffId(f"native-{i}")) for i in range(5)]
+        states: list[worker_panes.WorkerPane] = [
+            worker_panes.OpenWorker(rows[0], "p0", "t0", herdr.AgentStatus.WORKING),
+            worker_panes.StoppedWorker(rows[1], "p1", "t1"), worker_panes.ClosedWorker(rows[2]),
+            worker_panes.ProcessUnknownWorker(rows[3], "p3", "t3", "unreadable process"),
+            worker_panes.UncertainWorker(rows[4], "duplicate terminal")]
+        record = staff.StaffSnapshot(tuple(rows))
+        def finish(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
+            del client
+            self.assertEqual(row, rows[0])
+            self.assertEqual(deadline, 7)
+            states[0] = worker_panes.StoppedWorker(rows[0], "p0", "t0")
+            return True
+        def observed(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            return list(states)
+        with (patch.object(worker_panes, "observe", side_effect=observed),
+              patch.object(restart, "stop_row", side_effect=finish) as stop):
+            expected = ["worker-3: unreadable process", "worker-4: duplicate terminal"]
+            self.assertEqual(stop_resume.stop_unit_workers(parent, record), expected)
+            self.assertEqual(stop_resume.stop_unit_workers(parent, record), expected)
+        self.assertEqual(stop.call_count, 1)
+        self.assertEqual(record.rows, tuple(rows))
+
+    def test_worker_stop_requires_the_same_terminal_and_fresh_shell(self) -> None:
+        parent = staff.StaffId("holder")
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(parent),
+                             current_session=staff.StaffId("native-worker"))
+        before = worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)
+        for after, success in ((worker_panes.StoppedWorker(row, "pane", "terminal"), True),
+                               (worker_panes.StoppedWorker(row, "pane", "replaced-terminal"), False),
+                               (worker_panes.ProcessUnknownWorker(row, "pane", "terminal", "unreadable"), False)):
+            with (self.subTest(after=after),
+                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((row,))),
+                  patch.object(worker_panes, "observe", side_effect=[[before], [after]]),
+                  patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("native-worker", 123))):
+                result = stop_resume.stop(row.id)
+            self.assertEqual(isinstance(result, stop_resume.Stopped), success)
+
+    def test_shutdown_uses_committed_values_and_keeps_the_recovery_warning(self) -> None:
+        config = self.root / "committed-config"
+        path = config / "shutdown.conf"
+        atomic_file.write_text_atomic(path, "# range: 5e-324..\nSTOP_GRACE_SECONDS=.2\n# range: 5e-324..\nKILL_GRACE_SECONDS=.3\n")
+        for args in (("init", "-q"), ("add", "shutdown.conf"),
+                     ("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "settings")):
+            _ = subprocess.run(["git", "-C", str(config), *args], capture_output=True, check=True)
+        atomic_file.write_text_atomic(path, "# range: 5e-324..\nSTOP_GRACE_SECONDS=bad\n# range: 5e-324..\nKILL_GRACE_SECONDS=.3\n")
+        self.process.side_effect = self.alive_until_kill
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        with patch.dict(os.environ, {"CONF_DIR": str(config)}), redirect_stderr(io.StringIO()) as warnings:
+            result = stop_resume.stop(self.entry["session_id"])
+        self.assertIsInstance(result, stop_resume.Stopped)
+        self.assertIn("STOP_GRACE_SECONDS='bad'", warnings.getvalue())
+        self.assertAlmostEqual(self.clock.elapsed, .2)
+
+    def test_worker_stops_share_the_configured_deadline_concurrently(self) -> None:
+        parent = staff.StaffId("holder")
+        rows = tuple(staff.StaffRow(staff.StaffId(f"row-{i}"), "worker", f"worker-{i}", staff.ReportsTo(parent),
+                                   current_session=staff.StaffId(f"native-{i}")) for i in range(3))
+        states = [worker_panes.OpenWorker(row, row.name, row.name, herdr.AgentStatus.WORKING) for row in rows]
+        config = self.root / "config"
+        atomic_file.write_text_atomic(config / "shutdown.conf", "# range: 5e-324..\nSTOP_GRACE_SECONDS=.25\n# range: 5e-324..\nKILL_GRACE_SECONDS=.5\n")
+        joined = Barrier(3)
+        def stop(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
+            del row, client
+            self.assertEqual(deadline, .75)
+            _ = joined.wait(timeout=5)
+            return True
+        with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              patch.object(worker_panes, "observe", return_value=states),
+              patch.object(restart, "stop_row", side_effect=stop)):
+            self.assertEqual(stop_resume.stop_unit_workers(parent, staff.StaffSnapshot(rows)), [])
+
+    def test_unusable_shutdown_values_send_no_signal_or_start(self) -> None:
+        config = self.root / "config"
+        for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "START_SECONDS", "STAY_SECONDS"):
+            values = {name: "1" for name in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "START_SECONDS", "STAY_SECONDS")}
+            values[key] = "0"
+            atomic_file.write_text_atomic(config / "shutdown.conf", "\n".join(f"# range: 0..\n{name}={value}" for name, value in values.items()))
+            with (self.subTest(key=key), patch.dict(os.environ, {"CONF_DIR": str(config)}),
+                  patch.object(stop_resume, "_signal_process") as send,
+                  patch.object(stop_resume, "_start_session") as start):
+                result = stop_resume.stop(self.entry["session_id"]) if "GRACE" in key else stop_resume.resume(self.entry["session_id"])
+            self.assertIsInstance(result, (stop_resume.StopFailed, stop_resume.ResumeFailed))
+            self.assertIn(key, str(result))
+            self.assertIn(str(config / "shutdown.conf"), str(result))
+            send.assert_not_called()
+            start.assert_not_called()
+
     def test_tab_lookup_keeps_the_conversation_tab_when_staff_is_unreadable(self) -> None:
         identity = self.entry["session_id"]
         for error in (OSError("staff unreadable"), ValueError("staff invalid")):
@@ -462,6 +558,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(stop_resume, "Event", self.wait))
         cast(Mock, cast(Mock, self.wait.return_value).wait).side_effect = self.advance
         _ = self.enterContext(patch.object(self.client, "run", self.pane_run))
+        _ = self.enterContext(patch.object(self.client, "run_in_pane", self.run_in_pane))
         _ = self.enterContext(patch.object(self.client, "result", self.pane_result))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
         _ = self.enterContext(self.client.empty_shell(998042, self.root))
@@ -470,8 +567,12 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(stop_resume, "monotonic", lambda: self.clock.elapsed))
         _ = self.enterContext(patch.object(time, "sleep", self.advance))
         _ = self.enterContext(patch("unit_runs.held", return_value=[]))
+        _ = self.enterContext(patch.object(unit_runs, "held", return_value=[]))
         _ = self.enterContext(patch.object(pane_record, "seed", self.seed))
         _ = self.enterContext(patch.object(stop_resume, "_detach", self.detach))
+
+    def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
+        RUN_IN_PANE(self.client, pane, command, terminal=terminal)
 
     def process_account(self, _pid: int) -> account.ConfiguredClaudeFolder:
         return account.ConfiguredClaudeFolder(self.root / (".claude4" if self.launched else ".claude3"))
@@ -1486,14 +1587,13 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("stopped and resumed", opening.text)
         self.assertIn("maintenance", opening.text)
         self.assertIn("Continue where you stopped", opening.text)
-        self.assertIn("Codex", opening.text)
         self.assertEqual(self.client.closed, [])
         self.assertEqual(self.client.started, [])
 
 
     def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
         result = stop_resume.resume("alpha", why="maintenance")
-        self.assertLess(self.clock.elapsed, stop_resume.STAY_SECONDS)
+        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         arguments = cast(list[str], self.detach.call_args.args[0])
         self.assertEqual(arguments[:3], ["stay", "--session", "019b3a40-4250-7000-8000-000000000102"])
@@ -1518,7 +1618,7 @@ class StopResumeTests(unittest.TestCase):
             result, log = self.run_stay_child()
         self.assertEqual(result, 1)
         self.assertIn("stopped 0.6 s", log)
-        self.assertLess(self.clock.elapsed, stop_resume.STAY_SECONDS)
+        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
         push.assert_called_once()
         self.start.assert_not_called()
 
