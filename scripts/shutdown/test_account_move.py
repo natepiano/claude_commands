@@ -186,7 +186,7 @@ class AccountMoveTests(ShutdownTestCase):
             status, output, error = self.cli(session="remote-only")
         self.assertEqual((status, output), (0, ""))
         self.assertEqual(error, "accounts: anomaly: remote-only: no saved session was found\n")
-        moved.assert_called_once_with(["remote-only"], "claude3", why="finish account move")
+        moved.assert_called_once_with(["remote-only"], "claude3", why="finish account move", cause="by hand")
 
     def test_stopped_move_keeps_pending_outcome_then_rerun_reaches_resume(self) -> None:
         with (patch.object(inventory, "listing", return_value=[]),
@@ -295,7 +295,7 @@ class AccountMoveTests(ShutdownTestCase):
                   stop_resume.ClaudeUp("worker", "w1:p1", "claude3"),
                   stop_resume.SessionNotFound("missing")]) as batch):
             outcomes = accounts.move_sessions(("failed", "ok", "worker", "missing"), "claude3", why="retry")
-        batch.assert_called_once_with(["failed", "ok", "worker", "missing"], "claude3", why="retry")
+        batch.assert_called_once_with(["failed", "ok", "worker", "missing"], "claude3", why="retry", cause="by hand")
         self.assertEqual([accounts.move_result_line(item) for item in outcomes], [
             "failed: not moved: stop refused", "ok: Claude is up on claude3 in w1:p1 (0.0 s)",
             "worker: Claude is up on claude3 in w1:p1 (0.0 s)"])

@@ -141,6 +141,9 @@ class FolderMoveBackend:
             _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.fixture.owner.current_session}}) + "\n")
             descriptor.symlink_to(record)
 
+    def pane_row(self, pane: str) -> herdr.PaneIdentity | herdr.NoPane:
+        return next((row for row in self.panes() if row["pane_id"] == pane), herdr.NoPane(pane))
+
     def panes(self) -> list[herdr.PaneIdentity]:
         return [
             {"pane_id": "w1:p1", "terminal_id": "kept-terminal", "workspace_id": "w1",
