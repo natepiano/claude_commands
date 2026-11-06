@@ -135,6 +135,22 @@ class SidePaneTests(StaffTestCase):
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
         self.assertEqual(len(self.world.launches), 2)
 
+    def test_a_friend_launches_with_the_worker_permissions_for_both_families(self) -> None:
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                self.caller(family)
+                opened = side_pane.open("worker-policy-" + family, cwd=self.root)
+                self.assertIsInstance(opened, side_pane.OpenSidePane)
+                self.assertEqual(self.world.requests[-1][0], family)
+                arguments = self.world.requests[-1][1]
+                if family == "codex":
+                    self.assertEqual(arguments[arguments.index("--sandbox") + 1], "danger-full-access")
+                    self.assertEqual(arguments[arguments.index("--ask-for-approval") + 1], "never")
+                else:
+                    self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "bypassPermissions")
+                self.assertNotIn("read-only", arguments)
+                self.assertNotIn("plan", arguments)
+
     def test_claude_side_pane_ignores_the_codex_compaction_limit(self) -> None:
         config = self.root / "conf/direct.conf"
         write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=53000",
