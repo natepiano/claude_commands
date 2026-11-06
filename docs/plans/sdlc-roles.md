@@ -358,54 +358,25 @@ Superseded 2026-11-05 (sdlc showrunner). `review_pool.py` is gone from sdlc thro
 **Gotchas:** `~/.claude` main's `merge_gate.py` refuses a tree without `scripts/guilds` until this phase is on main; gate such a tree with its own `merge_gate.py`. `~/.local/state/guilds/` is removed only after this phase is on main.
 
 ### Phase 13 — Our scripts are safe to run again after a stop  · status: done
-**Depends on:** none. It restarts from sdlc 9ba842c60; the old wip 722b01ad3 on origin/sdlc-roles is reference only and is not merged (sdlc showrunner, 2026-11-05).
-
-#### Work Order
-
-**Goal:** each of the 13 live rerun-sweep rows in code that stays is fixed. After a stop or failure at the named place, the same command run again finishes the work or reports a clear cause, and a test proves it.
-
-**Spec:**
-- Source: `docs/plans/sdlc-rerun-sweep.md`, sections `roles-unit` and `guild-process-unit` (showrunner, 2026-10-29). Each row's "On a rerun" text is the failure to remove. Line numbers moved: find each place by its code.
-- Dropped rows, no code, because the code is being retired (sdlc showrunner, 2026-11-05): `codex_mesh.py` 1443, 2006, 8169 and `mesh_runs.py` 258. Closed rows: the three `review_pool.py` rows, because the file is gone.
-- Live rows:
-  1. `send.py` 912 — `claim` records the emergency attempt before delivery; `still_live` does not check delivery.
-  2. `send.py` 989 — `pending` deletes queue files before their text is printed.
-  3. `send.py` 1389 — the daily template-fix stamp is written before the delivery child starts.
-  4. `progress_history.py` 1480 — `_start_phase` saves state before it appends `phase_started`.
-  5. `progress_history.py` 5634 — `record_turn_wait` records the wait before it writes its marker.
-  6. `workers.py` 553 — `_write_roster` truncates before it writes.
-  7. `workers.py` 1604 — `end_unit` skips mesh end for an `ended` entry and removes the ledger while server cleanup is unfinished.
-  8. `astra_roles.py` 276 — exec-role liveness checks only the saved PID.
-  9. `astra_work.py` 167 — exclusive brief creation comes before the brief text is written.
-  10. `design_roles.py` 744 — the opening claim is saved before the thread launches.
-  11. `design_roles.py` 918 — the new binding generation is saved before `transition.json` is cleared and context updated.
-  12. `design_roles.py` 1000 — `RoleEnded` is saved before transition cleanup and census release.
-  13. `design_roles.py` 1427 — the new holder and generation are saved before transition cleanup and route updates.
-- A row already fixed on today's tree needs no new code. Report the place that fixes it. Add its stop-then-rerun test if none exists.
-- Each fix has one test that stops at the named place (inject the stop or the failure there), runs the same command again, and checks that the work finished or that a clear cause was reported. No existing assertion is removed or weakened. The tests share one stop-injection helper.
-- A test makes any project it needs in a tempdir at run time. It never commits one.
-- One place for each mechanism (user, 2026-10-30): use `scripts/lib/atomic_file.py` for atomic writes and `scripts/lib/process_start.py` for process lifetime. Look for an existing helper before adding one. `codex_mesh.py` also rewrites the roster: a roster fix must not lose updates beside it, and it belongs in the shared writer when one exists (`worker_lifecycle`, `session_staff`).
-- Liveness: only a gone or replaced process permits a reclaim. An alive owner keeps its claim. An unknown result keeps the record and deletes nothing.
-- Thread creation keeps "creation not started" apart from "creation outcome unknown". An unknown outcome gives the holder a clear recovery result and never starts a second thread.
-- Add no guard, refusal or check the plan item did not ask for. A mark a fix adds has an owner check and an expiry, or a command that clears it.
+#### As-built
+- The 13 live rows of `docs/plans/sdlc-rerun-sweep.md` are closed. Four `codex_mesh.py` and `mesh_runs.py` rows are dropped because that code is being retired. The old wip 722b01ad3 is not merged.
+- `send.py`: an emergency attempt saves its owner pid and process start. Only a gone or replaced owner releases a claim, and an unknown result keeps it. An undelivered emergency releases its claim, so only delivery starts the live window. `accept_sent` saves the clearing record with the acceptance. `pending` prints under the queue lock before it removes queue files. `template_fix_notice` starts the child before it publishes the daily stamp.
+- `progress_history.py`: `_start_phase` saves the event intent, and `_finish_phase_start` repairs a missing `phase_started`. `record_turn_wait` saves the declaration before the wait event, and `finish_turn_wait` shares one lookup with it (`_turn_waits_for_marker`).
+- `workers.py`: `end_unit` repeats the worker end for an `ended` entry, and a cleanup failure keeps the ledger. The roster row needed no new code because `worker_lifecycle.locked_state` and `session_staff.publish_worker_roster` already fix it.
+- `astra_roles.py`: `ExecProcess` saves the process identity through `process_start`. `astra_work.py`: `create_text_atomic` writes the whole brief, and an identical retry succeeds.
+- `design_roles.py`: creation keeps `not_started` apart from `outcome_unknown` and never starts a second thread. `recover` reports the cause, and `end` clears the role's own `outcome_unknown` mark. Rebind and checkout moves finish through `_finish_rebind`, and `end` finishes through `_finish_end`. The holder move row needed no new code because staff owns holder changes.
 
 **Files:**
-- `scripts/message/send.py` — emergency claim, pending queue, template-fix stamp
-- `scripts/direct/progress_history.py` — phase start and turn wait ordering
-- `scripts/direct/workers.py` — roster write, unit retirement cleanup
-- `scripts/astra/astra_roles.py` — exec-role process lifetime
-- `scripts/astra/astra_work.py` — brief creation
-- `scripts/astra/design_roles.py` — open, rebind, end and holder move
-- `scripts/lib/stop_injection_test_support.py` — the shared stop helper
+- `scripts/message/send.py`, `scripts/direct/progress_history.py`, `scripts/direct/workers.py`, `scripts/astra/astra_roles.py`, `scripts/astra/astra_work.py`, `scripts/astra/design_roles.py` — the fixes
+- `scripts/lib/stop_injection_test_support.py` — the shared stop helper, `stop_once`
 - `scripts/message/test_send.py`, `scripts/direct/test_progress_history.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_roles.py`, `scripts/astra/test_astra_work.py`, `scripts/astra/test_design_roles.py` — stop-then-rerun tests
+- `scripts/buildlog/mac_idle_test_support.py`, `scripts/buildlog/test_mac_idle.py` — the sender fixture holds owner facts
 
-**Workers:** `1 writer + 1 tester`.
-- `impl` — `send.py`, `progress_history.py`, `workers.py`, `astra_roles.py`, `astra_work.py`, `design_roles.py`, and a shared writer when a roster fix belongs there
-- `test` — the test files and `scripts/lib/stop_injection_test_support.py`
+**Gotchas:**
+- A test that stops a sender in its own process must also end the owner. `PrivateSenderAcceptance.end_owner` does this.
+- `process_start` reads `VERIFY_PROC_ROOT` on Linux, so a sender fixture that sets it must give owner facts.
 
-**State:** claim, stamp, roster, queue and role-state files under the run and state folders; a file that already exists stays readable.
-
-**Acceptance gate:** each live row has its stop-then-rerun test passing. The `astra`, `message`, `direct` and `production` suites pass. basedpyright on the changed files and their caller modules reports 0 errors, 0 warnings, 0 notes. Then the full merge gate.
+**Ruled out:** a new command to clear the unknown creation mark, because `end` clears it.
 
 ### Phase 14 — Close-out: the roles measure is gone  · status: done
 #### As-built
