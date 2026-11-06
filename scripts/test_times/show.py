@@ -8,6 +8,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import os
 from pathlib import Path
 import sqlite3
 import statistics
@@ -403,15 +404,52 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
 
 
 def open_report_index() -> sqlite3.Connection:
-    """Update the index and check the report tables before returning the connection."""
-    _ = index.update()
-    connection = index.read_only()
+    """Read a complete index and build one only when none qualifies."""
+    path = index.complete_gate_index_in(store.root())
+    if isinstance(path, index.NoCompleteGateIndex):
+        _ = index.update()
+        connection = index.read_only()
+    else:
+        connection = sqlite3.connect(index.read_only_path_uri(path), uri=True)
+        _ = connection.execute("PRAGMA query_only = ON")
     try:
         connection.execute(f"SELECT 1 FROM {', '.join(index.GATE_TABLES)} LIMIT 0").close()
     except BaseException:
         connection.close()
         raise
     return connection
+
+
+def rows_as_of(connection: sqlite3.Connection) -> None:
+    """Show the time of the last complete update in the user's zone."""
+    completed = cast(tuple[str] | None, connection.execute(
+        "SELECT value FROM meta WHERE key = 'updated_at'"
+    ).fetchone())
+    if completed is not None:
+        zone = user_zone()
+        moment = datetime.fromtimestamp(float(completed[0]), zone)
+        stamp = moment.strftime("%H:%M %Z" if moment.date() == datetime.now(zone).date() else "%m-%d %H:%M %Z")
+        print(f"rows as of {stamp}", file=sys.stderr)
+
+
+def refresh_after_report() -> None:
+    """Refresh in a detached child after the report releases its output."""
+    _ = sys.stdout.flush()
+    _ = sys.stderr.flush()
+    if os.fork():
+        return
+    status = 1
+    try:
+        _ = os.setsid()
+        descriptor = os.open(os.devnull, os.O_RDWR)
+        for target in (0, 1, 2):
+            _ = os.dup2(descriptor, target)
+        if descriptor > 2:
+            os.close(descriptor)
+        _ = index.update()
+        status = 0
+    finally:
+        os._exit(status)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -424,6 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"test times unavailable: {error}; run `buildlog reindex`", file=sys.stderr)
         return 1
     with closing(connection):
+        connection.execute("BEGIN").close()
         host = store.host_name()
         match request.command:
             case "top":
@@ -450,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
                 module(connection, host, request.subject, request.runs)
             case "test":
                 test(connection, host, request.subject, request.runs)
+        rows_as_of(connection)
+    refresh_after_report()
     return 0
 
 

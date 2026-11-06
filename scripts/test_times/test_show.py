@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import chdir, closing, redirect_stderr, redirect_stdout
+from collections.abc import Generator, Sequence
+from contextlib import chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 import io
 import os
 from pathlib import Path
 import re
+import select
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING, Self, override
+import time
+from typing import TYPE_CHECKING, BinaryIO, Self, cast, override
 import unittest
 from unittest import mock
 
@@ -48,6 +50,37 @@ HOST = store.host_name()
 REPORT_COMMANDS = (("top",), ("suites",), ("suite", "tools"),
                    ("module", "tools/test_alpha.py"), ("test", "target"))
 
+REPORT_PROCESS = """\
+import os
+from pathlib import Path
+import runpy
+import socket
+import sys
+sys.path.insert(0, sys.argv[1])
+report = runpy.run_path(str(Path(sys.argv[1]) / 'scripts/test_times/show.py'))
+main = report['main']
+main.__globals__['TOOL_REPOSITORY'] = Path(sys.argv[2])
+index = report['index']
+if sys.argv[3]:
+    table = sys.argv[3]
+    columns, key, description = index.TABLES[table]
+    index.TABLES[table] = (columns + [('fixture_column', 'TEXT', 'fixture column')], key, description)
+event = socket.socket(fileno=int(sys.argv[4]))
+parent = os.getpid()
+update = index.update
+def refresh():
+    if os.getpid() != parent:
+        event.sendall(b'S')
+        event.recv(1)
+    return update()
+index.update = refresh
+status = main(sys.argv[5:])
+os.close(1)
+os.close(2)
+os.waitpid(-1, 0)
+os._exit(status)
+"""
+
 
 class ReportTime(datetime):
     @classmethod
@@ -57,9 +90,15 @@ class ReportTime(datetime):
 
 
 def run(*arguments: str) -> tuple[int, str, str]:
+    # These report assertions use a complete snapshot. Process tests cover refreshes.
+    _ = show.index.update()
+    return report_without_update(*arguments)
+
+
+def report_without_update(*arguments: str) -> tuple[int, str, str]:
     output = io.StringIO()
     errors = io.StringIO()
-    with redirect_stdout(output), redirect_stderr(errors):
+    with redirect_stdout(output), redirect_stderr(errors), mock.patch.object(show, "refresh_after_report"):
         status = show.main(list(arguments))
     return status, output.getvalue(), errors.getvalue()
 
@@ -158,6 +197,124 @@ class TestTimesTests(unittest.TestCase):
         status, output, errors = run(*arguments)
         self.assertEqual(status, 0, output + errors)
         return output
+
+    @contextmanager
+    def report_process(self, changed_table: str = "", *arguments: str) -> Generator[tuple[subprocess.Popen[bytes], socket.socket]]:
+        event, child_event = socket.socketpair()
+        event.settimeout(TEST_HANG_GUARD_SECS)
+        process = subprocess.Popen(
+            [sys.executable, "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
+             str(self.repo), changed_table, str(child_event.fileno()),
+             *(arguments or ("top", "--repo", str(self.repo)))],
+            cwd=self.root, env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            pass_fds=(child_event.fileno(),),
+        )
+        child_event.close()
+        try:
+            self.assertEqual(event.recv(1), b"S")
+            yield process, event
+        finally:
+            try:
+                event.sendall(b"F")
+            except BrokenPipeError:
+                pass
+            event.close()
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0)
+
+    def report_pipe(self, pipe: BinaryIO) -> str:
+        chunks: list[bytes] = []
+        while True:
+            ready, _, _ = select.select([pipe], [], [], TEST_HANG_GUARD_SECS)
+            self.assertTrue(ready, "The report pipe stayed open during the refresh")
+            chunk = os.read(pipe.fileno(), 65536)
+            if not chunk:
+                return b"".join(chunks).decode()
+            chunks.append(chunk)
+
+    def test_first_report_closes_its_pipe_before_refresh_and_later_report_has_new_rows(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+            writer.execute("UPDATE meta SET value=? WHERE key='updated_at'", (str(EPOCH),)).close()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process() as (process, event):
+            first = self.report_pipe(cast(BinaryIO, process.stdout))
+            errors = self.report_pipe(cast(BinaryIO, process.stderr))
+            self.assertIn("tools/test_alpha.py", first)
+            self.assertNotIn("tools/test_beta.py", first.split("unmeasured:")[0])
+            self.assertEqual(errors, "rows as of 11-03 09:30 EST\n")
+            self.assertIsNone(process.poll(), "The supervisor must still wait for its refresh child")
+            event.sendall(b"F")
+        with self.report_process() as (process, event):
+            later = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_beta.py", later.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_reads_an_older_index_while_a_non_gate_schema_builds(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process("steps") as (process, event):
+            output = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_alpha.py", output)
+            self.assertNotIn("tools/test_beta.py", output.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_builds_before_reading_when_gate_sql_changes(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process("gate_runs") as (process, event):
+            output = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_beta.py", output.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_keeps_its_rows_and_timestamp_from_the_same_update(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        with mock.patch.object(time, "time", return_value=EPOCH):
+            _ = show.index.update()
+        self.write_run([module_run("test_alpha.py", 9.0)], epoch=EPOCH + 60)
+        report_module = show.module
+
+        def publish_after_rows(connection: sqlite3.Connection, host: str, subject: str, runs: int) -> None:
+            report_module(connection, host, subject, runs)
+            with mock.patch.object(time, "time", return_value=EPOCH + 60):
+                _ = show.index.update()
+
+        with mock.patch.object(show, "module", publish_after_rows):
+            status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertIn("11-03 09:30", output)
+        self.assertNotIn("11-03 09:31", output)
+        self.assertEqual(errors, "rows as of 09:30 EST\n")
+        with closing(show.index.read_only()) as reader:
+            self.assertEqual(reader.execute("SELECT count(*) FROM gate_runs").fetchone(), (2,))
+            self.assertEqual(reader.execute("SELECT value FROM meta WHERE key='updated_at'").fetchone(),
+                             (str(EPOCH + 60),))
+
+    def test_report_replaces_an_invalid_current_completion_time(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+            writer.execute("UPDATE meta SET value='invalid' WHERE key='updated_at'").close()
+        with mock.patch.object(time, "time", return_value=EPOCH):
+            status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertIn("11-03 09:30", output)
+        self.assertEqual(errors, "rows as of 09:30 EST\n")
+
+    def test_freshness_line_dates_updates_from_another_local_day(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        for completed, expected in ((EPOCH, "09:30 EST"), (EPOCH - 86400, "11-02 09:30 EST")):
+            with self.subTest(completed=completed):
+                with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+                    writer.execute("UPDATE meta SET value=? WHERE key='updated_at'", (str(completed),)).close()
+                status, output, errors = report_without_update("module", "tools/test_alpha.py")
+                self.assertEqual(status, 0, errors)
+                self.assertIn("11-03 09:30", output)
+                self.assertEqual(errors, f"rows as of {expected}\n")
 
     def line(self, output: str, subject: str) -> str:
         lines = [line for line in output.splitlines() if subject in line]
@@ -559,14 +716,18 @@ class TestTimesTests(unittest.TestCase):
             "no gate runs recorded for module tools/test_alpha.py", "no tests recorded matching target",
         ), strict=True):
             with self.subTest(arguments=arguments):
-                self.assertEqual(self.report(*arguments), expected + "\n")
+                status, output, errors = report_without_update(*arguments)
+                self.assertEqual(status, 0, errors)
+                self.assertEqual(output, expected + "\n")
 
     def test_reports_rebuild_a_dropped_gate_table_from_recorded_runs(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
         before = self.report("module", "tools/test_alpha.py")
         with closing(sqlite3.connect(index_path_in(self.log))) as connection:
             _ = connection.execute("DROP TABLE gate_modules")
-        self.assertEqual(self.report("module", "tools/test_alpha.py"), before)
+        status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(output, before)
 
     def test_reports_name_a_missing_gate_table_without_a_traceback(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
@@ -575,7 +736,7 @@ class TestTimesTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE gate_modules")
         for arguments in REPORT_COMMANDS:
             with self.subTest(arguments=arguments), mock.patch.object(show.index, "update", return_value=0):
-                status, output, errors = run(*arguments)
+                status, output, errors = report_without_update(*arguments)
                 self.assertEqual(status, 1)
                 self.assertEqual(output, "")
                 self.assertEqual(errors.splitlines(), [
@@ -594,17 +755,25 @@ class TestTimesTests(unittest.TestCase):
 
         with mock.patch.object(show, "open_report_index", remove_table_after_probe), \
                 self.assertRaisesRegex(sqlite3.OperationalError, "no such table: gate_modules"):
-            _ = run("top", "--repo", str(self.repo))
+            _ = report_without_update("top", "--repo", str(self.repo))
 
     def test_cli_imports_the_index_from_an_external_working_folder(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
-        completed = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("show.py")), "module", "tools/test_alpha.py"],
-            cwd=self.root, env=dict(os.environ), capture_output=True, text=True, check=False,
-            timeout=TEST_HANG_GUARD_SECS,
-        )
+        event, child_event = socket.socketpair()
+        event.settimeout(TEST_HANG_GUARD_SECS)
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("show.py")), "module", "tools/test_alpha.py"],
+                cwd=self.root, env=dict(os.environ), capture_output=True, text=True, check=False,
+                pass_fds=(child_event.fileno(),), timeout=TEST_HANG_GUARD_SECS,
+            )
+            child_event.close()
+            self.assertEqual(event.recv(1), b"", "The refresh must end before fixture cleanup")
+        finally:
+            child_event.close()
+            event.close()
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stderr, "")
+        self.assertRegex(completed.stderr, r"^rows as of \d\d:\d\d (EST|EDT)\n$")
         self.assertIn("11-03 09:30", completed.stdout)
 
 

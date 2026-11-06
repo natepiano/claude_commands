@@ -598,7 +598,46 @@ def index_path_in(root: Path) -> Path:
 
 
 def read_only_uri(root: Path) -> str:
-    return f"file:{quote(str(index_path_in(root)))}?mode=ro"
+    return read_only_path_uri(index_path_in(root))
+
+
+def read_only_path_uri(path: Path) -> str:
+    """Return a read-only SQLite URI for the selected index."""
+    return f"file:{quote(str(path))}?mode=ro"
+
+
+@dataclass(frozen=True)
+class NoCompleteGateIndex:
+    """No complete index has compatible gate tables."""
+
+
+def complete_gate_index_in(root: Path) -> Path | NoCompleteGateIndex:
+    """Prefer the current index, then the newest complete compatible index."""
+    expected = {statement.split()[2]: statement for statement in schema_statements()
+                if statement.startswith("CREATE TABLE ") and statement.split()[2] in GATE_TABLES}
+    current = index_path_in(root)
+    candidates: list[tuple[float, Path]] = []
+    for path in root.glob(f"{INDEX_PREFIX}-*{INDEX_SUFFIX}"):
+        try:
+            connection = sqlite3.connect(read_only_path_uri(path), uri=True, timeout=0)
+            try:
+                completed = cast(tuple[str] | None, connection.execute(
+                    "SELECT value FROM meta WHERE key = 'updated_at'"
+                ).fetchone())
+                tables = dict(cast(list[tuple[str, str]], connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()))
+                if completed is None or any(tables.get(name) != sql for name, sql in expected.items()):
+                    continue
+                completed_at = float(completed[0])
+                if path == current:
+                    return path
+                candidates.append((completed_at, path))
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValueError):
+            continue
+    return max(candidates)[1] if candidates else NoCompleteGateIndex()
 
 
 @contextmanager
@@ -682,6 +721,7 @@ def open_for_update(path: Path) -> sqlite3.Connection:
     for statement in schema_statements():
         if statement.startswith("CREATE INDEX") and statement.split(" ON ", 1)[0].split()[-1] not in indexes:
             _ = connection.execute(statement)
+    connection.execute("PRAGMA journal_mode = WAL").close()
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 
@@ -1144,7 +1184,9 @@ def update_in(root: Path) -> int:
             now = time.time()
             settings = conf.read("buildlog")
             touch_minutes = settings.number("INDEX_TOUCH_MINUTES")
-            if now - current.stat().st_mtime > touch_minutes * 60:
+            previous_stamp = current.stat()
+            touch_due = now - previous_stamp.st_mtime > touch_minutes * 60
+            if touch_due:
                 os.utime(current, (now, now))
             _ = connection.execute("BEGIN IMMEDIATE")
             known = {
@@ -1167,6 +1209,9 @@ def update_in(root: Path) -> int:
                 forget(connection, gone)
             if touched_calls:
                 resolve_mac_repositories(connection, touched_calls)
+            data_changed = connection.total_changes != 0
+            _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('updated_at', ?)",
+                                   (str(time.time()),))
             _ = connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -1174,6 +1219,8 @@ def update_in(root: Path) -> int:
             raise
         finally:
             connection.close()
+        if not data_changed and not touch_due:
+            os.utime(current, ns=(current.stat().st_atime_ns, previous_stamp.st_mtime_ns))
         cleanup_unused_indexes(root, current, settings)
     return lines
 

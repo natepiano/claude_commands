@@ -1409,7 +1409,7 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 - `module_cost.py` on a real tempdir module with a detached child: the end step of Phase 62 ends the child, and the module status stays. `test_module_cost.py` names this case.
 - Module `wall_s`, `cpu_s` and test status do not change meaning. `test_coverage_overlap.py` passes. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
 
-### Phase 65 — The first test time list after a gap appears in under a second  · status: todo
+### Phase 65 — The first test time list after a gap appears in under a second  · status: done
 **Depends on:** Phase 60
 
 #### Work Order
@@ -1472,7 +1472,12 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 1. The worktree holds this work's first step, uncommitted: 22 cases moved to `route()`, real launcher starts 32 to 7, a behavior map at `phases/61/slots/impl4/behavior_map.md` and a mutation proof. The F001 fix is in the tree: `verify_ssh_targets_test_support.py` uses `${EPOCHREALTIME:-$(date +%s)}`, the form of `verify.sh:1169`.
 2. Measure where the CPU goes, before any other edit. Report CPU by command across the module, from `strace -f` rusage or an equal count, and CPU for each test. Name the share of Python starts by script, Bash, the admission server thread in the test process, and `setUp`.
 3. Suspects: `caller_admission` serves one real admission server for each test, in the test process, with a `running_pass_seconds=0.25` pass. The real target commands import through `build_hold.py`. `refresh_inventory` writes the ledger for two targets in each test. `VerifyMacOffloadFixture.setUp()` starts admission for every test, and that server's loop calls `run_once(0.01)` through each test. The inherited cleanup scans `/proc/*/environ`.
-4. The director picks the cut from step 2 and writes it here. A move stays only if it cuts CPU, or another proof of the same behavior needs it. A move that gains nothing and loses an end-to-end path goes back.
+4. The measure is `phases/66/slots/impl4/measure/findings.md`. Child commands use 228.2 of 249.6 CPU s. `build_targets.py` uses 128.4 CPU s, and its 120 `eligible`, `reserve` and `release-wait` starts cost about 0.96 CPU s each. Admission threads, cleanup scans and inventory use 14.2 CPU s together, so those fixture parts stay. The cut:
+   a. Match the fixture's EXIT order to production: `finish_hold_wait` before `release_wait_claim`. This removes about 15 heavy starts.
+   b. Replace the `run_route` form and `ROUTING_INPUTS` with narrow calls, in the test process, of the real Python decision functions. Read each value where its consumer receives it. A result word with its own branch keeps a check that the next step ran.
+   c. Keep the seven real `verify.sh` starts. They use 41.3 CPU s and prove the command-line boundaries. A case with no usable function goes back to a real run, or verify-unit gets a request for the function.
+   d. The production cuts belong to their owners: cold imports, platform starts and cleanup scans to verify-unit, the admission loop to queue-unit. This phase does not wait for them.
+   A move stays only if it cuts CPU, or another proof of the same behavior needs it. A move that gains nothing and loses an end-to-end path goes back.
 5. Report why `test_verify_ssh_targets_results.py` went red in both measured runs: `test_linux_loss_keeps_the_attempt_and_queue_age_after_local_success` and `test_interruption_preserves_queue_age_and_records_local_state_before_compilation` after, `test_sigterm_runner_output_preserves_the_sender_interruption_result` and `test_interruption_from_another_generation_remains_an_unconfirmed_loss` before. Those runs had SIGINT ignored. Prove or refute that with a run that has SIGINT at its default.
 6. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
 
@@ -1482,8 +1487,6 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 - `scripts/direct/test_verify_ssh_targets_retry.py`
 - `scripts/direct/test_verify_ssh_targets_retained.py`
 - `scripts/direct/verify_ssh_targets_test_support.py` — the SSH fixture
-- `scripts/build_queue/admission_test_support.py` — only if step 4 names it; owner queue-unit
-- `scripts/direct/verify_mac_offload_test_support.py` — only if step 4 names it; the parent fixture of more than 40 files
 
 **Workers:** 1 writer on slot `impl4` (one fixture and its four files)
 - `impl4` — all files above, role impl
