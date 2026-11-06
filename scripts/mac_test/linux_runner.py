@@ -625,9 +625,9 @@ def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
         return 75
 
 
-def output_filesystem_paths(checkout: Path) -> tuple[Path, ...]:
+def output_filesystem_paths(checkout: Path, environment: Mapping[str, str] | None = None) -> tuple[Path, ...]:
     """Resolve the checkout and its Cargo output filesystems."""
-    outputs = read_cargo_output_roots(checkout)
+    outputs = read_cargo_output_roots(checkout, environment=environment)
     if isinstance(outputs, CargoOutputUnavailable):
         if not (checkout / "Cargo.toml").exists():
             return (checkout,)
@@ -635,9 +635,9 @@ def output_filesystem_paths(checkout: Path) -> tuple[Path, ...]:
     return (checkout, outputs.target_directory, outputs.build_directory)
 
 
-def output_free_bytes(checkout: Path) -> int:
+def output_free_bytes(checkout: Path, environment: Mapping[str, str] | None = None) -> int:
     readings: list[int] = []
-    for path in output_filesystem_paths(checkout):
+    for path in output_filesystem_paths(checkout, environment):
         while True:
             try:
                 readings.append(shutil.disk_usage(path)[2])
@@ -791,22 +791,28 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         '  exit 75',
         'fi',
     ])
-    command = (shell_environment_script(shell)
-               + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
-               + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
-               + '\n'.join(parity) + '\n'
-               + f'export {assignments}\n')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
             build_folders.FOLDER_PREFIXES["linux-step"], build_folders.ExplicitBuildParent(mirror))) as step_directory:
         started = step_directory / 'started'
-        command += (f': > {shlex.quote(str(started))} || exit 75\n'
+        toolchain_environment = step_directory / 'toolchain'
+        _ = toolchain_environment.write_text('')
+        command = (shell_environment_script(shell)
+                    + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
+                    + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
+                    + f'printf \'%s\' "${{RUSTUP_TOOLCHAIN-}}" > {shlex.quote(str(toolchain_environment))} || exit 75\n'
+                    + '\n'.join(parity) + '\n'
+                    + f'export {assignments}\n'
+                    + f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
         completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False)
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
+        toolchain = toolchain_environment.read_text()
+        if toolchain:
+            environment['RUSTUP_TOOLCHAIN'] = toolchain
     try:
-        free = output_free_bytes(mirror) / (1024 ** 3)
+        free = output_free_bytes(mirror, {**os.environ, **environment}) / (1024 ** 3)
         if free < floor:
             if target.exists():
                 shutil.rmtree(target)

@@ -100,6 +100,7 @@ An interruption marker reports the instance generation.
   The Linux runner keeps the caller PATH after the development shell PATH, then runs `shellHook`.
   Each job installs its toolchain in the mirror, before the parity checks and the work, in the job's process group.
   rustup's order selects the toolchain, the same as on natedev: `RUSTUP_TOOLCHAIN`, then the tree's toolchain file. With neither, a plain `x.y.z` version from natedev becomes `RUSTUP_TOOLCHAIN`. Other forms leave it unset, and parity declines the job.
+  The runner passes the step's selected `RUSTUP_TOOLCHAIN` to the disk measurement and cleanup. A toolchain file still applies when that variable is unset.
   One `flock` per toolchain protects the install. The lock name is `RUSTUP_TOOLCHAIN`, or the file's channel, or the SHA-256 of a file with no channel. A second job waits on the lock and downloads nothing.
   An install failure declines the attempt with its error text, and the job goes to normal routing.
   Toolchains stay in `~/.rustup` on `/home`, not in the image. A new volume downloads each version once, about 1.6 GB and 20 s.

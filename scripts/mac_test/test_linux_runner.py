@@ -113,6 +113,10 @@ if tool == "rustup":
     raise SystemExit(0)
 if tool in ("cargo", "cargo-nextest", "cargo-mend"):
     if tool == "cargo" and arguments == ["metadata", "--format-version", "1", "--no-deps"]:
+        if (os.environ.get("FAKE_CARGO_NEEDS_TOOLCHAIN") and not os.environ.get("RUSTUP_TOOLCHAIN")
+                and not any(Path(name).is_file() for name in ("rust-toolchain", "rust-toolchain.toml"))):
+            print("error: rustup could not choose a version of cargo to run", file=sys.stderr)
+            raise SystemExit(1)
         if os.environ.get("FAKE_RUSTUP_FAIL"):
             print("error: toolchain is not installed", file=sys.stderr)
             raise SystemExit(1)
@@ -609,6 +613,38 @@ class LinuxShellTests(unittest.TestCase):
         install = self.events("rustup")[0]
         self.assertEqual(install["cwd"], str(self.mirror))
         self.assertEqual(install["args"], ["toolchain", "install", "--no-self-update", "--no-update"])
+
+    def test_cleanup_uses_the_step_toolchain_without_a_default(self) -> None:
+        self.use_real_sweep = True
+        self.write_input("Cargo.toml", '[package]\nname = "fixture"\nversion = "0.1.0"\n')
+        for tool in ("rustc", "cargo"):
+            self.write_tool(self.root / "bin" / tool)
+        _ = self.settings.write_text(self.settings.read_text() + "parity.rustc=rustc 1.99.0\n")
+        self.environment.update({"FAKE_CARGO_NEEDS_TOOLCHAIN": "1", "TEST_SHELL_TOOL_VERSION": "1.99.0"})
+
+        for mode, expected in (("fallback", "1.99.0"), ("inherited", "nightly-2026-08-01"),
+                               ("shellHook", "nightly-2026-08-02"), ("file", "")):
+            with self.subTest(mode=mode):
+                _ = self.environment.pop("RUSTUP_TOOLCHAIN", None)
+                _ = self.environment.pop("FAKE_NIX_EXPORTS", None)
+                if mode == "inherited":
+                    self.environment["RUSTUP_TOOLCHAIN"] = expected
+                elif mode == "shellHook":
+                    self.environment["FAKE_NIX_EXPORTS"] = f"export shellHook='export RUSTUP_TOOLCHAIN={expected}'"
+                elif mode == "file":
+                    self.write_input("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.0"\n')
+                self.event_path.unlink(missing_ok=True)
+                shutil.rmtree(self.root / ".local/state/build-target/shells", ignore_errors=True)
+
+                result = self.execute(self.request())
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("mac_exit=0", result.stdout)
+                self.assertIn("mac_cleanup=kept", result.stdout, result.stderr)
+                metadata = [event for event in self.events("cargo") if event["args"][0] == "metadata"]
+                self.assertGreaterEqual(len(metadata), 2)
+                for event in [self.events("lint")[-1], *metadata]:
+                    self.assertEqual(event["environment"].get("RUSTUP_TOOLCHAIN", ""), expected)
 
     def test_toolchain_locks_follow_the_channel_across_trees(self) -> None:
         commands = self.root / "lock-commands"
