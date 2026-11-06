@@ -328,7 +328,7 @@ def close_unit_pane(pane: UnitPane | None) -> None:
     if pane is None:
         return
     try:
-        herdr.Herdr(pane.place.session).close_retained_pane(pane.place.pane)
+        _ = herdr.Herdr(pane.place.session).close_retained_pane(pane.place.pane)
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         raise RenameRefused(f"{pane.unit}: pane close failed: {error}") from error
 
@@ -628,7 +628,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                                 if resumed and member.id in retained:
                                     pane, terminal = retained[member.id]
                                     if resumed != pane:
-                                        client.close_retained_pane(pane, terminal=terminal)
+                                        _ = client.close_retained_pane(pane, terminal=terminal)
                             except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
                                 restart_notice(latest, error)
                         if not _wait_folder_rows(observe, live - reported, running=True):
