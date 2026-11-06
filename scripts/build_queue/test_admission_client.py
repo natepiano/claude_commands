@@ -781,12 +781,93 @@ class ClientTests(unittest.TestCase):
                     "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
                 self.doCleanups()
 
-    def test_a_connection_resets_the_unreachable_limit(self) -> None:
+    def test_repeated_accepted_connections_without_replies_stop_at_the_unreachable_limit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(unreachable_limit_seconds=0.3)
+            request = fixture.request()
+            transport = self.use_transport(fixture,
+                *(Exchange(TimedChunk(0.125, b"")) for _ in range(8)))
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.admit(request, lambda _wait: None, lambda: request)
+            self.assertEqual(result, wire.Refused(
+                "build queue unreachable for 0.3 s; step stopped; cargo token given back"))
+            self.assertGreaterEqual(fixture.clock.monotonic(), 0.3)
+            self.assertGreater(len(transport.requests), 1)
+            self.assertEqual(transport.requests, [request] * len(transport.requests))
+            self.assertEqual(output.getvalue().count(
+                "build queue unreachable for 0.3 s; step stopped; cargo token given back"), 1)
+
+    def test_valid_wait_after_restart_keeps_the_place_beyond_the_first_unreachable_deadline(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(unreachable_limit_seconds=0.3)
+            request = fixture.request()
+            waits: list[wire.Wait] = []
+            transport = self.use_transport(fixture,
+                Exchange(ConnectionResetError(errno.ECONNRESET, "reset")),
+                Exchange(TimedChunk(0.15, reply_bytes(WAIT)), TimedChunk(0.25, b"")),
+                Exchange(reply_bytes(WAIT) + reply_bytes(GRANTED)))
+            with redirect_stderr(io.StringIO()) as output:
+                started = fixture.clock.monotonic()
+                result = client.admit(request, waits.append, lambda: request)
+                elapsed = fixture.clock.monotonic() - started
+            self.assertEqual(result, GRANTED)
+            self.assertGreater(elapsed, 0.35)
+            self.assertEqual(transport.requests, [request] * 3)
+            self.assertEqual(waits, [WAIT, WAIT])
+            self.assertNotIn("step stopped", output.getvalue())
+
+    def test_reset_then_accepted_silent_connection_stops_at_the_unreachable_limit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(unreachable_limit_seconds=0.3, silence_seconds=5)
+            request = fixture.request()
+            transport = self.use_transport(fixture,
+                Exchange(ConnectionResetError(errno.ECONNRESET, "reset")), Exchange(TimeoutError()))
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.admit(request, lambda _wait: None, lambda: request)
+            self.assertEqual(result, wire.Refused(
+                "build queue unreachable for 0.3 s; step stopped; cargo token given back"))
+            self.assertGreaterEqual(fixture.clock.monotonic(), 0.3)
+            self.assertEqual(transport.requests, [request, request])
+            self.assertEqual(output.getvalue().count(
+                "build queue unreachable for 0.3 s; step stopped; cargo token given back"), 1)
+
+    def test_a_valid_reply_after_the_unreachable_limit_keeps_the_wait(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(unreachable_limit_seconds=5)
+            request = fixture.request()
+            waits: list[wire.Wait] = []
+            transport = self.use_transport(fixture,
+                Exchange(ConnectionResetError(errno.ECONNRESET, "reset")),
+                Exchange(TimedChunk(6, reply_bytes(WAIT)), reply_bytes(GRANTED)))
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.admit(request, waits.append, lambda: request)
+            self.assertEqual(result, GRANTED)
+            self.assertEqual(waits, [WAIT])
+            self.assertEqual(transport.requests, [request, request])
+            self.assertNotIn("step stopped", output.getvalue())
+
+    def test_an_owner_that_left_past_the_unreachable_limit_gets_left_queue(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(running_pass_seconds=3, unreachable_limit_seconds=5)
+            request = fixture.request()
+            transport = self.use_transport(fixture,
+                Exchange(ConnectionResetError(errno.ECONNRESET, "reset")),
+                Exchange(TimedChunk(6, b"incomplete reply")))
+            with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-leave"}), \
+                    mock.patch.object(client, "_leave_queue", return_value=True) as leave, \
+                    redirect_stderr(io.StringIO()) as output:
+                result = client.admit(request, lambda _wait: None, lambda: request)
+            self.assertEqual(result, client.LeftQueue())
+            leave.assert_called_once_with()
+            self.assertEqual(transport.requests, [request, request])
+            self.assertNotIn("step stopped", output.getvalue())
+
+    def test_a_valid_reply_resets_the_unreachable_limit(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
             request = fixture.request()
             transport = self.use_transport(fixture, Exchange(connect_error=FileNotFoundError()),
-                Exchange(ConnectionResetError(errno.ECONNRESET, "reset")), Exchange(connect_error=FileNotFoundError()),
+                Exchange(reply_bytes(WAIT), ConnectionResetError(errno.ECONNRESET, "reset")), Exchange(connect_error=FileNotFoundError()),
                 Exchange(reply_bytes(GRANTED)))
             with redirect_stderr(io.StringIO()) as output:
                 self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)

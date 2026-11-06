@@ -313,16 +313,20 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     restarted = False
     last_valid = CLOCK.monotonic()
     last_silence_notice = last_valid
-    while True:
-        if retry.left_queue():
-            return LeftQueue()
-        if CLOCK.monotonic() >= retry.deadline:
-            return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+
+    def check_unreachable() -> None:
         if CLOCK.monotonic() >= retry.unreachable_deadline:
             assert isinstance(configuration, gate.MemoryConfig)
             duration = _unreachable_duration(configuration.unreachable_limit_seconds)
             reason = f"build queue unreachable for {duration}; step stopped; cargo token given back"
             raise _QueueUnreachable(reason)
+
+    while True:
+        if retry.left_queue():
+            return LeftQueue()
+        if CLOCK.monotonic() >= retry.deadline:
+            return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+        check_unreachable()
         attempt()
         try:
             timeout = configuration.silence_seconds
@@ -331,7 +335,6 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
             timeout = retry.bound(timeout)
             active_channel, channel = channel, None
             with nullcontext(active_channel.connection) if active_channel is not None else _connect(timeout) as connection:
-                retry.unreachable_deadline = float("inf")
                 send_timeout = retry.bound(timeout)
                 if active_channel is not None or send_timeout < timeout:
                     connection.settimeout(send_timeout)
@@ -342,15 +345,17 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     if generation_query:
                         deadline = min(deadline, CLOCK.monotonic() + configuration.reconnect_seconds)
                     try:
-                        line = _line(connection, pending, min(deadline, retry.deadline, retry.next_leave))
+                        line = _line(connection, pending, min(deadline, retry.deadline, retry.next_leave,
+                                                             retry.unreachable_deadline))
                     except TimeoutError:
                         if CLOCK.monotonic() >= retry.next_leave:
                             if retry.left_queue():
                                 return LeftQueue()
-                            if CLOCK.monotonic() < min(deadline, retry.deadline):
+                            if CLOCK.monotonic() < min(deadline, retry.deadline, retry.unreachable_deadline):
                                 continue
                         if CLOCK.monotonic() >= retry.deadline:
                             return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+                        check_unreachable()
                         if generation_query:
                             raise
                         if retry.launch_without_wait:
@@ -364,6 +369,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         raise CheckerFailure(str(error)) from error
                     if CLOCK.monotonic() > retry.deadline:
                         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+                    retry.unreachable_deadline = float("inf")
                     if isinstance(reply, wire.Refused):
                         if generation_query:
                             return reply
@@ -460,18 +466,19 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         except (OSError, TransportUnavailable) as error:
             if retry.launch_without_wait or CLOCK.monotonic() >= retry.deadline:
                 return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
-            if isinstance(error, TransportUnavailable) or error.errno in (errno.ECONNRESET, errno.EPIPE):
-                if not restarted:
-                    print("admission service restarted; waiting again", file=sys.stderr)
-                    restarted = True
-                continue
+            restart_error = isinstance(error, TransportUnavailable) or error.errno in (errno.ECONNRESET, errno.EPIPE)
             if (isinstance(first, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
                     and isinstance(configuration, gate.MemoryConfig)
-                    and isinstance(error, (FileNotFoundError, ConnectionRefusedError))
+                    and (restart_error or isinstance(error, (FileNotFoundError, ConnectionRefusedError)))
                     and retry.unreachable_deadline == float("inf")):
                 retry.unreachable_deadline = CLOCK.monotonic() + configuration.unreachable_limit_seconds
                 duration = _unreachable_duration(configuration.unreachable_limit_seconds)
                 print(f"build queue not reachable; trying for {duration}", file=sys.stderr)
+            if restart_error:
+                if not restarted:
+                    print("admission service restarted; waiting again", file=sys.stderr)
+                    restarted = True
+                continue
             if CLOCK.monotonic() - retry.last_outage_line >= (configuration.outage_notice_seconds if isinstance(configuration, gate.MemoryConfig) else configuration.silence_seconds):
                 reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused" if isinstance(error, ConnectionRefusedError) else str(error)
                 print(f"admission service unavailable: {reason}; waiting again", file=sys.stderr)
