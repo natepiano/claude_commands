@@ -47,6 +47,7 @@
 #                                        open phase (review_tree.py).
 
 set -euo pipefail
+LAUNCHER_COMMAND=(bash "${BASH_SOURCE[0]}" "$@")
 "${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
@@ -435,6 +436,7 @@ record_pass_start() {
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}" \
+    --launcher-command "$("$PY" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${LAUNCHER_COMMAND[@]}")" \
     ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
     return 1
   fi

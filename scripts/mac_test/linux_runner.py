@@ -320,7 +320,8 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
-            uncertain.add(pid)
+            if not isinstance(lease, UnmarkedSlot):
+                uncertain.add(pid)
     # The checking process and its ancestors cannot be leftovers of a lost run.
     checking_chain: set[int] = set()
     ancestor = own_pid
@@ -376,7 +377,7 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
                 selected.add(pid)
         except (PermissionError, FileNotFoundError, ProcessLookupError):
             denied = True
-        if denied and pid not in selected:
+        if denied and pid not in selected and not isinstance(lease, UnmarkedSlot):
             # Confirm that missing evidence does not belong to an exited process.
             try:
                 if process_fields(pid, proc_root)[0] in ('Z', 'X'):

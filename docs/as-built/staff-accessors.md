@@ -51,6 +51,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
 | `scripts/herdr/pane_launch.py` | read | initial_snapshot |
+| `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hierarchies/worker_adoption.py` | read | local_snapshot, row_operation, ReportsTo, StaffId |
 | `scripts/hooks/conversation_pause.py` | read | LiveDoc, WrappedDoc (types only) |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
@@ -133,6 +134,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/update_registration.py` | read | snapshot |
 | `scripts/production/update_registration_test_support.py` | write | by_id, initial_snapshot, set_doc |
 | `scripts/production/waiting.py` | read | snapshot |
+| `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
 | `scripts/production/worker_fill.py` | write | ensure_worker, native_id, snapshot |
 | `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
@@ -166,7 +168,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-151 accessors: 28 write, 122 read, 1 owner.
+153 accessors: 30 write, 122 read, 1 owner.
 
 ## Approved copies
 
@@ -175,3 +177,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/command_inputs.rs`) | the user, 2026-11-04 |
 
 No other copy of the staff facts is allowed without the user's approval. Remake this list before any staff migration.
+
+`Herdr.codex_client_session` reads the current thread for a bare Codex pane from its tab's staff row.
+Both `Herdr._codex_launch` and `pane_record.seed` use this method.
+`pane_record.py` still reads staff for saved launch references and resume operations.

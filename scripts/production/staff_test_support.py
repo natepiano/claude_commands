@@ -561,6 +561,7 @@ class StaffTestCase(unittest.TestCase):
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
+            "CLAUDE_PYTHON": sys.executable,
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
@@ -622,7 +623,7 @@ class StaffTestCase(unittest.TestCase):
 
     def script(self, script: Path, *arguments: str, code: int = 0, input: str | None = None) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
-            [sys.executable, "-c", OWNER_CLI, str(script), *arguments],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", OWNER_CLI, str(script), *arguments],
             cwd=CHECKOUT, input=input, capture_output=True, text=True, check=False,
             timeout=TEST_HANG_GUARD_SECS,
         )
@@ -841,7 +842,7 @@ class StaffTestCase(unittest.TestCase):
 
     def start_script(self, script: Path, *arguments: str) -> subprocess.Popen[str]:
         pending = subprocess.Popen(
-            [sys.executable, "-c", OWNER_CLI, str(script), *arguments], cwd=CHECKOUT,
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", OWNER_CLI, str(script), *arguments], cwd=CHECKOUT,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 

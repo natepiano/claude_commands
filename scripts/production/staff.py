@@ -1065,12 +1065,11 @@ def _copy_to_mac(*, detached: bool = True) -> None:
         if "STAFF_FILE" in os.environ or remote.local_machine() != OWNER_MACHINE:
             return
         if detached:
-            code = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r}); "
-                    "from scripts.production import staff; staff._copy_to_mac(detached=False)")
+            code = "from scripts.production import staff; staff._copy_to_mac(detached=False)"
             # A retained stderr pipe would make captured CLI callers wait for SSH.
             with _default_file().with_name("mac-copy.log").open("a", encoding="utf-8") as errors:
                 _ = subprocess.Popen(
-                    [sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+                    [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", code], stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True,
                 )
             return

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 import shutil
 import subprocess
-import sys
 import unittest
 from typing import ClassVar, cast
 
@@ -33,7 +34,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
     runpy.run_path(script, run_name='__main__')
 """
         result = subprocess.run(
-            [sys.executable, "-c", harness, str(SCRIPT), "register", "--production", "example"],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", harness, str(SCRIPT), "register", "--production", "example"],
             cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
         )
 

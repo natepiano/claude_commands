@@ -1486,7 +1486,7 @@ class StaffTests(StaffTestCase):
         _ = self.tree()
         before = self.staff_file.read_bytes()
         killed = subprocess.run(
-            [sys.executable, "-c", KILLED_WRITER], cwd=CHECKOUT,
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", KILLED_WRITER], cwd=CHECKOUT,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(killed.returncode, 73, killed.stderr)
@@ -1781,7 +1781,7 @@ class StaffTests(StaffTestCase):
         with staff.operation():
             with staff.operation():
                 _ = fixture_member("showrunner", name="outer")
-            child = subprocess.run([sys.executable, "-c",
+            child = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child', runtime_id='02fc3c9a-b345-56a6-ac99-fdd5685739a6')\")"],
                 cwd=CHECKOUT, pass_fds=staff.operation_fds(), capture_output=True,
@@ -1804,7 +1804,7 @@ class StaffTests(StaffTestCase):
                 pass_fds=(inherited.fileno(),))
             self.assertEqual(exited.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             environment = {**os.environ, "STAFF_OPERATION_FD": str(inherited.fileno())}
-            child = subprocess.run([sys.executable, "-c",
+            child = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan', runtime_id='bace30cb-17a4-5156-a98f-c0d41e973849')\")"],
                 cwd=CHECKOUT, env=environment, pass_fds=(inherited.fileno(),), capture_output=True,
@@ -1832,7 +1832,7 @@ class StaffTests(StaffTestCase):
                     "from scripts.production.staff_test_support import observe_operation_lock; "
                     "observe_operation_lock(); from scripts.production import staff; "
                     "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='fallback', runtime_id='e49bd66f-2aaa-5521-b99d-225ca97f55f8')\")")
-                child = subprocess.Popen([sys.executable, "-c", program], cwd=CHECKOUT,
+                child = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program], cwd=CHECKOUT,
                     env=environment, pass_fds=(unlocked.fileno(),), stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True)
                 self.assert_operation_blocks(child, listener)

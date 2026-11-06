@@ -455,7 +455,7 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(main_publish.queue_path(), queue_path)
         self.assertEqual(main_publish.read_queue(), change)
         result = subprocess.run(
-            [sys.executable, "-c", "from scripts.lib import main_publish; "
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.lib import main_publish; "
              + "value = main_publish.read_queue(); print(value)"],
             cwd=Path(__file__).resolve().parents[2], env=repo.env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,

@@ -862,9 +862,16 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             if publish:
                 info: dict[str, object] = {"process_info": {"foreground_processes": [{
                     "pid": backend.pid, "argv": ["codex", *agent_arguments], "cwd": str(self.new_folder)}]}}
+
+                def publication_result(*arguments: str) -> dict[str, object]:
+                    if arguments[:2] == ("pane", "process-info"):
+                        return info
+                    return {"panes": [{"pane_id": "w1:p3", "terminal_id": "w1:p3-terminal",
+                        "workspace_id": "w1", "agent_session": {"kind": "id", "value": held_id}}]}
+
                 publishing = True
                 try:
-                    with mock.patch.object(client, "result", return_value=info):
+                    with mock.patch.object(client, "result", side_effect=publication_result):
                         launch = client.codex_launch(pane, agent_arguments)
                         launch["name"] = name
                         pane_launch.write(pane_record.record_path(client.session), launch)

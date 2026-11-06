@@ -254,7 +254,7 @@ def load(name, *args, **kwargs):
 builtins.__import__ = load
 print(scratch.target('gate:proof', 'tree', False))
 """
-        result = subprocess.run([sys.executable, "-c", probe], text=True, capture_output=True, timeout=10)
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", probe], text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(result.stdout.strip()).parent, copy_record.root())
         self.assertRegex(Path(result.stdout.strip()).name, r"^gate-proof-tree-[a-z0-9]{6}$")
@@ -412,7 +412,7 @@ print(scratch.target('gate:proof', 'tree', False))
         path = self.copy()
         program = ("import os,sys; from pathlib import Path; from scripts.lib import scratch; "
                    "os.replace=lambda *args: os._exit(71); scratch.hand_over(Path(sys.argv[1]), 'next-unit', 'gate:next-unit')")
-        stopped = subprocess.run([sys.executable, "-c", program, str(path)], check=False, capture_output=True)
+        stopped = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, str(path)], check=False, capture_output=True)
         self.assertEqual(stopped.returncode, 71, stopped.stderr)
         scratch.hand_over(path, "next-unit", "gate:next-unit")
         record = scratch.task_of(path)

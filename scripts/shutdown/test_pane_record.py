@@ -158,7 +158,7 @@ class PaneRecordTests(unittest.TestCase):
         arguments = ["codex"] if kind == "codex" else ["claude", "-n", "claude-name", "--model", "opus"]
         client.process_info = {"foreground_processes": [{"pid": 4242, "argv": arguments, "cwd": str(self.root)}]}
         output = io.StringIO()
-        with (mock.patch.dict(os.environ, {"HOME": str(self.root)}),
+        with (mock.patch.dict(os.environ, {"HOME": str(self.root), "HERDR_PROC": str(process.parent)}),
               mock.patch.object(pane_record, "PROC", process.parent),
               mock.patch.object(pane_record, "RECORD_DIR", self.records),
               mock.patch.object(sessions, "process_start", return_value="fixture-start"),
@@ -166,6 +166,8 @@ class PaneRecordTests(unittest.TestCase):
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(client, "pane_tab", return_value=("morty", 1, {"name": reference})),
               redirect_stdout(output)):
+            if kind == "codex" and rows:
+                self.assertEqual(client.codex_launch("w2C:p1")["session_id"], rows[0].current_session)
             self.assertEqual(pane_record.seed("agents"), 0)
         return output.getvalue()
 

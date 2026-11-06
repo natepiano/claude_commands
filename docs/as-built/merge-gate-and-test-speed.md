@@ -141,6 +141,14 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 - `wait_until(ready, directory, timeout=TEST_HANG_GUARD_SECS, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
 - `wait_for_file(path)` is a wrapper, also callable from the command line.
 
+**Python import root.** `scripts/lib/py` resolves its own repository root with shell operations.
+For stdin, `-c`, and `-m`, it puts that root first in `PYTHONPATH` and passes `-P` first.
+It preserves inherited Python paths after that root.
+Options such as `-B` and `-u` can precede the program mode.
+File scripts keep their existing import path behavior.
+The shim resolves relative paths and parent segments without another process or a directory change.
+`test_py_shim.py` tests local package collisions, old modules, cached interpreters, module mode, and file scripts.
+
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `implement.sh` run.
 
 **Stub app-server shutdown** (`scripts/agents/test_codex_mesh.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.

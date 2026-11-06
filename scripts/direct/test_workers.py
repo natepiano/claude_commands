@@ -729,7 +729,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                 _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
                 self.open_worker(name="impl")
                 child = subprocess.Popen([
-                    sys.executable, "-c",
+                    str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
                     "from pathlib import Path; import sys; from scripts.direct import workers; " +
                     "print(workers.resolve(Path(sys.argv[1]), 'impl'), flush=True)",
                     str(self.session_dir),
@@ -784,7 +784,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             fcntl.flock(owner, fcntl.LOCK_EX)
             _ = roster.truncate(0)
             roster.flush()
-            child = subprocess.Popen([sys.executable, "-c", script, str(self.session_dir), str(SCRIPT.parents[2])],
+            child = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(self.session_dir), str(SCRIPT.parents[2])],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
             try:
                 assert child.stdout is not None

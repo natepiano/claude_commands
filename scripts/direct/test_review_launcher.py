@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file
+from scripts.lib.test_models_registry import write_registry
 
 from scripts.lib.py_floor_test_support import cache_file_name
 
@@ -28,6 +29,37 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    def test_herdr_simplify_keeps_the_claude_launch_path(self) -> None:
+        run = self.start_implementation("pane-simplify")
+        self.finish_implementation(run)
+        _ = (run / "worker_transport").write_text("herdr\n")
+        source = Path(__file__).resolve().parents[1]
+        (self.root / "scripts/direct/simplify_result.py").symlink_to(source / "direct/simplify_result.py")
+        template = self.root / "review"
+        template.mkdir()
+        _ = (template / "simplify.md").write_text("Report only. Edit no file.\n")
+        _ = write_registry(self.root / ".claude/config/models.conf", {"assignments": {"direct.simplify": "claude"},
+                           "direct.claude": {"simplify": "opus:xhigh"}},
+                           update=True)
+        diff = self.root / "phase.diff"
+        _ = diff.write_text("diff --git a/worker.py b/worker.py\n-old\n+new\n")
+        agent = self.root / "scripts/agents/agent_exec.sh"
+        _ = agent.write_text(agent.read_text().replace("No findings.", "Pass"))
+        environment = self.environment()
+        environment["HERDR_BIN"] = "/nonexistent/herdr"
+        before = (self.root / "staff.json").read_bytes()
+        command = self.review_command(run, "simplify", "")
+        command[5] = "simplify"
+        command[2:2] = ["--diff", str(diff)]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((run / "review_findings_1_simplify.txt").read_text(), "Pass\n")
+        self.assertEqual((run / "review_status_simplify").read_text(), "reviewed\n")
+        self.assertIn("task=direct.simplify\nfamily=claude\n", (run / "review_agent_simplify").read_text())
+        self.assertEqual((run / "worker_transport").read_text(), "herdr\n")
+        self.assertEqual((self.root / "staff.json").read_bytes(), before)
+
 
     @override
     def environment(self) -> dict[str, str]:
@@ -167,7 +199,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         interpreter = binaries / "python3"
         calls = self.root / "python-calls"
         _ = interpreter.write_text(
-            '#!/bin/bash\nprintf "%s\\n" "$2" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
         )
         interpreter.chmod(0o755)
         environment = self.environment()
@@ -181,7 +213,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         commands = calls.read_text().splitlines()
         self.assertEqual(len(commands), 3)
         self.assertIn("sys.version_info", commands[0])
-        self.assertEqual(commands[1:], ["print('ready')"] * 2)
+        self.assertEqual(commands[1:], ["-P -c print('ready')"] * 2)
         self.assertEqual((self.root / "cold-cache" / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
     def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:

@@ -13,7 +13,6 @@ import re
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from collections import defaultdict
@@ -32,7 +31,7 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import models_registry, unit_runs  # noqa: E402
+from scripts.lib import atomic_file, models_registry, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import session_staff, staff, unit_config  # noqa: E402
@@ -491,23 +490,13 @@ def _read_state(session_dir: Path) -> dict[str, object]:
 
 
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
-    session_dir.mkdir(parents=True, exist_ok=True)
-    target = _state_path(session_dir)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=session_dir,
-        prefix=f".{plan_history.STATE_FILENAME}.",
-        delete=False,
-    ) as handle:
-        stored = _stored_fields(state)
-        if state.get(unit_runs.OWNER_FIELD) and state.get("status") == "active":
-            for key in ("production", "unit", "branch"):
-                _ = stored.pop(key, None)
-        json.dump(stored, handle, indent=2, sort_keys=True)
-        _ = handle.write("\n")
-        temporary = Path(handle.name)
-    os.replace(temporary, target)
+    stored = _stored_fields(state)
+    if state.get(unit_runs.OWNER_FIELD) and state.get("status") == "active":
+        for key in ("production", "unit", "branch"):
+            _ = stored.pop(key, None)
+    atomic_file.write_text_atomic(
+        _state_path(session_dir), json.dumps(stored, indent=2, sort_keys=True) + "\n",
+    )
 
 
 SESSION_ROOTS = tuple(
@@ -1323,6 +1312,7 @@ def _event(
                 "called_task": _string(current_pass.get("called_task")),
                 "worker_name": _string(current_pass.get("worker_name")),
                 "worker_id": _string(current_pass.get("worker_id")),
+                "launcher_command": current_pass.get("launcher_command", []),
             }
         )
     activity = _object_dict(state.get("activity")) if phase_record is None else None
@@ -1731,8 +1721,53 @@ def _check_launch(args: argparse.Namespace) -> None:
         _append_event(state, event)
 
 
+@dataclass(frozen=True)
+class MatchedDispatch:
+    worker_name: str
+    instance_id: str
+
+
+@dataclass(frozen=True)
+class NoMatchedDispatch:
+    pass
+
+
+def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
+                    fields: dict[str, object], launcher_command: list[str], *,
+                    dispatch_owned: bool, allow_stage_two: bool = False) -> MatchedDispatch | NoMatchedDispatch:
+    if active is None or _pass_phase_instance(active) != _string(phase.get("instance_id")):
+        return NoMatchedDispatch()
+    saved_command = active.get("launcher_command")
+    same_launcher = bool(launcher_command) and saved_command == launcher_command
+    if launcher_command and saved_command and not same_launcher:
+        return NoMatchedDispatch()
+    if not all(active.get(key, "") == value for key, value in fields.items()
+               if key != "prompt_file" or not (allow_stage_two and same_launcher)):
+        return NoMatchedDispatch()
+    if active.get("status") != "active" and not (
+            dispatch_owned and active.get("status") == "completed" and same_launcher):
+        return NoMatchedDispatch()
+    return MatchedDispatch(_string(active.get("worker_name")), _string(active.get("instance_id")))
+
+
+def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
+                    prompt: Path, launcher_command: list[str]) -> MatchedDispatch | NoMatchedDispatch:
+    """Find the worker for this dispatch retry without changing recorder state."""
+    if not _state_path(session_dir).is_file():
+        return NoMatchedDispatch()
+    state = _read_state(session_dir)
+    recorded_phase = _open_phase_named(state, phase)
+    if recorded_phase is None:
+        return NoMatchedDispatch()
+    return _dispatch_match(
+        _pass_slots(state).get(slot), recorded_phase,
+        {"kind": role, "prompt_file": str(prompt), "launcher_command": launcher_command},
+        launcher_command, dispatch_owned=True,
+    )
+
+
 def _start_pass(args: argparse.Namespace) -> None:
-    if not _launcher_owned():
+    if not _launcher_owned() and not getattr(args, "dispatch_owned", False):
         raise SystemExit(f"start-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
     session_dir = _session_dir(args)
     pass_kind = _arg_string(args, "pass_kind")
@@ -1743,28 +1778,44 @@ def _start_pass(args: argparse.Namespace) -> None:
         effort=_arg_string(args, "called_effort", "unset") or "unset",
         session_id="",
     )
-    team_slot = _team_slot()
+    team_slot = _optional_arg(args, "team_slot") if hasattr(args, "team_slot") else _team_slot()
     state = _read_state(session_dir)
     # A phase running beside the current one names itself, so its pass is not stamped with
     # the current phase's.
     phase, launch_check = _checked_launch(args, state, session_dir)
+    launcher_command = _launcher_arguments(_optional_arg(args, "launcher_command"))
+    dispatch_fields: dict[str, object] = {
+        "kind": pass_kind,
+        "fix_pass": fix_pass,
+        "called_task": _arg_string(args, "called_task"),
+        "worker_name": _optional_arg(args, "worker_name"),
+        "prompt_file": _optional_arg(args, "prompt_file"),
+        "dispatch_kind": _optional_arg(args, "dispatch_kind"),
+        "lens": _optional_arg(args, "lens"),
+    }
+    active = _pass_slots(state).get(team_slot)
+    match = _dispatch_match(active, phase, dispatch_fields, launcher_command,
+                            dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
+                            allow_stage_two=bool(getattr(args, "dispatch_owned", False)))
+    if active is not None and isinstance(match, MatchedDispatch):
+        if launcher_command and not active.get("launcher_command"):
+            active["launcher_command"] = launcher_command
+            _write_state(session_dir, state)
+        return
     now = plan_history.now_epoch()
-    # This slot's stale pass and no other. The peers belong to launchers still
-    # waiting on their own agents, and a phase team opens both within the same
-    # second: closing them here is the corruption this key exists to
-    # prevent, not the cleanup it looks like.
+    # A different dispatch replaces only this slot's pass.
     _ = _close_slot_pass(session_dir, state, team_slot, "interrupted", now)
     state = _read_state(session_dir)
     _refresh_main_identity(session_dir, state)
     current_pass: dict[str, object] = {
+        **dispatch_fields,
         "instance_id": str(uuid.uuid4()),
-        "kind": pass_kind,
-        "fix_pass": fix_pass,
         "activity": _arg_string(args, "activity"),
         "started_at": now,
         "called_task": _arg_string(args, "called_task"),
         "worker_name": _optional_arg(args, "worker_name"),
         "worker_id": _optional_arg(args, "worker_id"),
+        "launcher_command": launcher_command,
         "called_agent": called_agent,
         "team_slot": team_slot,
         "phase": _phase_stamp(phase),
@@ -1783,6 +1834,42 @@ def _start_pass(args: argparse.Namespace) -> None:
     # it, so the marker retires here instead of leaving two review rows.
     if pass_kind == "review":
         _ = _clear_armed_review(session_dir, _read_state(session_dir), "adopted", now)
+
+
+def _launcher_arguments(text: str) -> list[str]:
+    """Read the launcher's saved argument list without shell parsing."""
+    if not text:
+        return []
+    try:
+        value = cast(object, json.loads(text))
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid --launcher-command: {error}") from error
+    if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in cast(list[object], value)):
+        raise SystemExit("--launcher-command requires a nonempty JSON list of strings")
+    return cast(list[str], value)
+
+
+def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
+                   worker_name: str, launcher_command: list[str], prompt: Path, kind: str, lens: str,
+                   fix_cause: str = "", fix_pass: int = 0, activity: str = "") -> str:
+    """Record a published worker's dispatch and return its durable pass id."""
+    if role not in staff.WORKER_ROLES:
+        raise ValueError(f"Unknown worker role: {role}")
+    args = argparse.Namespace(
+        session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role,
+        worker_name=worker_name, launcher_command=json.dumps(launcher_command) if launcher_command else "",
+        prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
+        called_family="unknown", called_model="unknown", called_effort="unset",
+        fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens, dispatch_owned=True,
+    )
+    session_dir.mkdir(parents=True, exist_ok=True)
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            _start_pass(args)
+            return _string(_pass_slots(_read_state(session_dir))[slot]["instance_id"])
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _finish_pass(args: argparse.Namespace) -> None:
@@ -6539,7 +6626,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     check_launch = subparsers.add_parser("check-launch")
     _ = check_launch.add_argument("--session-dir", required=True)
-    _ = check_launch.add_argument("--pass-kind", choices=("impl", "test", "fix", "review"), required=True)
+    _ = check_launch.add_argument("--pass-kind", choices=staff.WORKER_ROLES, required=True)
     _ = check_launch.add_argument("--phase-id", default="")
     _ = check_launch.add_argument("--prompt-file", default="")
     _ = check_launch.add_argument("--fix-cause", default="")
@@ -6548,7 +6635,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     start_pass = subparsers.add_parser("start-pass")
     _ = start_pass.add_argument("--session-dir", required=True)
-    _ = start_pass.add_argument("--pass-kind", choices=("impl", "test", "fix", "review"), required=True)
+    _ = start_pass.add_argument("--pass-kind", choices=staff.WORKER_ROLES, required=True)
+    _ = start_pass.add_argument("--launcher-command", default="", help="JSON list of launcher arguments for recovery")
     _ = start_pass.add_argument("--fix-pass", type=int, default=0)
     _ = start_pass.add_argument("--activity", required=True)
     _ = start_pass.add_argument("--called-task", required=True)

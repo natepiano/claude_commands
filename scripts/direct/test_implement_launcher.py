@@ -3,11 +3,26 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
+from scripts.whoami.account_test_support import write_codex_auth
 from typing import cast
 
 from scripts.direct import implement_launcher_test_support as support
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+
+
+def configure_pane_account(home: Path, notes: Path) -> None:
+    """Give the child command a signed-in private worker account."""
+    configuration = home / ".claude/config"
+    configuration.mkdir(parents=True, exist_ok=True)
+    _ = (configuration / "accounts.json").write_text(json.dumps({"workers": "codex1"}))
+    notes.mkdir(parents=True, exist_ok=True)
+    _ = (notes / "codex1.md").write_text("---\nlogin: worker@example.invalid\n---\n")
+    account = home / ".codex"
+    account.mkdir(parents=True, exist_ok=True)
+    write_codex_auth(account, "worker@example.invalid")
+
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):

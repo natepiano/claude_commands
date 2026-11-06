@@ -90,7 +90,8 @@ An interruption marker reports the instance generation.
   The remote service and Linux runner need this config during import.
 - A version refusal names the target, each mismatched tool, both versions, and the file set by `version_pin_file`.
   The verify output and the step attempt record keep this reason.
-- `release_stopped_claims` releases only claims bound to the stopped host and generation, and writes `release-evidence/`.
+- `release_stopped_claims` releases host claims after a confirmed stop or a generation change, and writes `release-evidence/`.
+  A generation change releases only claims with a nonempty older generation and a start time at or before the observation.
 
 ### Status and report
 

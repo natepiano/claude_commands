@@ -267,11 +267,12 @@ class RecordedResumeTests(ShutdownTestCase):
         return cast(list[str], launch.call_args.args[4])
 
     def test_codex_resume_keeps_the_recorded_model_and_omits_an_empty_model(self) -> None:
+        folder = str(self.folder.resolve())
         for model in ("", "codex-model"):
             with self.subTest(model=model):
                 arguments = self.resumed_arguments(self.entry("codex", model))
-                expected = ["-C", "/tmp/recorded-resume", "-c",
-                            'projects={"/tmp/recorded-resume"={trust_level="trusted"}}', "resume", "current-id"]
+                expected = ["-C", folder, "-c",
+                            f'projects={{"{folder}"={{trust_level="trusted"}}}}', "resume", "current-id"]
                 if model:
                     expected.extend(("--model", model))
                 self.assertEqual(arguments, expected)
