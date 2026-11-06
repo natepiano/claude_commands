@@ -1732,3 +1732,42 @@ Each `--until` or default scratch folder now has the task `until:<stamp>/<id>`, 
 
 **Ruled out:**
 - `end` refusing a folder with uncommitted work, or a folder a gate holds: new checks, and the question is with the user.
+
+### Phase 77 — Random text uses the standard library  · status: done
+**Depends on:** Phase 76.
+
+**Approved:** the builds showrunner, 2026-11-05: "replace each one-line loop with the standard library call (secrets.token_hex or similar) where the output format allows; that removes the copies with no helper."
+
+#### Work Order
+
+**Goal:** the scratch suffix and the review link id come from `secrets.token_hex`, so two copies of the one-line random text loop go away and no new helper comes.
+
+**Measured:**
+1. `scripts/lib/scratch.py:485` `random_suffix` joins `secrets.choice(SUFFIX_CHARACTERS)`. `SUFFIX_CHARACTERS` (:90) has no other use, and `string` has no other use in that file.
+2. `scripts/review_links/review_link.py:160` joins `secrets.choice(ascii_lowercase + digits)` six times. `ascii_lowercase` and `digits` have no other use in that file.
+3. Readers and tests of both forms use `[a-z0-9]{6}`. Lowercase hex matches that text, so no reader changes.
+4. `scripts/lib/build_folders.py:150` takes its characters from `names.suffix_characters` in config, so its output format does not allow `token_hex`. It stays.
+5. Two collision tests in `scripts/review_links/test_review_link.py` (:616, :632) patch `secrets.choice`, so they stop at the new call. The writer found this: the first Work Order text said no test changes.
+
+**Spec:**
+1. `random_suffix` returns `secrets.token_hex(length)[:length]`, with `length` from the scratch.conf `suffix_length`. Remove `SUFFIX_CHARACTERS` and the `string` import.
+2. `review_link.py` makes each id with `secrets.token_hex(3)`. Remove `ascii_lowercase` and `digits` from its import.
+3. `docs/as-built/review-links.md` states the new id: six lowercase hex characters from `secrets.token_hex`.
+4. In the two collision tests, patch `secrets.token_hex` with whole ids: `side_effect=["taken1", "fresh2"]` and `return_value="aaaaaa"`. The count assertion changes from 60 characters to 10 ids, and it still proves ten tries. The other assertions stay.
+5. Do not change `build_folders.py`, a reader, a config value or any other test.
+6. Add no guard, refusal or check the Work Order did not ask for. Post blocked to ask instead.
+
+**Cost:** an id or a suffix has 24 random bits, not about 31. A review link id is not the access control of a page, and an exclusive `mkdir` with 10 tries already handles a taken id. A scratch suffix follows a stamp and a word, so a repeat needs the same minute and word.
+
+**Files:**
+- `scripts/lib/scratch.py`
+- `scripts/review_links/review_link.py`
+- `docs/as-built/review-links.md`
+- `scripts/review_links/test_review_link.py`
+
+**Workers:** `1 writer`.
+- impl: all files.
+
+**Acceptance gate:**
+- `scripts/lib/test_scratch.py`, `scripts/lib/test_build_folders.py`, `scripts/copies/test_copies.py`, `scripts/review_links/test_review_link.py`, `scripts/review_links/test_change_page.py` and `scripts/review_links/test_serve.py` pass, with no test change except Spec 4. Their existing `[a-z0-9]{6}` assertions observe the new forms.
+- basedpyright reports 0 errors and 0 warnings on `scripts/lib/scratch.py` and `scripts/review_links/review_link.py`.
