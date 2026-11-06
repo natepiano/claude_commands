@@ -988,3 +988,52 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **State:** none.
 
 **Verification:** `test_verify_lint*.py` through `scripts/test_times/module_run.py`; `basedpyright scripts/direct/test_verify_lint_judgment.py`; `bash -n scripts/direct/verify.sh` and `shellcheck scripts/direct/verify.sh`; the merge gate before the checkpoint.
+
+### Phase 40 — A verify step reads each target's platform from the eligibility answer · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** natest, routed by builds 2026-11-05 (next item "Platform column in build_targets.py eligible").
+
+**Goal:** `verify.sh` gets each target's platform from the `eligible` answer, so a routed step starts no `build_targets.py platform` interpreter.
+
+**Spec:**
+
+1. **The answer.** `print_eligible_target` in `scripts/build_targets/build_targets.py` prints a fifth tab-separated field: the target's platform for an `SshTarget`, `-` for a local target. Every `eligible` form prints it: plain, `--kind` and `--target`.
+2. **Every reader.** Each `read -r name eligibility reason settings` loop over the table in `scripts/direct/verify.sh` reads a fifth field, `platform`, so `settings` stays one field. There are 9 loops today, in `step_can_retry`, `initialize_step_record`, `target_for_settings`, `ssh_retry_hook`, `route_test` and others. Find each with grep.
+3. **Loops use the field.** A loop that calls `target_platform "$name"` for its own row reads `$platform`.
+4. **`target_platform`.** It scans `STEP_TARGET_TABLE` in Bash and starts no process. A row for the name with `macos` or `linux` gives that word. With no such answer, the last line stays as it is today: `[[ "$STEP_RUNS_ON" == mac_allowed && "$1" == mac ]] && printf '%s\n' macos`. `target_for_settings` does not change other than its read.
+5. **Remove the command.** `verify.sh` is the only caller of `build_targets.py platform`. Remove `command_platform`, the `platform` subparser, the `main` branch and the early `sys.argv[1:2] == ["platform"]` block. Keep `target_config.configured_ssh_target`, which other code calls.
+6. **Fixtures.** Each fake `eligible` answer prints the fifth field. Each fake `platform` branch goes, at `test_verify_ssh_targets.py:221` and `test_verify_step_state.py:142`, among others.
+7. **New tests.** `scripts/direct/test_verify_target_platform.py` extracts `target_platform` with `shell_functions` from `scripts/lib/shell_test_support.py` and runs it in `bash`, with `build_targets.py` not on any path it can reach. Cases: a `macos` row; a `linux` row; a `-` row; no row with `mac_allowed` and the name `mac`; no row with `ssh_allowed`. `scripts/build_targets/test_build_targets.py` states the fifth field for an SSH target and for a local target.
+
+**Invariants:** target selection, refusals, fallbacks, reservations, step records, `verify.sh` output and exit codes stay the same for every verb. A step that today reads `macos` for a target reads `macos` after this phase. `verify.sh` runs under bash 3.2. Add no other guard, refusal or check; the `invalid targets` check does not read the new field.
+
+**Test changes approved:**
+- Each fixture row and each expected `eligible` line gains the fifth field.
+- Each fake `platform` branch goes.
+- The total in `test_verify_python_starts.py::test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper` falls by exactly the `platform` starts that its trace held, if any.
+
+**Acceptance:**
+
+- Observation: the count of `build_targets.py platform` starts and the wall and CPU seconds of `python3 ~/.claude/scripts/test_times/module_run.py scripts/direct test_verify_ssh_targets_routing.py`. The director measures the tree before and after this phase.
+- Comparison: the count falls to 0. The numbers go in the notice, with the load noted.
+- Real path: `test_verify_ssh_targets*.py`, `test_verify_step_routes*.py`, `test_verify_mac*.py`, `test_verify_token*.py`, `test_verify_python_starts.py` and `scripts/build_targets`.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — the fifth field; the `platform` command goes.
+- `scripts/direct/verify.sh` — the readers and `target_platform`.
+- `docs/as-built/build-targets.md` — the `eligible` row and any `platform` row.
+- `scripts/direct/test_verify_target_platform.py` — new direct tests.
+- `scripts/build_targets/test_build_targets.py`, `scripts/build_targets/test_ssh_eligibility.py` — the expected lines.
+- `scripts/direct/test_verify_ssh_targets.py`, `scripts/direct/test_verify_step_state.py`, `scripts/direct/test_verify_mac_lint_token.py`, `scripts/direct/test_verify_mac_disk_leave.py`, `scripts/direct/verify_step_routes_test_support.py`, `scripts/direct/verify_token_wait_test_support.py` — fixture rows and fake commands. A fixture that the suites show also prints a row joins this set.
+
+**Workers:** 1 writer + 1 tester
+- `merge16` (impl): `scripts/build_targets/build_targets.py`, `scripts/direct/verify.sh`, `docs/as-built/build-targets.md`.
+- `fix16` (test): every test and fixture file.
+
+**State:** none.
+
+**Verification:** the Real path modules through `scripts/test_times/module_run.py`; `basedpyright` over each changed Python file; `bash -n scripts/direct/verify.sh` and `shellcheck scripts/direct/verify.sh`; the merge gate before the checkpoint.
