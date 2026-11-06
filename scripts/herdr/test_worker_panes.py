@@ -359,7 +359,7 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(found[parent.id], [worker_panes.ProcessUnknownWorker(
             other, "w2:p1", "terminal-w2:p1", "process permission denied")])
         self.assertIsInstance(next(item for item in found[self.parent.id] if item.row.id == absent.id),
-                              worker_panes.UncertainWorker)
+                              worker_panes.ClosedWorker)
         self.world.unreadable = True
         found = worker_panes.observe_parents([self.parent, parent], record)
         self.assertTrue(all(isinstance(item, worker_panes.UncertainWorker) for states in found.values() for item in states))
@@ -1324,6 +1324,19 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(found[known.id], worker_panes.OpenWorker)
         self.assertIsInstance(found[absent.id], worker_panes.ClosedWorker)
         self.assertEqual(self.world.commands, [])
+
+    def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
+        absent = self.worker("absent")
+        self.world.add(self.parent, "w1:p9", live=False, label="foreign")
+        self.world.unknown["w1:p9"] = "unreadable pane in the parent's tab"
+        found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
+
+    def test_unreadable_parent_pane_leaves_an_absent_worker_uncertain(self) -> None:
+        absent = self.worker("absent")
+        self.world.unknown["w1:p0"] = "unreadable parent pane"
+        found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
 
     def test_unrelated_unknown_pane_in_another_tab_allows_a_new_worker(self) -> None:
         self.world.add(self.parent, "w2:p9", live=False, label="foreign", workspace="w2", tab="w2:t2")

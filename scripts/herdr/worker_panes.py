@@ -287,7 +287,12 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr
     if isinstance(read, PaneReadUnavailable):
         return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in workers])
     panes, scan, statuses = read.panes, read.scan, read.statuses
-    parent_tabs = {_text(pane, "tab_id") for pane in scan.found.get(parent, [])} - {""}
+    parent_row = record.by_id(parent)
+    unread = {item.pane for item in scan.unknown}
+    parent_panes = scan.found.get(parent, []) + [
+        pane for pane in panes if parent_row is not None and pane.get("label") == parent_row.name
+        and _text(pane, "pane_id") in unread]
+    parent_tabs = {_text(pane, "tab_id") for pane in parent_panes} - {""}
     states: list[WorkerPane] = []
     for row in workers:
         matches = scan.found.get(row.id, [])
@@ -332,6 +337,8 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr
             except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: {row.name}: {error}", file=sys.stderr)
                 states.append(ProcessUnknownWorker(row, identity, terminal, str(error)))
+        elif any(item.tab in parent_tabs for item in scan.unknown):
+            states.append(_uncertain(row, "pane evidence is incomplete; absence is unproved"))
         else:
             states.append(ClosedWorker(row))
     return PaneEvidence(panes, scan, states)
