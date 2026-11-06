@@ -43,7 +43,7 @@ dispatcher overhead, so every hook keeps its full budget.
 `settings.json`: a dispatched hook file must no longer appear as an entry of
 its own.
 
-`stop-direct-continue.py` has a separate Stop entry with `asyncRewake: true` and a 10 s timeout.
+`stop-direct-continue.py` has a separate Stop entry with `asyncRewake: true` and a 60 s timeout.
 It runs after the turn ends.
 Exit 2 sends its stderr reason to the agent in a system-reminder.
 The user sees only "Continuing the unit run".

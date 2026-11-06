@@ -1,35 +1,77 @@
-# Review regime trial — results (closed 2026-10-05)
+# Review regime records
 
-**Question:** do extra review workers pay for themselves? From 2026-10-01 (user decision), every phase that changes the screen got a UX reviewer, and every phase got a code-quality reviewer (the `craft` lens). Both judged by the three gods (`docs/decision_criteria.md`). On 2026-10-04 the user dropped the code-quality reviewer and kept the UX reviewer. A 12-phase watch then measured the result. The user acknowledged it on 2026-10-05.
+## What it is
 
-**Data:** `review-regime-trial.jsonl` beside this file is the full ledger as of the acknowledgment: 122 rows from the production logs, one per merged phase. The live ledger is `~/.claude/data/review_regime.jsonl`, which is not in git. `scripts/production/review_regime.py report` recomputes the table from either file.
+The review records connect each merged phase to its findings, review time, merge holds, and merge defects.
+`scripts/production/review_regime.py` writes `~/.claude/data/review_regime.jsonl` and reports means by regime.
+The `simplify` lens has separate findings and minutes fields.
+[Simplify review lens](simplify-lens.md) defines its launch and decision rules.
 
-**Method:**
-- `before` = phases before 2026-10-01; `trial` = both extra reviewers; `after` = UX reviewer only.
-- `holds` = checkpoints the showrunner held.
-- `merge-defects` = defect rows that the merge design check found in the phase's own work.
-- Phases the comparison cannot use carry an `excluded` reason. These were marked from the logs on 2026-10-05, after build-tool phases skewed the first count: 46 changed nothing on screen, 17 had no merge design check, 3 had no check in the log, and 1 had no defect count. The table counts only the rest.
+## How it works
 
-| | before | trial | after |
-| --- | --- | --- | --- |
-| phases merged | 9 | 29 | 12 |
-| holds per phase (mean) | 1.3 | 0.2 | 0.1 |
-| merge design-check defects per phase (mean) | 8.0 | 3.2 | 2.8 |
-| hours, start to merge (median) | 13.9 | 8.1 | 6.3 |
-| review-worker minutes per phase (mean) | - | 62.0 | 48.7 |
-| screenshot check minutes per phase (mean) | - | 38.0 | 25.1 |
-| repair minutes after its findings per phase (mean) | - | 211.3 | 111.6 |
-| UX reviewer findings per phase (mean) | - | 5.7 | 2.5 |
-| code reviewer findings per phase (mean) | - | 4.1 | 0.3 |
+`progress_history.py review-trial --session-dir <run> [--phase-id <id>]` reports one phase instance.
+A named phase selects its open instance or its latest completed instance.
+Without `--phase-id`, the command selects the current phase, including a completed phase.
 
-**Learning:**
-- **The extra review workers paid for themselves.** Against `before`, review workers cut holds by about 6x and design-check defects by 2.5–3x, and phases merged in roughly half the time.
-- **The code-quality reviewer added nothing measurable on top of the UX reviewer.** Without it, every quality figure held or improved, and phases merged about 2 h faster.
-- **Keep the UX reviewer; leave the code-quality worker off.**
+Completed review records supply code and simplify finding counts through `_raised_findings`.
+The records live under `history_root()/review_turns/<run>/`.
+`CodeReviewEvidence` is `NoRecordedCodeReview | RecordedCodeFindings`.
+`RecordedCodeFindings(0)` records a completed review with no findings.
+`NoRecordedCodeReview` makes the count use `finding_opened` events instead.
 
-**Limits:**
-- The samples are small (9 / 29 / 12).
-- `after` phases came later in mature plans.
-- Exclusions were judged from logs, not re-measured.
+| Field | Source |
+| --- | --- |
+| UX findings | `finding_opened` events that name `ux`. |
+| Code findings | Completed review records, excluding `ux` and `simplify`; otherwise matching ledger events. |
+| Review-worker minutes | Finished review passes except `direct.simplify`, plus UX review activities. |
+| UX check minutes | Finished `UX review` activities. |
+| UX repair minutes | Finished fix passes whose dispatched batch includes a UX finding. |
+| Simplify findings | Completed simplify review records; otherwise ledger events that name `simplify`. |
+| Simplify minutes | Nonnegative elapsed time from all simplify review records, including failed runs. |
 
-**To re-run the comparison:** append rows with `review_regime.py add` and read `report`. From 2026-10-12 a row carries `plan`, the unit's plan path as its production doc names it, and `add` refuses a second row only for the same unit, plan and phase; a row written earlier has no `plan` and blocks nothing. The watch is acknowledged, so `watch` no longer alerts. From 2026-10-07 a row's code number is every code finding the phase's review raised, and `report` prints it as `code findings per phase (mean)`; the table above counts the code-quality reviewer's findings alone, so compare new rows with each other, not with that line of the table.
+The recorder rounds each time to the nearest whole minute.
+A ledger finding with several lenses contributes to each applicable count.
+A simplify-only finding does not contribute to the code count.
+
+The line has this form:
+
+```text
+review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>[, simplify <S> findings, simplify minutes <T>]
+```
+
+The simplify suffix appears when the phase has simplify records or findings.
+`scripts/production/merge_checkpoint.py` parses it with `review_numbers(line) -> ReviewTrial`.
+`ReviewTrial.simplify` is `SimplifyReviewMetrics(findings, minutes) | NoSimplifyReview`.
+The parser accepts lines without the suffix.
+The checkpoint script passes the present fields to `review_regime.py add`.
+
+`review_regime.Row` holds the unit, plan, phase, regime, times, holds, merge defects, findings, review minutes, and optional notes.
+The regime is `before`, `trial`, or `after`.
+`add` requires times with UTC offsets and refuses a merge time before the start time.
+It keeps an existing row for the same unit, plan, and phase.
+Missing simplify fields remain absent when it writes the row.
+
+`report [--since <ISO date>]` excludes rows with an `excluded` reason.
+It reports means for findings, holds, defects, and review times.
+It reports the median elapsed hours from start to merge.
+Simplify report rows appear only when the selected records contain those fields.
+A phase with zero UX check minutes receives `excluded: no visible change` unless a reason is supplied.
+
+## Calibration / gotchas
+
+The tracked `review-regime-trial.jsonl` contains a fixed data sample.
+The live ledger remains outside Git.
+Rows without a plan field do not identify the same key as rows that supply a plan.
+Missing metric fields do not mean zero.
+Older code counts can describe only the `craft` reviewer; current counts cover code reviews excluding UX and simplify.
+Compare records with the same count definition.
+
+`watch` waits for 12 eligible `after` phases, then returns 3 until `ack` records the user's acknowledgment.
+An acknowledged watch returns 0.
+
+## Why
+
+Separate simplify fields keep its findings and cost distinct from code review.
+Phase-instance selection keeps reopened phases separate.
+A recorded zero preserves evidence that a review completed.
+The row key lets one unit run several plans without merging their phase numbers.
