@@ -10,7 +10,7 @@ Run `python3 ~/.claude/scripts/test_times/show.py $ARGUMENTS` and show its lines
 - `module <folder>/<file> [--runs N]`: show each module execution and its slowest kept tests.
 - `test <text> [--runs N]`: show kept test names that contain the text and later missing measurements.
 
-In the ~/.claude repository, `top` ranks live gate modules by median wall time.
+In the ~/.claude repository, `top` ranks live gate modules by median CPU time.
 In another repository, `top` ranks recorded nextest tests on the current host within `TOP_MAX_AGE_DAYS`.
 The repository key follows its origin, so worktrees share the same test history.
 Use `--host NAME` to select another host. The default is the current host. The heading names the selected host.
@@ -20,3 +20,7 @@ It also shows retained run counts, failed and timed-out run counts, and the late
 Tests with only failed runs follow passed tests, ordered by their latest duration.
 The heading names the repository, host and recording threshold.
 The recorder retains failures, retries, SLOW results and tests above `NEXTEST_SLOW_TEST_S`.
+
+Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <path> <folder>/<file> [<folder>/<file> ...]` for module costs.
+It reports CPU seconds, process starts, successful execs, wall seconds and test status.
+It runs each module once for time and once under `strace` for counts.

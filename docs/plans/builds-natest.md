@@ -75,7 +75,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 - **Speed method** (every speed phase; CPU first, 2026-11-06):
   0. Targets: at dispatch, the director takes the top live rows of `show.py top`, ranked by median CPU per gate, that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal. `agents/test_codex_mesh.py` is excluded: it retires.
   1. Baseline: before the edit, run `python3 scripts/test_times/module_cost.py --tree <tree> <folder>/<file>` for CPU s, processes, execs and wall s. Run the module with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` for each test's time. Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
-  2. Find the cost: the process starts per test, what starts them, and the CPU per test. Name each real end-to-end run and what only it proves. Do not apply a cut the module already has. Estimate each command's removable cost, not the whole script's: Phase 41 estimated 54-62 CPU s and measured 1.8, because 246 of 366 starts already had the light path and two commands kept the heavy chain.
+  2. Find the cost: the process starts per test, what starts them, and the CPU per test (`module_cost.py --tests 10`, from Phase 64; before it lands, rank tests by process starts). Name each real end-to-end run and what only it proves. Do not apply a cut the module already has. Estimate each command's removable cost, not the whole script's: Phase 41 estimated 54-62 CPU s and measured 1.8, because 246 of 366 starts already had the light path and two commands kept the heavy chain.
   3. Cut it, in this order:
      - Test logic by direct calls of the functions under test. Use `scripts/lib/shell_test_support.py` for Bash functions, and run many cases in one shell where the cases allow it. Keep a few real end-to-end runs: each one proves a path that no direct call can prove. Write a behavior map with one row per assertion: the test that checks it after the phase, and whether that test is a direct call or an end-to-end run. For each moved check, show on a tempdir copy that breaking the function fails the new test (verify Phase 41).
      - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does. When files share a fake tool or a fixture, change the fixture once. Make no copy of a fixture.
@@ -1154,10 +1154,12 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 - `scripts/direct/test_assign_launcher_identity.py` — 64.5 CPU s
 - `scripts/direct/test_assign_launcher_review.py` — 43.8 CPU s
 - `scripts/direct/test_implement_launcher_records.py` — 43.6 CPU s
-- `scripts/direct/assign_launcher_test_support.py` — the shared fixture
+- `scripts/direct/assign_launcher_test_support.py` — the assign fixture
+- `scripts/direct/implement_launcher_test_support.py` — the Claude records fixture
 
-**Workers:** 1 writer on slot `impl4` (the files share one fixture, so they do not split)
-- `impl4` — all files above, role impl
+**Workers:** 2 writers, one for each fixture family
+- `impl4` — the four `test_assign_launcher*` files and `assign_launcher_test_support.py`, role impl
+- `test` — `test_implement_launcher_records.py` and `implement_launcher_test_support.py`, role impl
 
 **Constraints from prior phases:**
 - Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. The coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
@@ -1233,7 +1235,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 **Ruled out:** A proof that appends to the real shared log: it puts false rows in a log other tools read.
 
 ### Phase 59 — `style/test_style_proposals.py` uses half its CPU  · status: todo
-**Depends on:** Phase 61
+**Depends on:** Phase 61, Phase 64
 
 #### Work Order
 
@@ -1244,7 +1246,8 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 2. Cut in the Speed method's order, direct calls first.
 3. A cut in a production file goes to the director first, with the measured gain. Do not edit `scripts/style/style_sync.py` or `scripts/style/test_style_sync.py`: devtools holds them.
 4. devtools 3z holds this file and `style_proposals.py` for import lines only. Before the checkpoint, take 3z through builds when the showrunner says builds has it (showrunner, 2026-11-06).
-5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+5. A helper that this phase restructures replaces `dict[str, str | None]` at `test_style_proposals.py:3185`, where `None` means delete, with semantic values such as `WriteFile(content) | DeleteFile`.
+6. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
 
 **Files:**
 - `scripts/style/test_style_proposals.py` — the module
@@ -1263,7 +1266,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 - the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 60 — `show.py top` ranks by CPU, and `module_cost.py` counts process starts  · status: todo
+### Phase 60 — `show.py top` ranks by CPU, and `module_cost.py` counts process starts  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1344,3 +1347,118 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 - CPU s, processes, execs and wall s before and after for each file, from `module_cost.py` and same-load pairs, in the checkpoint notice.
 - The changed files and every importer of a changed fixture pass. No full suite: this batch is bumped, so it runs lint and the tests of the changed files only (showrunner, 2026-11-06).
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`.
+
+### Phase 62 — A test runner ends each process its tests leave  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** builds showrunner, queue-unit and verify-unit, 2026-11-06. Three fixture `verify.sh` runs from stopped gates of 11-04 stay alive. Each has its own session and a parent of `systemd --user`, and waits for a fixture hold that never ends. Each stays in its gate's scope in `builds.slice`, so the live queue reads it as a running build. Verify's reading of the cause: `merge_gate` `stop_gate_jobs` sends SIGTERM to each job's process group, `module_run.py` dies with no cleanup, and a fixture in its own session misses the signal.
+
+**Goal:** when a `module_run.py` run ends, by a normal end, a failed test or a signal, no process that its tests started stays alive.
+
+**Spec:**
+1. **Two processes on Linux.** `module_run.py` marks itself a child subreaper, then forks before it imports test code. The child runs the tests as today. The parent starts no test. A subreaper in the test process itself would leave each orphan as an unreaped zombie, and a test that waits for an orphan to end would see it alive.
+2. **The parent reaps.** The parent calls `os.waitpid(-1, 0)` in a loop, so an adopted orphan that exits is reaped at once.
+3. **The end.** When the test process ends, or the parent receives SIGTERM, SIGINT or SIGHUP, the parent sends SIGKILL to each direct child, and reaps until `waitpid` reports no child. An orphan of a killed process becomes a direct child, so this loop reaches each descendant, in any session.
+4. **Status.** The parent ends with the status of the test process: the same exit code, or the same signal. When a signal stopped the run, the parent ends by that signal.
+5. **One subreaper function.** One function in a new `scripts/lib/descendants.py` makes the `prctl` call. `module_run.py`, `scripts/lib/build_folders.py`, `scripts/build_queue/ci_cargo_front.py` and `scripts/message/process_test_support.py` call it.
+6. **Other platforms.** Where `prctl` does not exist, `module_run.py` does not fork, and works as it does today.
+7. **Records.** The module's `wall_s`, `cpu_s` and test records keep their meaning.
+8. **Doc.** `docs/as-built/merge-gate-and-test-speed.md` states the rule, and names the one gap: a SIGKILL of the parent stops this end step.
+
+**Files:**
+- `scripts/test_times/module_run.py` — the fork and the end step
+- `scripts/test_times/test_module_run.py` — the cases
+- `scripts/lib/descendants.py` — the subreaper function
+- `scripts/lib/build_folders.py` — caller
+- `scripts/build_queue/ci_cargo_front.py` — caller
+- `scripts/message/process_test_support.py` — caller
+- `docs/as-built/merge-gate-and-test-speed.md` — the rule
+
+**Workers:** 1 writer on slot `review3` (one mechanism and its callers)
+- `review3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- Do not stop the three live processes. queue-unit has asked the user about them.
+- `scripts/build_queue/scope_activity.py` belongs to queue-unit. Do not change it.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- A real `module_run.py` run of a tempdir test starts a process in its own session, whose parent exits. The observation is that process's state after each runner end: normal end, failed test, and SIGTERM to the runner's group. In each case the process is gone, and the runner's status is unchanged. `test_module_run.py` names these three cases.
+- A test in a real run sees an orphan that it killed end, with no zombie left. `test_module_run.py` names this case.
+- For each case, removing the step on a tempdir copy makes its test fail.
+- `test_module_run.py`, `scripts/message/test_repeat_guard.py`, `scripts/message/test_process_test_support.py` and the tests of `build_folders.py` and `ci_cargo_front.py` pass; basedpyright 0/0/0 on the changed Python files. No full suite: this is a bumped change, so it runs lint and the tests of the changed files only.
+
+### Phase 63 — Three verify test files stop failing at random  · status: todo
+**Depends on:** none
+**Blocked by:** verify's batch checkpoint; verify sends the hash. Two of these files can depend on fixtures that batch changes.
+
+#### Work Order
+
+**Source:** verify-unit and the showrunner, 2026-11-06. Each failed once, then passed on a rerun.
+
+**Goal:** each of the three tests has one cause named and removed, or a measured reason that the failure is not in the test.
+
+**Spec:**
+1. Get each failing log from queue-unit. Quote the failing line and the source line before any fix.
+2. `test_verify_token_mac_step.py`, `test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready`: gates 460168a30, 14f4644ef, and once at load 59 on 11-05.
+3. `test_verify_mac_copy_ownership.py`: gate 735747766.
+4. `test_verify_example_edits.py`: gate aa0e60d56.
+5. A flaky file's fixed wait goes first. Move what you can onto direct calls, under the Speed method, because each moved check also leaves the race.
+6. A cut in `verify.sh` or another production file goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_verify_token_mac_step.py`
+- `scripts/direct/test_verify_mac_copy_ownership.py`
+- `scripts/direct/test_verify_example_edits.py`
+
+**Workers:** 1 writer on slot `impl` (three small files; one writer reads all the logs)
+- `impl` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 56: an event wait uses one held descriptor and bounded reads.
+- Verify's support files `verify_mac_offload_test_support.py` and `verify_token_wait_test_support.py` change in its batch. Start only after its hash.
+
+**Acceptance gate:**
+- For each file, the quoted failing line and the named cause are in the summary.
+- A cause in the test: a forced reproduction, such as a held delay on a tempdir copy, fails before the fix and passes after it.
+- A cause outside the test: the summary gives the reproduction evidence, the owner and the condition that closes the follow-up.
+- Each file green in 5 runs at normal load. basedpyright 0/0/0 on the changed files. Lint and the tests of the changed files only.
+
+### Phase 64 — `module_cost.py` names the tests with the most CPU  · status: todo
+**Depends on:** Phase 60, Phase 62
+
+#### Work Order
+
+**Source:** architect review, 2026-11-06. Speed steps 1-2 and Phase 59 need CPU per test, and `module_run.py` records only each test's wall time and the module's CPU. At high load, wall time does not rank tests by CPU.
+
+**Goal:** `module_cost.py --tests 10 --tree <tree> <folder>/<file>` prints the ten tests with the most CPU, with each test's CPU s and wall s.
+
+**Spec:**
+1. `module_run.py` adds `cpu_s` to each test row in its output: the change in own plus reaped-children CPU across the test.
+2. A class or module fixture row, which `result.fixtures` names, carries its own `cpu_s` in the same way. Setup cost stays visible, apart from the tests.
+3. `module_cost.py` gets `--tests N`. It reads the rows of its time run through `TEST_TIMES_OUT`, and prints the N rows with the most CPU after the module table.
+4. The build log store and `show.py` do not change. A kept history of per-test CPU is a later proposal, when a reader needs it.
+5. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/test_times/module_run.py` — the `cpu_s` field
+- `scripts/test_times/test_module_run.py` — the case
+- `scripts/test_times/module_cost.py` — `--tests`
+- `scripts/test_times/test_module_cost.py` — the case
+- `commands/test_times.md` — the option
+
+**Workers:** 1 writer on slot `impl3` (one small field and its one reader)
+- `impl3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 62: an orphan is reaped by the parent process, so its CPU is not in the test process's counts. State this limit in `commands/test_times.md`.
+- Phase 60: the time run and the strace run are separate, so `--tests` reads the time run.
+
+**Acceptance gate:**
+- A real tempdir module with one test that starts a CPU-heavy child and one that does not: the first test has more `cpu_s`, and `--tests` lists it first. `test_module_cost.py` names this case.
+- A fixture row with a CPU-heavy `setUpClass` shows that cost in its own row. `test_module_run.py` names this case.
+- Module `wall_s`, `cpu_s` and test status do not change meaning. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
+

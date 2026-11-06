@@ -8,11 +8,12 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 
 1. Phase 60: `show.py top` ranks by CPU; `module_cost.py` counts process starts.
 2. Phase 61: the seven largest `test_verify*` files, 590 CPU s.
-3. Further `test_verify*` batches, largest CPU first, after verify sends its files. Each batch is one phase with one bumped checkpoint. Verify's cost doc lists the rest; its list has 122 files.
-4. Phase 55: the assign launcher group, 344 CPU s, beside the batches when models reaches builds.
-5. Phase 44: `copies.py` Git work and `style/test_crate_run.py`, 68.5 CPU s, on the showrunner's word.
-6. Phase 59: `style/test_style_proposals.py`, 60.8 CPU s.
-7. New phases by rank: `production/test_add_unit.py` 59.8, `production/test_fast_track.py` 55.1, `production/test_staff.py` 53.7, `style/test_add_style.py` 51.0.
+3. Phase 62, now: the module runner ends each process its tests leave. Phase 63, after verify's batch hash: three flaky verify files. Phase 64, after Phase 62: `module_cost.py` names the tests with the most CPU.
+4. Further `test_verify*` batches, largest CPU first, after verify sends its files. Each batch is one phase with one bumped checkpoint. Verify's cost doc lists the rest; its list has 122 files.
+5. Phase 55: the assign launcher group, 344 CPU s, beside the batches when models reaches builds.
+6. Phase 44: `copies.py` Git work and `style/test_crate_run.py`, 68.5 CPU s, on the showrunner's word.
+7. Phase 59: `style/test_style_proposals.py`, 60.8 CPU s.
+8. New phases by rank: `production/test_add_unit.py` 59.8, `production/test_fast_track.py` 55.1, `production/test_staff.py` 53.7, `style/test_add_style.py` 51.0.
 
 Held: `style/test_style_sync.py`, 66.6 CPU s; devtools holds it. Never: `types/basedpyright`, 238.4 CPU s; `agents/test_codex_mesh.py`, 232.6 CPU s, retires.
 
@@ -99,7 +100,7 @@ Held: `style/test_style_sync.py`, 66.6 CPU s; devtools holds it. Never: `types/b
   - Phase 41 result, 2026-11-05: lazy imports in `build_targets.py` alone gain 1% CPU in `test_verify_mac_only.py`, so they did not land. The gain needs `build_hold`'s chain to leave `eligible` and `reserve`.
   - Phase 42 result, 2026-11-06: the same method in `mac_idle.py` gains 17.9% CPU in `test_verify_mac_only.py`, because the whole chain leaves four of five commands.
   - Phase 56 result, 2026-11-06: `test_verify_ssh_targets_retained.py` and `_retry.py` reach this same floor after all fixed waits left. Measure them in the same pairs.
-  - Completion condition: natest measures `test_verify_ssh_targets_routing.py` again in same-load pairs when each change is on builds.
+  - Completion condition: after each owner change reaches builds, measure routing, retained, retry, and Mac-only modules in same-load pairs. Report CPU s and process counts first. Use the test forms that Phase 61 leaves.
   - Revealed by: Phase 24, 2026-11-05.
 
 - [x] **Phase notes stopped updating.** Text: `phase table not written: phase note target is not owned by builds/natest-unit: ~/rust/hanadocs/showrunners/builds/natest.md`. Cause: `_note_ownership` in `scripts/direct/phase_table.py` looks up the note's `unit:` field as a staff id, and the notes still hold the older `unit: natest-unit` header (queue, report and fastest also). So each write refuses. Fix: run the one-off `phase_table.py migrate-notes`, which reads `*/*.md` below `--vault-root` and rewrites the header to the staff id. Done 2026-11-05: the showrunner assigned the builds notes to natest; `phase_table.py migrate-notes` rewrote natest, queue, report, resources and verify. natedev has the fastest note.

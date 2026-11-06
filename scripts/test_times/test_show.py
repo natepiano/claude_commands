@@ -193,11 +193,13 @@ class TestTimesTests(unittest.TestCase):
             self.write_run([module_run("test_alpha.py", wall)], epoch=EPOCH + offset * 60)
         slow: TestTime = {"test": "Alpha.test_slow", "s": 1.25, "status": "pass"}
         types = type_job(3.0)
+        beta_run = module_run("test_beta.py", 1.0)
+        beta_run["cpu_s"] = 3.5
         self.write_run([
             module_run("test_alpha.py", 1000.0, restart="hold", status=-15),
             module_run("test_alpha.py", 2.0, attempt=2, tests=[slow]),
             module_run("test_alpha.py", 0.01, attempt=3),
-            module_run("test_beta.py", 7.0), module_run("test_removed.py", 999.0), types,
+            beta_run, module_run("test_removed.py", 999.0), types,
         ], epoch=EPOCH + 180)
         self.write_run([module_run("test_alpha.py", 9999.0)], host="other-host", epoch=EPOCH + 240)
 
@@ -211,8 +213,8 @@ class TestTimesTests(unittest.TestCase):
         self.assertNotIn("9999", output)
         self.assertIn("Alpha.test_slow", alpha)
         numbers = [float(match.group()) for match in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", alpha)]
-        self.assertEqual(numbers, [2, 4, 2, 2, 13, 1.25, 3], alpha)
-        self.assertRegex(self.line(output, "sum of medians"), r"3 modules; sum of medians 14(?:\.0+)? s")
+        self.assertEqual(numbers, [2, 2, 4, 2, 13, 1.25, 3], alpha)
+        self.assertRegex(self.line(output, "sum of median CPU"), r"3 modules; sum of median CPU 7(?:\.0+)? s")
         self.assertEqual(self.report(), output)
         limited = self.report("top", "--limit", "1", "--repo", str(self.repo))
         self.assertIn("tools/test_beta.py", limited)

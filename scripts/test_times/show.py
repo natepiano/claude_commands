@@ -30,8 +30,6 @@ sys.path.insert(0, str(TOOL_REPOSITORY))
 from scripts.lib import conf
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
-from scripts.production.gate_modules import discover_test_modules, test_module_name
-from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
 def query(connection: sqlite3.Connection, sql: str,
@@ -131,6 +129,9 @@ def mebibytes(value: float) -> str:
 
 
 def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> None:
+    from scripts.production.gate_modules import discover_test_modules, test_module_name
+    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
     modules = {(suite, test_module_name(repo, suite, path))
                for suite, path in discover_test_modules(repo)}
     config = conf.read("test_times")
@@ -162,7 +163,7 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
             histories.append(history)
     unmeasured = [f"{folder}/{filename}"
                   for folder, filename in sorted(modules - {history[0].key for history in histories})]
-    ranked = sorted(((statistics.median(attempt.wall_s for attempt in history), history)
+    ranked = sorted(((statistics.median(attempt.cpu_s for attempt in history), history)
                      for history in histories), key=lambda item: (-item[0], item[1][0].name))[:limit]
     output: list[list[str]] = []
     for rank, (median, history) in enumerate(ranked, 1):
@@ -177,13 +178,13 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
             tests = kept_tests(connection, last)
             if tests:
                 slowest = f"{tests[0].test} {seconds(tests[0].duration_s)} s"
-        output.append([str(rank), last.name, seconds(median), seconds(last.wall_s),
-                       seconds(statistics.median(attempt.cpu_s for attempt in history)),
+        output.append([str(rank), last.name, seconds(median),
+                       seconds(statistics.median(attempt.wall_s for attempt in history)), seconds(last.wall_s),
                        tests_run, slowest, str(len(history))])
-    print_table(["rank", "suite/module", "median s", "last s", "median CPU s", "tests run",
+    print_table(["rank", "suite/module", "median CPU s", "median s", "last s", "tests run",
                  "slowest kept test", "runs counted"], output, "no modules recorded yet")
     if output:
-        print(f"{len(output)} modules; sum of medians {seconds(sum(item[0] for item in ranked))} s")
+        print(f"{len(output)} modules; sum of median CPU {seconds(sum(item[0] for item in ranked))} s")
     if unmeasured:
         print(f"unmeasured: {len(unmeasured)} live modules: {', '.join(unmeasured)}")
 
@@ -275,6 +276,8 @@ def suite(connection: sqlite3.Connection, host: str, folder: str, days: int) -> 
 
 
 def module(connection: sqlite3.Connection, host: str, name: str, runs: int) -> None:
+    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
     folder, filename = name.split("/", 1)
     attempts = [ModuleAttempt.from_row(row) for row in query(connection, MODULE_ATTEMPTS_QUERY + """
         WHERE m.host = ? AND m.suite = ? AND m.module = ?
@@ -376,7 +379,7 @@ class ReportRequestArguments(argparse.Namespace):
 def arguments(argv: list[str]) -> ReportRequestArguments:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    top_parser = subcommands.add_parser("top", help="rank repository tests or gate modules by median time")
+    top_parser = subcommands.add_parser("top", help="rank gate modules by median CPU or nextest tests by median time")
     _ = top_parser.add_argument("--limit", type=positive, default=20)
     _ = top_parser.add_argument("--repo", type=Path, default=Path.cwd())
     _ = top_parser.add_argument("--host", default=store.host_name())
