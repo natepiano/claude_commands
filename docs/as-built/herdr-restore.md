@@ -1,9 +1,9 @@
-# herdr restore (as built)
+# Herdr restore
 
-Goal (user, 2026-10-19): after a crash or a reboot, `herdr session attach agents` shows every
-workspace, tab and pane as before, each Claude conversation resumed by its id on its own account.
+`herdr session attach agents` restores the saved workspaces, tabs, and panes.
+The saved launch selects each conversation and account.
 
-## Pane launch record (checkpoint 1)
+## Pane launch record
 
 - `scripts/shutdown/pane_record.py` keeps one file per herdr session,
   `~/.local/state/herdr-panes/<session>.json` (`HERDR_PANE_RECORD_DIR` in tests), keyed by
@@ -28,7 +28,9 @@ The settings.json entry, one more SessionStart item:
 {"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-pane-record.py\""}]}
 ```
 
-## Pane restore (checkpoint 2)
+The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current names without copied staff marks.
+
+## Pane restore
 
 - Each entry also holds `flags_read` (false when the hook found no Claude argv) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
   SessionEnd for any reason but `other`: `/exit` and logout mark it, a signal at a reboot or a
@@ -49,12 +51,14 @@ The settings.json entry, one more SessionStart item:
   A replacement uses the saved account and the current staff identity, name, and folder.
   A saved pane without a staff row uses its saved identity, account, and folder.
   Both routes send no opening prompt.
+  They preserve the saved model, Remote Control setting, and `disableAgentView`.
+  The launch-name reader supplies the current display name.
 - A replacement closes its source only after resume publication proves the new conversation.
   A source pane that gains another conversation or program stays open and prints an anomaly.
   A failed start preserves the pane. A failed restore returns exit status 1.
 - Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
   herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
-- `shutdown.py restart --all` stops and starts the local live Claude staff rows.
+- `shutdown.py restart --all` stops and starts the local live Claude and Codex staff rows.
 - `shutdown.py restart` starts the missing rows from the saved row ID list.
 - Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
 - Restart sends no work prompt and does not restore unrelated panes.
@@ -107,7 +111,7 @@ Settings entry for the user, one more SessionEnd item:
   turns off the line editor, so zsh keeps the raw tty that a stopped Codex leaves, and the Enter
   from `pane run` never ends a line.
 
-## Still to come
+## Restore services
 
 - Automatic boot restore is not installed on either machine.
 - Layout saving and detection-rule refresh run in `herdr-upkeep`.

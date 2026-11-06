@@ -48,6 +48,8 @@ from scripts.lib.resume_message import (
 )
 from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed, NoRoleAccount, NO_ROLE_ACCOUNT,
+
+    StopUnproved as StopUnproved,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
     ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
@@ -158,31 +160,34 @@ def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend:
     """Resolve native stop evidence before creating the destination."""
     from scripts.production import staff
 
-    result = stop(row.id)
+    kind = "claude" if isinstance(backend, staff.ClaudeBackend) else "codex" if isinstance(backend, staff.CodexBackend) else ""
+    result = stop(row.id, kind)
     if isinstance(result, SessionNotFound):
         return SourceUnresolved(f"{row.id}: lifecycle could not resolve the staff reference; check the staff row and retry")
-    if isinstance(result, StopFailed):
-        return SourceReleaseUnknown(f"{result.reason}; inspect the source session and retry")
-    if isinstance(result, NotRunning) and isinstance(backend, staff.CodexBackend):
+    if isinstance(result, StopUnproved):
+        herdr.conversation_note(herdr.UnknownConversation(result.reason))
+    if isinstance(result, (NotRunning, StopUnproved)) and isinstance(backend, staff.CodexBackend):
         stop_mesh = cast(Callable[[staff.StaffRow, tuple[Path, ...]], SourceRelease],
                          import_module("scripts.agents.codex_mesh").stop_worker_for_switch)
         released = stop_mesh(row, runs())
         return released if isinstance(released, SourceReleased) else replace(released, reason=f"{released.reason}; inspect the source session and retry")
+    if isinstance(result, StopFailed):
+        return SourceReleaseUnknown(f"{result.reason}; inspect the source session and retry")
     return SourceReleased()
 
 
-def stop(session: str, *, deadline: float = math.inf) -> StopResult:
+def stop(session: str, kind: str = "", *, deadline: float = math.inf) -> StopResult:
     from scripts.production import staff
 
     try:
         with operation_deadline.within(deadline), staff.row_operation(session):
-            return _stop_recorded(session)
+            return _stop_recorded(session, kind)
     except TimeoutError as error:
         reason = str(error)
         return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
 
 
-def _stop_recorded(session: str) -> StopResult:
+def _stop_recorded(session: str, kind: str = "") -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     from scripts.herdr import worker_panes
     from scripts.production import staff
@@ -204,7 +209,7 @@ def _stop_recorded(session: str) -> StopResult:
         result: StopResult = NotRunning(str(before.row.current_session))
     else:
         _record_launches([session])
-        result = _stop(session)
+        result = _stop(session, kind)
         if before is not None and isinstance(result, (Stopped, NotRunning)) and not _worker_stopped(before):
             return StopFailed(str(before.row.current_session), "worker stop has no fresh shell proof on the same terminal")
     if isinstance(result, (Stopped, NotRunning)):
@@ -251,7 +256,7 @@ def stop_grace_seconds() -> float:
     return float(conf.read("shutdown").text("STOP_GRACE_SECONDS"))
 
 
-def _stop(session: str) -> StopResult:
+def _stop(session: str, kind: str = "") -> StopResult:
     """Signal only the process that proves the current conversation."""
     identity = session
     last_signal = ""
@@ -275,17 +280,20 @@ def _stop(session: str) -> StopResult:
                 identity = tab.session_id
             else:
                 return SessionNotFound(session)
-        try:
-            publication = pane_record.publication_for_session(identity)
-            kind = pane_launch.agent_kind(publication.entry) if publication is not None else ""
-        except (OSError, ValueError) as error:
-            print(f"{identity}: launch record anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
-            kind = ""
+        if not kind:
+            try:
+                publication = pane_record.publication_for_session(identity)
+                kind = pane_launch.agent_kind(publication.entry) if publication is not None else ""
+            except (OSError, ValueError) as error:
+                print(f"{identity}: launch record anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
+                kind = ""
         observed = herdr.read_conversation(identity, kind)
         if isinstance(observed, herdr.StoppedConversation):
             return NotRunning(identity)
         if isinstance(observed, herdr.UnknownConversation):
-            return StopFailed(identity, observed.reason)
+            return StopUnproved(identity, observed.reason)
+        if not observed.pids:
+            return StopUnproved(identity, "conversation has no unique signal target; no signal sent")
         if len(observed.pids) != 1:
             return StopFailed(identity, "conversation has no unique signal target; no signal sent")
         live = sessions.LiveSessionProcess(observed.pids[0])
@@ -654,7 +662,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry = entry.copy()
         entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
-
         from scripts.whoami.account import named_account_environment
 
         selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")

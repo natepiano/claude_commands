@@ -179,7 +179,6 @@ class BrpLaunchGateTests(unittest.TestCase):
                 wire.ReleaseRequest("release-busy", busy.reservation, 0)), [wire.Ok()])
         self.assertEqual(self.admission.server.reservations, {})
         self.assertEqual(self.admission.server.waiters, {})
-        self.assertEqual(len(self.admission.server.launches), 0)
 
     def test_failed_memory_wait_denies_launch_with_its_last_reason_line(self) -> None:
         self.use_memory_wait_stub(

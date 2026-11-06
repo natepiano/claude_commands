@@ -1116,7 +1116,8 @@ class RestartTests(ShutdownTestCase):
                 records = [record for record in records if record["sessionId"] != self.rows[0].current_session]
                 orphan = next(record for record in records if record["sessionId"] == "orphan")
                 orphan.update(name="unassigned", cwd="/tmp/orphan")
-                def codex_conversations() -> herdr.CodexConversations:
+                def codex_conversations(*, wanted: str = "") -> herdr.CodexConversations:
+                    _ = wanted
                     identities: dict[str, tuple[int, ...]] = {"orphan": (456,), "codex-orphan": (789,)}
                     if self.rows[0].current_session in self.running:
                         identities[str(self.rows[0].current_session)] = (123,)
@@ -1381,7 +1382,7 @@ class RetainedSplitRestartTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
             "MODELS_CONFIG_FILE": str(config / "models.conf"), "MODELS_CONFIG_PUBLISH": "0",
             "SHUTDOWN_STATE_DIR": str(root / "shutdown"), "XDG_STATE_HOME": str(root / "state"),
-            "UNIT_RUN_DIR": str(root / "run")})))
+            "UNIT_RUN_DIR": str(root / "run"), "ROSTER_RUN_ROOT": str(root)})))
         showrunner = fixture_member("showrunner", name="showrunner")
         holder = fixture_member("unit", name="unit", parent=showrunner.id,
             worktree=staff.PresentWorktree("natedev", root))
@@ -1396,7 +1397,7 @@ class RetainedSplitRestartTests(unittest.TestCase):
             "model": "", "remote_control": False, "environment": {}, "flags_read": True,
             "written_at": "2026-11-06T00:00:00+00:00"}
         pane_record.write("agents", entry)
-        write_text_atomic(root / "run/progress_history_state.json", json.dumps({"pass": {
+        write_text_atomic(root / "run/progress_history_state.json", json.dumps({"main_agent": {"session_id": str(holder.current_session)}, "pass": {
             row.name: {"instance_id": "dispatch-" + row.name, "worker_name": row.name,
                        "team_slot": row.name, "kind": "impl", "status": "completed"} for row in children}}))
         write_text_atomic(root / "run/worker_transport", "herdr\n")

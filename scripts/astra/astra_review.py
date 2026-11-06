@@ -113,6 +113,7 @@ def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
     manager = staff.runtime_id()
     caller = staff.snapshot().by_current_session(manager) if manager else None
     if caller is not None and caller.kind in ("unit", "showrunner"):
+        write_text_atomic(log.parent / "worker_transport", unit_runs.parent_transport(caller.current_session) + "\n")
         write_text_atomic(log.parent / "prompt.md", prompt)
         return _managed_review(review, log)
     with log.open("w", encoding="utf-8") as output:

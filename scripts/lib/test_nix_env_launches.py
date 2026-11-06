@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -34,6 +34,7 @@ else:
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.accounts import accounts
 from scripts.lib import nix_env
+from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.production_doc import Production
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
@@ -41,6 +42,24 @@ from scripts.shutdown.remote import local_machine
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+class AgentExecEnvironmentTests(NixFixture):
+    def test_exec_removes_operation_configuration_after_the_worktree_environment_load(self) -> None:
+        _ = self.envrc(self.work)
+        restored = {"KEEP": "loaded", "IN_NIX_SHELL": "impure",
+                    "MODELS_LAUNCH_CONFIGURATION": "stale launch", "MODELS_REGISTRY_EDIT_BASE": "stale editor"}
+        with (chdir(self.work), patch.dict(os.environ, {"DIRENV_DIFF": json.dumps(restored)}),
+              patch.object(os, "execvpe", side_effect=SystemExit(0)) as execute):
+            with self.assertRaises(SystemExit):
+                _ = nix_env.main(["exec", sys.executable, "--version"])
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[:2], (sys.executable, [sys.executable, "--version"]))
+        environment = cast(dict[str, str], execute.call_args.args[2])
+        self.assertEqual(environment["KEEP"], "loaded")
+        self.assertEqual(environment["NIX_ENV_ENVRC"], str(self.work / ".envrc"))
+        self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", environment)
+        self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", environment)
 
 
 class HerdrLaunchTests(NixFixture):
@@ -246,9 +265,12 @@ class ShellLaunchTests(NixFixture):
         _ = py.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
         py.chmod(0o755)
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
-        _ = (self.scripts / "agents/models_config.sh").write_text('''agents_resolve() { AGENT_FAMILY=claude; }
-agents_claude_args() { echo '--model fixture'; }
-''')
+        _ = (self.scripts / "agents/models_config.sh").write_text(
+            (ROOT / "scripts/agents/models_config.sh").read_text()
+            + "\nagents_resolve() { AGENT_FAMILY=claude; }\n"
+            + "agents_claude_args() { echo '--model fixture'; }\n")
+        registry = write_registry(self.root / "models.conf")
+        self.env.update(MODELS_CONFIG_FILE=str(registry), MODELS_CONFIG_PUBLISH="0", MODELS_CONFIG_TIER_ONLY="1")
         self.started = self.root / "started.jsonl"
         self.script(self.bin / "claude", '''import json, os, sys
 from pathlib import Path
@@ -301,7 +323,6 @@ print('{"type":"result","result":"fixture completed"}')
         with isolated_staff_file(self.root / "staff.json", self.env):
             owner = unit_membership("child", "unit")
             self.env["CODEX_THREAD_ID"] = owner.id
-            self.env["AGENT_BG_ROLE"] = "impl"
             self.launch_contract("agents/agent_bg.sh", ["--run", str(self.root / "run"), "fixture", str(self.work), str(self.root / "prompt"),
                 str(self.root / "result"), str(self.root / "launch.log")], self.work)
         rows = [cast(dict[str, object], json.loads(line)) for line in self.started.read_text().splitlines()]

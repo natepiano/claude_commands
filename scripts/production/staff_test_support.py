@@ -5,6 +5,7 @@ import fcntl
 import io
 import json
 import os
+import pwd
 import shlex
 import shutil
 import socket
@@ -28,6 +29,28 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import pane_record, remote
+
+_LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+_FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
+
+
+def fixture_account_home(home: Path) -> Path:
+    """Keep fixture sessions outside the login user's real account folders."""
+    for candidate, login in ((Path(os.path.abspath(home)), _LOGIN_HOME), (home.resolve(), _LOGIN_HOME.resolve())):
+        if candidate.parent == login and candidate.name.startswith((".claude", ".codex")):
+            return Path(_FIXTURE_ACCOUNTS.name) / candidate.name
+    return home
+
+
+def _redirect_fixture_accounts() -> None:
+    for variable, folder in (("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex")):
+        home = Path(os.environ.get(variable) or Path.home() / folder)
+        private_home = fixture_account_home(home)
+        if private_home != home:
+            os.environ[variable] = str(private_home)
+
+
+_redirect_fixture_accounts()
 
 FIXTURE_GIT: str = shutil.which("git") or "git"
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -56,26 +79,39 @@ def fixture_runtime_id(label: str) -> str:
     return str(uuid5(NAMESPACE_URL, "staff-test-backend:" + label))
 
 
+def _claude_home() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
 def _fixture_session_path(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> Path:
-    home = backend.codex_home if isinstance(backend, staff.CodexBackend) else Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    home = fixture_account_home(backend.codex_home if isinstance(backend, staff.CodexBackend) else _claude_home())
     return home / "sessions" / f"{identity}.jsonl" if isinstance(backend, staff.CodexBackend) else home / "projects/fixture" / f"{identity}.jsonl"
+
+
+def _prepare_fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> Path:
+    if isinstance(backend, staff.ClaudeBackend):
+        home = _claude_home()
+        private_home = fixture_account_home(home)
+        if private_home != home:
+            os.environ["CLAUDE_CONFIG_DIR"] = str(private_home)
+    path = _fixture_session_path(identity, backend)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> None:
     """Create the private session file that supplies the worker family."""
-    path = _fixture_session_path(identity, backend)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _prepare_fixture_session(identity, backend)
     path.touch(exist_ok=True)
     if isinstance(backend, staff.CodexBackend):
-        os.environ["CODEX_HOME"] = str(backend.codex_home)
+        os.environ["CODEX_HOME"] = str(fixture_account_home(backend.codex_home))
 
 
 def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
                        turns: int = 1, malformed: bool = False) -> tuple[Path, tuple[list[str], list[str], list[str]]]:
     """Write source evidence with private tool data between assignments and final replies."""
-    path = _fixture_session_path(row.current_session, backend)
+    path = _prepare_fixture_session(row.current_session, backend)
     family = backend.family
-    path.parent.mkdir(parents=True, exist_ok=True)
     assignments = [f"Assignment {index}: preserve this complete requirement. " + "detail " * 90
                    for index in range(turns)]
     replies = [f"Final {index}: completed the required change. " + "proof " * 90
@@ -125,7 +161,7 @@ def stopped_worker_module(directory: Path) -> Path:
 from pathlib import Path
 from scripts.production import staff
 from scripts.shutdown import stop_resume
-def stop(reference):
+def stop(reference, kind=""):
     row = staff.by_id(staff.StaffId(reference))
     if os.environ.get("FIXTURE_STOPPED"):
         Path(os.environ["FIXTURE_STOPPED"]).write_text(json.dumps(row.to_json()))
@@ -145,7 +181,7 @@ from scripts.production.staff_test_support import fixture_runtime_id, fixture_se
 from scripts.shutdown import stop_resume
 args = sys.argv[1:]
 run = Path(args[args.index("--session-dir") + 1])
-allowed = admission.admit(args[args.index("--name") + 1], run, role="impl")
+allowed = admission.admit(args[args.index("--name") + 1], run)
 row = allowed.slot.row
 def start(handoff):
     identity = fixture_runtime_id("destination:" + row.id + "codex")

@@ -14,4 +14,5 @@ def copy_session_modules(destination: Path) -> None:
         _ = shutil.copy2(source / name, destination / name)
     library = destination.parent / "lib"
     library.mkdir(parents=True, exist_ok=True)
-    _ = shutil.copy2(source.parent / "lib/session_paths.py", library / "session_paths.py")
+    for name in ("session_paths.py", "boot_identity.py"):
+        _ = shutil.copy2(source.parent / "lib" / name, library / name)
