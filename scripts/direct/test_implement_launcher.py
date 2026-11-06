@@ -9,6 +9,7 @@ from typing import cast
 
 from scripts.direct import implement_launcher_test_support as support
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_models_registry import RegistryReadProbe
 from scripts.production import staff
 
 
@@ -26,6 +27,17 @@ def configure_pane_account(home: Path, notes: Path) -> None:
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
+        session = self.start_phase("registry-snapshot")
+        environment = self.environment()
+        probe = RegistryReadProbe(self.root, Path(environment["MODELS_CONFIG_FILE"]))
+        result = subprocess.run(
+            ["bash", str(self.implement_script), str(session), str(self.working_dir), str(self.prompt_file),
+             "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            env=probe.environment(environment), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(probe.reads()), 1, probe.reads())
+
     def test_a_dispatch_names_its_director_in_the_run_folder(self) -> None:
         # Staff records the director for each worker.
         session_dir = self.start_phase("director")

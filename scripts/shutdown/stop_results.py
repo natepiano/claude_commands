@@ -40,6 +40,11 @@ class StopFailed:
     reason: str
 
 
+@dataclass(frozen=True)
+class StopUnproved(StopFailed):
+    """The read cannot prove absence or identify one process to signal."""
+
+
 class ClaudeStartState(StrEnum):
     STARTED = "started"
     ALREADY_RUNNING = "already running"
