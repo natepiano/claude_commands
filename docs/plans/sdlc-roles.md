@@ -156,31 +156,22 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** a literal `git grep` prefilter, because it misses joined literals and escapes that Python extraction decodes; candidate selection alone, because it reached 8.4 s at load 38-44.
 
 ### Phase 4b — The retired-name check runs in about a second again  · status: done
-**Depends on:** Phase 4
 
-#### Work Order
+#### As-built
 
-**Goal:** a plain `roles_audit.py check` finishes in about a second on today's tree and reports the same findings as before.
-
-**Spec:**
-- Source: change row C918, which the user returned (sdlc showrunner, 2026-11-05). The fix returns as a new change row.
-- Measured by natedev on main 066881e96: 5.9-6.5 s wall, 18 s CPU, one line printed. It took 1.5 s at the merge of Phase 4.
-- History: 1.1 s before 4a243d5e3 (Phase 6, 2026-10-29), 3.8 s at that commit, about 4.7 s after it.
-- Find the cost with a profile on today's tree, then fix the cause. Use the measured profile, not the history, as the cause.
-- Findings, exit status, kept contexts, syntax diagnostics and source-read errors of a plain `check` stay byte-equal. The parity test keeps passing.
-- The sentence count prints only with `--prose` (sdlc showrunner, 2026-11-05: the count is not a finding, and the user asked for about a second). `check --prose` output stays byte-equal.
-- Add no guard, refusal or check the plan item did not ask for.
+- A plain `roles_audit.py check` parses every Python file for syntax diagnostics and extracts prose only from a file that can hold a finding. It prints only findings and diagnostics. On a clean tree it prints nothing and exits 0.
+- `extraction_candidate(text, python, retired, fixed=NO_FIXED_FORMS, *, prose=True)` selects a Python file when a decoded string Constant can hold a finding, or when the file has a `+` join or an f-string. `check_sources` passes `prose=False`.
+- The sentence count and its list print only with `--prose`. That output is unchanged.
+- The scan uses the default process pool with `chunksize=1`, and each scan worker disables the garbage collector. `python_tree` caches one parsed tree per process with `@lru_cache(maxsize=1)`.
+- On natedev: 1.36-1.44 s wall and 7.5 s CPU at load 51; 5.13 s wall at load 150. Before: 7.8 s wall and 19.5 s CPU at load 86.
 
 **Files:**
-- `scripts/production/roles_audit.py` — the check's file selection and scan
-- `scripts/production/test_roles_audit.py` — parity and any fixture the change needs
+- `scripts/production/roles_audit.py` — selection and scan
+- `scripts/production/test_roles_audit.py` — parity with full extraction and one fixture per string assembly form
 
-**Workers:** `1 writer`.
-- `review3` as writer — both files
+**Gotchas:** The selector must be a superset of what extraction can report. A bound name hides its value from the selector, so every join selects the file. Wall time follows load; record the load with each time.
 
-**State:** none
-
-**Acceptance gate:** `python3 scripts/production/roles_audit.py check` takes about a second, measured the same way, before and after on one tree, with the load recorded. `python3 -m unittest scripts.production.test_roles_audit` passes. basedpyright on both files reports 0 errors, 0 warnings, 0 notes. Then the full merge gate.
+**Ruled out:** keeping the count line in a plain check, because the count sets a floor of about 2.5 s and is not a finding; a selector that follows bindings, because wider selection is simpler and costs 0.09 s CPU.
 
 ### Phase 5 — Each session records its role apart from its name  · status: done
 **Depends on:** Phase 4
@@ -433,6 +424,8 @@ Superseded 2026-11-05 (sdlc showrunner). `review_pool.py` is gone from sdlc thro
 **Files:**
 - `scripts/production/roles_audit.py` — remove the measure
 - `scripts/production/test_roles_audit.py` — remove the measure's tests
+- `docs/plans/sdlc-roles-design.md` — the measure section
+- `docs/as-built/staff-accessors.md` — the `roles_audit.py` row, when the staff read leaves with the measure
 
 **Workers:** `1 writer`.
 - `review3` as writer — both files
