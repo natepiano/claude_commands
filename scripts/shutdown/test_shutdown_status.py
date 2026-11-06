@@ -21,7 +21,9 @@ from unittest.mock import Mock, patch
 
 from test_support import ShutdownSendLeaf, ShutdownTestCase
 import shutdown
-from scripts.shutdown import restart, shutdown_record
+from scripts.shutdown import restart, shutdown_record, stop_resume
+from scripts.herdr import worker_panes
+from scripts.lib.atomic_file import write_text_atomic
 import inventory
 from scripts.production import staff
 from scripts.agents import codex_mesh
@@ -86,6 +88,28 @@ def setUpModule() -> None:
 
 @final
 class ShutdownStatusTests(ShutdownTestCase):
+    def test_stop_reports_each_unresolved_worker_and_the_director_result(self) -> None:
+        parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("director-session"))
+        row = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", staff.ReportsTo(parent.id),
+                             current_session=staff.StaffId("worker-session"))
+        record = staff.StaffSnapshot((parent, row))
+        write_text_atomic(self.root / "run/worker_transport", "herdr\n")
+        def observe(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            print("anomaly: impl: terminal changed", file=sys.stderr)
+            return [worker_panes.UncertainWorker(row, "terminal changed")]
+        for result, expected in ((stop_resume.StopFailed("director-session", "director stop failed"), "director stop failed"),
+                                 (stop_resume.NotRunning("director-session"), "unchanged")):
+            with (self.subTest(result=result), patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(worker_panes, "worker_run", return_value=self.root / "run"),
+                  patch.object(worker_panes, "observe", side_effect=observe),
+                  patch.object(stop_resume, "stop", return_value=result),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(shutdown.main(["stop", "director"]), 1)
+            text = output.getvalue() + errors.getvalue()
+            self.assertEqual(text.count("anomaly: impl: terminal changed"), 1, text)
+            self.assertIn(expected, text)
+
     def test_record_precedes_worker_window(self) -> None:
         row = staff.StaffRow(staff.StaffId("retained-worker"), "worker", "impl", staff.STAFF_ROOT,
                              current_session=staff.StaffId("native-worker"))

@@ -74,6 +74,16 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 class RetireUnitTests(unittest.TestCase):
 
 
+    def test_retirement_continues_after_a_member_stop_raises(self) -> None:
+        with (mock.patch.object(stop_resume, "stop", side_effect=[OSError("stop read failed"), stop_resume.NotRunning(SEAT)]) as stops,
+              mock.patch.object(retire_unit, "refusals", return_value=[]),
+              mock.patch.object(retire_unit, "remove", return_value=[]) as remove):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(stops.call_count, 2)
+        self.assertEqual(output.count("stop read failed"), 1)
+        remove.assert_called_once()
+
     def test_retire_keeps_stopped_worker_rows(self) -> None:
         row = staff.snapshot().find(kind="worker", parent=self.unit_staff_id)[0]
         states: list[worker_panes.WorkerPane] = [worker_panes.OpenWorker(row, "outside-pane", "same-terminal", herdr.AgentStatus.WORKING)]

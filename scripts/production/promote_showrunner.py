@@ -23,8 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote, stop_resume
-from scripts.lib import conf, operation_deadline
-from time import monotonic
+from scripts.lib import operation_deadline
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -201,12 +200,19 @@ def stop(promotion: Promotion) -> bool:
     """Stop the director and retain its workers for the promoted holder."""
     record = staff.snapshot()
     row = record.by_member_reference(promotion.claude.session_id)
-    settings = conf.read("shutdown")
-    deadline = monotonic() + settings.number("STOP_GRACE_SECONDS") + settings.number("KILL_GRACE_SECONDS")
+    deadline = stop_resume.stop_deadline()
     with operation_deadline.within(deadline):
-        _ = stop_resume.stop_unit_workers(row.id, record) if row is not None else []
+        unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None else []
         result = stop_resume.stop(promotion.claude.session_id, deadline=deadline)
-    return isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning))
+    stopped = isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning))
+    if stopped and not unresolved:
+        place = promotion.marked.place
+        try:
+            if not herdr.Herdr(place.session).close_tab_confirmed(place.pane, target=promotion.claude.session_id):
+                print(f"anomaly: {promotion.unit}: old director tab close failed", file=sys.stderr)
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            print(f"anomaly: {promotion.unit}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+    return stopped
 
 
 def showrunner_account_directory() -> Path:

@@ -123,6 +123,7 @@ class RelaunchTests(ShutdownTestCase):
         workers = ResumeWorkers(panes=(PaneWorkerResume(staff.StaffId("busy-id"), BusyPass("dispatch-id")),
                                       PaneWorkerResume(staff.StaffId("idle-id"), IdleWorker())))
         text = resume_message("a shutdown", move=AccountMove("source", "destination"), workers=workers)
+        self.assertIn("for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.", text)
         self.assertIn("moved from source to destination", text)
         self.assertEqual(text.count("Worker busy-id: busy dispatch dispatch-id"), 1)
         self.assertEqual(text.count("Worker idle-id: idle"), 1)

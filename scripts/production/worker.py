@@ -7,7 +7,6 @@ from contextlib import redirect_stderr
 from dataclasses import dataclass
 import io
 import json
-import shlex
 import socket
 import time
 from pathlib import Path
@@ -22,7 +21,7 @@ from scripts.agents import codex_mesh
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.lib import atomic_file, unit_runs
-from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume, ResumeWorkers
+from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume, ResumeWorkers, launcher_prompt
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import session_staff, staff, worker_admission
 
@@ -342,7 +341,7 @@ def end(parent: StaffId, name: WorkerName) -> ExitCode:
         return ExitCode.OK
 
 
-def _resume_launcher(row: staff.StaffRow, run: Path, dispatch: progress_history.ActiveDispatch) -> ExitCode:
+def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch) -> ExitCode:
     """Ask the restored director to run the saved launcher from its session shell."""
     record = staff.snapshot()
     parent = record.parent_of(row)
@@ -352,15 +351,13 @@ def _resume_launcher(row: staff.StaffRow, run: Path, dispatch: progress_history.
     if pane is None or parent is None:
         print(f"anomaly: {row.name}: director session is unavailable", file=sys.stderr)
         return ExitCode.UNCERTAIN
-    text = script_prompt(f"Resume worker {row.id}, dispatch {dispatch.instance_id}. "
-        + f"Run this saved command from your session shell: {shlex.join(dispatch.launcher_command)}")
-    if not herdr.check_target(str(parent.current_session), action="keys",
-            place=herdr.HerdrPlace(client.session, pane.pane_id), text=text, client=client):
-        return ExitCode.UNCERTAIN
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "agents/mesh_runs.py"),
-        "start", "--session-dir", str(run), "--to", row.name, "--label", f"resume {dispatch.instance_id}", "--",
-        *client.argv("agent", "prompt", pane.pane_id, text, "--wait")], check=False)
-    return ExitCode.OK if result.returncode == 0 else ExitCode.UNCERTAIN
+    with worker_panes.worker_lock(parent.id, WorkerName.parse(row.name)) as hold:
+        kept = isinstance(hold, worker_panes.Kept)
+    if kept:
+        return ExitCode.OK
+    client.prompt(pane.pane_id, launcher_prompt(row.id, dispatch.instance_id, dispatch.launcher_command),
+                  target=str(parent.current_session))
+    return ExitCode.OK
 
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
@@ -412,7 +409,7 @@ def restore(parent: StaffId) -> ExitCode:
                     print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
                     outcome = ExitCode.UNCERTAIN
                 elif isinstance(active, progress_history.ActiveDispatch):
-                    code = _resume_launcher(state.row, run, active)
+                    code = _resume_launcher(state.row, active)
                     if code != ExitCode.OK:
                         outcome = code
         except (herdr.HerdrFailure, OSError, ValueError) as error:

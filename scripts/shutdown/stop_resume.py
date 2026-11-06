@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
 from importlib import import_module
 from threading import Event
@@ -53,6 +53,7 @@ import sessions
 from scripts.shutdown.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
+    from scripts.herdr import worker_panes
     from scripts.production.staff import StaffRow, StaffSnapshot, ClaudeBackend, CodexBackend, BackendUnavailable, StaffId
 
 
@@ -166,6 +167,13 @@ def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend:
     return SourceReleased()
 
 
+def stop_deadline() -> float:
+    """Read both stop limits and cap the batch by the operation deadline."""
+    settings = conf.read("shutdown")
+    duration = settings.number("STOP_GRACE_SECONDS") + settings.number("KILL_GRACE_SECONDS")
+    return monotonic() + operation_deadline.remaining(duration)
+
+
 def stop(session: str, *, deadline: float = math.inf) -> StopResult:
     from scripts.production import staff
 
@@ -198,10 +206,7 @@ def _stop_recorded(session: str) -> StopResult:
     _record_launches([session])
     result = _stop(session)
     if before is not None and isinstance(result, (Stopped, NotRunning)):
-        after = next((item for item in worker_panes.observe(before.row.parent.id, staff.snapshot())
-                      if item.row.id == before.row.id), None) if isinstance(before.row.parent, staff.ReportsTo) else None
-        if not isinstance(after, worker_panes.StoppedWorker) or not isinstance(
-                before, (worker_panes.OpenWorker, worker_panes.StoppedWorker)) or after.terminal != before.terminal:
+        if not _worker_stopped(before):
             return StopFailed(str(before.row.current_session), "worker stop has no fresh shell proof on the same terminal")
     if isinstance(result, (Stopped, NotRunning)):
         _retire_prompt(result.session_id)
@@ -214,6 +219,23 @@ def _stop_recorded(session: str) -> StopResult:
         except (OSError, ValueError) as error:
             print(f"{result.session_id}: stop note anomaly: {error}", file=sys.stderr)
     return result
+
+
+def _worker_stopped(before: worker_panes.WorkerPane) -> bool:
+    """Prove the recorded worker pane directly, even when the director has no tab."""
+    from scripts.herdr import worker_panes
+
+    if isinstance(before, worker_panes.ClosedWorker):
+        return True
+    if isinstance(before, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
+        client = herdr.Herdr(herdr.shared_session())
+        try:
+            return (any(pane["pane_id"] == before.pane and pane.get("terminal_id") == before.terminal for pane in client.panes())
+                    and isinstance(client.pane_activity(before.pane), herdr.PaneAtShell)
+                    and not isinstance(herdr.read_conversation(str(before.row.current_session)), herdr.LiveConversation))
+        except (OSError, ValueError, herdr.HerdrFailure):
+            return False
+    return False
 
 
 def _retire_prompt(session_id: str) -> None:
@@ -237,9 +259,6 @@ def _stop(session: str) -> StopResult:
 
         settings = conf.read("shutdown")
         stop_grace, kill_grace = settings.number("STOP_GRACE_SECONDS"), settings.number("KILL_GRACE_SECONDS")
-        for key, value in (("STOP_GRACE_SECONDS", stop_grace), ("KILL_GRACE_SECONDS", kill_grace)):
-            if value <= 0:
-                raise conf.Unusable(f"{settings.source}: {key} must be positive")
         try:
             member = staff.initial_snapshot().by_member_reference(session)
         except (OSError, ValueError) as error:
@@ -319,26 +338,26 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
     if not record.find(kind="worker", parent=unit) or holder is not None and unit_runs.worker_transport(worker_panes.worker_run(holder)) == "mesh":
         return []
     try:
-        settings = conf.read("shutdown")
-        durations = [settings.number(key) for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS")]
-        for key, value in zip(("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS"), durations):
-            if value <= 0:
-                raise conf.Unusable(f"{settings.source}: {key} must be positive")
-        deadline = monotonic() + operation_deadline.remaining(sum(durations))
-        states = worker_panes.observe(unit, record) if record.find(kind="worker", parent=unit) else []
-        unresolved = [f"{item.row.name}: {item.reason}" for item in states
-                      if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
-        live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
-        client = herdr.Herdr(herdr.shared_session())
-        with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
-            futures = [(item, pool.submit(restart.stop_row, item.row, client, deadline=deadline)) for item in live]
-            for item, future in futures:
-                if not future.result():
-                    unresolved.append(f"{item.row.name}: not proved stopped")
-        return unresolved
+        deadline = stop_deadline()
+        with redirect_stderr(StringIO()) as notes:
+            states = worker_panes.observe(unit, record)
+            unresolved = [f"{item.row.name}: {item.reason}" for item in states
+                          if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
+            live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
+            client = herdr.Herdr(herdr.shared_session())
+            with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
+                futures = [(item, pool.submit(restart.stop_row, item.row, client, deadline=deadline)) for item in live]
+                for item, future in futures:
+                    if not future.result():
+                        unresolved.append(f"{item.row.name}: not proved stopped")
+        for line in notes.getvalue().splitlines():
+            if line.startswith("warning:"):
+                print(line, file=sys.stderr)
     except (OSError, ValueError, herdr.HerdrFailure) as error:
-        print(f"{unit}: {error}", file=sys.stderr)
-        return [f"{unit}: {error}"]
+        unresolved = [f"{unit}: {error}"]
+    for line in unresolved:
+        print(f"anomaly: {line}", file=sys.stderr)
+    return unresolved
 
 
 def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:
@@ -376,10 +395,8 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     settings = conf.read("shutdown")
-    start_seconds, stay_seconds = settings.number("START_SECONDS"), settings.number("STAY_SECONDS")
-    for key, value in (("START_SECONDS", start_seconds), ("STAY_SECONDS", stay_seconds)):
-        if value <= 0:
-            raise conf.Unusable(f"{settings.source}: {key} must be positive")
+    start_seconds = settings.number("START_SECONDS")
+    _ = settings.number("STAY_SECONDS")
     launched_at = datetime.now(timezone.utc)
     operation_deadline.check()
     client.run_in_pane(tab.pane_id, command)
@@ -454,8 +471,7 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
     try:
         settings = conf.read("shutdown")
         for key in ("START_SECONDS", "STAY_SECONDS"):
-            if settings.number(key) <= 0:
-                raise conf.Unusable(f"{settings.source}: {key} must be positive")
+            _ = settings.number(key)
     except conf.Unusable as error:
         return ResumeFailed(session, str(error))
     with staff.row_operation(session):
@@ -671,8 +687,6 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
     """Observe the started generation after the command returns; recovery belongs to the watchdog."""
     settings = conf.read("shutdown")
     stay_seconds = settings.number("STAY_SECONDS")
-    if stay_seconds <= 0:
-        raise conf.Unusable(f"{settings.source}: STAY_SECONDS must be positive")
     began = monotonic()
     while _same_process(pid, generation):
         remaining = stay_seconds - (monotonic() - began)

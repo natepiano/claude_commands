@@ -57,6 +57,12 @@ NO_ACCOUNT_MOVE = NoAccountMove()
 NO_WORKERS = ResumeWorkers()
 
 
+def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[str]) -> str:
+    """Build launcher instructions; the prompt client adds the script envelope."""
+    return (f"Resume worker {worker}, dispatch {dispatch_id}. "
+            + f"Run this saved command from your session shell: {shlex.join(command)}")
+
+
 def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_MOVE,
                    workers: ResumeWorkers = NO_WORKERS, context: str = "") -> str:
     lines: list[str] = []
@@ -64,7 +70,7 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
         moved = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
         opening = context or f"You were stopped and resumed because {why}.{moved} Continue where you stopped."
         lines.append(opening.rstrip() + " First run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py pending` "
-                     + "for retained messages. Continue the work. If you waited for the user, continue to wait.")
+                     + "for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.")
     for pane in workers.panes:
         turn = f"busy dispatch {pane.turn.dispatch_id}" if isinstance(pane.turn, BusyPass) else "idle"
         lines.append(f"Worker {pane.staff_id}: {turn}. Continue with this worker's existing conversation.")

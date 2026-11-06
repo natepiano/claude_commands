@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, final, override
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import worker_panes
@@ -161,33 +162,66 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
-        resume.assert_called_once_with(opened.row, self.run_dir, active)
+        resume.assert_called_once_with(opened.row, active)
         self.assertEqual(len(self.fixture.world.launches), launches)
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
 
-    def test_launcher_recovery_runs_the_saved_command_from_the_restored_director(self) -> None:
+    def test_launcher_recovery_uses_the_real_lock_and_delivers_once(self) -> None:
         opened = self.opened()
         active = progress_history.ActiveDispatch("saved-pass", ("bash", "assign.sh", "argument with spaces"))
-        client = worker._client()  # pyright: ignore[reportPrivateUsage]
+        director = herdr.TabSession("director-pane", "unit", "workspace", str(self.fixture.parent.current_session))
+        lock_path = staff.record_path().parent / "locks" / f"{opened.row.id}.lock"
+        atomic_file.write_text_atomic(lock_path, "")
+        for held in (True, False):
+            with (self.subTest(held=held), lock_path.open("r") as lock,
+                  patch.object(self.fixture.world, "tab_sessions", return_value=[director]),
+                  patch.object(progress_history, "active_dispatch", return_value=active),
+                  patch.object(self.fixture.world, "prompt") as prompt,
+                  patch.object(herdr, "check_target", return_value=True),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as start):
+                if held:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
+                if held:
+                    prompt.assert_not_called()
+                    start.assert_not_called()
+                else:
+                    prompt.assert_called_once()
+                    start.assert_not_called()
+                    self.assertEqual(prompt.call_args.args[0], director.pane_id)
+                    text = cast(str, prompt.call_args.args[1])
+                    self.assertIn("Run this saved command from your session shell: bash assign.sh 'argument with spaces'", text)
+                    self.assertIn("saved-pass", text)
+                    self.assertIn(str(opened.row.id), text)
+                    self.assertNotIn('<system-reminder source="script">', text)
+                    self.assertEqual(prompt.call_args.kwargs, {"target": str(self.fixture.parent.current_session)})
+                    with lock_path.open("r") as available:
+                        fcntl.flock(available, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_launcher_delivery_failure_keeps_restore_uncertain(self) -> None:
+        opened = self.opened()
+        active = progress_history.ActiveDispatch("saved-pass", ("bash", "assign.sh"))
         director = herdr.TabSession("director-pane", "unit", "workspace", str(self.fixture.parent.current_session))
         with (patch.object(self.fixture.world, "tab_sessions", return_value=[director]),
-              patch.object(herdr, "check_target", return_value=True) as target,
-              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as start):
-            self.assertEqual(worker._resume_launcher(opened.row, self.run_dir, active), worker.ExitCode.OK)  # pyright: ignore[reportPrivateUsage]
-        args = cast(list[str], start.call_args.args[0])
-        self.assertIn("mesh_runs.py", args[1])
-        self.assertEqual(args[2:7], ["start", "--session-dir", str(self.run_dir), "--to", opened.row.name])
-        prompt = args[-2]
-        self.assertIn("Run this saved command from your session shell: bash assign.sh 'argument with spaces'", prompt)
-        self.assertIn("saved-pass", prompt)
-        self.assertIn("director-pane", args)
-        self.assertNotIn(opened.pane, args)
-        target.assert_called_once_with(str(self.fixture.parent.current_session), action="keys",
-            place=herdr.HerdrPlace(client.session, director.pane_id), text=prompt, client=ANY)
-        with (patch.object(self.fixture.world, "tab_sessions", return_value=[]), patch.object(subprocess, "run") as start):
-            self.assertEqual(worker._resume_launcher(opened.row, self.run_dir, active), worker.ExitCode.UNCERTAIN)  # pyright: ignore[reportPrivateUsage]
-        start.assert_not_called()
+              patch.object(progress_history, "active_dispatch", return_value=active),
+              patch.object(self.fixture.world, "prompt", side_effect=herdr.HerdrFailure("delivery failed")),
+              patch.object(herdr, "check_target", return_value=True),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.UNCERTAIN)
+        self.assertNotIn("unchanged", output.getvalue())
+        self.assertEqual(errors.getvalue(), "anomaly: impl: delivery failed\n")
+        self.assertEqual(staff.by_id(opened.row.id), opened.row)
+
+    def test_launcher_recovery_reports_an_absent_director(self) -> None:
+        opened = self.opened()
+        with (patch.object(self.fixture.world, "tab_sessions", return_value=[]),
+              patch.object(self.fixture.world, "prompt") as prompt, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(worker._resume_launcher(opened.row, progress_history.ActiveDispatch("saved-pass", ("assign.sh",))),  # pyright: ignore[reportPrivateUsage]
+                             worker.ExitCode.UNCERTAIN)
+        prompt.assert_not_called()
+        self.assertEqual(errors.getvalue(), "anomaly: impl: director session is unavailable\n")
 
     def test_resume_workers_names_the_active_pass_and_idle_worker(self) -> None:
         from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume

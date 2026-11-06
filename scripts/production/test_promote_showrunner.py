@@ -82,6 +82,26 @@ def commit_all(path: Path) -> None:
 
 @final
 class PromoteShowrunnerTests(unittest.TestCase):
+    def test_promotion_closes_the_old_tab_only_after_every_stop_proves_success(self) -> None:
+        for unresolved in ([], ["impl: not proved stopped"]):
+            with (self.subTest(unresolved=unresolved),
+                  mock.patch.object(stop_resume, "stop_unit_workers", return_value=unresolved),
+                  mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close):
+                promotion = promote_showrunner.checked("demo", self.child_doc)
+                self.assertTrue(promote_showrunner.stop(promotion))
+            if unresolved:
+                close.assert_not_called()
+            else:
+                close.assert_called_once_with(PANE, target=SESSION)
+
+    def test_promotion_continues_after_a_failed_confirmed_close(self) -> None:
+        promotion = promote_showrunner.checked("demo", self.child_doc)
+        with (mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=False),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertTrue(promote_showrunner.stop(promotion))
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("anomaly:", errors.getvalue())
+
     def test_promote_restores_retained_workers(self) -> None:
         unit = self.staff_unit()
         retained = fixture_member("worker", name="impl", parent=unit.id)
@@ -199,6 +219,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             raise AssertionError(arguments)
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", pane_result))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True))
         for module, name, stand_in in (
                 (showrunners, "production_of", self.production_of), (unit_lookup, "labeled_session", self.labeled_session),
                 (stop_resume, "stop", self.stop_member), (stop_resume, "stop_unit_workers", mock.Mock(return_value=[])),

@@ -69,26 +69,69 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(worker_panes, "observe", side_effect=observed),
               patch.object(restart, "stop_row", side_effect=finish) as stop):
             expected = ["worker-3: unreadable process", "worker-4: duplicate terminal"]
-            self.assertEqual(stop_resume.stop_unit_workers(parent, record), expected)
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(stop_resume.stop_unit_workers(parent, record), expected)
+            self.assertEqual(errors.getvalue().splitlines(), [f"anomaly: {line}" for line in expected])
             self.assertEqual(stop_resume.stop_unit_workers(parent, record), expected)
         self.assertEqual(stop.call_count, 1)
         self.assertEqual(record.rows, tuple(rows))
 
-    def test_worker_stop_requires_the_same_terminal_and_fresh_shell(self) -> None:
+    def test_unresolved_worker_has_one_report_line_and_keeps_config_warnings(self) -> None:
+        parent = staff.StaffId("holder")
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(parent),
+                             current_session=staff.StaffId("native-worker"))
+        def stop(_row: staff.StaffRow, _client: herdr.Herdr, *, deadline: float) -> bool:
+            del deadline
+            print("warning: recovered shutdown configuration", file=sys.stderr)
+            print("impl: restart anomaly: no shell proof", file=sys.stderr)
+            return False
+        with (patch.object(worker_panes, "observe", return_value=[worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)]),
+              patch.object(restart, "stop_row", side_effect=stop), redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(stop_resume.stop_unit_workers(parent, staff.StaffSnapshot((row,))), ["impl: not proved stopped"])
+        self.assertEqual(errors.getvalue().splitlines(), ["warning: recovered shutdown configuration", "anomaly: impl: not proved stopped"])
+
+    def test_worker_stop_proves_the_retained_pane_without_a_director_tab(self) -> None:
         parent = staff.StaffId("holder")
         row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(parent),
                              current_session=staff.StaffId("native-worker"))
         before = worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)
-        for after, success in ((worker_panes.StoppedWorker(row, "pane", "terminal"), True),
-                               (worker_panes.StoppedWorker(row, "pane", "replaced-terminal"), False),
-                               (worker_panes.ProcessUnknownWorker(row, "pane", "terminal", "unreadable"), False)):
-            with (self.subTest(after=after),
+        for pane, terminal, activity, conversation, success in (
+                ("pane", "terminal", herdr.PaneAtShell(), herdr.StoppedConversation(), True),
+                ("other-pane", "terminal", herdr.PaneAtShell(), herdr.StoppedConversation(), False),
+                ("pane", "other-terminal", herdr.PaneAtShell(), herdr.StoppedConversation(), False),
+                ("pane", "terminal", herdr.PaneRunning(("busy",)), herdr.StoppedConversation(), False),
+                ("pane", "terminal", herdr.PaneAtShell(), herdr.LiveConversation("claude", (123,)), False)):
+            with (self.subTest(pane=pane, terminal=terminal, activity=activity),
                   patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((row,))),
-                  patch.object(worker_panes, "observe", side_effect=[[before], [after]]),
+                  patch.object(worker_panes, "observe", side_effect=[[before], [worker_panes.ClosedWorker(row)]]),
+                  patch.object(self.client, "panes", return_value=[{"pane_id": pane, "terminal_id": terminal}]),
+                  patch.object(self.client, "tab_sessions", return_value=[]),
+                  patch.object(self.client, "pane_activity", return_value=activity),
+                  patch.object(herdr, "read_conversation", return_value=conversation),
                   patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("native-worker", 123))):
                 result = stop_resume.stop(row.id)
-            self.assertEqual(isinstance(result, stop_resume.Stopped), success)
+                self.assertEqual(isinstance(result, stop_resume.Stopped), success)
+
+    def test_worker_stop_rejects_an_unreadable_retained_pane(self) -> None:
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                             current_session=staff.StaffId("native-worker"))
+        before = worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(worker_panes, "observe", return_value=[before]),
+              patch.object(self.client, "panes", side_effect=herdr.HerdrFailure("unreadable")),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("native-worker", 123))):
+            result = stop_resume.stop(row.id)
+        self.assertIsInstance(result, stop_resume.StopFailed)
+
+    def test_closed_worker_needs_no_retained_shell_proof(self) -> None:
+        row = staff.StaffRow(staff.StaffId("closed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                             current_session=staff.StaffId("native-worker"))
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(worker_panes, "observe", return_value=[worker_panes.ClosedWorker(row)]),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("native-worker"))):
+            self.assertEqual(stop_resume.stop(row.id), stop_resume.NotRunning("native-worker"))
 
     def test_shutdown_uses_committed_values_and_keeps_the_recovery_warning(self) -> None:
         config = self.root / "committed-config"
@@ -129,7 +172,7 @@ class StopResumeTests(unittest.TestCase):
         for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "START_SECONDS", "STAY_SECONDS"):
             values = {name: "1" for name in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "START_SECONDS", "STAY_SECONDS")}
             values[key] = "0"
-            atomic_file.write_text_atomic(config / "shutdown.conf", "\n".join(f"# range: 0..\n{name}={value}" for name, value in values.items()))
+            atomic_file.write_text_atomic(config / "shutdown.conf", "\n".join(f"# range: 5e-324..\n{name}={value}" for name, value in values.items()))
             with (self.subTest(key=key), patch.dict(os.environ, {"CONF_DIR": str(config)}),
                   patch.object(stop_resume, "_signal_process") as send,
                   patch.object(stop_resume, "_start_session") as start):

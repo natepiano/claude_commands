@@ -28,6 +28,7 @@ from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
 import berth_board
 import progress_history
+import herdr
 import unit_lookup
 import unit_move
 import unit_names
@@ -516,15 +517,17 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     pane_run = worker_panes.worker_run(row)
     pane_workers = worker_panes.observe(row.id, record) if unit_runs.worker_transport(pane_run) == "herdr" else []
     pane_ids = {item.row.id for item in pane_workers}
-    with operation_deadline.within(time.monotonic() + conf.read("shutdown").number("STOP_GRACE_SECONDS")
-                                   + conf.read("shutdown").number("KILL_GRACE_SECONDS")):
+    with operation_deadline.within(stop_resume.stop_deadline()):
         _ = stop_resume.stop_unit_workers(row.id, record)
         for member in owned:
             if member.id in pane_ids or isinstance(record.backends.get(member.id), staff.CodexBackend):
                 continue
-            outcome = stop_resume.stop(member.current_session, deadline=worker_lifecycle.effective_deadline())
-            if isinstance(outcome, stop_resume.StopFailed):
-                print(f"anomaly: {member.name}: {outcome.reason}")
+            try:
+                outcome = stop_resume.stop(member.current_session, deadline=worker_lifecycle.effective_deadline())
+                if isinstance(outcome, stop_resume.StopFailed):
+                    print(f"anomaly: {member.name}: {outcome.reason}")
+            except (OSError, ValueError, herdr.HerdrFailure) as error:
+                print(f"anomaly: {member.name}: {' '.join(str(error).splitlines())}")
     for key in holds({member.current_session for member in owned}):
         result = run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
         if result.returncode:
