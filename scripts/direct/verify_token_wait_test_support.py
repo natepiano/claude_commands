@@ -26,7 +26,6 @@ from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -400,17 +399,8 @@ esac
         return process
 
     def wait_for_output(self, path: Path, text: str, process: subprocess.Popen[bytes]) -> None:
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        with local_release_waiter(path.parent, path.parent) as events:
-            events.arm()
-            if isinstance(events, LocalReleaseEvents):
-                # Include MODIFY: the child keeps this log open while blocked.
-                _ = events.add_watch(events.descriptor, os.fsencode(path.parent), 0x00000FCA)
-            while text not in path.read_text(errors="replace") and process.poll() is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                events.wait(remaining if isinstance(events, LocalReleaseEvents) else min(0.01, remaining))
+        wait_until(lambda: text in path.read_text(errors="replace") or process.poll() is not None,
+                   path.parent, processes=(process,), watch_writes=True)
         self.assertIn(text, path.read_text(errors="replace"))
 
     def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:

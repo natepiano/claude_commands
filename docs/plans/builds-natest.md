@@ -1129,7 +1129,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the routes of each script on natedev and on the Mac, before and after, with the same exit status, in the notice
 - the full test green on the phase commit merged with `origin/builds`
 
-### Phase 50 — One shared wait watches writes, and one file binds inotify  · status: todo
+### Phase 50 — One shared wait watches writes, and one file binds inotify  · status: done
 **Depends on:** Phase 43
 
 #### Work Order
