@@ -123,7 +123,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
             if isinstance(found, session_staff.MemberFound):
                 return found.row
     if run is not None:
-        entries = roster if roster is not None else session_staff.read_worker_roster(run / "mesh_roster.json")
+        entries = roster if roster is not None else worker_lifecycle.read_worker_state(run / "mesh_roster.json")
         for raw in entries.values():
             if not isinstance(raw, dict):
                 continue

@@ -1,9 +1,12 @@
 """Test staff membership and native worker identity sources."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
+from scripts.herdr import worker_panes
+from scripts.herdr.test_worker_panes import PaneWorld
 
 import io
+import json
 import os
 import unittest
 from contextlib import redirect_stderr
@@ -43,6 +46,102 @@ class StaffSourcesTests(StaffTestCase):
         owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.source_root / "sdlc-production.md"))
         return owner, unit, worker
 
+
+    def test_live_pane_workers_keep_all_five_states_and_report_unknown_evidence(self) -> None:
+        fixture = self.row_production()
+        _ = self.session_record(fixture.runner.current_session, fixture.runner.name)
+        _ = self.session_record(fixture.unit.current_session, fixture.unit.name)
+        rows = [fixture_worker(name, fixture.unit.id) for name in ("open", "stopped", "closed", "unknown")]
+        remote_parent = fixture_member("unit", name="remote-parent", parent=fixture.runner.id,
+                                       worktree=staff.PresentWorktree("mac", self.root / "remote-tree"))
+        remote_worker = fixture_worker("remote-worker", remote_parent.id)
+        world = PaneWorld()
+        world.add(fixture.unit, "w1:p0")
+        world.add(rows[0], "w1:p1")
+        world.add(rows[1], "w1:p2", live=False)
+        world.add(rows[3], "w1:p4")
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        before = self.staff_file.read_bytes()
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(self.root / "runs")}),
+              mock.patch.object(worker_panes, "_client", return_value=world),
+              mock.patch.object(herdr, "native_process", side_effect=world.native_process),
+              mock.patch.object(herdr, "_startup_processes", side_effect=world.descendants)):
+            with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+                document = staff_sources.live()
+            self.assertEqual(reads.call_count, 1)
+            members = {value["name"]: value for value in cast(list[dict[str, object]], document["members"])}
+            self.assertEqual([members[name]["pane_state"] for name in ("open", "stopped", "closed")],
+                             ["open", "stopped", "closed"])
+            self.assertNotIn("pane_state", members[fixture.unit.name])
+            self.assertNotIn("pane_state", members[remote_worker.name])
+            self.assertEqual(document["schema"], 3)
+            world.unknown["w1:p4"] = "process read denied"
+            with redirect_stderr(io.StringIO()) as errors:
+                document = staff_sources.live()
+            members = {value["name"]: value for value in cast(list[dict[str, object]], document["members"])}
+            self.assertEqual(members["unknown"]["pane_state"], "unknown")
+            self.assertEqual(members["closed"]["pane_state"], "incomplete")
+            self.assertIn("unknown: process read denied", errors.getvalue())
+            self.assertIn("unknown: process read denied", cast(list[str], document["problems"]))
+            self.assertFalse(document["complete"])
+            self.assertEqual(self.staff_file.read_bytes(), before)
+            self.assertEqual(list((self.root / "runs").glob("**/worker_transport*")), [])
+
+    def test_live_reports_a_bad_run_pin_and_keeps_mesh_members(self) -> None:
+        fixture = self.row_production()
+        _ = self.session_record(fixture.unit.current_session, fixture.unit.name)
+        worker = fixture_worker("mesh-worker", fixture.unit.id)
+        run = self.root / "runs/pinned"
+        run.mkdir(parents=True)
+        write_text_atomic(run / "mesh_roster.json", json.dumps({"mesh-worker": {"staff_id": worker.id}}))
+        pin = run / "worker_transport"
+        for failure in ("invalid", "unreadable"):
+            with self.subTest(failure=failure):
+                if failure == "invalid":
+                    write_text_atomic(pin, "junk\n")
+                else:
+                    pin.unlink()
+                    pin.mkdir()
+                with (mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(run.parent)}),
+                      redirect_stderr(io.StringIO()) as errors):
+                    document = staff_sources.live()
+                self.assertFalse(document["complete"])
+                self.assertIn(str(pin), errors.getvalue())
+                problems = cast(list[str], document["problems"])
+                self.assertTrue(any(str(pin) in problem for problem in problems), problems)
+                if failure == "invalid":
+                    self.assertTrue(any("junk" in problem for problem in problems), problems)
+                members = cast(list[dict[str, object]], document["members"])
+                self.assertIn(worker.id, [member["id"] for member in members])
+
+    def test_live_reports_unreadable_owner_and_record_without_an_empty_member_list(self) -> None:
+        _ = self.row_production()
+        _ = self.write_document({"schema": 2, "rows": ["invalid member"]})
+        with redirect_stderr(io.StringIO()) as errors:
+            document = staff_sources.live()
+        self.assertFalse(document["complete"])
+        self.assertNotIn("members", document)
+        self.assertIn("staff membership", errors.getvalue())
+        self.assertTrue(document["problems"])
+        with (self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}),
+              redirect_stderr(io.StringIO()) as errors):
+            document = staff_sources.live()
+        self.assertFalse(document["complete"])
+        self.assertNotIn("members", document)
+        self.assertIn("not reached", errors.getvalue())
+        self.assertTrue(document["problems"])
+
+    def test_live_names_an_unreadable_production_document_and_keeps_its_members(self) -> None:
+        fixture = self.row_production()
+        _ = self.session_record(fixture.unit.current_session, fixture.unit.name)
+        _ = staff.set_doc(fixture.runner.id, staff.LiveDoc("natedev", self.root / "other-production.md"))
+        with redirect_stderr(io.StringIO()) as errors:
+            document = staff_sources.live()
+        self.assertFalse(document["complete"])
+        self.assertIn("production doc could not be read", errors.getvalue())
+        self.assertIn(fixture.unit.id, [value["id"] for value in cast(list[dict[str, object]], document["members"])])
 
     def test_live_keeps_the_unit_and_reports_unreadable_branch_or_missing_configuration(self) -> None:
         fixture = self.row_production()
@@ -236,9 +335,7 @@ class StaffSourcesTests(StaffTestCase):
         sources = MemberSources((launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(record, sources)
-            evidence = staff_sources.observe_workers(record, sources, unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(record, sources)
         expected = "staff sources: Codex process 42401: native thread identity is unavailable"
         self.assertEqual(evidence.diagnostics, (expected,))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
@@ -259,14 +356,14 @@ class StaffSourcesTests(StaffTestCase):
             self.assertEqual(errors.getvalue(), "")
 
 
-    def test_codex_process_with_unreadable_environment_keeps_the_scan_incomplete(self) -> None:
+    def test_codex_process_with_unreadable_environment_reports_a_diagnostic(self) -> None:
         from scripts.message import process_table
 
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", side_effect=[table, table]),
               mock.patch.object(herdr, "process_environment", side_effect=PermissionError("permission denied"))):
-            with self.assertRaisesRegex(staff.StaffUnreadable, "Codex processes: permission denied"):
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
+        self.assertIn("staff sources: Codex processes: permission denied", evidence.diagnostics)
 
 
     def test_codex_without_a_thread_in_an_unowned_pane_reports_a_diagnostic_without_refusal(self) -> None:
@@ -298,10 +395,7 @@ class StaffSourcesTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(staff.snapshot(), MemberSources((launch,)))
-            evidence = staff_sources.observe_workers(
-                staff.snapshot(), MemberSources((launch,)), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources((launch,)))
         self.assertEqual(evidence.diagnostics, (
             "staff sources: Codex process 42401: native thread identity is unavailable",))
 
@@ -345,10 +439,7 @@ class StaffSourcesTests(StaffTestCase):
             42401, 1, "node", 'node /modules/@openai/codex/bin/codex.js --config "unfinished')}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment") as environment):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
-            evidence = staff_sources.observe_workers(
-                staff.StaffSnapshot(()), MemberSources(()), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
         environment.assert_not_called()
         self.assertEqual(evidence.diagnostics,
                          ("staff sources: Codex process scan: pid 42401: No closing quotation",))
@@ -358,10 +449,7 @@ class StaffSourcesTests(StaffTestCase):
         from scripts.message import process_table
 
         with mock.patch.object(process_table, "snapshot", side_effect=OSError("process table unavailable")):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
-            evidence = staff_sources.observe_workers(
-                staff.StaffSnapshot(()), MemberSources(()), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
         self.assertEqual(evidence.diagnostics, ("staff sources: Codex processes: process table unavailable",))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
@@ -821,3 +909,19 @@ class StaffWorkerIdentityTests(StaffTestCase):
         evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(()), current_only=True)
         self.assertEqual(evidence.workers, ())
         staff_sources.require_worker_stopped(staff.snapshot(), worker.id)
+
+    def test_retire_stopped_worker_prints_an_anomaly_for_another_codex_process(self) -> None:
+        from scripts.message import process_table
+
+        runner, owner, worker = self.tree()
+        launch = pane_record.launch("test:pane", owner.current_session, str(self.root), {}, [])
+        table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"}),
+              mock.patch.object(session_staff, "member_sources", return_value=MemberSources((launch,))),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(staff.retire(worker.id), worker)
+        self.assertIsNone(staff.by_id(worker.id))
+        self.assertEqual(staff.snapshot().rows, tuple(sorted((runner, owner), key=lambda row: row.id)))
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "anomaly: staff sources: Codex process 42401: native thread identity is unavailable"])
