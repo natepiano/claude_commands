@@ -8,7 +8,6 @@ import io
 import json
 import multiprocessing
 import os
-import pwd
 import stat
 import subprocess
 import sys
@@ -25,7 +24,7 @@ from unittest import mock
 
 from scripts.production import staff
 from scripts.message import sessions
-from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase
+from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -508,6 +507,24 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_staff_fixture_keeps_registry_paths_under_its_private_folder(self) -> None:
+        from scripts.lib.session_paths import sessions_directory
+        from scripts.production import showrunners
+        from scripts.shutdown import pane_record
+
+        keys = ("SHOWRUNNER_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "HERDR_PANE_RECORD_DIR", "XDG_CONFIG_HOME")
+        root = self.root / "registry-fixture"
+        environment: dict[str, str] = {}
+        with (mock.patch.dict(os.environ, {key: "/fixture/live" for key in keys}),
+              isolated_staff_file(root / "staff.json", environment)):
+            for key in keys:
+                with self.subTest(key=key):
+                    self.assertTrue(Path(environment[key]).is_relative_to(root))
+                    self.assertEqual(os.environ[key], environment[key])
+            self.assertEqual(showrunners.SHOWRUNNER_STATE_DIR, Path(environment["SHOWRUNNER_STATE_DIR"]))
+            self.assertEqual(sessions_directory(), Path(environment["NOTIFIER_SESSIONS_DIR"]))
+            self.assertEqual(pane_record.record_directory(), Path(environment["HERDR_PANE_RECORD_DIR"]))
+
     def test_snapshots_keep_their_production_record_source(self) -> None:
         value: dict[str, object] = {"schema": 2, "rows": []}
         _ = self.write_document(value)
@@ -527,13 +544,15 @@ class StaffTests(StaffTestCase):
                   mock.patch.object(staff, "_remote", return_value=value)):
                 self.assertTrue(staff.snapshot().production)
 
-    def test_gate_module_writes_keep_the_real_staff_and_launch_folders_unchanged(self) -> None:
+    def test_gate_module_writes_keep_the_supplied_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
         from scripts.production import merge_gate
 
-        real_state = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state"
+        real_state = self.root / "supplied-state"
         real_staff = real_state / "staff"
         real_launches = real_state / "herdr-panes"
+        self.write_json(real_staff / "staff.json", {"schema": 2, "rows": []})
+        self.write_json(real_launches / "agents.json", {})
 
         def folder_bytes(folder: Path) -> dict[Path, bytes]:
             return {path.relative_to(folder): path.read_bytes()

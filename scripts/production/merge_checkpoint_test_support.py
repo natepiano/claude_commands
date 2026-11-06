@@ -209,14 +209,14 @@ class BumpGateObservation(NamedTuple):
 
 
 def configure_test_environment() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them. The
-    scratch folders a merge removes are in a temporary folder, never /tmp/claude/scratch or ~/rust/repro."""
+    """Use Pacific time and private scratch and registry folders for each module."""
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         **config_environment(Path(folder.name) / "config"),
         "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch",
         "SCRATCH_VISIBLE_ROOT": f"{folder.name}/repro"}))
+    _ = unittest.enterModuleContext(isolated_staff_file(Path(folder.name) / "staff.json", {}))
 
 
 class MergeResult(NamedTuple):
@@ -255,7 +255,8 @@ class MergeCheckpointFixture(unittest.TestCase):
         cls.fixture_snapshot = cls.fixture_root.with_name("snapshot")
         builder = cls()
         builder.bind_fixture(cls.fixture_root)
-        builder.build_fixture()
+        with isolated_staff_file(Path(builder.env["STAFF_FILE"]), builder.env):
+            builder.build_fixture()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot)
         shutil.rmtree(cls.fixture_root)
 
@@ -275,6 +276,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
         self.addCleanup(cleanup)
         self.bind_fixture(self.fixture_root)
+        _ = self.enterContext(isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env))
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
