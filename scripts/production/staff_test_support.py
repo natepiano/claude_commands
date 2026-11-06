@@ -160,7 +160,7 @@ def stopped_worker_module(directory: Path) -> Path:
 from pathlib import Path
 from scripts.production import staff
 from scripts.shutdown import stop_resume
-def stop(reference):
+def stop(reference, kind=""):
     row = staff.by_id(staff.StaffId(reference))
     if os.environ.get("FIXTURE_STOPPED"):
         Path(os.environ["FIXTURE_STOPPED"]).write_text(json.dumps(row.to_json()))

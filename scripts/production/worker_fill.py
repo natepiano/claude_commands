@@ -62,10 +62,17 @@ def coordinate_claude(name: str, run: Path, prompt: Path, reference: str = "") -
     def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
         if not started:
             if worker_admission.dispatch_record(allowed, report_anomaly=False).state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
-                source = worker_admission.transcript_source(published.row, staff.ClaudeBackend())
+                try:
+                    source = worker_admission.transcript_source(published.row, staff.ClaudeBackend())
+                except ValueError as error:
+                    if str(error) != "no source transcript found":
+                        raise
+                    entries = ()
+                else:
+                    entries = worker_admission.transcript_entries(source, set())
                 torn = False
                 text = prompt.read_text()
-                for entry in worker_admission.transcript_entries(source, set()):
+                for entry in entries:
                     if isinstance(entry, worker_admission.TornTranscriptRecord):
                         torn = True
                     elif entry.startswith("user:\n") and entry.endswith(text):

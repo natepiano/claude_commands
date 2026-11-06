@@ -356,7 +356,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
   printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
   if [[ "${AGENT_FAMILY}" == "claude" ]]; then
-    bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach --run "${SESSION_DIR}" \
+    AGENT_BG_ROLE="${PASS_KIND}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach --run "${SESSION_DIR}" \
       "${MESH_NAME}" "${WORKING_DIR}" "${FOLLOW_MESSAGE}" "${SUMMARY_FILE}" \
       "${LOG_FILE}" "${AGENT_MODEL}" &
   else
@@ -368,7 +368,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
       --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --run "${SESSION_DIR}" \
+  AGENT_BG_ROLE="${PASS_KIND}" AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --run "${SESSION_DIR}" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${AGENT_MODEL}" &
 else

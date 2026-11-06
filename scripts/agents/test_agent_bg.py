@@ -19,6 +19,7 @@ from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.lib.process_group import send_process_group
 from scripts.message import sessions
 from scripts.production import staff, worker_admission
+from scripts.usage import agents_log
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.socket_test_support import ShortUnixSocket
@@ -62,11 +63,18 @@ SEND = '''import json, os, sys, socket
 from pathlib import Path
 sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production import staff
+from scripts.direct import workers
+from scripts.usage import agents_log
+try:
+    history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+except OSError:
+    history = agents_log.RoleLog({}, ())
 row = staff.by_current_session(os.environ["FIXTURE_NATIVE_ID"])
 if row is None:
     raise SystemExit("opening prompt preceded staff publication")
 prompt = Path(sys.argv[sys.argv.index("--file") + 1]).read_text()
-Path(os.environ["FIXTURE_SENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "row": row.to_json(), "prompt": prompt}))
+Path(os.environ["FIXTURE_SENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "row": row.to_json(), "prompt": prompt,
+    "role": workers._worker_task_role({"staff_id": row.id}, staff.local_snapshot(), history)}))
 if os.environ.get("FIXTURE_GATE"):
     with socket.socket(socket.AF_UNIX) as gate:
         gate.connect(os.environ["FIXTURE_GATE"])
@@ -156,6 +164,36 @@ class NativeClaudeWorkerTests(StaffTestCase):
 
     def backend_calls(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in self.fixture.backend_log.read_text().splitlines()]
+
+    def test_claude_dispatch_records_the_task_role_before_delivery(self) -> None:
+        for switched in (False, True):
+            with self.subTest(switched=switched):
+                environment = {"AGENT_BG_ROLE": "impl"}
+                if switched:
+                    backend = staff.CodexBackend(self.root / "source-codex")
+                    source = fixture_worker("fresh-impl", self.fixture.unit.id, backend=backend)
+                    _ = transcript_fixture(source, backend)
+                    modules = stopped_worker_module(self.root / "source-stop-modules")
+                    environment.update(CODEX_HOME=str(backend.codex_home),
+                        FIXTURE_STOPPED=str(self.root / "source-stopped.json"),
+                        PYTHONPATH=os.pathsep.join((str(modules), str(CHECKOUT))))
+                result = self.launch(**environment)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
+                self.assertEqual(sent["role"], "impl")
+                history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+                self.assertEqual(history.assignments[self.fixture.identity][-1].role, "impl")
+                row = staff.by_current_session(self.fixture.identity)
+                assert row is not None
+                self.clear_worker(row)
+
+    def test_claude_consultation_without_a_role_preserves_the_assignment_history(self) -> None:
+        result = self.launch(AGENT_BG_ROLE="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+        self.assertEqual(history.assignments, {})
+        sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
+        self.assertEqual(sent["prompt"], self.fixture.prompt.read_text())
 
     def test_claude_admission_completes_and_cancels_without_linux_process_files(self) -> None:
         read_text = Path.read_text

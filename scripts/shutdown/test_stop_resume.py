@@ -24,7 +24,7 @@ from scripts.message import sessions as runtime_sessions
 from scripts.accounts import accounts
 from scripts.whoami import account
 from scripts.shutdown import restart, stop_resume
-from scripts.shutdown.stop_results import ClaudeStartState
+from scripts.shutdown.stop_results import ClaudeStartState, SourceReleased
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
 from scripts.lib.resume_message import PausedSeat
@@ -1190,6 +1190,79 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(len(output.getvalue().splitlines()), 1)
             self.assertIn("test-tab", output.getvalue())
 
+    def test_codex_release_uses_recorded_servers_after_an_unknown_process(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
+        runs = (self.root / "source-run",)
+        unknown = "pid 998071 (Codex thread unknown)"
+        with (patch.object(herdr, "_scan_herdr_processes", return_value=[]),
+              patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, (unknown,))),
+              patch("scripts.agents.codex_mesh.stop_worker_for_switch", return_value=SourceReleased()) as release,
+              redirect_stderr(io.StringIO()) as output):
+            result = stop_resume.release_source(row, lambda: runs, staff.CodexBackend(self.root / "codex"))
+        self.assertIsInstance(result, SourceReleased)
+        release.assert_called_once_with(row, runs)
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"anomaly: {identity} is not proved live or stopped: 1 processes unknown, first: {unknown}; not blocking"])
+        self.kill.assert_not_called()
+
+    def test_codex_release_uses_recorded_servers_for_a_hosted_thread_without_a_pid(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
+        runs = (self.root / "hosted-run",)
+        with (patch.object(herdr, "_scan_herdr_processes", return_value=[]),
+              patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: ()}, ())),
+              patch("scripts.agents.codex_mesh.stop_worker_for_switch", return_value=SourceReleased()) as release):
+            result = stop_resume.release_source(row, lambda: runs, staff.CodexBackend(self.root / "codex"))
+        self.assertIsInstance(result, SourceReleased)
+        release.assert_called_once_with(row, runs)
+        self.kill.assert_not_called()
+
+    def test_claude_release_ignores_unrelated_unknown_codex_processes(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
+        with (patch.object(herdr, "_scan_herdr_processes", return_value=[]),
+              patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()) as claude,
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
+                  {}, ("pid 998071 (Codex thread unknown)",))) as codex):
+            result = stop_resume.release_source(row, lambda: (), staff.ClaudeBackend())
+        self.assertIsInstance(result, SourceReleased)
+        claude.assert_called_once_with(identity)
+        codex.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_codex_release_does_not_read_an_unreadable_claude_registry(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "worker", "alpha", staff.STAFF_ROOT, current_session=identity)
+        runs = (self.root / "codex-run",)
+        with (patch.object(herdr, "_scan_herdr_processes", return_value=[]),
+              patch.object(runtime_sessions, "session_liveness", side_effect=OSError("Claude registry unreadable")) as claude,
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
+              patch("scripts.agents.codex_mesh.stop_worker_for_switch", return_value=SourceReleased()) as release):
+            result = stop_resume.release_source(row, lambda: runs, staff.CodexBackend(self.root / "codex"))
+        self.assertIsInstance(result, SourceReleased)
+        release.assert_called_once_with(row, runs)
+        claude.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_direct_stop_keeps_shared_unknown_evidence_failed_and_preserves_the_prompt(self) -> None:
+        identity = self.entry["session_id"]
+        prompt = stall_watch.STATE_DIR / "selected.prompt.json"
+        with prompt.open("w") as output:
+            json.dump({"session_id": identity, "key": "selected-prompt"}, output)
+        before = {path: path.read_bytes() for path in stall_watch.STATE_DIR.iterdir()}
+        with (patch.object(herdr, "_scan_herdr_processes", return_value=[]),
+              patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
+                  {}, ("pid 998071 (Codex thread unknown)",)))):
+            result = stop_resume.stop(identity)
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        self.assertIsInstance(result, stop_resume.StopUnproved)
+        self.assertEqual({path: path.read_bytes() for path in stall_watch.STATE_DIR.iterdir()}, before)
+        self.kill.assert_not_called()
+
     def test_stop_proves_an_idle_restarted_codex_process_with_the_staff_current_session(self) -> None:
         identity = self.entry["session_id"]
         self.client.rows.insert(0, {"pane_id": "w1:p1", "workspace_id": "w1", "label": "unnamed"})
@@ -1395,7 +1468,7 @@ class StopResumeTests(unittest.TestCase):
         identity = "019b3a40-4250-7000-8000-000000000102"
         reason = f"{identity} is not proved live or stopped: 1 processes unknown, first: "\
             + f"{identity} (Claude session unknown: registry unreadable)"
-        self.assertEqual(stop_resume.stop("alpha"), stop_resume.StopFailed(identity, reason))
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.StopUnproved(identity, reason))
         self.assertEqual(stop_resume.stop("elsewhere"), stop_resume.SessionNotFound("elsewhere"))
         self.assertEqual(stop_resume.resume("elsewhere", why="maintenance"), stop_resume.ResumeFailed("elsewhere", "unknown name"))
         self.kill.assert_not_called()
@@ -1711,7 +1784,7 @@ class StopResumeTests(unittest.TestCase):
         identity = "019b3a40-4250-7000-8000-000000000102"
         reason = f"{identity} is not proved live or stopped: 1 processes unknown, first: "\
             + f"{identity} (Claude session unknown: identity unreadable)"
-        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.StopFailed(identity, reason))
+        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.StopUnproved(identity, reason))
         self.start.assert_not_called()
         self.kill.assert_not_called()
 

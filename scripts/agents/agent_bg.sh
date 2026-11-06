@@ -208,6 +208,22 @@ fi
 switch_signal "$BG_ID" || exit 2
 fi
 
+if [[ -n "${AGENT_BG_ROLE:-}" ]]; then
+  "$PY" - "$(dirname "${BASH_SOURCE[0]}")/../.." "$NATIVE_ID" "$AGENT_BG_ROLE" <<'PYROLE'
+import sys
+from datetime import datetime, timezone
+from typing import cast
+
+sys.path.insert(0, sys.argv[1])
+from scripts.usage import agents_log
+
+try:
+    agents_log.append(sys.argv[2], cast(agents_log.Role, sys.argv[3]), None, datetime.now(timezone.utc))
+except Exception as error:
+    print("agents_log: " + " ".join(str(error).splitlines()), file=sys.stderr)
+PYROLE
+fi
+
 SEND_SCRIPT="${AGENT_BG_SEND_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/../message/send.py}"
 delivery="$("$PY" "${SEND_SCRIPT}" --to "session:${NATIVE_ID}" --from "launcher" --file "${PROMPT_FILE}")" || exit 2
 if [[ "$delivery" != SENT:* && "$delivery" != SKIPPED:* ]]; then
@@ -243,7 +259,6 @@ PY
   fi
 else
 
-"$PY" "$(dirname "${BASH_SOURCE[0]}")/../usage/agents_log.py" append --id "${BG_ID}" --role worker || true
 if [[ "${DETACH}" == "1" ]]; then
   echo "launched ${MESH_NAME} (${BG_ID})"
   exit 0

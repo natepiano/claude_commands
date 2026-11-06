@@ -323,8 +323,9 @@ class FamilyHandoffTests(StaffTestCase):
                         with self.assertRaises(BlockingIOError):
                             fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-                def stop(reference: str) -> stop_resume.Stopped:
+                def stop(reference: str, kind: str) -> stop_resume.Stopped:
                     self.assertEqual(reference, old.id)
+                    self.assertEqual(kind, family)
                     locked()
                     events.append("stop")
                     return stop_resume.Stopped(old.current_session, 987654)

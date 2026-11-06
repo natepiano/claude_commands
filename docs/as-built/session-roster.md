@@ -37,7 +37,7 @@ The roster joins records that each name one part of the picture. A session's rol
 
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `unit_runs.LIVE_HEARTBEAT_SECS` (600 s) |
 
-| Workers ledgers | `<run>/workers`, one `<background id>\t<worker name>` per `agent_bg.sh` launch | Claude workers |
+| Staff worker rows | `staff.json`, through `staff.local_snapshot()`: rows of kind `worker` under the run's director whose backend reads `ClaudeBackend`. A running registry record counts as Claude evidence when no transcript exists yet | Claude workers |
 
 | Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Codex workers: `thread_id`, `status`, `role`, `lens`, `launcher_pid`, `cwd`; server `pid` |
 
@@ -59,7 +59,7 @@ Claude rows come from `sessions.running_sessions()`, one per `sessionId` (newest
 
 Codex rows:
 
-- **worker** — each mesh entry of a live run whose status is not `ended` and whose server pid or `launcher_pid` is alive. Slot role from the record's `role`: `review (<lens>)` for a `review` role with a lens, `no role` when absent, `role unknown` when unrecognized. Status reads `done` → `idle`, `waiting_capacity` → `waiting for capacity`, `capacity_exhausted` → `out of capacity`, others as stored. cwd from the record, else the agent process's `--cwd`, else the director's cwd. Director and showrunner links come from the run; a heartbeat-only run gives `NoDirector` / `NoShowrunner`.
+- **worker** — each mesh entry of a live run whose status is not `ended` and whose server pid or `launcher_pid` is alive, except an entry whose staff member reads `ClaudeBackend`: a worker that switched to Claude keeps its record for recovery and reads as one Claude row. Slot role from the record's `role`: `review (<lens>)` for a `review` role with a lens, `no role` when absent, `role unknown` when unrecognized. Status reads `done` → `idle`, `waiting_capacity` → `waiting for capacity`, `capacity_exhausted` → `out of capacity`, others as stored. cwd from the record, else the agent process's `--cwd`, else the director's cwd. Director and showrunner links come from the run; a heartbeat-only run gives `NoDirector` / `NoShowrunner`.
 - **held Astra role** (`_durable_roles`) — each open held role in the held role store (`docs/as-built/long-lived-workers.md#lasting-roles`), skipping a role not opened or ended and a thread fenced by an adoption (`transferring_role`, `role_redirect`, `design_roles.transfer_route`). Role `astra-designer` or `astra-reviewer`, name the instance name, status the mesh entry's, else the lifecycle name; cwd the design's checkout. A unit holder gives `UnderDirector`; a showrunner holder gives `UnderShowrunner` and `NoDirector`. Its account reads `AccountUnread("serving home not read")`.
 - **blind reviewer** — `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).

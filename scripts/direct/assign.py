@@ -794,9 +794,9 @@ def require_live_director() -> None:
     refuse("assign.sh requires a live Claude or Codex ancestor; run it from the director's session shell")
 
 
-def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Path,
-                   env: dict[str, str]) -> int:
-    """Use the Claude launcher under the same assign parent."""
+def execute_worker_launcher(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Path,
+                            env: dict[str, str]) -> int:
+    """Use the worker launcher for Claude dispatch and family changes."""
     options = ["--phase", phase]
     if args.to:
         options += ["--to", args.to]
@@ -932,8 +932,16 @@ def main() -> int:
     env["UNIT_PASS_OWNER"] = "launcher"
     if args.operation != AssignmentOperation.DISPATCH:
         return execute_operation(args, admitted, held, cwd, prompt, family, model, effort, tier, env)
-    if family == "claude":
-        return execute_claude(args, run, phase, cwd, prompt, env)
+    membership = staff.local_snapshot()
+    member = worker_admission.member(run, worker, membership)
+    changing_family = member is not None and session_staff.worker_family(membership, member.id) != family
+    if family == "claude" or changing_family:
+        if changing_family:
+            args.to = worker
+        try:
+            return execute_worker_launcher(args, run, phase, cwd, prompt, env)
+        finally:
+            workers.release_allocation(run, worker, reservation)
     dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation)
     try:
         return execute(dispatch, paths)

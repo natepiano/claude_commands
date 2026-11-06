@@ -9,10 +9,46 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from scripts.production import staff, worker_admission, worker_fill
-from scripts.production.staff_test_support import CHECKOUT, fixture_runtime_id, StaffTestCase, production_membership, unit_membership, recorded_showrunner, transcript_fixture
+from scripts.production.staff_test_support import CHECKOUT, fixture_member, fixture_runtime_id, StaffTestCase, production_membership, unit_membership, recorded_showrunner, transcript_fixture
+from scripts.message import sessions
 
 
 class WorkerFillTests(StaffTestCase):
+    def test_claude_retry_without_a_transcript_keeps_the_session_and_delivers_the_saved_handoff(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
+        native = staff.native_id(fixture_runtime_id("published-claude-without-transcript"))
+        row = staff.ensure_worker(native, "impl", unit.id)
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
+        _ = registry.write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": native, "name": row.name,
+            "messagingSocketPath": "", "procStart": sessions.process_start(os.getpid()), "updatedAt": 1,
+        }))
+        run = self.root / "published-retry"
+        run.mkdir()
+        prompt = run / "prompt.md"
+        _ = prompt.write_text("Complete the assignment after the family switch.")
+        source = run / "source.jsonl"
+        _ = source.write_text("Source conversation before the switch.\n")
+        extract = worker_admission.handoff_path(run, row)
+        _ = extract.write_text(f"{worker_admission.HANDOFF_SOURCE_PREFIX}{source}\nSaved source conversation.\n")
+        allowed = worker_admission.WorkerStartAllowed(row.name, unit.id, run, worker_admission.ExistingWorkerSlot(row))
+        worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt),
+                                         worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+        before = self.staff_file.read_bytes()
+        self.assertEqual(sessions.transcript_locations(native), [])
+        result = self.script(CHECKOUT / "scripts/production/worker_fill.py", "coordinate-claude",
+                             "--name", row.name, "--run", str(run), "--prompt", str(prompt),
+                             "--staff-id", row.id, input="attached\ndispatched\n")
+        self.assertEqual(result.stdout.splitlines(),
+                         ["attach", str(run / f"{row.id}.opening.md"), f"published {native}"])
+        prepared = Path(result.stdout.splitlines()[1]).read_text()
+        self.assertIn(prompt.read_text(), prepared)
+        self.assertLess(prepared.index(str(extract)), prepared.index(prompt.read_text()))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
     def test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch(self) -> None:
         _, unit, row = self.tree()
         run = self.root / "retry"

@@ -10,7 +10,7 @@ A set of agent-session tools in `~/.claude`, all Python (standard library) or zs
 
 - Cargo-token hygiene: each verify step runs in its own process group that a release or reclaim stops.
 
-- Launcher changes: `implement.sh --to <worker>` carries follow-up work to a worker still open (`review.sh --to <worker>` does the same for reviews; see `long-lived-workers.md`), a Claude worker starts at its registry effort, a pane-derived summary is plain text, and `/unit:report on|off` switches a unit's progress updates.
+- Launcher changes: `implement.sh --to <worker>` carries follow-up work to a worker still open and of the same family (`review.sh --to <worker>` does the same for reviews; see `long-lived-workers.md`), a Claude worker starts at its registry effort, a pane-derived summary is plain text, and `/unit:report on|off` switches a unit's progress updates.
 
 The 96-hour measure ran from 2026-10-07 01:44:05 EDT to 2026-10-11 01:44:05 EDT. It found 27 `too_many_lines` failed steps among 763 hana clippy steps. The rate was 3.539 per 100 against a ≤3.3 limit: **FAIL** (baseline 13.3). Sole-cause cost was 0.116 worker-hours per day against ≤0.27: **PASS** (baseline 1.07). All four Claude/Codex controls on natedev/Mac passed.
 

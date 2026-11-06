@@ -697,12 +697,13 @@ class WorkerGroupPendingTests(StaffTestCase):
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop_worker))
         _ = self.enterContext(patch.object(accounts, "SCRIPTS", self.root / "no-launchers"))
 
-    def stop_worker(self, reference: str) -> stop_resume.Stopped | stop_resume.StopFailed:
+    def stop_worker(self, reference: str, kind: str = "") -> stop_resume.Stopped | stop_resume.StopFailed:
         self.stop_requests.append(reference)
         if reference == self.failed_worker:
             return stop_resume.StopFailed(reference, "source process could not stop")
         row = staff.by_id(staff.StaffId(reference))
         assert row is not None
+        self.assertIn(kind, ("", staff.snapshot().backends[row.id].family))
         return stop_resume.Stopped(row.current_session, 987654)
 
     def worker(self, name: str, family: Literal["claude", "codex"]) -> tuple[staff.StaffRow, Path]:

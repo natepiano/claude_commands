@@ -885,8 +885,10 @@ def _found_backends(rows: Sequence[StaffRow]) -> dict[StaffId, ClaudeBackend | C
                         _ = found.setdefault(identity, CodexBackend(home))
         except OSError as error:
             print(f"anomaly: {home}: {error}", file=sys.stderr)
+    running = ({record["sessionId"] for record in sessions.running_sessions()}
+               if any(identity not in found for identity in wanted.values()) else set[str]())
     for current, identity in wanted.items():
-        if identity not in found and bool(sessions.transcript_locations(current)):
+        if identity not in found and (current in running or bool(sessions.transcript_locations(current))):
             found[identity] = ClaudeBackend()
     return found
 

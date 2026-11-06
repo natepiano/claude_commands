@@ -69,6 +69,21 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_running_claude_registry_identifies_a_worker_before_its_first_transcript(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
+        native = staff.native_id(fixture_runtime_id("claude-before-first-message"))
+        worker = staff.ensure_worker(native, "impl", unit.id)
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
+        _ = registry.write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": native, "name": worker.name,
+            "messagingSocketPath": "", "procStart": sessions.process_start(os.getpid()), "updatedAt": 1,
+        }))
+        self.assertEqual(sessions.transcript_locations(native), [])
+        self.assertEqual(staff.backend(worker), staff.ClaudeBackend())
+        registry.unlink()
+        self.assertIsInstance(staff.backend(worker), staff.BackendUnavailable)
+
     def test_agent_environment_removes_launch_and_editor_configuration(self) -> None:
         environment = {"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
                        "MODELS_REGISTRY_EDIT_BASE": "editor-generation", "KEEP": "agent-value"}

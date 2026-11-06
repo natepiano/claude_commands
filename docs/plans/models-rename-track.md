@@ -210,7 +210,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 - `scripts/shutdown/stop_resume.py`, `scripts/shutdown/stop_results.py` — source release and its reasons (shutdown-unit's files).
 - `commands/ask_a_friend.md` — calls `worker_fill.py end-friend`.
 
-**Binds later work:** phase 3r removed the `role` parameter of `worker_admission.admit` at every caller and the `AGENT_BG_ROLE` assignments. `release_source` and `ReleaseSource` stay as built beside shutdown-unit's `stop(session, *, deadline=math.inf)`. The tests `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch`, `test_worker_release_refusals_name_the_reason_and_next_action` and the `test_end_friend.py` stop and retry tests own the states above.
+**Binds later work:** phase 3r removed the `role` parameter of `worker_admission.admit` at every caller and the `AGENT_BG_ROLE` assignments. `release_source` and `ReleaseSource` stay as built beside shutdown-unit's `stop(session, kind="", *, deadline=math.inf)`. The tests `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch`, `test_worker_release_refusals_name_the_reason_and_next_action` and the `test_end_friend.py` stop and retry tests own the states above.
 
 **Gotchas:**
 - A ruling must be in the worker prompt. A queued codex_mesh message loses to the prompt's own text.
@@ -248,7 +248,7 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 **Ruled out:** a test that counts agents-log reads — it tests the implementation, not the behavior.
 
-### Phase 3r — Live family-switch proofs through assign.sh  · status: todo
+### Phase 3r — Live family-switch proofs through assign.sh  · status: done
 
 **Owner:** models-unit. 3p Milestone 2 (Spec items 10-11) moved here so that 3p could land Milestone 1.
 
@@ -298,6 +298,42 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 2. Each destination reads the extract before its first assignment.
 3. `test_worker_admission.py`, `test_worker_fill.py`, `test_codex_mesh.py`, `test_agent_bg.py` and the 3s suites pass; basedpyright 0/0 on changed files and caller modules. `test_default_switch_request_reuses_the_published_destination_after_fresh_admission` and `test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch` stay.
 4. Both outcomes go to sdlc with the evidence paths.
+
+### Phase 3t — A retry after a failed delivery restores the handoff  · status: todo
+
+**Owner:** models-unit. Phase 3r routed this case here (ledger 3r F008).
+
+**Depends on:** 3r.
+
+#### Work Order
+
+**Goal:** A worker switch retry after a failed first delivery still gives the destination the transcript extract before its assignment.
+
+**Spec:**
+
+1. Cause: after a failed delivery, the destination is live and reads the requested family. `worker_record switch` in `scripts/direct/implement.sh` returns 1, so the retry takes a plain follow-up. `coordinate_claude` does not run, the extract is not delivered, and the dispatch record stays `sending`.
+2. `worker_record switch` also returns 0 when the dispatch record is pending for this prompt. The retry then reaches `coordinate_claude`, which restores the saved handoff through `switch_worker`.
+3. A follow-up with no pending dispatch record keeps the follow path.
+4. Add no guard, refusal or check.
+
+**Files:**
+- `scripts/direct/implement.sh` — the switch check.
+- `scripts/direct/test_implement_launcher_claude_follow.py` — real-path regression tests.
+
+**Workers:** `1 writer`
+
+- `impl` — the source repair and its tests.
+
+**Constraints from prior phases:**
+
+1. 3r: the dispatch role goes to `agent_bg.sh` as `AGENT_BG_ROLE`, and a live Claude session with no transcript reads `ClaudeBackend`.
+2. No unasked guards (user via sdlc, 2026-11-05).
+
+**Acceptance gate:**
+
+1. Observation: a retry with a pending dispatch record delivers one prompt whose extract path comes before the assignment, to the same destination session. Real-path check: a test through `implement.sh`.
+2. The dispatch record reads `accepted` after that delivery, and a plain follow-up leaves the record unchanged.
+3. The merge gate passes; basedpyright 0/0 on changed files and on caller modules.
 
 ### Phase 5a — Bash reads the resolved model registry in one call  · status: done
 

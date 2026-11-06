@@ -383,8 +383,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   second look at the moment before it is signalled, under its run folder's
   server lock so a launcher reaching `ensure_server` waits and then starts its
   own. The second look must find the same pid still serving the same port and
-  must again say unused; then `_reap` stops it and `mesh_server.json` is removed
-  if it names that pid. A deleted run folder is not created again for the lock.
+  must again say unused; then `_reap` stops it and `_forget_run_server` removes
+  that server from `mesh_server.json`. The file goes when no other server record
+  stays, and it stays when it holds another retained server. A deleted run folder is not created again for the lock.
   Nothing runs the sweep on a schedule. Neither `remove_workers.py` at phase
   end nor `end_session.sh` at run end launches it. Explicit sweeps, idle-stop
   and retired-server reclamation use the common busy check and its second look.
@@ -398,7 +399,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   and touches the record. The marker is left out because a stopped server comes
   back at the next use: `follow` starts one and sends `thread/resume`, and `send`
   now reopens a thread the server has not loaded (`_load_thread`; a new server
-  accepts a queued message for an unloaded thread and never runs it). A stopped server leaves no `mesh_server.json` and one
+  accepts a queued message for an unloaded thread and never runs it). A stopped server leaves no record of itself in `mesh_server.json` and one
   line in `mesh_server.log` saying why. Cost: a shell and a `sleep` per server
   (under 1 MB of their own memory against a mean 38 MB per app-server), one
   `find` per wake, and one short Python run about twice an hour while the server

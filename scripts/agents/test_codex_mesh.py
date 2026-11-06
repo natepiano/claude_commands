@@ -2075,7 +2075,8 @@ class StaffAdmissionTests(MeshCommandFixture):
         source, evidence = transcript_fixture(old, staff.ClaudeBackend())
         stopped: list[str] = []
 
-        def stop(reference: str) -> stop_resume.Stopped:
+        def stop(reference: str, kind: str = "") -> stop_resume.Stopped:
+            self.assertEqual(kind, "claude")
             stopped.append(reference)
             self.assertEqual(staff.by_id(old.id), old)
             return stop_resume.Stopped(old.current_session, 987654)
@@ -2257,7 +2258,9 @@ class StaffAdmissionTests(MeshCommandFixture):
             ("mixed retained records", {"previous_servers": [stopped, {}]}, True, stop_results.SourceReleaseUnknown),
             ("missing current pid", {"port": 9, "previous_servers": [stopped]}, True, stop_results.SourceReleaseUnknown),
             ("stopped retained servers", {"previous_servers": [stopped]}, True, stop_results.SourceReleased),
-            ("missing server file", None, True, stop_results.SourceUnresolved),
+            ("missing server file", None, True, stop_results.SourceReleased),
+            ("empty server list", {"previous_servers": []}, True, stop_results.SourceReleased),
+            ("missing server file, unrelated row", None, False, stop_results.SourceUnresolved),
         )
         for label, evidence, identified, expected in cases:
             with self.subTest(evidence=label):
@@ -2283,8 +2286,7 @@ class StaffAdmissionTests(MeshCommandFixture):
         old = self.codex_switch_source()
         allowed = worker_admission.admit(old.name, self.session_dir)
         server = self.session_dir / codex_mesh.SERVER_FILE
-        for reason, change in (("stop is unresolved", lambda: server.unlink()),
-                               ("worker state unreadable", lambda: server.write_text("{unknown server state"))):
+        for reason, change in (("worker state unreadable", lambda: server.write_text("{unknown server state")),):
             with self.subTest(reason=reason):
                 _ = change()
                 before = Path(os.environ["STAFF_FILE"]).read_bytes(), self.worker_record()
@@ -2297,6 +2299,60 @@ class StaffAdmissionTests(MeshCommandFixture):
                 self.assertEqual((Path(os.environ["STAFF_FILE"]).read_bytes(), self.worker_record()), before)
                 self.assertEqual(self.methods("thread/unsubscribe"), [])
                 self.assertEqual(self.methods("turn/start"), [])
+
+    def test_switch_without_a_source_server_record_publishes_and_dispatches_the_destination(self) -> None:
+        from scripts.production.staff_test_support import fixture_session
+        from scripts.shutdown import stop_resume
+
+        old = self.codex_switch_source()
+        allowed = worker_admission.admit(old.name, self.session_dir)
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        identity = fixture_runtime_id("Claude after source server stop")
+        dispatched: list[staff.StaffRow] = []
+
+        def start(handoff: worker_admission.FamilyHandoff) -> str:
+            self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
+            self.assertEqual(staff.by_id(old.id), old)
+            fixture_session(identity, staff.ClaudeBackend())
+            return identity
+
+        def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
+            self.assertEqual(staff.by_id(old.id), published.row)
+            dispatched.append(published.row)
+            return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
+
+        with patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)):
+            result = worker_admission.switch_worker(allowed, "claude", start=start, dispatch=dispatch,
+                cleanup=lambda native: self.fail("published destination was discarded: " + native))
+        self.assertEqual(result.row, dataclasses.replace(old, current_session=staff.StaffId(identity)))
+        self.assertEqual(dispatched, [result.row])
+        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+        self.assertEqual(self.methods("thread/unsubscribe"), [])
+
+    def test_idle_stop_preserves_a_live_retained_server_for_source_release(self) -> None:
+        old = self.codex_switch_source()
+        retained = StubAppServer(self.respond)
+        self.addCleanup(retained.close)
+        self.retain_server(retained.port)
+        expected = codex_mesh.run_server_records(self.session_dir)[0]
+        age = codex_mesh.SERVER_IDLE_SECS + 60
+        stale = time.time() - age
+        for name in codex_mesh.SWEEP_ACTIVITY_FILES:
+            path = self.session_dir / name
+            if path.exists():
+                os.utime(path, (stale, stale))
+        stop_unused = cast(Callable[[tuple[Path, ...], int, int], bool], getattr(codex_mesh, "_stop_unused_with_lock_held"))
+        with (patch.object(codex_mesh, "_running_servers", return_value=[
+                (os.getpid(), self.server.port, age), (os.getpid(), retained.port, age)]),
+              patch.object(codex_mesh, "_client_counts", return_value={}),
+              patch.object(codex_mesh, "_reap", return_value=True) as reap):
+            self.assertTrue(stop_unused((self.session_dir.parent,), os.getpid(), self.server.port))
+        reap.assert_called_once_with(os.getpid(), deadline=worker_lifecycle.NO_LOCK_DEADLINE)
+        self.assertEqual(codex_mesh.run_server_records(self.session_dir), [expected])
+        self.failing_method = "thread/loaded/list"
+        result = codex_mesh.stop_worker_for_switch(old, (self.session_dir,))
+        self.assertIsInstance(result, stop_results.SourceReleaseUnknown)
+        self.assertIn("thread/loaded/list", [request.get("method") for request in retained.requests])
 
     def test_start_uses_staff_worktree_instead_of_caller_or_saved_shell_folder(self) -> None:
         parent = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
@@ -6181,6 +6237,18 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(errors.getvalue(), "agents_log: ledger is too deeply nested read failed\n")
         self.assertEqual(self.worker_record()["status"], "done")
         self.assertEqual(len(self.methods("turn/start")), 2)
+
+    def test_follow_claim_replaces_an_interactive_assignment_with_the_claim_role(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        agents_log.append(THREAD_ID, "interactive", None, datetime.now(timezone.utc))
+        self.assertIsInstance(codex_mesh.task_role(THREAD_ID, codex_mesh.task_assignments()),
+                              codex_mesh.RolelessThread)
+        args = self.start_args()
+        args.to, args.role, args.claim_pid = "worker", "fix", os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        self.assertEqual(codex_mesh.task_role(THREAD_ID, codex_mesh.task_assignments()),
+                         codex_mesh.AssignedWorkerRole("fix"))
+        self.assertEqual(self.worker_record()["launcher_pid"], os.getpid())
 
     def test_resident_start_without_task_role_keeps_the_staff_role(self) -> None:
         args = self.start_args()
@@ -18779,6 +18847,39 @@ class ServerRecordTests(unittest.TestCase):
 
         self.assertIsNotNone(process.poll())
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_failed_start_after_publication_preserves_the_retained_server_for_source_release(self) -> None:
+        def respond(request: dict[str, object]) -> list[dict[str, object]]:
+            if request.get("method") == "thread/loaded/list":
+                return [{"id": request["id"], "error": {"message": "retained source proof unavailable"}}]
+            return [_reply(request, {})]
+
+        retained = StubAppServer(respond)
+        self.addCleanup(retained.close)
+        replacement = StubAppServer(respond)
+        self.addCleanup(replacement.close)
+        write_server_record(self.session_dir, retained.port, agent_accounts.workers_home())
+        before = codex_mesh.run_server_records(self.session_dir)
+        worker = fixture_worker("worker", staff.StaffId(os.environ["CODEX_THREAD_ID"]),
+            backend=staff.CodexBackend(agent_accounts.workers_home()))
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            worker.name: {"staff_id": worker.id, "status": "done"}}))
+        process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], start_new_session=True)
+        self.spawned.append(process)
+        with (patch.object(codex_mesh, "_free_port", return_value=replacement.port),
+              patch.object(subprocess, "Popen", return_value=process),
+              patch.object(codex_mesh, "_start_watcher", side_effect=OSError("watcher start failed"))):
+            with self.assertRaisesRegex(OSError, "watcher start failed"):
+                start_server = cast(Callable[[str, Path], int], getattr(codex_mesh, "_start_server"))
+                _ = start_server(str(self.session_dir), agent_accounts.workers_home())
+        self.assertIsNotNone(process.poll())
+        self.assertEqual(codex_mesh.run_server_records(self.session_dir), before)
+        result = codex_mesh.stop_worker_for_switch(worker, (self.session_dir,))
+        self.assertIsInstance(result, stop_results.SourceReleaseUnknown)
+        assert isinstance(result, stop_results.SourceReleaseUnknown)
+        self.assertIn("retained source proof unavailable", result.reason)
+        self.assertEqual([request["method"] for request in retained.requests if request.get("method") != "initialize"],
+                         ["thread/loaded/list"])
 
     def watcher(self, pid: int, *, fresh_probes: int = 0) -> tuple[subprocess.Popen[bytes], Path]:
         """Start the real watcher with a stand-in for the Python that would run `idle-stop`."""

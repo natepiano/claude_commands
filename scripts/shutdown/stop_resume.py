@@ -43,7 +43,7 @@ from scripts.lib.resume_message import (
     resume_worker_command as resume_worker_command,
 )
 from scripts.shutdown.stop_results import (
-    Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
+    Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed, StopUnproved as StopUnproved,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
     ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
@@ -156,34 +156,35 @@ def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend:
     """Resolve native stop evidence before creating the destination."""
     from scripts.production import staff
 
-    result = stop(row.id)
+    kind = "claude" if isinstance(backend, staff.ClaudeBackend) else "codex" if isinstance(backend, staff.CodexBackend) else ""
+    result = stop(row.id, kind)
     if isinstance(result, SessionNotFound):
         return SourceUnresolved(f"{row.id}: lifecycle could not resolve the staff reference; check the staff row and retry")
-    if isinstance(result, StopFailed):
-        return SourceReleaseUnknown(f"{result.reason}; inspect the source session and retry")
-    if isinstance(result, NotRunning) and isinstance(backend, staff.CodexBackend):
+    if isinstance(result, (NotRunning, StopUnproved)) and isinstance(backend, staff.CodexBackend):
         stop_mesh = cast(Callable[[staff.StaffRow, tuple[Path, ...]], SourceRelease],
                          import_module("scripts.agents.codex_mesh").stop_worker_for_switch)
         released = stop_mesh(row, runs())
         return released if isinstance(released, SourceReleased) else replace(released, reason=f"{released.reason}; inspect the source session and retry")
+    if isinstance(result, StopFailed):
+        return SourceReleaseUnknown(f"{result.reason}; inspect the source session and retry")
     return SourceReleased()
 
 
-def stop(session: str, *, deadline: float = math.inf) -> StopResult:
+def stop(session: str, kind: str = "", *, deadline: float = math.inf) -> StopResult:
     from scripts.production import staff
 
     try:
         with operation_deadline.within(deadline), staff.row_operation(session):
-            return _stop_recorded(session)
+            return _stop_recorded(session, kind)
     except TimeoutError as error:
         reason = str(error)
         return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
 
 
-def _stop_recorded(session: str) -> StopResult:
+def _stop_recorded(session: str, kind: str = "") -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     _record_launches([session])
-    result = _stop(session)
+    result = _stop(session, kind)
     if isinstance(result, (Stopped, NotRunning)):
         _retire_prompt(result.session_id)
     if isinstance(result, Stopped):
@@ -207,7 +208,7 @@ def _retire_prompt(session_id: str) -> None:
         print(f"{session_id}: prompt cancellation: {error}", file=sys.stderr)
 
 
-def _stop(session: str) -> StopResult:
+def _stop(session: str, kind: str = "") -> StopResult:
     """Signal only the process that proves the current conversation."""
     identity = session
     last_signal = ""
@@ -229,12 +230,14 @@ def _stop(session: str) -> StopResult:
                 identity = tab.session_id
             else:
                 return SessionNotFound(session)
-        observed = herdr.read_conversation(identity)
+        observed = herdr.read_conversation(identity, kind)
         if isinstance(observed, herdr.StoppedConversation):
             return NotRunning(identity)
         if isinstance(observed, herdr.UnknownConversation):
             herdr.conversation_note(observed)
-            return StopFailed(identity, observed.reason)
+            return StopUnproved(identity, observed.reason)
+        if not observed.pids:
+            return StopUnproved(identity, "conversation has no unique signal target; no signal sent")
         if len(observed.pids) != 1:
             return StopFailed(identity, "conversation has no unique signal target; no signal sent")
         live = sessions.LiveSessionProcess(observed.pids[0])

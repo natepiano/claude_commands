@@ -656,12 +656,8 @@ def _roster_role(value: object) -> RosterRole:
         return AssignedWorkerRole("review")
     if role == "astra-designer":
         return AssignedWorkerRole("impl")
-    if not role:
-        return RolelessThread()
     if role not in WORKER_ROLES:
-        raise SystemExit(
-            f"codex_mesh: role must be impl, test, fix, or review; got '{role}'"
-        )
+        return RolelessThread()
     return AssignedWorkerRole(cast(WorkerRole, role))
 
 
@@ -3160,7 +3156,7 @@ def _discard_failed_server_start(
                          + "failed startup process is not confirmed stopped; confirm or stop it before retrying")
     path = _session_path(session_dir, SERVER_FILE)
     if _record_names_server(_read_json_object(path), served["pid"], served["port"]):
-        path.unlink(missing_ok=True)
+        _forget_run_server(Path(session_dir), served["pid"], served["port"])
 
 
 # ---------------------------------------------------------------------------
@@ -6952,7 +6948,7 @@ def _release_source_servers(session_dir: str, row: staff.StaffRow, *, deadline: 
     if not isinstance(retained, list) or any(not isinstance(item, dict) for item in cast(list[object], retained)):
         return SourceReleaseUnknown("source server records are invalid")
     records = _recorded_run_servers(session_dir)
-    observed = False
+    observed = not records
     for record in records:
         pid = record.get("pid")
         if type(pid) is not int or pid <= 0:
@@ -8297,10 +8293,6 @@ def _forget_run_server(folder: Path, pid: int, port: int) -> None:
         path.unlink(missing_ok=True)
 
 
-def _forget_retired(folder: Path, pid: int, port: int) -> None:
-    _forget_run_server(folder, pid, port)
-
-
 def _roster_threads(folder: Path) -> dict[str, str]:
     """Thread id to worker name for every conversation the run folder's roster lists."""
     roster = _read_json_object(folder / ROSTER_FILE)
@@ -8454,10 +8446,7 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
         return False
     folder = ownership.session_dir
     if folder.is_dir():
-        _forget_retired(folder, pid, port)
-        record = folder / SERVER_FILE
-        if _record_names_server(_read_json_object(record), pid, port):
-            record.unlink(missing_ok=True)
+        _forget_run_server(folder, pid, port)
         pending = folder / SERVER_START_FILE
         if _record_names_server(_read_json_object(pending), pid, port):
             pending.unlink(missing_ok=True)
