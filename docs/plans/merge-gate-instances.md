@@ -101,7 +101,9 @@ The first build phase defines the two small trial steps and their selection rule
 
 ## Split and owners
 
-The remote boundary is `merge_gate.run_suites`, at `scripts/production/merge_gate.py:918`.
+The planned production boundary is `merge_gate.run_suites`, at `scripts/production/merge_gate.py:918`.
+The trial calls the same runner with `WholeMachine`.
+`SharedMachine` keeps the existing admission and scheduling behavior.
 The smallest gate change replaces its checkpoint call with a backend call returning the same `GateRun` meaning.
 That call currently occurs at `scripts/production/merge_gate.py:1464`.
 
@@ -297,7 +299,7 @@ Do not copy natedev's private home configuration.
 | Requirement found in code | File and line | Instance treatment or local work |
 | --- | --- | --- |
 | User scopes and `builds.slice` | `scripts/build_queue/queue_place.py:105`, `:122`, `:290` | Provide the user manager and slice. Keep real scope accounting. Do not set `BUILDLOG_SCOPE=0` for the gate. |
-| Fixed gate memory reservation | `scripts/production/merge_gate.py:337` | Run the existing admission service and reservation against the instance. Keep the 6-GiB sampled cap. |
+| Fixed gate memory reservation | `scripts/production/merge_gate.py:337` | The trial uses no admission service or memory reservation on the instance. |
 | Linux process memory and process groups | `scripts/production/merge_gate.py:484`, `:590`, `:1146` | Provide `/proc`, cgroup v2, and normal process permissions. Keep sampling and group cleanup. |
 | Writable tmpfs | `scripts/production/merge_gate.py:1013` | Provide writable `/dev/shm` with space for the gate's temporary files. |
 | Optional shared CPU device | `scripts/production/merge_gate.py:312` | Use the existing absent-device path. One instance has one gate, so it needs no shared `/dev/steve` pool. |
@@ -650,14 +652,19 @@ Start with one small run:
 3. Upload the bundle to a temporary private bucket.
 4. Launch one Spot instance from the configured official NixOS image.
 5. Prepare tools through `nix shell`.
-6. Run `merge_gate.run_suites` with `full=True` and all script type checks.
+6. Run all discovered test modules and the script type check through `run_suites` with `WholeMachine`.
 7. Terminate each instance when its attempt ends.
 
 The bundle excludes uncommitted changes.
 The image has no box Tailscale identity or box idle service.
-The gate uses its own admission service.
-It sets `max_running_jobs` to the instance CPU count and records this value in JSON and text.
-It sets the memory governor to `gate_trial_governor_gib_per_vcpu` GiB per vCPU, with a default of 3.
+The instance uses no admission service, hold check, queue reservation, memory governor, CPU pool, systemd scope, or test ledger.
+The `WholeMachine` mode uses the instance CPU count as its maximum parallel job count.
+It records this value as `max_running_jobs` in JSON and text.
+It limits each module to `gate_trial_module_limit_s` seconds, with a default of 600, and disables reruns.
+The JSON report retains each module's status, time, and stopped flag.
+The log prints the module name, exit status, and time as each job ends.
+Both machine modes use one runner loop with the same module command, test environment, and process cleanup.
+It runs basedpyright on `scripts` as one more job.
 A failed suite remains a measured result.
 
 The command calls `DescribeSubnets` for the configured VPC.
@@ -715,7 +722,10 @@ The bucket has public access blocked and a one-day object lifetime.
 
 User data schedules `shutdown -h +30` before other commands by default.
 It runs the tool shell directly and creates no systemd unit.
-The guest uploads `boot.log`, `gate.log`, and the current UTC time every `gate_trial_log_push_s` seconds.
+The guest uploads `boot.log`, `gate.log`, `timeline.log`, and the current UTC time every `gate_trial_log_push_s` seconds.
+Each timeline line records the UTC time, load, available memory, and process count.
+Each upload includes the current process snapshot, with at most 60 lines and 200 characters per line.
+The snapshot excludes lines that contain `curl` and is not stored between uploads.
 The default interval is 30 seconds. A failed upload does not stop later uploads.
 The final log contains the same files and time. The reserve and reported S3 cost include periodic uploads.
 A shell failure uploads the combined log and an error result through the image's curl.

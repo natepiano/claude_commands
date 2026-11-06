@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from contextlib import nullcontext, redirect_stdout
+from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import BytesIO, StringIO
@@ -242,6 +242,7 @@ class FakeAws:
                 at = self.clock.read()
                 payload = self.guest_payload or {'tools_ready_at': at + 10, 'gate_started_at': at + 13,
                     'gate_finished_at': at + 23, 'memory_peak_bytes': 123456789, 'tests': 19, 'skips': 2, 'verdict': self.gate_status,
+                    'modules': [{'module': 'fixture/test_failure.py', 'status': int(self.gate_status != 'pass'), 'seconds': 10}],
                     'failed_modules': [] if self.gate_status == 'pass' else ['fixture/test_failure.py']}
                 if '/ready-' in option('--key') and self.guest_payload is None:
                     payload = {'tools_ready_at': at + 10, 'verdict': self.gate_status}
@@ -335,10 +336,10 @@ class GateTrialTests(unittest.TestCase):
 
     def test_full_attempt_has_five_times_result_and_report(self) -> None:
         settings = self.root / 'trial.conf'
-        _ = settings.write_text(trial_config().replace('gate_trial_governor_gib_per_vcpu=3', 'gate_trial_governor_gib_per_vcpu=2'))
+        _ = settings.write_text(trial_config().replace('gate_trial_module_limit_s=600', 'gate_trial_module_limit_s=450'))
         command = self.run_trial()
         links = ledger.mapping(cast(object, json.loads(self.fake.payloads[0].split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0])))
-        self.assertEqual(links['governor_gib'], 32)
+        self.assertEqual(links['module_time_limit_s'], 450)
         row = command.attempts[0]
         self.assertEqual(row.verdict, 'pass')
         self.assertEqual(row.times['request_to_running_s'], 5)
@@ -357,6 +358,9 @@ class GateTrialTests(unittest.TestCase):
         self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
         self.assertIn('i-fixture', saved.read_text())
         self.assertNotIn('i-fixture', content)
+        saved_report = ledger.mapping(cast(object, json.loads(saved.read_text())))
+        saved_attempt = ledger.mapping(cast(list[object], saved_report['attempts'])[0])
+        self.assertEqual(ledger.mapping(saved_attempt['result'])['modules'], row.result['modules'])
         self.assert_cleanup()
 
     def test_terminate_waits_through_shutting_down_and_runs_next_attempt(self) -> None:
@@ -580,6 +584,11 @@ class GateTrialTests(unittest.TestCase):
         self.assertEqual(command.attempts[0].result['failed_modules'], ['fixture/test_failure.py'])
         self.assertEqual(command.attempts[0].times['gate_s'], 10)
         self.assertIsNone(command.report()[0]['cheapest_size'])
+        saved = command.directory / f'gate-trial-{command.run_id}.json'
+        saved_report = ledger.mapping(cast(object, json.loads(saved.read_text())))
+        saved_attempt = ledger.mapping(cast(list[object], saved_report['attempts'])[0])
+        self.assertEqual(ledger.mapping(saved_attempt['result'])['modules'],
+                         [{'module': 'fixture/test_failure.py', 'status': 1, 'seconds': 10}])
 
     def test_stopped_start_uses_on_demand_and_two_markers(self) -> None:
         self.fake.gate_status = 'ready'
@@ -620,9 +629,11 @@ class GateTrialTests(unittest.TestCase):
         self.assertNotIn('exec nix', data)
         self.assertNotIn('gate-trial.service', data)
         self.assertIn('export PATH=/run/current-system/sw/bin:$PATH', data)
-        self.assertIn('type_dirs=[\'scripts\'], full=True, max_running_jobs=', data)
+        self.assertIn('machine=merge_gate.WholeMachine()', data)
         self.assertLess(data.index('push_logs &'), data.index('trap boot_failed EXIT'))
-        self.assertIn('admission_service.py', data)
+        self.assertNotIn('admission_service.py', data)
+        self.assertNotIn('governor_gib', data)
+        self.assertNotIn('RERUN_LIMIT', data)
         _ = compile(trial.GUEST, '<guest>', 'exec')
 
     def test_capacity_refusal_tries_next_public_zone_with_its_price(self) -> None:
@@ -863,7 +874,8 @@ class GateTrialTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 uploads = [cast(list[str], json.loads(line)) for line in (root / 'uploads').read_text().splitlines()]
                 self.assertEqual(uploads[0][0], links['log'])
-                self.assertIn('fixture nix failure\nUTC: ', uploads[0][1])
+                self.assertIn('fixture nix failure', uploads[0][1])
+                self.assertIn('\nUTC: ', uploads[0][1])
                 key = 'result' if step == 'size' else 'ready-warm' if warm else 'ready-cold'
                 self.assertEqual(uploads[1][0], links[key])
                 payload = ledger.mapping(cast(object, json.loads(uploads[1][1])))
@@ -879,6 +891,17 @@ class GateTrialTests(unittest.TestCase):
             + "number=int(count.read_text())+1 if count.exists() else 1\ncount.write_text(str(number))\n"
             + "assert sys.argv[1]=='0.001'\ntime.sleep(float(sys.argv[1]))\nsys.exit(number>2)\n")
         sleep.chmod(0o700)
+        _ = (root / 'loadavg').write_text('1.00 2.00 3.00 1/10 42\n')
+        _ = (root / 'meminfo').write_text('MemAvailable: 123456 kB\n')
+        ps = root / 'ps'
+        _ = ps.write_text('#!' + sys.executable + '\nimport pathlib, sys\n'
+            + "root=pathlib.Path(__file__).parent\nnumber=(root/'sleeps').read_text()\n"
+            + "if sys.argv[1:] == ['-e', '--no-headers']: print('process1\\nprocess2')\n"
+            + "else:\n"
+            + "    assert sys.argv[1:]==['-eo','etimes,pcpu,rss,args','--sort=-etimes']\n"
+            + "    print('HIDDEN'+'x'*210+'curl signed-link')\n"
+            + "    for n in range(65): print('SNAP'+number+' '+str(n)+' '+'x'*220)\n")
+        ps.chmod(0o700)
         curl = root / 'curl'
         _ = curl.write_text('#!' + sys.executable + '\nimport json, pathlib, sys\n'
             + "root=pathlib.Path(__file__).parent\nargs=sys.argv[1:]\n"
@@ -889,6 +912,7 @@ class GateTrialTests(unittest.TestCase):
         curl.chmod(0o700)
         links = {'log': 'https://fixture.invalid/log'}
         script = 'set -eu\n' + trial.log_push_loop(links, 0.001).replace('/var/lib/gate-trial', str(root))
+        script = script.replace('/proc/loadavg', str(root / 'loadavg')).replace('/proc/meminfo', str(root / 'meminfo'))
         result = subprocess.run(['sh', '-c', script + 'wait "$log_push_pid"\n'], capture_output=True,
                                 text=True, timeout=10, env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH']})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -897,8 +921,18 @@ class GateTrialTests(unittest.TestCase):
         self.assertEqual([row[0] for row in uploads], [links['log']] * 2)
         self.assertNotIn('fixture gate', uploads[0][1])
         self.assertIn('fixture gate', uploads[1][1])
-        for _, content in uploads:
+        timeline = (root / 'timeline.log').read_text().splitlines()
+        self.assertEqual(len(timeline), 2)
+        for line in timeline:
+            self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ loadavg=1.00 2.00 3.00 1/10 42 MemAvailable: 123456 kB processes=\s*2$')
+        for number, (_, content) in enumerate(uploads, 1):
             self.assertIn('fixture boot\n', content)
+            self.assertIn(timeline[number - 1], content)
+            snapshots = [line for line in content.splitlines() if line.startswith('SNAP')]
+            self.assertEqual(len(snapshots), 60)
+            self.assertTrue(all(len(line) == 200 and line.startswith(f'SNAP{number} ') for line in snapshots))
+            self.assertNotIn('HIDDEN', content)
+            self.assertNotIn('curl', content)
             self.assertRegex(content, r'\nUTC: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$')
 
     def test_source_bundle_contains_head_without_uncommitted_changes(self) -> None:
@@ -916,20 +950,15 @@ class GateTrialTests(unittest.TestCase):
 
 
 @final
-class GuestChild:
-    def __init__(self) -> None:
-        self.terminated: bool = False
-
-    def terminate(self) -> None:
-        self.terminated = True
-
-    def wait(self, *, timeout: float) -> int:
-        assert timeout == 10
-        return 0
-
-
-@final
 class GuestTests(unittest.TestCase):
+    def test_user_data_fits_ec2_limit_with_five_400_character_signed_links(self) -> None:
+        prefix = 'https://fixture.invalid/object?X-Amz-Signature='
+        url = prefix + 'a' * (400 - len(prefix))
+        links = {'step': 'size', 'commit': 'a' * 40,
+                 **dict.fromkeys(('source', 'log', 'result', 'ready-cold', 'ready-warm'), url)}
+        data = trial.user_data(links, '26.05', 30, 30, 600)
+        self.assertLessEqual(len(data.encode()), 16384)
+
     def test_guest_samples_peak_machine_memory_every_two_seconds(self) -> None:
         for present in (True, False):
             with self.subTest(present=present), tempfile.TemporaryDirectory() as folder:
@@ -982,18 +1011,35 @@ class GuestTests(unittest.TestCase):
             self.assertFalse((root / 'prepared').exists())
             uploads = [cast(list[str], json.loads(line)) for line in (root / 'uploads').read_text().splitlines()]
             self.assertEqual(uploads[0][0], links['log'])
-            self.assertIn('fixture publish failure\nUTC: ', uploads[0][1])
+            self.assertIn('fixture publish failure', uploads[0][1])
+            self.assertIn('\nUTC: ', uploads[0][1])
             self.assertEqual(uploads[1][0], links['ready-cold'])
             self.assertEqual(ledger.mapping(cast(object, json.loads(uploads[1][1])))['verdict'], 'error')
 
-    def test_guest_runs_full_gate_with_types_and_keeps_failures(self) -> None:
+    def test_guest_uses_whole_machine_with_types_timeout_and_counts(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            (root / 'repo').mkdir()
+            repo = root / 'repo'
+            suite = repo / 'scripts' / 'fixture'
+            suite.mkdir(parents=True)
             links = {'step': 'size', 'commit': 'fixture-head', 'source': 'https://fixture.invalid/source',
                      'log': 'https://fixture.invalid/log', 'result': 'https://fixture.invalid/result'}
-            _ = (root / 'links.json').write_text(json.dumps({**links, 'governor_gib': 48}))
+            _ = (root / 'links.json').write_text(json.dumps({**links, 'module_time_limit_s': 2}))
             _ = (root / 'boot.log').write_text('fixture tool preparation\n')
+            _ = (root / 'timeline.log').write_text('fixture timeline\n')
+            runner = root / 'module_run.py'
+            _ = runner.write_text('import json, os, pathlib, sys, time\n'
+                + f'root=pathlib.Path({str(root)!r})\n'
+                + "name=sys.argv[2]\n(root/name).write_text(json.dumps({'args':sys.argv[1:], 'env':dict(os.environ)}))\n"
+                + "if name=='test_stuck.py': time.sleep(30)\n"
+                + "pathlib.Path(os.environ['TEST_TIMES_OUT']).write_text(json.dumps({'wall_s':1, 'cpu_s':1, 'tests_s':1, 'tests_run':3, 'skipped':1, 'failures':1, 'errors':0, 'tests':[]}))\n"
+                + "print('fixture failure')\nsys.exit(1)\n")
+            types = root / 'basedpyright'
+            _ = types.write_text('#!' + sys.executable + '\nimport json, pathlib, sys\n'
+                + f'pathlib.Path({str(root / "types-args")!r}).write_text(json.dumps(sys.argv[1:]))\n'
+                + "print('0 errors, 0 warnings, 0 notes')\n")
+            types.chmod(0o700)
+            modules = [('fixture', suite / 'test_stuck.py'), ('fixture', suite / 'test_broken.py')]
             uploads: dict[str, bytes] = {}
             def http(request: str | Request, *, timeout: float) -> BytesIO:
                 self.assertIn(timeout, (30, 60))
@@ -1001,50 +1047,61 @@ class GuestTests(unittest.TestCase):
                     uploads[request.full_url] = cast(bytes, request.data)
                     return BytesIO()
                 return BytesIO(b'fixture bundle')
-            jobs = (
-                merge_gate.GateJobResult('fixture', 'test_broken.py', 1, 2, 'failed',
-                    times={'wall_s': 2, 'cpu_s': 1, 'tests_s': 1, 'tests_run': 3, 'failures': 1,
-                           'errors': 0, 'skipped': 1, 'tests': []}),
-                merge_gate.GateJobResult('types', 'basedpyright', 0, 1, '0 errors'),
-            )
             code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root))).replace("'/root/.claude'", repr(str(root / 'home'))).replace("'/root/.claude/config'", repr(str(root / 'home/config')))
             _ = (root / 'meminfo').write_text('MemTotal: 1000000 kB\nMemAvailable: 200000 kB\n')
-            child = GuestChild()
-            governors: list[float] = []
-            def run_suites(repo: Path, type_dirs: list[str], full: bool, max_running_jobs: int) -> merge_gate.GateRun:
-                self.assertEqual((repo, type_dirs, full, max_running_jobs), (root / 'repo', ['scripts'], True, 16))
-                governors.append(merge_gate.merge_gate_governor_gib())
-                return merge_gate.GateRun(jobs, 4, 1)
-            with (mock.patch.dict(os.environ), mock.patch.object(sys, 'path', list(sys.path)),
+            with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable}),
+                  mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch('urllib.request.urlopen', side_effect=http),
                   mock.patch('subprocess.run', return_value=subprocess.CompletedProcess(['fixture'], 0, 'version', '')),
-                  mock.patch('subprocess.Popen', return_value=child),
-                  mock.patch('os.cpu_count', return_value=16),
-                  mock.patch.object(merge_gate, 'merge_gate_governor_gib'),
-                  mock.patch.object(merge_gate, 'run_suites', side_effect=run_suites) as run,
-                  mock.patch.object(merge_gate, 'rollback_signals', return_value=nullcontext()),
-                  mock.patch.object(merge_gate, 'typecheck_python', return_value=root / 'python')):
+                  mock.patch('os.cpu_count', return_value=2),
+                  mock.patch.object(merge_gate, 'module_runner', return_value=runner),
+                  mock.patch.object(merge_gate, 'discover_test_modules', return_value=modules) as discover,
+                  mock.patch.object(merge_gate, 'BuildHoldWait', side_effect=AssertionError('hold read')),
+                  mock.patch.object(merge_gate, 'gate_reservation', side_effect=AssertionError('admission')),
+                  mock.patch.object(merge_gate, 'shared_cpu_pool', side_effect=AssertionError('CPU pool')),
+                  mock.patch.object(merge_gate, 'suite_scope_prefix', side_effect=AssertionError('scope')),
+                  mock.patch.object(merge_gate, 'merge_gate_governor_gib', side_effect=AssertionError('governor')),
+                  mock.patch.object(merge_gate, 'gate_state_dir', side_effect=AssertionError('test ledger')),
+                  mock.patch.object(merge_gate, 'typecheck_python', return_value=Path(sys.executable))):
                 previous = Path.cwd()
                 try:
                     exec(compile(code, '<guest>', 'exec'), {})
                 finally:
                     os.chdir(previous)
+            discover.assert_called_once_with(repo)
             payload = ledger.mapping(cast(object, json.loads(uploads[links['result']])))
-            self.assertEqual(payload['governor_gib'], 48)
-            self.assertEqual(governors, [48])
+            self.assertNotIn('governor_gib', payload)
+            self.assertEqual(payload['module_time_limit_s'], 2)
             self.assertEqual(payload['memory_peak_bytes'], 800000 * 1024)
-            self.assertEqual(payload['max_running_jobs'], 16)
+            self.assertEqual(payload['max_running_jobs'], 2)
             self.assertEqual(payload['verdict'], 'fail')
             self.assertEqual(payload['tests'], 3)
             self.assertEqual(payload['skips'], 1)
-            self.assertEqual(payload['failed_modules'], ['fixture/test_broken.py'])
+            self.assertEqual(set(cast(list[str], payload['failed_modules'])), {'fixture/test_broken.py', 'fixture/test_stuck.py'})
+            measured = {str(row['module']): row for value in cast(list[object], payload['modules']) if (row := ledger.mapping(value))}
+            self.assertEqual(len(measured), 3)
+            self.assertEqual(measured['fixture/test_broken.py']['status'], 1)
+            self.assertEqual(measured['types/basedpyright']['status'], 0)
+            self.assertEqual(measured['fixture/test_stuck.py']['stopped'], True)
+            self.assertEqual(measured['fixture/test_stuck.py']['status'], -signal.SIGKILL)
             self.assertIn('gate_started_at', payload)
             self.assertIn('gate_finished_at', payload)
-            run.assert_called_once_with(root / 'repo', type_dirs=['scripts'], full=True, max_running_jobs=16)
-            self.assertTrue(child.terminated)
-            self.assertIn(links['log'], uploads)
-            self.assertIn(b'fixture tool preparation\n', uploads[links['log']])
-            self.assertIn(b'UTC: ', uploads[links['log']])
+            for _, path in modules:
+                call = ledger.mapping(cast(object, json.loads((root / path.name).read_text())))
+                self.assertEqual(call['args'], [str(suite), path.name])
+                environment = ledger.mapping(call['env'])
+                for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
+                    self.assertIn(key, environment)
+            self.assertEqual(cast(object, json.loads((root / 'types-args').read_text())), ['--pythonpath', sys.executable, 'scripts'])
+            content = uploads[links['log']].decode()
+            self.assertLess(content.index('fixture/test_broken.py exit=1'), content.index('fixture/test_stuck.py exit=-9'))
+            self.assertIn(' stopped', content)
+            self.assertIn('types/basedpyright exit=0', content)
+            self.assertEqual(sum(line.startswith('fixture/test_broken.py exit=') for line in content.splitlines()), 1)
+            self.assertEqual(sum(line.startswith('fixture/test_stuck.py exit=') for line in content.splitlines()), 1)
+            self.assertIn('fixture tool preparation\n', content)
+            self.assertIn('fixture timeline\n', content)
+            self.assertIn('UTC: ', content)
 
     def test_start_guest_repeats_ready_marker_without_a_gate(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

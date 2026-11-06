@@ -100,42 +100,35 @@ try:
         pathlib.Path('/root/.claude').mkdir(exist_ok=True)
         pathlib.Path('/root/.claude/config').symlink_to(repo / 'config', target_is_directory=True)
         os.chdir(repo)
-        # The gate uses its own admission service. It never contacts natedev's queue.
-        admission = subprocess.Popen([sys.executable, 'scripts/build_queue/admission_service.py', 'serve'])
-        try:
-            sys.path.insert(0, str(repo))
-            from scripts.production import merge_gate
-            merge_gate.merge_gate_governor_gib = lambda: links['governor_gib']
-            result['governor_gib'] = links['governor_gib']
-            preparation = merge_gate.typecheck_python()
-            if isinstance(preparation, str):
-                raise RuntimeError(preparation)
-            result['tools_ready_at'] = time.time()
-            result['gate_started_at'] = time.time()
-            result['max_running_jobs'] = os.cpu_count() or 1
-            # Sample the whole machine because test scopes run outside amazon-init.service.
-            sample_memory()
-            memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
-            memory_thread.start()
-            with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-                with merge_gate.rollback_signals():
-                    gate = merge_gate.run_suites(repo, type_dirs=['scripts'], full=True, max_running_jobs=result['max_running_jobs'])
-            result['gate_finished_at'] = time.time()
-            result['gate_s'] = gate.seconds
-            result['verdict'] = 'pass' if gate.passed else 'fail'
-            result['modules'] = []
-            for job in gate.jobs:
-                measured = job.times if isinstance(job.times, dict) else {}
-                result['tests'] += measured.get('tests_run', 0)
-                result['skips'] += measured.get('skipped', 0)
-                name = job.suite + '/' + job.module
-                result['modules'].append({'module': name, 'status': job.returncode, 'tests': measured.get('tests_run', 0),
-                                          'skips': measured.get('skipped', 0), 'seconds': job.seconds})
-                if job.returncode:
-                    result['failed_modules'].append(name)
-        finally:
-            admission.terminate()
-            admission.wait(timeout=10)
+        sys.path.insert(0, str(repo))
+        from scripts.production import merge_gate
+        preparation = merge_gate.typecheck_python()
+        if isinstance(preparation, str):
+            raise RuntimeError(preparation)
+        result['tools_ready_at'] = time.time()
+        result['gate_started_at'] = time.time()
+        result['module_time_limit_s'] = links['module_time_limit_s']
+        result['max_running_jobs'] = os.cpu_count() or 1
+        sample_memory()
+        memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
+        memory_thread.start()
+        with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            with merge_gate.rollback_signals():
+                gate = merge_gate.run_suites(repo, type_dirs=['scripts'], full=True, machine=merge_gate.WholeMachine(),
+                                             module_time_limit_s=links['module_time_limit_s'])
+        result['gate_finished_at'] = time.time()
+        result['gate_s'] = gate.seconds
+        result['verdict'] = 'pass' if gate.passed else 'fail'
+        result['modules'] = []
+        for job in gate.jobs:
+            measured = job.times if isinstance(job.times, dict) else {}
+            result['tests'] += measured.get('tests_run', 0)
+            result['skips'] += measured.get('skipped', 0)
+            name = job.suite + '/' + job.module
+            result['modules'].append({'module': name, 'status': job.returncode, 'tests': measured.get('tests_run', 0),
+                                      'skips': measured.get('skipped', 0), 'seconds': job.seconds, 'stopped': bool(job.killed_for)})
+            if job.returncode:
+                result['failed_modules'].append(name)
 except BaseException:
     if 'gate_started_at' in result:
         result['gate_finished_at'] = time.time()
@@ -149,7 +142,13 @@ finally:
         memory_thread.join()
         sample_memory()
     try:
-        content = b''.join(path.read_bytes() for path in (root / 'boot.log', log) if path.exists())
+        content = b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists())
+        try:
+            snapshot = subprocess.run(['ps', '-eo', 'etimes,pcpu,rss,args', '--sort=-etimes'], capture_output=True, text=True)
+            lines = [line[:200] for line in snapshot.stdout.splitlines() if 'curl' not in line][:60]
+            content += ('\n' + '\n'.join(lines) + '\n').encode()
+        except (OSError, subprocess.SubprocessError):
+            pass
         content += time.strftime('\nUTC: %Y-%m-%dT%H:%M:%SZ\n', time.gmtime()).encode()
         put(links['log'], content)
     except Exception as error:
@@ -161,7 +160,8 @@ finally:
 
 
 def log_upload(links: dict[str, str]) -> str:
-    return f'''{{ cat /var/lib/gate-trial/boot.log /var/lib/gate-trial/gate.log 2>/dev/null || :
+    return f'''{{ cat /var/lib/gate-trial/boot.log /var/lib/gate-trial/gate.log /var/lib/gate-trial/timeline.log 2>/dev/null || :
+    ps -eo etimes,pcpu,rss,args --sort=-etimes 2>/dev/null | awk '!/curl/ {{print substr($0,1,200); if (++n==60) exit}}' || :
     printf '\\n'
     date -u '+UTC: %Y-%m-%dT%H:%M:%SZ'
 }} | curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(links['log'])} || :'''
@@ -170,6 +170,7 @@ def log_upload(links: dict[str, str]) -> str:
 def log_push_loop(links: dict[str, str], interval_s: float) -> str:
     return f'''push_logs() {{
     while sleep {interval_s:g}; do
+        printf '%s loadavg=%s %s processes=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(cat /proc/loadavg)" "$(awk '/^MemAvailable:/' /proc/meminfo)" "$(ps -e --no-headers | wc -l)" >> /var/lib/gate-trial/timeline.log || :
         {log_upload(links)}
     done
 }}
@@ -199,7 +200,8 @@ trap boot_failed EXIT
 '''
 
 
-def user_data(links: dict[str, str], release: str, lifetime_minutes: int, log_push_s: float, governor_gib: float) -> str:
+def user_data(links: dict[str, str], release: str, lifetime_minutes: int, log_push_s: float,
+              module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
     packages = ('git', 'python3', 'basedpyright', 'cargo', 'rustc', 'rustup', 'cargo-nextest',
                 'uv', 'curl', 'openssh', 'rsync', 'gnupg', 'ripgrep', 'jq', 'gcc', 'pkg-config', 'tmux')
@@ -212,7 +214,7 @@ mkdir -p /var/lib/gate-trial
 exec > /var/lib/gate-trial/boot.log 2>&1
 export PATH=/run/current-system/sw/bin:$PATH
 {log_push_loop(links, log_push_s)}{boot_trap(links)}cat > /var/lib/gate-trial/links.json <<'GATE_LINKS'
-{json.dumps({**links, 'governor_gib': governor_gib})}
+{json.dumps({**links, 'module_time_limit_s': module_time_limit_s})}
 GATE_LINKS
 cat > /var/lib/gate-trial/guest.py <<'GATE_GUEST'
 {GUEST}
@@ -700,7 +702,7 @@ class GateTrial:
             data = Path(folder) / 'user-data'
             minutes = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes')
             _ = data.write_text(user_data(self.links(key, step), self.settings.release, minutes,
-                                         self.option('log_push_s'), attempt.size * self.option('governor_gib_per_vcpu')))
+                                         self.option('log_push_s'), self.option('module_limit_s')))
             lifetime = minutes * 60
             try:
                 for subnet, zone in self.subnets:
