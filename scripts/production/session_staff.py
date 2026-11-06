@@ -27,6 +27,7 @@ from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
 from scripts.shutdown import remote
+from scripts.message import process_table
 from sessions import SessionRecord
 from place import HerdrPlace
 from pane_launch import PaneLaunch
@@ -785,6 +786,8 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
         runtime_row = record.by_current_session(unit.identity.id) if isinstance(unit.identity, LiveSession) else None
         if runtime_row is None:
             if isinstance(unit.identity, LiveSession):
+                continue
+            if (pid := process_pid(unit)) and pid not in process_table.snapshot():
                 continue
             reason = "process identity is unavailable"
             candidates = set(pane_rows.get(unit.place, ()))

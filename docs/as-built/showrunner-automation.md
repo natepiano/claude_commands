@@ -280,7 +280,9 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     A process without an identity reports an unreadable thread when its pane holds staff.
     One staff candidate retains its pane placement with unknown status.
     `CodexProcessThreads.thread` reads the open rollout first.
-    With no open rollout, it reads the thread environment, resume arguments, native pane session, and terminal title with daemon names.
+    With no open rollout, it reads the thread environment and resume arguments.
+    It then reads the native pane session and the terminal title with daemon names, only when this process is the pane's one foreground process.
+    A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
     Other rollout read failures stop identity recovery.
     The worker scanner uses this reader before it joins the current thread to its staff row.
     A missing pane launch record does not make a resolved staff worker unknown.

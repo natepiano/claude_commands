@@ -2047,6 +2047,18 @@ class Herdr:
         except ValueError as error:
             raise HerdrFailure(str(error)) from error
 
+    def pane_codex_pid(self, pane: str) -> int:
+        """Return the sole foreground Codex PID, or zero for other foreground work."""
+        info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
+                           "pane process info")
+        if not codex_without_session(info):
+            return 0
+        foreground = json_items(info.get("foreground_processes"), "native foreground processes")
+        pid = json_object(foreground[0], "native foreground process").get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise HerdrFailure("native process pid is unavailable")
+        return pid
+
     def native_pane_process(self, pane: str, kind: str, timeout: float) -> NativeAgentProcess:
         """Read the identity and launch environment from one proved foreground process."""
         result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)

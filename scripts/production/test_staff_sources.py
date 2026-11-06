@@ -368,13 +368,40 @@ class StaffSourcesTests(StaffTestCase):
                       mock.patch.object(process_table, "snapshot", return_value=table),
                       mock.patch.object(herdr, "process_environment", return_value=environment),
                       mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane")),
-                      mock.patch.object(herdr.Herdr, "result", return_value={"pane": pane}),
+                      mock.patch.object(herdr.Herdr, "result", return_value={
+                          "pane": pane, "process_info": {"foreground_processes": [{"pid": 42401, "argv": arguments}]}}),
                       mock.patch.object(codex_daemon, "loaded_sessions", return_value=[
                           codex_daemon.DaemonSession(worker.current_session, "impl", str(self.root), "idle")])):
                     evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(()), current_only=True)
                 self.assertEqual(evidence.diagnostics, ())
                 self.assertEqual(evidence.identities[worker.id], {"codex": worker.current_session})
                 self.assertEqual([entry.row for entry in evidence.workers], [worker])
+
+    def test_only_the_panes_foreground_codex_can_use_its_metadata(self) -> None:
+        from scripts.message import process_table
+
+        owner = unit_membership("show", "unit")
+        worker = fixture_worker("impl", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        table = {42401: process_table.Process(42401, 1, "codex", "codex task")}
+        payload: dict[str, object] = {
+            "pane": {"agent_session": {"value": worker.current_session}},
+            "process_info": {"foreground_processes": [{"pid": 42402, "argv": ["codex", "--no-daemon"]}]},
+        }
+        with (mock.patch.object(herdr, "codex_resume_thread", side_effect=ValueError("no resume argument")),
+              mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane")),
+              mock.patch.object(herdr.Herdr, "result", return_value=payload) as reads,
+              mock.patch.object(herdr, "process_environment", return_value={}),
+              mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(session_staff, "member_sources", return_value=MemberSources(()))):
+            reader = staff_sources.CodexProcessThreads()
+            self.assertEqual(reader.thread(42401, {}), "")
+            self.assertEqual(reader.check(42403, "").native_id, "")
+            self.assertEqual(reader.thread(42402, {}), worker.current_session)
+            self.assertEqual(reads.call_args_list, [
+                mock.call("pane", "process-info", "--pane", "test:pane"),
+                mock.call("pane", "get", "test:pane"),
+            ])
+            staff_sources.require_worker_stopped(staff.snapshot(), worker.id)
 
     def test_current_rollout_overrides_resume_and_does_not_block_the_old_thread(self) -> None:
         from scripts.message import process_table

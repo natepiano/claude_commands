@@ -149,6 +149,7 @@ class CodexProcessThreads:
 
     def __init__(self) -> None:
         self.panes: dict[tuple[str, str], dict[str, object]] = {}
+        self.foreground_pids: dict[tuple[str, str], int] = {}
         self.threads: dict[Path, dict[str, str]] = {}
 
     def thread(self, pid: int, environment: Mapping[str, str]) -> str:
@@ -172,8 +173,13 @@ class CodexProcessThreads:
             if isinstance(place, herdr.NotInHerdr):
                 return ""
             key = (place.session, place.pane)
+            client = herdr.Herdr(place.session)
+            if key not in self.foreground_pids:
+                self.foreground_pids[key] = client.pane_codex_pid(place.pane)
+            if self.foreground_pids[key] != pid:
+                return ""
             if key not in self.panes:
-                self.panes[key] = herdr.json_object(herdr.Herdr(place.session).result("pane", "get", place.pane).get("pane"),
+                self.panes[key] = herdr.json_object(client.result("pane", "get", place.pane).get("pane"),
                                                   "Codex pane")
             pane = self.panes[key]
             if identity := herdr.pane_session(pane):
