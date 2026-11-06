@@ -1122,133 +1122,136 @@ if [[ "$CMD" == example-test ]]; then
 fi
 
 # Remove routing flags before constructing command words and records.
-NO_CACHE=0
-LOCAL_ONLY=0
-LOCAL_REASON=""
-MAC_ONLY=0
-MAC_REASON=""
-MAC_ENV_NAMES=()
-VERIFY_MAC_ENVIRONMENT=()
-MAC_FETCH=""
-MAC_FETCH_GIVEN=0
-PINNED_TARGET=""
-ARGS=()
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --target)
-            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* || -n "$PINNED_TARGET" ]]; then
-                echo 'verify.sh: --target needs one configured SSH target.' >&2
-                exit 2
+parse_routing_arguments() {
+    NO_CACHE=0
+    LOCAL_ONLY=0
+    LOCAL_REASON=""
+    MAC_ONLY=0
+    MAC_REASON=""
+    MAC_ENV_NAMES=()
+    VERIFY_MAC_ENVIRONMENT=()
+    MAC_FETCH=""
+    MAC_FETCH_GIVEN=0
+    PINNED_TARGET=""
+    ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target)
+                if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* || -n "$PINNED_TARGET" ]]; then
+                    echo 'verify.sh: --target needs one configured SSH target.' >&2
+                    exit 2
+                fi
+                PINNED_TARGET=$2
+                shift 2
+                ;;
+            --no-cache)
+                NO_CACHE=1
+                shift
+                ;;
+            --mac)
+                if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
+                    echo 'verify.sh: --mac needs a reason: --mac "<why this test must run on macOS>".' >&2
+                    exit 2
+                fi
+                MAC_ONLY=1 MAC_REASON=$2
+                shift 2
+                ;;
+            --env)
+                name=${2:-}
+                if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                    printf 'verify.sh: --env %s: not a variable name.\n' "$name" >&2
+                    exit 2
+                fi
+                MAC_ENV_NAMES+=("$name")
+                shift 2
+                ;;
+            --fetch)
+                if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then
+                    echo 'verify.sh: --fetch is given twice; name one folder.' >&2
+                    exit 2
+                fi
+                if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+                    echo 'verify.sh: --fetch needs a folder relative to the repository root, such as target/shots.' >&2
+                    exit 2
+                fi
+                MAC_FETCH_GIVEN=1 MAC_FETCH=${2%/}
+                shift 2
+                ;;
+            --local)
+                if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
+                    echo 'verify.sh: --local needs a reason: --local "<why this test cannot pass on macOS>". Leave it off to run on the Mac.' >&2
+                    exit 2
+                fi
+                # A reservation used as a --local reason never ends.
+                # Use a Mac hold to keep tests off the Mac (user, 2026-10-18).
+                if [[ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" =~ (^|[^[:alpha:]])(reserve|reserved|reservation|hold|holds|held|blocked|claim|claims|busy|showrunner|ruling)([^[:alpha:]]|$) ]]; then
+                    printf 'verify.sh: --local is only for a test that cannot pass on macOS, not to keep tests off the Mac ("%s"). To reserve the Mac, its holder runs /build:hold hold <why> target mac: tests then skip the Mac by themselves, /build:status shows the hold, and it ends at its expiry. Leave --local off.\n' "$2" >&2
+                    exit 2
+                fi
+                LOCAL_ONLY=1
+                LOCAL_REASON=$2
+                shift 2
+                ;;
+            *)
+                ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+    if [[ "$MAC_ONLY" == 1 && "$CMD" != test ]]; then
+        echo 'verify.sh: --mac applies only to test.' >&2
+        exit 2
+    fi
+    if [[ "$MAC_ONLY" == 1 && "$LOCAL_ONLY" == 1 ]]; then
+        echo 'verify.sh: --mac and --local cannot be used together.' >&2
+        exit 2
+    fi
+    if [[ "$MAC_ONLY" == 0 && ( ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ) ]]; then
+        echo 'verify.sh: --env and --fetch need --mac "<why>".' >&2
+        exit 2
+    fi
+    for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do
+        case "$name" in
+            PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
+                printf 'verify.sh: --env %s: the runner sets it, or it changes what Cargo builds; it is not forwarded.\n' "$name" >&2
+                exit 2 ;;
+        esac
+        VERIFY_ENV_FOUND=0
+        for VERIFY_ENV_ENTRY in ${VERIFY_CALL_ENVIRONMENT[@]+"${VERIFY_CALL_ENVIRONMENT[@]}"}; do
+            if [[ "${VERIFY_ENV_ENTRY%%=*}" == "$name" ]]; then
+                VERIFY_MAC_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
+                VERIFY_ENV_FOUND=1
+                break
             fi
-            PINNED_TARGET=$2
-            shift 2
-            ;;
-        --no-cache)
-            NO_CACHE=1
-            shift
-            ;;
-        --mac)
-            if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
-                echo 'verify.sh: --mac needs a reason: --mac "<why this test must run on macOS>".' >&2
-                exit 2
-            fi
-            MAC_ONLY=1 MAC_REASON=$2
-            shift 2
-            ;;
-        --env)
-            name=${2:-}
-            if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-                printf 'verify.sh: --env %s: not a variable name.\n' "$name" >&2
-                exit 2
-            fi
-            MAC_ENV_NAMES+=("$name")
-            shift 2
-            ;;
-        --fetch)
-            if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then
-                echo 'verify.sh: --fetch is given twice; name one folder.' >&2
-                exit 2
-            fi
-            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
-                echo 'verify.sh: --fetch needs a folder relative to the repository root, such as target/shots.' >&2
-                exit 2
-            fi
-            MAC_FETCH_GIVEN=1 MAC_FETCH=${2%/}
-            shift 2
-            ;;
-        --local)
-            if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
-                echo 'verify.sh: --local needs a reason: --local "<why this test cannot pass on macOS>". Leave it off to run on the Mac.' >&2
-                exit 2
-            fi
-            # A reservation passed as a --local reason is recorded nowhere and
-            # never ends; the Mac hold is the one way to keep tests off the Mac
-            # (user, 2026-10-18).
-            if [[ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" =~ (^|[^[:alpha:]])(reserve|reserved|reservation|hold|holds|held|blocked|claim|claims|busy|showrunner|ruling)([^[:alpha:]]|$) ]]; then
-                printf 'verify.sh: --local is only for a test that cannot pass on macOS, not to keep tests off the Mac ("%s"). To reserve the Mac, its holder runs /build:hold hold <why> target mac: tests then skip the Mac by themselves, /build:status shows the hold, and it ends at its expiry. Leave --local off.\n' "$2" >&2
-                exit 2
-            fi
-            LOCAL_ONLY=1
-            LOCAL_REASON=$2
-            shift 2
-            ;;
-        *)
-            ARGS+=("$1")
-            shift
-            ;;
-    esac
-done
-set -- "${ARGS[@]}"
-if [[ "$MAC_ONLY" == 1 && "$CMD" != test ]]; then
-    echo 'verify.sh: --mac applies only to test.' >&2
-    exit 2
-fi
-if [[ "$MAC_ONLY" == 1 && "$LOCAL_ONLY" == 1 ]]; then
-    echo 'verify.sh: --mac and --local cannot be used together.' >&2
-    exit 2
-fi
-if [[ "$MAC_ONLY" == 0 && ( ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ) ]]; then
-    echo 'verify.sh: --env and --fetch need --mac "<why>".' >&2
-    exit 2
-fi
-for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do
-    case "$name" in
-        PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
-            printf 'verify.sh: --env %s: the runner sets it, or it changes what Cargo builds; it is not forwarded.\n' "$name" >&2
-            exit 2 ;;
-    esac
-    VERIFY_ENV_FOUND=0
-    for VERIFY_ENV_ENTRY in ${VERIFY_CALL_ENVIRONMENT[@]+"${VERIFY_CALL_ENVIRONMENT[@]}"}; do
-        if [[ "${VERIFY_ENV_ENTRY%%=*}" == "$name" ]]; then
-            VERIFY_MAC_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
-            VERIFY_ENV_FOUND=1
-            break
+        done
+        if [[ "$VERIFY_ENV_FOUND" == 0 ]]; then
+            printf 'verify.sh: --env %s: not set here; set it on the call (NAME=value verify.sh …).\n' "$name" >&2
+            exit 2
         fi
     done
-    if [[ "$VERIFY_ENV_FOUND" == 0 ]]; then
-        printf 'verify.sh: --env %s: not set here; set it on the call (NAME=value verify.sh …).\n' "$name" >&2
-        exit 2
+    if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then
+        if [[ ! "$MAC_FETCH" =~ ^[A-Za-z0-9._/-]+$ || "$MAC_FETCH" == /* || "$MAC_FETCH" == -* \
+              || "/$MAC_FETCH/" == *//* || "/$MAC_FETCH/" == */./* || "/$MAC_FETCH/" == */../* ]]; then
+            printf 'verify.sh: --fetch %s: not a plain relative folder.\n' "$MAC_FETCH" >&2
+            exit 2
+        fi
+        if ! git -C "$(git rev-parse --show-toplevel)" check-ignore -q -- "$MAC_FETCH/"; then
+            printf 'verify.sh: --fetch %s: git does not ignore it; name a folder the tests write, such as one under target/.\n' "$MAC_FETCH" >&2
+            exit 2
+        fi
     fi
-done
-if [[ "$MAC_FETCH_GIVEN" == 1 ]]; then
-    if [[ ! "$MAC_FETCH" =~ ^[A-Za-z0-9._/-]+$ || "$MAC_FETCH" == /* || "$MAC_FETCH" == -* \
-          || "/$MAC_FETCH/" == *//* || "/$MAC_FETCH/" == */./* || "/$MAC_FETCH/" == */../* ]]; then
-        printf 'verify.sh: --fetch %s: not a plain relative folder.\n' "$MAC_FETCH" >&2
-        exit 2
+    if [[ -n "$PINNED_TARGET" ]]; then
+        if [[ "$LOCAL_ONLY" == 1 || ! "$CMD" =~ ^(test|check|doc)$ ]]; then
+            echo 'verify.sh: --target supports test, check, and doc without --local.' >&2
+            exit 2
+        fi
+        NO_CACHE=1
     fi
-    if ! git -C "$(git rev-parse --show-toplevel)" check-ignore -q -- "$MAC_FETCH/"; then
-        printf 'verify.sh: --fetch %s: git does not ignore it; name a folder the tests write, such as one under target/.\n' "$MAC_FETCH" >&2
-        exit 2
-    fi
-fi
-if [[ -n "$PINNED_TARGET" ]]; then
-    if [[ "$LOCAL_ONLY" == 1 || ! "$CMD" =~ ^(test|check|doc)$ ]]; then
-        echo 'verify.sh: --target supports test, check, and doc without --local.' >&2
-        exit 2
-    fi
-    NO_CACHE=1
-fi
-export BUILDLOG_PINNED_TARGET="$PINNED_TARGET"
+    export BUILDLOG_PINNED_TARGET="$PINNED_TARGET"
+}
+
+parse_routing_arguments "$@"
+set -- "${ARGS[@]}"
 DEV_FEATURES="$(VERIFY_PY_HELPER=DEV_FEATURES_PY "$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml")" || exit 2
 if [[ "$LOCAL_ONLY" -eq 1 ]]; then
     export BUILDLOG_LOCAL_REASON="$LOCAL_REASON"
