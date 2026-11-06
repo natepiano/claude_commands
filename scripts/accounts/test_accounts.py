@@ -2016,7 +2016,7 @@ class AccountsTests(unittest.TestCase):
     def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
         from scripts.shutdown.inventory import ListedSession
 
-        inventory = import_module("inventory")
+        inventory = import_module("scripts.shutdown.inventory")
         owner = ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
                               self.home / ".claude1", "", "", "")
         target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
