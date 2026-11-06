@@ -60,7 +60,7 @@ else:
     agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
     note_file = _lazy_module("scripts.whoami.note_file")
 from scripts.shutdown import remote as remote  # noqa: E402
-from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
+from sessions import RegistryRead, SessionRecord, messaging_socket_exists  # noqa: E402
 
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding", "astra-designer", "astra-reviewer"]
@@ -1407,14 +1407,16 @@ def machine_name() -> str:
 
 
 def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot,
-                  records: list[SessionRecord]) -> Roster:
+                  registry: RegistryRead) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
     machine = machine_name()
-    running = records
+    directory = sessions.sessions_dir()
+    if directory in registry.unreadable:
+        _problem(problems, "Claude session records", f"cannot list {directory}")
     newest: dict[str, SessionRecord] = {}
-    for record in running:
+    for record in sessions.running_records(registry):
         _ = newest.setdefault(record["sessionId"], record)
     records = list(newest.values())
     details = _session_details(records)
@@ -1521,7 +1523,7 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 
 @role_map_command
 def roster(environment: Mapping[str, str], scope: RosterScope, *,
-           membership: staff.StaffSnapshot | None = None, records: list[SessionRecord] | None = None) -> Roster:
+           membership: staff.StaffSnapshot | None = None, registry: RegistryRead | None = None) -> Roster:
     problems: list[str] = []
     try:
         membership = staff.initial_snapshot() if membership is None else membership
@@ -1529,16 +1531,16 @@ def roster(environment: Mapping[str, str], scope: RosterScope, *,
         _problem(problems, "staff membership", error)
         other = peer_roster(environment) if isinstance(scope, AllMachines) else Roster([], [])
         return Roster(other.entries, [*problems, *other.problems], other.warnings, other.row_anomalies)
-    records = sessions.running_sessions() if records is None else records
+    registry = sessions.read_registry() if registry is None else registry
     match scope:
         case ThisMachine():
-            local = _local_roster(environment, membership=membership, records=records)
+            local = _local_roster(environment, membership=membership, registry=registry)
             local.problems[:0] = problems
             return local
         case AllMachines():
             with ThreadPoolExecutor(max_workers=2) as pool:
                 peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment, membership=membership, records=records)
+                local = _local_roster(environment, membership=membership, registry=registry)
                 local.problems[:0] = problems
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],

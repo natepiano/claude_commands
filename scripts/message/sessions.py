@@ -338,12 +338,17 @@ def _readable_records() -> Iterator[SessionRecord]:
     yield from (item.record for item in read_registry().entries)
 
 
-def running_sessions() -> list[SessionRecord]:
-    """Every running record, newest first, including processes without sockets."""
+def running_records(registry: RegistryRead) -> list[SessionRecord]:
+    """Every running record of one registry read, newest first, including processes without sockets."""
     return sorted(
-        (record for record in _readable_records() if running_session(record)),
+        (item.record for item in registry.entries if running_session(item.record)),
         key=lambda record: record["updatedAt"], reverse=True,
     )
+
+
+def running_sessions() -> list[SessionRecord]:
+    """Every running record, newest first, including processes without sockets."""
+    return running_records(read_registry())
 
 
 def live_sessions() -> list[SessionRecord]:

@@ -1093,18 +1093,26 @@ class RosterTests(unittest.TestCase):
             roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
 
-    def test_a_roster_takes_folder_and_status_from_the_records_it_receives(self) -> None:
-        path = self.sessions / "solo.json"
-        record = sessions.read_session(path)
-        if isinstance(record, sessions.UnreadableSessionRecord):
-            self.fail("the fixture session record is unreadable")
-        path.unlink()
+    def test_a_roster_takes_folder_and_status_from_the_registry_read_it_receives(self) -> None:
+        registry = sessions.read_registry()
+        solo = next(item.record for item in registry.entries if item.record["name"] == "solo-director")
+        (self.sessions / "solo.json").unlink()
 
-        found = roster.roster(os.environ, roster.ThisMachine(), records=[record])
+        found = roster.roster(os.environ, roster.ThisMachine(), registry=registry)
 
         entry = next(entry for entry in found.entries if entry.name == "solo-director")
-        self.assertEqual((entry.cwd, entry.status), (record.get("cwd"), "waiting"))
-        self.assertEqual(found.problems, [])
+        self.assertEqual((entry.cwd, entry.status), (solo.get("cwd"), "waiting"))
+
+    def test_a_send_by_name_stops_when_the_session_folder_cannot_be_listed(self) -> None:
+        missing = self.root / "no-session-folder"
+        membership = staff.snapshot()
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(missing)}):
+            result = roster.roster(os.environ, roster.ThisMachine())
+        self.assertIn(f"Claude session records: cannot list {missing}", result.problems)
+        with mock.patch.object(roster, "peer_roster") as peer:
+            found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
+        self.assertIsInstance(found, send.LocalRosterIncomplete)
+        peer.assert_not_called()
 
     def test_a_roster_build_reads_the_role_log_once(self) -> None:
         with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
@@ -2585,11 +2593,11 @@ class PaneRosterTests(StaffTestCase):
     def test_roster_names_owner_and_record_failures(self) -> None:
         _ = self.row_production()
         _ = self.write_document({"schema": 2, "rows": ["invalid member"]})
-        result = roster.roster(os.environ, roster.ThisMachine(), records=[])
+        result = roster.roster(os.environ, roster.ThisMachine(), registry=sessions.RegistryRead((), ()))
         self.assertTrue(any("staff membership" in problem for problem in result.problems), result.problems)
         self.assertTrue(any("staff" in problem for problem in result.problems), result.problems)
         with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}):
-            result = roster.roster(os.environ, roster.ThisMachine(), records=[])
+            result = roster.roster(os.environ, roster.ThisMachine(), registry=sessions.RegistryRead((), ()))
         self.assertTrue(any("not reached" in problem for problem in result.problems), result.problems)
 
 
