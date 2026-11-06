@@ -285,33 +285,21 @@ only I can bump
 
 **Ruled out:** a new import test; the `build_hold.py` import, under the builds file freeze.
 
-### Phase 20c — A merge gate near its end keeps less memory with rerun records in its history  · status: todo
+### Phase 20c — A merge gate near its end keeps less memory with rerun records in its history  · status: done
 
-**Depends on:** nothing. Source: builds showrunner, 2026-11-06, change C1145 returned. It follows 18a and goes ahead of 20b and 10v.
+#### As-built
 
-#### Work Order
+- The look-ahead window in `window_peak` stops at the end of `suites:1` (`GATE_FIRST_PASS` in `scripts/build_queue/progress_profile.py`).
+- A gate that reads a profile with old `suites:2` records now gets its first pass tail: measured 0.23 GiB at 85-86%, 0.14 GiB at 95%.
+- Crossings between `build:` and `test:` phases, and `build:1` to `build:2`, stay. A `suites:2` counter over measured bins follows the normal window rule.
 
-**Goal:** A merge gate past 80% of its first pass keeps the memory of its remaining bins, also when old gate records hold a rerun phase.
+**Files:** `scripts/build_queue/progress_profile.py`, `scripts/build_queue/test_progress_profile.py`, `scripts/production/test_merge_gate_suites_admission.py`, `docs/as-built/build-memory-admission.md`.
 
-**Spec:**
+**Binds later work:** the service reads this rule after a restart. The Change-Review row comes after a live gate past 85% shows under 1 GiB.
 
-1. **Cause, measured.** Live gate at 86.3%: "full need: unmeasured progress window". The merged live profile has all 20 bins of `suites:1`, tail 0.23 GiB at 85%. 17 of its 42 records also hold a `suites:2` phase, from gates that ran code before phase 20a. `window_peak` at `scripts/build_queue/progress_profile.py:124` has 6.3% left after `suites:1`, crosses into `suites:2`, meets an unmeasured bin and refuses.
-2. **Fix.** A gate clears its counter before reruns, so its first pass is the last thing its counter describes. `window_peak` stops at the end of phase `suites:1`. Name the phase once, as a constant in `progress_profile.py`.
-3. **Other phases.** The `build:1` to `test:1` and `build:1` to `build:2` crossings stay as they are.
-4. **Live records.** No removal and no write to live state. Old `suites:2` phases stay on disk and have no effect on the first pass. A `suites:2` counter, which only code before phase 20a writes, follows the normal window rule, as before this phase.
-5. **Proof.** Tests with the live shape, each in a tempdir: records saved through `ProfileHistory`, some with `suites:1` only, some with `suites:1` and a `suites:2` holding bin 0 only. At 86% and at 99%, `window_peak` returns the peak of the remaining `suites:1` bins. `progress_memory` for a gate row gives that value, and `progress_text` does not read "full need". The existing crossing tests pass unchanged.
+**Gotchas:** old-code gates still write `suites:2` records until each tree carries 20a; they have no effect on the first pass.
 
-**Files:**
-- `scripts/build_queue/progress_profile.py`
-- `scripts/build_queue/test_progress_profile.py`
-- `scripts/production/test_merge_gate_suites_admission.py`
-- `docs/as-built/build-memory-admission.md` — the look-ahead rule.
-
-**Workers:** `1 writer` — `impl3`, code, tests and docs.
-
-**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, adversary and contract reviews.
-
-**Change-Review:** none in the commit. Builds adds no row until a live gate past 85% shows under 1 GiB; I add the row at that time.
+**Ruled out:** removal of live records; a change to `merge_gate.py`.
 
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
