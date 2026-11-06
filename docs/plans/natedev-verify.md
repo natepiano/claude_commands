@@ -925,12 +925,12 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 2. **Report flag.** `step_record.py write --report` replaces `--clock-offset`. It prints three lines: the wall minus monotonic offset in microseconds, the record path and the state file path.
 3. **Saved values.** `initialize_step_record` (`verify.sh:1952`) reads those three lines. It keeps `VERIFY_MONOTONIC_OFFSET_US`, `STEP_RECORD_PATH`, `STEP_STATE_PATH` and `STEP_RECORD_TEXT`, the bytes of the record read just after the write. The JSON record does not change after this write.
 4. **Publish.** A new `publish_step_state <word> [target]` does these steps, in Bash, with no interpreter:
-   1. Read the record at `STEP_RECORD_PATH`.
-   2. Refuse when the text differs from `STEP_RECORD_TEXT`. The refusal prints `step record: cannot update step record: <reason>; step refused` to stderr and returns 2. A missing, damaged or rewritten record refuses, the same as the Python read check today. This replaces that check and is not a new one.
-   3. Write the line to a `.step-*` temporary file from `mktemp` in the record directory, then `mv` it over `STEP_STATE_PATH`.
-5. **Callers.** `step_state` (`verify.sh:412`) calls `publish_step_state`, followed by `|| exit 2`. The `on_ssh` call at `verify.sh:1719` becomes `step_state on_ssh "$selected_target"`. The interrupt path at `verify.sh:3478` calls `publish_step_state waiting_hold || true`. `remove_step_record` (`verify.sh:417`) runs `rm -f -- "$STEP_RECORD_PATH" "$STEP_STATE_PATH"`, in that order, and keeps its `|| true`.
+   1. Compare the bytes of the record at `STEP_RECORD_PATH` with `STEP_RECORD_TEXT`, with `cmp -s`. A Bash text read drops NUL bytes, so it cannot make this comparison.
+   2. Refuse when the bytes differ or the record is missing. The refusal prints `step record: cannot update step record: <reason>; step refused` to stderr and returns 2. A missing, damaged or rewritten record refuses, the same as the Python read check today. This replaces that check and is not a new one.
+   3. Write the line to `.step-<state file name>-$RANDOM` in the record directory, then `mv` it over `STEP_STATE_PATH`. The step subshell also publishes, so a parent cannot know its temporary name, and the name is not fixed because both can publish during an interrupt.
+5. **Callers.** `step_state` (`verify.sh:412`) calls `publish_step_state`, followed by `|| exit 2`. The `on_ssh` call at `verify.sh:1719` becomes `step_state on_ssh "$selected_target"`. The interrupt path at `verify.sh:3478` calls `publish_step_state waiting_hold || true`. `remove_step_record` (`verify.sh:417`) runs `rm -f --` on `STEP_RECORD_PATH`, `STEP_STATE_PATH` and every temporary file of this call, in that order, and keeps its `|| true`.
 6. **Tree-writing steps.** The word `writes_tree` replaces the two Python writes. While a tree-writing step runs, `step_state <state>` writes `writes_tree <state>`, so the step keeps its real state. `run_step` (`verify.sh:495`) publishes `writes_tree local_noncompiling`, and `run()` (`verify.sh:476`) publishes `local_noncompiling` after the step. `STEP_RECORD_ARGS` goes when it has no other use. Phase 37's binding stays: the step reads as `natedev_only` for its whole lifetime, and the call's decision comes back before the next read-only step. `hold_enforcer.py:228` stops a step only when its state is `on_natedev`, so a tree-writing compile must read `on_natedev`.
-7. **Join.** `step_record.read` is the one join point. All production readers go through it (`mac_idle.py`, `hold_enforcer.py`, `aws_target.py`, `build_targets.py`, `copy_watch.py`). After it parses the JSON and before it decodes the row, it opens the state file and joins these values:
+7. **Join.** `step_record.read` is the one join point. All production readers go through it (`mac_idle.py`, `hold_enforcer.py`, `aws_target.py`, `build_targets.py`, `copy_watch.py`). It opens the state file before it reads the JSON and keeps it open through the join, because cleanup removes the JSON first. A reader that finds the JSON and no state file then knows that no publication has happened. After it parses the JSON and before it decodes the row, it joins these values:
    - No state file: the row stays as it is.
    - `state` is the word. `selected_target` is the target when given, `mac` for `on_mac`, `natedev` for `on_natedev`, and empty for other words. `updated` is the file's modification time in UTC, read from the open file.
    - `writes_tree <state>` gives `runs_on` `{"kind": "natedev_only", "reason": "step writes the tree"}`, and joins `<state>` by the rules above.
@@ -956,10 +956,10 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 1. A call with no tree-writing step starts `step_record.py` for `start` and `write` only.
 2. Two tree-writing steps in one call start no more `step_record.py` processes. During each step, `step_record.read` returns `natedev_only`. After each step, it returns the call's own decision.
 3. Each published state reads back through `step_record.read` as a valid record, with `pinned_target`, `eligible_targets`, `mac_targets` and `package` unchanged, and the right `selected_target` for `on_mac`, `on_ssh` and `on_natedev`. Reuse a fixture from `test_verify_step_routes*.py`, and add no copy of a case those files already pin.
-4. A record that is removed, or rewritten by another pid, makes the next state publication exit 2 with `step refused`, before the step runs.
-5. The removal at call end leaves no record, no state file and no `.step-*` file.
+4. A record that is removed, rewritten by another pid, or changed by one added NUL byte makes the next state publication exit 2 with `step refused`, before the step runs.
+5. The removal at call end leaves no record, no state file and no `.step-*` file. This includes a TERM while a publication holds its temporary file.
 
-Direct tests of the join in `scripts/direct/test_step_record.py`: no state file, a word, a word with a target, `writes_tree`, an unknown word, and `updated` from the file time.
+Direct tests of the join in `scripts/direct/test_step_record.py`: no state file, a word, a word with a target, `writes_tree`, an unknown word, `updated` from the file time, and both files removed after the JSON read.
 
 **Acceptance:**
 
