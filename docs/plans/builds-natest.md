@@ -1431,7 +1431,7 @@ Measure: a first list on a scratch history took 0.116 CPU s and 0.166 s wall at 
 
 **Ruled out:** an update before the print, which cannot reach 1 s after a gap.
 
-### Phase 66 — The four SSH target test files use half their CPU  · status: todo
+### Phase 66 — The four SSH target test files use half their CPU  · status: done
 **Depends on:** none
 
 #### Work Order
