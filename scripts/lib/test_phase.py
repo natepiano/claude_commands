@@ -9,6 +9,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
+TEST_STEPS = ("nextest", "test", "t")
+
+
 @dataclass(frozen=True)
 class NoTestPhaseRecord:
     pass

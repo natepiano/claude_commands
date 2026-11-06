@@ -170,18 +170,18 @@ class SerializationTests(unittest.TestCase):
         self.assertEqual(json_form([(Span("plain queue text"),)], 60, 100.0)["lines"],
                          [[{"text": "plain queue text"}]])
 
-    def test_cut_spans_lose_their_deadline_while_whole_and_wrapped_spans_keep_it(self) -> None:
-        line = (Span("ab", "success", background="suggestion", until=200.0),
-                Span("cd", "success", background="suggestion", until=201.0))
+    def test_cut_and_wrapped_spans_keep_their_background(self) -> None:
+        line = (Span("ab", "success", background="suggestion"),
+                Span("cd", "success", background="suggestion"))
         clipped = clip(line, 3)
         self.assertEqual(plain([clipped]), "ab…")
-        self.assertEqual([(span.background, span.until) for span in clipped],
-                         [("suggestion", 200.0), ("suggestion", None)])
+        self.assertEqual([span.background for span in clipped],
+                         ["suggestion", "suggestion"])
         wrapped = wrap(line, 2, indent=0)
         self.assertEqual([plain([row]) for row in wrapped], ["ab", "cd"])
         wire = json_form(wrapped, 2, 100.0)
-        self.assertEqual([(span.get("background"), span.get("until")) for row in wire["lines"] for span in row],
-                         [("suggestion", 200.0), ("suggestion", 201.0)])
+        self.assertEqual([span.get("background") for row in wire["lines"] for span in row],
+                         ["suggestion", "suggestion"])
         self.assertEqual(plain(wrapped), "ab\ncd")
 
     def test_serialized_spans_are_detached_from_the_rendered_lines(self) -> None:

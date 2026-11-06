@@ -9,9 +9,10 @@ import subprocess
 import sys
 import venv
 from pathlib import Path
-from typing import final
+from typing import cast, final
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_gate_test_support import gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -19,6 +20,92 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class MergeGateTypesTests(GateSuitesFixture):
+    def run_nightly(self) -> subprocess.CompletedProcess[str]:
+        configuration = self.root / "copies.conf"
+        self.write(configuration, f"[copies]\nroot={self.root / 'copies'}\n"
+                   + "wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n")
+        self.environment["COPIES_CONFIG"] = str(configuration)
+        arguments = ["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"]
+        with mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner"):
+            return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
+                              self.environment, self.root)
+
+    def test_nightly_checks_all_scripts_with_the_fake_type_checker(self) -> None:
+        result = self.run_nightly()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
+        python = self.state / "runner/typecheck-venv/bin/python"
+        self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts"])
+        self.assertNotEqual(type_call["cwd"], str(self.checkout))
+        self.assertTrue(Path(type_call["cwd"]).is_relative_to(self.root / "copies"))
+        self.assert_all_modules_started()
+        self.assertIn("basedpyright: OK", result.stdout)
+        history, = self.gate_history()
+        self.assertEqual(history["shape"], "types")
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+    def test_nightly_type_error_names_the_file_without_requiring_full_test_runs(self) -> None:
+        from scripts.production import showrunners
+
+        failing_file = "scripts/fixture.py"
+        self.write(self.state / "types-red", "red")
+        self.write(self.state / "runner/full-required", "older marker\n")
+        with mock.patch.object(showrunners, "tell", return_value="sent to fixture-showrunner") as notice:
+            result = self.run_nightly()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(failing_file, result.stdout)
+        self.assert_all_modules_started()
+        notice.assert_called_once()
+        arguments = notice.call_args
+        assert arguments is not None
+        tree = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
+        self.assertEqual(arguments.args[:2], ("fixture-showrunner", f"merge-gate-nightly:{tree}"))
+        message = cast(str, arguments.args[2])
+        self.assertIn(failing_file, message)
+        self.assertNotIn("requires the full suite", message)
+        self.assertFalse((self.state / "runner/full-required").exists())
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+    def test_nightly_notice_limits_a_large_type_report_and_keeps_its_summary(self) -> None:
+        from scripts.production import showrunners
+
+        diagnostics = [f"scripts/broken_{index}.py:1: error: " + "incompatible type " * 8
+                       for index in range(2000)]
+        summary = "2000 errors, 0 warnings, 0 notes"
+        job = merge_gate.GateJobResult("types", "basedpyright", 1, 0,
+            "\n".join([*diagnostics, summary]), kind=merge_gate.GateJobKind.TYPE_CHECK)
+        with (mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner"),
+              mock.patch.object(showrunners, "tell", return_value="sent to fixture-showrunner") as notice):
+            merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),
+                                        "fixture-tree", [], type_failures=(job,))
+
+        notice.assert_called_once()
+        arguments = notice.call_args
+        assert arguments is not None
+        message = cast(str, arguments.args[2])
+        self.assertLess(len(message.encode()), 8000)
+        for line in diagnostics[:20]:
+            self.assertIn(line, message)
+        self.assertNotIn(diagnostics[20], message)
+        self.assertIn("1980 other diagnostic lines omitted.", message)
+        self.assertIn(summary, message)
+
+    def test_nightly_notice_without_a_failed_job_says_the_full_suite_is_required(self) -> None:
+        from scripts.production import showrunners
+
+        with (mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner"),
+              mock.patch.object(showrunners, "tell", return_value="sent to fixture-showrunner") as notice):
+            merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"), "fixture-tree", [])
+
+        arguments = notice.call_args
+        assert arguments is not None
+        message = cast(str, arguments.args[2])
+        self.assertIn("(runner failure)", message)
+        self.assertIn("requires the full suite", message)
+        self.assertNotIn("Tests passed", message)
+
     def test_type_check_requires_exit_zero_and_a_clean_summary(self) -> None:
         for status, summary, expected in (
             (0, "0 errors, 0 warnings, 0 notes", 0),
@@ -119,7 +206,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
 
-    def test_tests_only_runs_types_with_hooks_in_the_default_scope(self) -> None:
+    def test_tests_only_runs_modules_without_a_default_type_check(self) -> None:
         result = subprocess.run(
             [*self.gate_command(), "--tests-only", "--repo", str(self.checkout)],
             cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
@@ -127,10 +214,21 @@ class MergeGateTypesTests(GateSuitesFixture):
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        type_call, = [call for call in self.calls() if call["tool"] == "basedpyright"]
-        python = self.state / "runner/typecheck-venv/bin/python"
-        self.assertEqual(type_call["args"], ["--pythonpath", str(python), "scripts"])
-        self.assertEqual(type_call["cwd"], str(self.checkout))
+        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
+        self.assert_all_modules_started()
+        self.assert_not_pushed()
+        history, = self.gate_history()
+        self.assertEqual(history["shape"], "tests")
+
+    def test_merge_pushes_modules_without_a_default_type_check(self) -> None:
+        result = self.run_gate(type_dirs=())
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
+        self.assert_all_modules_started()
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"),
+                         self.git(self.checkout, "rev-parse", "HEAD"))
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
     @gate_suites("lib")
     def test_a_type_check_venv_that_cannot_be_built_is_red_and_names_the_command(self) -> None:
