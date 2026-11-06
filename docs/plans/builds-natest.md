@@ -66,7 +66,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - **Speed method** (every speed phase):
   0. Targets: at dispatch, the director takes the top live rows of `test_times top` that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal.
   1. Baseline: before the edit, run the module three times with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` and keep the median `wall_s` and `cpu_s`. These runs find the cost (step 2); they are not the before number of the gain (step 5). Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
-  2. Find the cost from the JSON: the slowest tests, and `wall_s - tests_s` (import and module or class fixtures). Name the expensive operations before any edit; do not apply a cut the module already has.
+  2. Find the cost from the JSON: the slowest tests, and `wall_s - tests_s` (import and module or class fixtures). Name the expensive operations before any edit; do not apply a cut the module already has. Estimate each command's removable cost, not the whole script's: Phase 41 estimated 54-62 CPU s and measured 1.8, because 246 of 366 starts already had the light path and two commands kept the heavy chain.
   3. Cut it, in this order:
      - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s). A server fixture that runs `serve_forever` pays its 0.5 s poll interval on each stop; stop it on an event (Phase 20: 62 to 21 s).
      - Remove trivial tests (Invariants above) only when step 2 shows tests that read as repeats: tests with the same setup and the same assertion target. Then run `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` and compare each candidate's assertions with its covering tests; a candidate whose result a covering test also checks is a trivial test. Skip the sweep in a module whose time is in process starts: Phase 13 found no repeat in five such modules.
@@ -668,6 +668,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Phase 25: `MergeGateFixture.build_fixture` commits the real `module_run.py` into each fixture checkout, and the gate refuses a checkout with no runner.
 - Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- Architect review after Phase 41: the module now has 18 tests, and `test_full_test.py` also imports the fixture. Profile the current module after Phase 36, and add `test_full_test.py` to the final run when the fixture changes.
 - Architect review after Phase 34: `merge_gate_test_support.py:273` casts `None` to `AdmissionFixture`, and `admission_started` tracks its lifetime apart. A change to that lifetime uses named states (for example `AdmissionNotStarted | RunningAdmission`). A change that only measures needs no refactor.
 
 **Acceptance gate:**
@@ -1075,6 +1076,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Constraints from prior phases:**
 - Phase 40 measured the cost; the module itself is at a floor.
+- Recovery from missing borrowed objects stays (`copies.py:349`, `test_copies.py:980`). If the refresh error path changes, replace `PostUseError.caller_error: BaseException | None` (`copies.py:110`) with named caller outcomes.
 
 **Acceptance gate:**
 - caller suites for `copies.py` green
@@ -1090,7 +1092,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Goal:** `scripts/direct/test_verify_lint_cache_versions.py` (rank 9 in `test_times top` at 139 s median, 91.4 CPU s, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
 
 **Spec:** Follow the Speed method. Ranks 1 and 5 are excluded. Ranks 2, 3, 4, 6, 8 are floors whose CPU has not risen, and rank 7 is Phase 43.
-1. Profile before any edit. It has 7 tests at about 13 CPU s each, so name what each test spends that CPU on.
+1. Profile before any edit, per group: five integration tests make 29 `verify.sh` calls, and two tests are direct (`test_verify_lint_cache_versions.py:16-79`). The module average does not name either cost.
 2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
 3. A cut in a production file or a support file goes to the director first, with the measured gain.
 4. Keep every test name and assertion. Add no guard, refusal or check that this Work Order does not name (user rule, 2026-11-05).
@@ -1103,6 +1105,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Constraints from prior phases:**
 - Phase 31: the `verify.sh lint` route costs 3.1 s per run with no repair (step-record and admission client Python starts).
+- The fixture uses `caller_admission`, whose server advances its clock with real time. queue-unit owns the start spacing fix. Do not advance the admission clock by hand: Phase 31 ruled that out.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
