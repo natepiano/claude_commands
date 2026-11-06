@@ -1551,7 +1551,9 @@ class FloorTests(SweepCase):
         shrink = sweep.shrink_floor
 
         def device(path: str) -> int:
-            return os.stat(path).st_dev
+            """Report one filesystem wherever TMPDIR is. A missing path still raises."""
+            _ = os.stat(path)
+            return base.stat().st_dev
 
         def remove_target(
             scan: sweep.Scan, total: int, budget: int, dry_run: bool,
@@ -1590,7 +1592,9 @@ class FloorTests(SweepCase):
         shrink = sweep.shrink_floor
 
         def device(path: str) -> int:
-            return os.stat(path).st_dev
+            """Report one filesystem wherever TMPDIR is. A missing path still raises."""
+            _ = os.stat(path)
+            return base.stat().st_dev
 
         def remove_other_target(
             scan: sweep.Scan, total: int, budget: int, dry_run: bool,
