@@ -1113,3 +1113,67 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - the full test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 46 — style test runs do less Git work outside `copies.py`  · status: todo
+**Depends on:** none
+**Blocked by:** the style owner's work in `style/bulk_run.py` and `style/git_process.py`; the showrunner says when.
+
+#### Work Order
+
+**Goal:** `style/test_crate_run.py` spends less time in Git calls made by `style/bulk_run.py` and `style/git_process.py`, with the same behavior. Phase 40 measured 10,444 Git calls and 60.9 s of a 325 s profiled run. Estimate: about 30 s. The showrunner assigned this on 2026-11-05.
+
+**Spec:**
+1. Measure before any edit: count Git calls per command form, per caller line, in a real `style/test_crate_run.py` run. Estimate the removable cost per form.
+2. Cut repeated reads first: a value that cannot change inside one operation is read once. Use one Git process for a batch where Git offers it (`cat-file --batch`, `for-each-ref`).
+3. Keep every write, every ref update and the order of writes. Pair a trial before any review; land only when the pair median falls by at least 5% wall.
+4. Behavior does not change: same trees, same refs, same exit status. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/style/bulk_run.py` — the cuts
+- `scripts/style/git_process.py` — the cuts
+
+**Workers:** 1 writer on slot `impl` (two files with one caller chain; they do not split)
+- `impl` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 40: the module is at a floor; the cost is in production Git work.
+- Phase 44 owns `copies.py`; this phase does not edit it.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- Same-load pair medians (`pairs.sh`) of `style/test_crate_run.py` before and after, in the checkpoint notice
+- Each caller module of the changed files green, with the same test names and assertions
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 47 — test runs spend less time forcing writes to disk  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** test modules spend less time in `fsync`, with production durability unchanged. Phase 40 measured 5,777 `fsync` calls and 44.4 s in `style/test_crate_run.py`, about 7.7 ms each. The showrunner assigned this on 2026-11-05: the switch comes from config or the test harness, not from a test check inside production code.
+
+**Spec:**
+1. Measure before any edit: run `style/test_crate_run.py` and two other modules in same-load pairs, normal against a trial that sets the module's `TMPDIR` to a tmpfs folder in the run. An `fsync` on tmpfs costs nothing, and no code changes. Record the wall and CPU medians, the peak tmpfs use per module, and any failure.
+2. If the pairs show a gain of at least 5% wall, the test harness sets `TMPDIR` for each module to a tmpfs folder named in config. The path and an off value live in config, read at use (`scripts/test_times/module_run.py`, `config/`). Each run removes its folder.
+3. Peak tmpfs use counts against the gate's memory. Name the sum at the gate's module parallelism in the notice, against the gate's 6 GiB sampled cap, before any landing.
+4. A Mac run keeps today's path: tmpfs is not there, so the harness uses the normal folder.
+5. No production file changes. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/test_times/module_run.py` — sets the module's temp folder from config
+- `config/test_times.conf` — the path and the off value
+
+**Workers:** 1 writer (one script and one config file; the files do not split). The director names the first free slot at dispatch.
+- `impl` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 40: the `fsync` cost is in production durable publications, and those stay durable.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+- Names through config; tools from pinned Nix derivations, so no `libeatmydata` install script.
+
+**Acceptance gate:**
+- Same-load pair medians before and after for the three modules, in the checkpoint notice
+- `scripts/test_times/` suite green
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
