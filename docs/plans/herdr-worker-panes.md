@@ -2767,31 +2767,6 @@ No Python or new rerun test is required for this text phase.
 
 **Acceptance gate:** A real-path test runs `assign.py` for a run pinned to herdr against the `PaneWorld` fixture: the reviewer takes a pane, the reply reaches the summary path, and the row and the hold end. A second test: a failed end returns 1 and keeps the hold. The mesh tests of the operation stay green. The Phase 15 pilot runs one real Astra review in a pane. Require basedpyright 0/0 on changed files and every caller module.
 
-### Phase 14c — An unrelated Codex process does not stop a retire  · status: done
-
-**Depends on:** Phase 12a
-
-#### Work Order
-
-**Goal:** a Codex process that the scan cannot identify does not stop `staff.retire` (sdlc c2c81fdb). The scan reports it as an anomaly. Each Astra review then ends its row.
-
-**Spec:**
-
-1. In `_WorkerSources`, a Codex process with no native thread identity, or with arguments that do not parse, no longer sets `codex_scan_incomplete`. The `_problem` line stays.
-2. A failed read of the whole process table keeps `codex_scan_incomplete`.
-3. Add no new check.
-
-**Files:**
-- `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py` — the scan and its tests.
-
-**Workers:** `1 writer` — one small change and its tests.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 12a keeps a process that exits during the scan out of the scan. Do not touch a live row or process.
-
-**Acceptance gate:** A test runs `staff.retire` for a stopped row with an unidentified Codex process in the table: the row goes, and the anomaly line prints. `test_staff_sources`, `test_staff`, `test_remove_workers`, `test_worker` and `test_astra_roles` pass. Require basedpyright 0/0 on changed files.
-
 ### Phase 15 — Pilot and default switch  · status: todo
 
 **Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b
@@ -2811,7 +2786,7 @@ No Python or new rerun test is required for this text phase.
 
 **State:** `config/direct.conf`.
 
-**Constraints from prior phases:** Phases 3, 4 and 6-14. The pilot runs one real Astra review in a pane through `assign.sh --operation astra-review` (Phase 14b).
+**Constraints from prior phases:** Phases 3, 4 and 6-14. The pilot runs one real Astra review in a pane through `assign.sh --operation astra-review` (Phase 14b). Hierarchies Phase 23 keeps an unrelated Codex process from stopping the retire at the end of that review.
 - Phase 14a (herdr-unit, 2026-11-06): the pilot's director is Claude, so the pilot does not exercise a Codex parent. The Phase 14a tests and its live proof from a worker's environment cover TERM and COLORTERM at the pane boundary. A failed fresh start prints `publication failed: ...` and keeps the pane; the same launcher command publishes once from that pane.
 - Phase 3h review (2026-11-01): the pilot and default switch gate only the pane track, not the rename track.
 
