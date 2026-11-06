@@ -1372,3 +1372,4 @@ Source: the user approved on C1119, through sdlc [b8646245]: fold `scripts/direc
 - `names` — comments, docs and samples.
 
 **State:** none. The phase writes no new lasting record.
+
