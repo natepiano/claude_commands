@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from scripts.accounts import moves
 from scripts.shutdown import stop_resume
 
 
@@ -21,7 +22,8 @@ class FakeSessionMoves:
 
     batches: list[list[str]] = field(default_factory=list)
 
-    def __call__(self, sessions: list[str], target: str, *, why: str) -> list[stop_resume.MoveResult]:
+    def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause = "by hand") -> list[stop_resume.MoveResult]:
+        del cause
         self.batches.append(list(sessions))
         return [self.move(session, target, why=why) for session in sessions]
 

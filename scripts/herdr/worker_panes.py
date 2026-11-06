@@ -379,7 +379,7 @@ def _passes(run: Path) -> list[dict[str, object]]:
         for item in fields.values() if isinstance(item, dict)]
 
 
-def _worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
+def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
     no_pass: dict[str, object] = {}
     return next((item for item in reversed(_passes(run)) if item.get("worker_name") == row.name
                  or item.get("team_slot") == row.name), no_pass)
@@ -390,7 +390,7 @@ def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
     parent = staff.snapshot().parent_of(row)
     if parent is None:
         return WorkerRoleUnavailable("worker parent is unavailable")
-    role = _worker_pass(row, worker_run(parent)).get("kind")
+    role = worker_pass(row, worker_run(parent)).get("kind")
     return role if isinstance(role, str) and role in staff.WORKER_ROLES else WorkerRoleUnavailable("dispatch role is unavailable")
 
 
@@ -412,6 +412,8 @@ def _idle_checks(row: staff.StaffRow, run: Path,
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     return Kept("dispatch lock is held")
+    if worker_pass(row, run).get("status") in ("active", "refused"):
+        return Kept("launcher has not recorded a completed pass")
     live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.mesh_runs").live_runs)
     if live_runs(run / "mesh_runs", row.name):
         return Kept("a detached run is live")
@@ -436,7 +438,7 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
         return idle
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         return Kept(f"agent state is {worker.status.value}")
-    passed = _worker_pass(worker.row, directory)
+    passed = worker_pass(worker.row, directory)
     if passed.get("status") != "completed":
         return Kept("launcher has not recorded a completed pass")
     try:
@@ -685,8 +687,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     return state
                 return _uncertain(row, "retained launch proof is incomplete")
     if isinstance(current, OpenWorker):
-        passed = _worker_pass(current.row, allowed.run)
-        if passed.get("status") == "active" and passed.get("kind") != role:
+        passed = worker_pass(current.row, allowed.run)
+        if passed.get("status") in ("active", "refused") and passed.get("kind") != role:
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "active dispatch has another role")
         matches = _live_policy(current, policy, client, same_role=passed.get("kind") == role)
         if isinstance(matches, UncertainWorker):
