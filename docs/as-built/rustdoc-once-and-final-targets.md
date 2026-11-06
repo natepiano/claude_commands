@@ -47,7 +47,11 @@ The record has four keys: `repo_top` (the resolved path of the original repo, no
 
 ### `lint`
 
-`lint` runs mend, fmt, taplo, clippy fix, fmt and clippy judgment. It does not run rustdoc. It takes `<package>` or `--workspace [--check]` and refuses all other arguments, `--features` included (usage, exit 2).
+`lint` runs mend, fmt, taplo, and a clippy judgment.
+After a failed judgment, it runs fix and fmt passes, then judges again.
+[Lint-step fix](build-followups-mul-add.md#lint-step-fix) defines those passes.
+Lint does not run rustdoc.
+It takes `<package>` or `--workspace [--check]` and refuses all other arguments, including `--features`, with usage and exit 2.
 
 ### The hook
 
@@ -130,6 +134,8 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - Both hooks use the command parser in `checkpoint_gate.py`. The doc hook uses `SUBJECT` to check each message line.
 - `final` must not link examples, and the example scan must run before any build. Together they make sure no test is lost.
 - `final` must not pass `--lib`.
+- `verify_doc_test_support.py` sets `LINT_SKIP_SWEEP=1` in the doc-test environment.
+  This prevents a detached lint sweep from writing into the temporary home after the test ends.
 - Tests that pin this: `test_verify_doc.py`, the `test_verify_lint_*.py` modules (shared fixture: `verify_lint_scope_test_support.py`), `test_checkpoint_doc_gate.py`, `test_verify_final_targets.py` and `test_verify_untested_examples.py`.
 - A repo with no `Cargo.toml`, such as `~/.claude`, needs no doc record, but its checkpoints still follow the own-call rule.
 
