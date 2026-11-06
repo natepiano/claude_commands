@@ -961,7 +961,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Ruled out:**
 - One end-to-end status (1): it drops the only real-path test of the hold-stop checks.
 
-### Phase 40 — A verify step reads each target's platform from the eligibility answer · status: todo
+### Phase 40 — A verify step reads each target's platform from the eligibility answer · status: done
 
 **Depends on:** none
 
@@ -974,14 +974,14 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Spec:**
 
 1. **The answer.** `print_eligible_target` in `scripts/build_targets/build_targets.py` prints a fifth tab-separated field: the target's platform for an `SshTarget`, `-` for a local target. Every `eligible` form prints it: plain, `--kind` and `--target`.
-2. **Every reader.** Each `read -r name eligibility reason settings` loop over the table in `scripts/direct/verify.sh` reads a fifth field, `platform`, so `settings` stays one field. There are 9 loops today, in `step_can_retry`, `initialize_step_record`, `target_for_settings`, `ssh_retry_hook`, `route_test` and others. Find each with grep.
+2. **Every reader.** Each `read -r name eligibility reason settings` loop over the table in `scripts/direct/verify.sh` reads a fifth field, `platform`, so `settings` stays one field. The validation loop in `initialize_step_record` also reads a sixth name, `extra`, and `-n "$extra"` replaces its `"$settings" == *$'\t'*` test, so a settings path that holds a tab still takes the same refusal. There are 9 loops today, in `step_can_retry`, `initialize_step_record`, `target_for_settings`, `ssh_retry_hook`, `route_test` and others. Find each with grep.
 3. **Loops use the field.** A loop that calls `target_platform "$name"` for its own row reads `$platform`.
 4. **`target_platform`.** It scans `STEP_TARGET_TABLE` in Bash and starts no process. A row for the name with `macos` or `linux` gives that word. With no such answer, the last line stays as it is today: `[[ "$STEP_RUNS_ON" == mac_allowed && "$1" == mac ]] && printf '%s\n' macos`. `target_for_settings` does not change other than its read.
 5. **Remove the command.** `verify.sh` is the only caller of `build_targets.py platform`. Remove `command_platform`, the `platform` subparser, the `main` branch and the early `sys.argv[1:2] == ["platform"]` block. Keep `target_config.configured_ssh_target`, which other code calls.
 6. **Fixtures.** Each fake `eligible` answer prints the fifth field. Each fake `platform` branch goes, at `test_verify_ssh_targets.py:221` and `test_verify_step_state.py:142`, among others.
 7. **New tests.** `scripts/direct/test_verify_target_platform.py` extracts `target_platform` with `shell_functions` from `scripts/lib/shell_test_support.py` and runs it in `bash`, with `build_targets.py` not on any path it can reach. Cases: a `macos` row; a `linux` row; a `-` row; no row with `mac_allowed` and the name `mac`; no row with `ssh_allowed`. `scripts/build_targets/test_build_targets.py` states the fifth field for an SSH target and for a local target.
 
-**Invariants:** target selection, refusals, fallbacks, reservations, step records, `verify.sh` output and exit codes stay the same for every verb. A step that today reads `macos` for a target reads `macos` after this phase. `verify.sh` runs under bash 3.2. Add no other guard, refusal or check; the `invalid targets` check does not read the new field.
+**Invariants:** target selection, refusals, fallbacks, reservations, step records, `verify.sh` output and exit codes stay the same for every verb. A step that today reads `macos` for a target reads `macos` after this phase. `verify.sh` runs under bash 3.2. Add no other guard, refusal or check; the `invalid targets` check does not read `platform`.
 
 **Test changes approved:**
 - Each fixture row and each expected `eligible` line gains the fifth field.

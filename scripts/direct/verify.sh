@@ -1634,8 +1634,8 @@ SSH_RETRYABLE_REASON='^(busy|blocked|disk|backoff|unreachable|state|copy|mac_bus
 step_can_retry() {
     [[ "${STEP_WRITES_TREE:-0}" == 0 && "$LOCAL_ONLY" == 0 ]] || return 1
     case "$CMD" in test|check|lint|doc) ;; *) return 1 ;; esac
-    local name eligibility reason settings
-    while IFS=$'\t' read -r name eligibility reason settings; do
+    local name eligibility reason settings platform
+    while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$settings" != - && -n "$settings" && ( "$eligibility" == eligible ||
               ( "$eligibility" == excluded && ( "$reason" =~ $SSH_RETRYABLE_REASON ||
                 ( -n "${PINNED_TARGET:-}" && "$reason" == starting ) ) ) ) ]]; then
@@ -1905,7 +1905,7 @@ check_routing_hold() {
 }
 
 initialize_step_record() {
-    local answer table line name eligibility reason settings status=0 decision_reason="no eligible SSH target" mac_targets=0
+    local answer table line name eligibility reason settings platform extra status=0 decision_reason="no eligible SSH target" mac_targets=0
     local eligible_names="" mac_names=""
     local arguments=(eligible --kind "$CMD" --repo-root "$(git rev-parse --show-toplevel)")
     PKG="${ARGS[0]:-}"
@@ -1931,8 +1931,8 @@ initialize_step_record() {
         printf 'verify.sh: target eligibility check returned no targets; step refused\n' >&2
         exit 2
     fi
-    while IFS=$'\t' read -r name eligibility reason settings; do
-        if [[ -z "$name" || ( "$eligibility" != eligible && "$eligibility" != excluded ) || -z "$reason" || -z "$settings" || "$settings" == *$'\t'* ]]; then
+    while IFS=$'\t' read -r name eligibility reason settings platform extra; do
+        if [[ -z "$name" || ( "$eligibility" != eligible && "$eligibility" != excluded ) || -z "$reason" || -z "$settings" || -n "$extra" ]]; then
             printf 'verify.sh: target eligibility check returned invalid targets; step refused\n' >&2
             exit 2
         fi
@@ -1943,7 +1943,7 @@ initialize_step_record() {
             fi
             (( mac_targets += 1 ))
             eligible_names+="${eligible_names:+,}$name"
-            if [[ "$(target_platform "$name")" == macos ]]; then mac_names+="${mac_names:+,}$name"; fi
+            if [[ "$platform" == macos ]]; then mac_names+="${mac_names:+,}$name"; fi
         elif [[ "$eligibility" == eligible && "$settings" == - ]]; then
             eligible_names+="${eligible_names:+,}$name"
         fi
@@ -1957,7 +1957,7 @@ initialize_step_record() {
         STEP_DEFER_LOCAL=1
     fi
     if step_can_retry; then
-        while IFS=$'\t' read -r name eligibility reason settings; do
+        while IFS=$'\t' read -r name eligibility reason settings platform; do
             if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON ) ]]; then
                 MAC_LEAVE_SETTINGS="$settings"
                 break
@@ -1990,8 +1990,8 @@ initialize_step_record() {
     if [[ "$MAC_ONLY" == 1 ]]; then
         printf 'verify.sh: Mac only (%s): route this test to the Mac.\n' "$MAC_REASON" >&2
         local mac_eligible=0 refusal=state
-        while IFS=$'\t' read -r name eligibility reason settings; do
-            [[ "$settings" != - && "$(target_platform "$name")" == macos ]] || continue
+        while IFS=$'\t' read -r name eligibility reason settings platform; do
+            [[ "$settings" != - && "$platform" == macos ]] || continue
             if [[ "$eligibility" == eligible || "$reason" == busy ]]; then
                 mac_eligible=1
             else
@@ -2004,9 +2004,9 @@ initialize_step_record() {
         fi
     fi
     if step_can_retry; then
-        while IFS=$'\t' read -r name eligibility reason settings; do
+        while IFS=$'\t' read -r name eligibility reason settings platform; do
             if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON )
-                  && "$(target_platform "$name")" == macos ]]; then
+                  && "$platform" == macos ]]; then
                 MAC_LEAVE_SETTINGS=$settings
                 register_mac_wait "$settings" 0
                 break
@@ -2143,17 +2143,19 @@ remember_mac_retry() {
 # The same command gates routing retries and both local wait hooks. The
 # deadline uses the call's monotonic clock. free-now reads local state only.
 target_platform() {
-    local platform
-    platform="$("$PY" "$BUILD_TARGETS_SCRIPT" platform --target "$1" 2>/dev/null)" || platform=""
-    case "$platform" in
-        macos|linux) printf '%s\n' "$platform" ;;
-        *) [[ "$STEP_RUNS_ON" == mac_allowed && "$1" == mac ]] && printf '%s\n' macos ;;
-    esac
+    local name eligibility reason settings platform
+    while IFS=$'\t' read -r name eligibility reason settings platform; do
+        [[ "$name" == "$1" ]] || continue
+        case "$platform" in
+            macos|linux) printf '%s\n' "$platform"; return ;;
+        esac
+    done <<< "$STEP_TARGET_TABLE"
+    [[ "$STEP_RUNS_ON" == mac_allowed && "$1" == mac ]] && printf '%s\n' macos
 }
 
 target_for_settings() {
-    local name eligibility reason settings
-    while IFS=$'\t' read -r name eligibility reason settings; do
+    local name eligibility reason settings platform
+    while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$settings" == "$1" ]]; then printf '%s' "$name"; return; fi
     done <<< "$STEP_TARGET_TABLE"
     printf '%s' mac
@@ -2190,9 +2192,9 @@ ssh_reserve_hook() {
 
 ssh_retry_hook() {
     step_can_retry || { printf 'false'; return; }
-    local name eligibility reason settings pivot=-1 index
+    local name eligibility reason settings platform pivot=-1 index
     local names=() candidates=()
-    while IFS=$'\t' read -r name eligibility reason settings; do
+    while IFS=$'\t' read -r name eligibility reason settings platform; do
         [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ $SSH_RETRYABLE_REASON ) ]] || continue
         names+=("$name") candidates+=("$settings")
         if [[ "$settings" == "$SSH_RETRY_AFTER_SETTINGS" ]]; then pivot=$((${#candidates[@]} - 1)); fi
@@ -2290,10 +2292,10 @@ check_mac_only_result() {
 }
 
 route_test() {
-    local name eligibility reason settings admission remote_candidates=0 reservation_status
+    local name eligibility reason settings platform admission remote_candidates=0 reservation_status
     local announced_reason="" retry=0 retry_ready
-    while IFS=$'\t' read -r name eligibility reason settings; do
-        if [[ "$eligibility" == excluded && "$settings" != - && "$(target_platform "$name")" == macos ]]; then
+    while IFS=$'\t' read -r name eligibility reason settings platform; do
+        if [[ "$eligibility" == excluded && "$settings" != - && "$platform" == macos ]]; then
             BUILDLOG_MAC=declined
             if [[ "$LOCAL_ONLY" == 0 && "$MAC_ONLY" == 0 ]]; then
                 BUILDLOG_MAC_REASON=$reason
@@ -2319,9 +2321,9 @@ route_test() {
             esac
         fi
         remote_candidates=0
-        while IFS=$'\t' read -r name eligibility reason settings; do
+        while IFS=$'\t' read -r name eligibility reason settings platform; do
             if [[ "$MAC_ONLY" == 1 ]]; then
-                [[ "$settings" != - && "$(target_platform "$name")" == macos ]] || continue
+                [[ "$settings" != - && "$platform" == macos ]] || continue
             fi
             if [[ "$settings" == - ]]; then
                 [[ "$retry" == 0 && "$eligibility" == eligible && "$STEP_FORCE_MAC" == 0 ]] || continue

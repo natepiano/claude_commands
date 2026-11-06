@@ -139,7 +139,6 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
         targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
         _ = targets.write_text(TARGETS.replace('print("mac_allowed" if allowed else "natedev_only makes natedev artifacts")',
                                                'print("ssh_allowed" if allowed else "natedev_only makes natedev artifacts")')
-                              + '\nif command == "platform":\n    print("macos" if sys.argv[-1] == "mac" else "linux")\n'
                               + 'if command == "reserve":\n'
                               + '    Path(sys.argv[sys.argv.index("--reservation-file") + 1]).write_text("mac\\t" + os.environ["MAC_TEST_CONFIG"] + "\\n")\n')
         result = self.run_verify("test", "sample", "--target", "mac")
@@ -155,6 +154,21 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
             for field in ("pinned_target", "eligible_targets", "runs_on", "package"):
                 self.assertEqual(row[field], initial[field], (field, row))
         self.assertTrue(all(row["unchanged"] for row in rows), rows)
+
+    def test_initial_ssh_record_lists_only_macos_targets_as_mac_targets(self) -> None:
+        _ = self.observe()
+        targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
+        _ = targets.write_text(TARGETS.replace(
+            'print("mac_allowed" if allowed else "natedev_only makes natedev artifacts")',
+            'print("ssh_allowed" if allowed else "natedev_only makes natedev artifacts")')
+            + 'if command == "eligible":\n'
+            + '    print("linux-box\\teligible\\t-\\t/tmp/linux.conf\\tlinux")\n'
+            + 'if command == "reserve":\n'
+            + '    Path(sys.argv[sys.argv.index("--reservation-file") + 1]).write_text("mac\\t" + os.environ["MAC_TEST_CONFIG"] + "\\n")\n')
+        result = self.run_verify("test", "sample", "--target", "mac")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        initial = next(row for row in self.observations() if row["event"] == "initialize_step_record")
+        self.assertEqual(initial["runs_on"], {"kind": "ssh_allowed", "mac_targets": ["mac"]})
 
     def test_removed_or_foreign_record_refuses_before_the_step(self) -> None:
         for damage in ("removed", "foreign", "nul"):

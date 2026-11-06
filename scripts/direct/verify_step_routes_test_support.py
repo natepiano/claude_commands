@@ -24,9 +24,9 @@ with Path(os.environ["TEST_ROUTE_EVENTS"]).open("a") as output:
 if command == "eligible":
     allowed = os.environ.get("TEST_MAC_ALLOWED", "1") == "1"
     print("mac_allowed" if allowed else "natedev_only makes natedev artifacts")
-    print("natedev\teligible\t-\t-")
+    print("natedev\teligible\t-\t-\t-")
     if allowed:
-        print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"])
+        print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"] + "\tmacos")
 elif command in ("register-local", "check-local"):
     raise SystemExit(10 if any(holders.iterdir()) else 0)
 elif command == "wait-local":

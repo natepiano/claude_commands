@@ -455,7 +455,7 @@ from scripts.direct.wait_for_test_state import wait_until
 root = Path(os.environ["TEST_HOLD_ROOT"])
 if sys.argv[1] == "eligible":
     print("natedev_only test target")
-    print("natedev\teligible\t-\t-")
+    print("natedev\teligible\t-\t-\t-")
 if sys.argv[1] == "wait-local":
     calls = root / "wait-local-calls"
     count = len(calls.read_text().splitlines()) if calls.exists() else 0

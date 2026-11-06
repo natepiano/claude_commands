@@ -351,9 +351,9 @@ import tempfile
 
 if sys.argv[1] == "eligible":
     print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
-    print("natedev\\teligible\\t-\\t-")
+    print("natedev\\teligible\\t-\\t-\\t-")
     if {runs_on!r} == "mac_allowed":
-        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"])
+        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 else:
     sys.path.insert(0, {str(TARGETS.parent)!r})
     runpy.run_path({str(TARGETS)!r}, run_name="__main__")
