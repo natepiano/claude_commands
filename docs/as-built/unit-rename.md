@@ -1,6 +1,6 @@
 # Unit rename
 
-`rename_unit.py plan|apply|verify <slug> <old> <new>` renames one staff unit.
+`rename_unit.py plan|apply|verify <showrunner name> <old> <new>` renames one staff unit.
 The command reads the unit from its staff row.
 It keeps the staff id, current session, parent, and recorded role.
 A pending rename finishes before the command sets the displays.

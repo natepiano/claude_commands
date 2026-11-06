@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Make the production tools safe to run again after a stop or a failure part way. Each phase fixes one cause in one shared place, moves every copy onto it, and adds a check that refuses a new copy, or names the copies its check cannot see. Phase 1 is the file writer.
 
-> **Production: sdlc** — unit `devtools-unit`; production doc `docs/plans/sdlc-production.md`
 
 > **Runs after:** the sdlc-devtools-tests plan is done (sdlc showrunner, 2026-10-30: this plan runs after it). This binds every phase below.
 

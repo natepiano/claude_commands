@@ -20,6 +20,8 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.lib import process_start as process_identity
 
+from scripts.lib.boot_identity import boot_identity
+
 
 KINDS = ("check", "lint", "doc", "test", "build", "example", "final")
 STATES = ("waiting_hold", "waiting_mac", "waiting_ssh", "on_ssh", "on_mac", "on_natedev", "local_noncompiling")
@@ -238,7 +240,7 @@ def consume_stopped_build(call_id: str, consumed: Path) -> bool:
     proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
     if sys.platform == "darwin":
         return False  # The Linux build enforcer does not run on Darwin.
-    boot_id = (proc / "sys/kernel/random/boot_id").read_text().strip()
+    boot_id = boot_identity(proc)
     seen: set[str]
     try:
         seen = set(consumed.read_text().splitlines())

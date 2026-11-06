@@ -366,13 +366,14 @@ class SampleTests(unittest.TestCase):
         proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16 kB\nMemAvailable: 4 kB\nSwapTotal: 8 kB\nSwapFree: 1 kB\n")
         _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
-        _ = (proc / "boot_id").write_text("test-boot\n")
+        (proc / "sys/kernel/random").mkdir(parents=True, exist_ok=True)
+        _ = (proc / "sys/kernel/random/boot_id").write_text("test-boot\n")
         with patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root),
                                   "BUILDLOG_BUILDS_CGROUP": str(self.root / "absent-builds"),
                                   "BUILDLOG_CI_CGROUP": str(self.root / "absent-ci")}), \
              patch.object(sample, "MEMINFO", proc / "meminfo"), \
              patch.object(sample, "PRESSURE", proc / "pressure"), \
-             patch.object(sample, "BOOT_ID", proc / "boot_id"), \
+             patch.object(sample, "BOOT_ID", proc / "sys/kernel/random/boot_id"), \
              patch.object(sample, "POWER_PROFILE_STATE", state), \
              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["stevie"], 0, "7\n", "")):
             if via_cli:
@@ -433,7 +434,8 @@ class SampleTests(unittest.TestCase):
         proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16384 kB\nMemAvailable: 4096 kB\nSwapTotal: 8192 kB\nSwapFree: 1024 kB\n")
         _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
-        _ = (proc / "boot_id").write_text("d963a34a-50fa-48a8-8485-8b219c45fe02\n")
+        (proc / "sys/kernel/random").mkdir(parents=True, exist_ok=True)
+        _ = (proc / "sys/kernel/random/boot_id").write_text("d963a34a-50fa-48a8-8485-8b219c45fe02\n")
         builds = self.root / "builds.slice"
         ci = self.root / "ci.slice"
         builds.mkdir(parents=True)
@@ -459,7 +461,7 @@ class SampleTests(unittest.TestCase):
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
             "import sample, cli; proc = Path(sys.argv[2]); "
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
-            "sample.BOOT_ID = proc / 'boot_id'; "
+            "sample.BOOT_ID = proc / 'sys/kernel/random/boot_id'; "
             "from unittest.mock import patch; from contextlib import ExitStack; "
             "stack = ExitStack(); "
             "from scripts.lib.cargo_output_test_support import fake_cargo_output_roots; "
@@ -471,7 +473,7 @@ class SampleTests(unittest.TestCase):
             "sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
-            [sys.executable, "-c", command, str(CLI.parent), str(proc)],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command, str(CLI.parent), str(proc)],
             env=environment,
             capture_output=True,
             text=True,

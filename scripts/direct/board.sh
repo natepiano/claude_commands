@@ -230,11 +230,10 @@ pid_is_gone() {
 owned_group_matches() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 1
-  "$BOARD_DIR/../lib/py" - "$dir/owned" "$BOARD_DIR/../lib" <<'PYTHON'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" <<'PYTHON'
 import json
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start, process_start_format
 try:
     record = json.loads(Path(sys.argv[1]).read_text())
@@ -287,7 +286,7 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  "$BOARD_DIR/../lib/py" - "$dir/owned" "$BOARD_DIR/../lib" <<'PY'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" <<'PY'
 from __future__ import annotations
 
 import json
@@ -298,7 +297,6 @@ import time
 
 record = Path(sys.argv[1])
 
-sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
 from scripts.lib.process_start import Started, Zombie, process_start
 
 def identity(pid: int) -> str | None:

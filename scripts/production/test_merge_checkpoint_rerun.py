@@ -33,7 +33,7 @@ def setUpModule() -> None:
 @final
 class CheckpointRerunTests(MergeCheckpointFixture):
     def review_checkpoint(self, *changes: str, unit: str = "alpha") -> tuple[Path, str]:
-        review = self.root / "change-review.md"
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
         return review, self.dated_checkpoint(f"checkpoint({unit}): change\n\n" + "\n".join(
             f"Change-Review: {change}" for change in changes))

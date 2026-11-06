@@ -15,7 +15,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 from git_process import GitExitAnswers, parse_status_z, run_git
 
 import style_ledger
-from scripts.production import session_staff, staff, unit_lookup, unit_names
+from scripts.production import session_staff, staff, unit_lookup
 
 
 @dataclass(frozen=True)
@@ -59,7 +59,7 @@ def _unit_file_sources(owner: staff.StaffRow, resolver: session_staff.RowResolve
                        ) -> tuple[UnitWorktree | UnitFilesWithoutBranches | UnitTicketsOnly, ...]:
     result: list[UnitWorktree | UnitFilesWithoutBranches | UnitTicketsOnly] = []
     for row in resolver.record.find(kind="unit", parent=owner.id):
-        unit = unit_names.unit_id(row.name)
+        unit = row.name
         if isinstance(row.worktree, staff.RemovedWorktree):
             continue
         try:

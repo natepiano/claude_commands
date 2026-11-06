@@ -775,7 +775,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "RUSTUP_HOME": str(self.root / "rustup"),
             # The private toolchain is complete; host Nix discovery is unrelated.
             "IN_NIX_SHELL": "pure",
-            "BUILDLOG_BUILD_BUDGET_GIB": "64",
             "PACKAGE_ROOT": str(self.root),
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),

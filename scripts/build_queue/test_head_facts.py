@@ -551,7 +551,7 @@ class HeadFactsTests(AdmissionLogTests):
             bump_line(NOW - 24, session="runner", step="nextest", folder="/tmp/run", old_position=2),
         ])
         step = gate.RunningStep("runner", "runner", "nextest", "/tmp/run", gate.GIB, gate.MeasuredMemory(gate.GIB), pid=123)
-        running = gate.ExplainedRunningStep(step, NOW - 25, gate.GIB, gate.GIB, gate.GIB, gate.UsingNow(gate.GIB))
+        running = gate.ExplainedRunningStep(step, NOW - 25, gate.GIB, gate.GIB, gate.GIB, owner="123-123")
         facts = self.facts(reading)
         self.assertEqual([record.old_position for record in head_facts.running_moves(facts, running)], [29, 4])
         self.assertEqual(head_facts.running_moves(facts, replace(running, admitted_at=gate.AdmissionTimeNotRecorded())), ())

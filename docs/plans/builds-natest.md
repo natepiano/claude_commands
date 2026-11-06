@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Record each `~/.claude` test run, test module and slow test in the build log, show their history at once with `/test_times`, and make the slowest test modules faster, from the top of a descending sort down.
 
-> **Production: builds** — unit `natest-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 
@@ -1231,3 +1230,35 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the full test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
+### Phase 57 — The merge tip holds the queue stack, and the unit's narrow run is called targeted test  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** One tip holds Phases 34 and 36-54 merged with `origin/builds`, with every conflict resolved. Every name and text that means the unit's narrow run says targeted test, in one change with all callers.
+
+**Spec:**
+1. Merge `origin/builds` in a private clone of this branch. Resolve each conflict so both sides' behavior stays. Read this plan's As-built for the phase on one side and the owner plan for the other side.
+2. Rename, from the user's words "Okay let's use targeted tests and not full tests". `full_test.py` becomes `targeted_test.py`. `test_full_test.py` becomes `test_targeted_test.py`. The step id `full-test` becomes `targeted-test`.
+3. Config keys, approved by the user: `names.targeted-test` is `targeted test`, `prefixes.targeted-test` is `targeted-test-`, and `peak_hold_seconds.targeted-test` is `180`.
+4. Change all text that means the unit's narrow run, in code, config, commands, docs and tests. "Merge gate" stays, with its meaning. A worker must leave no reader of the old names in main code.
+5. Stored records and build folders with the old id or prefix get a one-off program at deploy, if any exist. The director checks live state at the merge and reports.
+6. `build_steps.memory_cap_text` has no step set. The text is `f"{prose} memory cap"`. Update its tests.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:** Every file the merge conflicts in, and every file that holds the old name on the merged tree. The list is in `phases/57/files` of the run.
+
+**Workers:** 2 writers for the conflicts, split by file group. Then 1 writer for the rename, because all sites change together.
+- `impl` — conflicts in `docs/` and `scripts/` outside the build queue, then the rename
+- `impl3` — conflicts in `scripts/build_queue/`, `scripts/build_hold/` and `scripts/lint/`
+
+**Constraints from prior phases:**
+- Phase 36: the unit's run selects modules, and the merge gate runs all modules. The rename changes neither behavior.
+- Phase 48: `names.` holds a step's table word, and `prose.` holds a step's sentence word. Other steps keep their current keys.
+
+**Acceptance gate:**
+- no conflict marker on the merged tree
+- `git grep -n -E 'full[-_ ]test|FULL_TEST|Full test'` finds no old name outside history in `docs/plans/`
+- the targeted test green on the tip, and its time beside the old name's last time
+- `merge_gate.py --tests-only` green on the tip
+- `basedpyright` on the changed Python files prints `0 errors, 0 warnings, 0 notes`

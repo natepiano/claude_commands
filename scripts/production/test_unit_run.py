@@ -21,7 +21,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 SCRIPT = Path(__file__).with_name("unit_run.py")
 REPOSITORY = SCRIPT.resolve().parents[2]
 EPOCH = datetime(2026, 10, 12, tzinfo=timezone.utc).timestamp()
-UNIT = "review-unit"
+UNIT = "review"
 SSH_STUB = r'''
 import json
 import os
@@ -121,7 +121,7 @@ class UnitRunTests(unittest.TestCase):
         })
 
     def run_script(self, *arguments: str, unit: str = UNIT) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.production),
+        return subprocess.run([sys.executable, str(SCRIPT), "--production", "show",
                                unit, *arguments], env=self.environment, capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
@@ -147,7 +147,7 @@ class UnitRunTests(unittest.TestCase):
         owner = next(row for row in staff.snapshot().find(kind="showrunner"))
         _ = fixture_member("unit", name="unfilled", parent=owner.id)
         _ = self.record(self.history, "table-decoy", str(self.worktree), 10)
-        result = self.run_script("--no-mac", unit="unfilled-unit")
+        result = self.run_script("--no-mac", unit="unfilled")
         self.assertEqual(result.returncode, 1)
         self.assertIn("unfilled", result.stderr)
         self.assertEqual(result.stdout, "")
@@ -210,9 +210,9 @@ class UnitRunTests(unittest.TestCase):
         self.assert_match(self.run_script("--no-mac"), "matching", "natedev", 10)
 
     def test_no_staff_row_reports_the_unit_and_does_not_call_ssh(self) -> None:
-        result = self.run_script(unit="absent-unit")
+        result = self.run_script(unit="absent")
         self.assertEqual((result.returncode, result.stdout), (1, ""))
-        self.assertIn("absent-unit", result.stderr)
+        self.assertIn("absent", result.stderr)
         self.assertFalse(self.ssh_log.exists())
 
     def test_no_run_with_no_mac_reports_the_unit_and_worktree(self) -> None:

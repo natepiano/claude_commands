@@ -32,7 +32,6 @@ mkdir -p "$AGENT_NOTES_DIR"
 import json, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import accounts
 from scripts.whoami.account_test_support import write_codex_auth, write_claude_account
 notes = Path.home().parent / "notes"
@@ -206,7 +205,6 @@ assert_equal "fallback followed its caller instead of the workers role" "$HOME/.
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import role_map
 from scripts.whoami.account_test_support import create_claude_account
 create_claude_account("claude4", "route@example.invalid")
@@ -275,6 +273,10 @@ CASES
 
 test_every_claude_print_launch_keeps_agents_and_reports_errors
 
+export CLAUDE_CONFIG_DIR="$HOME/.claude2"
+agents_exec_main direct.simplify readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+assert_equal "simplify replaced the caller account with the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
+
 # The worker's registry-selected Claude path uses the same account.
 export STAFF_FILE="$TEST_DIR/staff.json"
 export AGENT_BG_ROLE=impl
@@ -283,7 +285,6 @@ export FIXTURE_CHECKOUT="$SCRIPT_DIR/../.."
 "$SCRIPT_DIR/../lib/py" - "$TEST_DIR" <<'PYTHON'
 import os, shlex, sys
 from pathlib import Path
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production.staff_test_support import source_environment, unit_membership
 root = Path(sys.argv[1])
 environment = source_environment(root / "sources")
@@ -318,9 +319,8 @@ cat > "$TEST_DIR/bin/claude-bg" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
 printf '%s\n' "${AGENT_BG_WORKERS+set}" > "$TEST_CLAUDE_WORKERS_FLAG_FILE"
-"$HOME/.claude/scripts/lib/py" - <<'PYTHON'
+"$FIXTURE_CHECKOUT/scripts/lib/py" - <<'PYTHON'
 import os, sys
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production.staff_test_support import record_fixture_claude_start
 record_fixture_claude_start(sys.argv[1:])
 PYTHON
@@ -352,7 +352,6 @@ assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(c
 "$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import role_map
 from datetime import datetime, timezone
 role_map.write_role_map(role_map.WorkersClaudeRouteChange(

@@ -2,7 +2,6 @@
 
 # Frozen copies: one helper makes every build copy
 
-> **Production: builds** — unit `verify-unit`; production doc `docs/plans/builds-production.md`
 > **Status:** approved by the user 2026-10-29 (via builds). Phase 1 done: measured 2026-10-30 02:00-02:41 EDT under verify-unit's build hold; the builds showrunner set the target mode to seed on 2026-10-30 (Decision, Verdict). Unit-director survey of the path format closed 23:00 EDT; its answers are in Survey changes.
 
 One helper, `scripts/copies/copies.py` (verify-unit), makes every frozen copy we build in: gate, review, merge and land copies on natedev, and the Mac test mirrors. It names each copy `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, gives it its own git, fills its target by the measured best option, and registers it with the cleanup that already exists.

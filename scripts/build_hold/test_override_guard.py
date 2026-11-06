@@ -162,11 +162,11 @@ class OverrideGuardPythonTests(unittest.TestCase):
             override_guard.require_checkout(checkout)
 
     def test_build_hold_imports_as_a_scripts_package_module(self) -> None:
-        _ = temporary_root(self)
-        environment = child_environment({})
+        root = temporary_root(self)
+        environment = child_environment({"HOME": str(root), "CLAUDE_PYTHON": sys.executable})
         self.assertNotIn("PYTHONPATH", environment)
         result = subprocess.run(
-            [sys.executable, "-c", "from scripts.build_hold import build_hold"],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.build_hold import build_hold"],
             cwd=SCRIPT_DIRECTORY.parent.parent, env=environment,
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )

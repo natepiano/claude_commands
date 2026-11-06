@@ -213,10 +213,6 @@ esac
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_MEMINFO": str(meminfo),
-            # Two 12 GiB fallback promises fit this 48 GiB fixture. The host's
-            # 21 GiB budget would add an unrelated 120-second ramp wait before
-            # the test can observe the token handoff.
-            "BUILDLOG_BUILD_BUDGET_GIB": "48",
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_ZRAM": str(self.root / "zram"),

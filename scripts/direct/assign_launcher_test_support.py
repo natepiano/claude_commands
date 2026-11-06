@@ -141,7 +141,7 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         self.record("start-run", "--working-dir", str(self.project), "--plan-doc", "plan.md",
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "high",
                     "--main-session-id", owner.current_session)
-        self.record("set-unit", "--production", "fixture-production", "--unit", "fixture-unit")
+        self.record("set-unit", "--production", "fixture-production", "--unit", "fixture")
         self.record("start-phase", "--phase-id", "7", "--phase-title", "Assignment core")
         self.claims = []
         self.reservations = []

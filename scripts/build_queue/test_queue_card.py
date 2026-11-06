@@ -66,8 +66,7 @@ class QueueCardTests(QueueFixtureTests):
                 (head_path, {**head, "need": 21 * gate.GIB, "priority_since": NOW - 60}),
                 (follower_path, {**follower, "need": 10 * gate.GIB}),
             ])
-        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(3 * gate.GIB),
-                                       policy=admission_policy_fixture())
+        reading = gate.queue_read_from(inputs, policy=admission_policy_fixture())
         self.assertEqual([step.pid for step in reading.view.waiting], [token["pid"], head["pid"], follower["pid"]])
         self.assertIsInstance(reading.view.waiting[2].reason, gate.BehindHead)
         self.assertEqual(queue_view.reason_phrase(reading.view.waiting[2].reason, reading.view.waiting), "behind #2")
@@ -88,8 +87,11 @@ class QueueCardTests(QueueFixtureTests):
     def test_behind_head_check_survives_missing_optional_head_facts(self) -> None:
         model = self.fixture.model()
         follower = replace(model.reading.view.waiting[1], reason=gate.BehindHead("head", NOW - 600, "head-id"))
-        waiting = (model.reading.view.waiting[0], follower, *model.reading.view.waiting[2:])
-        reading = queue_read_fixture(replace(model.reading.view, waiting=waiting),
+        head = model.reading.view.waiting[0]
+        available = 16 * gate.GIB
+        waiting = (replace(head, reason=gate.NeedsMemory(head.need, available)),
+                   follower, *model.reading.view.waiting[2:])
+        reading = queue_read_fixture(replace(model.reading.view, waiting=waiting, available=available),
                                      policy=model.reading.explanation.policy)
         model = replace(model, facts=gate.NoWaiter(), reading=reading,
                         release=gate.smallest_head_release(reading.explanation))
@@ -147,8 +149,7 @@ class QueueCardTests(QueueFixtureTests):
                  "since": NOW - 60, "order_since": NOW - 600}
         second = {**second, "priority_since": 0, "priority_rank": 1,
                   "since": NOW - 300}
-        reading = gate.queue_read_from(replace(inputs, ordered=[(first_path, first), (second_path, second)]),
-            gate.resolve_admission_limits(gate.read_memory_config()), policy=admission_policy_fixture())
+        reading = gate.queue_read_from(replace(inputs, ordered=[(first_path, first), (second_path, second)]), policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_selection(model, "2", 400))
         selected = text.split("\nHost:", 1)[0]
@@ -160,7 +161,7 @@ class QueueCardTests(QueueFixtureTests):
         inputs = self.fixture.inputs(policy=admission_policy_fixture())
         path, row = inputs.ordered[1]
         reading = gate.queue_read_from(replace(inputs, ordered=[inputs.ordered[0],
-            (path, {**row, "estimated_at": NOW - 600})]), gate.resolve_admission_limits(gate.read_memory_config()), policy=admission_policy_fixture())
+            (path, {**row, "estimated_at": NOW - 600})]), policy=admission_policy_fixture())
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [2], 400))
         self.assertIn("✗ estimate       the estimate expired at 10:36; the client refreshes it through the admission service", text)
@@ -176,9 +177,7 @@ class QueueCardTests(QueueFixtureTests):
             running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB, anonymous=gate.AnonymousRunUse(gate.GIB))),),
             reservations=({**inputs.reservations[0], "need": gate.GIB},), ordered=[
                 (path, {**head, "need": 15 * gate.GIB}),
-                (follower_path, {**follower, "need": gate.GIB})]),
-                gate.resolve_admission_limits(gate.read_memory_config()),
-                policy=admission_policy_fixture())
+                (follower_path, {**follower, "need": gate.GIB})]), policy=admission_policy_fixture())
         self.assertIsInstance(reading.view.waiting[1].reason, gate.BehindHead)
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [2], 400))
@@ -295,7 +294,7 @@ class QueueCardTests(QueueFixtureTests):
         from unittest import mock
         release = gate.smallest_head_release(model.reading.explanation)
         with mock.patch.object(gate, "smallest_head_release", return_value=release), \
-             mock.patch.object(gate, "decide", side_effect=AssertionError("card recalculated admission")):
+             mock.patch.object(gate, "admission_pass", side_effect=AssertionError("card recalculated admission")):
             text = plain(queue_card.render_card(model, [5], 400))
         self.assertIn(queue_evidence.room_check_text(follower.room), text)
         self.assertNotIn("Build budget:", text)
