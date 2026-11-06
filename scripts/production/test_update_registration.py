@@ -321,7 +321,7 @@ class QuestionIdentityTests(RegistrationFixture):
         _ = proposal.write_text("---\nstatus: open\ntags: [proposal]\n---\nKeep this proposal.\n")
         before = proposal.read_bytes()
         _ = self.doc.write_text(self.doc.read_text() + "\n> **Status: PRODUCTION — wrapped.** Complete.\n")
-        shutil.rmtree(self.state / "notifier/showrunner-example")
+        shutil.rmtree(self.state / f"notifier/showrunner-{self.fixture_staff_id()}")
         with (self.forbid_legacy_question_access(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner"),
               mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.state / "notifier"),
@@ -637,7 +637,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         owner = staff.snapshot().by_doc("natedev", self.doc)
         assert owner is not None
-        timer = self.state / "notifier/showrunner-example"
+        timer = self.state / f"notifier/showrunner-{self.fixture_staff_id()}"
         shutil.rmtree(timer)
         _ = staff.rename(owner.id, "different-display-name")
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):

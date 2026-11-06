@@ -520,7 +520,7 @@ def observed_session_labels(*, record: staff.StaffSnapshot | None = None, runnin
     """Read native process identities for stop and cleanup checks."""
     try:
         record = record if record is not None else staff.snapshot()
-        processes = herdr.herdr_processes(membership=StaffLabels(record, {}, {}))
+        processes = herdr.herdr_processes(membership=StaffLabels(record))
         claudes, unread = _claudes(processes, running=running)
         return tuple(_herdr_labeled(claudes, unread, processes))
     except herdr.HerdrFailure as error:

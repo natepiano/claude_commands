@@ -717,7 +717,7 @@ class LaunchMembership:
         return cls(record, member_sources(record=record))
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
-        labels = StaffLabels(self.record, self.sources.productions, self.sources.showrunner_members(self.record))
+        labels = StaffLabels(self.record)
         owner = self.record.by_member_reference(launch["session_id"])
         session_id = owner.current_session if owner is not None else launch["session_id"]
         return labels.environment(launch["environment"], session_id)

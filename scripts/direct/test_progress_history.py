@@ -157,6 +157,38 @@ class ProgressHistoryTests(unittest.TestCase):
             _ = before.pop(key, None)
         self.assertEqual(after, before)
 
+    def test_set_unit_selects_the_staff_name_when_another_document_uses_that_name(self) -> None:
+        run = self.start_run("staff-name-owner", 1760658000)
+        hana = fixture_member("showrunner", name="hana",
+                              doc=staff.LiveDoc("natedev", self.root / "tool-based-ui-production.md"))
+        _ = fixture_member("unit", name="alpha-unit", parent=hana.id)
+        owner = fixture_member("showrunner", name="tool-based-ui",
+                               doc=staff.LiveDoc("natedev", self.root / "other-production.md"))
+        unit = fixture_member("unit", name="alpha-unit", parent=owner.id)
+        _ = self.run_command("set-unit", "--session-dir", str(run), "--production", "tool-based-ui",
+                             "--unit", "alpha", at=1760658001)
+        state = cast(dict[str, object], json.loads((run / "progress_history_state.json").read_text()))
+        self.assertEqual(state[unit_runs.OWNER_FIELD], unit.id)
+
+    def test_set_unit_does_not_select_a_showrunner_by_its_document_name(self) -> None:
+        run = self.start_run("document-name-owner", 1760658000)
+        owner = fixture_member("showrunner", name="hana",
+                               doc=staff.LiveDoc("natedev", self.root / "tool-based-ui-production.md"))
+        _ = fixture_member("unit", name="alpha-unit", parent=owner.id)
+        path = run / "progress_history_state.json"
+        before = path.read_bytes()
+        environment = os.environ.copy()
+        self.isolate_recorder_roots(environment)
+        self.isolate_identity(environment)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "set-unit", "--session-dir", str(run),
+             "--production", "tool-based-ui", "--unit", "alpha"],
+            env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tool-based-ui/alpha: no unique unit staff row", result.stderr)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
         append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
         history = self.root / "sync-event.jsonl"

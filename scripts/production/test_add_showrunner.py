@@ -86,6 +86,16 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
 
 
 class AddShowrunnerTests(AddShowrunnerFixture):
+    def test_existing_showrunner_uses_its_staff_document_when_given_another_document(self) -> None:
+        document = self.doc("kid")
+        owner = fixture_member("showrunner", name="kid", doc=staff.LiveDoc("natedev", document))
+        unrelated = self.doc("unrelated")
+        result = self.run_command("kid", "--doc", str(unrelated), "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"would start kid in {self.root / 'kid-checkout'}", result.stdout)
+        self.assertNotIn(str(self.root / "unrelated-checkout"), result.stdout)
+        self.assertEqual(staff.by_id(owner.id), owner)
+
     def test_new_showrunner_and_missing_parent_are_admitted_with_their_live_docs(self) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")

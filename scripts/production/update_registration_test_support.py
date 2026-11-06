@@ -275,14 +275,14 @@ class RegistrationFixture(unittest.TestCase):
 
     def timer(self, name: str) -> None:
         """A production with a complete update timer, so the tree counts it."""
-        instance = self.state / "notifier" / f"showrunner-{name}"
-        instance.mkdir(parents=True)
-        document = self.document_for(name)
+        _ = self.document_for(name)
         row_id = self.fixture_staff_id(name=name)
         row = staff.by_id(row_id)
         assert row is not None
+        instance = self.state / "notifier" / f"showrunner-{row.id}"
+        instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {document}\n", encoding="utf-8")
+            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {row.id}\n", encoding="utf-8")
         showrunner_launch(row, row.id, self.env)
 
     def attach(self, child: str, parent: str) -> None:

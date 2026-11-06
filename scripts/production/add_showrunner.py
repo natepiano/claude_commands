@@ -259,13 +259,15 @@ def _main(argv: list[str]) -> int:
         parser.error("--resume and --cwd go together")
     caller = showrunners.own_name()
     try:
+        record = staff.initial_snapshot()
+        name = cast(str, args.production)
         doc = cast(Path | None, args.doc)
-        child = read_new_production(doc, cast(str, args.production)) if doc else read_production(cast(str, args.production))
+        existing = any(row.kind == "showrunner" and (row.name == name or row.id == name) for row in record.rows)
+        child = read_new_production(doc, name) if doc and not existing else read_production(name, record=record)
         where = cwd or child.checkout
         selected = account_for_launch(child, resume, cast(str, args.account), cast(str, args.config_dir))
         identity = ShowrunnerLaunch(resume or "", selected.dir, datetime.now(UTC))
         place: herdr.HerdrPlace | herdr.NotInHerdr = herdr.NotInHerdr()
-        record = staff.initial_snapshot()
         owner = record.by_doc(local_machine(), child.doc)
         saved: completion_receipt.OwnedReceipt | completion_receipt.UnpublishedReceipt | completion_receipt.NoReceipt = completion_receipt.NoReceipt()
         if owner is not None:

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import io
+from contextlib import redirect_stderr
 import shlex
 import subprocess
 import sys
@@ -17,12 +19,22 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_runtime
 
 
 class NativeSessionLabelTests(StaffTestCase):
+    def test_labels_use_staff_without_reading_an_unreadable_timer_document(self) -> None:
+        fixture = self.row_production()
+        fixture.doc.unlink()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            labels = session_labels.StaffLabels.for_record(staff.snapshot())
+        self.assertEqual(labels.environment({}, fixture.unit.current_session),
+                         {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session})
+        self.assertEqual(errors.getvalue(), "")
+
     def test_runtime_identity_selects_the_current_member_and_removes_copied_labels(self) -> None:
         _, unit, worker = self.tree()
         current = staff.native_id(fixture_runtime_id("label-unit-after-clear"))
         unit = staff.update_current_session(unit.current_session, current)
         self.assertNotEqual(unit.id, unit.current_session)
-        labels = session_labels.StaffLabels(staff.snapshot(), {}, {})
+        labels = session_labels.StaffLabels(staff.snapshot())
         environment = {"STAFF_ID": worker.id, "SHOWRUNNER_" + "UNIT_ID": "models-unit"}
         selected = labels.environment(environment, unit.current_session)
         self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": unit.current_session})
@@ -48,7 +60,7 @@ class NativeSessionLabelTests(StaffTestCase):
     def test_unknown_runtime_is_not_assigned_by_its_unique_folder_or_display_name(self) -> None:
         runner, unit, _ = self.tree()
         located = replace(unit, worktree=staff.PresentWorktree("natedev", self.root))
-        labels = session_labels.StaffLabels(staff.StaffSnapshot((runner, located)), {}, {})
+        labels = session_labels.StaffLabels(staff.StaffSnapshot((runner, located)))
         before = self.staff_file.read_bytes()
         selected = labels.environment({"STAFF_ID": unit.id}, fixture_runtime_id("unpublished"))
         self.assertNotIn("CLAUDE_CODE_SESSION_ID", selected)

@@ -33,7 +33,7 @@ def write_timer(notifier_dir: Path, production_name: str, session_id: str, zone:
     if zone and "- **User zone:** " not in held:
         _ = path.write_text(f"- **User zone:** {zone}\n{held}", encoding="utf-8")
     _ = (instance / "conf").write_text(
-        f"TARGET=session:{row.id}\nPROMPT_FILE={prompt}\nCHECK=zsh /scripts/production_check.sh {doc}\n",
+        f"TARGET=session:{row.id}\nPROMPT_FILE={prompt}\nCHECK=zsh /scripts/production_check.sh {row.id}\n",
         encoding="utf-8")
     return instance
 

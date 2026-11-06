@@ -4,7 +4,7 @@ Usage: counts_row.py <notifier instance dir>
 
 statusline.sh runs this only when the cache is older than a file it was read from, or a deferred
 question has fallen due, so a render runs no Python while nothing changed. The cache is
-`<showrunner state>/counts/<name>`:
+`<showrunner state>/counts/<staff id>`:
 
   line 1  the counts line, empty when nothing is counted;
   line 2  the epoch second the soonest deferred question falls due, empty when none is deferred;

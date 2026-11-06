@@ -441,8 +441,7 @@ def _set_owner(state: dict[str, object], production: str, unit: str) -> None:
         return
     record = staff.initial_snapshot()
     parents = {row.id for row in record.find(kind="showrunner")
-               if row.name == production or (isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
-                   and row.doc.path.name.removesuffix("-production.md") == production)}
+               if row.name == production}
     matches = [row for row in record.find(kind="unit")
                if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents and row.name.removesuffix("-unit") == unit.removesuffix("-unit")]
     if len(matches) != 1:

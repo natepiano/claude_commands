@@ -365,6 +365,21 @@ class InventoryTests(ShutdownTestCase):
                     self.assertEqual(light.doc, str(self.root / "build-followups-production.md"))
                     self.assertNotIn("doc", session["host"])
 
+    def test_registration_reads_the_folder_owner_document_from_one_staff_snapshot(self) -> None:
+        doc = self.root / "document-name-differs.md"
+        _ = doc.write_text("# Production\n", encoding="utf-8")
+        owner = recorded_showrunner("staff-name", doc)
+        other = recorded_showrunner("other-owner", self.root / "other-document.md")
+        folder = self.notifier / f"showrunner-{owner.id}"
+        folder.mkdir()
+        _ = (folder / "conf").write_text(
+            f"TARGET=session:{owner.id}\nCHECK=zsh /opt/production_check.sh {other.id}\n", encoding="utf-8")
+        with patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            registrations = inventory.showrunner_registrations()
+        found = next(item for item in registrations.entries if item.name == owner.name)
+        self.assertEqual(found.doc, str(doc))
+        self.assertEqual(reads.call_count, 1)
+
     def test_listing_and_absent_target_check_share_timer_reads_without_resolving_sockets(self) -> None:
         stale_doc = self.root / "stale-production.md"
         owner = recorded_showrunner("stale", stale_doc)
@@ -372,11 +387,11 @@ class InventoryTests(ShutdownTestCase):
         stale.mkdir()
         _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         _ = (stale / "conf").write_text(
-            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {owner.id}\n",
             encoding="utf-8")
         with (patch.object(showrunners, "socket_for", side_effect=AssertionError("listing probed a messaging socket")),
               patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("listing resolved showrunner messaging")),
-              patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as checked):
+              patch.object(inventory, "_conf", wraps=getattr(inventory, "_conf")) as checked):
             registrations = inventory.showrunner_registrations()
             listed = inventory.listing(registrations=registrations)
             missing = inventory.unregistered_showrunners(listed, registrations=registrations)
@@ -795,13 +810,14 @@ elif "comm=" in joined:
         _ = staff.update_current_session(member.current_session, staff.StaffId(UNIT_ID))
         production_doc = self.root / "build-followups-production.md"
         _ = production_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
-        showrunner = self.notifier / "showrunner-build-followups"
+        _ = staff.set_doc(parent.id, staff.LiveDoc("natedev", production_doc))
+        showrunner = self.notifier / f"showrunner-{parent.id}"
         showrunner.mkdir()
         _ = (showrunner / "conf").write_text(
             "\n".join(
                 (
                     f"TARGET=session:{DIRECTOR_ID}",
-                    f"CHECK=zsh /opt/production_check.sh {production_doc}",
+                    f"CHECK=zsh /opt/production_check.sh {parent.id}",
                     "",
                 )
             ),
@@ -903,7 +919,9 @@ elif "comm=" in joined:
         self.assertEqual(
             director["model"], {"kind": "model", "name": "director-model"}
         )
-        self.assertEqual(director["timers"], ["showrunner-build-followups"])
+        owner = staff.snapshot().by_current_session(DIRECTOR_ID)
+        assert owner is not None
+        self.assertEqual(director["timers"], [f"showrunner-{owner.id}"])
         self.assertEqual(director["host"]["kind"], "ghostty")
         self.assertEqual(
             director["host"].get("desktop"),
@@ -1111,7 +1129,7 @@ elif "comm=" in joined:
         stale.mkdir()
         _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         _ = (stale / "conf").write_text(
-            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {owner.id}\n",
             encoding="utf-8")
         self.assertEqual({runner["name"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
 

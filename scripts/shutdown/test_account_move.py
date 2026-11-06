@@ -208,6 +208,8 @@ class AccountMoveTests(ShutdownTestCase):
     def test_group_preview_starts_in_a_fresh_process_without_prior_shutdown_imports(self) -> None:
         environment = {
             "HOME": str(self.root),
+            "STAFF_FILE": os.environ["STAFF_FILE"],
+            "STAFF_CONFIG": os.environ["STAFF_CONFIG"],
             "PATH": os.defpath,
             "CONF_DIR": os.environ["CONF_DIR"],
             "AGENT_NOTES_DIR": str(self.root / "notes"),
@@ -441,9 +443,9 @@ class AccountMoveTests(ShutdownTestCase):
         runner.mkdir(parents=True)
         _ = doc.write_text("- **User zone:** America/New_York\n", encoding="utf-8")
         _ = (runner / "conf").write_text(
-            f"TARGET=session:absent-session\nCHECK=zsh /opt/production_check.sh {doc}\n", encoding="utf-8")
+            f"TARGET=session:absent-session\nCHECK=zsh /opt/production_check.sh {owner.id}\n", encoding="utf-8")
         with (patch.object(inventory, "listing", return_value=[]),
-              patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as checked,
+              patch.object(inventory, "_conf", wraps=getattr(inventory, "_conf")) as checked,
               patch.object(showrunners, "socket_for", side_effect=AssertionError("preview resolved a socket")),
               patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("preview resolved showrunners")),
               patch.object(inventory, "inventory", side_effect=AssertionError("registration check inventories"))):

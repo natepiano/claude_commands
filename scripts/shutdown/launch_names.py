@@ -86,8 +86,7 @@ class LaunchNames:
 
         membership = self.membership
         if isinstance(membership, session_staff.LaunchMembership):
-            return StaffLabels(membership.record, membership.sources.productions,
-                               membership.sources.showrunner_members(membership.record))
+            return StaffLabels(membership.record)
         return pane_launch.StaffLabelsRead.UNAVAILABLE
 
     @classmethod

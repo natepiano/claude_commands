@@ -678,7 +678,7 @@ class StaffTestCase(unittest.TestCase):
         timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{row.id}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
         identity = row.id
-        write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
+        write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {row.id}\n")
 
     def record_production(self, production_name: str, doc: Path) -> staff.StaffRow:
         """Register the timer and record its private owner document."""
@@ -762,7 +762,7 @@ class StaffTestCase(unittest.TestCase):
         timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.id}" / "conf"
         timer.parent.mkdir(parents=True)
         write_text_atomic(timer, f"TARGET=session:{runner.id}\n"
-                          + f"CHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
+                          + f"CHECK=zsh /fixture/production_check.sh {runner.id}\n")
         return RowProductionFixture(runner, unit, worker, doc, folder, runner.name)
 
     def separated_unit_folders(self) -> RowProductionFixture:

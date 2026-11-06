@@ -30,7 +30,6 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/astra/design_roles.py` | read | runtime_id |
 | `scripts/bevy_upgrade/bevy_upgrade.py` | read | snapshot |
 | `scripts/bevy_upgrade/cli_test_support.py` | write | native_id, update_current_session |
-| `scripts/bevy_upgrade/migrate_bevy_watch.py` | read | operation, snapshot |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
@@ -99,6 +98,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/proposal_issue.py` | read | snapshot, StaffId |
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
+| `scripts/production/prune_phase_notes.py` | read | snapshot |
 | `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, set_doc, snapshot |
 | `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |

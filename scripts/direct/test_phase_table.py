@@ -3392,49 +3392,6 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(unreadable_show.returncode, 1)
         self.assertIn(str(missing_plan), unreadable_show.stderr)
 
-    def test_migration_reports_unknown_names_and_preserves_body_and_mode(self) -> None:
-        self.write_production_plan()
-        path = self.vault_root / "runner" / "legacy.md"
-        path.parent.mkdir(parents=True)
-        body = "# Saved phase\n\n| 1 | done |\n"
-        _ = path.write_text("---\nphase_table: true\nshowrunner: runner\nproduction: show\nproduction_file: \"[[docs/show-production]]\"\nunit: table-unit\n---\n" + body)
-        path.chmod(0o640)
-        unknown = path.with_name("unknown.md")
-        _ = unknown.write_text("---\nphase_table: true\nproduction: show\nunit: missing-unit\n---\n")
-        before = unknown.read_bytes()
-        with patch.dict(os.environ, self.environment()):
-            changed, unresolved = phase_table.migrate_notes(self.vault_root)
-            self.assertEqual(changed, [path])
-            self.assertEqual(unresolved, [unknown])
-            self.assertEqual(phase_table.migrate_notes(self.vault_root), ([], [unknown]))
-        self.assertEqual(unknown.read_bytes(), before)
-        self.assertTrue(path.read_text().endswith(body))
-        self.assertIn(f"unit: {self.unit_id()}", path.read_text())
-        self.assertNotIn("production_file:", path.read_text())
-        self.assertNotIn("showrunner:", path.read_text())
-        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
-
-    def test_migration_resumes_after_first_file_and_current_session_change(self) -> None:
-        self.write_production_plan()
-        folder = self.vault_root / "runner"
-        folder.mkdir(parents=True)
-        for name in ("a", "b"):
-            _ = (folder / f"{name}.md").write_text("---\nphase_table: true\nproduction: show\nunit: table-unit\n---\n# Saved\n")
-        replace_file = os.replace
-        def interrupt(source: str, target: Path) -> None:
-            replace_file(source, target)
-            raise InterruptedError("Stopped after the first file")
-        with patch.dict(os.environ, self.environment()):
-            with patch.object(os, "replace", side_effect=interrupt):
-                with self.assertRaises(InterruptedError):
-                    _ = phase_table.migrate_notes(self.vault_root)
-            unit = unit_membership("show", "table-unit")
-            _ = staff.update_current_session(unit.id, staff.StaffId("11111111-1111-4111-8111-111111111111"))
-            self.assertEqual(phase_table.migrate_notes(self.vault_root), ([folder / "b.md"], []))
-            contents = [path.read_bytes() for path in sorted(folder.glob("*.md"))]
-            self.assertEqual(contents[0], contents[1])
-            self.assertEqual(phase_table.migrate_notes(self.vault_root), ([], []))
-
     def test_note_follows_staff_rename_and_transfer_without_rewrite(self) -> None:
         self.write_production_plan()
         path = self.write_phase_note("runner", "table", "show", "table-unit")

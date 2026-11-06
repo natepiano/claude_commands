@@ -791,59 +791,6 @@ class BoardJsonTests(unittest.TestCase):
         assert changed is not None
         self.assertEqual(changed.current_session, current)
 
-    def test_cache_migration_resumes_after_first_file_and_preserves_unknown_files(self) -> None:
-        _ = self.production("first", running=False)
-        _ = self.production("second", running=False)
-        self.output.mkdir()
-        for name in ("first", "second", "unknown"):
-            _ = (self.output / f"{name}.json").write_text(name)
-        record = staff.snapshot()
-        real_unlink = Path.unlink
-        calls = 0
-
-        def interrupt(source: Path, missing_ok: bool = False) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise OSError("migration interrupted")
-            real_unlink(source, missing_ok=missing_ok)
-
-        with self.source_readers(), patch.object(Path, "unlink", interrupt):
-            with self.assertRaisesRegex(OSError, "migration interrupted"):
-                _ = board_json.migrate_cache(self.output, record)
-        self.assertEqual(self.invoke("--migrate-cache").returncode, 1)
-        self.assertEqual((self.output / "unknown.json").read_text(), "unknown")
-        self.assertEqual(self.cache_path("first").read_text(), "first")
-        self.assertEqual(self.cache_path("second").read_text(), "second")
-        self.assertFalse((self.output / "first.json").exists())
-        self.assertFalse((self.output / "second.json").exists())
-        (self.output / "unknown.json").unlink()
-        before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in self.output.iterdir()}
-        result = self.invoke("--migrate-cache")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(before, {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in self.output.iterdir()})
-        clean = self.root / "clean-cache"
-        clean.mkdir()
-        for name in ("first", "second"):
-            _ = (clean / f"{name}.json").write_text(name)
-        with self.source_readers():
-            self.assertEqual(board_json.migrate_cache(clean, record), 0)
-        self.assertEqual({path.name: path.read_bytes() for path in clean.iterdir()},
-                         {path.name: path.read_bytes() for path in self.output.iterdir()})
-
-    def test_cache_migration_refuses_to_replace_a_different_staff_cache(self) -> None:
-        _ = self.production(running=False)
-        self.output.mkdir()
-        source = self.output / "show.json"
-        _ = source.write_text("old")
-        target = self.cache_path("show")
-        _ = target.write_text("current")
-        with self.source_readers():
-            with self.assertRaisesRegex(FileExistsError, "staff cache already differs"):
-                _ = board_json.migrate_cache(self.output, staff.snapshot())
-        self.assertEqual(source.read_text(), "old")
-        self.assertEqual(target.read_text(), "current")
-
     def test_each_pass_kind_has_its_user_facing_stage(self) -> None:
         fixture = self.production()
         for kind, label in (("impl", "Build"), ("test", "Tests"), ("review", "Review"),

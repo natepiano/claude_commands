@@ -475,13 +475,14 @@ print(observed.row.id)
             _ = unit_membership("new", name)
         doc = self.root / "new-production.md"
         _ = doc.write_text("# Production\n")
+        owner = recorded_showrunner("new", doc)
         state = self.root / "showrunner-state"
         _ = self.enterContext(mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state))
         self.environment["SHOWRUNNER_STATE_DIR"] = str(state)
         instance = self.root / f"notifier/showrunner-{showrunner_relationship('new').id}"
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{showrunner_relationship('new').id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=zsh /scripts/production_check.sh {owner.id}\n")
 
     def process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
         fake_unit_host.process(self.environment, pid, parent, argv, environment, cwd=self.root)
@@ -600,10 +601,12 @@ print(observed.row.id)
         self.renamed_production()
         self.hosts({"$1": labeled("current", "w4:p1", "trunk", production_name="new")})
         self.claude("current", "w4:p1")
-        with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
-            checked = showrunners.checked_doc(self.root / f"notifier/showrunner-{showrunner_relationship('new').id}")
-            self.assertIsInstance(checked, showrunners.CheckedDoc)
-            found = unit_lookup.every_labeled_session()
+        sources = unit_lookup.member_sources()
+        with mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads:
+            source = showrunners.read_sources(self.root / "notifier",
+                unreadable=showrunners.UnreadableTimerPolicy.STRICT, record=staff.snapshot())[0]
+            self.assertIsInstance(source, showrunners.ShowrunnerSource)
+            found = unit_lookup.every_labeled_session(sources=sources)
             self.assertEqual(list(found.units["new"]), ["trunk"])
             self.assertEqual(reads.call_count, 1, "current marks must not reread already inventoried timers")
 
@@ -611,8 +614,9 @@ print(observed.row.id)
         self.renamed_production()
         self.hosts({"$1": labeled("current", "w4:p1", "trunk", production_name="new")})
         self.claude("current", "w4:p1")
-        with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
-            found = unit_lookup.labeled_sessions("new")
+        sources = unit_lookup.member_sources()
+        with mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads:
+            found = unit_lookup.labeled_sessions("new", sources=sources)
             self.assertEqual(found["trunk"].place, herdr.HerdrPlace("current", "w4:p1"))
             self.assertEqual(reads.call_count, 0)
 

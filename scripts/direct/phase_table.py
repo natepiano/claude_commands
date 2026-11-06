@@ -1881,46 +1881,6 @@ def owned_notes(production: str, unit: str) -> list[Path]:
             if _owns_note(_note_ownership(candidate), identity, unit)]
 
 
-def migrate_notes(vault_root: Path) -> tuple[list[Path], list[Path]]:
-    """Replace legacy note fields with the staff id. Report unresolved notes."""
-    changed: list[Path] = []
-    unresolved: list[Path] = []
-    for path in sorted(vault_root.glob("*/*.md")):
-        with _phase_note_lock(path.parent):
-            before = path.read_text(encoding="utf-8")
-            lines = before.splitlines(keepends=True)
-            if not lines or lines[0].strip() != "---":
-                continue
-            end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), 0)
-            fields = dict(line.strip().split(":", 1) for line in lines[1:end] if ":" in line)
-            fields = {key.strip(): value.strip() for key, value in fields.items()}
-            if fields.get("phase_table") != "true":
-                continue
-            record = staff.snapshot()
-            unit = fields.get("unit", "")
-            row = record.by_id(staff.StaffId(unit))
-            if row is None:
-                production = fields.get("production", "")
-                owners = [owner for owner in record.find(kind="showrunner") if owner.name == production]
-                matches = [member for owner in owners for member in record.find(kind="unit", parent=owner.id)
-                           if member.name == unit_names.name(unit)]
-                row = matches[0] if len(matches) == 1 else None
-            if row is None or row.kind != "unit":
-                unresolved.append(path)
-                continue
-            header = [line for line in lines[1:end]
-                      if line.partition(":")[0].strip() not in {"unit", "showrunner", "production_file", "production"}]
-            newline = "\r\n" if lines[0].endswith("\r\n") else "\n"
-            after = "".join([lines[0], *header, f"unit: {row.id}{newline}", *lines[end:]])
-            if after != before:
-                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-                    _ = handle.write(after)
-                    os.fchmod(handle.fileno(), path.stat().st_mode & 0o7777)
-                os.replace(handle.name, path)
-                changed.append(path)
-    return changed, unresolved
-
-
 def refresh(session_dir: Path) -> None:
     """Rewrite a production unit's generated phase note, when it has one."""
     resolver = session_staff.RowResolver(staff.snapshot())
@@ -1991,8 +1951,6 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = prune_parser.add_argument("--production-doc", type=Path, required=True)
     archive_parser = commands.add_parser("archive")
     _ = archive_parser.add_argument("--production-doc", type=Path, required=True)
-    migration = commands.add_parser("migrate-notes")
-    _ = migration.add_argument("--vault-root", type=Path, required=True)
     return parser
 
 
@@ -2008,14 +1966,6 @@ def main() -> int:
     production_doc = production_value if isinstance(production_value, Path) else None
     zone_name = zone_value if isinstance(zone_value, str) else ""
     try:
-        if command == "migrate-notes":
-            vault = cast(Path, args.vault_root)
-            changed, unresolved = migrate_notes(vault.expanduser().resolve())
-            for path in changed:
-                print(f"migrated: {path}")
-            for path in unresolved:
-                print(f"unresolved: {path}", file=sys.stderr)
-            return 1 if unresolved else 0
         if command == "refresh":
             refresh(session_dir.expanduser().resolve())
             return 0

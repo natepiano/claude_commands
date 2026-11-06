@@ -28,7 +28,6 @@ from scripts.production.production_doc import Production, Refusal, read_producti
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup, unit_names
-from scripts.production.session_labels import StaffLabels
 from proposals_folder import issues_folder
 from scripts.production.store_owner import document_id, showrunner_id
 from issues import Issue, frontmatter
@@ -278,7 +277,6 @@ class QuestionStaff:
 
     record: staff.StaffSnapshot
     sources: session_staff.MemberSources
-    labels: StaffLabels
 
     @classmethod
     def read(cls) -> QuestionStaff:
@@ -290,7 +288,7 @@ class QuestionStaff:
         if sources is None:
             dependencies = staff.RecordInputs()
             sources = session_staff.member_sources(dependencies=dependencies, record=record)
-        return cls(record, sources, StaffLabels(record, sources.productions, sources.showrunner_members(record)))
+        return cls(record, sources)
 
     def owner(self, document: Path) -> staff.StaffRow:
         """Select the production owner from the command's staff snapshot."""

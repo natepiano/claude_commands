@@ -172,7 +172,8 @@ class TidyWrappedTests(unittest.TestCase):
             read_context.assert_called_once_with()
             self.assertEqual(owned.call_count, 2)
             for call in owned.call_args_list:
-                self.assertIs(cast(object, call.kwargs["identities"]), identities)
+                owner = cast(staff.StaffRow, call.args[0])
+                self.assertIs(owner, identities.record.by_id(owner.id))
         self.assertFalse(any(path.exists() for path in paths))
 
     def test_wrap_closes_and_retains_questions_without_a_proposals_line(self) -> None:
@@ -301,13 +302,26 @@ class TidyWrappedTests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
                 self.assertTrue(all(path.exists() for path in own))
 
-    def test_a_production_name_naming_a_shared_folder_deletes_nothing(self) -> None:
-        own = self.state_files("live")
-        doc = self.doc("outstanding", "wrapped")
-        result = self.run_tidy(doc)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("'outstanding' is not a production name", result.stderr)
-        self.assertTrue(all(path.exists() for path in own))
+    def test_a_staff_name_matching_a_shared_folder_removes_only_its_owned_state(self) -> None:
+        shared = [self.write(self.state / name / "keep", "shared state\n")
+                  for name in ("footers-off", "review-paused", "outstanding", "counts", "reports")]
+        other = self.state_files("live")
+        for path in shared:
+            with self.subTest(name=path.parent.name):
+                name = path.parent.name
+                owner = self.owner(name)
+                own = (*self.state_files(name), *(self.write(path, "state\n") for path in (
+                    self.state / "outstanding" / f"{owner.id}.answered.jsonl",
+                    self.state / "outstanding" / f"{owner.id}.history.jsonl",
+                    self.state / "outstanding" / f"{owner.id}.lock",
+                    self.state / "counts" / owner.id,
+                    self.state / "reports" / f"{owner.id}.json")))
+                result = self.run_tidy(self.doc(name, "wrapped"))
+                self.assertEqual((result.returncode, result.stderr), (0, ""), result.stdout + result.stderr)
+                self.assertFalse(any(path.exists() for path in own))
+                self.assertTrue(all(path.exists() for path in other))
+                self.assertTrue(all(path.parent.is_dir() for path in shared))
+                self.assertEqual([path.read_text() for path in shared], ["shared state\n"] * len(shared))
 
     def test_a_refused_doc_does_not_stop_the_next(self) -> None:
         kept = self.state_files("live")

@@ -7,7 +7,6 @@ import json
 import math
 from time import monotonic
 import os
-import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -141,24 +140,11 @@ def _registration(instance: Path, record: staff.StaffSnapshot, *,
     return TimerRegistration(owner.name, f"session:{owner.id}", user_zone_name())
 
 
-def timer_for(row: staff.StaffRow, snapshot: staff.StaffSnapshot, *,
-              sources: Iterable[ShowrunnerSource] | None = None) -> TimerRegistration | NoTimer:
+def timer_for(row: staff.StaffRow, snapshot: staff.StaffSnapshot) -> TimerRegistration | NoTimer:
     """Read the fixed owner's timer without requiring a document."""
     instance = NOTIFIER_STATE_DIR / f"showrunner-{row.id}"
-    if sources is None and instance.exists():
+    if instance.exists():
         return _registration(instance, snapshot)
-    failures: list[ShowrunnerLookupFailure] = []
-    sources = sources if sources is not None else read_sources(
-        unreadable=UnreadableTimerPolicy.SKIP, record=snapshot, on_failure=failures.append)
-    matches = [source.timer for source in sources
-               if source.timer.target in (f"session:{row.id}", f"session:{row.current_session}")]
-    if len(matches) > 1:
-        raise staff.StaffUnreadable(f"{row.name}: several timers name staff {row.id}")
-    if matches:
-        timer = matches[0]
-        return TimerRegistration(timer.name, f"session:{row.id}", timer.zone)
-    if failures:
-        raise OSError("; ".join(failure.reason for failure in failures))
     return NoTimer(f"{row.name}: no timer for staff {row.id}")
 
 
@@ -183,14 +169,6 @@ class ShowrunnerSource:
 
     timer: Timer
     document: str
-
-
-class CheckedDoc(NamedTuple):
-    path: Path
-
-
-class NoCheckedDoc(NamedTuple):
-    reason: str
 
 
 def load_settings() -> ShowrunnerSettings:
@@ -230,45 +208,6 @@ def _fields(path: Path, *, dependencies: Callable[[Path], None] | None = None) -
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
 
 
-def checked_doc(instance: Path) -> CheckedDoc | NoCheckedDoc:
-    """Read a staff document or the document in a legacy migration source."""
-    try:
-        return _checked_doc(_fields(instance / "conf").get("CHECK"))
-    except (OSError, UnicodeError) as error:
-        return NoCheckedDoc(f"conf could not be read: {error}")
-
-
-def _checked_doc(check: str | None,
-                 record: staff.StaffSnapshot | DiscoverMembership = DISCOVER_MEMBERSHIP) -> CheckedDoc | NoCheckedDoc:
-    if check is None:
-        return NoCheckedDoc("CHECK is missing")
-    try:
-        command = shlex.split(check)
-    except ValueError as error:
-        return NoCheckedDoc(f"CHECK could not be parsed: {error}")
-    try:
-        script_index = next(index for index, token in enumerate(command)
-                            if Path(token).name == "production_check.sh")
-    except StopIteration:
-        return NoCheckedDoc("CHECK has no production_check.sh token")
-    if script_index + 1 >= len(command):
-        return NoCheckedDoc("CHECK has no production doc token")
-    path = Path(command[script_index + 1])
-    if path.is_absolute():
-        return CheckedDoc(path)
-    try:
-        identity = staff.native_id(command[script_index + 1])
-    except staff.StaffRefused:
-        return NoCheckedDoc("production doc path is relative")
-    record = staff.snapshot() if isinstance(record, DiscoverMembership) else record
-    row = record.by_id(identity)
-    if (row is not None and row.kind == "showrunner"
-            and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
-            and row.doc.machine == remote.local_machine()):
-        return CheckedDoc(row.doc.path)
-    return NoCheckedDoc("timer owner has no local staff document")
-
-
 def session_name(session_id: str) -> str:
     """The live Claude session's name, or empty when it has none or is not running."""
     return _session_name(session_id)
@@ -300,7 +239,9 @@ def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = Non
     if not target.startswith("session:") or not target[8:]:
         raise ValueError("invalid TARGET")
     record = staff.snapshot() if isinstance(record, DiscoverMembership) else record
-    owner = owner_for(instance.name.removeprefix("showrunner-"), record)
+    owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
+    if owner is None or owner.kind != "showrunner":
+        raise ValueError(f"{instance}: no showrunner staff row")
     if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
         raise ValueError(f"{owner.name}: no production document")
     path = owner.doc.path
@@ -362,7 +303,7 @@ class DiscoverSessions(NamedTuple):
 DISCOVER_SESSIONS = DiscoverSessions()
 
 
-def _registered(timer: TimerRegistration | Timer, *,
+def _registered(timer: TimerRegistration, *,
                 known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
                 deadline: float = math.inf,
                 membership: staff.StaffSnapshot | None = None) -> Showrunner:
@@ -379,8 +320,7 @@ def _registered(timer: TimerRegistration | Timer, *,
         live = record is not None and messaging_socket_exists(record)
         socket = record["messagingSocketPath"] if record is not None and live else ""
         name = record["name"] if record is not None and live else ""
-    doc = (str(timer.doc) if isinstance(timer, Timer)
-           else str(owner.doc.path) if owner is not None
+    doc = (str(owner.doc.path) if owner is not None
            and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else "")
     return Showrunner(session=name, socket=socket or "", name=timer.name, zone=timer.zone, doc=doc)
 
@@ -395,15 +335,13 @@ def registered_showrunners(
     found: list[Showrunner] = []
     failures: list[ShowrunnerLookupFailure] = []
     membership = staff.initial_snapshot() if isinstance(membership, DiscoverMembership) else membership
-    timers: list[TimerRegistration | Timer] = []
+    timers: list[TimerRegistration] = []
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
         if not instance.is_dir():
             continue
         owner = membership.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
         try:
-            timers.append(_source(instance, record=membership).timer
-                          if owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
-                          else _registration(instance, membership))
+            timers.append(_registration(instance, membership))
         except (KeyError, ValueError, UnicodeError) as error:
             name = owner.name if owner is not None else instance.name.removeprefix("showrunner-")
             _report_source_failure(ShowrunnerLookupFailure(name, str(error)))

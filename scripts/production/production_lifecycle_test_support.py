@@ -126,7 +126,7 @@ class LifecycleFixture(unittest.TestCase):
         self.staff.register_production("example", self.doc)
         owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
         self.write(self.state / "notifier" / f"showrunner-{owner.id}" / "conf",
-                   f"TARGET=session:{owner.current_session}\nCHECK=production_check.sh {self.doc}\n")
+                   f"TARGET=session:{owner.current_session}\nCHECK=production_check.sh {owner.id}\n")
         for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
             _ = fixture_member("unit", name=name, parent=owner.id,
                                worktree=staff.PresentWorktree("natedev", folder))
@@ -308,7 +308,7 @@ class LifecycleFixture(unittest.TestCase):
         owner = (staff.set_doc(owners[0].id, staff.LiveDoc("natedev", doc)) if owners
                  else fixture_member("showrunner", name=production_name, doc=staff.LiveDoc("natedev", doc)))
         self.write(self.state / "notifier" / f"showrunner-{owner.id}" / "conf",
-                   f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {doc}\n")
+                   f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
         if live:
             self.write(self.state / "sessions" / f"{os.getpid()}.json",
                        json.dumps({"pid": os.getpid(), "name": f"{production_name}-name", "sessionId": owner.current_session,

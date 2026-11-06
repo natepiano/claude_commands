@@ -1003,6 +1003,47 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
         self.assertIn("wrapped", (self.checkout / "archive/checkout/example/example-production.md").read_text())
 
+    def test_wrap_recovers_the_archive_move_before_staff_document_publication(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        kept = self.checkout / "productions/different-production.md"
+        kept.parent.mkdir()
+        _ = self.git("mv", str(self.doc), str(kept))
+        _ = self.git("commit", "-m", "Move the production document")
+        _ = self.git("push", "origin", "production")
+        self.doc = kept
+        runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+        self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
+                   f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
+        real_checked = production_lifecycle.checked
+
+        def stop_after_move(checkout: Path, step: str, *arguments: str) -> str:
+            result = real_checked(checkout, step, *arguments)
+            if step == "wrap" and arguments[:1] == ("mv",):
+                raise OSError("Stopped before staff document publication")
+            return result
+
+        with mock.patch.object(production_lifecycle, "checked", stop_after_move):
+            stopped = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(stopped.returncode, 2, stopped.stdout)
+        self.assertFalse(kept.exists())
+        retained = staff.by_id(runner.id)
+        assert retained is not None
+        self.assertEqual(retained.doc, staff.LiveDoc("natedev", kept))
+        with self.assertRaises(Refusal):
+            _ = read_production("example")
+        finished = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(finished, "ok")
+        archived = self.checkout / "archive/checkout/example/different-production.md"
+        wrapped = staff.by_id(runner.id)
+        assert wrapped is not None
+        self.assertEqual(wrapped.doc, staff.WrappedDoc("natedev", archived))
+        self.assertIn("wrapped", archived.read_text())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
+
     def test_wrap_names_herdr_sessions_for_close_out(self) -> None:
         self.merged_units()
         result = self.run_lifecycle("wrap", "--no-ci")

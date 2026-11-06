@@ -539,7 +539,7 @@ class DailiesInputFixture(unittest.TestCase):
         instance = self.root / "notifier-state" / f"showrunner-{row.id}"
         instance.mkdir(parents=True, exist_ok=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{row.current_session}\nCHECK=zsh /x/production_check.sh {document}\n", encoding="utf-8")
+            f"TARGET=session:{row.current_session}\nCHECK=zsh /x/production_check.sh {row.id}\n", encoding="utf-8")
         showrunner_launch(row, row.current_session, self.env)
 
     def attach(self, child: str, parent: str) -> None:

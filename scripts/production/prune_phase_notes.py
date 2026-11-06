@@ -14,34 +14,41 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..direct import phase_table
-    from . import showrunners
+    from . import showrunners, staff
     from .production_doc import Refusal
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.direct import phase_table
-    from scripts.production import showrunners
+    from scripts.production import showrunners, staff
     from scripts.production.production_doc import Refusal
+
+from scripts.shutdown import remote
 
 
 def prune_all() -> list[str]:
     """Prune each update timer's production, running or not; return one line per production that failed.
 
-    The doc comes from the timer alone. No session record is read: whether a showrunner runs does
-    not change which notes are retired. One production failing never stops the next.
+    Read each timer owner from staff. Do not read session records.
+    Continue after a production fails.
     """
     failures: list[str] = []
+    record = staff.snapshot()
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         if not instance.is_dir():
             continue
-        name = instance.name.removeprefix("showrunner-")
-        checked = showrunners.checked_doc(instance)
-        if isinstance(checked, showrunners.NoCheckedDoc):
-            failures.append(f"{name}: {checked.reason}")
+        owner_id = staff.StaffId(instance.name.removeprefix("showrunner-"))
+        owner = record.by_id(owner_id)
+        if owner is None or owner.kind != "showrunner":
+            failures.append(f"{owner_id}: no showrunner staff row")
+            continue
+        if (not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                or owner.doc.machine != remote.local_machine()):
+            failures.append(f"{owner.name}: timer owner has no local staff document")
             continue
         try:
-            phase_table.prune(checked.path)
+            phase_table.prune(owner.doc.path)
         except (Refusal, OSError, UnicodeError) as error:
-            failures.append(f"{name}: {error}")
+            failures.append(f"{owner.name}: {error}")
     return failures
 
 

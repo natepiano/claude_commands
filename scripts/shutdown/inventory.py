@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.whoami import account
+from scripts.shutdown import remote
 from probe_session import PROBE_ENV
 import unit_runs
 import herdr
@@ -354,6 +355,7 @@ def _conf(path: Path) -> dict[str, str]:
 def showrunner_registrations() -> ShowrunnerRegistrations:
     """Read timer identities and production docs without resolving messaging sockets."""
     found: list[ShowrunnerRegistration] = []
+    record = staff.snapshot()
     for instance in sorted(_notifier_state_dir().glob("showrunner-*")):
         if not instance.is_dir():
             continue
@@ -361,14 +363,17 @@ def showrunner_registrations() -> ShowrunnerRegistrations:
         target = fields.get("TARGET", "")
         if not target.startswith("session:") or not target[8:]:
             continue
-        doc = showrunners.checked_doc(instance)
-        if isinstance(doc, showrunners.NoCheckedDoc):
+        owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
+        if (owner is None or owner.kind != "showrunner"
+                or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                or owner.doc.machine != remote.local_machine()):
             continue
+        doc = owner.doc
         try:
             _ = doc.path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        found.append(ShowrunnerRegistration(target[8:], showrunners.owner_for(instance.name.removeprefix("showrunner-")).name, str(doc.path)))
+        found.append(ShowrunnerRegistration(target[8:], owner.name, str(doc.path)))
     return ShowrunnerRegistrations(tuple(found))
 
 

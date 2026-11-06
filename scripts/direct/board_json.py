@@ -458,44 +458,13 @@ def write_board(path: Path, board: dict[str, object]) -> None:
             Path(temporary).unlink(missing_ok=True)
 
 
-def migrate_cache(root: Path, record: staff.StaffSnapshot) -> int:
-    """Move exact timer names to staff ids. Retain files without a recorded owner."""
-    owners: dict[str, staff.StaffId] = {}
-    for row in record.find(kind="showrunner"):
-        timer = showrunners.timer_for(row, record)
-        if isinstance(timer, showrunners.TimerRegistration):
-            owners[row.name] = row.id
-    ids = {row.id for row in record.find(kind="showrunner")}
-    unknown: list[str] = []
-    for source in sorted(root.glob("*.json")):
-        if source.stem in ids:
-            continue
-        owner = owners.get(source.stem)
-        if owner is None:
-            unknown.append(str(source))
-            continue
-        target = root / f"{owner}.json"
-        try:
-            target.hardlink_to(source)
-        except FileExistsError:
-            if source.read_bytes() != target.read_bytes():
-                raise FileExistsError(f"{source}: staff cache already differs: {target}") from None
-        source.unlink()
-    for path in unknown:
-        print(f"board_json: no recorded cache owner: {path}", file=sys.stderr)
-    return int(bool(unknown))
-
-
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--migrate-cache", action="store_true", help="Move cache files to staff ids.")
     _ = parser.add_argument("--session", default="")
     _ = parser.add_argument("--production", default="")
     args = parser.parse_args(arguments)
     session, production = cast(str, args.session), cast(str, args.production)
     root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
-    if cast(bool, args.migrate_cache):
-        return migrate_cache(root, staff.snapshot())
     if not session and not production:
         parser.error("--session or --production is required")
     subtree = resolve(production, session)

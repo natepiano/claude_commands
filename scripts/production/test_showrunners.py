@@ -11,7 +11,6 @@ from time import monotonic
 from dataclasses import FrozenInstanceError, replace
 import os
 import re
-import shlex
 import socket
 import subprocess
 import sys
@@ -174,7 +173,7 @@ raise SystemExit(1)
         if include_prompt:
             fields.append(f"PROMPT_FILE={prompt}")
         if doc is not None:
-            fields.append("CHECK=" + shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc)]))
+            fields.append(f"CHECK=zsh /opt/tools/production_check.sh {target.removeprefix('session:')}")
             # Older docs carry a User zone line. It is no longer read; the zone is the user's setting.
             _ = Path(doc).write_text(f"- **User zone:** {zone}\n", encoding="utf-8")
         _ = (directory / "conf").write_text("\n".join(fields) + "\n")
@@ -332,8 +331,9 @@ class RowTimerJoinTests(StaffTestCase):
     def test_remote_or_timerless_staff_remains_a_member(self) -> None:
         row, folder = self.timer("remote")
         remote = replace(row, doc=staff.LiveDoc("other-machine", self.root / "remote-production.md"))
-        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((remote,))):
-            self.assertIsInstance(showrunners.checked_doc(folder), showrunners.NoCheckedDoc)
+        with mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", folder.parent):
+            self.assertIsInstance(showrunners.timer_for(remote, staff.StaffSnapshot((remote,))),
+                                  showrunners.TimerRegistration)
         with mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "absent"):
             self.assertIsInstance(showrunners.timer_for(row, staff.snapshot()), showrunners.NoTimer)
         self.assertEqual(staff.snapshot().by_id(row.id), row)
@@ -363,8 +363,33 @@ class RowTimerJoinTests(StaffTestCase):
         self.assertIsInstance(timer, showrunners.TimerRegistration)
         assert isinstance(timer, showrunners.TimerRegistration)
         self.assertEqual(timer.name, row.name)
-        self.assertEqual(showrunners.checked_doc(folder),
-                         showrunners.CheckedDoc(self.root / "old-production.md"))
+        sources = showrunners.read_sources(folder.parent, unreadable=showrunners.UnreadableTimerPolicy.STRICT,
+                                          record=staff.snapshot())
+        self.assertEqual(sources[0].timer.doc, self.root / "old-production.md")
+
+    def test_name_keyed_timer_is_not_a_staff_id_registration(self) -> None:
+        row, folder = self.timer("hana")
+        folder = folder.rename(folder.with_name(f"showrunner-{row.name}"))
+        with mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", folder.parent):
+            with self.assertRaisesRegex(ValueError, "no showrunner staff row"):
+                _ = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.STRICT,
+                                            record=staff.snapshot())
+
+    def test_timer_lookup_does_not_scan_name_keyed_targets(self) -> None:
+        row, folder = self.timer("hana")
+        folder = folder.rename(folder.with_name(f"showrunner-{row.name}"))
+        with mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", folder.parent):
+            timer = showrunners.timer_for(row, staff.snapshot())
+        self.assertIsInstance(timer, showrunners.NoTimer)
+
+    def test_registered_showrunner_stays_discoverable_without_a_readable_document(self) -> None:
+        row, folder = self.timer("hana")
+        doc = self.root / "hana-production.md"
+        doc.unlink()
+        with mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", folder.parent):
+            runners = showrunners.registered_showrunners(known_sessions={}, membership=staff.snapshot())
+        self.assertEqual([(runner["name"], runner["doc"]) for runner in runners], [(row.name, str(doc))])
+        self.assertEqual(runners.lookup_failures, ())
 
 
 class ShowrunnerRegistryTests(ShowrunnerFixture):
@@ -400,14 +425,6 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
                     self.assertEqual(target.read_bytes(), source.read_bytes())
                 self.assertEqual(sorted(p.name for p in target.parent.iterdir()), [name])
                 self.assertEqual(showrunners.copy_session_state(owner_id, scratch), [])
-
-    def test_checked_doc_reads_absolute_path_after_check_script(self) -> None:
-        directory = self.notifier / "showrunner-check"
-        directory.mkdir()
-        doc = self.root / "example-production.md"
-        check = shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc), "extra"])
-        _ = (directory / "conf").write_text(f"TARGET=session:abc\nCHECK={check}\n", encoding="utf-8")
-        self.assertEqual(showrunners.checked_doc(directory), showrunners.CheckedDoc(doc))
 
     def test_stalled_session_discovery_obeys_the_callers_deadline(self) -> None:
         reader = stalled_session_reader(self.root)
@@ -566,20 +583,6 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
             _ = showrunners.registered_showrunners(self.notifier, known_sessions={})
         self.assertIn(str(conf), str(raised.exception))
 
-    def test_checked_doc_refuses_missing_check_line(self) -> None:
-        directory = self.notifier / "showrunner-check"
-        directory.mkdir()
-        _ = (directory / "conf").write_text("TARGET=session:abc\n", encoding="utf-8")
-        self.assertIsInstance(showrunners.checked_doc(directory), showrunners.NoCheckedDoc)
-
-    def test_checked_doc_refuses_relative_production_path(self) -> None:
-        directory = self.notifier / "showrunner-check"
-        directory.mkdir()
-        _ = (directory / "conf").write_text(
-            "CHECK=zsh /opt/tools/production_check.sh docs/example-production.md\n", encoding="utf-8")
-        result = showrunners.checked_doc(directory)
-        self.assertEqual(result, showrunners.NoCheckedDoc("production doc path is relative"))
-
     def test_list_shows_each_showrunner_under_the_name_it_has_now(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
         self.instance("showrunner-other", target="session:stopped-id")
@@ -678,11 +681,13 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         _ = self.record("gone", "unnamed-id", pid=99999999)
         result = self.cli("list")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [f"show\tdirector\t{LOS_ANGELES}\t{self.doc}"])
+        self.assertEqual(result.stdout.splitlines(), [
+            f"lost-doc\tdirector\t{LOS_ANGELES}\t{self.root / 'lost-production.md'}",
+            f"show\tdirector\t{LOS_ANGELES}\t{self.doc}"])
         self.assertIn("skipping showrunner-no-target", result.stderr)
         self.assertIn("skipping showrunner-no-doc:", result.stderr)
         self.assertIn("no showrunner staff row", result.stderr)
-        self.assertIn("skipping showrunner-lost-doc: production doc could not be read", result.stderr)
+        self.assertNotIn("skipping showrunner-lost-doc", result.stderr)
         self.assertIn(f"skipping showrunner-unnamed: session {fixture_runtime_id('unnamed-id')} has no live named process", result.stderr)
 
     def test_the_name_comes_from_the_live_process_not_a_stale_record_of_the_same_session(self) -> None:

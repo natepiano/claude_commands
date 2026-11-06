@@ -355,6 +355,23 @@ def archived_doc(production: Production) -> Path | None:
     return production.doc.parent.parent / "archive" / common.parent.name / production.name / production.doc.name
 
 
+def wrap_production(name: str) -> Production:
+    """Recover the recorded document after an interrupted archive move."""
+    record = staff.snapshot()
+    owner = showrunners.owner_for(name, record)
+    if isinstance(owner.doc, staff.LiveDoc) and not owner.doc.path.exists():
+        source = owner.doc.path
+        checkout = Path(checked(source.parent, "wrap", "rev-parse", "--show-toplevel"))
+        renames = checked(checkout, "wrap", "diff", "--cached", "--name-status",
+                          "--diff-filter=R", "--find-renames", "-z").split("\0")
+        for before, after in zip(renames[1::3], renames[2::3]):
+            if checkout / before == source:
+                production = production_doc.read_new_production(checkout / after, owner.name)
+                if archived_doc(production._replace(doc=source)) == production.doc:
+                    return production
+    return read_production(owner.name, record=record)
+
+
 def retire_reservations(worktree: Path) -> None:
     board = berth_board.read_board(worktree)
     if isinstance(board, berth_board.BoardUnavailable):
@@ -704,7 +721,8 @@ def main() -> int:
             raise LifecycleStop("input", "failed", "--no-ci excludes the verdict flags")
         ci_green = CommitVerdict(ci_sha) if ci_sha is not None else VerdictMissing()
         smoke_passed = CommitVerdict(smoke_sha) if smoke_sha is not None else VerdictMissing()
-        production = read_production(cast(str, args.production))
+        name = cast(str, args.production)
+        production = wrap_production(name) if action == "wrap" else read_production(name)
         lines = doc_lines(production)
         if action == "load":
             load(production, lines, cast(bool, args.resume), cast(Path | None, args.scratch))
