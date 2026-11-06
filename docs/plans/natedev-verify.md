@@ -1015,9 +1015,9 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Ruled out:**
 - A test for the read in the `MAC_ONLY` loop: `register_mac_wait` repeats the same check.
 
-### Phase 41 — Test Mac arguments by direct calls, and measure the verify test set  · status: todo
+### Phase 41 — Test Mac arguments by direct calls, and measure the verify test set  · status: done
 
-**Depends on:** Phase 8.
+**Depends on:** none. The bump of 2026-11-06 11:24 EST removed the wait on Phase 8.
 
 #### Work Order
 
@@ -1030,7 +1030,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 1. **Baseline.** Before any test edit, measure `test_verify_mac_arguments.py`: processes started, CPU s and wall s. Count processes with one method that follows every child, and name the method. Save the method with the numbers. Measure the whole `test_verify*` set from the gate records (`show.py`): median CPU s for each file, and the total. Write the list, largest CPU first, in `docs/plans/natedev-verify-test-cost.md`.
 2. **Behavior map.** List each behavior the 4 tests check, with its assertion. Each behavior gets one row: the test that checks it after the phase, and whether it is a direct call or an end-to-end run.
 3. **Direct calls.** Move the argument and routing checks onto direct calls of the Bash functions in `verify.sh` and the Python functions they use. Use `scripts/lib/shell_test_support.py` for Bash functions, and run many cases in one shell where the cases allow it. Make no second extractor. Replace a fake `cargo`, `git` or `rustc` with a direct call where the check does not need the tool.
-4. **End to end.** Keep the smallest set of real `verify.sh` runs that proves the path from the command line to the recorded call: one Mac decline that runs locally, and one real offload busy result. A further run stays only when it proves something that no direct call can prove. Say why in the map.
+4. **End to end.** Keep the smallest set of real `verify.sh` runs that proves the path from the command line to the recorded call: one Mac decline that runs locally, one real offload busy result, and one plain-package `no_tests` decline, because the reviews showed that `route_test` and the local run after that answer have no direct call without a stand-in for the routing decision. A further run stays only when it proves something that no direct call can prove. Say why in the map.
 5. **Production code.** Move a piece of `verify.sh` into a function only when a check has no function to call. Such a move changes no behavior.
 6. **Measure again.** Measure the file with the same method, and write before and after in `docs/plans/natedev-verify-test-cost.md`.
 
@@ -1039,7 +1039,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `scripts/direct/verify.sh`, only under Spec item 5.
 - `docs/plans/natedev-verify-test-cost.md` (new).
 
-**Workers:** 1 integration writer + 1 measurer and reviewer of the behavior map.
+**Workers:** 1 integration writer. The director runs the measures. The review reads the behavior map.
 
 **Constraints from prior phases:**
 - Add no guard, refusal or check that this Spec does not ask for.
@@ -1052,7 +1052,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The behavior map has a row for each assertion of the 4 tests, and no row lacks a test. A reviewer reads the old assertions against the map.
 - For each moved check, breaking the function it calls makes the new test fail. Show this on a tempdir copy for each moved behavior.
 - The before and after numbers for this file are in the cost doc: processes, CPU s and wall s, by one named method. The observation is the drop in processes and in CPU s for this file.
-- `test_verify_python_starts.py` and the Mac offload suites pass; basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
+- `test_verify_mac_arguments.py` and `test_verify_python_starts.py` pass; basedpyright 0/0/0 on the changed Python files; no full suite: the bump (builds showrunner, 2026-11-06 11:24 EST) runs lint and the tests of the changed files only, and the merge gate runs all modules.
 
 ### Phase 41a — Test the other verify files by direct calls, largest CPU first  · status: todo
 
@@ -1084,4 +1084,4 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Acceptance gate:**
 - Each changed file has a complete behavior map, and breaking a function makes its moved test fail, as in Phase 41.
 - The cost doc holds before and after CPU s for each changed file and, after the last batch, for the whole set.
-- basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
+- basedpyright 0/0/0 on the changed Python files; no full suite: the bump (builds showrunner, 2026-11-06 11:24 EST) runs lint and the tests of the changed files only, and the merge gate runs all modules.
