@@ -1756,46 +1756,24 @@ The scratch suffix and the review link id come from `secrets.token_hex`, so two 
 - `secrets.token_hex` for `os.urandom(n).hex()` and `uuid4().hex[:8]`: each stays one call and no copy goes away.
 
 ### Phase 78 — A target that goes away during a floor pass does not fail the pass  · status: done
-**Depends on:** none.
 
-**Approved:** the builds showrunner, 2026-11-06: "A folder that goes away during a sweep counts as done; it must not fail the whole run. Fix it at the source in the sweep, with a test."
+#### As-built
 
-#### Work Order
+A target that goes away during a floor pass counts as done. The pass finishes with status 0 and saves its floor record. Any other `OSError` still fails the pass.
 
-**Goal:** a target that goes away during a floor pass counts as done, so the pass finishes, saves its accounting and exits 0.
-
-**Measured:**
-1. `disk-floor.service` on natedev exited 1 at 2026-11-06 07:57 EST with `lint sweep: [Errno 2] No such file or directory: '/tmp/claude/unit/5f707c80-741b-4bcd-8258-fa3b7e0df65f/tmp/lint-scope-test-5_chjo8j/case/target'`. A test removed its temp target while the pass ran. The pass had already removed output and printed `299.0 GiB free`.
-2. `on_floor_filesystem` (`scripts/lint/sweep.py:362`) calls `output_device`, which is a bare `os.stat`. The pass calls it on target roots after the scan (:4037, :4070, :4096, :4100). A missing root raises `FileNotFoundError`, and the outer `except` of `_hold_floor_pass` returns status 1 with no floor accounting saved. The :4096 call is the first one after the `free` line, which matches the journal.
-3. `filesystem_floors` (:3688) calls `output_device` after an `os.path.isdir` check, so the same race gives status 2.
-4. The `sweep_ci_targets` measure (:4049) has the same check and call. A missing path adds 0 bytes on both branches, because `directory_blocks` returns 0 for it.
-5. The trim of a paired target (:2075) calls `os.stat` on `USE_STAMP` after `os.path.exists`, so the same race raises there.
-6. natedev has one filesystem. The probe of a secondary filesystem is outside this phase: on natedev it is always the home folder.
-
-**Spec:**
-1. `on_floor_filesystem` returns False when `output_device` raises `FileNotFoundError`. A target that went away is on no filesystem. Say that in its docstring.
-2. The `sweep_ci_targets` condition becomes `if on_floor_filesystem(os.path.expanduser(path))`. It replaces the `isinstance` and `isdir` parts.
-3. `filesystem_floors` keeps its `isdir` check and skips a path when `output_device` raises `FileNotFoundError`.
-4. Add a private `stamp_newer(root: str, moment: float) -> bool`. It returns False when `USE_STAMP` is missing. The paired trim uses it, so the `exists` call goes away.
-5. Catch only `FileNotFoundError`. Any other `OSError` still fails the pass as it does now.
-6. In `docs/as-built/build-memory-admission.md`, under `### Disk floor: what it removes`, add one bullet: a target that goes away during a pass counts as done, and the pass finishes with status 0.
-7. Add these tests to `scripts/lint/test_sweep.py`, each on real folders in a tempdir:
-   - A real private floor pass in which a real idle target is removed during `shrink_floor`. The status is 0, stderr has no `Errno`, and the floor record is saved. This test fails on the code before this phase.
-   - `filesystem_floors` with a path that goes away after the `isdir` check. The path is not in any floor, and the call does not raise.
-   - `stamp_newer` with a missing, an older and a newer stamp.
-8. Add no guard, refusal or check the Work Order did not ask for. Post blocked to ask instead.
+- `on_floor_filesystem` returns False when `output_device` raises `FileNotFoundError`: a missing target is on no filesystem. The `sweep_ci_targets` measure uses it.
+- `filesystem_floors` keeps its `isdir` check and skips a path that goes away after it.
+- Private `stamp_newer(root, moment)` returns False when `USE_STAMP` is missing. The paired trim uses it.
+- `removed` leaves out the blocks of an idle target that went away and that the pass did not take, so the alert states only what the pass removed. A block that a surviving target still links stays in.
 
 **Files:**
-- `scripts/lint/sweep.py`
-- `scripts/lint/test_sweep.py`
-- `docs/as-built/build-memory-admission.md`
+- `scripts/lint/sweep.py`.
+- `scripts/lint/test_sweep.py` — a real private floor pass with a target removed during `shrink_floor`, the removal alert test, the `filesystem_floors` and `stamp_newer` tests, and a fixed alert channel in `test_protected_report_limits_paths_and_measures_each_folder_once_per_pass`.
+- `docs/as-built/build-memory-admission.md` — one bullet under the disk floor section.
 
-**Workers:** `1 writer`.
-- impl: all files.
+**Gotchas:**
+- The base floor fixture replaces `output_device`, so a test of a missing target restores the real call.
+- `before_caches` keeps the bytes of a target that went away, because the growth check compares it with `scanned_free`, and both are from before the take.
 
-**State:** none.
-
-**Acceptance gate:**
-- The new floor pass test fails before the source change and passes after it. Observation: the pass status and the saved floor record.
-- `scripts/lint/test_sweep.py` passes.
-- basedpyright reports 0 errors and 0 warnings on `scripts/lint/sweep.py` and `scripts/lint/test_sweep.py`.
+**Ruled out:**
+- A probe of a secondary filesystem: on natedev it is always the home folder.
