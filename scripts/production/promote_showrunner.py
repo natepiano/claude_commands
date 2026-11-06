@@ -209,7 +209,12 @@ def stop(promotion: Promotion) -> bool:
     if stopped and not unresolved:
         place = promotion.marked.place
         client = herdr.Herdr(place.session)
-        for state in worker_panes.observe(row.id, staff.snapshot()) if row is not None else []:
+        try:
+            states = worker_panes.observe(row.id, staff.snapshot()) if row is not None else []
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            print(f"anomaly: {promotion.unit}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+            states = []
+        for state in states:
             if isinstance(state, worker_panes.StoppedWorker):
                 try:
                     if not client.close_tab_confirmed(state.pane, terminal=state.terminal):

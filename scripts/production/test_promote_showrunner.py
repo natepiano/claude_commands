@@ -136,6 +136,17 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn("anomaly:", errors.getvalue())
 
+    def test_promotion_continues_after_a_failed_worker_observation(self) -> None:
+        promotion = promote_showrunner.checked("demo", self.child_doc)
+        with (mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]),
+              mock.patch.object(worker_panes, "observe", side_effect=herdr.HerdrFailure("unreadable")),
+              mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertTrue(promote_showrunner.stop(promotion))
+        close.assert_called_once_with(PANE, target=SESSION)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("anomaly:", errors.getvalue())
+
     def test_promote_restores_retained_workers(self) -> None:
         unit = self.staff_unit()
         retained = fixture_member("worker", name="impl", parent=unit.id)
