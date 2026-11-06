@@ -1020,10 +1020,6 @@ class SpendTests(CostFixture):
                     self.assertEqual(trial.main(['--step', 'size', '--repo', str(self.root), '--approve-resources', '--vcpus', '64'], self.settings, self.state), 1)
 
     def test_quota_read_sets_limit_before_resources_and_failure_creates_none(self) -> None:
-        lines = self.settings.read_text().splitlines()
-        index = next(index for index, line in enumerate(lines) if line.startswith('deployment_timeout_s='))
-        lines[index - 1] = '# range: 1..'
-        _ = self.settings.write_text('\n'.join(lines) + '\n')
         for failure in (False, True):
             with self.subTest(failure=failure):
                 costs = ledger.CostEstimate(1000, ledger.DailyTotal('fixture', Decimal(0)),

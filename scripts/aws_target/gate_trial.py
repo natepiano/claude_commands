@@ -254,7 +254,7 @@ class TrialSettings:
                    settings.text('nixos_release'), settings.text('subnet_id'), settings.text('vpc_id'),
                    settings.text('availability_zone'), settings.text('root_device_name'),
                    settings.whole('root_volume_gib'), settings.text('instance_type').split('.')[0],
-                   settings.number('deployment_timeout_s'), path)
+                   settings.whole('deployment_timeout_s'), path)
 
 
 def instance_type(family: str, size: int) -> str:
