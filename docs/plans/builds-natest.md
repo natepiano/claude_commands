@@ -75,9 +75,9 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 - **Speed method** (every speed phase; CPU first, 2026-11-06):
   0. Targets: at dispatch, the director takes the top live rows of `show.py top`, ranked by median CPU per gate, that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal. `agents/test_codex_mesh.py` is excluded: it retires.
   1. Baseline: before the edit, run `python3 scripts/test_times/module_cost.py --tree <tree> <folder>/<file>` for CPU s, processes, execs and wall s. Run the module with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` for each test's time. Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
-  2. Find the cost: the process starts per test, what starts them, and the CPU per test (`module_cost.py --tests 10`, from Phase 64; before it lands, rank tests by process starts). A process count does not rank CPU: Phase 61's SSH files lost 52% of their processes and no CPU, because a Python start and a live server cost far more than a Bash start. Add up CPU by command before a move. Name each real end-to-end run and what only it proves. Do not apply a cut the module already has. Estimate each command's removable cost, not the whole script's: Phase 41 estimated 54-62 CPU s and measured 1.8, because 246 of 366 starts already had the light path and two commands kept the heavy chain.
+  2. Find the cost: the process starts per test, what starts them, and the CPU per test (`module_cost.py --tests 10`). A process count does not rank CPU: Phase 61's SSH files lost 52% of their processes and no CPU, because a Python start and a live server cost far more than a Bash start. Add up CPU by command (`module_cost.py --commands 10`) before a move. CPU in a production command that the tests need goes to its owner: no test edit removes it (Phase 66). Name each real end-to-end run and what only it proves. Do not apply a cut the module already has. Estimate each command's removable cost, not the whole script's: Phase 41 estimated 54-62 CPU s and measured 1.8, because 246 of 366 starts already had the light path and two commands kept the heavy chain.
   3. Cut it, in this order:
-     - Test logic by direct calls of the functions under test. Use `scripts/lib/shell_test_support.py` for Bash functions, and run many cases in one shell where the cases allow it. Keep a few real end-to-end runs: each one proves a path that no direct call can prove. Write a behavior map with one row per assertion: the test that checks it after the phase, and whether that test is a direct call or an end-to-end run. For each moved check, show on a tempdir copy that breaking the function fails the new test (verify Phase 41).
+     - Test logic by direct calls of the functions under test. Use `scripts/lib/shell_test_support.py` for Bash functions, and run many cases in one shell where the cases allow it. Keep a few real end-to-end runs: each one proves a path that no direct call can prove. Write a behavior map with one row per assertion: the test that checks it after the phase, and whether that test is a direct call or an end-to-end run. For each moved check, show on a tempdir copy that breaking the function fails the new test (verify Phase 41). A direct call keeps the decision that the test proves. A fixture that plays that decision itself cuts CPU and removes the proof (Phase 66).
      - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does. When files share a fake tool or a fixture, change the fixture once. Make no copy of a fixture.
      - Remove trivial tests (Invariants above) only when step 2 shows tests that read as repeats: tests with the same setup and the same assertion target. Then run `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` and compare each candidate's assertions with its covering tests; a candidate whose result a covering test also checks is a trivial test. Skip the sweep in a module whose time is in process starts: Phase 13 found no repeat in five such modules.
      - Remove a fixed wait: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. This cut gains wall time and no CPU (Phase 56: 30.5 to 31.1 CPU s), so it does not reach the target alone. A fixed wait often causes flakes, so a flaky module is a target too.
@@ -1240,7 +1240,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 **Goal:** `scripts/style/test_style_proposals.py` (60.8 CPU s, 112.7 s wall, 186 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
 
 **Spec:** Follow the Speed method.
-1. Profile before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count.
+1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count.
 2. Cut in the Speed method's order, direct calls first.
 3. A cut in a production file goes to the director first, with the measured gain. Do not edit `scripts/style/style_sync.py` or `scripts/style/test_style_sync.py`: devtools holds them.
 4. devtools 3z holds this file and `style_proposals.py` for import lines only. Before the checkpoint, take 3z through builds when the showrunner says builds has it (showrunner, 2026-11-06).
@@ -1375,47 +1375,33 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 ### Phase 64 — `module_cost.py` names the tests with the most CPU  · status: done
 **Depends on:** Phase 60, Phase 62
 
-#### Work Order
+#### As-built
 
-**Source:** architect review, 2026-11-06. Speed steps 1-2 and Phase 59 need CPU per test, and `module_run.py` records only each test's wall time and the module's CPU. At high load, wall time does not rank tests by CPU.
+`module_cost.py --tests N` prints the N tests with the most CPU, with each test's CPU s and wall s. `--commands N` prints the N commands with the most CPU, with starts and CPU s, then an `unassigned` line with its sign: the run's `RUSAGE_CHILDREN` CPU less the sum of all rows.
 
-**Goal:** `module_cost.py --tests 10 --tree <tree> <folder>/<file>` prints the ten tests with the most CPU, with each test's CPU s and wall s. `--commands 10` prints the ten commands with the most CPU, and states the CPU that no command holds.
+- `module_run.py` adds `cpu_s` to each test row and writes a row for each class and module fixture, with its own `cpu_s`. It wraps a fixture only when the value is not `None`. It skips the module fixtures of a class whose module is not in `sys.modules`, as unittest does. `coverage_overlap.py` keeps its three-value tuples.
+- `gate_record._test_time` keeps only test, s and status, so gate records do not grow. `show.py` and the build log store do not change.
+- `module_cost.py` starts both of its runs through `module_run.py`, so each process count holds the supervisor, and the end step of Phase 62 runs. It removes `TEST_TIMES_OUT` from the trace and command runs. `--commands` adds one run; without it, the other runs do not change.
+- `task_cpu.measure` forks a child that blocks on a pipe read, then seizes it with `PTRACE_SEIZE`. The options trace fork, vfork, clone, exec and exit, and add `PTRACE_O_EXITKILL`, so the tracees end with the tracer. It stops at no system call.
+- A task's first stop assigns its command from `/proc/<pid>/status`: a thread takes its `Tgid`'s row, a process takes its `PPid`'s row. An exec stop reads `/proc/<pid>/cmdline`. An exit stop reads the first field of `/proc/<pid>/schedstat`.
+- A group stop (`SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`) calls `PTRACE_LISTEN`, so the task stays stopped and its real parent sees the stop. A signal-delivery stop passes its signal on, `SIGSTOP` included.
+- `command_name` knows two families. Python (`python*`, `pypy*`) takes values for `-W` and `-X`. Shells (`bash`, `sh`, `zsh`) take values for `-o` and `-O`. A short cluster ending `c` gives `<program> -c`. A Python cluster ending `m` gives `<program> -m <name>`. `--` ends the options. Other programs group by program name.
 
-**Spec:**
-1. `module_run.py` adds `cpu_s` to each test row in its output: the change in own plus reaped-children CPU across the test.
-2. `module_run.py:90-98` records a fixture row only when a fixture fails or skips, so a successful `setUpClass` or module fixture has no row. Add timing boundaries for fixtures, with a type that tells a fixture measure from a test measure. Each fixture row carries its own `cpu_s`. Keep `testsRun`, `tests_s` and the existing error outcomes as they are.
-3. `module_cost.py:74` starts `unittest discover`, so its time run writes no `TEST_TIMES_OUT` report and skips the end step of Phase 62. Run both of its runs through `module_run.py`. Each process count then rises by the supervisor, so state one new baseline. `--tests N` reads the rows of the time run, and prints the N rows with the most CPU after the module table.
-4. The build log store and `show.py` do not change. A kept history of per-test CPU is a later proposal, when a reader needs it.
-5. `coverage_overlap.py:245` reads the three-value tuples from `timed_outcomes()`, and its collector uses `TimedResult`. Keep that API. The new types stay in the runner's output.
-6. **CPU by command (add-on from Phase 61, accepted by the showrunner on 2026-11-06).** Phase 61 cut process starts and not CPU, because a process count does not rank CPU.
-   a. `wait4` usage is not valid for this: most waits in a module request no usage.
-   b. New `scripts/test_times/task_cpu.py` runs a command under `ptrace`, with trace options for fork, vfork, clone, exec and exit. At each exec it reads `/proc/<pid>/cmdline`. At each exit event it reads the first field of `/proc/<pid>/schedstat`, the task's CPU, and `Tgid` from `/proc/<pid>/status`. It stops at no system call. On four SSH modules at Phase 66 this sum was within 2.5% of the `module_cost.py` CPU.
-   c. `module_cost.py --commands N` adds this one run. Without the option, the time run and the strace run do not change.
-   d. It groups task CPU by the process's last exec: the program name, plus the script name for an interpreter. A process with no exec counts under its parent's command. Each row prints the command, its starts and its CPU s, with the most CPU first.
-   e. After the rows, it prints `unassigned`: the CPU of this run from `RUSAGE_CHILDREN`, less the sum of all rows. It prints the number with its sign. A negative number is a result, not an error.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+Measure: `unassigned` was +0.0056 s of 2.599 CPU s on `message/test_process_test_support.py`, and +0.39 s of 36.7 CPU s on `direct/test_verify_ssh_targets_retained.py`.
 
 **Files:**
 - `scripts/test_times/task_cpu.py` — the kernel task counters by command
-- `scripts/test_times/module_run.py` — the `cpu_s` field and the fixture boundaries
-- `scripts/test_times/test_module_run.py` — the case
+- `scripts/test_times/module_run.py` — `cpu_s` and the fixture rows
+- `scripts/test_times/test_module_run.py` — the runner cases
 - `scripts/test_times/module_cost.py` — `--tests`, `--commands`
-- `scripts/test_times/test_module_cost.py` — the cases
-- `commands/test_times.md` — the options
+- `scripts/test_times/test_module_cost.py` — the real-module cases
+- `commands/test_times.md` — the options and limits
 
-**Workers:** 1 writer on slot `impl3` (one runner and its one reader)
-- `impl3` — all files above, role impl
+**Binds later work:** an orphan is reaped by the parent process, so its CPU is not in the test process's count. A speed phase reads `--commands` for orphan CPU.
 
-**Constraints from prior phases:**
-- Phase 62: an orphan is reaped by the parent process, so its CPU is not in the test process's counts. State this limit in `commands/test_times.md`.
-- Phase 60: the time run and the strace run are separate, so `--tests` reads the time run.
+**Gotchas:** a failed `PTRACE_SEIZE` leaves the blocked child reading end of file when the tracer exits, and it then runs untraced. A forked task with no exec takes its parent's current row. A recycled pid can take an old row. A long option with a value, such as `--rcfile`, reads its value as the script. A task ended by `SIGKILL` reports no exit stop, so its CPU goes to `unassigned`.
 
-**Acceptance gate:**
-- A real tempdir module with one test that starts a CPU-heavy child and one that does not: the first test has more `cpu_s`, and `--tests` lists it first. `test_module_cost.py` names this case.
-- A fixture row with a CPU-heavy `setUpClass` shows that cost in its own row. `test_module_run.py` names this case.
-- `module_cost.py` on a real tempdir module with a detached child: the end step of Phase 62 ends the child, and the module status stays. `test_module_cost.py` names this case.
-- `--commands` on a real tempdir module, where one test starts a CPU-heavy script and one test starts a light script: the heavy script is the first row, its CPU is greater than the light script's CPU, and an `unassigned` line prints. `test_module_cost.py` names this case. Report the row sum against the time run's CPU on one real module.
-- Module `wall_s`, `cpu_s` and test status do not change meaning. `test_coverage_overlap.py` passes. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
+**Ruled out:** `wait4` usage, because most waits in a module request none. Script groups for perl, ruby and node. A cleanup path other than `PTRACE_O_EXITKILL`.
 
 ### Phase 65 — The first test time list after a gap appears in under a second  · status: done
 **Depends on:** Phase 60
@@ -1508,7 +1494,7 @@ Measure: a first list on a scratch history took 0.116 CPU s and 0.166 s wall at 
 
 **Spec:**
 1. Merge builds with verify's hash. Do not merge verify's branch.
-2. Follow the Speed method. Measure CPU by command first: a process count does not rank CPU.
+2. Follow the Speed method. Measure CPU with `module_cost.py --commands 10` first: a process count does not rank CPU.
 3. Move the judgment and parser cases onto direct calls of the two new functions. Keep the real starts that prove what no direct call can.
 4. A further cut in `verify.sh` goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
 
