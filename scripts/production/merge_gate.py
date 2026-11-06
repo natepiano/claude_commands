@@ -1656,7 +1656,7 @@ def nightly(args: GateArguments) -> int:
         _ = nightly_git(repo, "fetch", "origin",
                         f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
         commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
-        with copies.standing(nightly_owner(args), repo, commit) as clone:
+        with copies.standing(nightly_owner(args), repo, copies.CommittedSource(commit)) as clone:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
                 run = run_suites(clone, args.type_dirs,

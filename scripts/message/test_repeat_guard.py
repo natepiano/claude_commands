@@ -28,7 +28,7 @@ import repeat_guard as guard
 import repeats
 from scripts.message.repeat_guard_test_support import (
     NoticeAttemptTrace, NoticeDrainClock, install_guard_test_budget, install_notice_test_config, run_ready_notice_attempt,
-    wait_for_notice_readiness,
+    wait_for_notice_exit, wait_for_notice_readiness,
 )
 
 
@@ -761,6 +761,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 guard.notice_job(command, 1)
             self.assertLess(time.monotonic() - started, DEADLINE_CEILING_FACTOR)
             for pid in marker.read_text().split():
+                wait_for_notice_exit(int(pid))
                 status = subprocess.run(["ps", "-p", pid, "-o", "stat="], text=True, capture_output=True, check=False)
                 self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
         finally:
