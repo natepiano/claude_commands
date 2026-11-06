@@ -333,6 +333,42 @@ class WorkerPaneTests(StaffTestCase):
     def observation(self, row: staff.StaffRow) -> worker_panes.WorkerPane:
         return next(item for item in worker_panes.observe(self.parent.id, staff.snapshot()) if item.row.id == row.id)
 
+    def test_observe_parents_shares_one_read_and_keeps_each_parents_worker_states(self) -> None:
+        active, stopped, absent = self.worker("active"), self.worker("stopped"), self.worker("absent")
+        self.world.add(active, "w1:p1")
+        self.world.add(stopped, "w1:p2", live=False)
+        runner = fixture_member("showrunner", name="second-show")
+        parent = fixture_member("unit", name="second-unit", parent=runner.id,
+                                worktree=staff.PresentWorktree("natedev", self.root / "second"))
+        other = fixture_worker(active.name, parent.id)
+        self.world.add(parent, "w2:p0", workspace="w2", tab="w2:t2")
+        self.world.add(other, "w2:p1", workspace="w2", tab="w2:t2")
+        record = staff.snapshot()
+        with (patch.object(self.world, "panes", wraps=self.world.panes) as panes,
+              patch.object(self.world, "scan_row_panes", wraps=self.world.scan_row_panes) as scan,
+              patch.object(self.world, "agents", wraps=self.world.agents) as agents):
+            found = worker_panes.observe_parents([self.parent, parent], record)
+        self.assertEqual((panes.call_count, scan.call_count, agents.call_count), (1, 1, 1))
+        self.assertEqual({item.row.id: item for item in found[self.parent.id]}, {
+            active.id: worker_panes.OpenWorker(active, "w1:p1", "terminal-w1:p1", herdr.AgentStatus.IDLE),
+            stopped.id: worker_panes.StoppedWorker(stopped, "w1:p2", "terminal-w1:p2"),
+            absent.id: worker_panes.ClosedWorker(absent)})
+        self.assertEqual(found[parent.id], [worker_panes.OpenWorker(other, "w2:p1", "terminal-w2:p1", herdr.AgentStatus.IDLE)])
+        self.world.unknown["w2:p1"] = "process permission denied"
+        found = worker_panes.observe_parents([self.parent, parent], record)
+        self.assertEqual(found[parent.id], [worker_panes.ProcessUnknownWorker(
+            other, "w2:p1", "terminal-w2:p1", "process permission denied")])
+        self.assertIsInstance(next(item for item in found[self.parent.id] if item.row.id == absent.id),
+                              worker_panes.UncertainWorker)
+        self.world.unreadable = True
+        found = worker_panes.observe_parents([self.parent, parent], record)
+        self.assertTrue(all(isinstance(item, worker_panes.UncertainWorker) for states in found.values() for item in states))
+        self.assertEqual(self.world.commands, [])
+
+    def test_observe_no_parents_makes_no_herdr_call(self) -> None:
+        with patch.object(herdr, "Herdr", side_effect=AssertionError("no parents need panes")):
+            self.assertEqual(worker_panes.observe_parents([], staff.snapshot()), {})
+
     def start(self, name: str = "impl2", role: staff.WorkerRole | worker_panes.WorkerRoleUnavailable = "impl",
               *, account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount = worker_panes.ConfiguredWorkerAccount.CURRENT) -> worker_panes.WorkerStart:
         return worker_panes.start_or_resume(self.parent.id, staff.WorkerName.parse(name), role, account=account)
