@@ -195,7 +195,7 @@ class ChangePageTests(unittest.TestCase):
         question = status.ask(self.page, 'C1', 'Which steps?')
         assert isinstance(question, change_page.QuestionDelivery)
         answer = '  \n1. First\n\n2.  Second | <result>\n  '
-        arguments = ['answer-question', '--production', str(self.production), '--list', str(self.review_list),
+        arguments = ['answer-question', '--production', 'page-owner', '--list', str(self.review_list),
                      '--row', 'C1', '--question', question.question_id, '--text', answer]
         self.assertEqual(change_page.main(arguments), 0)
         saved = status.slots(self.page, 'C1').question
@@ -809,7 +809,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(len(self.messages), 1)
         self.assertIn("Change review C1: the user asks you to validate this", self.messages[0][2])
         self.assertIn(f"List: {self.review_list}", self.messages[0][2])
-        self.assertIn(f"Production: {self.production}", self.messages[0][2])
+        self.assertIn("Production: page-owner", self.messages[0][2])
         self.assertIn("User feedback: Keep these words", self.messages[0][2])
         self.assertNotIn("/wrong-production", self.messages[0][2])
         self.assertNotIn("page", cast(dict[str, object], json.loads(path.read_text())))
@@ -830,7 +830,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(len(self.messages), 2)
         production_lines = [next(line for line in message.splitlines() if line.startswith("Production:"))
                             for _, _, message in self.messages]
-        self.assertEqual(production_lines, [f"Production: {doc}"] * 2)
+        self.assertEqual(production_lines, ["Production: current-owner"] * 2)
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["current-owner"] * 2)
         self.assert_record_cleared()
 
@@ -860,7 +860,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(change.page.owner.showrunner_recipients, (runner.id,))
         self.assertEqual(change.page.production, doc)
         self.assertEqual(len(self.messages), 1)
-        self.assertIn(f"Production: {doc}", self.messages[0][2])
+        self.assertIn("Production: current-owner", self.messages[0][2])
 
     def test_a_row_without_a_staff_unit_uses_its_list_showrunner_and_production(self) -> None:
         row = change_page.answer_row(self.page, "C1") | {"Producer": "", "Merged": "", "Production": "another-production"}
@@ -1028,7 +1028,7 @@ class ChangePageTests(unittest.TestCase):
         if not question_id:
             question = change_page.DeliveryStatus(self.root).slots(self.page, row).question
             question_id = question.question_id if not isinstance(question, change_page.NoQuestion) else "unknown"
-        return subprocess.run([sys.executable, change_page.__file__, "answer-question", "--production", str(self.production),
+        return subprocess.run([sys.executable, change_page.__file__, "answer-question", "--production", "page-owner",
                                "--list", str(self.review_list), "--row", row, "--question", question_id, "--text", text],
                               capture_output=True, text=True, check=False)
 
@@ -1523,7 +1523,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("The showrunner will answer this", content)
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
         message = self.messages[0][2]
-        for text in ("C1: the user asks a question", f"List: {self.review_list}", f"Production: {self.production}",
+        for text in ("C1: the user asks a question", f"List: {self.review_list}", "Production: page-owner",
                      "Change: Numbered moves", "Question: What does <this> change?"):
             self.assertIn(text, message)
         question = change_page.DeliveryStatus(self.root).slots(self.page, "C1").question
@@ -2052,7 +2052,7 @@ class ChangePageTests(unittest.TestCase):
     def test_command_publishes_one_row_and_a_batch_through_the_same_path(self) -> None:
         for rows in (["C1"], ["C1", "C2", "C3"]):
             with self.subTest(rows=rows):
-                result = subprocess.run([sys.executable, change_page.__file__, "--production", str(self.production),
+                result = subprocess.run([sys.executable, change_page.__file__, "--production", "page-owner",
                                          "--list", str(self.review_list), *rows],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual((result.returncode, result.stderr), (0, ""))
@@ -2101,7 +2101,7 @@ class ChangePageTests(unittest.TestCase):
                                           "page-owner/C1", "--if-proposed"])
         self.assertEqual(invocations[2],
                          [sys.executable, str(Path(change_review.__file__)), "verdict", "--production",
-                          str(self.production), "--list", str(self.review_list), "--row", "C1", "--verdict=works"])
+                          "page-owner", "--list", str(self.review_list), "--row", "C1", "--verdict=works"])
         saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
         self.assertEqual(saved["Verdict"], "works")
         self.assertEqual([row["#"] for row in change_review.pending(self.review_list)], ["C2", "C3"])
@@ -2218,16 +2218,17 @@ class ChangePageTests(unittest.TestCase):
         child = self.temporary / "child-production.md"
         sibling = self.temporary / "sibling-production.md"
         root_doc = self.temporary / "root-production.md"
-        for doc in (root_doc, child, sibling):
-            slug = doc.stem.removesuffix("-production")
+        _ = staff.set_doc(root.id, staff.LiveDoc("natedev", root_doc))
+        for name, doc in (("root", root_doc), ("child", child), ("sibling", sibling)):
+
             _ = doc.write_text(self.production.read_text().replace("builder-unit", f"{doc.stem}-unit").replace(
-                "fallback-owner", slug))
-            timer = notifier / f"showrunner-{doc.stem.removesuffix('-production')}"
+                "fallback-owner", name))
+            timer = notifier / f"showrunner-{name}"
             timer.mkdir(parents=True)
             _ = (timer / "conf").write_text(f"EVERY=15\nTARGET=session:test\nPROMPT_FILE={timer / 'prompt'}\n"
-                                           + f"CHECK=zsh /unused/production_check.sh {doc}\n")
+                                           + f"CHECK=zsh /unused/production_check.sh {name}\n")
             if doc != root_doc:
-                _ = fixture_member("showrunner", name=doc.stem.removesuffix("-production"), parent=root.id)
+                _ = fixture_member("showrunner", name=name, parent=root.id, doc=staff.LiveDoc("natedev", doc))
         owner = staff.snapshot().by_path("page-owner")
         if owner is None:
             self.fail("the list showrunner must have a staff record")
@@ -2241,8 +2242,10 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([target for target, _, _ in self.messages], ["sibling-production-unit", "page-owner"])
 
     def test_an_unknown_production_is_refused_before_saving(self) -> None:
+        owner = fixture_member("showrunner", name="missing-owner",
+                               doc=staff.LiveDoc("natedev", self.temporary / "missing-production.md"))
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown owner", "Run", "Proof")],
-                                      date(2026, 11, 1), "", self.temporary / "missing-production.md", record=staff.snapshot())
+                                      date(2026, 11, 1), "", self.production, producers=[owner.id], record=staff.snapshot())
         _ = change_review.set_row_kind(self.review_list, "C4", "Read only", self.production)
         path = urlsplit(change_page.publish(self.production, self.review_list, ["C4"])).path
         page = change_page.page_at(self.root, path)
@@ -2765,7 +2768,7 @@ class FixtureStartupRecoveryTests(unittest.TestCase):
             change_page.recover_pending(restarted)
             self.assertEqual(len(fixture.messages), 1)
             self.assertIn("User feedback: Keep these words", fixture.messages[0][2])
-            self.assertIn(f"Production: {fixture.production}", fixture.messages[0][2])
+            self.assertIn("Production: page-owner", fixture.messages[0][2])
             self.assertNotIn("page", cast(dict[str, object], json.loads(path.read_text())))
             self.assertEqual(fixture.review_list.read_bytes(), before)
             self.assertIsInstance(status.slots(fixture.page, "C1").validation, change_page.ValidationRequested)

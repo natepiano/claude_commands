@@ -16,7 +16,7 @@ from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_
 from unit_lookup import LiveSession, LiveClaude, Place, labeled_session, sessions_dir  # noqa: E402
 from scripts.lib.script_envelope import script_prompt  # noqa: E402
 
-USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|session <id>> "
+USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <production_name> <unit>|session <id>> "
          "[--lines N --joined --ansi | <text> | <key>...]")
 
 
@@ -82,12 +82,12 @@ def main(arguments: list[str]) -> int:
             raise ValueError(USAGE)
         verb, kind = arguments[:2]
         if kind == "unit" and len(arguments) >= 4:
-            slug, name = arguments[2:4]
-            target, rest = f"unit {slug} {name}", arguments[4:]
+            production_name, name = arguments[2:4]
+            target, rest = f"unit {production_name} {name}", arguments[4:]
         elif kind == "session":
             name = arguments[2]
             target, rest = f"session {name}", arguments[3:]
-            slug = ""
+            production_name = ""
         else:
             raise ValueError(USAGE)
         lines, joined, ansi = 60, False, False
@@ -108,7 +108,7 @@ def main(arguments: list[str]) -> int:
               or verb == "where" and rest):
             raise ValueError(USAGE)
         if kind == "unit":
-            unit = labeled_session(slug, name)
+            unit = labeled_session(production_name, name)
             if unit is None:
                 raise NoSuchTarget(target)
             place = unit.place

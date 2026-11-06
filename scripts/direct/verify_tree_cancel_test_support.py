@@ -217,7 +217,7 @@ with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
       patch.object(mesh_runs.session_staff, "worker_directory", return_value=os.environ["PACKAGE_ROOT"])):
     raise SystemExit(mesh_runs.main(["supervise", sys.argv[1]]))
 """
-            arguments = [sys.executable, "-c", supervisor, str(record_path)]
+            arguments = [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", supervisor, str(record_path)]
         process = subprocess.Popen(arguments,
                                    cwd=self.workspace, env={**self.environment, **extra},
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

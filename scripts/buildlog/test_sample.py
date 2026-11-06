@@ -473,7 +473,7 @@ class SampleTests(unittest.TestCase):
             "sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
-            [sys.executable, "-c", command, str(CLI.parent), str(proc)],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command, str(CLI.parent), str(proc)],
             env=environment,
             capture_output=True,
             text=True,

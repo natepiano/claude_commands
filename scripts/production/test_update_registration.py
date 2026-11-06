@@ -15,10 +15,10 @@ from typing import IO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production import rename_unit, session_staff, staff
+from scripts.production import rename_unit, session_staff, staff, showrunners
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
-from scripts.production.staff_test_support import fixture_member, fixture_showrunner_name, showrunner_relationship
+from scripts.production.staff_test_support import fixture_member, showrunner_relationship
 from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
 
 import dailies_input
@@ -152,7 +152,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertNotIn("<STATE_DIR>", prompt)
         self.assertEqual(prompt.count("--render-state"), 1)
         self.assertIn("America/Los_Angeles", prompt)
-        self.assertIn(f"--production {self.doc}", prompt)
+        self.assertIn("--production example", prompt)
         self.assertNotIn("first-showrunner", prompt)
 
 
@@ -167,14 +167,14 @@ class QuestionIdentityTests(RegistrationFixture):
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
         self.timer("example")
-        parent = showrunner_relationship(fixture_showrunner_name("example", self.doc))
+        parent = showrunner_relationship("example")
         self.asker_id = fixture_member("unit", name="alpha", parent=parent.id,
                                        worktree=staff.PresentWorktree("natedev", self.root / "alpha")).id
 
     def file_question(self, title: str = "Choose the layout", question: str = "Keep the layout?") -> None:
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
             result = self.run_command("ask", "--text", title, "--question", question,
-                                      "--unit", "alpha-unit")
+                                      "--unit", "alpha")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.question_rows()
         self.assertTrue(rows, "The filed question needs a canonical record")
@@ -231,7 +231,7 @@ class QuestionIdentityTests(RegistrationFixture):
     def test_next_reader_keeps_the_migrated_question_and_its_queue_key(self) -> None:
         legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
                                         "question": "Keep the layout?", "reviewed": "Keep the layout?",
-                                        "asked_by": "alpha-unit", "urgency": "user"}
+                                        "asked_by": "alpha", "urgency": "user"}
         _ = self.outstanding().write_text(json.dumps([legacy]))
         self.migrate()
         with self.forbid_legacy_question_access():
@@ -241,7 +241,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(len(after.entries), 1)
         self.assertEqual(after.entries[0].key, f"{owner.id}: Choose the layout")
         self.assertEqual(after.entries[0].item,
-                         "example [user], since Tue Oct 06 08:00, asked by alpha-unit: Keep the layout?")
+                         "example [user], since Tue Oct 06 08:00, asked by alpha: Keep the layout?")
 
     def test_dailies_reader_preserves_review_timing_and_rank_after_migration(self) -> None:
         legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
@@ -289,7 +289,8 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         self.migrate()
         production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                                                  showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
+                                                  showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED,
+                                                  showrunners.owner_for("example"))
         with self.forbid_legacy_question_access():
             self.assertEqual(showrunner_footer.open_questions([production]), 1)
 
@@ -321,7 +322,7 @@ class QuestionIdentityTests(RegistrationFixture):
         _ = proposal.write_text("---\nstatus: open\ntags: [proposal]\n---\nKeep this proposal.\n")
         before = proposal.read_bytes()
         _ = self.doc.write_text(self.doc.read_text() + "\n> **Status: PRODUCTION — wrapped.** Complete.\n")
-        shutil.rmtree(self.state / "notifier/showrunner-example")
+        shutil.rmtree(self.state / f"notifier/showrunner-{self.fixture_staff_id()}")
         with (self.forbid_legacy_question_access(),
               mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner"),
               mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.state / "notifier"),
@@ -333,7 +334,7 @@ class QuestionIdentityTests(RegistrationFixture):
 
     def test_migration_rerun_completes_after_the_record_write(self) -> None:
         legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
-                  "question": "Keep the layout?", "asked_by": "alpha-unit",
+                  "question": "Keep the layout?", "asked_by": "alpha",
                   "review_unavailable": "offline", "after": "2099-01-02T08:00"}
         _ = self.outstanding().write_text(json.dumps([legacy]))
         original = self.outstanding().read_bytes()
@@ -421,7 +422,7 @@ class QuestionIdentityTests(RegistrationFixture):
         errors = io.StringIO()
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             identities = registration.QuestionStaff.read()
-            self.assertIn(child.name, identities.slugs("example", below=True))
+            self.assertIn(child.name, identities.names("example", below=True))
             self.assertNotIn(child.name, identities.documents())
             owner = identities.owner(self.doc)
             with redirect_stderr(errors):
@@ -470,8 +471,12 @@ class QuestionIdentityTests(RegistrationFixture):
         _ = staff.set_doc(owner.parent.id, staff.LiveDoc("macbook", self.doc))
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                            showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
-            self.assertEqual(showrunner_footer.open_questions([production]), 0)
+                            showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED,
+                                                  showrunners.owner_for("example"))
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(showrunner_footer.open_questions([production]), 0)
+            self.assertIn("questions: unavailable", errors.getvalue())
             self.assertEqual(dailies_render.read_outstanding(self.outstanding()), [])
             self.assertIn(self.doc, footer_counts.sources(self.doc))
         refused = self.run_command("ask", "--text", "Choose the compiler", "--question", "Use it?")
@@ -497,8 +502,8 @@ class QuestionIdentityTests(RegistrationFixture):
             result = self.run_command("answer", "--item", "Choose the layout")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(str(self.asker_id), references)
-        self.assertIn("renamed-unit", result.stdout)
-        self.assertNotIn("relay: to alpha-unit", result.stdout)
+        self.assertIn("renamed", result.stdout)
+        self.assertNotIn("relay: to alpha", result.stdout)
 
     def test_answer_resolves_the_fixed_asker_after_a_transfer(self) -> None:
         self.file_question()
@@ -516,7 +521,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(str(self.asker_id), references)
         self.assertIn("destination", result.stdout)
-        self.assertIn("alpha-unit", result.stdout)
+        self.assertIn("alpha", result.stdout)
 
     def test_reminder_replacement_and_answer_preserve_the_filed_question(self) -> None:
         self.file_question()
@@ -546,7 +551,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertIn("Keep the layout?", first.stdout)
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Ship the release?")):
             filed = self.run_command("ask", "--text", "Choose the release", "--question", "Ship the release?",
-                                     "--unit", "alpha-unit", "--urgency", "user")
+                                     "--unit", "alpha", "--urgency", "user")
         self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         repeated = self.run_command("next")
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
@@ -576,7 +581,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
         self.assertIn("|", listed.stdout)
         self.assertIn("Choose the layout", listed.stdout)
-        self.assertIn("alpha-unit", listed.stdout)
+        self.assertIn("alpha", listed.stdout)
         self.assertNotIn("A separate proposal", listed.stdout)
         answered = self.run_command("answer", "--item", "Choose the layout")
         self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
@@ -588,7 +593,7 @@ class QuestionIdentityTests(RegistrationFixture):
     def test_question_store_migration_is_idempotent_and_preserves_next(self) -> None:
         _ = self.outstanding().write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "Choose the layout",
                                         "question": "Keep the layout?", "reviewed": "Keep the layout?",
-                                        "asked_by": "alpha-unit"}]))
+                                        "asked_by": "alpha"}]))
         migrated = self.run_command("migrate-questions")
         self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
         rows = self.question_rows()
@@ -601,7 +606,7 @@ class QuestionIdentityTests(RegistrationFixture):
         following = self.run_command("next")
         self.assertEqual(following.returncode, 0, following.stdout + following.stderr)
         self.assertEqual(following.stdout.splitlines(),
-                         ["example, since Tue Oct 06 08:00, asked by alpha-unit: Keep the layout?",
+                         ["example, since Tue Oct 06 08:00, asked by alpha: Keep the layout?",
                           "next: ok — 0 more due"])
         before = self.store_snapshot()
         repeated = self.run_command("migrate-questions")
@@ -612,14 +617,14 @@ class QuestionIdentityTests(RegistrationFixture):
         held = review.QuestionAwaitingFacts("Keep the layout?", ("Which layout?",))
         with mock.patch.object(review, "review_question", return_value=held):
             result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep the layout?",
-                                      "--unit", "alpha-unit")
+                                      "--unit", "alpha")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("Which layout?", result.stdout + result.stderr)
         self.assertEqual(list(self.issues.glob("*.md")), [])
         with mock.patch.object(review, "review_question",
                                return_value=review.QuestionReviewUnavailable("Keep the layout?", "fixture timeout")):
             filed = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep the layout?",
-                                     "--unit", "alpha-unit")
+                                     "--unit", "alpha")
         self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         state = self.question_state([{"text": "Choose the layout", "after": "2099-01-02T08:00"}])
         deferred = self.run_command("questions", "--state", str(state))
@@ -637,14 +642,14 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         owner = staff.snapshot().by_doc("natedev", self.doc)
         assert owner is not None
-        timer = self.state / "notifier/showrunner-example"
+        timer = self.state / f"notifier/showrunner-{self.fixture_staff_id()}"
         shutil.rmtree(timer)
         _ = staff.rename(owner.id, "different-display-name")
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             identities = registration.QuestionStaff.read()
-            self.assertNotIn("example", identities.sources.productions)
-            self.assertEqual(identities.documents()["example"], self.doc)
-            self.assertEqual(registration.outstanding_file("example", identities=identities),
+            self.assertEqual(identities.owner(self.doc).name, "different-display-name")
+            self.assertEqual(identities.documents()["different-display-name"].doc, owner.doc)
+            self.assertEqual(registration.outstanding_file("different-display-name", identities=identities),
                              self.state / "showrunner/outstanding" / f"{owner.id}.json")
         listed = self.run_command("open")
         self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)

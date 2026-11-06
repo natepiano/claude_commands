@@ -397,21 +397,13 @@ def interrupted(signum: int, _frame: object) -> None:
 
 
 @contextmanager
-def rollback_signals(*, defer: bool = False) -> Generator[None, None, None]:
-    pending: list[int] = []
-
-    def record(signum: int, _frame: object) -> None:
-        pending.append(signum)
-
-    signals = (*ROLLBACK_SIGNALS, signal.SIGINT) if defer else ROLLBACK_SIGNALS
-    previous = {sig: signal.signal(sig, record if defer else interrupted) for sig in signals}
+def rollback_signals() -> Generator[None, None, None]:
+    previous = {sig: signal.signal(sig, interrupted) for sig in ROLLBACK_SIGNALS}
     try:
         yield
     finally:
         for sig, handler in previous.items():
             _ = signal.signal(sig, handler)
-    if pending:
-        signal.raise_signal(pending[0])
 
 
 def fetch_branches(repo: Path, *branches: str) -> None:
@@ -595,7 +587,7 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
     """Collect the leader's status and CPU once, including children it waited for."""
     if job.process.returncode is not None:
         return
-    with rollback_signals(defer=True):
+    with build_folders.defer_signals():
         pid, status, usage = os.wait4(job.process.pid, 0 if block else os.WNOHANG)
         if pid:
             job.process.returncode = os.waitstatus_to_exitcode(status)
@@ -612,22 +604,24 @@ def kill_job_group(job: RunningGateJob) -> None:
     reap_gate_job(job, block=True)
 
 
-def stop_gate_job(job: RunningGateJob) -> None:
-    """Stop the group and reap its leader before capacity returns."""
+def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
+    """Stop all groups with one deadline, then reap their leaders."""
     config = memory_admit.read_memory_config()
-    try:
-        process_group.send_process_group(job.process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
     deadline = time.monotonic() + config.program_stop_seconds
-    while job.process.returncode is None:
-        reap_gate_job(job)
+    for job in jobs:
+        try:
+            process_group.send_process_group(job.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    while True:
+        for job in jobs:
+            reap_gate_job(job)
         remaining = deadline - time.monotonic()
-        if job.process.returncode is not None or remaining <= 0:
+        if remaining <= 0 or all(job.process.returncode is not None for job in jobs):
             break
         time.sleep(min(config.program_sample_seconds, remaining))
-    # Kill surviving group members even when the leader has exited.
-    kill_job_group(job)
+    for job in jobs:
+        kill_job_group(job)
 
 
 def one_minute_load() -> float:
@@ -935,9 +929,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if not modules:
         raise GateRefused("the test list is empty")
     runner = module_runner(repo)
-    tmpfs = Path("/dev/shm")
+    tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
+        raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
     hold = BuildHoldWait()
     hold.wait_until_free()
     initial_hold_seconds = hold.seconds
@@ -1075,7 +1069,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, str(runner), str(path.parent), path.name])
-                    with rollback_signals(defer=True):
+                    with build_folders.defer_signals():
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
@@ -1155,9 +1149,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            with rollback_signals(defer=True):
+            with build_folders.defer_signals():
+                stop_gate_jobs(running)
                 for job in running:
-                    stop_gate_job(job)
                     job.output.close()
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
@@ -1539,7 +1533,7 @@ def record_changes(repo: Path, review_list: Path, production: Path, changes: lis
 
 
 def nightly_owner(args: GateArguments) -> str:
-    from scripts.production import session_staff, showrunners, staff
+    from scripts.production import session_staff, showrunners, staff, unit_lookup
     from scripts.shutdown import remote
 
     try:
@@ -1555,7 +1549,7 @@ def nightly_owner(args: GateArguments) -> str:
         if len(matching) != 1:
             return copies.fallback_owner("nightly")
         doc = matching[0]
-    return showrunners.production_slug(str(doc))
+    return unit_lookup.doc_owner(doc, staff.snapshot()).name
 
 
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
@@ -1639,7 +1633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
-                            help="the production doc whose header names the list (default: the calling showrunner's)")
+                            help="the production staff name (default: the calling showrunner's)")
     _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=[],
                             help="check these folders by hand; nightly always checks scripts")
     _ = parser.add_argument("--promote", action="store_true")

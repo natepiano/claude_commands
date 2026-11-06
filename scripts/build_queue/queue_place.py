@@ -85,24 +85,6 @@ def defer_cleanup_signals() -> Generator[None]:
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-@contextmanager
-def defer_start_signals() -> Generator[None]:
-    """Record cancellation until the newly started child has an owner."""
-    pending: list[int] = []
-
-    def record(number: int, _frame: object) -> None:
-        pending.append(number)
-
-    previous = {number: signal.signal(number, record) for number in (signal.SIGTERM, signal.SIGINT)}
-    try:
-        yield
-    finally:
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
-    if pending:
-        signal.raise_signal(pending[0])
-
-
 def in_builds_slice() -> bool:
     try:
         return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
@@ -308,7 +290,7 @@ class QueuePlace:
         command = ([*prefix, sys.executable, str(Path(__file__).resolve()), "--scope-start", str(self.sidecar),
                     str(holder_pid), holder_start, *argv]
                    if prefix else list(argv))
-        with defer_start_signals():
+        with build_folders.defer_signals():
             process = subprocess.Popen(command, **popen_arguments)
             stopped = threading.Event()
             tracking: ScopedProgram | ProgramTree = ScopedProgram()

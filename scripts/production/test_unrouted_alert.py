@@ -6,7 +6,6 @@ import fcntl
 import time
 import os
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -59,7 +58,7 @@ from scripts.production import unrouted_alert
 assert 'scripts.message.send' not in sys.modules
 assert 'send' not in sys.modules
 """
-        result = subprocess.run([sys.executable, "-I", "-c", command, str(Path(__file__).resolve().parents[2])],
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-I", "-c", command, str(Path(__file__).resolve().parents[2])],
                                 capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
