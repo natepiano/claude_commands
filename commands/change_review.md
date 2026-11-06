@@ -62,6 +62,10 @@ half a second and can drop a row; the vault owner sets Excluded folders →
 
 ## add
 
+A row requires a change the user can check now, merged where they run it and live after rebuild, restart or deploy.
+Until then, add no row.
+`add --merged` refuses a hash that is not on `origin/main`.
+
 For a change the user should check that no checkpoint `Change-Review:` line
 carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
@@ -235,11 +239,3 @@ Producer retains the unit's fixed staff id for verdict delivery.
 Unknown units leave Producer empty and print one named note.
 For `add`, `--repo` selects the directory; the default is `.`.
 A showrunner directory or an unowned directory records a production-owned change.
-
-## Migrate owner cells
-
-Run `migrate-owners [--list <list>]` to list conversions and unknown names.
-Add `--write` to replace known names with fixed staff ids.
-Without `--list`, the command reads all change review lists.
-Unknown names and reviewed rows remain unchanged.
-A retry completes interrupted work; a finished retry writes nothing.

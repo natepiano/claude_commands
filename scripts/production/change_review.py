@@ -10,8 +10,6 @@ Readers resolve current names and the unit's current parent.
 Reviewed rows retain the production name recorded at the verdict.
 Unknown owner names remain unresolved.
 
-Run migrate-owners [--list PATH] [--write] to convert known names once.
-The migration leaves unknown names and reviewed rows unchanged.
 Run backfill-production [--list PATH] [--write] to resolve empty cells from recorded merge history.
 List writes hold the directory lock. Normal writes update metadata and commit only the list.
 """
@@ -134,6 +132,10 @@ class Commit:
 
 class ChangeReviewError(Exception):
     """A list that cannot take rows, or a git read that failed."""
+
+
+class _ChangeNotOnMain(ChangeReviewError):
+    """The requested merged hash is not on origin/main."""
 
 
 def parse(value: str) -> Entry:
@@ -1107,38 +1109,6 @@ def _list_lock(path: Path) -> Generator[None]:
         os.close(descriptor)
 
 
-def migrate_owners(paths: Iterable[Path], *, write: bool) -> list[str]:
-    """Replace open name cells with fixed ids. Leave unknown names and reviewed rows unchanged."""
-    messages: list[str] = []
-    for path in paths:
-        with _list_lock(path):
-            record = staff.snapshot()
-            lines = read(path).splitlines(keepends=True)
-            rows = _review_table(path, lines, SECTION)
-            replacements: dict[str, str] = {}
-            for row in rows:
-                value = row.get(PRODUCER) or row.get(PRODUCTION, "")
-                member = record.by_id(staff.StaffId(value)) or record.by_path(value)
-                if member is None or member.kind not in ("unit", "showrunner"):
-                    messages.append(f"{path}: {row['#']}: no staff row for {value!r}")
-                elif row.get(PRODUCTION) != member.id:
-                    replacements[row['#']] = str(member.id)
-            if not replacements:
-                continue
-            _add_column(path, lines, SECTION, PRODUCTION)
-            columns, first, end = _table(path, lines, SECTION)
-            at = columns.index(PRODUCTION)
-            for index in range(first, end):
-                cells = _cells(lines[index])
-                if cells[0] in replacements:
-                    cells[at] = _cell(replacements[cells[0]])
-                    lines[index] = _join_cells(cells) + "\n"
-            if write:
-                write_text_atomic(path, "".join(lines))
-            messages.extend(f"{path}: {row}: {identity}" for row, identity in replacements.items())
-    return messages
-
-
 def describe(row: dict[str, str]) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
     record = staff.initial_snapshot()
@@ -1544,16 +1514,20 @@ def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
 
 def _run(options: CommandLine) -> int:
     match options.action:
-        case "migrate-owners":
-            paths = [Path(options.list).expanduser()] if options.list else sorted(lists_directory().glob(PREFIX + "*.md"))
-            for message in migrate_owners(paths, write=options.write):
-                print(message)
         case "add":
+            repo = Path(options.repo).expanduser().resolve()
+            merged = options.merged.strip()
+            if merged and subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", merged, "origin/main"],
+                                         capture_output=True, check=False).returncode:
+                raise _ChangeNotOnMain(
+                    f"{merged} is not on origin/main; no row added. "
+                    + "A change goes on the list only when the user can check it now. "
+                    + "If it just landed, run git fetch and retry.")
             item, rank = _visible(options), _rank_option(options)
             path = _list(options)
             record = staff.snapshot()
-            rows = append_rows(path, [item], today(), options.merged.strip(), production_doc(options.production), rank,
-                               producers=[producer_at(Path(options.repo).expanduser().resolve(), record)], record=record)
+            rows = append_rows(path, [item], today(), merged, production_doc(options.production), rank,
+                               producers=[producer_at(repo, record)], record=record)
             row = row_id(rows[0])
             print(row)
             for line in hold_for_row(path, row, options.hold or []):
@@ -1638,7 +1612,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
-                                                   "backfill-production", "migrate-owners"))
+                                                   "backfill-production"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
                  "row", "verdict", "production", "urgency", "due", "after", "kind"):
@@ -1647,6 +1621,9 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--hold", action="append")
     try:
         return _run(cast(CommandLine, parser.parse_args(argv)))
+    except _ChangeNotOnMain as error:
+        print(error, file=sys.stderr)
+        return 1
     except (ChangeReviewError, OSError) as error:
         print(f"change review: {error}", file=sys.stderr)
         return 1

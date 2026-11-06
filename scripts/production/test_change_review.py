@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import change_review
-from scripts.lib import atomic_file, copy_record
+from scripts.lib import copy_record
 from scripts.production import showrunners, staff, change_routing, merge_checkpoint, unit_lookup
 from scripts.shutdown import remote
 from scripts.production.production_doc import Production
@@ -200,58 +200,10 @@ class ProducerWriterTests(ProducerFixture):
         self.assertIn("Producer: renamed", change_review.describe(unit))
         self.assertEqual(self.listing.read_bytes(), before)
 
-    def legacy_list(self, name: str) -> Path:
-        path = self.root / name
-        _ = path.write_text("## To review\n\n| # | Change | Production | Producer |\n| --- | --- | --- | --- |\n"
-            + f"| C1 | Unit | top | {self.unit.id} |\n| C2 | Production | top | |\n"
-            + "| C3 | Unknown producer | top | lost |\n| C4 | Unknown production | lost-production | |\n\n"
-            + "## Reviewed\n\n| # | Change | Production | Verdict | Date |\n| --- | --- | --- | --- | --- |\n"
-            + "| C5 | History | top | works | 2026-11-01 |\n", encoding="utf-8")
-        return path
-
-    def test_owner_migration_keeps_unknown_names_and_reviewed_bytes(self) -> None:
-        path = self.legacy_list("legacy.md")
-        before = path.read_bytes()
-        messages = change_review.migrate_owners([path], write=False)
-        self.assertEqual(path.read_bytes(), before)
-        self.assertTrue(any("C3" in line and "lost" in line for line in messages))
-        self.assertTrue(any("C4" in line and "lost-production" in line for line in messages))
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(change_review.main(["migrate-owners", "--list", str(path), "--write"]), 0)
-        rows = change_review.pending(path)
-        assert isinstance(self.unit.parent, staff.ReportsTo)
-        self.assertEqual([row["Production"] for row in rows],
-                         [self.unit.id, self.unit.parent.id, "top", "lost-production"])
-        self.assertEqual(path.read_bytes().split(b"## Reviewed")[1], before.split(b"## Reviewed")[1])
-        with mock.patch.object(change_review, "write_text_atomic") as write:
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(change_review.main(["migrate-owners", "--list", str(path), "--write"]), 0)
-        write.assert_not_called()
-
-    def test_interrupted_owner_migration_survives_a_clear_and_matches_a_clean_run(self) -> None:
-        interrupted = [self.legacy_list(f"retry-{index}.md") for index in range(2)]
-        clean = [self.legacy_list(f"clean-{index}.md") for index in range(2)]
-        original_write = atomic_file.write_text_atomic
-        new_session = staff.StaffId(fixture_runtime_id("cleared"))
-
-        def write(path: Path, text: str) -> None:
-            if path == interrupted[1]:
-                raise OSError("interrupted after the first file")
-            original_write(path, text)
-            _ = staff.update_current_session(self.unit.current_session, new_session)
-
-        with mock.patch.object(change_review, "write_text_atomic", side_effect=write):
-            self.assertRaises(OSError, change_review.migrate_owners, interrupted, write=True)
-        _ = change_review.migrate_owners(interrupted, write=True)
-        _ = change_review.migrate_owners(clean, write=True)
-        self.assertEqual([path.read_bytes() for path in interrupted], [path.read_bytes() for path in clean])
-        member = staff.snapshot().by_current_session(new_session)
-        assert member is not None
-        self.assertEqual(member.id, self.unit.id)
-        self.assertEqual(change_review.pending(interrupted[1])[0]["Production"], self.unit.id)
-        with mock.patch.object(change_review, "write_text_atomic") as finished:
-            _ = change_review.migrate_owners(interrupted, write=True)
-        finished.assert_not_called()
+    def test_migrate_owners_is_not_a_command(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            _ = change_review.main(["migrate-owners"])
+        self.assertEqual(error.exception.code, 2)
 
     def colliding_units(self) -> staff.StaffRow:
         _ = self.branch_unit("new", "unit", "branch-a", "branch-b.md")
@@ -705,6 +657,81 @@ def run(*arguments: str) -> tuple[int, str, str]:
     return code, output.getvalue(), error.getvalue()
 
 
+def origin_commits(root: Path) -> tuple[Path, str, str]:
+    """Create two commits on main and push them to a temporary bare origin."""
+    repo = root / "source"
+    repo.mkdir()
+
+    def git(*arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
+                              text=True, check=True).stdout.strip()
+
+    _ = git("init", "-q", "-b", "main")
+    for key, value in (("user.name", "Review fixture"), ("user.email", "review@example.invalid"),
+                       ("commit.gpgsign", "false")):
+        _ = git("config", key, value)
+    _ = git("commit", "-q", "--allow-empty", "-m", "First change")
+    first = git("rev-parse", "HEAD")
+    _ = git("commit", "-q", "--allow-empty", "-m", "Second change")
+    second = git("rev-parse", "HEAD")
+    origin = root / "origin.git"
+    _ = git("init", "-q", "--bare", str(origin))
+    _ = git("remote", "add", "origin", str(origin))
+    _ = git("push", "-q", "origin", "main")
+    return repo, first, second
+
+
+class MergedAddTests(unittest.TestCase):
+    root: Path = Path()
+    repo: Path = Path()
+    path: Path = Path()
+    merged: str = ""
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.repo, self.merged, second = origin_commits(self.root)
+        self.path = self.root / "change-review.md"
+        _ = self.path.write_text(LIST, encoding="utf-8")
+        _ = subprocess.run(["git", "-C", str(self.repo), "switch", "-qc", "side", second],
+                           capture_output=True, text=True, check=True)
+        _ = subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "--allow-empty", "-m", "Side change"],
+                           capture_output=True, text=True, check=True)
+
+    def add(self, *options: str) -> tuple[int, str, str]:
+        return run("add", "--repo", str(self.repo), "--production", DOC, "--list", str(self.path),
+                   "--change", "Ready change", "--check", "Read", "--see", "The change", *options)
+
+    def test_add_accepts_an_ancestor_of_origin_main(self) -> None:
+        self.assertEqual(self.add("--merged", self.merged), (0, "C81\n", ""))
+        row = change_review.pending(self.path)[-1]
+        self.assertEqual(row["Change"], "Ready change")
+        self.assertEqual(row["Merged"], f"{change_review.today().isoformat()} · {self.merged}")
+
+    def assert_merge_refused(self, merged: str) -> None:
+        before = self.path.read_bytes()
+        self.assertEqual(self.add("--merged", merged), (1, "",
+            f"{merged} is not on origin/main; no row added. "
+            + "A change goes on the list only when the user can check it now. "
+            + "If it just landed, run git fetch and retry.\n"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_add_refuses_a_commit_on_a_side_branch(self) -> None:
+        side = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assert_merge_refused(side)
+
+    def test_add_refuses_an_unknown_hash(self) -> None:
+        self.assert_merge_refused("f" * 40)
+
+    def test_add_without_merged_does_not_require_a_repository(self) -> None:
+        self.repo = self.root / "not-a-repository"
+        self.assertEqual(self.add(), (0, "C81\n", ""))
+        row = change_review.pending(self.path)[-1]
+        self.assertEqual(row["Change"], "Ready change")
+        self.assertEqual(row["Merged"], change_review.today().isoformat())
+
+
 class ActionTest(unittest.TestCase):
     """add, show, verdict and list-path, on a Hana-shaped list and on a list not yet written."""
 
@@ -731,27 +758,31 @@ class ActionTest(unittest.TestCase):
         self.assertIn(f"| --- | --- | --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B. You see: C | {DEMO_ID} |  |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_takes_the_next_number_and_fills_the_mac_build_column_only_where_the_table_has_one(self) -> None:
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look", "--see", "It",
-                             "--merged", "216c4e1d"), (0, "C81\n", ""))
+        repo, *commits = origin_commits(self.path.parent)
+        merged = commits[-1][:8]
+        self.assertEqual(run("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look", "--see", "It",
+                             "--merged", merged), (0, "C81\n", ""))
         day = change_review.today().isoformat()
-        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · 216c4e1d | not yet | Look. You see: It | {DEMO_ID} |  |\n\n## Questions",
+        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · {merged} | not yet | Look. You see: It | {DEMO_ID} |  |\n\n## Questions",
                       self.path.read_text(encoding="utf-8"))
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
         self.assertIn(f"| C1 | A | {day} | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_refuses_a_second_row_for_the_same_merge_and_change_in_a_short_or_long_hash(self) -> None:
-        add = ("add", "--production", DOC, "--list", str(self.path), "--change", "Tabs", "--check", "Look", "--see", "It")
-        self.assertEqual(run(*add, "--merged", "216c4e1")[:2], (0, "C81\n"))
+        repo, first, second = origin_commits(self.path.parent)
+        short, long_hash, other = first[:7], first[:8], second[:8]
+        add = ("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs", "--check", "Look", "--see", "It")
+        self.assertEqual(run(*add, "--merged", short)[:2], (0, "C81\n"))
         before = self.path.read_text(encoding="utf-8")
-        for merged in ("216c4e1d", "216c4e1"):
+        for merged in (long_hash, short):
             with self.subTest(merged=merged):
                 code, output, error = run(*add, "--merged", merged)
                 self.assertEqual((code, output), (1, ""))
                 self.assertIn(f"C81 already holds that change from merge {merged}", error)
                 self.assertEqual(self.path.read_text(encoding="utf-8"), before)
-        # Another merge of the same change, and another change of the same merge, are new rows.
-        self.assertEqual(run(*add, "--merged", "9e03c9ad")[:2], (0, "C82\n"))
-        self.assertEqual(run(*add[:-6], "--change", "Spaces", "--check", "Look", "--see", "It", "--merged", "216c4e1d")[:2],
+        # A different merge or change receives a new row.
+        self.assertEqual(run(*add, "--merged", other)[:2], (0, "C82\n"))
+        self.assertEqual(run(*add[:-6], "--change", "Spaces", "--check", "Look", "--see", "It", "--merged", long_hash)[:2],
                          (0, "C83\n"))
 
     def test_a_style_productions_change_is_credited_to_its_parent(self) -> None:
@@ -792,11 +823,13 @@ class ActionTest(unittest.TestCase):
                            "~/.config/cargo-tile/panic.log gains nothing"),
                    Visible("cargo-berth gives each phase its own reservation", "run `cargo-berth board | grep phase`",
                            "one line per phase")]
+        repo, *commits = origin_commits(self.path.parent)
         script = str(Path(change_review.__file__))
+        python = str(Path(__file__).resolve().parents[1] / "lib/py")
         for path, first in ((self.fresh, 1), (self.path, 81)):
-            numbers = [subprocess.run([sys.executable, script, "add", "--production", DOC, "--list", str(path),
+            numbers = [subprocess.run([python, script, "add", "--repo", str(repo), "--production", DOC, "--list", str(path),
                                        "--change", item.change, "--check", item.check, "--see", item.see,
-                                       "--merged", "4ad20245"],
+                                       "--merged", commits[-1][:8]],
                                       capture_output=True, text=True, check=True).stdout.strip()
                        for item in changes]
             self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
@@ -1225,11 +1258,13 @@ class CommitTest(unittest.TestCase):
         return self.git("log", "-1", "--format=%s"), self.git("show", "--name-only", "--format=", "HEAD").splitlines()
 
     def test_add_commits_a_new_list_and_then_the_existing_one(self) -> None:
+        source, *commits = origin_commits(self.repo.parent)
+        merged = commits[-1][:8]
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
         self.assertEqual(self.last(), ("change-review: hana add C1", ["change-review/change-review - hana.md"]))
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--see", "E", "--merged", "4ad20245"),
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--see", "E", "--repo", str(source), "--merged", merged),
                          (0, "C2\n", ""))
-        self.assertEqual(self.last(), ("change-review: hana row C2 from 4ad20245", ["change-review/change-review - hana.md"]))
+        self.assertEqual(self.last(), (f"change-review: hana row C2 from {merged}", ["change-review/change-review - hana.md"]))
         _ = change_review.append_rows(self.path, [Visible("E", "F", "S"), Visible("G", "H", "S")], date(2026, 10, 15), "61b65bbf", PRODUCTION, record=staff.snapshot())
         self.assertEqual(self.last(), ("change-review: hana rows C3–C4 from 61b65bbf", ["change-review/change-review - hana.md"]))
         self.assertEqual(self.git("status", "--porcelain"), "")

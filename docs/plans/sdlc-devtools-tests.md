@@ -1303,7 +1303,7 @@ Source: sdlc [6d2745c7], [68b227b5]. Only `end_session.sh` removes a run's marke
 
 **State:** none. The phase writes no new lasting record. It runs two existing commands.
 
-### Phase 8g — The review links service restarts when its code changes  · status: todo
+### Phase 8g — The review links service restarts when its code changes  · status: done
 
 Source: sdlc [fc249e32], [c4e2eefc], [ecddfb26]. review-links.service ran from 11-05 17:14 EST and kept the old `change_page.py` in memory after 486e87bb0 moved `--production` to the showrunner name. Each Works press then failed: `ValueError: .../natedev-production.md: no showrunner staff row`, POST 400, page "Not saved". natedev restarted it at 09:42 EST 11-06. This is the second time. The user also set the rule "a change cannot be in the change list unless it is ready to check" and said yes to a refusal in `change_review.py add`. The Mac final read shows staff ids in every open row, so the one-off `migrate-owners` command goes.
 
