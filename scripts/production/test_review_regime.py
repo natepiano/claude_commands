@@ -51,31 +51,30 @@ class ReviewRegimeTests(unittest.TestCase):
             review_regime.report(None)
         return output.getvalue()
 
-    def test_add_stores_and_reports_simplify_fields_without_using_the_note(self) -> None:
-        self.add_row(FIRST_PLAN, "1")
-        _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "2",
-                     "--simplify-findings", "0", "--simplify-minutes", "2.5", "--note", "user note")
-
-        record = cast(dict[str, object], json.loads(self.ledger.read_text().splitlines()[1]))
-        self.assertEqual(record["simplify_findings"], 0)
-        self.assertEqual(record["simplify_minutes"], 2.5)
-        self.assertEqual(record["note"], "user note")
-        row = review_regime.read_rows()[1]
-        self.assertEqual((row.simplify_findings, row.simplify_minutes), (0, 2.5))
-        report = self.report()
-        self.assertIn("| simplify findings per phase (mean) | - | - | 0.0 |", report)
-        self.assertIn("| simplify minutes per phase (mean) | - | - | 2.5 |", report)
-
-    def test_add_without_simplify_fields_preserves_the_legacy_record_and_report(self) -> None:
+    def test_add_preserves_the_legacy_review_record_and_report(self) -> None:
         _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "1",
                      "--ux-findings", "2", "--code-findings", "3", "--review-minutes", "14")
         row = review_regime.read_rows()[0]
         self.assertEqual((row.ux_findings, row.code_findings, row.review_minutes), (2, 3, 14))
-        self.assertEqual((row.simplify_findings, row.simplify_minutes), (None, None))
         report = self.report()
         self.assertNotIn("simplify", report)
         self.assertIn("| UX reviewer findings per phase (mean) | - | - | 2.0 |", report)
         self.assertIn("| code findings per phase (mean) | - | - | 3.0 |", report)
+
+    def test_old_simplify_fields_do_not_change_the_known_review_values(self) -> None:
+        _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "1",
+                     "--ux-findings", "2", "--code-findings", "3", "--review-minutes", "14")
+        record = cast(dict[str, object], json.loads(self.ledger.read_text()))
+        record.update({"simplify_findings": 5, "simplify_minutes": 2.5})
+        _ = self.ledger.write_text(json.dumps(record) + "\n")
+
+        rows = review_regime.read_rows()
+        self.assertEqual([(row.unit, row.plan, row.phase, row.ux_findings,
+                           row.code_findings, row.review_minutes) for row in rows],
+                         [("dashboard-unit", FIRST_PLAN, "1", 2, 3, 14)])
+        report = self.report()
+        self.assertIn("| code findings per phase (mean) | - | - | 3.0 |", report)
+        self.assertNotIn("simplify", report)
 
     def test_legacy_add_keeps_the_serialized_record_bytes(self) -> None:
         _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "1")
@@ -86,40 +85,6 @@ class ReviewRegimeTests(unittest.TestCase):
             "ux_check_minutes": None, "ux_repair_minutes": None, "note": None, "excluded": None,
         }
         self.assertEqual(self.ledger.read_bytes(), (json.dumps(expected) + "\n").encode())
-
-    def test_read_ignores_invalid_simplify_values_and_reports_recorded_zero_minutes(self) -> None:
-        self.add_row(FIRST_PLAN, "1")
-        record = cast(dict[str, object], json.loads(self.ledger.read_text()))
-        for findings, minutes, expected_findings, expected_minutes in (
-            ("4", 0, None, 0.0),
-            (4, "invalid", 4, None),
-        ):
-            with self.subTest(findings=findings, minutes=minutes):
-                record.update({"simplify_findings": findings, "simplify_minutes": minutes})
-                _ = self.ledger.write_text(json.dumps(record) + "\n")
-                row = review_regime.read_rows()[0]
-                report = self.report()
-                for field, actual, expected in (
-                    ("simplify findings per phase", row.simplify_findings, expected_findings),
-                    ("simplify minutes per phase", row.simplify_minutes, expected_minutes),
-                ):
-                    if expected is None:
-                        self.assertIsNone(actual)
-                        self.assertNotIn(field, report)
-                    else:
-                        self.assertEqual(actual, expected)
-                        self.assertIn(f"| {field} (mean) | - | - | {expected:.1f} |", report)
-
-    def test_each_simplify_flag_records_only_its_own_field(self) -> None:
-        for phase, flag, field, value, absent in (
-            ("1", "--simplify-findings", "simplify_findings", "4", "simplify_minutes"),
-            ("2", "--simplify-minutes", "simplify_minutes", "0", "simplify_findings"),
-        ):
-            with self.subTest(flag=flag):
-                _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", phase, flag, value)
-                record = cast(dict[str, object], json.loads(self.ledger.read_text().splitlines()[-1]))
-                self.assertEqual(record[field], float(value))
-                self.assertNotIn(absent, record)
 
     def test_a_units_second_plan_records_its_own_phase_1(self) -> None:
         self.add_row(FIRST_PLAN, "1")

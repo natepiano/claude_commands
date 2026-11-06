@@ -10,7 +10,7 @@ read-only and persist across phases and plans. The fresh Claude helper in
 A unit keeps its worker threads across phases and plans. `assign.sh` selects
 an idle worker by role, resumes it, and claims it for the dispatch.
 Codex code review uses the unit's read-only `review` workers.
-The [simplify lens](simplify-lens.md) uses a fresh Claude review.
+The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Writers keep their writing roles.
 Each follow compacts when the recorded context exceeds the configured limit.
 Phase cleanup ends turns and keeps threads. Unit pause, move and end use the
@@ -302,7 +302,7 @@ See `unit-rename.md`.
 - **Open once.** Before this design, each phase opened new `impl` and `test` threads and every review was a new thread, so every task paid a worker's startup cost. A worker that stays open pays that cost once per run.
 - **Compact between tasks.** Startup turned out to be a small share of usage. Over 1,437 natedev threads, usage before the first edit was 19% of uncached input, 4% of cached input and 10% of output: about 6% of weighted usage. Most usage is cached context that long threads read again on every call. A long-lived worker saves its startup but carries its context, so frequent compaction is what keeps the saving.
 - **Codex workers only.** The cost being addressed is Codex worker startup. Claude workers are the fallback family and keep their existing lifecycle.
-- **Read-only unit reviewers.** Codex code review uses the unit's own role and read-only sandbox. Writers keep their roles. The fresh Claude design check and [simplify lens](simplify-lens.md) use separate launches.
+- **Read-only unit reviewers.** Codex code review uses the unit's own role and read-only sandbox. Writers keep their roles. The fresh Claude design check and [daily simplify run](simplify-lens.md) use separate launches.
 - **Verdict per checkpointed phase.** The amount of work changes from day to day, so usage per day would not compare the two windows. Account switches are too rare for a verdict: the baseline had 2 in about five days, too few to show a change within a week. They are reported alongside the verdict.
 - **Hyphens refused in `--slot`.** `--to` derives the slot from the worker name, so refusing hyphens is simpler than resolving a hyphenated slot from its recorded identity.
 - **Second-overflow error kept.** It stops a worker that fills its context again and again without doing work, so press-on cannot loop forever.
