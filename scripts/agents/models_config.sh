@@ -439,6 +439,14 @@ agents_resolve() {
     _models_registry_read _agents_resolve_from_table "$@"
 }
 
+agents_resolve_claude_launcher() {
+    agents_resolve "$1" || return $?
+    if [[ "$AGENT_FAMILY" != claude ]]; then
+        printf '%s: Codex workers must use assign.sh.\n' "$2" >&2
+        return 2
+    fi
+}
+
 _agents_resolve_from_table() {
     local task="$1" function subtask family pair section configured allowed_families
 

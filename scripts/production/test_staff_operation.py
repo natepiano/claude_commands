@@ -1,6 +1,8 @@
 """Real operation-lock contention with bounded flock waits."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import subprocess
 import sys
 import time
@@ -33,7 +35,7 @@ class StaffOperationTests(StaffTestCase):
                              "raise SystemExit(staff.cli_result(lambda: "
                              "staff.operation().__enter__()))")
                 started = time.monotonic()
-                refused = subprocess.run([sys.executable, "-c", contender], cwd=CHECKOUT,
+                refused = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", contender], cwd=CHECKOUT,
                                          capture_output=True, text=True, check=False, timeout=3)
                 elapsed = time.monotonic() - started
                 self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
@@ -63,7 +65,7 @@ class StaffOperationTests(StaffTestCase):
         )
         with lock.open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX)
-            result = subprocess.run([sys.executable, "-c", program, owner.id], cwd=CHECKOUT,
+            result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, owner.id], cwd=CHECKOUT,
                                     capture_output=True, text=True, check=False, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("OperationDeadlineExpired", result.stderr)

@@ -283,8 +283,7 @@ For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
 phase note from the event stream; `eta` asks for it after its append and before
 its `ETA recorded:` line. A refresh failure adds one stderr line and changes
-neither the command's output nor its exit status. Plans without a
-`> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
+neither the command's output nor its exit status. Runs whose plan has no staff unit skip the subprocess. [Phase tables](phase-tables.md)
 covers the note, the table built from these events and the hook's limits.
 
 `eta` reads its times in the user's zone setting (`scripts/lib/user_zone.py`):

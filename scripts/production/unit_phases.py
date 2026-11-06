@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Print a showrunner's phase table or style ticket table.
 
-Usage: unit_phases.py [--production <production doc>]
+Usage: unit_phases.py [--production <staff name>]
 
-Without `--production`, the doc is the one held by the update timer of the calling session
-(`CLAUDE_CODE_SESSION_ID`). The phase is read from the unit's run records, and the task is the
-step its newest run has open; no pane is read.
+Without `--production`, the caller's staff row names the production.
+The phase and task come from the unit's run records.
 """
 from __future__ import annotations
 
 import json
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -19,8 +17,8 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import live_units
-from scripts.production import showrunners, staff, unit_lookup, unit_names
-from scripts.production.production_doc import Refusal, production_field
+from scripts.production import showrunners, staff, unit_lookup
+from scripts.production.production_doc import Refusal, production_field, read_production
 from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
@@ -92,7 +90,7 @@ def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str,
     import style_ledger
 
     try:
-        rows = {unit_names.unit_id(row.name): row for row in unit_lookup.doc_units(doc, staff.snapshot())}
+        rows = {row.name: row for row in unit_lookup.doc_units(doc, staff.snapshot())}
     except (OSError, staff.StaffRefused) as error:
         print(f"unit_phases: {error}", file=sys.stderr)
         return {}
@@ -111,21 +109,22 @@ def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str,
 
 def main(arguments: list[str]) -> int:
     match arguments:
-        case ["--production", doc_text]:
-            doc: Path | None = Path(doc_text)
+        case ["--production", name]:
+            pass
         case []:
-            doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
-            if doc is None:
-                print("unit_phases: this session is no production's showrunner; pass --production <doc>",
+            name = showrunners.own_name()
+            if not name:
+                print("unit_phases: this session is no production's showrunner; pass --production <staff name>",
                       file=sys.stderr)
                 return 1
         case _:
-            print("usage: unit_phases.py [--production <production doc>]", file=sys.stderr)
+            print("usage: unit_phases.py [--production <staff name>]", file=sys.stderr)
             return 2
     try:
+        doc = read_production(name).doc
         style = is_style_production(doc)
         with ThreadPoolExecutor(max_workers=2) as reads:
-            sessions = reads.submit(live_units.units_of_doc, doc)
+            sessions = reads.submit(live_units.units_of, name)
             if style:
                 import style_units
             records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))

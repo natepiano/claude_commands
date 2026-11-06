@@ -177,12 +177,12 @@ class LocalReviewTests(unittest.TestCase):
         binary.chmod(0o700)
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
 
-    def question_record(self, fields: dict[str, str], *, slug: str) -> Path:
-        folder = self.root / "proposals" / slug
+    def question_record(self, fields: dict[str, str], *, name: str) -> Path:
+        folder = self.root / "proposals" / name
         folder.mkdir(parents=True, exist_ok=True)
-        document = self.root / f"{slug}-production.md"
-        _ = document.write_text(f"# Production — {slug}\n\n- **Proposals:** `{folder}`\n")
-        owner = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", document))
+        document = self.root / f"{name}-production.md"
+        _ = document.write_text(f"# Production — {name}\n\n- **Proposals:** `{folder}`\n")
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", document))
         record = folder / "question-fixture.md"
         fields = {**fields, "asked_by": owner.id}
         _ = record.write_text(f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"
@@ -565,7 +565,7 @@ class LocalReviewTests(unittest.TestCase):
         question = "Would you retry the build?"
         path = self.transcript("question.jsonl", [("2026-10-13T10:00:00Z", question, "end_turn")])
         record = self.question_record({"since": "2026-10-13T10:00", "text": question,
-                                       "question": question}, slug="demo")
+                                       "question": question}, name="demo")
         before = record.read_bytes(), record.stat().st_mtime_ns
         staff_path = Path(os.environ["STAFF_FILE"])
         _ = staff_path.write_text("{invalid")
@@ -668,7 +668,7 @@ class LocalReviewTests(unittest.TestCase):
         question = "Should handler-enh go ahead with phases 1 and 2?"
         request = "Say go and I'll have cargo-liner do it."
         choice = ("Allow (recommended, since both requests are a day old): "
-                  + "the shutdown unit runs the cancel once, then moves dashboard-unit to claude 4.")
+                  + "the shutdown unit runs the cancel once, then moves dashboard to claude 4.")
         self.assertEqual(reply_asks.user_reply_questions(question + "\n" + request + "\n" + choice),
                          reply_asks.ReplyAsks((question, request), True, (choice,)))
 
@@ -754,7 +754,7 @@ class LocalReviewTests(unittest.TestCase):
                 "question": "Retry it?", "reviewed": accepted}
         current = directory / "demo.json"
         _ = current.write_text("[]")
-        record = self.question_record(item, slug="demo")
+        record = self.question_record(item, name="demo")
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}):
             questions = review.registered_questions(cutoff)
             assert isinstance(questions, list)
@@ -802,7 +802,7 @@ class LocalReviewTests(unittest.TestCase):
         registration.parent.mkdir(parents=True)
         item = {"since": "2026-10-13T10:00", "text": "Run check", "question": question, "reviewed": question}
         _ = registration.write_text("[]")
-        record = self.question_record(item, slug="build")
+        record = self.question_record(item, name="build")
         draft = review.Draft("review.sample", "0", "", NoActionRequired(), "The build passed.", False)
         for closed in (False, True):
             with self.subTest(closed=closed):

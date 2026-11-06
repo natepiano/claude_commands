@@ -270,7 +270,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
     def test_importing_hana_shot_leaves_the_import_path_and_record_name_unchanged(self) -> None:
         result = subprocess.run(
-            [sys.executable, "-c", "\n".join((
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "\n".join((
                 "import json, sys",
                 "before = list(sys.path)",
                 "import scripts.hana_shot.hana_shot",

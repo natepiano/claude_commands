@@ -14,7 +14,7 @@ Print the script's output without changes.
 ## Execution
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/retire_unit.py" <slug> <unit> [--dry-run]
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/retire_unit.py" <showrunner name> <unit> [--dry-run]
 ```
 
 Retire finds the unit by its staff name or id under the production.

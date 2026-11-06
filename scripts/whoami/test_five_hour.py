@@ -39,7 +39,7 @@ RESETS = NOW.replace(hour=21)
 CONFIG = cast(Config, cast(object, {
     "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana", "always": ["natedev"],
 }))
-SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", slug="show", zone="America/Los_Angeles", doc="")]
+SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", name="show", zone="America/Los_Angeles", doc="")]
 CLAUDE_LOGIN = "claude-fixture@example.invalid"
 
 

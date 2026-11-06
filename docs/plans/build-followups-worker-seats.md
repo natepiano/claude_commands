@@ -4,7 +4,6 @@
 
 > **As-built disposition: create** — `docs/as-built/workers.md`; it replaces `docs/as-built/long-lived-workers.md` (Phase 15). roles-unit (sdlc) removes `docs/as-built/review-pool.md` with `review_pool.py` (showrunner, 2026-10-29).
 
-> **Production: natedev** — unit `models-unit`; production doc `docs/plans/natedev-production.md`
 
 > **Sources:** `~/.local/state/plan-backlog/2026-10-28-worker-tool.md` (WT) and `~/.local/state/plan-backlog/2026-10-27-long-lived-worker-seats.md` (WS). Each phase title names the source phases it builds.
 

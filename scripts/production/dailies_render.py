@@ -4,7 +4,7 @@
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
        dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>]
                          [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
-                         [--below <outstanding.json>]... [--reports-to <root slug>] [--doc <production doc>]
+                         [--below <outstanding.json>]... [--reports-to <root name>] [--doc <production doc>]
 Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
@@ -42,11 +42,11 @@ production's own plumbing words (PLUMBING).
          missing file is an empty list.
 --below  With --footer, once per production below a root showrunner: that
          production's list. Its due items count with --outstanding. A list
-         that cannot be read adds the bullet `<slug>: needs-user list
-         unreadable`, where the slug is the file's name, and never fails the
+         that cannot be read adds the bullet `<name>: needs-user list
+         unreadable`, where the name is the file's name, and never fails the
          footer.
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
-         `reports to <root slug>`.
+         `reports to <root name>`.
 --doc    With --footer, the production doc: the line after the header counts
          its changes, efficiency and proposals (footer_counts.py). A
          report reads the doc from its input's `doc`.
@@ -1027,7 +1027,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         raise InputError(f"{where}.held: required; the reason the phase's checkpoint is not merged, or null when no checkpoint waits")
     unit = text(fields, "unit", where)
     name = optional_text(fields, "name", where) or unit
-    label = optional_text(fields, "label", where) or name.removesuffix("-unit")
+    label = optional_text(fields, "label", where) or name
     if len(label) > LABEL_LIMIT:
         raise InputError(f"{where}.label: {label!r} is longer than {LABEL_LIMIT}; give a short label")
     phase = text(fields, "phase", where)
@@ -1580,7 +1580,7 @@ def footer(
         items.append(mac_block_line(mac_block, zone))
     items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")
     # By name, so the lists keep one order however the tree was walked.
-    items.extend(f"{slug}: {UNREADABLE_LIST}" for slug in sorted(unreadable))
+    items.extend(f"{name}: {UNREADABLE_LIST}" for name in sorted(unreadable))
     if root:
         items.append(f"reports to {root}")
     # An item the user deferred stays hidden until its `after` time, in the report's zone.
@@ -1825,7 +1825,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
               or any(child.open for child in report.children))
     lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, report.mac_block, outstanding,
                         nothing_needed=not needed, agent_lines=agent_section(now, zone, at=at),
-                        unreadable=[slug for child in report.children for slug in child.unreadable],
+                        unreadable=[name for child in report.children for name in child.unreadable],
                         root=report.reports_to, counts=doc_counts(report.doc)))
     return lines
 
