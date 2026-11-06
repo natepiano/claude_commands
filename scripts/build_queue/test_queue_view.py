@@ -478,9 +478,9 @@ class QueueViewTests(QueueFixtureTests):
             labels = {first.identity.session_id: UnitLabels("first", "builds", "other-unit"),
                       later.identity.session_id: UnitLabels("gate", "builds", "wrong-unit")}
             with mock.patch.object(gate, "priority_labels", return_value=labels):
-                refused, = fixture.server.handle_request(wire.PrioritySetRequest("wrong-bump", "wrong-unit", "urgent", "user"))
+                refused, = fixture.completed_queue_change(wire.PrioritySetRequest("wrong-bump", "wrong-unit", "urgent", "user"))
                 self.assertIsInstance(refused, wire.Refused)
-                replies = fixture.server.handle_request(wire.PrioritySetRequest("bump-unit", "queue-unit", "urgent", "user"))
+                replies = fixture.completed_queue_change(wire.PrioritySetRequest("bump-unit", "queue-unit", "urgent", "user"))
                 self.assertEqual(replies, [wire.Ok()])
                 model = self.service_model(fixture)
                 self.assertEqual([step.pid for step in model.reading.view.waiting], [later.owner.pid, first.owner.pid])

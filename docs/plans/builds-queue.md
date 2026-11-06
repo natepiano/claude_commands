@@ -371,7 +371,7 @@ only I can bump
 
 **Acceptance gate:** queue and caller suites pass; basedpyright 0/0/0. Change-Review: none (the fault needs a failing service; the tests show it).
 
-### Phase 15 — A queue priority change stops blocking other queue requests while it reads the roster  · status: todo
+### Phase 15 — A queue priority change stops blocking other queue requests while it reads the roster  · status: done
 
 **Depends on:** 14. Source: the 10x architect review; builds ruling, 2026-11-05: one small phase after 14.
 
@@ -387,8 +387,9 @@ only I can bump
 
 **Files:**
 - `scripts/build_queue/admission_service.py` — the priority request path.
-- `scripts/lint/memory_admit.py` — the roster caller, when the change reaches it.
+- `scripts/build_queue/admission_test_support.py` — `completed_queue_change`.
 - `scripts/build_queue/test_admission_service.py` — the tests.
+- `scripts/build_queue/test_queue_view.py`, `scripts/lint/test_memory_admit.py` — callers of a priority change take the socket reply.
 
 **Workers:** `1 writer + 1 tester`.
 

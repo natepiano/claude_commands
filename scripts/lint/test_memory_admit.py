@@ -2232,7 +2232,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
             before = {key: wire.encode_record(gate.stored_waiter(value.row))
                 for key, value in admission.server.waiters.items()}
             for unit, expected in (("first", [300, 400]), ("second", [400, 300])):
-                replies = admission.server.handle_request(wire.PrioritySetRequest(unit, unit, "user's work", "showrunner-id"))
+                replies = admission.completed_queue_change(wire.PrioritySetRequest(unit, unit, "user's work", "showrunner-id"))
                 self.assertEqual(replies, [wire.Ok()])
                 reading, = admission.server.handle_request(wire.ViewRequest())
                 assert isinstance(reading, wire.ViewReply)
@@ -2349,14 +2349,14 @@ class ServicePriorityRepairTests(unittest.TestCase):
 
     def test_unknown_priority_unit_preserves_the_priority_and_log(self) -> None:
         with AdmissionFixture() as fixture:
-            self.assertEqual(fixture.server.handle_request(wire.PrioritySetRequest(
+            self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
                 "initial", "chosen", "saved reason", "director")), [wire.Ok()])
             priority = fixture.server.priority
             assert not isinstance(priority, gate.NoQueuePriority)
             before = priority.copy()
             logged = buildlog_rows(fixture.state_dir.parent)
             for unit in ("not-a-roster-unit", UnitLabels("").unit):
-                self.assertEqual(fixture.server.handle_request(wire.PrioritySetRequest(
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
                     "bad-" + unit, unit, "new reason", "director")), [wire.Refused(
                         f"unknown unit {unit}; the queue priority did not change")])
                 self.assertEqual(fixture.server.priority, before)
@@ -2384,7 +2384,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
             request = wire.PrioritySetRequest("stopped-set", "chosen", "saved reason", "director")
             with patch.object(buildlog_record, "queue_priority", side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
-                    _ = fixture.server.handle_request(request)
+                    _ = fixture.completed_queue_change(request)
             priority = fixture.server.priority
             assert not isinstance(priority, gate.NoQueuePriority)
             self.assertIsInstance(priority["transition"], gate.PendingPriorityTransition)
@@ -2392,7 +2392,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
             assert isinstance(transition, gate.PendingPriorityTransition)
             self.assertEqual(transition.month_row_end, len(prefix))
             fixture.restart()
-            self.assertEqual(fixture.server.handle_request(request), [wire.Ok()])
+            self.assertEqual(fixture.completed_queue_change(request), [wire.Ok()])
             fixture.restart()
             tail = path.read_bytes()[len(prefix):]
             self.assertEqual(path.read_bytes()[:len(prefix)], prefix)

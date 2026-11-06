@@ -544,6 +544,17 @@ class AdmissionFixture(ExitStack):
         _ = self.callback(peer.close)
         return peer
 
+    def completed_queue_change(self, request: wire.Request) -> list[wire.Reply]:
+        """Run the private loop until this change replies through its socket."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.connect(str(self.socket_path))
+            peer.sendall(wire.encode_request(request).encode())
+            with self.loop_turn():
+                while not select.select([peer], [], [], 0)[0]:
+                    self.server.run_once(float("inf"))
+            with peer.makefile("rb") as stream:
+                return [wire.parse_reply(stream.readline())]
+
     def occupy_host(self) -> wire.Admitted:
         """Keep one measured run active without another memory keep-aside."""
         with self.loop_turn():
