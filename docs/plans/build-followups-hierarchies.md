@@ -564,23 +564,17 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 21 — A transfer's message reaches the moved unit  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
+- `transfer_unit.py apply` sends the moved unit's message to the bare staff id. The `staff:<id>` address is gone, because `send.py` does not take it.
+- `test_transfer_unit.py` expects the bare staff id. One new test checks that `send.resolve_staff_recipient` resolves that value to the moved unit's staff row, so a fake sender cannot hide a wrong address.
+- `commands/showrunner/transfer_unit.md` now says what the script does: the staff parent change, the one message and the tab move.
+- No other check, guard or refusal is added.
+- The live proof passed on main 04ea6cd03. Both transfers printed `told zz-tr-mike`, and the transcript records the notice once. The status line and the pane name the new production. The tab takes its A-Z place. A rerun sends no second notice. The live staff record did not change.
 
-**Goal:** the message from Phase 20 reaches the moved unit. In the live proof on 2026-11-05 (main 3b42139d0: hierarchies-unit to builds and back to sdlc), both transfers printed `could not tell hierarchies-unit: send.py: absence of staff:<id> here is not proven`. The tab moves were correct both ways.
+**Files:** `scripts/production/transfer_unit.py`, `scripts/production/test_transfer_unit.py`, `commands/showrunner/transfer_unit.md`.
 
-**Cause (found by the unit director):** `transfer_unit.py apply` sends to `staff:<member id>`. `send.py` does not take a `staff:` address: `resolve_staff_recipient` looks up the whole text as a staff id, finds nothing, and the roster lookup then fails. `send.py --to <member id>` (the bare staff id) resolves the row and delivers; a live probe proved it. The Phase 20 test replaced the sender with a fake, so it did not see this.
-
-**Spec:**
-1. `scripts/production/transfer_unit.py` `apply`: send to the bare staff id (`str(request.member.id)`), not `staff:<id>`.
-2. `scripts/production/test_transfer_unit.py`: the expected `--to` value is the bare staff id. Add one test that `send.resolve_staff_recipient` resolves that value to the moved unit's staff row, so a fake sender cannot hide a wrong address again.
-3. `commands/showrunner/transfer_unit.md` (the unit director writes this): it still describes a stop, a relaunch, a plan-header commit and a journal. Make it say what `transfer_unit.py` does now: the staff parent change, the one message, and the tab move.
-4. Add no other check, guard or refusal. Do not edit `scripts/production/unit_lookup.py`.
-
-**Acceptance gate:**
-- The unittest module `scripts/production/test_transfer_unit.py` passes, and basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
-- Live, from main after the merge: transfer hierarchies-unit to builds and back to sdlc. Each transfer prints `told hierarchies-unit`, the unit gets the message, its status line names the new production, and its tab is in its A-Z place.
+**Gotchas:** the Work Order named a live transfer of hierarchies-unit. The proof ran on TEST rows and tabs instead, because the user does not allow tests to act on a live unit. The proof script is not in the repo. It is at `phases/21/proof/` in the run folder of 2026-11-06.
 
 ### Phase 22 — Displays read workers through observe  · status: done
 
@@ -644,6 +638,19 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 3. A read of a worker roster in a folder that does not exist reads as a missing roster and creates nothing. A write still creates its folder.
 4. Tests: one `worker.py list` over several workers and an ownerless folder prints each anomaly line once and makes one `held_by_session` scan. A roster read of a missing folder leaves no folder.
 5. Delete no folder under `/tmp/claude`. Add no check, guard or refusal.
+
+**Files:**
+- `scripts/lib/unit_runs.py`
+- `scripts/herdr/worker_panes.py`
+- `scripts/production/worker.py`
+- `scripts/production/session_staff.py`
+- `scripts/agents/worker_lifecycle.py`
+- `scripts/lib/test_unit_runs.py`
+- `scripts/herdr/test_worker_panes.py`
+- `scripts/production/test_worker.py`
+- `scripts/production/test_session_staff.py`
+
+**Workers:** 1 writer, slot impl2.
 
 **Acceptance gate:**
 - basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
