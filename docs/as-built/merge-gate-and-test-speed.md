@@ -9,8 +9,8 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 `scripts/production/merge_gate.py` merges a checkpoint and tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 `scripts/production/full_test.py --checkout TREE [--full]` runs a unit's full tests through the same runner.
-Full tests use the existing affected-module selection. Merge gates and nightly runs always use all modules.
-A full-test run that selects all modules certifies the tree.
+Full tests select modules by direct imports, complete path tokens, changed test modules, and folders of changed Python source files.
+Merge gates and nightly runs use all modules.
 
 **Build-hold guard tests.** `scripts/hooks/test_build_hold_guard.py` calls the real Python hook entry point in-process for command parsing and hold decisions, restoring stdin, environment and import paths for each call. `build_hold_guard_test_support.py` copies the existing hold fixture's class seed into a private case directory at the same path for each test. Real subprocess tests retain the shell front's no-Python fast paths, byte-for-byte stdin/output/status relay, lazy imports, malformed input, and shell-to-reader integration. No production hook or hold decision is replaced, and no clock or wait budget is shortened.
 
@@ -36,7 +36,6 @@ A full-test run that selects all modules certifies the tree.
 
 ### Full tests: `scripts/production/full_test.py`
 
-`--full` forces all modules.
 The entry has its own parser and description.
 It shares the suite arguments, signal wrapper, copy lock, and suite runner with `merge_gate.py`.
 `SuiteMode.FULL_TEST` enables selection and takes the `full-test` admission step.
@@ -79,15 +78,44 @@ A checkpoint rerun accepts its own recorded merge only for the same checkpoint, 
 
 **Passed trees.** `${MERGE_GATE_PASSED_DIR:-~/.local/state/merge-gate}/passed-trees.jsonl` has one JSON line per passing run, with `kind: full` or `kind: affected` (a legacy record without `kind` is full). Fields are `tree` (`HEAD^{tree}`), `commit`, `at` (UTC), `host`, `checkout`, sorted `suites`, and `source` (`tests-only` or `checkpoint`). Full passes also record `reason`; older records without it remain valid. The checkout must have an empty `git status --porcelain`, including untracked files; ignored files do not count. It must still be clean with the same tree after the run. Failed runs and reused results add no record. Each append uses one write. A read or write error prints one reason and leaves the gate result unchanged; a ledger unavailable at lookup makes all modules run.
 
-Before modules start, a clean checkout reuses the most recent full record with the same tree hash, host and sorted suite names from the found test modules. Affected records never certify reuse or a selection base. Commits and checkout paths may differ. It prints `tests reused from <short tree> (<when in the user zone>, <source>, <checkout>)` and marks each suite `OK reused`. Types, settings, ancestry, production doc and change-review checks still run as before. A dirty tree runs all modules and records no reusable pass. Without exact reuse, a full test selects affected modules as below. `--full` and a red nightly marker bypass reuse.
+Before modules start, a clean checkout reuses the most recent full record with the same tree hash, host and sorted suite names from the found test modules. Affected records never certify reuse or a selection base. Commits and checkout paths may differ. It prints `tests reused from <short tree> (<when in the user zone>, <source>, <checkout>)` and marks each suite `OK reused`. Types, settings, ancestry, production doc and change-review checks still run as before. A dirty tree records no reusable pass. Without exact reuse, a full test selects affected modules as below.
 
 Recursive discovery changes the ledger key once, so the first gate after this change runs all modules. A later added or removed test folder changes the suite set and also forces a full run. The newly covered modules add about 120 module-seconds (measured 2026-10-30).
 
-**Affected modules for full tests** (`scripts/production/affected_modules.py`). The base is the newest full record on this host with the complete suite set whose commit is an ancestor of HEAD. No certified base means a full run. On a clean checkout, `git diff --name-status -M <base> HEAD` supplies the changed files. A static AST graph covers every tracked Python and shell file under `scripts/`: qualified imports include existing package initializers; bare non-library imports include every same-named module; Python strings and shell text mentioning a tracked basename under `scripts/` or `config/` include every matching file. Dependency closures select the tests. An unreferenced change under a suite includes that suite; an unmentioned file outside scripts/config includes nothing. Tests using tree scans (`walk`, `rglob`, recursive `glob`, `git ls-files`) always run, conservatively including fixture scans. Shared fixture providers and imported test modules select their dependents through the same graph. Strings in `affected_modules.py` and `merge_gate.py` are selection data and do not create mention edges; their imports still count.
+**Affected modules for full tests** (`scripts/production/affected_modules.py`).
+The base is the newest full record on this host with the complete suite set and a commit that is an ancestor of `HEAD`.
+The changed set includes changes from the base to `HEAD`, plus dirty paths.
+A static Python graph selects a test module under four rules:
 
-A deleted or renamed Python file, a graph/read error, a change under `scripts/lib/`, `conftest.py`, `settings.json`, `merge_gate.py`, `affected_modules.py`, `models_config.sh`, a `config/*.conf` change, or more than 40% affected modules forces all modules. `--full` does too. Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`, the module names when N ≤ 10, and the number of always-selected tree scanners. Otherwise it prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary. An untouched suite prints `skipped (not affected)`. A certified selection of zero modules is green; affected passes record `kind: affected` and never replace the full base. Types, admission, isolated reruns and later merge checks retain their existing behavior.
+1. The test module changed.
+2. The test module directly imports a changed Python file.
+3. The test module names a changed path as a complete token.
+4. The test module shares a folder with a changed Python source file that is not a test module.
 
-**Nightly.** `merge_gate.py --nightly --merge-branch B [--production DOC] [--checkout DIR]` fetches `origin/B`, takes the production’s standing checkout through `copies.standing(owner, repo, commit)`, resets it to the fetched commit, and runs the same full tests-only runner there, with basedpyright over `--type-dirs` (default `scripts`, including `scripts/hooks`). The checkout has its own git directory, holds the copies busy lock for the full run, and retains its ignored build files for reuse; local branches, HEAD and edits stay in place. Git has stdin closed, terminal credential prompts disabled and SSH batch mode enabled, so a user timer needs no terminal. Promotion stays separate and runs no tests. A green nightly appends a full pass as usual. A red nightly atomically writes `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/full-required` with the tree, UTC time and failed modules, then calls the existing showrunner messaging path once. With no calling showrunner session it finds the registered production whose doc names that merge branch; an absent or ambiguous match prints a delivery failure. `--production DOC` can name it explicitly. A delivery failure is printed and keeps the marker. While it exists every test gate runs all modules with `last nightly run was red (<tree>, <time>)`; any green full run removes it. An unreadable marker also forces a full run. No timer is installed by this command.
+Only test modules have graph rows. All Python paths can resolve imports.
+A removed Python file uses import facts from the base.
+A syntax error in a test module requires a full run. Non-test syntax errors do not block selection.
+The selector reads source without importing or evaluating it.
+The cache holds imports and complete path tokens for each test-module blob.
+The current and base graphs share one cache read and one cache update.
+A warm selection reads base blobs only when the cache lacks their facts.
+Dirty sources never enter the cache or cause cache writes.
+A full test runs all modules only for `--full`, no certified base, or a graph error.
+The nightly-red marker widens only a merge gate. It does not block full-test reuse or selection.
+A full test leaves the marker in place, including after `--full`.
+`--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
+A passing merge gate removes the marker. An unreadable marker also requires all modules in a merge gate.
+
+Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`.
+It prints module names when ten or fewer modules are selected.
+A full run prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary.
+An untouched suite prints `skipped (not affected)`.
+A selection of zero modules passes.
+Affected passes record `kind: affected` and never replace the full base.
+Types, admission, isolated reruns, and later merge checks keep their existing behavior.
+
+**Nightly.** `merge_gate.py --nightly --merge-branch B [--production DOC] [--checkout DIR]` fetches `origin/B`, takes the production’s standing checkout through `copies.standing(owner, repo, commit)`, resets it to the fetched commit, and runs the same full tests-only runner there, with basedpyright over `--type-dirs` (default `scripts`, including `scripts/hooks`). The checkout has its own git directory, holds the copies busy lock for the full run, and retains its ignored build files for reuse; local branches, HEAD and edits stay in place. Git has stdin closed, terminal credential prompts disabled and SSH batch mode enabled, so a user timer needs no terminal. Promotion stays separate and runs no tests. A green nightly appends a full pass as usual. A red nightly atomically writes `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/full-required` with the tree, UTC time and failed modules, then calls the existing showrunner messaging path once. With no calling showrunner session it finds the registered production whose doc names that merge branch; an absent or ambiguous match prints a delivery failure. `--production DOC` can name it explicitly. A delivery failure is printed and keeps the marker.
+No timer is installed by this command.
 
 **Suite runner** (`run_suites(repo, memory_cap_mib, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, mode=SuiteMode.MERGE_GATE) -> GateRun`):
 - `test_modules(repo)` finds every `scripts/**/test_*.py` file outside `__pycache__`, sorted by path. A module belongs to its first folder under `scripts/`, including modules in nested `tests/` folders. A folder without test modules is no suite. New test folders need no registration.

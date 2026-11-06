@@ -600,6 +600,12 @@ class MergeGateFixture(unittest.TestCase):
         path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
+    def write_nightly_red_marker(self) -> tuple[Path, str]:
+        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
+        notice = json.dumps({"tree": "red-tree", "at": "2026-10-29T00:00:00+00:00"})
+        self.write(marker, notice)
+        return marker, notice
+
     def clear_gate_events(self) -> None:
         for name in ("modules.jsonl", "tools.jsonl", "types-ran"):
             (self.state / name).unlink(missing_ok=True)

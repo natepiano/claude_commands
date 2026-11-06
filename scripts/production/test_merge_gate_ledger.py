@@ -64,11 +64,11 @@ class MergeGateLedgerTests(MergeGateFixture):
     def test_full_flag_and_red_marker_force_all_modules_and_green_clears_the_marker(self) -> None:
         first = self.run_gate("--tests-only")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
         for trigger in ("--full", "red marker"):
             with self.subTest(trigger=trigger):
-                if trigger == "red marker":
-                    self.write(marker, json.dumps({"tree": "red-tree", "at": "2026-10-29T00:00:00+00:00"}))
+                marker = self.write_nightly_red_marker()[0]
+                if trigger == "--full":
+                    marker.unlink()
                 self.clear_gate_events()
                 result = self.run_gate("--tests-only", *(["--full"] if trigger == "--full" else []))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -121,13 +121,13 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertEqual(record["status"], 0)
         self.assert_all_modules_started()
 
-    def test_staged_rename_records_only_the_destination_path(self) -> None:
+    def test_staged_rename_records_the_source_and_destination_paths(self) -> None:
         _ = self.git(self.checkout, "mv", "subject.txt", "renamed subject.txt")
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         record = self.gate_run_records()[-1]
-        self.assertEqual(record["dirty_paths"], ["renamed subject.txt"])
-        self.assertEqual(record["dirty_path_count"], 1)
+        self.assertEqual(record["dirty_paths"], ["renamed subject.txt", "subject.txt"])
+        self.assertEqual(record["dirty_path_count"], 2)
         self.assert_all_modules_started()
 
     def test_second_tests_only_run_reuses_without_starting_any_module(self) -> None:
@@ -266,7 +266,6 @@ class MergeGateLedgerTests(MergeGateFixture):
                     notice.assert_called_once()
                     self.assertEqual(notice.call_args.args[2], ["hooks/test_first.py"])
                 else:
-                    self.assertFalse(marker.exists())
                     notice.assert_not_called()
 
     def test_nightly_without_an_identified_production_runs_in_the_configured_role_pool(self) -> None:

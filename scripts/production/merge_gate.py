@@ -61,7 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib import build_folders
 from scripts.lib.build_steps import read_step_names
-from scripts.production import change_review, staff  # noqa: E402
+from scripts.production import affected_modules, change_review, staff  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -744,16 +744,10 @@ class UnrecordableTestTree:
 
 
 def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
-    status = git(repo, "status", "--porcelain", "-z", "--untracked-files=all")
-    if status.returncode:
-        raise GateRefused(f"git status: {failure_detail(status)}")
-    entries = iter(status.stdout.split("\0"))
-    paths: list[str] = []
-    for entry in entries:
-        if entry:
-            paths.append(entry[3:])
-            if "R" in entry[:2] or "C" in entry[:2]:
-                _ = next(entries, "")
+    try:
+        paths = sorted(affected_modules.dirty_paths(repo))
+    except affected_modules.GraphError as error:
+        raise GateRefused(str(error)) from error
     if paths:
         return UnrecordableTestTree("checkout is dirty", tuple(paths))
     return CleanTestTree(checked_git(repo, "rev-parse", "HEAD^{tree}"), checked_git(repo, "rev-parse", "HEAD"))
@@ -821,8 +815,6 @@ class PassedTreeLedger:
         return False
 
     def certified_base(self) -> CertifiedBase | NoCertifiedBase:
-        if isinstance(self.tree, UnrecordableTestTree):
-            return NoCertifiedBase()
         try:
             records = sorted(self.records(), key=lambda record: datetime.fromisoformat(cast(str, record["at"])), reverse=True)
             for record in records:
@@ -885,7 +877,6 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
           + f"{len(selection.changed_files)} changed files", flush=True)
     if len(selection.modules) <= 10:
         print(", ".join(f"{path.parent.name}/{path.name}" for path in selection.modules) or "(none)", flush=True)
-    print(f"Tree-scanning modules: {len(selection.tree_scanners)} (always affected)", flush=True)
 
 
 def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult],
@@ -970,7 +961,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         print(f"Dirty checkout: {len(tested_tree.dirty_paths)} paths", flush=True)
     suites = sorted({suite for suite, _ in modules})
     ledger = PassedTreeLedger(repo, source, tested_tree, suites)
-    required = full_required()
+    required = full_required() if mode is SuiteMode.MERGE_GATE else NoFullRunRequired()
     reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
     selection: AffectedSelection | FullSuite = FullSuite("passed tree reused")
     if not reused:
@@ -981,7 +972,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         elif mode is SuiteMode.MERGE_GATE:
             selection = FullSuite(f"{read_step_names().prose(mode.value)} runs all modules")
         else:
-            selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], state_dir=gate_state_dir())
+            dirty: set[str] = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set()
+            selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
+                                        state_dir=gate_state_dir())
         report_selection(selection, len(modules))
         if isinstance(selection, AffectedSelection):
             selected = set(selection.modules)
@@ -1233,7 +1226,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         print("RED: sampled memory exceeded the cap", flush=True)
     if run.passed and not reused:
         ledger.record_pass(selection)
-        if isinstance(selection, FullSuite):
+        if isinstance(required, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
     return run
 
@@ -1589,7 +1582,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> N
         outcome = showrunners.tell(nightly_owner(args), f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. "
                                    + f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
-                                   + "Every gate now requires the full suite until a full run passes.")
+                                   + "Every merge gate now requires the full suite until a merge gate passes.")
         print(f"Nightly notice: {outcome}", flush=True)
     except (GateRefused, change_review.ChangeReviewError, OSError, ValueError) as error:
         print(f"Nightly notice could not be sent: {error}; full-required marker kept", flush=True)
@@ -1621,7 +1614,6 @@ def nightly(args: GateArguments) -> int:
             run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error)),), 0, 0)
         marker = gate_state_dir() / "full-required"
         if run.passed:
-            marker.unlink(missing_ok=True)
             return 0
         failed = [f"{job.suite}/{job.module}" for job in run.jobs if job.returncode]
         marker.parent.mkdir(parents=True, exist_ok=True)

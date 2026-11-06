@@ -846,7 +846,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Live check: the queue page showed `7▸builds  natest  full test  2 pid 1674416 ██████ 6.0`.
 - Phase 48 owns the raw step id in the running and release sentences, the three copies of the suite-runner names, and `build_hold.py:493`.
 
-### Phase 37 — A unit's full test runs under 40% of the test modules  · status: todo
+### Phase 37 — A unit's full test runs under 40% of the test modules  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1085,7 +1085,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Every shell script and shell test starts Python through the adjacent `scripts/lib/py`, so a Mac with Apple's Python 3.9 first on PATH starts the right interpreter. Arguments, stdin and exit status of each start stay the same.
 - `board.sh` resolves its folder with `readlink -f`, so a filename-only start and a symlink start find the launcher. `memory_gate.sh` holds the launcher path in `BUILDLOG_MEM_PY`, so a relative source survives a directory change, and it has no bare-Python fallback.
 - `direct/verify.sh` and `rust_style/load-rust-style.sh` keep `export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"`. That line names a default value and starts nothing.
-- One start costs more on the launcher, same-load pairs: `board.sh read` 14.2 ms to 27.2 ms, `statusline.sh` 200.4 ms to 224.7 ms.
+- The launcher adds about 4 ms to each start (200 random-order pairs of `statusline.sh`, load 54-59: median pair difference 4.09 ms). The two `readlink` and `dirname` starts in `board.sh` add about 4.7 ms to each call.
 
 **Files:**
 - `scripts/berth_fix/capture.sh`, `scripts/berth_fix/launch.sh`, `scripts/bevy_migration_plan/bevy_migration_count_pattern.sh`, `scripts/direct/board.sh`, `scripts/lint/memory_gate.sh`, `scripts/production/mac_run.sh`, `scripts/statusline/statusline.sh` — start Python through the launcher
@@ -1181,3 +1181,39 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `git grep -n 'cat-file.*--batch'` finds one framing reader outside a test.
 - Each caller module of the changed files green in the gate form.
 - The full test green on the phase commit merged with `origin/builds`.
+
+### Phase 53 — `board.sh` starts no process to find its folder  · status: todo
+**Depends on:** Phase 49
+
+#### Work Order
+
+**Goal:** `board.sh read` costs what it cost before Phase 49. Phase 49 added two process starts to every `board.sh` call to find the script's folder.
+
+**Spec:**
+1. In `scripts/direct/board.sh`, replace `BOARD_DIR=$(dirname "$(readlink -f -- "${BASH_SOURCE[0]}")")` with this form:
+   ```bash
+   BOARD_SCRIPT=${BASH_SOURCE[0]}
+   [[ ! -L "$BOARD_SCRIPT" && "$BOARD_SCRIPT" == */* ]] || BOARD_SCRIPT=$(readlink -f -- "$BOARD_SCRIPT")
+   BOARD_DIR=${BOARD_SCRIPT%/*}
+   ```
+2. A filename-only start and a symlink start still call `readlink`. Every other start starts no process to find the folder.
+3. Remove `"readlink"` from the fixture tool list at `scripts/direct/verify_lint_scope_test_support.py:413`. A fixture that starts `board.sh` by a path with a slash does not need it now.
+4. Add a test for each start form: path with a slash in a PATH without `readlink`, filename-only, and symlink. Each form posts one line to the board. Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after.
+5. Add no guard, refusal or ban check.
+
+**Files:**
+- `scripts/direct/board.sh`
+- `scripts/direct/verify_lint_scope_test_support.py` — owner verify; tell the verify unit before the edit
+- `scripts/direct/test_board_start.py` — new
+
+**Workers:** 1 writer on slot `impl3` (one line and its tests)
+- `impl3` — all files above
+
+**Constraints from prior phases:**
+- Phase 49: without `readlink`, the old form gave `BOARD_DIR=.`, and the board request failed and retried for 60 s.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- same-load random-order pairs of `board.sh read`, 200 pairs: the median pair difference shows about 4.7 ms less than the Phase 49 form (measured on a trial: 12.6 ms to 7.9 ms)
+- each start form on natedev and on the Mac gives rc=0
+- the full test green on the phase commit merged with `origin/builds`
