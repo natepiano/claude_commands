@@ -28,16 +28,26 @@ Rustdoc runs once per phase, as the unit director's last command before a Rust c
 
 `verify.sh doc [--features <list>]` does these steps:
 
-1. It reads the repo top (`git rev-parse --show-toplevel`) and the staged tree id (`doc_tree`).
-2. It resolves the original repo's target directory: `CARGO_TARGET_DIR` when set (relative to the repo top), otherwise `cargo metadata`'s `target_directory` at the repo top. It exports that absolute target for rustdoc and locks `<target>/verify-doc/<repo-path-hash>/lock` for the whole run. The stable `tree/` there has its own index. The first run checks out all staged files; later runs use `git read-tree -m -u <previous-tree> <new-tree>`, retaining unchanged mtimes and updating changed or deleted files. Untracked build outputs are cleaned from the source checkout. Missing metadata or a failed update triggers one fresh full checkout.
+1. It reads the repository root through `git rev-parse --show-toplevel`.
+2. It resolves the original target directory from `CARGO_TARGET_DIR` or `cargo metadata` and exports this target for rustdoc.
+   It starts `copies.py hold` without a tree argument.
+   `hold` computes the staged tree and creates `StagedSource(tree)`.
+   It prints the tree identity and standing checkout path on separate lines.
+   `verify.sh` reads both lines.
+   The copies owner leases the standing checkout for the whole run.
+   The checkout has its own index.
+   The copies owner updates staged content and preserves unchanged modification times.
+   It removes a stale index lock before index writes.
+   It repairs a damaged private index under the checkout lease.
+   Source files and the source index stay unchanged.
 3. If `lint.conf` has `doc=off`, it prints one line that says it ignores the switch.
-4. In `tree/`, it runs `LINT_CONFIG_FORCE=1 invoke_doc --workspace`, through the cargo token and the memory gate. Feature names pass through unchanged.
+4. In the standing checkout, it runs `LINT_CONFIG_FORCE=1 invoke_doc --workspace`, through the cargo token and the memory gate. Feature names pass through unchanged.
 5. On exit 0, `doc_record` computes the staged tree id again. If the staged tree changed during the run, it prints a notice and writes no record.
 6. Otherwise it writes `~/.local/state/verify/doc_pass/<tree_id>.json`.
 
 At call start, `verify.sh` reads `[workspace.metadata.dev] features = [...]` once from the repo root `Cargo.toml`. It adds that list to check, test (filtered runs included), final, doc and build without `--release`. Work Order `--features` and a build example's required features are merged without duplicates; package feature names are qualified, and names that contain `/` keep their spelling. Doc keeps workspace feature names unchanged. Release builds and lint receive no dev features. A missing or empty list keeps the existing Cargo arguments; a value other than a list of strings refuses the step with one line.
 
-The checkout and target survive exit, including a failed rustdoc run. Unchanged dependencies reuse artifacts in the repo's target directory; path-source package ids separate the checkout's workspace artifacts from the worktree's. The lock prevents concurrent runs for this repo from sharing its checkout. No checkout goes in tmpfs. Rustdoc never reads the working tree, so unstaged and untracked files do not change the result.
+The checkout and target survive exit, including a failed rustdoc run. Unchanged dependencies reuse artifacts in the repo's target directory; path-source package ids separate the checkout's workspace artifacts from the worktree's. The copies lease prevents concurrent runs from sharing the standing checkout. No checkout goes in tmpfs. Rustdoc never reads the working tree, so unstaged and untracked files do not change the result.
 
 The record has four keys: `repo_top` (the resolved path of the original repo, not the checkout), `tree_id`, `time` (UTC ISO 8601) and `call_id` (the build-log call id, `BUILDLOG_CALL_ID`). The write goes to a temporary file and is then renamed, with fsync on the file and the folder. Each write deletes records older than 14 days. The records are outside the worker session folder, so `end_session.sh` does not delete them. Workers can run `doc` too; their Work Orders do not ask for it.
 
@@ -125,7 +135,7 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - `doc` always covers the whole workspace. A change in one member can break the intra-doc links of another member.
 - The doc record path is `~/.local/state/verify/doc_pass/<tree_id>.json`, and its keys are `repo_top`, `tree_id`, `time` and `call_id`. `verify.sh` and the hook must agree on both.
 - `doc_tree` writes the staged tree from a private copy of the index. It runs no `git add` and never changes the real index. Unstaged and untracked files are not in the tree.
-- `doc` runs rustdoc in a locked, stable staged-tree checkout under the original repo's target directory, never in the working tree or tmpfs. The record's `repo_top` is the original repo top. The private index and checkout persist; unchanged source mtimes and dependency artifacts are reused.
+- `doc` runs rustdoc in the standing checkout from `copies.py hold` with `StagedSource`. The copies configuration sets its location. The original target directory stores the artifacts. The record names the original repo top. The checkout and private index persist. Later runs reuse unchanged mtimes and dependency artifacts.
 - A staged tree that changes during a `doc` run writes no record. An unstaged edit during the run does not stop the record. A failed `doc` writes no record.
 - `lint` does not run rustdoc and refuses `--features`.
 - The hook fails closed for Cargo checkpoints and opaque commands with git commit/merge words plus explicit checkpoint text in any cwd (or unreadable messages in a Cargo cwd). Modeled constructs never use quote-removed fallback evidence. Unrelated opaque calls and default merges pass. The first check stays cheap: every Bash call reaches it.
@@ -149,7 +159,7 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - Both hooks ignore example checkpoint text in other commands. Both hooks pass help requests before repository and message checks.
 - Both hooks refuse `--trailer` on checkpoints and merges, or when the message or merge state is unknown. Supply the complete message through literal `-m` text, a `-F` file, or a supported heredoc.
 - `doc` judges only the staged tree. A plain `git commit` also leaves out unstaged and untracked files, so they need no action. With `-a`, `--only`, `--include` or paths, the commit writes working changes that `doc` did not judge. The record then matches only if those changes were staged before `doc`.
-- `doc` always uses the original repo's target directory and a stable checkout below it. Later staged trees preserve unchanged source mtimes; the private checkout lock covers the whole doc run. Missing or damaged checkout metadata gets one fresh checkout, not a shared or temporary source tree.
+- `doc` uses the original target directory and a standing checkout from `copies.py hold`. Its lease covers the whole doc run. `StagedSource` preserves unchanged source mtimes. The copies owner removes stale private index locks and repairs damaged private indexes under that lease.
 - The memory gate can hold a doc step for minutes. A one-file crate waited 15 min for a 2.6 s rustdoc run.
 - An example that sets `test = true` makes `final` and `test` refuse until the line is removed. hana main and bevy_hana still have two such lines (fairy_dust and hana_clerestory). hana_clerestory pads the `=`, so a search for `test = true` misses it; search with `test *= *true`.
 - A hana build outside its checkout needs its flake shell (`direnv exec <hana checkout> …`). Without it, mold fails with "library not found: gbm".

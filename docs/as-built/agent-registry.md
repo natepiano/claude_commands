@@ -239,6 +239,7 @@ These roles keep their staff row and current session in a pane.
 Held roles receive messages through `send.py`.
 An ad hoc Astra review outside the staff hierarchy uses the one-turn `codex exec` path in `astra_review.py`.
 `side_pane.py` serves ask-a-friend consultations without a staff row.
+The friend launches with the worker policy through `worker_panes.worker_policy`, so it replies with `send.py` and stops at no permission prompt.
 A managed Astra review starts through `assign.sh --role review --operation astra-review`.
 The mesh transport primes, holds, follows, and ends the reviewer through `codex_mesh.py`.
 The herdr transport adds, assigns, and ends the reviewer through `worker.py`.
