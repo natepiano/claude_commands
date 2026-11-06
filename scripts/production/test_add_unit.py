@@ -180,7 +180,6 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(unit_config.read(worktree), expected)
         path = worktree / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
-        _ = self.doc.write_text(self.doc.read_text().split("## Units")[0])
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--responsibility", "nightly-review")
         self.assertEqual(unit_config.read(worktree), expected)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
@@ -264,6 +263,13 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertTrue((self.root / "project-alpha").exists())
         self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
             unit_config.StandbyPlan(), unit_config.NoAppPort(), ()))
+
+    def test_named_responsibilities_are_written_once(self) -> None:
+        _ = self.successful("alpha-unit", "--standby", "--responsibility", "nightly-review",
+                            "--responsibility", "build-check", "--responsibility", "nightly-review")
+        config = unit_config.read(self.root / "project-alpha")
+        assert isinstance(config, unit_config.UnitConfig)
+        self.assertEqual(config.responsibilities, ("build-check", "nightly-review"))
 
     def test_standby_launch_writes_the_standby_plan_in_its_unit_config(self) -> None:
         _ = self.successful("alpha", "--standby")

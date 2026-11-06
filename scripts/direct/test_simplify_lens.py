@@ -69,19 +69,15 @@ class SimplifyDispatchTests(NixFixture):
                          "UNIT_SYNC_WRITES": "0", "PYTHONPATH": str(ROOT),
                          "CODEX_THREAD_ID": fixture_runtime_id("simplify-director"),
                          "TZ": "UTC", "USER_ZONE": "UTC"})
-        # Call the function with a review runner that preserves the assign parent.
         startup = self.root / "assignment-startup"
         startup.mkdir()
         _ = (startup / "sitecustomize.py").write_text("\n".join((
-            "import os, subprocess, sys",
+            "import os, sys",
             "def enter(frame, event, argument):",
             f"    if event == 'call' and frame.f_code.co_filename == {str(ROOT / 'scripts/direct/assign.py')!r} and frame.f_code.co_name == 'main':",
             "        sys.setprofile(None)",
             f"        os.environ['PYTHONPATH'] = {str(ROOT)!r}",
             "        frame.f_globals['require_live_director'] = lambda: None",
-            "        def review(file, command, environment):",
-            "            raise SystemExit(subprocess.call(command, env=environment))",
-            "        raise SystemExit(frame.f_globals['main'](exec_review=review))",
             f"if sys.argv[0] == {str(ROOT / 'scripts/direct/assign.py')!r}: sys.setprofile(enter)",
         )) + "\n")
         self.env["PYTHONPATH"] = os.pathsep.join((str(startup), str(ROOT)))
@@ -152,7 +148,6 @@ raise SystemExit(int(os.environ.get("SIMPLIFY_TEST_EXIT", "0")))
         return ["bash", str(ROOT / "scripts/direct/assign.sh"), *self.arguments(*options)]
 
     def launch(self, *options: str) -> subprocess.CompletedProcess[str]:
-        # The fixture passes exec_review explicitly and preserves the assignment parent.
         result = subprocess.run(self.command(*options), env=self.env, capture_output=True, text=True,
                                 check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

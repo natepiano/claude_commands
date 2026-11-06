@@ -6,7 +6,6 @@ from scripts.lib.test_models_registry import write_registry
 
 import json
 import os
-import shlex
 import sqlite3
 import subprocess
 import sys
@@ -32,7 +31,6 @@ from scripts.production.staff_test_support import isolated_staff_file, recorded_
 SCRIPT = Path(add_style.__file__)
 STUB = '''import json
 import os
-import shlex
 import sys
 from pathlib import Path
 
@@ -67,7 +65,7 @@ elif name == "launch.py":
     if os.environ.get("TEST_OPEN_SESSION_EXIT"):
         (Path(os.environ["TEST_LIVE_SESSIONS"]) / name).touch()
         raise SystemExit(int(os.environ["TEST_OPEN_SESSION_EXIT"]))
-    timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / ("showrunner-" + name) / "conf"
+    timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / ("showrunner-" + owner.id) / "conf"
     timer.parent.mkdir(parents=True, exist_ok=True)
     timer.write_text("TARGET=session:" + owner.id + "\\nCHECK=zsh /x/production_check.sh " + owner.id + "\\n")
 elif arguments[0] == "detach":
@@ -189,11 +187,15 @@ class AddStyleTests(unittest.TestCase):
         if proposals:
             fields.append(f"- **Proposals:** `{self.root / (name + '-issues')}`")
         _ = path.write_text("\n".join([*fields, ""]))
-        timer = self.root / "notifier" / f"showrunner-{name}" / "conf"
+        owner = recorded_showrunner(name, path)
+        timer = self.root / "notifier" / f"showrunner-{owner.id}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
-        _ = timer.write_text(f"TARGET=session:{name}\nCHECK=zsh /x/production_check.sh {shlex.quote(str(path))}\n")
-        _ = recorded_showrunner(name, path)
+        _ = timer.write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
         return path
+
+    def _timer_conf(self) -> Path:
+        owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
+        return self.root / "notifier" / f"showrunner-{owner.id}" / "conf"
 
     def parent_document(self) -> Path:
         record = staff.snapshot()
@@ -402,6 +404,7 @@ atomic_file.os.replace = interrupted_replace
 
     def test_check_uses_the_staff_name_and_keeps_document_paths(self) -> None:
         _ = self.run_bootstrap()
+        self._timer_conf().unlink()
         owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
         _ = staff.rename(owner.id, "hana")
         output = self.run_bootstrap("--check").stdout
@@ -464,7 +467,7 @@ atomic_file.os.replace = interrupted_replace
 
     def test_launch_with_an_existing_staff_row_uses_its_doc_without_a_doc_argument(self) -> None:
         _ = self.run_bootstrap()
-        (self.root / "notifier/showrunner-sample-style/conf").unlink()
+        self._timer_conf().unlink()
         _ = self.run_bootstrap()
 
         launches = [call for call in self.calls() if call["command"] == "launch.py"]
@@ -499,13 +502,11 @@ atomic_file.os.replace = interrupted_replace
                         ledger.set_tip(self.initial_tip, previous_branch)
                     else:
                         ledger.set_tip(self.initial_tip)
-                timer = self.root / "notifier/showrunner-sample-style/conf"
-                if timer.exists():
-                    timer.unlink()
                 _ = self.run_bootstrap()
                 self.assertEqual(self.sync()[:2], (branch_tip, "refs/heads/style/main"))
                 with style_ledger.open_ledger(self.checkout) as ledger:
                     self.assertIn("src/new.rs", {cell.path for cell in ledger.cells()})
+                self._timer_conf().unlink()
 
     def test_create_retry_with_the_exact_sync_pair_does_not_refresh_its_timestamp(self) -> None:
         self.env["TEST_FAIL_LAUNCH"] = "1"
@@ -650,7 +651,7 @@ atomic_file.os.replace = interrupted_replace
         self.assertEqual(retry.returncode, 2, retry.stderr)
         self.assertIn(guidance, retry.stderr)
         self.assertEqual((self.calls(), self.sync()), (calls, sync))
-        timer = self.root / "notifier/showrunner-sample-style/conf"
+        timer = self._timer_conf()
         timer.parent.mkdir(parents=True)
         owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
         _ = timer.write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")

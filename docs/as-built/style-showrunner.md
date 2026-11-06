@@ -174,8 +174,9 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 - `standing_style_production(repo_dir) -> StandingStyleProduction | NoStyleProduction` (frozen; `checkout`, `doc`, `name`, `branch_point`) is the one shared lookup. `style_plan.style_document`, `style_sync.notify` and `add_style` use it. A new caller that resolves from a repo folder must use it.
 - **Existing production** = doc present and staff name in `showrunners.timer_names()`. `_attach` detaches from any old parent, attaches under the caller, rewrites `**Parent production:**` and `**Proposals:**`, then runs `style_sync.py resume`. A doc on another branch point raises `StyleBranchPointTaken` (exit 2) with no write. A doc with no timer is an interrupted bootstrap and reruns the create path, which also rewrites the two fields.
 - Production docs and standing plans use `atomic_file.write_text_atomic` for each whole-file write. A stopped first write leaves no partial file that bootstrap could mistake for a completed file.
-- **Create path** (each step idempotent): branch from the branch-point tip and worktree; production doc with Units table `Unit | Plan | Worktree | Branch | Port | Owns` (Unit `<showrunner name>-<family>-unit`, Worktree `<repo parent>/<showrunner name>-<family>`, Branch `<showrunner name>-<family>`, Port `—`, Owns `none — takes what the board leaves free`); four standing plans `docs/style-production/units/<showrunner name>-<family>-unit.md` with a `**Family:**` snapshot of rule ids and tiers and an empty `## Phases`; `.git/info/exclude` entries for `/docs/style-production/`, the doc and the log; `set_tip(<stored synced tip, else the style branch commit>, style_branch)`; then `add_showrunner.py`. Launcher exit 1 or 3 prints `_open_session_guidance` and returns that code. A live herdr session named `<showrunner name>` with no timer is refused before any write.
-- `--pilot` (create path only; else exit 2 `--pilot applies only while creating <showrunner name>`) lists only the named units in the Units table; all four plans are still written. `=<crates>` writes `- **Pilot scope:** <packages>` into that unit's showrunner-copy plan. `--pilot` accepts a family, an old `<family>-unit` id or a full `<showrunner name>-<family>-unit` id. `--check` prints seven steps with full ids and acts on nothing.
+- **Create path:** Each step is idempotent. The command creates the branch and worktree from the branch-point tip. It writes a production document without a Units table. It writes four plans at `docs/style-production/units/<showrunner name>-<family>-unit.md`. Each plan records rule ids and tiers in `**Family:**` and has an empty `## Phases`. The command excludes `/docs/style-production/`, the document, and the log through `.git/info/exclude`. It calls `set_tip` with the stored synced tip, or the style branch commit. It then runs `add_showrunner.py`. Launcher exit 1 or 3 prints `_open_session_guidance` and returns that code. A live herdr session with the showrunner name and no timer prevents writes.
+- **Pilot:** `--pilot` applies only during creation. Otherwise, the command exits 2 with `--pilot applies only while creating <showrunner name>`. It records selected and already launched units in `**Pilot units:**`. All four plans remain. `=<crates>` writes `- **Pilot scope:** <packages>` into the selected unit's showrunner-copy plan. `--pilot` accepts a family, an old `<family>-unit` id, or a full `<showrunner name>-<family>-unit` id. `--check` prints seven steps with full ids and changes nothing.
+
 - Format fields (`docs/production_format.md`): `**Kind:** style` (absent = product production), `**Branch point:**`, `**Parent production:**`; `**Proposals:**` required for style. Plan header (`docs/direct_plan_format.md`): `> **Standing:** style_plan.py`. A standing plan never closes and is git-excluded.
 - `add_unit._is_excluded_standing_plan` accepts a plan absent on the merge branch when the showrunner copy is git-ignored and carries `> **Standing:**`. `ensure_worktree` copies it into the unit worktree only when the unit copy is missing. After first launch, the unit copy is the only one that counts.
 
@@ -291,10 +292,51 @@ See `gate-checkouts.md` for configured paths, pool limits and lock rules.
 
 ### Child hand-off merge
 
-- Style showrunner, after each unit checkpoint merge: `merge_checkpoint.py --production <showrunner name> <unit> <phase> <hash> --started …` with one `--also <path>` per entry of the ticket's `files` (Owns parses as `('none',)`); `ticket merge`; then `style_sync.py send-handoff --repo R --production <style showrunner name> --checkpoint <style branch tip>` (`handoff add`, notice `From the showrunner of <showrunner name>: hand-off <hash>` to `showrunners.py parent <style showrunner name>`, `handoff send`). `handoff_notice` returns `HandoffDelivery` (`sent` | `queued`): send.py exit 1 with stdout `QUEUED:` is queued, because send.py delivers it later. Both outcomes record `handoff send` (resume reroutes a row sent elsewhere), and a queued one prints `hand-off <c7>: queued for <parent>`. Every other non-zero exit, a refusal or a timeout keeps the row and exits 1. A root prints `root: merge <c7> with --root-self`.
-- `style_sync.py resume --repo --production <style showrunner name> --branch-point --style-branch` runs first at startup and on reattach: `reconcile` lines, then oldest first: `pending` → notice and `send`; `sent` to the current parent → notice again; `sent` elsewhere → notice and `reroute`. A failed send prints one line and leaves the row (exit 1).
-- Parent: correctness-review the diff against the branch point, then `merge_checkpoint.py --from-child <child> --checkpoint <hash> --production <showrunner name> --started <time> [--root-self]`. It reads no Units table. Refusals: child not attached (`parent_of(child) == parent`; `--root-self` needs no parent), hash not on the child's merge branch, not descended from the last merged hand-off, staged changes in the parent tree, or a unit-only flag (`--regime` other than after, `--holds`, `--merge-defects`, `--excluded`, `--scratch`). Fixed metadata: phase `style hand-off`, no review trial.
-- Run: `checkpoint_tests` (`merge_<c7>_test.log`), merge `Merge <child> hand-off (<hash7>) into <branch point>`, push, `notify_style`, promote (label `<child> style hand-off`). Then `record_handoff_merge` runs `style_ledger.py handoff merged --repo <child checkout> --checkpoint <hash> --merge-commit <merge>` (30 s timeout; a failure prints `hand-off ledger: <detail>`, and the style showrunner then runs `handoff merged` by hand), and `acknowledge_handoff` sends `From the showrunner of <parent showrunner name>: hand-off <hash7> merged as <merge7>.` (a failure prints `hand-off acknowledgment: <error>`). A root prints `root: run style_ledger.py reconcile to mark <h7> merged` and does neither.
+1. Merge each unit checkpoint with `merge_checkpoint.py --production <style showrunner name> <unit> <phase> <hash> --started …`.
+2. Run `ticket merge`.
+3. Run `style_sync.py send-handoff --repo R --production <style showrunner name> --checkpoint <style branch tip>`.
+
+`send-handoff` records `handoff add` and sends `From the showrunner of <showrunner name>: hand-off <hash>` to the parent.
+It then records `handoff send`.
+`handoff_notice` returns `HandoffDelivery` with `sent` or `queued`.
+A send.py exit 1 with stdout `QUEUED:` means queued delivery.
+Both outcomes record the send.
+Resume reroutes a row sent to another parent.
+A queued notice prints `hand-off <c7>: queued for <parent>`.
+Other failures preserve the row and exit 1.
+A root prints `root: merge <c7> with --root-self`.
+
+`style_sync.py resume --repo --production <style showrunner name> --branch-point --style-branch` runs at startup and after reattachment.
+It reconciles rows, then processes the oldest row first.
+A pending row receives a notice and a send record.
+A row sent to the current parent receives another notice.
+A row sent elsewhere receives a notice and a reroute record.
+A failed send prints one line, preserves the row, and exits 1.
+
+The parent reviews correctness against the branch point.
+It runs `merge_checkpoint.py --from-child <child> --checkpoint <hash> --production <showrunner name> --started <time> [--root-self]`.
+The command reads no Units table.
+The child must report to the parent, except with `--root-self`.
+The hash must occur on the child's merge branch and descend from the last merged hand-off.
+Staged parent changes prevent the merge.
+Unit-only flags also prevent the merge: non-default `--regime`, `--holds`, `--merge-defects`, `--excluded`, and `--scratch`.
+The phase is `style hand-off`, without a review trial.
+
+1. Run `checkpoint_tests` with log `merge_<c7>_test.log`.
+2. Merge with subject `Merge <child> hand-off (<hash7>) into <branch point>`.
+3. Push the merge.
+4. Run `notify_style`.
+5. Promote with label `<child> style hand-off`.
+6. Record `style_ledger.py handoff merged --repo <child checkout> --checkpoint <hash> --merge-commit <merge>`.
+7. Send `From the showrunner of <parent showrunner name>: hand-off <hash7> merged as <merge7>.`.
+
+The ledger command has a 30-second timeout.
+A ledger failure prints `hand-off ledger: <detail>`.
+The style showrunner then runs `handoff merged` manually.
+An acknowledgment failure prints `hand-off acknowledgment: <error>`.
+A root prints `root: run style_ledger.py reconcile to mark <h7> merged`.
+It skips both the ledger command and the acknowledgment.
+
 - Delivery state is computed from git each run, never stored: `NotMerged | MergedNotPushed(merge_head) | MergedAndPushed(merge_head)`. A marker in Git’s `checkpoint-tests-pending/<checkpoint>` is written before merging and removed only after tests pass, so an interrupted merge reruns its tests before pushing. A pushed hand-off retries configured promotion until `checkpoint-completed/<merge>/handoff-promotion` records success; this receipt is written only after all promotion destinations finish. The completion log is restored without duplicating its entry. A retry pushes an unpushed merge before any acknowledgment; an already merged hand-off prints `hand-off <hash7> already merged as <merge7>` and acknowledges again (exit 0). `undo_failed_push` aborts a half merge and resets only when origin is unchanged.
 - History: `merge_branch_history` also matches `^Merge (.+?) hand-off \(([0-9a-f]+)\)` into `ChildHandoffEntry(child, short, merge_branch, merge_hash)`. `entries: tuple[MergeEntry | ChildHandoffEntry, ...]`. Unit readers (`last_for_unit`, `code_merge_count`, CI points, lifecycle, dailies) guard with `isinstance(entry, MergeEntry)`; `last_handoff_for_child` and `last_merge()` read hand-offs.
 - Wrap: `production_lifecycle.wrap` detaches running style children (`refuse_running_children -> RunningStyleChildren`, `detach_style_children`) only after promotion, unit retirement and notifier removal, and tells each `<parent> wrapped, so you are a root now: run style_sync.py resume and merge your own hand-offs (docs/style_production.md, Merging back).` Any other running child holds the wrap. `retire_reservations` reads `read_board`, prints `retire skipped: board unavailable (<reason>)` on `BoardUnavailable`, and releases nothing for an unconfigured repo.
@@ -454,7 +496,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - A `checkpointed` ticket blocks the unit's next `assign` until `ticket merge`.
 - `git add` on a path under the shared exclude exits 1 without `-f`; stage from `git status --porcelain`.
 - `add_unit` copies a standing plan only when the unit copy is missing; later showrunner-copy edits never reach a launched unit.
-- Every style Units row's Owns parses as `('none',)`, so a unit checkpoint merge needs one `--also` per ticket file.
+- Unit checkpoints do not filter code paths by responsibilities. The ticket gate and cargo-berth manage ticket files and reservations.
 - A root's own hand-off stays `pending`; `reconcile` after each `--root-self` merge marks it merged by ancestry.
 - The child showrunner staff row gives its current name and document path.
 - The footprint filter is lexical and fails closed: a private rename with a test module's `use super::*`, an unrelated edit on a macro line, or an attribute on an unknown item goes to review. It reads committed revisions only; `--worktree` exists for that reason.
@@ -492,7 +534,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - **Lint in check mode:** a check never touches the tree, so no rewrite-and-rollback is needed.
 - **`--ff-only` for standing units:** a `--no-ff` merge breaks no-change ticket ancestry. No-change tickets make no empty commits, which would carry empty merges into the branch point.
 - **Delivery state from git, not stored:** a single local ancestry check would acknowledge an unpushed merge after a failed push.
-- **A hand-off is not a unit phase:** it is the child's work landing, so it counts toward no unit CI point. Style files go in as `--also`, so no scope code changes.
+- **A hand-off is not a unit phase:** it is the child's work landing, so it counts toward no unit CI point. The hand-off does not use a responsibility filter.
 - **`style_plan.py gate` serves both gates:** one place reads `SelectedByCoverage.base` and the proposal rules.
 - **Per-file structure cells and per-file blocking:** a crate-wide structure cell held every other family off a whole crate; per-file cells let values and names work start as soon as a file's own structure check is done.
 - **Two blind judges on names read tickets, and a when-to-split step on structure tickets:** one judge, or no split question, missed the 95% recall bar in the pilot.

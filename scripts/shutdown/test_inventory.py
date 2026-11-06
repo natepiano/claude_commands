@@ -464,7 +464,7 @@ class InventoryTests(ShutdownTestCase):
         self.home = self.root / "home"
         self.notes = self.root / "agents"
         self.records = self.root / "sessions"
-        self.notifier = self.root / "notifier"
+        self.notifier = Path(os.environ["NOTIFIER_STATE_DIR"])
         self.history = self.root / "history"
         self.runs = self.root / "runs"
         self.checkout = self.root / "checkout"
@@ -497,7 +497,6 @@ class InventoryTests(ShutdownTestCase):
             "USAGE_STATE_DIR": str(self.root / "usage"),
             "AGENT_NOTES_DIR": str(self.notes),
             "NOTIFIER_SESSIONS_DIR": str(self.records),
-            "NOTIFIER_STATE_DIR": str(self.notifier),
             "UNIT_HISTORY_DIR": str(self.history),
             "SHUTDOWN_RUN_ROOT": str(self.runs),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
@@ -514,9 +513,6 @@ class InventoryTests(ShutdownTestCase):
         del patch_dict_context
         _home_context: object = self.enterContext(
             patch.object(Path, "home", return_value=self.home)
-        )
-        _notifier_context: object = self.enterContext(
-            patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier)
         )
         _live_context: object = self.enterContext(
             patch.object(sessions, "live_session", return_value=True)

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import roles_audit as audit
 from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.test_names import NAMES_TOML
 from scripts.shutdown import remote
 
@@ -863,7 +864,8 @@ other_names = ["seat"]
             doc = root / "fixture-production.md"
             _ = doc.write_text("# Fixture\n", encoding="utf-8")
             at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-            with patch.object(showrunners, "timer_docs", return_value={"alpha": doc}), \
+            with isolated_staff_file(root / "staff.json", {}), \
+                    patch.object(showrunners, "timer_docs", return_value={"alpha": doc}), \
                     patch.object(staff, "snapshot", return_value=owned_units(doc, "render")), \
                     patch.object(Path, "home", return_value=root), \
                     patch.dict("os.environ", {"USER_ZONE": "America/New_York"}):

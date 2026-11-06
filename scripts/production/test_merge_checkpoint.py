@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
-from scripts.production import staff, unit_config
+from scripts.production import staff
 
 import os
 import subprocess
@@ -181,21 +181,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertNotIn("docs/plans/alpha.md", tree)
         self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha-unit phase \S+ as-built \(")
 
-    def test_empty_responsibilities_refuse_before_merge_and_name_the_repair(self) -> None:
-        self.production_doc(owns=())
-        result = self.run_checkpoint(self.checkpoint())
-        self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
-        self.assert_stopped_before_merge(
-            result, "failed", "unit alpha-unit: .unit.toml has no responsibilities; "
-            + "edit the unit's .unit.toml responsibilities, then rerun the checkpoint")
-        self.assertNotIn("outside responsibilities", result.process.stdout)
-
-    def test_board_free_allows_an_unowned_path(self) -> None:
-        self.production_doc(owns=(unit_config.BOARD_FREE,))
-        result = self.run_checkpoint(self.checkpoint("outside.txt", "unowned\n"))
-        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed (board-free)", result.process.stdout)
-
     def test_checkpoint_merges_into_its_staff_parent_and_ignores_unavailable_worktrees(self) -> None:
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
@@ -250,18 +235,13 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = doc.write_text("\n".join(lines) + "\n")
         return doc
 
-    def test_scope_rerun_leaves_out_another_productions_paths(self) -> None:
-        import change_review
-
+    def test_scope_leaves_out_another_productions_paths(self) -> None:
         doc = self.import_production_paths()
         sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            with mock.patch.object(change_review, "reviewed_merge_refs", return_value=[]):
-                held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt, outside/second.txt")
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", accepted.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
         self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "other production\n")
 
@@ -269,21 +249,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         doc = self.import_production_paths()
         sha = self.checkpoint("outside/imported.txt", "unit changed this\n")
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            held = self.run_checkpoint(sha)
-        self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt\n")
-        self.assertNotIn("outside/second.txt", held.process.stdout)
-
-    def test_scope_holds_only_unit_outside_paths_then_allows_also(self) -> None:
-        doc = self.import_production_paths()
-        sha = self.checkpoint("outside/unit.txt", "unit's outside work\n")
-        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/unit.txt\n")
-            self.assertNotIn("outside/imported.txt", held.process.stdout)
-            self.assertNotIn("outside/second.txt", held.process.stdout)
-            accepted = self.run_checkpoint(sha, "--also", "outside/unit.txt")
+            accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 1 only by --also; 2 came from origin merge branches", accepted.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths; 1 came from origin merge branches", accepted.process.stdout)
+        self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "unit changed this\n")
 
     def test_scope_leaves_out_own_origin_paths_not_in_local_merge_branch(self) -> None:
         self.write(self.other, "outside/own-production.txt", "already on own origin branch\n")
@@ -295,19 +264,17 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with mock.patch.object(showrunners, "timer_docs", return_value={}):
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 1 came from origin merge branches", accepted.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths; 1 came from origin merge branches", accepted.process.stdout)
         self.assertEqual((self.checkout / "outside/own-production.txt").read_text(), "already on own origin branch\n")
 
-    def test_scope_checks_paths_from_production_without_review_rows(self) -> None:
+    def test_scope_leaves_out_paths_after_production_review_rows_are_added(self) -> None:
         doc = self.import_production_paths(review_rows=False)
         sha = self.checkpoint()
         with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
-            held = self.run_checkpoint(sha)
-            self.assert_stopped_before_merge(held, "held", "scope: held — outside responsibilities: outside/imported.txt, outside/second.txt")
             _ = doc.write_text(doc.read_text() + f"- **Change review:** `{self.root / 'other-review.md'}`\n")
             accepted = self.run_checkpoint(sha)
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths; 2 came from origin merge branches", accepted.process.stdout)
 
     def test_same_checkpoint_rerun_skips_another_productions_reviewed_commits(self) -> None:
         import change_review
@@ -406,13 +373,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(result, "failed", "ancestry: failed")
         self.assertIn("send alpha-unit: the showrunner will inspect the failed command", result.process.stdout)
-    def test_scope_holds_unowned_path_and_allows_explicit_also(self) -> None:
-        sha = self.checkpoint("outside.txt", "unowned\n")
-        held = self.run_checkpoint(sha)
-        self.assert_stopped_before_merge(held, "held", "outside.txt")
-        accepted = self.run_checkpoint(sha, "--also", "outside.txt")
-        self.assertEqual(accepted.process.returncode, 0, accepted.process.stderr + accepted.process.stdout)
-        self.assertIn("scope: ok — 1 changed paths are allowed; 1 only by --also", accepted.process.stdout)
     def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
         plan = self.root / "scratch-plan.md"
         _ = plan.write_text("### Phase 2 — Checkpoint\n\n### Phase 3 — Later work\n")

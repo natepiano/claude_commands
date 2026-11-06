@@ -203,8 +203,6 @@ def _production_text(style: StyleProduction) -> str:
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
-        "## Units", "", "| Unit | Owns |", "| --- | --- |",
-        *(f"| {style.name}-{family}-unit | none — board-free |" for family in FAMILIES), "",
     ])
 
 

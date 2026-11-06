@@ -289,17 +289,25 @@ class ClaudeBackendFixture:
 
 @contextmanager
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
-    """Use the same private record in this process and its fixture children."""
+    """Use private staff and notifier paths in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
     _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
+    _ = environment.setdefault("NOTIFIER_STATE_DIR", str(path.parent / "notifier"))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
+            "NOTIFIER_STATE_DIR": environment["NOTIFIER_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
             "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
         })))
+        for name in ("showrunners", "scripts.production.showrunners"):
+            module = sys.modules.get(name)
+            if module is not None:
+                _ = contexts.enter_context(mock.patch.object(
+                    module, "NOTIFIER_STATE_DIR", Path(environment["NOTIFIER_STATE_DIR"]),
+                ))
         if "HERDR_PANE_RECORD_DIR" in environment:
             _ = contexts.enter_context(mock.patch.object(
                 pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),

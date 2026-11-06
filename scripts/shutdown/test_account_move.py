@@ -56,10 +56,8 @@ class AccountMoveTests(ShutdownTestCase):
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "registry"),
-            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
         })))
         del context
-        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "user_zone", return_value=timezone.utc))
         self.moves = FakeSessionMoves()
         _ = self.enterContext(patch.object(stop_resume, "move_sessions", side_effect=self.moves))
@@ -214,7 +212,7 @@ class AccountMoveTests(ShutdownTestCase):
             "CONF_DIR": os.environ["CONF_DIR"],
             "AGENT_NOTES_DIR": str(self.root / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
-            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
+            "NOTIFIER_STATE_DIR": os.environ["NOTIFIER_STATE_DIR"],
             "NOTIFIER_SESSIONS_DIR": str(self.root / "registry"),
             "USER_ZONE": "UTC",
         }
@@ -439,7 +437,7 @@ class AccountMoveTests(ShutdownTestCase):
     def test_preview_reports_absent_registration_target_from_one_timer_read_without_sockets(self) -> None:
         doc = self.root / "missing-production.md"
         owner = recorded_showrunner("missing", doc)
-        runner = self.root / "notifier" / f"showrunner-{owner.id}"
+        runner = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{owner.id}"
         runner.mkdir(parents=True)
         _ = doc.write_text("- **User zone:** America/New_York\n", encoding="utf-8")
         _ = (runner / "conf").write_text(

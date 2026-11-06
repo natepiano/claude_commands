@@ -131,10 +131,8 @@ State:
   - packaging;
   - cargo-berth overlap answers, incursion resolves, orphan retirement and
     releases (<Dependencies/> rule 3);
-  - whether a unit edits files outside its `.unit.toml` responsibilities, another unit's crate
-    included: settle it by who holds the files on the berth board and when
-    each holder merges, as <Dependencies/> rule 3 settles a file wait. No
-    rule needs the user's OK for this (user, 2026-10-04).
+  - which unit edits a file, including another unit's crate. Use berth reservations
+    and merge order, as <Dependencies/> rule 3 specifies (user, 2026-10-04).
 - **As-built close-out** is the unit director's: it decides, reports what moved,
   and never asks (user, 2026-10-06). A scope change to the main plan is a
   product choice, not an as-built one.
@@ -620,8 +618,7 @@ notice to the unit director before any merge command runs:
    --review-trial "<the complete review trial: line>"
    --parallel "<the notice's Parallel: line>"
    --delivers "<one line of what the phase delivers>"`.
-   Add one `--also <path>` per approved outside path, one `--trailer <line>`
-   per attribution line this session requires, `--regime trial` if the broad
+   Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
    review used the craft lens, `--holds <K>` (this phase's held checkpoints)
    and `--merge-defects <D>` (the defect rows its merge design checks found in
    its own work, moved ones included and rows the check calls older left out),

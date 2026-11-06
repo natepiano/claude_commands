@@ -271,15 +271,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.stdout.strip(), "merge_checkpoint: --from-child is separate from unit checkpoint arguments")
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.events("send.py"), [])
-    def test_style_unit_none_owns_needs_explicit_ticket_file_allowance(self) -> None:
-        self.production_doc(owns=("none",))
-        checkpoint = self.checkpoint(relative="src/lib.rs", content="fn fixed() {}\n")
-        refused = self.run_checkpoint(checkpoint)
-        self.assertNotEqual(refused.process.returncode, 0)
-        self.assertIn("outside responsibilities: src/lib.rs", refused.process.stdout)
-        permitted = self.run_checkpoint(checkpoint, "--also", "src/lib.rs")
-        self.assertEqual(permitted.process.returncode, 0, permitted.process.stdout + permitted.process.stderr)
-        self.assertIn("scope: ok", permitted.process.stdout)
     def test_mixed_history_keeps_child_identity_separate_from_renamed_unit_phases(self) -> None:
         subjects = (
             "Merge old-unit phase 1 (aaaaaaa) into production",

@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import shlex
+from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,7 +45,7 @@ def called_by_assign() -> bool:
             result = subprocess.run(['ps', '-p', str(pid), '-o', 'ppid=', '-o', 'args='],
                                     capture_output=True, text=True, check=True)
             parent, command = result.stdout.strip().split(None, 1)
-            words = shlex.split(command)
+            words = command.split()
             script = Path(words[1]).resolve() if len(words) > 1 else Path()
             if script == ASSIGN and Path(words[0]).name.startswith('python'):
                 return True

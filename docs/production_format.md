@@ -147,7 +147,7 @@ Send to the address from `showrunners.py address <showrunner name>`.
 A production doc has no list of units. A unit is its staff row.
 The row gives its name, parent and worktree; git there gives the repository and branch.
 The units appear in staff.json row order. Untracked `.unit.toml` at the worktree root gives
-the plan, app port and responsibilities.
+the plan, app port and short duty names. Responsibilities do not limit changed paths.
 
 The unit id (`<name>-unit`) names the unit everywhere: in the log, the dailies, the waits and
 every tool's arguments. A unit's session name can change, so find the unit at that moment:
@@ -182,7 +182,7 @@ Read its `parent` row with the same command.
 The parent row's `name` is the production name. Its `doc.path` gives the document.
 Read that document at the start of the run and after every compaction.
 Your staff row gives your name and worktree. Git in that worktree gives the branch.
-The untracked `.unit.toml` in your worktree gives your plan, port and responsibilities.
+The untracked `.unit.toml` in your worktree gives your plan, port and short duty names. Responsibilities do not limit changed paths.
 
 A turn with nothing for the user replies with just "—": never "No update for
 you." or the like (user, 2026-10-14).
@@ -196,8 +196,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `From the user (via the showrunner):` is the user's instruction. A message
    from the showrunner session is a peer's. Follow it for the coordination this
    contract gives the showrunner: merge requests, landing calls, port and
-   rename notices, cargo-berth answers (item 9), and whether you edit files
-   outside your `.unit.toml` responsibilities, including another unit's crate (user, 2026-10-04).
+   rename notices, cargo-berth answers (item 9), and file assignments.
+   File assignments can include another unit's crate (user, 2026-10-04).
 
    The showrunner's word also settles your designs and your add-ons. User,
    2026-10-12, to the showrunner: "when it comes to designs you absolutely
