@@ -63,6 +63,14 @@ MARKED_HERDR_PLACE = HerdrPlace("marked-herdr", "w7:p1")
 SHARED = herdr.SHARED_SESSION
 NO_LAUNCH_FIXTURE = add_unit.NoLabeledSession()
 SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime(2026, 10, 17, tzinfo=timezone.utc))
+LINUX_LAUNCHER_CLI = """import runpy, sys
+from unittest.mock import patch
+from scripts.production.fake_unit_host import private_process_registry
+from scripts.shutdown import remote
+script = sys.argv.pop(1)
+with private_process_registry(), patch.object(remote, 'local_machine', return_value='natedev'):
+    runpy.run_path(script, run_name='__main__')
+"""
 
 
 def fixture_process_start(pid: int) -> str | None:
@@ -462,17 +470,12 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = write_registry(self.agent_config, overrides)
 
     def production_doc(self, merge_branch: str = "build-followups") -> str:
-        units = "".join(f"| {name}-unit | none — board-free |\n" for name in
-                        ("alpha", "beta", "review", "lfo", "mul_add", "mul-add", "nightly-review", "trunk"))
         return ("# Production\n\n"
                 f"- **Merge branch:** `{merge_branch}` — unit checkpoints merge here\n"
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
                 "- **Showrunner session:** director\n"
                 "- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n"
-                "- **User zone:** America/Los_Angeles — reports use PDT\n\n"
-                "## Units\n\n"
-                "| Unit | Owns |\n| --- | --- |\n"
-                f"{units}")
+                "- **User zone:** America/Los_Angeles — reports use PDT\n")
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
@@ -598,12 +601,7 @@ class AddUnitTestCase(ShutdownTestCase):
         self.prepare_herdr_launch(*args)
         arguments = ["--production", str(self.doc), *args]
         if subprocess_cli:
-            bootstrap = ("import runpy, sys\n"
-                         "from scripts.production.fake_unit_host import private_process_registry\n"
-                         "script = sys.argv.pop(1)\n"
-                         "with private_process_registry():\n"
-                         "    runpy.run_path(script, run_name='__main__')\n")
-            return subprocess.run([sys.executable, "-c", bootstrap, str(SCRIPT), *arguments],
+            return subprocess.run([sys.executable, "-c", LINUX_LAUNCHER_CLI, str(SCRIPT), *arguments],
                                   env=self.env, capture_output=True, text=True,
                                   timeout=timeout, check=False)
         return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,

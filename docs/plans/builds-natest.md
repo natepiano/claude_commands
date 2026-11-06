@@ -747,37 +747,27 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - A manual `allow_next_start()` advance in the verify fixtures: a workaround for the spacing (showrunner ruling).
 
-### Phase 32 — `smoke_launch.sh` reads its settings with no process for each key  · status: todo
+### Phase 32 — `smoke_launch.sh` reads its settings with no process for each key  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/smoke_launch.sh` reads its 9 settings through `scripts/lib/conf.sh` with no Python start for each key, with the same values, exits and read order.
-
-**Spec:** The showrunner approved this phase (2026-11-05). No builds unit holds `smoke_launch.sh`.
-
-1. Caller survey (2026-11-05): `smoke_launch.sh:22-31` is the only shell script that still starts `conf.py get` for each key. `scripts/message/notifier.sh` `read_conf` reads its own instance file with no Python. Nine `conf.py get` reads take 0.51 s; nine `conf.sh` reads take 0.02 s.
-2. Replace the local `conf_value()` function (`smoke_launch.sh:22`) with one `source "$LIB/conf.sh"`. Keep each of the 9 reads, its key, its order and its variable name. The script runs under bash with `set -euo pipefail`, so a failed read still stops the script.
-3. Leave the other Python starts as they are: `user_zone.py` (line 36) and `process_group.py` (lines 78, 80).
-4. Measure the config reads of one real `smoke_launch.sh` run before and after, and give the median of 3. Measure `test_smoke_launch.py` and the `test_mac_run.py` smoke test in same-load pairs.
-5. Add no guard, refusal or check that this Work Order does not name.
+- `scripts/production/smoke_launch.sh` sources `scripts/lib/conf.sh` and reads its 9 settings with no Python start for each key. Each read keeps its key, order, variable name and exit. `user_zone.py` and `process_group.py` still start as before.
+- `conf.sh` gives a read it cannot answer to `conf.py` through the `py` launcher in the same folder, held in one global `_CONF_LIB` (`.` for a bare file name). `py` honors `CLAUDE_PYTHON` and finds Python 3.12 or newer.
+- `py_floor_test_support.seed_interpreter_cache(cache_home, interpreter=sys.executable)` writes the interpreter cache that `py` reads. `test_conf_sh.py` and 8 `scripts/direct` fixtures use it.
+- Settings read of one real smoke launch (median of 3): 0.770 s -> 0.076 s. `test_smoke_launch.py` same-load pairs: 1.1 s -> 1.1 s. The full gate on this phase plus builds was green.
 
 **Files:**
-- `scripts/production/smoke_launch.sh` — one `conf.sh` source; `conf_value` for each read
+- `scripts/production/smoke_launch.sh` — one `conf.sh` source for its 9 settings
+- `scripts/lib/conf.sh` — shell settings reader; fallback through `py`
+- `scripts/lib/py_floor_test_support.py` — `seed_interpreter_cache`
+- `scripts/lib/test_conf_sh.py` — fixture with a `bash` link and a seeded cache
 
-**Workers:** 1 writer (one script; the work does not split)
-- `impl` — all files above
+**Gotchas:**
+- A fixture whose PATH holds only a stub folder needs a `bash` link, because `py` starts with `#!/usr/bin/env bash`. Without a seeded cache, `py` runs the stub once more to check its version.
 
-**Constraints from prior phases:**
-- Phase 30: `scripts/lib/conf.sh` gives the same value and exit as `conf.py get`, or gives the read to `conf.py`. It runs under bash 3.2 and zsh, and reads the host name once when sourced.
-- Phase 30: `review.sh`, `implement.sh` and `mac_run.sh` source `conf.sh`; a change to it runs their tests. This phase does not change `conf.sh`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_smoke_launch.py'` green, with the same test names and assertions
-- `python3 -m unittest discover -s scripts/production -p 'test_mac_run.py'` green, with `test_smoke_uses_the_shared_refused_port_and_host` unchanged
-- `python3 -m unittest discover -s scripts/lib -p 'test_conf_sh.py'` green
-- config read seconds of one real smoke launch, before and after, and same-load pair medians (`pairs.sh`) of `test_smoke_launch.py`, in the checkpoint notice
+**Ruled out:**
+- Starting `scripts/build_hold/cargo`, the BRP launch hook and `scripts/lint/lint` through `py` in this phase: outside its scope; a next item after the PYTHONPATH item.
 
 ### Phase 33 — `test_fast_track.py` runs in half its time  · status: todo
 **Depends on:** none
@@ -789,6 +779,13 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Spec:** Follow the Speed method. The showrunner approved this phase (2026-11-05). No builds unit holds `test_fast_track.py` or `fast_track.py`. Claim the files with cargo-berth before the first edit; send any holder to the showrunner.
 
 1. Profile before any edit. Phase 7 took this module from 304 s to 193 s (load 40-73), with a floor of about 3.5 s of real Git work in each of 55 tests. The median is now 216.9 s with 108.7 CPU s, so about half of the wall time has no CPU. Find where it goes: waits (polls, sleeps, timeouts, lock or admission waits), Git process starts, repository setup in each test, and Python starts. Compare against the Phase 7 floor, and name what grew since then. Write the result into this Spec and name the files and changes before the code step.
+   **Profile result (2026-11-05):**
+   - Baseline: 243.0 s wall, 110.8 CPU s. Admission waits take 0.02 s. Setup takes 2.9 s and cleanup 0.8 s over 55 tests; the class already shares its seed repository.
+   - 4,627 Git calls take 118.6 s in the test process. 22 fast-track CLI runs take 105.5 s, with their own Git work.
+   - What grew since Phase 7: the Phase 7 repair added 5 tests and a Python watchdog for each Git call. 3,612 watchdog starts take a median of 38.3 ms each; a shell watchdog takes 13.8 ms.
+   - Sleeps take 15.2 s, mostly subprocess deadline polls. The blocked-hook test waits for two 5 s deadlines by design.
+   - Change: `GIT_HANG_GUARD` in `test_fast_track.py` becomes a bash job-control guard with the same deadline and the same process-group kill. `merge_checkpoint_test_support.py` does not change.
+   - Production proposals (Spec step 3): repeated `rev-parse` (898), `update-ref` (777) and `cat-file` (283) calls around `fast_track.reconcile`; 403 fetches through `copies.py` remote refresh; the Phase 7 injected Git runner.
 2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
 3. A cut in `fast_track.py` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase. The Phase 7 proposal (one injected Git runner in `fast_track.py`) is already with the showrunner.
 4. A change to `merge_checkpoint_test_support.py` or `cli_fixture.py` keeps every importer green; name each one in the final run.

@@ -4,7 +4,7 @@
 
 ## How it works
 
-**The seven checks** (defined in `docs/direct/phase_checks.md`)
+**The six checks** (defined in `docs/direct/phase_checks.md`)
 
 | Check | Runs in | Over |
 | --- | --- | --- |
@@ -15,11 +15,16 @@
 | rustdoc `-D warnings` | `verify.sh doc`, run by the unit director as the last command before the checkpoint commit | the workspace |
 | style review | the reviewer worker assigned by `<ReviewPromptContract/>` | the phase range selected under `<ReviewPromptContract/>` |
 
-`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Workspace rustdoc runs separately through `verify.sh doc` after staging, immediately before the checkpoint commit; its exact-tree pass record is mandatory. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
-
-The prefix rules only `test removed` findings.
-It does not rule assertions in tests that remain.
-A prefix that matches no removed test blocks.
+`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy.
+Mend rewrites the code first.
+Fmt formats what mend wrote.
+Clippy judges first.
+A passing judgment skips repairs.
+A failed judgment starts up to three `cargo clippy --fix` and fmt passes, followed by a final judgment.
+Every clippy run in this path uses `--keep-going`.
+The director runs workspace rustdoc through `verify.sh doc` after staging, immediately before the checkpoint commit.
+The checkpoint requires its pass record for the exact tree.
+[Lint-step fix](build-followups-mul-add.md#lint-step-fix) defines the pass rules.
 
 **Files and their roles**
 
@@ -43,6 +48,10 @@ the report and completion state; the reviewer returns text and never writes
 files. `<ReviewPromptContract/>` defines phase paths and retries.
 
 **How findings flow**
+
+Broad review includes the [simplify lens](simplify-lens.md).
+Its held items stay outside repair batches.
+The contract reviewer retains the style assignment.
 
 - The reviewer includes style violations in its normal findings summary. `<Synthesize/>` confirms, deduplicates and opens them with `--caught-by worker --lens contract`, using the same severity gate and closure process as code findings. The reviewer does not write the ledger.
 - A lint failure is fixed by the worker that ran `lint`, before it reports done.
@@ -72,7 +81,8 @@ files. `<ReviewPromptContract/>` defines phase paths and retries.
 
 ## Invariants
 
-- Each of the seven checks runs at the place `<PhaseChecks/>` names. The lint check owns its multiply-add repair rounds and the format and judgment that follow them.
+- Each of the six checks runs at the place `<PhaseChecks/>` names.
+  The lint check owns its multiply-add repairs and the format and judgment that follow them.
 - After the last phase, lint and style review do not repeat: `verify.sh final` stays check plus tests, `verify.sh` has no `fmt` arm, and `<FinalGate/>`, `<FinalGateCommit/>` and `/unit:checkpoint` do not lint, reformat or style-review. Each later Cargo checkpoint still needs its rustdoc pass.
 - `config/review/style.md` is the one reviewer protocol. Callers use the shared preparer and never restate its steps.
 - The assigned reviewer owns phase style review; the director, implementation, fix and test workers do not load the guide. The reviewer loads it once per applicable phase under `<StyleReview/>`.

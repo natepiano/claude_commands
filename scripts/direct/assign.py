@@ -14,7 +14,6 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -30,11 +29,11 @@ from scripts.direct import phase_reservation, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import style_review
 from scripts.usage.agents_log import LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
-ReviewExec = Callable[[str, list[str], dict[str, str]], NoReturn]
 PYTHON = str(SCRIPTS / "../lib/py")
 MESH = str(SCRIPTS / "../agents/codex_mesh.py")
 PROGRESS = str(SCRIPTS / "progress_history.py")
@@ -761,7 +760,7 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
 
 
 def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
-                     env: dict[str, str], exec_review: ReviewExec) -> int:
+                     env: dict[str, str]) -> int:
     if conf.read("direct").text("SIMPLIFY_LENS") == "off":
         print("simplify: off")
         return 0
@@ -771,7 +770,62 @@ def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_p
     command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, "--diff", args.diff,
                "--summary", str(Path(args.summary).resolve()) if args.summary else "", str(run), str(cwd),
                str(source_prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
-    exec_review(command[0], command, env)
+    return subprocess.run(command, env=env, check=False).returncode
+
+
+def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
+                  role: str, paths: list[str], env: dict[str, str]) -> int:
+    """Send the assignment through the shared worker command."""
+    directory = phase_reservation.phase_directory(run, phase)
+    directory.mkdir(parents=True, exist_ok=True)
+    slot = args.to or args.new_worker or role
+    suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
+    summary = directory / f"{slot}_summary{suffix}.txt"
+    status = directory / f"{slot}_status{suffix}"
+    message = directory / f"{slot}_prompt{suffix}.txt"
+    reply = directory / f"{slot}_reply{suffix}.txt"
+    log = directory / f"{slot}_agent{suffix}.log"
+    content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
+    if args.image:
+        content += "\nRead these images:\n" + "\n".join(str(Path(image).resolve()) for image in args.image)
+    if not message.is_file() or message.read_text() != content:
+        write_text_atomic(message, content)
+    end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
+    style: NoStyleAssignment | StyleAssignment = NoStyleAssignment()
+    if args.style_since:
+        style = StyleAssignment(style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end), summary)
+        message = style.directory / "prompt.md"
+    env["UNIT_RUN_DIR"] = str(run)
+    env["UNIT_TEAM_ROLE"] = slot
+    command = [PYTHON, str(SCRIPTS / "../production/worker.py"), "assign", role, str(message),
+               "--session-dir", str(run), "--phase", phase, "--slot", slot, "--kind", "assign", "--reply", str(reply),
+               "--lens", args.lens, "--fix-cause", args.fix_cause,
+               "--fix-pass", str(args.pass_number if role == "fix" else 0)]
+    if args.to or args.new_worker:
+        command += ["--name", args.to or args.new_worker]
+    if args.early_ready:
+        command += ["--early-ready", str(Path(args.early_ready).resolve())]
+    command += ["--launcher-command", json.dumps(["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])]
+    write_text_atomic(status, "running\n")
+    _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "register",
+              f"role={role}; transport=herdr; status in {status}"], env)
+    _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
+              "header", slot, role], env, check=False)
+    with log.open("a") as output:
+        result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
+    if result.returncode == 0:
+        env["UNIT_PASS_OWNER"] = "launcher"
+        _ = call([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run), "--status", "completed"], env)
+        write_text_atomic(summary, reply.read_text())
+        if args.summary:
+            write_text_atomic(Path(args.summary), summary.read_text())
+    write_text_atomic(status, "done\n" if result.returncode == 0 else "error\n")
+    if isinstance(style, StyleAssignment):
+        style_review.finish(style.directory, style.summary, result.returncode)
+    _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot,
+              "done" if result.returncode == 0 else "blocked",
+              f"role={role}; exit {result.returncode}; summary {summary}"], env)
+    return result.returncode
 
 
 def require_live_director() -> None:
@@ -879,7 +933,7 @@ def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAll
     return call(command, env, check=False).returncode
 
 
-def main(exec_review: ReviewExec = os.execvpe) -> int:
+def main() -> int:
     require_live_director()
     args = parse_arguments()
     recover_arguments(args)
@@ -890,8 +944,9 @@ def main(exec_review: ReviewExec = os.execvpe) -> int:
     paths = [] if isinstance(held, HeldAssignment) or args.operation in RECOVERY_OPERATIONS else authorized_paths(args, cwd)
     env = dict(os.environ)
     run, phase = prepare_run(args, cwd, prompt, env)
+    transport = unit_runs.worker_transport(run)
     if args.lens == "simplify":
-        return execute_simplify(args, run, phase, cwd, prompt, env, exec_review)
+        return execute_simplify(args, run, phase, cwd, prompt, env)
     role = "impl" if args.role == "implement" else args.role
     check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
@@ -900,6 +955,8 @@ def main(exec_review: ReviewExec = os.execvpe) -> int:
     checked = call(check, env, check=False)
     if checked.returncode:
         return 3 if checked.returncode == 3 else 2
+    if transport == "herdr" and args.operation == AssignmentOperation.DISPATCH:
+        return execute_herdr(args, run, phase, prompt, role, paths, env)
     family, model, effort, tier = (("codex", "", "", "") if args.operation in RECOVERY_OPERATIONS
                                    else resolve_model(args, role, env))
     if args.family and args.family != family:
