@@ -67,6 +67,13 @@ whose first 1M release changes, is a row here.
 `agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
 Both callers read the value when they use it.
 
+## merge_gate.conf
+
+`nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
+`off` disables both pushes. The user can remove this push later.
+`nightly_result_modules=8` limits the failed test modules named in a result push.
+Both values are read at use. The module limit must be a whole number of at least one.
+
 ## context_usage.conf
 
 `message = off` disables the per-call context message for main threads and subagents.

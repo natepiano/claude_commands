@@ -767,7 +767,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
 
     def test_lint_takes_second_checkout_when_first_is_busy(self) -> None:
         observed = self.root / "checked-directory"
-        with copies.standing("sample-style", self.repo, self.tip) as first:
+        with copies.standing("sample-style", self.repo, copies.CommittedSource(self.tip)) as first:
             probe = """import fcntl
 from pathlib import Path
 with Path('.claude-busy').open('r+') as lock:
@@ -788,7 +788,7 @@ with Path('.claude-busy').open('r+') as lock:
             with (second / ".claude-busy").open("r+") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lock, fcntl.LOCK_UN)
-        with copies.standing("sample-style", self.repo, self.tip) as reused:
+        with copies.standing("sample-style", self.repo, copies.CommittedSource(self.tip)) as reused:
             self.assertEqual(reused, first)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 

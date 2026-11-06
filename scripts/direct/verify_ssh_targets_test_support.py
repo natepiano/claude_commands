@@ -203,6 +203,7 @@ def stream(arguments):
         permission_directory = seed_runner_permission(Path.home(), config.source, now, "fixture-boot")
         values = offload.runner_values(offload.read_config(config.source), request.target)
         command = shlex.split(arguments[-1])
+        command = shlex.split(command[-1])
         mirror = Path.home() / command[command.index("--mirror") + 1]
         mirror.mkdir(parents=True, exist_ok=True)
         exports = root / "shell-exports"

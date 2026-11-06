@@ -6,6 +6,7 @@ from __future__ import annotations
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib import models_registry
 from scripts.lib import unit_runs
 
 import argparse
@@ -27,7 +28,8 @@ from unittest.mock import patch
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.production.staff_test_support import (
-    StaffTestCase, isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id, recorded_showrunner, recorded_unit,
+    StaffTestCase, isolated_staff_file, isolated_source_readers, source_environment,
+    fixture_member, fixture_worker, fixture_runtime_id, recorded_showrunner, recorded_unit,
 )
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 # These regressions check the private verifier's semantic result before wait closure.
@@ -87,6 +89,8 @@ class ProgressHistoryTests(unittest.TestCase):
         # Socket fixtures need a short path even when the run's TMPDIR is long.
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.temporary.name)
+        self.enterContext(patch.dict(os.environ, source_environment(self.root / "sources")))
+        self.enterContext(isolated_source_readers())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         _ = fixture_member("showrunner", name="recorder")
@@ -117,6 +121,35 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_config_digest_reads_without_catalog_sync_and_keeps_the_inherited_launch_text(self) -> None:
+        settings = self.root / "digest-settings"
+        settings.mkdir()
+        _ = (settings / "direct.conf").write_text("fixture=1\n")
+        log = self.root / "unexpected-sync"
+        script = self.root / "scripts/agents/sync_codex_catalog.sh"
+        script.parent.mkdir(parents=True)
+        _ = script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(log)!r}).touch()\n")
+        script.chmod(0o755)
+        digest = cast(Callable[[], str], vars(progress_history)["_config_digest"])
+        clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
+        original = self.models_config_file.read_text()
+        configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
+        for inherited in (False, True):
+            with self.subTest(inherited=inherited), patch.object(models_registry, "launch_configuration", wraps=models_registry.launch_configuration) as launches, patch.object(models_registry, "__file__", str(script.parent.parent / "lib/models_registry.py")), patch.dict(os.environ, {
+                "HOME": str(self.root), "CONF_DIR": str(settings), "MODELS_CONFIG_FILE": str(self.models_config_file),
+                "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
+                "MODELS_LAUNCH_CONFIGURATION": configuration.environment({})["MODELS_LAUNCH_CONFIGURATION"] if inherited else "",
+            }):
+                _ = self.models_config_file.write_text(original + "# later edit\n")
+                clear()
+                try:
+                    text = original if inherited else self.models_config_file.read_text()
+                    self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                    self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
+                    self.assertEqual(launches.call_count, int(inherited), "telemetry entered the fresh launch path")
+                finally:
+                    clear()
 
     def test_review_trial_counts_rerun_findings_as_code(self) -> None:
         self.write_full_config()
@@ -3465,7 +3498,7 @@ with patch.object(fcntl, "flock", admission):
             if event.get("event_type") == event_type
         ]
 
-    def test_last_dispatch_retains_the_finished_pass_when_the_same_slot_starts_again(self) -> None:
+    def test_last_dispatch_selects_the_new_open_pass_when_the_same_slot_starts_again(self) -> None:
         run = self.start_run("dispatch-history", 20_000, unit_owned=True)
         parent = staff.local_snapshot().unit_by_worktree("natedev", self.working_dir)
         assert parent is not None
@@ -3479,11 +3512,12 @@ with patch.object(fcntl, "flock", admission):
         _ = staff.rename(worker.id, "renamed-worker")
         self.start_slot_pass(run, "impl", "test", 20_040, "gpt-called", 0,
                              "--worker-id", worker.id, worker_name="renamed-worker")
+        latest = self.pass_events("dispatch-history", "pass_started")[-1]
         with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(self.root)}):
             dispatch = progress_history.last_dispatch(worker.id)
         self.assertEqual(dispatch, progress_history.RecordedDispatch(
-            "impl", "3", progress_history.DispatchDetailNotRecorded.UNRECORDED,
-            str(run / "phases/3/files"), str(opened["pass_instance_id"]), "completed"))
+            "test", "3", progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            str(run / "phases/3/files"), str(latest["pass_instance_id"]), "active"))
 
     def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
         _ = write_registry(self.models_config_file, {"direct.codex": {"impl": "gpt-called:xhigh"}})
@@ -8335,6 +8369,20 @@ class LastDispatchTests(StaffTestCase):
         (run / unit_runs.STATE_FILE).unlink()
         self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
 
+    def test_last_dispatch_keeps_the_role_and_id_of_a_refused_fix_after_a_completed_review(self) -> None:
+        run, worker = self.dispatch_fixture({
+            "review": {"instance_id": "review-pass", "worker_name": "dispatch-worker", "kind": "review",
+                       "started_at": 1, "finished_at": 2, "status": "completed", "phase": {"id": "14f"}},
+            "fix": {"instance_id": "refused-fix", "worker_name": "dispatch-worker", "kind": "fix",
+                    "started_at": 3, "status": "refused", "phase": {"id": "14f"}},
+        })
+        path = run / unit_runs.STATE_FILE
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "fix", "14f", missing, str(run / "phases/14f/files"), "refused-fix", "refused"))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def test_last_dispatch_reads_the_older_single_pass_shape(self) -> None:
         run, worker = self.dispatch_fixture({"instance_id": "old", "worker_name": "dispatch-worker",
                                              "kind": "impl", "phase": {"id": "3t"}})
@@ -8388,7 +8436,7 @@ class LastDispatchTests(StaffTestCase):
         _ = staff.rename(worker.id, "renamed-worker")
         self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
 
-    def test_last_dispatch_finds_the_newest_finished_pass_in_another_parent_run(self) -> None:
+    def test_last_dispatch_finds_the_newest_open_pass_in_another_parent_run(self) -> None:
         run, worker = self.dispatch_fixture({"first": {
             "instance_id": "first", "worker_name": "dispatch-worker", "kind": "impl", "started_at": 1}})
         owner = cast(dict[str, object], json.loads((run / unit_runs.STATE_FILE).read_text()))["main_agent"]
@@ -8400,7 +8448,7 @@ class LastDispatchTests(StaffTestCase):
                      "started_at": 5, "status": "active"}}})
         missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
         self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
-            "review", missing, "contract", missing, "second", "error"))
+            "fix", missing, missing, missing, "open", "active"))
 
     def test_last_dispatch_filters_another_parent_before_directory_and_history_reads(self) -> None:
         run, worker = self.dispatch_fixture({"finished": {
@@ -8412,6 +8460,8 @@ class LastDispatchTests(StaffTestCase):
         self.write_json(run.with_name("other-run") / unit_runs.STATE_FILE, {
             "owner_staff_id": parent.id, "main_agent": {"session_id": parent.current_session},
             "status": "active", "history_file": str(history)})
+        self.write_json(run.with_name("unavailable-owner") / unit_runs.STATE_FILE, {
+            "owner_staff_id": fixture_runtime_id("unavailable-dispatch-owner"), "history_file": str(history)})
         calls = self.root / "git-calls"
         _ = calls.write_text("")
         binaries = self.root / "dispatch-bin"

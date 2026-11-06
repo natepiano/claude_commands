@@ -11,14 +11,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
-from typing import TypedDict, final, override
-
-from scripts.direct.wait_for_test_state import wait_for_file
+from typing import TypedDict, cast, final, override
+from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
+from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.cli_fixture import ImmutableGitSeed
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -40,6 +43,13 @@ class CommandEvent(TypedDict):
 
 
 COMMAND_STUB = r'''
+run_real_copies() {
+    export PATH=$MAC_RUN_REAL_PATH
+    export COPIES_CONFIG=$MAC_RUN_REMOTE_COPIES_CONFIG
+    export MAC_TEST_STATE_DIR=$MAC_RUN_REMOTE_CLAIMS
+    eval "$remote"
+    exit $?
+}
 state=$MAC_RUN_STUB_STATE
 command=${0:t}
 claimed=false
@@ -85,6 +95,9 @@ fi
 
 remote=${@[-1]}
 clone_head=$state/clone-head
+if [[ $MAC_RUN_REAL_COPIES == 1 && $remote == *'copies.py '* ]]; then
+    run_real_copies
+fi
 if [[ $remote == *'hana_instances.py stop-checkout '* ]]; then
     print -r -- called > "$state/cleanup-called"
     code=${MAC_RUN_CLEANUP_STATUS:-0}
@@ -99,6 +112,9 @@ if [[ $remote == *'scratch.py end '* ]]; then
     if [[ ! -e $state/checkout-clear ]]; then
         print -u2 -- 'task end before confirmed exit'
         exit 98
+    fi
+    if [[ $MAC_RUN_REAL_COPIES == 1 ]]; then
+        run_real_copies
     fi
     print -r -- mac_exit=0
     exit 0
@@ -595,6 +611,62 @@ class MacRunTests(unittest.TestCase):
                     self.assertIn(self.environment["MAC_RUN_CHECKOUT"], result.stderr)
                     self.assertIn("kept checkout", result.stderr.lower())
                 self.assert_claim_released()
+
+    def clone_registry_records(self, config: str) -> list[dict[str, object]]:
+        with mock.patch.dict(os.environ, {"COPIES_CONFIG": config}):
+            return [cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
+                    for mirror in copies.remote_mirrors()]
+
+    def assert_clone_records_after_cleanup(self, cleanup_status: int) -> None:
+        source = ImmutableGitSeed.create(self.root, "main", "Clone Tests", "clone@example.invalid",
+                                         {"source.txt": "content\n"}).checkout
+        head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        production = self.root / "config/production.conf"
+        _ = write_config_fixture(production, production.read_text() + f"mac_run_source={source}\n")
+        local = self.root / "local-copies"
+        remote = self.root / "remote-copies"
+        local.mkdir()
+        remote.mkdir()
+        local_environment = copies_environment(local)
+        remote_environment = copies_environment(remote)
+        self.environment.update({key: value for key, value in local_environment.items() if key != "HOME"})
+        self.environment.update({
+            "MAC_RUN_SHA": head, "MAC_RUN_REAL_COPIES": "1", "MAC_RUN_REAL_PATH": os.environ["PATH"],
+            "MAC_RUN_REMOTE_COPIES_CONFIG": remote_environment["COPIES_CONFIG"],
+            "MAC_RUN_REMOTE_CLAIMS": str(self.root / "remote-claims"),
+        })
+        process = self.start_mac_run(extra={"MAC_RUN_HOLD_BUILD": "1", "MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
+        try:
+            ready = self.stub_state / "build-started"
+            wait_until(lambda: ready.exists() or process.poll() is not None, self.stub_state, processes=(process,))
+            if process.poll() is not None:
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.fail(output + errors)
+            before_local = self.clone_registry_records(local_environment["COPIES_CONFIG"])
+            before_remote = self.clone_registry_records(remote_environment["COPIES_CONFIG"])
+            self.assertEqual(len(before_local), 1)
+            self.assertEqual(len(before_remote), 1)
+            self.assertEqual(before_local[0]["path"], before_remote[0]["path"])
+            self.assertEqual(before_local[0]["host"], "natemccoy@mac")
+            self.assertEqual(before_remote[0]["host"], "localhost")
+            send_process_group(process.pid, signal.SIGTERM)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        finally:
+            if process.poll() is None:
+                send_process_group(process.pid, signal.SIGKILL)
+                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 143, output + errors)
+        for name, settings, before in (("natedev", local_environment["COPIES_CONFIG"], before_local),
+                                       ("Mac", remote_environment["COPIES_CONFIG"], before_remote)):
+            with self.subTest(registry=name):
+                self.assertEqual(self.clone_registry_records(settings), before if cleanup_status else [])
+
+    def test_successful_clone_cleanup_removes_both_registry_records(self) -> None:
+        self.assert_clone_records_after_cleanup(0)
+
+    def test_failed_clone_cleanup_keeps_both_registry_records(self) -> None:
+        self.assert_clone_records_after_cleanup(23)
 
     def test_signals_clean_remote_work_before_releasing_claim(self) -> None:
         for signal_number, cleanup_status in (

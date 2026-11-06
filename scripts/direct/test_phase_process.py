@@ -773,7 +773,7 @@ class PhaseProcessTests(unittest.TestCase):
         self.assertIn("mixed n=1 (finished in window or open)", output.getvalue())
         self.assertIn("open unmixed n=1 (started before window end)", output.getvalue())
 
-    def test_ledger_only_round_counts_without_worker_time(self) -> None:
+    def test_dispatch_without_a_fix_pass_adds_no_round_or_worker_time(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "run.jsonl"
             records = [
@@ -784,7 +784,7 @@ class PhaseProcessTests(unittest.TestCase):
             _ = path.write_text("\n".join(json.dumps(record) for record in records))
             events, problems = process.read_events((path,))
         self.assertEqual(problems, ())
-        self.assertEqual(process.fix_time(process.phase_boundaries(events, WINDOW)), (process.FixWorkerTime(0, 1),))
+        self.assertEqual(process.fix_time(process.phase_boundaries(events, WINDOW)), (process.FixWorkerTime(0, 0),))
 
     def test_closure_review_stays_in_review_wall_costs(self) -> None:
         events = parsed_phase_records([

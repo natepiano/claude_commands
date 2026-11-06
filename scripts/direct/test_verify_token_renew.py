@@ -40,7 +40,7 @@ class LongStepOwnershipTests(VerifyTokenWaitFixture):
     def test_running_step_renews_past_its_original_hold_and_stops_on_release(self) -> None:
         _ = write_config_fixture(self.root / "direct.conf", "VERIFY_TOKEN_HOLD_SECONDS=2\nVERIFY_TOKEN_RENEW_SECONDS=1")
         board = self.root / "board"
-        process = self.start_check({**self.environment, "UNIT_RUN_DIR": str(board),
+        process = self.start_owned_step({**self.environment, "UNIT_RUN_DIR": str(board),
                                     "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1",
                                     })
         lock = board / "locks" / "cargo.d"
@@ -63,7 +63,7 @@ class LongStepOwnershipTests(VerifyTokenWaitFixture):
 
     def test_expired_matching_live_step_keeps_ownership_but_dead_holder_is_freed(self) -> None:
         board = self.root / "board"
-        process = self.start_check({**self.environment, "UNIT_RUN_DIR": str(board),
+        process = self.start_owned_step({**self.environment, "UNIT_RUN_DIR": str(board),
                                     "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1",
                                     })
         lock = board / "locks" / "cargo.d"

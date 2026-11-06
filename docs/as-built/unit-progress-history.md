@@ -16,6 +16,15 @@ The live session cache remains in
 `/tmp/claude/unit/<run-id>/progress_history_state.json` (under `/tmp/claude/delegate/` for a run started before the folder rename). Deleting `/tmp`
 does not remove the durable event stream.
 
+## Configuration digest
+
+`_config_digest` hashes the exact model registry text and `direct.conf` bytes once per recorder process.
+It uses the inherited [launch configuration](agent-registry.md#configuration-lifetimes) when present.
+Without that configuration, it reads the registry through `registry_text` without catalog synchronization or publication.
+The same text and direct settings produce the same digest.
+An unreadable or invalid source produces an empty digest.
+Telemetry does not stop the launch.
+
 ## Event model
 
 Schema version 1 records these event types:
@@ -227,6 +236,16 @@ limits are set in `~/.claude/config/direct.conf`, read at startup by
 than falling back. They now decide when an advisory is worth printing rather than
 when a phase stops, so the shipped values set where a phase starts being reported
 as slow, not where it is cut off.
+
+A ledger batch with a started fix pass counts as one repair round. Relaunches of that batch add no round.
+A dispatch alone adds no round. Passes without a ledger round retain overlap grouping.
+`dispatch` records the batch before the worker launch. Its `round` is a stable audit number.
+`repair_round` uses the fix pass history and its `launch_check.fix_cause.round` ledger number. Missing pass history gives no repair rounds.
+`abandon --reason "<launch refusal>"` refunds a refused launch's reserved fix attempt.
+Refunded batches spend no repair round or repair budget and do not trigger the runaway advisory.
+The history reader uses `finding_batch_abandoned.edits_landed=false` to identify a refund. A later landed event restores the batch.
+The first batch without a refund sets the budget's original finding count.
+The consecutive-fix advisory counts each ledger batch once per worker. Refunded batches add no fix to that count.
 
 ## Commands
 
@@ -476,9 +495,11 @@ with the round's result on the row that closes it. A later occupancy reports the
 kind its own pass recorded: the role the last occupant left on the board
 describes work that is already over.
 
-Window names come from the pass kind and its position among that kind in the
-phase — `Impl`, `Fix 1`, `Fix 2` — and a fix carries the round the ledger
-dispatched, so its number is the one convergence counts. A review is named for
+Window names use the pass kind and its position within the phase: `Impl`, `Fix 1`, `Fix 2`.
+A fix also carries its ledger dispatch number for the audit trail.
+Relaunches with the same ledger number count as one repair round for convergence.
+Refunded batches add no round unless they later land. The repair count can therefore differ from the dispatch number.
+A review is named for
 the pass whose diff it reads rather than for its own ordinal — `Impl Review`,
 `Review Fix 1` — since a review always follows the pass it judges, and an
 activity between them is transparent, so verification does not break the pair. A

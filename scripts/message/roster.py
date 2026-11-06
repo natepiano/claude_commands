@@ -1282,7 +1282,7 @@ def _unit_workers(
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=AccountUnread("worker account not read")))
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, herdr.HerdrFailure) as error:
         _problem(problems, "pane workers", error)
     for run in runs:
         try:
@@ -1303,6 +1303,8 @@ def _unit_workers(
                 _problem(problems, f"{run.path}: {name}", error)
                 continue
             member = membership.by_id(staff.StaffId(_as_string(record.get("staff_id"))))
+            if member is not None and isinstance(membership.backends.get(member.id), staff.ClaudeBackend):
+                continue
             parent = (membership.by_id(member.parent.id)
                       if member is not None and isinstance(member.parent, staff.ReportsTo) else None)
             if parent is None:

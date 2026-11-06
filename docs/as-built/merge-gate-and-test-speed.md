@@ -4,6 +4,59 @@ Code reviews now use the unit's persistent `review` and `review2` workers
 through `assign.sh --role review`. Any pool maintenance paths described below
 remain only for the pending archive cleanup; they do not dispatch new reviews.
 
+## Private account fixtures
+
+`staff_test_support.py` redirects fixture sessions away from real account folders.
+A real account folder is a direct child of the login home with a name that starts with `.claude` or `.codex`.
+The login home comes from `pwd`, independent of `HOME`.
+`fixture_account_home` compares the absolute lexical path and the resolved path.
+This covers relative paths, `..` paths, symlinks, and real account folders that are themselves symlinks.
+
+At import, the helper redirects real `CLAUDE_CONFIG_DIR` and `CODEX_HOME` values into one private temporary folder.
+It keeps other folder values unchanged.
+Child processes inherit the selected folders.
+The temporary folder keeps each matched account folder's name and is removed at exit.
+
+`_fixture_session_path` applies the same rule at call time, including an explicit Codex home.
+It only computes a path.
+Both `fixture_session` and `transcript_fixture` prepare the private file location.
+A Claude write changes `CLAUDE_CONFIG_DIR` only when the folder moves.
+`fixture_session` sets `CODEX_HOME` to the same selected Codex folder.
+Readers use those variables to find the fixture transcripts and backend evidence.
+
+Tests that write through another route supply their own private account folders.
+The rule redirects fixture paths; it does not refuse a test operation.
+
+`test_review_launcher.py` copies the real agent wrapper and its relative dependencies into the fixture.
+These dependencies are `claude_account.sh`, `claude_result.py`, and `lib/nix_env.py`.
+The wrapper therefore runs the fixture's assignment gate.
+
+An external audit hook observes writes into real account folders.
+Its `sitecustomize.py` shadows `pathlib` and disrupts `test_fn_length` and `test_repeat_guard`.
+A run under that hook measures writes only; it does not establish a complete test pass.
+
+## Model registry regression tests
+
+The [model registry](agent-registry.md#configuration-lifetimes) defines the configuration lifetimes.
+The regression tests observe complete operations and child processes.
+
+| Test | Observation |
+|---|---|
+| `test_resolve_reuses_the_stored_role_and_live_model_identity` | Worker reuse reads the registry zero times with both operation snapshots cleared. |
+| `test_inherited_editor_writes_without_catalog_sync` | An inherited editor publishes its row with exactly two registry reads. |
+| `test_sync_codex_catalog.sh` | Lock contention produces no registry reads; an acquired lock permits reads before an invalid cache fails. |
+| `test_failed_catalog_sync_warns_and_returns_the_current_configuration` | Both fresh factories warn after sync failure and return the current path and text. |
+
+The fixtures give catalog sources fixed times and private paths.
+Shell fixtures use `touch -t` to control those times.
+Scratch reverts establish that each test detects its corresponding defect.
+
+## Unit configuration fixtures
+
+The [unit configuration writer](showrunner-automation.md#unit-configuration-formatting) owns formatting and publication.
+Its `run_taplo` alias keeps the formatter independent of a fixture's replacement for `subprocess.run`.
+The launcher fixture replaces non-Git commands; the formatter still runs real taplo.
+
 ## What it is
 
 `scripts/production/merge_gate.py` merges a checkpoint into a production's merge branch and tests all modules before it pushes the merge.
@@ -159,9 +212,21 @@ Affected passes record `kind: affected` and never replace the full base.
 Types, admission, isolated reruns, and later merge checks keep their existing behavior.
 
 **Nightly.** `merge_gate.py --nightly --merge-branch B [--production <showrunner name>] [--checkout DIR]` fetches `origin/B`.
-It uses the production's standing checkout through `copies.standing(owner, repo, commit)`.
+It uses the production's standing checkout through `copies.standing(owner, repo, copies.CommittedSource(commit))`.
 It runs all test modules and basedpyright over `NIGHTLY_TYPE_DIRS`, which names `scripts` and includes hooks.
 The 03:00 timer calls this path.
+Each exit sends `nightly.result`, or `nightly.not_run` when the checks could not start.
+The result names the branch, finish time, type result and full test result.
+The failure text names the reason on one line within the message limit.
+Both pushes use need `note` and the key `nightly-result`.
+The result requires no action. The failure text includes an action.
+The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+Silence keeps only the newest push on that key and delivers it when silence ends.
+The gate reads `nightly_result_push` and `nightly_result_modules` from `config/merge_gate.conf` at use.
+`nightly_result_push=off` disables both texts. The default is `on`.
+`nightly_result_modules=8` limits the failed test modules named before `and N more`.
+A push failure does not change the gate result, marker or showrunner notice.
+A run that never reaches merge_gate.py sends no push unless the timer script sends one.
 The checkout retains its ignored build files and holds the copies busy lock during the run.
 The caller's local branches, HEAD and edits stay unchanged.
 Git disables terminal credential prompts and uses SSH batch mode.
@@ -186,7 +251,8 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
   Targeted tests use step `targeted-test` through the same reservation path.
   It reads `program_first_peak_gib.merge-gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
   The gate uses the first peak as its full need.
-  A matching anonymous profile uses the progress window after admission.
+  A matching anonymous profile uses the first pass's progress window after admission.
+  Reruns publish no progress counter and keep the full need.
   A missing or legacy profile keeps the full need.
   A wait keeps its gate identity and queue place.
   An admission error refuses the gate with its last reason line.

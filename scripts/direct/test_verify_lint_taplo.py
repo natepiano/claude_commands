@@ -42,11 +42,9 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         unit = self.root / ".unit.toml"
         _ = unit.write_text('plan="standby"\nresponsibilities=[]\n')
         before = unit.read_bytes(), unit.stat().st_mtime_ns
-        for arguments in (("lint", "sample"), ("lint", "--workspace", "--check")):
-            with self.subTest(arguments=arguments):
-                result = self.invoke_verify(*arguments, cwd=self.root / "src")
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual((unit.read_bytes(), unit.stat().st_mtime_ns), before)
+        result = self.invoke_taplo_at(self.root / "src", "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((unit.read_bytes(), unit.stat().st_mtime_ns), before)
 
     def test_badly_formatted_tracked_toml_with_spaces_and_newlines_still_fails_lint(self) -> None:
         self.use_real_toml_tools()
@@ -95,11 +93,9 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.run_git("rm", "--cached", "--", "Cargo.toml", "taplo.toml")
         _ = (self.root / ".unit.toml").write_text('plan="standby"\nresponsibilities=[]\n')
         self.write_shell(self.root / "bin/taplo", 'echo "taplo must not run" >&2\nexit 97\n')
-        for arguments in (("lint", "sample"), ("lint", "--workspace", "--check")):
-            with self.subTest(arguments=arguments):
-                result = self.invoke_verify(*arguments, cwd=self.root)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertNotIn("taplo must not run", result.stdout + result.stderr)
+        result = self.invoke_taplo_at(self.root, "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("taplo must not run", result.stdout + result.stderr)
         result = self.invoke_workspace_taplo()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

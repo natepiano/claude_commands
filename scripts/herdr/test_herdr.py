@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
 from types import SimpleNamespace
-from typing import BinaryIO, Literal, cast, final, override
+from typing import BinaryIO, Literal, TextIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -298,6 +298,85 @@ class NativePaneSessionTests(StaffTestCase):
             observed = herdr.native_process(998072, "codex")
         self.assertEqual(observed, herdr.NativeAgentProcess(herdr.RolloutThread(current), "same-process", environment))
         self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
+
+    def assert_target_survives_closed_descriptor(self, stage: Literal[
+            "listing", "read", "final listing", "new descriptor"]) -> None:
+        identity = fixture_runtime_id("descriptor-current-thread")
+        other = fixture_runtime_id("descriptor-other-thread")
+        proc = self.root / "descriptor-proc"
+        descriptors = proc / "998081" / "fd"
+        descriptors.mkdir(parents=True)
+        rollout = self.root / "rollout-descriptor.jsonl"
+        write_text_atomic(rollout, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+        closing, stable = descriptors / "7", descriptors / "8"
+        closing.symlink_to(rollout)
+        stable.symlink_to(rollout)
+        readlink = os.readlink
+        open_file = cast(Callable[..., TextIO], Path.open)
+
+        def read_descriptor(path: Path) -> str:
+            if path == closing and stage == "listing":
+                path.unlink()
+            return readlink(path)
+
+        def read_rollout(path: Path, *args: object, **kwargs: object) -> TextIO:
+            if path == closing and stage == "read":
+                path.unlink()
+            return open_file(path, *args, **kwargs)
+
+        stat = Path.stat
+        reads = 0
+
+        def read_metadata(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            nonlocal reads
+            value = stat(path, follow_symlinks=follow_symlinks)
+            if path == closing and stage in ("final listing", "new descriptor"):
+                reads += 1
+                if reads == 2:
+                    if stage == "final listing":
+                        path.unlink()
+                    else:
+                        (descriptors / "9").symlink_to(rollout)
+            return value
+
+        client = herdr.Herdr("fixture")
+        pane: herdr.PaneIdentity = {"pane_id": "w1:p1", "workspace_id": "w1",
+                                    "terminal_id": "private-terminal", "session_id": other}
+        info = {"process_info": {"shell_pid": 998080, "foreground_process_group_id": 998081,
+                "foreground_processes": [{"pid": 998081, "argv": ["codex"]}]}}
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", return_value="same-process"),
+              patch.object(herdr, "process_environment", return_value={}),
+              patch.object(client, "result", return_value=info),
+              patch.object(client, "composer", return_value=herdr.ComposerInput("")),
+              patch.object(os, "readlink", side_effect=read_descriptor),
+              patch.object(Path, "open", read_rollout),
+              patch.object(Path, "stat", read_metadata)):
+            with redirect_stderr(io.StringIO()) as output:
+                allowed = herdr.check_target(identity, action="keys", client=client,
+                    pane_info=pane, place=herdr.HerdrPlace("fixture", "w1:p1"))
+            if stage == "new descriptor":
+                self.assertFalse(allowed)
+                self.assertIn("current Codex rollout or process changed", output.getvalue())
+            else:
+                self.assertTrue(allowed)
+            with self.assertRaisesRegex(herdr.HerdrFailure, f"does not run session {other}") as refused:
+                self.assertTrue(herdr.check_target(other, action="keys", client=client,
+                    pane_info=pane, place=herdr.HerdrPlace("fixture", "w1:p1")))
+            self.assertEqual(refused.exception.code, "wrong_target")
+
+    def test_target_proof_survives_a_descriptor_closing_during_listing(self) -> None:
+        self.assert_target_survives_closed_descriptor("listing")
+
+    def test_target_proof_survives_a_descriptor_closing_during_read(self) -> None:
+        self.assert_target_survives_closed_descriptor("read")
+
+    def test_target_proof_survives_a_descriptor_closing_before_the_final_listing(self) -> None:
+        self.assert_target_survives_closed_descriptor("final listing")
+
+    def test_target_proof_refuses_a_new_descriptor_before_the_final_listing(self) -> None:
+        self.assert_target_survives_closed_descriptor("new descriptor")
 
     def test_launch_argument_cannot_prove_the_current_pane_session(self) -> None:
         launch = fixture_runtime_id("native-fallback-launch")
@@ -3764,6 +3843,30 @@ class HerdrTests(unittest.TestCase):
                 self.assertEqual([command for command in self.commands() if command[2:4] == ["pane", "list"]],
                                  [["--session", "writing", "pane", "list"]])
 
+    def test_process_sessions_without_scope_reads_does_not_read_the_agent_slice(self) -> None:
+        server = self.process(30, 1, ["herdr", "server"], {})
+        shell = self.process(11, 30, ["zsh"], {})
+        with patch.object(herdr, "agents_slice", side_effect=AssertionError("no scope read")) as setting:
+            self.assertEqual(herdr._process_sessions([server, shell], {30: "writing"}),  # pyright: ignore[reportPrivateUsage]
+                             {11: "writing"})
+        setting.assert_not_called()
+
+    def test_process_sessions_reads_the_agent_slice_once_for_multiple_pane_scopes(self) -> None:
+        server = self.process(30, 1, ["herdr", "server"], {})
+        shell = self.process(11, 30, ["zsh"], {})
+        claude = self.process(12, 11, ["claude"], {})
+        survivor = self.process(13, 1, ["daemon"], {})
+        unrelated = self.process(20, 1, ["unrelated"], {})
+        _ = (server / "cgroup").write_text("0::/app.slice/herdr-writing.service\n")
+        for process in (shell, claude, survivor):
+            _ = (process / "cgroup").write_text("0::/app.slice/app-agents.slice/run-p11.scope\n")
+        _ = (unrelated / "cgroup").write_text("0::/app.slice/app-agents.slice/run-p20.scope\n")
+        with (patch.object(herdr, "agents_slice", return_value="app-agents.slice") as setting,
+              patch.object(herdr, "_pane_shell_pids", return_value=[11])):
+            self.assertEqual(herdr._process_sessions([server, shell, claude, survivor, unrelated], {30: "writing"}),  # pyright: ignore[reportPrivateUsage]
+                             {11: "writing", 12: "writing", 13: "writing"})
+        setting.assert_called_once_with()
+
     def test_server_start_gives_each_pane_shell_a_scope_through_the_wrapper(self) -> None:
         real = self.root / "bin/zsh"
         real.parent.mkdir()
@@ -3805,7 +3908,7 @@ class HerdrTests(unittest.TestCase):
             wrapper = (self.root / "home/.local/state/herdr/pane-shell").read_text()
             self.assertIn("--slice=app-custom.slice", wrapper)
             scope = Path("/app.slice/app-custom.slice/run-p11.scope")
-            self.assertEqual(herdr.pane_scopes([("0", scope)]), [("0", scope)])
+            self.assertEqual(herdr.pane_scopes([("0", scope)], agents_slice()), [("0", scope)])
 
     def test_pane_shell_falls_back_to_bin_sh(self) -> None:
         plain = self.root / "not-executable"

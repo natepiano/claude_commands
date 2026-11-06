@@ -232,6 +232,9 @@ nix_python="$nix_lib/py"
 claude_binary="$(command -v claude)"
 "$nix_python" "$nix_helper" ensure "$worktree" >/dev/null || exit 1
 
+source "$(dirname "${BASH_SOURCE[0]}")/../agents/models_config.sh"
+models_agent_environment
+
 if [ "$mode" = here ]; then
     cd "$worktree" || exit 1
     exec env -u CLAUDE_CODE_MESSAGING_SOCKET \

@@ -9,7 +9,7 @@ import json
 import io
 import os
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -21,6 +21,11 @@ from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGat
 
 @final
 class MergeGateLedgerTests(MergeGateFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
+
     @gate_suites(*FIXTURE_FOLDERS)
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
         result = self.run_gate("--tests-only")
