@@ -179,8 +179,8 @@ class UnitPhasesTests(unittest.TestCase):
                                               {owner.name: ("first", "second")})
 
         def render() -> str:
-            with patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources({}, ())):
-                return unit_phases.table(live_units.units_in(doc, every), {})
+            with patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())):
+                return unit_phases.table(live_units.units_in(owner.name, every), {})
 
         initial = render()
         self.assertIn("| Unit | Status | Phase | Task |", initial)
@@ -221,7 +221,7 @@ class UnitPhasesTests(unittest.TestCase):
             ["send.py"], send_code, "", "fixture send failed" if send_code else ""))
         with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
               patch.object(unit_lookup, "observed_session_labels", return_value=tuple(observed)),
-              patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())),
               patch.object(phase_table, "show_production", return_value="{}"),
               patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)),
               contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):
@@ -259,7 +259,7 @@ class UnitPhasesTests(unittest.TestCase):
         output = io.StringIO()
         sender = Mock()
         with (patch.object(unit_lookup, "observed_session_labels", return_value=()),
-              patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())),
               patch.object(phase_table, "show_production", return_value="{}"),
               patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
             result = unit_phases.main(["--production", owner.name])
@@ -277,7 +277,7 @@ class UnitPhasesTests(unittest.TestCase):
         _ = doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
         owner = fixture_member("showrunner", name="scan-owner", doc=staff.LiveDoc("natedev", doc))
         member = recorded_unit(owner.name, "member", self.root / "member", doc)
-        sources = session_staff.MemberSources({}, ())
+        sources = session_staff.MemberSources(())
         output, errors = io.StringIO(), io.StringIO()
         line = "anomaly: codex pid 123: no process identity"
         sender = Mock(return_value=subprocess.CompletedProcess(["send.py"], 0, "", ""))
@@ -454,7 +454,7 @@ class UnitPhasesTests(unittest.TestCase):
             directory = self.root / name
             directory.mkdir()
             _ = (directory / "conf").write_text(
-                f"TARGET={target}\nCHECK=zsh /opt/production_check.sh {doc}\n", encoding="utf-8")
+                f"TARGET={target}\nCHECK=zsh /opt/production_check.sh show\n", encoding="utf-8")
         caller = fixture_runtime_id("unit-phases-caller")
         _ = fixture_member("showrunner", name="show", runtime_id=caller, doc=staff.LiveDoc("natedev", doc))
         self.assertEqual(showrunners.production_of(caller, self.root), doc)

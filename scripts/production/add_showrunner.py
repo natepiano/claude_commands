@@ -32,13 +32,13 @@ from typing import TYPE_CHECKING, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.shutdown.remote import local_machine
 from scripts.production import completion_receipt, staff
+from scripts.shutdown.remote import local_machine
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
 from scripts.production import showrunners
 import showrunner_tree
-from scripts.production.production_doc import Production, Refusal, read_new_production, read_production
+from scripts.production.production_doc import ProductionDocument, Refusal, read_new_production, read_production
 import herdr
 
 if TYPE_CHECKING:
@@ -117,7 +117,7 @@ def claude_json(config_dir: Path) -> Path:
     return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or config_dir / ".claude.json")
 
 
-def checked(child: Production, caller: str, ending: EndingTab = NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path) -> None:
+def checked(child: ProductionDocument, caller: str, ending: EndingTab = NO_ENDING_TAB, start_in: Path | None = None, *, config_dir: Path) -> None:
     """Check whether `child` can start; raise Refusal naming what is in the way.
 
     `ending` identifies the unit's tab that closes before launch, or says no tab ends.
@@ -170,7 +170,7 @@ def account_directory(selected: ClaudeLaunchAccount) -> Path:
     return selected.dir
 
 
-def account_for_launch(child: Production, resume: str | None, target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
+def account_for_launch(child: ProductionDocument, resume: str | None, target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
     """Every launch uses the configured showrunners account, including resumes."""
     _ = child
     from scripts.accounts import accounts
@@ -181,7 +181,7 @@ def account_for_launch(child: Production, resume: str | None, target: str = "", 
         raise Refusal(str(error)) from error
 
 
-def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount,
+def launch(child: ProductionDocument, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount,
            *, identity: ShowrunnerLaunch | NewShowrunnerLaunch = NEW_SHOWRUNNER_LAUNCH,
            before_prompt: Callable[[herdr.SessionTranscript], object] | None = None) -> herdr.PromptSubmitOutcome:
     """Start once and prove the opening prompt reached this showrunner's transcript."""

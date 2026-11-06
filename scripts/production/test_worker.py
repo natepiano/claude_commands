@@ -190,7 +190,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_unknown_assignment_evidence_stays_uncertain_without_creating_workers(self) -> None:
         opened = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
-            worker_name=opened.row.name, launcher_command=["prior-assign.sh"], prompt=self.prompt, kind="impl", lens="")
+            worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["prior-assign.sh"], prompt=self.prompt, kind="impl", lens="")
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
         for evidence in ("process", "structure"):
             with self.subTest(evidence=evidence):
@@ -211,7 +211,7 @@ class WorkerCommandTests(unittest.TestCase):
         for name in ("impl", "impl2"):
             opened = self.opened(name)
             _ = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
-                worker_name=name, launcher_command=["assign.sh", name], prompt=self.prompt, kind="impl", lens="")
+                worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh", name], prompt=self.prompt, kind="impl", lens="")
             _ = self.fixture.world.stop(opened.row, self.fixture.world)
         states = worker_panes.observe(self.fixture.parent.id, staff.snapshot())
         first, second = states
@@ -234,6 +234,13 @@ class WorkerCommandTests(unittest.TestCase):
         before = len(self.fixture.world.launches)
         self.assertEqual(self.command("restore"), (0, "unchanged\n", ""))
         self.assertEqual(len(self.fixture.world.launches), before)
+
+    def test_herdr_dispatch_records_the_worker_staff_id(self) -> None:
+        self.assertEqual(self.dispatch(), worker.ExitCode.OK)
+        pane = self.agent.submitted[0][0]
+        state = cast(dict[str, dict[str, dict[str, object]]],
+                     json.loads((self.run_dir / "progress_history_state.json").read_text()))
+        self.assertEqual(state["pass"]["impl"]["worker_id"], self.agent.row(pane).id)
 
     def test_fast_dispatch_writes_reply_without_changing_the_prompt(self) -> None:
         before = self.prompt.read_bytes(), self.prompt.stat().st_mtime_ns

@@ -13,6 +13,7 @@ import tempfile
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
@@ -132,7 +133,80 @@ def session_directory(run_id: str) -> Path:
     return next((path for path in candidates if path.is_dir()), candidates[0])
 
 
-def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[dict[str, object]]:
+def pane_worker_rows(record: staff.StaffSnapshot) -> dict[staff.StaffId, list[dict[str, object]]]:
+    parents = session_staff.pane_parents(record)
+    if not parents:
+        return {}
+    from scripts.herdr import worker_panes
+
+    result: dict[staff.StaffId, list[dict[str, object]]] = {}
+    for parent, observed in worker_panes.observe_parents(parents, record).items():
+        rows: list[dict[str, object]] = []
+        for worker in observed:
+            reason = ""
+            pane = ""
+            if isinstance(worker, worker_panes.OpenWorker):
+                state, pane = worker.status.value, worker.pane
+            elif isinstance(worker, worker_panes.StoppedWorker):
+                state, pane = "stopped", worker.pane
+            elif isinstance(worker, worker_panes.ClosedWorker):
+                state = "closed"
+            elif isinstance(worker, worker_panes.ProcessUnknownWorker):
+                state, pane, reason = "unknown", worker.pane, worker.reason
+            else:
+                state, reason = "incomplete", worker.reason
+            if reason:
+                print(f"board_json: {worker.row.name}: {state}: {reason}", file=sys.stderr)
+            rows.append({"slot": worker.row.name, "role": "", "state": state,
+                         "model": "", "effort": "", "doing": ": ".join(part for part in (pane, reason) if part)})
+        result[parent] = rows
+    return result
+
+
+class ReadPaneRows(Enum):
+    CURRENT = "read the current pane workers"
+
+
+@dataclass(frozen=True)
+class PaneRowsUnreadable:
+    reason: str
+
+
+def read_pane_worker_rows(record: staff.StaffSnapshot) -> dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable:
+    try:
+        return pane_worker_rows(record)
+    except (staff.StaffUnreadable, OSError, ValueError) as error:
+        print(f"board_json: {error}", file=sys.stderr)
+        return PaneRowsUnreadable(str(error))
+
+
+def workers(session: Path, sources: set[Path], mesh_prefix: str = "", *,
+            record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
+            pane_rows: dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable | ReadPaneRows = ReadPaneRows.CURRENT) -> list[dict[str, object]]:
+    try:
+        record = staff.snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
+        state_path = session / unit_runs.STATE_FILE
+        transport = unit_runs.run_pin(session)
+        mesh_pinned = transport == "mesh"
+        if not mesh_pinned:
+            pane_rows = read_pane_worker_rows(record) if isinstance(pane_rows, ReadPaneRows) else pane_rows
+            if isinstance(pane_rows, PaneRowsUnreadable):
+                return [{"slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": pane_rows.reason}]
+        owner: staff.StaffRow | unit_runs.RunOwnerUnrecorded = unit_runs.RunOwnerUnrecorded("run has no unit staff owner")
+        if state_path.exists():
+            state = cast(object, json.loads(state_path.read_text(encoding="utf-8")))
+            if not isinstance(state, dict):
+                raise ValueError(f"{state_path}: expected an object")
+            owner = unit_runs.run_owner(cast(dict[str, object], state), record)
+            if not mesh_pinned and isinstance(owner, staff.StaffRow) and isinstance(pane_rows, dict) and owner.id in pane_rows:
+                sources.update((state_path, session, session / "board.log"))
+                return pane_rows[owner.id]
+        if transport == "herdr":
+            reason = owner.reason if isinstance(owner, unit_runs.RunOwnerUnrecorded) else f"{owner.name}: no local pane parent"
+            raise staff.StaffUnreadable(f"{session}: {reason}")
+    except (staff.StaffUnreadable, OSError, ValueError) as error:
+        print(f"board_json: {session}: {error}", file=sys.stderr)
+        return [{"slot": "?", "role": "", "state": "incomplete", "model": "", "effort": "", "doing": str(error)}]
     roster = read_object(session / "mesh_roster.json")
     sources.update((session, session / "mesh_roster.json", session / "board.log"))
     metadata = list(session.glob("impl_worker_*.json"))
@@ -140,10 +214,10 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[di
     by_name: dict[str, dict[str, object]] = {}
     prefixes = {mesh_prefix} if mesh_prefix else set[str]()
     for path in metadata:
-        record = read_object(path)
-        record["slot"] = text(record.get("slot")) or path.stem.removeprefix("impl_worker_")
-        by_name[text(record.get("name"))] = record
-        name, slot = text(record.get("name")), text(record.get("slot"))
+        entry = read_object(path)
+        entry["slot"] = text(entry.get("slot")) or path.stem.removeprefix("impl_worker_")
+        by_name[text(entry.get("name"))] = entry
+        name, slot = text(entry.get("name")), text(entry.get("slot"))
         if name.endswith(f"-{slot}"):
             prefixes.add(name[: -len(slot) - 1])
 
@@ -153,12 +227,12 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[di
                 return name[len(prefix) + 1:]
         return name
 
-    by_slot = {short_slot(text(record.get("slot"))): record for record in by_name.values()}
+    by_slot = {short_slot(text(entry.get("slot"))): entry for entry in by_name.values()}
 
     def slot_for(name: str) -> str:
         meta = by_name.get(name, {})
-        record = fields(roster.get(name))
-        return short_slot(text(meta.get("slot")) or text(record.get("slot")) or name)
+        entry = fields(roster.get(name))
+        return short_slot(text(meta.get("slot")) or text(entry.get("slot")) or name)
 
     selected: dict[str, str] = {}
     for name in roster:
@@ -180,13 +254,13 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[di
             newest[slot_for(match[1])] = re.split(r"; (?:summary at|findings in)\s", activity, maxsplit=1)[0].strip()[:80]
     result: list[dict[str, object]] = []
     for slot, name in selected.items():
-        record = fields(roster[name])
+        entry = fields(roster[name])
         meta = by_name.get(name, {}) or by_slot.get(slot, {})
-        status = text(record.get("status"))
-        settings = worker_lifecycle.recorded_turn_settings(record)
+        status = text(entry.get("status"))
+        settings = worker_lifecycle.recorded_turn_settings(entry)
         model_label = f"{settings.model}:{settings.effort}" if settings.model and settings.effort else settings.model
         state = {"done": "idle"}.get(status, status)
-        result.append({"slot": slot, "role": text(record.get("role")), "state": state,
+        result.append({"slot": slot, "role": text(entry.get("role")), "state": state,
                        "model": "/".join(part for part in (text(meta.get("family")), model_label) if part),
                        "effort": settings.effort,
                        "doing": newest.get(slot, "")})
@@ -292,7 +366,8 @@ def unit_ticket_progress(worktree: Path, unit_id: staff.StaffId, sources: set[Pa
 
 
 def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str, clock: BoardClock, sources: set[Path],
-         *, resolver: session_staff.RowResolver | None = None) -> dict[str, object]:
+         *, resolver: session_staff.RowResolver | None = None,
+         pane_rows: dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable | ReadPaneRows = ReadPaneRows.CURRENT) -> dict[str, object]:
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     worktree = worktree.expanduser().resolve()
     plan = plan_history.resolve_plan_path(worktree, plan_text)
@@ -309,7 +384,8 @@ def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str,
         sources.add(path)
         events = display_cells.run_events(path)
         worker_rows = workers(session_directory(found.run_id), sources,
-                              re.sub(r"[^a-zA-Z0-9._-]", "-", worktree.name)[:40])
+                              re.sub(r"[^a-zA-Z0-9._-]", "-", worktree.name)[:40],
+                              record=resolver.record, pane_rows=pane_rows)
     header = events[0] if events else {}
     run_plan = text(header.get("project_plan_doc")) or text(header.get("plan_doc"))
     record_plan = plan_history.resolve_plan_path(worktree, run_plan) if run_plan else plan
@@ -370,18 +446,17 @@ class NoBoardSubtree:
 def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree:
     try:
         record = staff.snapshot()
-        members: dict[str, staff.StaffRow] = {}
-        by_name: dict[str, showrunners.Showrunner] = {}
+        runners: dict[staff.StaffId, showrunners.Showrunner] = {}
         for owner in staff.active(record, "showrunner"):
             timer = showrunners.timer_for(owner, record)
             if isinstance(timer, showrunners.NoTimer):
                 continue
-            members[owner.name] = owner
-            by_name[owner.name] = showrunners.Showrunner(
+            runners[owner.id] = showrunners.Showrunner(
                 name=owner.name, session=owner.name, socket="", doc=(str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""),
                 zone=timer.zone)
         if production:
-            root = members.get(production)
+            root = next((row for row in staff.active(record, "showrunner")
+                         if row.name == production and row.id in runners), None)
         else:
             root = record.by_current_session(session)
             while root is not None and root.kind != "showrunner":
@@ -389,25 +464,24 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
     except staff.StaffUnreadable as error:
         print(f"board_json: {error}", file=sys.stderr)
         return NoBoardSubtree()
-    names = {row.id: name for name, row in members.items()}
-    if root is None or root.id not in names:
+    if root is None or root.id not in runners:
         return NoBoardSubtree()
     boards: list[BoardProduction] = []
     level = [root]
     while level:
         for row in level:
-            name = names.get(row.id, "")
-            if name in by_name:
-                boards.append(BoardProduction(row, by_name[name]))
+            boards.append(BoardProduction(row, runners[row.id]))
         level = sorted((child for row in level for child in staff.active(record, "showrunner")
-                        if child.parent == staff.ReportsTo(row.id) and child.id in names),
-                       key=lambda row: names.get(row.id, row.name))
+                        if child.parent == staff.ReportsTo(row.id) and child.id in runners),
+                       key=lambda row: row.name)
     return BoardSubtree(record, tuple(boards))
 
 
 def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
-          resolver: session_staff.RowResolver | None = None) -> dict[str, object]:
+          resolver: session_staff.RowResolver | None = None,
+          pane_rows: dict[staff.StaffId, list[dict[str, object]]] | PaneRowsUnreadable | ReadPaneRows = ReadPaneRows.CURRENT) -> dict[str, object]:
     resolver = resolver if resolver is not None else session_staff.RowResolver(record)
+    pane_rows = read_pane_worker_rows(record) if isinstance(pane_rows, ReadPaneRows) else pane_rows
     clock = BoardClock(ZoneInfo(runner["zone"]), plan_history.now_epoch())
     document = Path(runner["doc"]).expanduser().resolve()
     sources = {document}
@@ -437,7 +511,7 @@ def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot,
             units.append({"key": row.name, "state": "unavailable", "problem": reason})
         elif isinstance(config, unit_config.UnitConfig) and isinstance(tree, staff.PresentWorktree):
             plan = str(tree.path / config.plan.path) if isinstance(config.plan, unit_config.PlanFile) else "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
-            units.append(unit(row.name, row.id, tree.path, plan, clock, sources, resolver=resolver))
+            units.append(unit(row.name, row.id, tree.path, plan, clock, sources, resolver=resolver, pane_rows=pane_rows))
     offset = datetime.fromtimestamp(clock.now, clock.zone).utcoffset()
     return {"production": runner["name"], "as_of": clock.time(clock.now), "zone": runner["zone"],
             "utc_offset_minutes": int(offset.total_seconds() / 60) if offset else 0,
@@ -470,9 +544,10 @@ def main(arguments: list[str]) -> int:
     files: list[str] = []
     if isinstance(subtree, BoardSubtree):
         resolver = session_staff.RowResolver(subtree.record)
+        pane_rows = read_pane_worker_rows(subtree.record)
         for production_board in subtree.runners:
             path = root / f"{production_board.owner.id}.json"
-            write_board(path, build(production_board.runner, record=subtree.record, resolver=resolver))
+            write_board(path, build(production_board.runner, record=subtree.record, resolver=resolver, pane_rows=pane_rows))
             files.append(str(path))
     watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
     if isinstance(subtree, BoardSubtree):

@@ -97,7 +97,7 @@ def reconcile_attempted(instance: Path, path: Path, record: ReviewPauseRecord) -
 
 
 def pause(instance: Path) -> str:
-    name = showrunners.owner_for(showrunner_footer.key_values(instance / "conf")["TARGET"].removeprefix("session:")).name
+    name = showrunners.owner_for_timer(instance).name
     path = record_path(name)
     existing = path.exists()
     record = read_record(path) if existing else ReviewPauseRecord(dailies="untouched")
@@ -119,7 +119,7 @@ def pause(instance: Path) -> str:
 
 
 def status(instance: Path) -> str:
-    name = showrunners.owner_for(showrunner_footer.key_values(instance / "conf")["TARGET"].removeprefix("session:")).name
+    name = showrunners.owner_for_timer(instance).name
     path = record_path(name)
     if not path.exists():
         return ""
@@ -129,7 +129,7 @@ def status(instance: Path) -> str:
 
 
 def resume(instance: Path, answer: str) -> str:
-    name = showrunners.owner_for(showrunner_footer.key_values(instance / "conf")["TARGET"].removeprefix("session:")).name
+    name = showrunners.owner_for_timer(instance).name
     path = record_path(name)
     if not path.exists():
         return ""

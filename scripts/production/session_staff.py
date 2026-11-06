@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import fcntl
 import json
+import os
 import shlex
 import subprocess
 import tomllib
@@ -22,7 +23,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr", SCRIPTS.parent):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
-from scripts.production import staff, showrunners
+from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
 from scripts.shutdown import remote
@@ -200,6 +201,26 @@ def worker_run_index(record: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[P
     return {identity: tuple(runs) for identity, runs in found.items()}
 
 
+def pane_parents(record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+    """Select local parents whose workers use panes."""
+    from scripts.lib import unit_runs
+
+    parents = {row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo)}
+    found: list[staff.StaffRow] = []
+    for row in record.rows:
+        if row.id not in parents:
+            continue
+        location = row.doc if row.kind == "showrunner" else row.worktree
+        if (isinstance(location, (staff.LiveDoc, staff.WrappedDoc, staff.PresentWorktree, staff.RemovedWorktree))
+                and location.machine == remote.local_machine()):
+            found.append(row)
+    if not found:
+        return []
+    scanned = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record)
+    return [row for row in found
+            if unit_runs.parent_transport(row.current_session, scanned=scanned, record=record) == "herdr"]
+
+
 def worker_name(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
     member = worker_row(entry, record)
     return member.name if member is not None else ""
@@ -234,7 +255,7 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
         owner = record.parent_of(row) if row.kind == "worker" else row
         if owner is not None and owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
             from scripts.production.production_doc import read_production
-            return read_production(owner.name, record).checkout
+            return read_production(owner).checkout
         tree = RowResolver(record).unit_worktree(row)
         if isinstance(tree, PresentWorktree):
             return tree.path
@@ -256,6 +277,7 @@ class BranchUnreadable:
 class ProductionDoc:
     machine: str
     path: Path
+    owner: staff.StaffRow
 
 
 @dataclass(frozen=True)
@@ -446,7 +468,7 @@ class RowResolver:
     def production_doc(self, row: staff.StaffRow) -> ProductionDoc | DocumentUnavailable | LocationUnfilled:
         owner = self._holder(row)
         if owner.kind == "unit":
-            parent = self.record.by_id(owner.parent.id) if isinstance(owner.parent, staff.ReportsTo) else None
+            parent = self.record.parent_of(owner)
             if parent is None or parent.kind != "showrunner":
                 return DocumentUnavailable(f"{owner.name}: no showrunner staff parent")
             owner = parent
@@ -454,7 +476,7 @@ class RowResolver:
         if isinstance(doc, staff.DocUnfilled):
             return LocationUnfilled("the production document is not recorded")
         state, text = self._fact(doc.machine, "file", doc.path)
-        return ProductionDoc(doc.machine, doc.path) if state == "value" else DocumentUnavailable(text)
+        return ProductionDoc(doc.machine, doc.path, owner) if state == "value" else DocumentUnavailable(text)
 
     def merge_branch(self, row: staff.StaffRow) -> Branch | BranchUnreadable:
         doc = self.production_doc(row)
@@ -568,7 +590,6 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
 
 @dataclass(frozen=True)
 class MemberSources:
-    productions: dict[str, showrunners.ShowrunnerSource]
     launches: tuple[PaneLaunch, ...]
 
     def member(self, selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
@@ -586,13 +607,8 @@ class MemberSources:
         row = next((row for row in record.find(kind="showrunner") if row.name == selector.name), None)
         return MemberFound(row) if row is not None else NoSuchMember(selector)
 
-    def showrunner_members(self, record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
-        return {row.name: row for row in record.find(kind="showrunner")}
 
-
-def member_sources(*, dependencies: Callable[[Path], None] | None = None,
-                   record: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
-                   unreadable: showrunners.UnreadableTimerPolicy = showrunners.UnreadableTimerPolicy.SKIP) -> MemberSources:
+def member_sources(*, dependencies: Callable[[Path], None] | None = None) -> MemberSources:
     import herdr
     from scripts.shutdown import pane_record
 
@@ -603,9 +619,7 @@ def member_sources(*, dependencies: Callable[[Path], None] | None = None,
         raise staff.StaffUnreadable(f"{pane_record.record_path(session)}: {error}") from error
     except ValueError as error:
         raise staff.StaffUnreadable(str(error)) from error
-    sources = showrunners.read_sources(unreadable=unreadable,
-                                       dependencies=dependencies, record=record)
-    return MemberSources({source.timer.name: source for source in sources}, tuple(launches.values()))
+    return MemberSources(tuple(launches.values()))
 
 
 class LiveClaude(NamedTuple):
@@ -683,10 +697,11 @@ class LabeledProductions:
 
 
 
-def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> dict[str, tuple[staff.StaffRow, ...]]:
+def production_members(record: staff.StaffSnapshot) -> dict[str, tuple[staff.StaffRow, ...]]:
     """All recorded unit children, including those with no pane or local worktree."""
-    return {row.name: tuple(unit for unit in staff.active(record, "unit") if unit.parent == staff.ReportsTo(row.id))
-            for row in sources.showrunner_members(record).values() if row in staff.active(record, "showrunner")}
+    units = tuple(staff.active(record, "unit"))
+    return {row.name: tuple(unit for unit in units if unit.parent == staff.ReportsTo(row.id))
+            for row in staff.active(record, "showrunner")}
 
 
 def group_labeled_sessions(marked: Iterable[LabeledSession], *,
@@ -694,14 +709,14 @@ def group_labeled_sessions(marked: Iterable[LabeledSession], *,
                        sources: MemberSources | None = None) -> LabeledProductions:
     """Join native runtime identities to their recorded parents."""
     record = record if record is not None else staff.snapshot()
-    sources = sources if sources is not None else member_sources(record=record)
-    return _group_labeled_sessions(marked, record, production_members(record, sources), sources.launches)
+    sources = sources if sources is not None else member_sources()
+    return _group_labeled_sessions(marked, record, production_members(record), sources.launches)
 
 
 def retained_session_labels(marked: Iterable[LabeledSession], row: staff.StaffRow, production_name: str, *,
                         record: staff.StaffSnapshot, sources: MemberSources) -> LabeledProductions:
     """Keep pane evidence for a retained identity during stop and cleanup checks."""
-    membership = production_members(record, sources)
+    membership = production_members(record)
     if row not in membership.get(production_name, ()):
         membership[production_name] = (*membership.get(production_name, ()), row)
     return _group_labeled_sessions(marked, record, membership, sources.launches)
@@ -778,7 +793,7 @@ def session_staff_and_directors(
     known = {session["sessionId"] for session in records}
     proc = Path(environment.get("HERDR_PROC", "/proc"))
     record = record if record is not None else staff.snapshot()
-    sources = member_sources(record=record)
+    sources = member_sources()
     for session in records:
         try:
             # Herdr's Linux environment reader is private; keep this PID-only IO here.
@@ -813,7 +828,7 @@ class LaunchMembership:
     @classmethod
     def read(cls) -> LaunchMembership:
         record = staff.snapshot()
-        return cls(record, member_sources(record=record))
+        return cls(record, member_sources())
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
         labels = StaffLabels(self.record)

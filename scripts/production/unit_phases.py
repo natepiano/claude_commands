@@ -143,7 +143,7 @@ def main(arguments: list[str]) -> int:
             doc = read_production(name).doc
             style = is_style_production(doc)
             with ThreadPoolExecutor(max_workers=2) as reads:
-                sessions = reads.submit(live_units.read_units, doc, staff_sources.unplaced_processes,
+                sessions = reads.submit(live_units.read_units, name, staff_sources.unplaced_processes,
                                         check=staff_sources.CodexProcessThreads().check)
                 records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
                 listing = sessions.result()

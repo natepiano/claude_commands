@@ -156,7 +156,7 @@ class ConversationPauseFixture(unittest.TestCase):
         self.root = self.fixture_root
         self.bind_environment()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        self.record_showrunner("showrunner-demo")
+        _ = self.showrunner_timer("demo")
 
     def build_fixture(self) -> None:
         self.root.mkdir()
@@ -322,15 +322,13 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             "UNIT_ACTIVE_DIR": str(self.unit_active_root),
         }
 
-    def record_showrunner(self, name: str) -> None:
-        """Record the production owner that review checks require."""
-        if not name.startswith("showrunner-"):
-            return
-        name = name.removeprefix("showrunner-")
+    def showrunner_timer(self, name: str) -> str:
+        """Return the timer name for a production fixture."""
         doc = self.root / f"{name}-production.md"
         if not doc.exists():
             _ = doc.write_text(f"# {name}\n")
-        _ = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+        return f"showrunner-{owner.id}"
 
     def create_instance(
         self,
@@ -342,7 +340,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         sender: str = "",
         run: str = "",
     ) -> Path:
-        self.record_showrunner(name)
         instance = self.notifier_root / name
         instance.mkdir()
         if run:
@@ -373,8 +370,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         # A paused item is one whose schedule still exists; `scheduled=False` writes a record
         # naming schedules removed since, as switching a production to on demand does. An item
         # the test has not set up yet is set up as the pause leaves it: stopped and marked.
-        for name in instances:
-            self.record_showrunner(name)
         for name in instances if scheduled else ():
             (self.notifier_root / name).mkdir(exist_ok=True)
         for name in instances if scheduled else ():

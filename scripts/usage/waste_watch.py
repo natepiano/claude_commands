@@ -28,7 +28,7 @@ if __package__ in (None, ""):
 from scripts.usage import collect, outcomes, usage_report, weights
 from scripts.usage.agents_log import state_dir
 from scripts.usage.usage_report import UnitWorktree
-from scripts.production import session_staff, staff
+from scripts.production import session_staff, showrunners, staff
 from scripts.shutdown import remote
 from scripts.message import send_budget, session_send
 
@@ -184,7 +184,8 @@ def registered_showrunners(*, resolver: session_staff.RowResolver | None = None)
         for warning in diagnostics.warnings:
             print(f"warning: {warning}", file=sys.stderr)
         found = tuple(Showrunner(runner["name"], f"uds:{runner['socket']}" if runner["socket"] else "",
-                                usage_report.document_units(Path(runner["doc"]), resolver=resolver))
+                                usage_report.document_units(
+                                    showrunners.owner_for(runner["name"], record=record), resolver=resolver))
                       for runner in runners)
         if problems:
             return ShowrunnerLookupFailed("; ".join(problems))

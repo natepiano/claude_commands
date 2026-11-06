@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
-from scripts.production.production_doc import Production, read_new_production, read_production
+from scripts.production.production_doc import ProductionDocument, read_new_production, read_production
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.whoami import usage_store
@@ -111,7 +111,6 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.enterContext(patch.object(add_showrunner, "local_machine", return_value="natedev"))
         _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc("top")))
 
     @override
@@ -184,7 +183,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         class NativeCallbackInterrupted(BaseException):
             """The backend was observed before this launcher process ended."""
 
-        def interrupted(child: Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
+        def interrupted(child: ProductionDocument, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
             self.assertEqual((child.name, caller), ("kid", "top"))
             self.assertEqual(runtime_id, "cfc4564d-fed3-5803-9a4c-e3119733bb53")
             raise NativeCallbackInterrupted("stopped after saving launch")
@@ -285,7 +284,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         class NativeCallbackInterrupted(BaseException):
             """Process loss after native observation leaves the launch available for recovery."""
 
-        def interrupted(child: Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
+        def interrupted(child: ProductionDocument, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
             self.assertEqual(runtime_id, native)
             if after_publication:
                 _ = original(child, caller, runtime_id=runtime_id)
@@ -340,6 +339,31 @@ class AddShowrunnerTests(AddShowrunnerFixture):
 
     def test_observed_native_launch_recovers_after_staff_publication_before_its_opening_work(self) -> None:
         self.assert_observed_callback_recovers(True)
+
+    def test_former_name_retry_reads_the_renamed_showrunners_receipt_and_refuses_another_backend(self) -> None:
+        native = "cfc4564d-fed3-5803-9a4c-e3119733bb53"
+        self.starts(native, registers="kid")
+        first = self.run_command("kid")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        child = staff.by_path("kid")
+        assert child is not None
+        renamed = staff.rename(child.id, "renamed-kid")
+        receipt_path = self.root / "showrunner" / child.id / "add_showrunner.json"
+        receipt = completion_receipt.read_launch_receipt(receipt_path, staff.snapshot())
+        self.assertIsInstance(receipt, completion_receipt.OwnedReceipt)
+        before = self.staff.staff_file.read_bytes(), receipt_path.read_bytes(), self.herdr_calls()
+        other_native = fixture_runtime_id("another-showrunner-backend")
+        with (patch.object(completion_receipt, "read_launch_receipt",
+                           wraps=completion_receipt.read_launch_receipt) as read,
+              patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1")),
+              patch.object(runtime.Herdr, "native_session", return_value=other_native)):
+            retry = self.run_command("kid")
+        self.assertEqual(retry.returncode, 2, retry.stdout + retry.stderr)
+        self.assertIn(f"pending backend {native} differs from {other_native}", retry.stderr)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(read.call_args.args[0], receipt_path)
+        self.assertEqual(staff.by_id(child.id), renamed)
+        self.assertEqual((self.staff.staff_file.read_bytes(), receipt_path.read_bytes(), self.herdr_calls()), before)
 
     def test_retired_showrunner_receipt_cannot_complete_a_new_add_request(self) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")

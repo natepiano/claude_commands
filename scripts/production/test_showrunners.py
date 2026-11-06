@@ -27,7 +27,7 @@ from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
-from scripts.production import session_staff, showrunners, staff_sources
+from scripts.production import showrunners, staff_sources
 from sessions import SessionRecord
 from fake_unit_host import HostedUnit
 from scripts.lib.socket_test_support import short_socket_directory
@@ -320,14 +320,6 @@ class RowTimerJoinTests(StaffTestCase):
         self.assertEqual([runner["name"] for runner in runners], ["hana-owner"])
         self.assertEqual(members, {"hana-owner": row})
 
-    def test_production_membership_does_not_require_a_matching_timer_target(self) -> None:
-        row, folder = self.timer("member")
-        source = showrunners.read_bound_source(folder, self.root / "member-production.md")
-        source = replace(source, timer=source.timer._replace(target="session:unrecorded"))
-        sources = session_staff.MemberSources({"member": source}, ())
-        self.assertEqual(sources.member(session_staff.ShowrunnerMember("member"), staff.snapshot()),
-                         session_staff.MemberFound(row))
-
     def test_remote_or_timerless_staff_remains_a_member(self) -> None:
         row, folder = self.timer("remote")
         remote = replace(row, doc=staff.LiveDoc("other-machine", self.root / "remote-production.md"))
@@ -366,6 +358,25 @@ class RowTimerJoinTests(StaffTestCase):
         sources = showrunners.read_sources(folder.parent, unreadable=showrunners.UnreadableTimerPolicy.STRICT,
                                           record=staff.snapshot())
         self.assertEqual(sources[0].timer.doc, self.root / "old-production.md")
+
+    def test_session_state_adoption_uses_the_staff_id_after_rename_and_clear(self) -> None:
+        row, folder = self.timer("old-name")
+        _ = staff.rename(row.id, "new-name")
+        current = fixture_runtime_id("adoption-cleared-session")
+        _ = staff.update_current_session(row.current_session, staff.native_id(current))
+        scratch = self.root / "claude-test/project" / current / "scratchpad"
+        scratch.mkdir(parents=True)
+        write_text_atomic(scratch / "showrunner_state.json", '{"kept": true}\n')
+        state = self.root / "state"
+        record = staff.snapshot()
+        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", folder.parent),
+              mock.patch.object(showrunners, "SCRATCH_ROOT", self.root),
+              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state),
+              mock.patch.object(staff, "snapshot", side_effect=AssertionError("staff was read again"))):
+            copied = showrunners.adopt_session_state(row.id, record=record)
+        self.assertEqual(copied, ["showrunner_state.json"])
+        self.assertEqual((state / row.id / "session/showrunner_state.json").read_text(),
+                         (scratch / "showrunner_state.json").read_text())
 
     def test_name_keyed_timer_is_not_a_staff_id_registration(self) -> None:
         row, folder = self.timer("hana")

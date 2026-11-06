@@ -40,6 +40,14 @@ SCRIPT = Path(__file__).with_name("unit_lookup.py")
 
 
 class UnitReferenceTests(StaffTestCase):
+    def test_row_production_returns_the_recorded_parent_when_its_document_is_missing(self) -> None:
+        doc = self.source_root / "missing-production.md"
+        parent = fixture_member("showrunner", name="owner", doc=staff.LiveDoc("natedev", doc))
+        unit = fixture_member("unit", name="member", parent=parent.id)
+        self.assertFalse(doc.exists())
+        self.assertEqual(unit_lookup.row_production(unit, staff.snapshot()),
+                         unit_lookup.UnitProduction(parent.name, str(doc)))
+
     def test_selected_identity_keeps_its_parent_after_a_session_and_name_change(self) -> None:
         fixture = self.row_production()
         row = staff.rename(fixture.unit.id, "renamed")
@@ -75,8 +83,7 @@ class UnitLookupTests(unittest.TestCase):
         assert isinstance(historical.parent, staff.ReportsTo)
         _ = staff.set_doc(historical.parent.id, staff.WrappedDoc("natedev", self.root / "archive.md"))
         record = staff.snapshot()
-        sources = unit_lookup.MemberSources({}, ())
-        self.assertEqual(unit_lookup.production_members(record, sources), {"current": (live,), "show": ()})
+        self.assertEqual(unit_lookup.production_members(record), {"current": (live,), "show": ()})
         self.assertIsNotNone(record.by_id(retired.id))
         self.assertEqual(unit_lookup.unit_row("retired", record, reference=session_staff.StoredReference(retired.id)).id, retired.id)
 
@@ -85,7 +92,7 @@ class UnitLookupTests(unittest.TestCase):
         live = unit_membership("show", "live")
         retired = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         record = staff.snapshot()
-        sources = unit_lookup.MemberSources({}, ())
+        sources = unit_lookup.MemberSources(())
         for durable_id in (retired.id, ""):
             with self.subTest(durable_id=bool(durable_id)):
                 fake_unit_host.write(self.environment, [
@@ -134,7 +141,7 @@ class UnitLookupTests(unittest.TestCase):
         for broken in (missing, parentless, invalid):
             with self.subTest(rows=broken.rows):
                 found = unit_lookup.group_labeled_sessions([pane], record=broken,
-                    sources=unit_lookup.MemberSources({}, ()))
+                    sources=unit_lookup.MemberSources(()))
                 self.assertEqual(found.units, {})
 
     def test_retained_unit_cleanup_lookup_keeps_a_live_director_after_active_membership_excludes_it(self) -> None:
@@ -189,7 +196,7 @@ class UnitLookupTests(unittest.TestCase):
         config = unit_config.UnitConfig(unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ())
         with (mock.patch.object(session_staff, "_read_facts", side_effect=read_facts),
               mock.patch.object(unit_config, "read", return_value=config)):
-            metadata = unit_lookup.unit_metadata(staff.snapshot(), unit_lookup.MemberSources({}, ()))
+            metadata = unit_lookup.unit_metadata(staff.snapshot())
         self.assertEqual(metadata.cells, {live.id: cells})
         self.assertEqual(metadata.problems, ())
 

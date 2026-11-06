@@ -73,7 +73,7 @@ class WasteWatchTests(unittest.TestCase):
         owner = recorded_showrunner("watch", showrunner_doc)
         _ = fixture_unit_location(owner, "alpha", self.worktree)
         self.lookup = waste_watch.ShowrunnersFound((waste_watch.Showrunner(
-            "watch", ADDRESS, usage_report.document_units(showrunner_doc)),))
+            "watch", ADDRESS, usage_report.document_units(owner)),))
         self.lookups = 0
 
         def registered(*, resolver: session_staff.RowResolver | None = None) -> waste_watch.ShowrunnerLookup:
@@ -247,7 +247,7 @@ class WasteWatchTests(unittest.TestCase):
         self.wait("worker", 1, 500_000)
         for lookup, reason in (
                 (waste_watch.ShowrunnersFound((waste_watch.Showrunner(
-                    "watch", "", usage_report.document_units(self.root / "elsewhere/watch-production.md")),)),
+                    "watch", "", usage_report.document_units(showrunners.owner_for("watch"))),)),
                  "showrunner watch is not running"),
                 (waste_watch.ShowrunnerLookupFailed("showrunner lookup failed: invented"),
                  "showrunner lookup failed: invented")):

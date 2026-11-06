@@ -213,8 +213,8 @@ class StyleUnitsTests(unittest.TestCase):
                                               {"style-owner": ("names", "types")})
 
         def render_status() -> str:
-            with patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources({}, ())):
-                return self.render(live_units.units_in(self.doc, every))
+            with patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())):
+                return self.render(live_units.units_in("style-owner", every))
 
         initial = render_status()
         self.assertIn("| names | active | idle |", initial)

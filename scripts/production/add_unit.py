@@ -1251,8 +1251,7 @@ def checked_unit_member(production: Production, unit: str,
     if isinstance(found, staff_sources.MemberFound):
         if isinstance(found.row.worktree, staff.RemovedWorktree):
             raise Refusal(f"unit {unit} is retired; resume that unit, or remove it for good to free the name")
-        parent = staff_sources.member(staff_sources.ShowrunnerMember(production.name), record)
-        if not isinstance(parent, staff_sources.MemberFound) or found.row.parent != staff.ReportsTo(parent.row.id):
+        if found.row.parent != staff.ReportsTo(production.owner.id):
             owner = record.by_id(found.row.parent.id) if isinstance(found.row.parent, staff.ReportsTo) else None
             if owner is None or owner.kind != "showrunner":
                 raise staff.StaffUnreadable(f"{found.row.name}: no showrunner staff row")

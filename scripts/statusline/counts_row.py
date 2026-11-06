@@ -57,7 +57,9 @@ def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str
     sources.extend(footer_counts.sources(production.doc, identities=identities))
     sources.extend(footer_counts.routing_sources(identities.record))
     try:
-        owner = identities.owner(production.doc)
+        owner = production.owner
+        if identities.record.by_id(owner.id) is None:
+            raise RegistrationFailure("questions", f"{production.doc}: no showrunner staff row")
     except (RegistrationFailure, staff.StaffRefused) as error:
         print(f"questions: unavailable — {error}", file=sys.stderr)
         line = footer_counts.counts_line(footer_counts.read_counts(production.doc, record=identities.record)) or ""

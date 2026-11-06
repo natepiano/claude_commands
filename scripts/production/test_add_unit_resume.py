@@ -26,7 +26,7 @@ from test_support import ShutdownTestCase
 
 
 from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT
-from scripts.production.staff_test_support import fixture_runtime_id, fixture_showrunner_name, unit_membership
+from scripts.production.staff_test_support import fixture_runtime_id, unit_membership
 
 
 def setUpModule() -> None:
@@ -38,7 +38,7 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_resume_preserves_existing_config_settings_and_launches_with_the_same_staff_id(self) -> None:
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
+        row = unit_membership("build-followups", "alpha")
         fixed_id = row.id
         row = staff.update_current_session(row.current_session, staff.native_id("3001165e-ca76-59c2-9490-878224585fad"))
         row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
@@ -80,14 +80,14 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         old_head = self.git("rev-parse", "build-followups")
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
+        row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         stopped = unit_lookup.LabeledSession("alpha", unit_lookup.ClaudeNotRunning(),
-                                        HerdrPlace("old-host", "w2:p3"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha").current_session))
+                                        HerdrPlace("old-host", "w2:p3"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha").current_session))
         running = unit_lookup.LabeledSession("alpha",
             unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture/socket", 4242),
-            HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha").current_session))
+            HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha").current_session))
         order = Mock()
         with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(stopped)),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
@@ -105,7 +105,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(order.mock_calls[1][0], "start")
         waited.assert_called_once()
         self.assertIn("alpha started:", result.stdout)
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
+        row = unit_membership("build-followups", "alpha")
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
         self.assertEqual(self.git("rev-parse", "build-followups"), old_head)
         self.assertTrue((self.root / "project-alpha").is_dir())
@@ -187,7 +187,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in self.pane_environment()))
         self.assertIn(str(prior), self.opened())
         self.assertIn("attached 62ccbd64-f22e-5647-b20e-7899aa39d766 as alpha: one process, pid 202", result.stdout)
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
+        row = unit_membership("build-followups", "alpha")
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
         self.assertNotIn("STAFF_ID", self.pane_environment())
         arguments = self.agent_arguments()
@@ -279,7 +279,7 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_retired_plan_resume_cannot_bypass_the_retained_row_restore(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
+        row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         before = self.repository_state()
@@ -304,7 +304,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.git("branch", "build-followups-alpha")
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
+        row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         before = self.repository_state()

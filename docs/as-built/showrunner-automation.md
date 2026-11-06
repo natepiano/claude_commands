@@ -219,17 +219,20 @@ The showrunner still judges, before the call: the other units' overlap notice, n
 
 A unit's session name is written in one place, the session itself (user, 2026-10-08). Nothing copies it into the production doc, a registry or the showrunner's saved report state, so a rename in Claude or a relaunch leaves nothing to bring in step. The same holds for a showrunner's name.
 
-- **Readers.** `live_units.py <showrunner>` joins the registered doc's live rows with the lookup and prints the unit, its pane, `live|stopped|unknown|gone` and its name now, tab-separated. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `dailies_input.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (dailies ETAs, judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
+- **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `dailies_input.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (dailies ETAs, judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
   The command prints one row per production staff unit.
-  Without `--production`, the caller's staff name selects the production document.
+  Without `--production`, `showrunners.own_name()` selects the production name.
+  `read_production(name)` reads the document from that showrunner's staff row.
   A missing owner or document exits 1.
   Unit shows the unit's staff name (`row.name`), including stopped units and units without a session.
   All cells escape pipes.
   The command reads terminal metadata, never pane contents.
   - **Status and anomalies:** Both tables show Status as `paused` or `active` from the staff row.
-    `live_units.read_units` returns `UnitListing(units, anomalies)`.
+    `live_units.read_units(name)` returns `UnitListing(units, anomalies)`.
+    `units_of(name)` uses that reader and prints its anomalies on stderr.
+    `units_in(name, every)` joins supplied observations and adds each unit's staff status.
     `session_staff.anomalies` collects diagnostics and preserves other callers' stderr output.
     The command prints unplaced processes below the table on stdout.
     The process scanner also supplies processes outside the pane lookup.
@@ -450,7 +453,7 @@ Copied pane marks do not select rows.
   Missing, invalid, or unreadable answers produce no machines.
   Only the status line starts a background refresh.
 - **One source for the zone (2026-10-12).** The user's zone is `config/user_zone.conf`, read through `scripts/lib/user_zone.py`, and nothing else. A production doc's `- **User zone:**` line was parsed in three places: `showrunners.py` (the registry's zone), `add_unit.py` (`Production.zone`, which `merge_checkpoint`, `ci_points`, the dailies builder, `waiting`, `stall_watch` and `update_registration` use) and `hooks/showrunner_footer.py`. Each now returns the setting. A doc that still carries the line loads as before and the line is ignored; a doc without it registers, where before it was refused. `/producer:to_production` no longer writes the line. `progress_history.py eta` reads a typed time in the setting's zone and no longer in the process `TZ`, so `/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`. The shell displays in `message/notifier.sh` (`next_due`), `validate_and_push/ci_tick.sh` and `production/smoke_launch.sh` read the helper as well. Tests whose expected times are Pacific pin `USER_ZONE` at module level.
-- **LOG backups (2026-10-12).** On every scheduled update tick `production_check.sh` runs `scripts/production/log_backup.py <doc>` for a running production, so every production is covered with no setup of its own. `backup(log: Path, directory: Path, now: datetime) -> Path | None` copies LOG to `<SHOWRUNNER_STATE_DIR or ~/.local/state/showrunner>/<showrunner name>/log-backups/log-<YYYYmmddTHHMM>.md`, stamped in the production's zone, and keeps the newest 48 (`KEEP`). An empty or missing LOG is not copied, and neither is one unchanged since the newest copy. A failed copy prints `log_backup: <reason>` to the tick's stderr and leaves the check's exit code alone. To restore, copy the wanted file back over LOG. Added after a LOG was emptied by mistake with no copy anywhere.
+- **LOG backups (2026-10-12).** On each scheduled update tick, `production_check.sh <staff id>` passes that same argument to `scripts/production/log_backup.py` for a running production. `log_backup.py <production name or staff id>` resolves the showrunner's staff row and reads its production document. `backup(log: Path, directory: Path, now: datetime) -> Path | None` copies LOG and keeps the newest 48 copies (`KEEP`). Copies use `<SHOWRUNNER_STATE_DIR or ~/.local/state/showrunner>/<staff id>/log-backups/log-<YYYYmmddTHHMM>.md`, with timestamps in the production's zone. An empty, missing, or unchanged LOG produces no copy. A failed copy prints `log_backup: <reason>` to stderr and does not change the check's exit code. To restore LOG, copy the selected backup over LOG. This feature followed an accidental LOG deletion without a backup.
 - **`dailies_render.py --footer --nothing-needed`** replaced a scan for an invented `needed` key.
 - `LastUnitReport.held` and `first` retain their earlier optional types.
 

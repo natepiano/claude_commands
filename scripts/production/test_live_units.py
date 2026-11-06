@@ -44,8 +44,8 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         with (mock.patch.object(unit_lookup, "member_sources", return_value=sources),
               mock.patch.object(unit_lookup, "every_labeled_session", return_value=every),
               redirect_stderr(errors)):
-            listing = live_units.read_units(fixture.doc, scan)
-            legacy = live_units.units_of_doc(fixture.doc)
+            listing = live_units.read_units(fixture.name, scan)
+            legacy = live_units.units_of(fixture.name)
 
         self.assertEqual([item.unit for item in listing.units], [fixture.unit.name])
         self.assertEqual(listing.anomalies, ("anomaly: codex pid 123: no current staff row",))
@@ -70,7 +70,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
                 errors = io.StringIO()
                 with (redirect_stderr(errors),
                       mock.patch("unit_lookup.every_labeled_session", return_value=every)):
-                    units = live_units.units_of_doc(fixture.doc)
+                    units = live_units.units_of(fixture.runner.name)
                 self.assertEqual([item.unit for item in units], ["member"])
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
                 self.assertIn(fixture.unit.name, errors.getvalue())
@@ -78,15 +78,24 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
                 if failure == "configuration":
                     self.assertIn(".unit.toml", errors.getvalue())
 
-    def test_units_in_uses_the_document_join_when_the_filename_and_timer_production_name_differ(self) -> None:
+    def test_units_in_uses_the_staff_name_when_the_document_filename_differs(self) -> None:
         from scripts.production import live_units, session_staff
 
         fixture = self.row_production()
         every = session_staff.LabeledProductions({}, {fixture.runner.name: ("member",)})
         before = self.staff_file.read_bytes()
-        selected = live_units.units_in(fixture.doc, every)
+        selected = live_units.units_in(fixture.runner.name, every)
         self.assertEqual([unit.unit for unit in selected], ["member"])
         self.assertEqual(self.staff_file.read_bytes(), before)
+
+
+    def test_unknown_name_has_no_units_in_the_supplied_snapshot(self) -> None:
+        from scripts.production import live_units, session_staff
+
+        every = session_staff.LabeledProductions({}, {"known": ("member",)})
+        with mock.patch.object(staff, "snapshot") as read_staff:
+            self.assertEqual(live_units.units_in("unknown", every), [])
+        read_staff.assert_not_called()
 
 
 
@@ -238,6 +247,11 @@ class LiveUnitsTests(unittest.TestCase):
         result = self.run_script()
         self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
         self.assertIn("no-such-herdr", result.stderr)
+
+    def test_unknown_production_has_no_units(self) -> None:
+        self.hosts({})
+        result = self.run_script("--production", "unknown")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
 
     def test_a_showrunner_no_timer_names_exits_one(self) -> None:
         result = self.run_script("missing")

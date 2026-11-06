@@ -26,7 +26,6 @@ from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.production import staff, worker_admission
 from scripts.agents import worker_lifecycle
 from scripts.direct import recorder_state
-from scripts.shutdown import restart
 
 StaffId = staff.StaffId
 WorkerName = staff.WorkerName
@@ -222,6 +221,18 @@ class PaneEvidence:
     states: list[WorkerPane]
 
 
+@dataclass(frozen=True)
+class PaneRead:
+    panes: list[dict[str, object]]
+    scan: herdr.RowPaneScan
+    statuses: dict[str, herdr.AgentStatus]
+
+
+@dataclass(frozen=True)
+class PaneReadUnavailable:
+    reason: str
+
+
 def _client() -> herdr.Herdr:
     return herdr.Herdr(herdr.shared_session())
 
@@ -236,17 +247,35 @@ def _uncertain(row: staff.StaffRow, reason: str) -> UncertainWorker:
     return UncertainWorker(row, reason)
 
 
-def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneEvidence:
-    workers = record.find(kind="worker", parent=parent)
+def agent_inventory(client: herdr.Herdr) -> list[herdr.AgentOccupant]:
+    """Read agent status for worker and freestanding displays."""
+    return client.agents()
+
+
+def _stop_row(row: staff.StaffRow, client: herdr.Herdr) -> bool:
+    stop = cast(Callable[[staff.StaffRow, herdr.Herdr], bool], import_module("scripts.shutdown.restart").stop_row)
+    return stop(row, client)
+
+
+def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | PaneReadUnavailable:
     try:
         panes = [dict(pane) for pane in client.panes()]
         scan = client.scan_row_panes(record, panes)
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-        return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, str(error)) for row in workers])
+        return PaneReadUnavailable(str(error))
     try:
-        statuses = {agent["pane_id"]: agent["agent_status"] for agent in client.agents()}
+        statuses = {agent["pane_id"]: agent["agent_status"] for agent in agent_inventory(client)}
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         statuses = {}
+    return PaneRead(panes, scan, statuses)
+
+
+def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr,
+                     read: PaneRead | PaneReadUnavailable) -> PaneEvidence:
+    workers = record.find(kind="worker", parent=parent)
+    if isinstance(read, PaneReadUnavailable):
+        return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in workers])
+    panes, scan, statuses = read.panes, read.scan, read.statuses
     parent_tabs = {_text(pane, "tab_id") for pane in scan.found.get(parent, [])} - {""}
     states: list[WorkerPane] = []
     for row in workers:
@@ -301,8 +330,21 @@ def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr)
     return PaneEvidence(panes, scan, states)
 
 
+def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneEvidence:
+    return _parent_evidence(parent, record, client, _read_panes(record, client))
+
+
 def observe(parent: StaffId, record: staff.StaffSnapshot) -> list[WorkerPane]:
     return _evidence(parent, record, _client()).states
+
+
+def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot) -> dict[StaffId, list[WorkerPane]]:
+    """Join all requested parents to one pane read."""
+    if not parents:
+        return {}
+    client = _client()
+    read = _read_panes(record, client)
+    return {parent.id: _parent_evidence(parent.id, record, client, read).states for parent in parents}
 
 
 def worker_run(parent: staff.StaffRow) -> Path:
@@ -616,7 +658,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
     if isinstance(current, OpenWorker):
-        if not restart.stop_row(current.row, client):
+        if not _stop_row(current.row, client):
             return _uncertain(current.row, "agent stop is incomplete; pane retained")
         current = StoppedWorker(current.row, current.pane, current.terminal)
     if isinstance(current, StoppedWorker):
@@ -699,7 +741,7 @@ def close(parent: StaffId, name: WorkerName, *,
                         else Kept("worker parent is unavailable"))
             if isinstance(closable, Kept):
                 return closable
-            if isinstance(observed, OpenWorker) and not restart.stop_row(observed.row, client):
+            if isinstance(observed, OpenWorker) and not _stop_row(observed.row, client):
                 return _uncertain(row, "agent stop is incomplete; pane retained")
             panes = client.panes()
             matches = [pane for pane in panes if pane.get("terminal_id") == observed.terminal]
