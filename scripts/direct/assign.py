@@ -624,9 +624,35 @@ def record_review(dispatch: Dispatch, completed: bool, summary: Path) -> None:
         break
 
 
+def _record_fix_round(dispatch: Dispatch, code: int, completed: bool) -> bool:
+    if dispatch.role != "fix" or dispatch.env.get("UNIT_RESOLVES_ROUND") == "0":
+        return True
+    ledger = [PYTHON, str(SCRIPTS / "findings.py")]
+    phase = ["--session-dir", str(dispatch.run), "--phase", dispatch.phase]
+    status = call([*ledger, "status", *phase], dispatch.env, capture=True, check=False)
+    if status.returncode:
+        print(status.stderr, file=sys.stderr, end="")
+        return False
+    state = object_map(cast(object, json.loads(status.stdout)))
+    if not state.get("in_flight"):
+        return True
+    result = ["landed"] if completed else [
+        "abandon", "--edits-landed", "--reason", f"the {dispatch.worker} worker exited with code {code}",
+    ]
+    recorded = call([*ledger, *result, *phase], dispatch.env, capture=True, check=False)
+    if recorded.returncode:
+        print(recorded.stderr, file=sys.stderr, end="")
+        return False
+    print(recorded.stdout, end="")
+    return True
+
+
 def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
                     status: Path, summary: Path, reply: Path) -> int:
-    """Completed work wins; otherwise ownership loss precedes refusal or failure."""
+    """Record the round before publishing the dispatch result."""
+    if not _record_fix_round(dispatch, code, completed):
+        completed = False
+        code = 1
     if dispatch.args.early_ready:
         lens_suffix = f"_{dispatch.args.lens}" if dispatch.args.lens else ""
         _ = (status.parent / f"{dispatch.worker}_status{lens_suffix}").write_text("reviewed\n" if completed else "error\n")
@@ -646,15 +672,6 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
     if dispatch.pass_open:
         _ = call([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(dispatch.run), "--status", outcome], dispatch.env)
         dispatch.pass_open = False
-    if dispatch.role == "fix" and dispatch.env.get("UNIT_RESOLVES_ROUND") != "0":
-        ledger = [PYTHON, str(SCRIPTS / "findings.py")]
-        phase = ["--session-dir", str(dispatch.run), "--phase", dispatch.phase]
-        state = object_map(cast(object, json.loads(call([*ledger, "status", *phase], dispatch.env, capture=True).stdout)))
-        if state.get("in_flight"):
-            result = ["landed"] if completed else [
-                "abandon", "--edits-landed", "--reason", f"the {dispatch.worker} worker exited with code {code}",
-            ]
-            _ = call([*ledger, *result, *phase], dispatch.env)
     if dispatch.claim is not None:
         dispatch.board(dispatch.claim.slot, "done" if completed else "blocked", f"{shown}: {outcome}; summary {summary}")
     return 0 if completed else 2 if code == 2 else 1

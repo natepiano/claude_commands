@@ -50,6 +50,30 @@ class AssignLauncherTests(AssignLauncherFixture):
         event, = [event for event in self.events() if event.get("event_type") == "finding_batch_landed"]
         self.assertEqual(event["phase_id"], "7")
 
+    def test_failed_round_record_marks_the_completed_worker_as_blocked(self) -> None:
+        self.open_repair_round()
+        self.instrument_launcher("\n".join((
+            "import subprocess",
+            "from scripts.direct import assign",
+            "real_call = assign.call",
+            "def call(command, env, **options):",
+            "    if command[1] == str(assign.SCRIPTS / 'findings.py') and command[2] == 'landed':",
+            "        return subprocess.CompletedProcess(command, 1, '', 'cannot record landed round\\n')",
+            "    return real_call(command, env, **options)",
+            "assign.call = call",
+        )))
+
+        result = self.launch("fix")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("cannot record landed round", result.stderr)
+        worker, = self.assignment_records()
+        self.assertEqual((self.session_dir / "phases/7" / f"{worker}_status").read_text().strip(), "error")
+        self.assertIn(" blocked:", (self.session_dir / "board.log").read_text())
+        ended, = [event for event in self.events() if event.get("event_type") == "pass_finished"]
+        self.assertEqual(ended["status"], "error")
+        self.assertEqual(self.findings_command("status")["in_flight"], ["F001"])
+
     def test_failed_codex_fix_abandons_its_round_and_keeps_the_attempt(self) -> None:
         self.open_repair_round()
         self.outcomes = ["failed"]
