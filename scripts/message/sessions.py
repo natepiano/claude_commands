@@ -369,11 +369,8 @@ def addressed(to: str, records: list[SessionRecord]) -> SessionRecord | None:
 
 
 def named(name: str, records: list[SessionRecord]) -> SessionRecord | None:
-    """The live session a session name or unit id means, as `addressed` finds it: "handler-unit" and
-    "handler" each find the session named either way."""
-    bare = name.removesuffix("-unit")
-    return next((found for candidate in dict.fromkeys((name, bare, f"{bare}-unit"))
-                 if (found := addressed(candidate, records)) is not None), None)
+    """Find the live session with this staff name."""
+    return addressed(name, records)
 
 
 def config_dirs() -> list[Path]:

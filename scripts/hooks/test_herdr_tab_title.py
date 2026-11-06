@@ -344,7 +344,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         instance = state / "showrunner-sdlc"
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            "TARGET=session:session-a\nCHECK=/scripts/production_check.sh /docs/sdlc-production.md\n")
+            "TARGET=session:session-a\nCHECK=/scripts/production_check.sh fixture-owner\n")
         environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", "NOTIFIER_STATE_DIR": str(state)}
         self.record(41, "session-a", "renamed-showrunner")
         self.assertTrue(herdr_tab_title.sync({"session_id": "session-a"}, environment))
@@ -354,7 +354,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         state = self.records.parent / "notifier/showrunner-sdlc"
         state.mkdir(parents=True)
         _ = (state / "conf").write_text(
-            "TARGET=session:showrunner-id\nCHECK=/scripts/production_check.sh /docs/sdlc-production.md\n")
+            "TARGET=session:showrunner-id\nCHECK=/scripts/production_check.sh fixture-owner\n")
         cases: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("showrunner-id", "control", {}),
             ("director-id", "roles", {"SHOWRUNNER_" + "UNIT": "sdlc", "SHOWRUNNER_" + "UNIT_ID": "roles-unit"}),

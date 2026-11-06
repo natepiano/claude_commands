@@ -14,7 +14,6 @@ from pathlib import Path
 from scripts.lib import conf
 from scripts.production import delivery_state, staff, unrouted_alert
 from scripts.production.production_doc import Refusal, production_field
-from scripts.production.proposals_folder import slug_of
 
 PREFIX = "change-review - "
 PRODUCER = "Producer"
@@ -107,8 +106,6 @@ def production_documents(initial: dict[str, Path], lists: Iterable[tuple[str, st
     documents = dict(initial)
     for owner, text in lists:
         docs = list_documents(text)
-        for doc in docs:
-            _ = documents.setdefault(slug_of(doc), doc)
         if docs:
             _ = documents.setdefault(owner, docs[0])
     return documents
@@ -137,7 +134,6 @@ class StaffRouting:
                 if exists[path]:
                     self.production_by_runner[runner.id] = path
                     self.documents[runner.name] = path
-                    self.documents[slug_of(path)] = path
                     break
         self.production_by_name: dict[str, Path] = {}
         for name, path in self.documents.items():

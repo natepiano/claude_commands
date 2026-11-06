@@ -30,7 +30,7 @@ class OtherPhasesPathsTests(unittest.TestCase):
         self.session = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.enterContext(isolated_staff_file(self.session / "staff.json", {}))
         owner = fixture_member("showrunner", name="review-owner")
-        self.owner_id = fixture_member("unit", name="review-unit", parent=owner.id,
+        self.owner_id = fixture_member("unit", name="review", parent=owner.id,
                                     worktree=staff.PresentWorktree("natedev", self.session / "tree-x")).id
 
     def open_phases(self, files: dict[str, str]) -> None:

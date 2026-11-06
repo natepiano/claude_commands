@@ -20,9 +20,8 @@ class RowProductionMetadataTests(StaffTestCase):
         write_text_atomic(folder / ".unit.toml", 'plan = "standby"\nresponsibilities = []\n')
         second = fixture_member("unit", name="second", parent=fixture.runner.id,
                                 worktree=staff.PresentWorktree("natedev", folder))
-        sources = unit_lookup.member_sources()
         with mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as reads:
-            metadata = unit_lookup.unit_metadata(staff.snapshot(), sources, slug=fixture.slug)
+            metadata = unit_lookup.unit_metadata(staff.snapshot(), name=fixture.name)
         self.assertEqual(set(metadata.cells), {fixture.unit.id, second.id})
         self.assertEqual(metadata.problems, ())
         documents = [call.args[0] for call in reads.call_args_list if call.args[0] == fixture.doc]
@@ -32,7 +31,7 @@ class RowProductionMetadataTests(StaffTestCase):
         runner, unit, _ = self.tree()
         errors = io.StringIO()
         with redirect_stderr(errors):
-            metadata = unit_lookup.unit_metadata(staff.snapshot(), unit_lookup.MemberSources({}, ()))
+            metadata = unit_lookup.unit_metadata(staff.snapshot())
         self.assertIn(unit.id, metadata.cells)
         self.assertIn("unavailable:", metadata.cells[unit.id]["Worktree"])
         self.assertIn("unavailable:", metadata.cells[unit.id]["Plan"])

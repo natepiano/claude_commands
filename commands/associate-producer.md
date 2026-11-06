@@ -132,7 +132,7 @@ Do not issue a separate progress announcement for every routine record update.
 
 ## Failure alerts
 
-Relay each new genuine `/simplify` failure urgently with its unit, phase, and reason.
+Relay each new `/simplify` failure from a daily run urgently with its unit, date, and reason.
 Do not repeat the same failure. Label forced proof failures as tests, not production incidents.
 Honor a proof message's no-user-notification instruction. Reply to its sender when confirmation is requested.
 
