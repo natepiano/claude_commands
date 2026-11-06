@@ -1,9 +1,6 @@
 """Stop live staff rows, then resume their current sessions in their saved tabs."""
 from __future__ import annotations
 
-# Function imports defer the lifecycle dependency until both modules exist.
-# pyright: reportImportCycles=false
-
 import math
 import os
 import subprocess
@@ -12,7 +9,8 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, cast
+from importlib import import_module
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
@@ -24,10 +22,36 @@ import sessions
 from scripts.production import staff, session_staff
 from scripts.lib import conf, nix_env, operation_deadline, unit_runs
 from scripts.shutdown import shutdown_record, pane_record
-from scripts.shutdown.stop_results import Stopped, NotRunning, StopFailed
+from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.whoami.account import named_account_environment
+
+
+class WorkerRow(Protocol):
+    row: staff.StaffRow
+
+
+class WorkerPanes(Protocol):
+    StoppedWorker: type[WorkerRow]
+    ClosedWorker: type[WorkerRow]
+    def observe(self, parent: staff.StaffId, record: staff.StaffSnapshot) -> list[WorkerRow]: ...
+    def worker_run(self, parent: staff.StaffRow) -> Path: ...
+
+
+class WorkerRestore(Protocol):
+    def restore(self, parent: staff.StaffId) -> int: ...
+
+
+class MemberLifecycle(Protocol):
+    def stop(self, session: str, *, deadline: float) -> StopResult: ...
+    def stop_deadline(self) -> float: ...
+    def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
+    def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
+
+
+worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
+stop_resume = cast(MemberLifecycle, cast(object, import_module("scripts.shutdown.stop_resume")))
 
 
 @dataclass(frozen=True)
@@ -54,8 +78,6 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf) -> bool:
-    from scripts.shutdown import stop_resume
-
     with operation_deadline.within(deadline):
         try:
             panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
@@ -113,24 +135,29 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
 
 
 def pane_workers(row: staff.StaffRow) -> bool:
-    from scripts.herdr import worker_panes
-
     return unit_runs.worker_transport(worker_panes.worker_run(row)) != "mesh"
 
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
-    from scripts.production import worker
+    worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
     if row.kind in ("unit", "showrunner") and any(
             child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
             ) and pane_workers(row) and worker.restore(row.id) != 0:
         raise OSError("worker restore is incomplete")
 
 
+def pane_holds_other_work(client: herdr.Herdr, pane_id: str, identity: str) -> bool:
+    fresh = next((pane for pane in client.tab_sessions() if pane.pane_id == pane_id), None)
+    if fresh is not None and ((fresh.session_id and fresh.session_id != identity)
+            or not isinstance(client.pane_activity(pane_id), herdr.PaneAtShell)):
+        print(f"{pane_id}: pane close anomaly: pane holds other work; kept open", file=sys.stderr)
+        return True
+    return False
+
+
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
               present: bool = False, target_account: str = "", deadline: float = math.inf,
               resolver: session_staff.RowResolver | None = None) -> str:
-    from scripts.shutdown import stop_resume
-
     with operation_deadline.within(deadline):
         if row.kind == "worker":
             parent = record.parent_of(row)
@@ -156,7 +183,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         projected = names.resume(original) if original is not None else None
         kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name)
             if original is not None else session_launch(str(row.current_session), row.name))
-        if kind == "claude" and not target_account and original is None and row.kind in ("unit", "showrunner"):
+        if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
             from scripts.accounts import accounts
 
             target_account = accounts.role_account(row.kind).label
@@ -204,11 +231,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 return result.pane
             raise OSError(result.outcome.reason)
         if original is not None and projected is not None and result.pane != original["pane_id"]:
-            fresh = next((pane for pane in client.tab_sessions() if pane.pane_id == original["pane_id"]), None)
-            if fresh is not None and ((fresh.session_id and fresh.session_id != row.current_session)
-                    or not isinstance(client.pane_activity(fresh.pane_id), herdr.PaneAtShell)):
-                print(f"{fresh.pane_id}: pane close anomaly: pane holds other work; kept open", file=sys.stderr)
-            else:
+            if not pane_holds_other_work(client, original["pane_id"], str(row.current_session)):
                 path = pane_record.record_path(client.session)
                 pane_launch.finish_restore(path, original, pane_launch.resume_attempt(path, result.pane),
                                            names.resume_proof(original, projected), close=client.close_tab_confirmed)
@@ -283,8 +306,6 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
 
 def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
               resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
-    from scripts.herdr import worker_panes
-
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     # The registry supplies candidate names; the reader proves each conversation.
     try:
@@ -300,7 +321,7 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     for identity in sorted(candidates.keys() - owned):
         if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
             print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
-    workers: dict[staff.StaffId, worker_panes.WorkerPane] = {}
+    workers: dict[staff.StaffId, WorkerRow] = {}
     for holder in record.rows:
         if holder.kind in ("unit", "showrunner") and any(child.parent == staff.ReportsTo(holder.id) for child in record.rows) and pane_workers(holder):
             workers.update((state.row.id, state) for state in worker_panes.observe(holder.id, record))
@@ -322,8 +343,6 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
 
 
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = ()) -> int:
-    from scripts.shutdown import stop_resume
-
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -334,8 +353,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     selected: list[staff.StaffRow] = []
     if stop_all:
         selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver)
-    pending_ids = list(only) if only and not stop_all else shutdown_record.read()
-    if dry_run and not only and not stop_all:
+    select_only = bool(only) and not stop_all
+    pending_ids = list(only) if select_only else shutdown_record.read()
+    if dry_run and not select_only and not stop_all:
         path = shutdown_record.record_path()
         saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
         print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
@@ -343,12 +363,12 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             if str(row.id) not in pending_ids:
                 print(f"{row.name}: live, not in the restart record")
     for reference in pending_ids:
-        row = record.by_member_reference(reference) if only and not stop_all else record.by_id(staff.StaffId(reference))
-        if only and not stop_all and row is None:
+        row = record.by_member_reference(reference) if select_only else record.by_id(staff.StaffId(reference))
+        if select_only and row is None:
             matches = [item for item in record.rows if item.name == reference]
             row = matches[0] if len(matches) == 1 else None
         if row is None:
-            print(f"{reference}: unknown or ambiguous staff row" if only and not stop_all else
+            print(f"{reference}: unknown or ambiguous staff row" if select_only else
                   f"{' '.join(reference.split())}: restart anomaly: in the restart record, no fixed staff id", file=sys.stderr)
             continue
         if row not in selected:

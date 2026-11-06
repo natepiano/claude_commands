@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from contextlib import redirect_stderr, redirect_stdout
 from collections.abc import Generator, Mapping
@@ -336,6 +337,23 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(output.count("pane close anomaly:"), 1)
                 self.assertIn("w1:p2", pane_record.read("agents"))
 
+    def test_restore_of_a_unit_uses_the_saved_account(self) -> None:
+        self.row = replace(self.row, kind="unit")
+        record = staff.StaffSnapshot((self.row,))
+        with mock.patch.object(staff, "initial_snapshot", return_value=record):
+            self.entry()
+            client = self.restored()
+            with (mock.patch.object(accounts, "accounts_home", return_value=self.root),
+                  mock.patch.object(accounts, "role_account",
+                      return_value=accounts.NamedAccount("claude4", self.root / ".claude4")) as role,
+                  mock.patch.object(herdr, "prepare_session_environment", wraps=herdr.prepare_session_environment) as prepare,
+                  mock.patch.object(client, "run_in_pane")):
+                code, output = self.run_restore(client)
+        self.assertEqual(code, 0, output)
+        role.assert_not_called()
+        self.assertEqual(len(client.started), 1)
+        self.assertEqual(prepare.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(self.config))
+
     def test_restore_resumes_a_saved_entry_without_a_staff_row(self) -> None:
         with mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(())):
             self.entry()
@@ -416,6 +434,7 @@ class RestoreStaffNamesTests(StaffTestCase):
 
         _ = self.enterContext(mock.patch.object(herdr.nix_env, "ensure", side_effect=no_envrc))
         _ = self.enterContext(mock.patch.object(restart_records, "RECORD_DIR", self.root / "saved-panes"))
+        _ = self.enterContext(mock.patch.object(accounts, "accounts_home", return_value=self.root))
         _ = self.enterContext(mock.patch("remote.local_machine", return_value=machine))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "saved_row_tab",
             side_effect=saved_tab))
@@ -427,13 +446,13 @@ class RestoreStaffNamesTests(StaffTestCase):
         _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("decoy-unit"))
         missing = fixture_runtime_id("missing-row")
         directory = self.root / "saved-panes"
-        config = self.root / "account"
+        config = self.root / ".claude3"
         (config / "projects/work").mkdir(parents=True)
         entries: dict[str, pane_record.PaneLaunch] = {}
         rows: list[dict[str, object]] = []
         for index, (reference, current, name) in enumerate((
             (unit.id, unit.current_session, "models"),
-            (worker.current_session, worker.current_session, "old-worker-label"),
+            (worker.id, worker.current_session, "old-worker-label"),
             (missing, missing, "models"),
         ), start=1):
             pane = f"w1:p{index}"
@@ -465,7 +484,7 @@ class RestoreStaffNamesTests(StaffTestCase):
                 with mock.patch.object(staff, "row_operation", row_operation):
                     _ = staff.update_current_session(owner.current_session, changed)
                 expected[reference] = str(changed)
-                write_text_atomic(self.root / "account/projects/work" / f"{changed}.jsonl", "{}\n")
+                write_text_atomic(self.root / ".claude3/projects/work" / f"{changed}.jsonl", "{}\n")
             else:
                 expected[reference] = reference
             active.append(reference)
@@ -555,7 +574,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         record = staff.snapshot()
         identities: dict[str, str] = {}
         started: list[str] = []
-        config = self.root / "account"
+        config = self.root / ".claude3"
 
         def start(name: str, pane: str, kind: str, agent_arguments: list[str],
                   opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
@@ -622,7 +641,7 @@ class RestoreStaffNamesTests(StaffTestCase):
               redirect_stdout(output), redirect_stderr(output)):
             self.assertEqual(pane_restore.restore("agents", dry_run=False), 0, output.getvalue())
             self.assertEqual(len(pane_record.read("agents")), 3)
-        self.assertEqual(len(self.ssh_commands()), 7)
+        self.assertEqual(len(self.ssh_commands()), 6)
         self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
         self.assertEqual(order.call_count, 3)
         self.assertEqual(started, ["renamed-unit", "impl1", "models"])

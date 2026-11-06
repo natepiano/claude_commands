@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inventory
 import herdr
+import pane_launch
 import sessions
 import restart
 import shutdown
@@ -671,6 +672,27 @@ class RestartTests(ShutdownTestCase):
             prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
                                             environment, herdr.NO_ENVIRONMENT_REMOVALS)
             self.assertEqual(pane, "w1:p0")
+
+    def test_start_row_with_a_saved_entry_uses_the_role_account(self) -> None:
+        self.running.clear()
+        row = self.rows[0]
+        source, target = self.root / ".claude3", self.root / ".claude2"
+        entry = pane_record.launch("w1:p0", str(row.id), str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(source)}, ["claude", "--resume", str(row.current_session)])
+        with (patch.object(pane_record, "publication_for_session",
+                  return_value=pane_launch.LaunchPublication(self.root / "agents.json", entry)),
+              patch.object(herdr, "prepare_session_environment",
+                  return_value=herdr.PreparedAgentEnvironment(self.root, {})) as prepare,
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p0", herdr.PromptSubmissionNotRequired()))):
+            self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p0")
+        self.assertEqual(prepare.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(target))
+
+    def test_account_trust_with_the_same_account_keeps_the_file(self) -> None:
+        target = self.root / ".claude2"
+        before = (target / ".claude.json").read_text()
+        self.assertIsInstance(stop_resume.heal_account_trust(self.root, target, target, "test"), herdr.Trusted)
+        self.assertEqual((target / ".claude.json").read_text(), before)
 
     def test_start_row_opens_and_trusts_the_codex_folder(self) -> None:
         self.running.clear()

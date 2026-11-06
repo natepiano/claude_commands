@@ -26,6 +26,8 @@ from scripts.shutdown.codex_trust import trust_arguments
 from scripts.whoami.account import named_account_environment
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import staff  # noqa: E402
+from scripts.accounts import accounts
+from scripts.shutdown import restart
 
 SERVER_TIMEOUT_MS = 60_000
 
@@ -45,18 +47,13 @@ def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
         raise herdr.HerdrFailure(launched.reason)
     path = pane_record.record_path(session)
     attempt = pane_launch.resume_attempt(path, launched.pane)
-    fresh = next((item for item in client.tab_sessions() if item.pane_id == pane.pane_id), None)
-    if fresh is not None and ((fresh.session_id and fresh.session_id != entry["session_id"])
-                              or not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell)):
-        print(f"{pane.pane_id}: pane close anomaly: pane holds other work; kept open", file=sys.stderr)
+    if restart.pane_holds_other_work(client, pane.pane_id, entry["session_id"]):
         return
     pane_launch.finish_restore(path, original, attempt,
         pane_launch.VerifiedResume(entry, frozenset({entry["session_id"]})), close=client.close_tab_confirmed)
 
 
 def restore(session: str, *, dry_run: bool) -> int:
-    from scripts.shutdown import restart
-
     client = herdr.Herdr(session)
     names = LaunchNames.read()
     record = names.tab_record
@@ -68,6 +65,7 @@ def restore(session: str, *, dry_run: bool) -> int:
         print(f"pane_restore: retained launch repair failed: {error}", file=sys.stderr)
         failures += 1
     selected: dict[staff.StaffId, staff.StaffRow] = {}
+    target_accounts: dict[staff.StaffId, str] = {}
     saved_panes: list[herdr.TabSession] = []
     entries = pane_record.read(session)
     live: set[str] = set()
@@ -81,11 +79,11 @@ def restore(session: str, *, dry_run: bool) -> int:
                 continue
             saved_panes.append(pane)
             continue
-        if saved is not None and saved["session_id"] != row.id and not dry_run:
-            pane_record.write(session, {**saved, "session_id": row.id})
         parent = record.parent_of(row) if row.kind == "worker" else None
         holder = parent if parent is not None and restart.pane_workers(parent) else row
         selected[holder.id] = holder
+        if saved is not None and pane_launch.agent_kind(saved) == "claude" and holder.id == row.id:
+            target_accounts[holder.id] = accounts.claude_config_label(Path(saved["config_dir"]))
         if dry_run:
             entry = names.resume(saved) if saved is not None else None
             account = entry["config_dir"] if entry is not None else "retained account"
@@ -97,7 +95,7 @@ def restore(session: str, *, dry_run: bool) -> int:
                 row = current.by_id(holder.id)
                 if row is not None:
                     with herdr.restore_staff(current):
-                        _ = restart.start_row(row, current, client)
+                        _ = restart.start_row(row, current, client, target_account=target_accounts.get(holder.id, ""))
         except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
             failures += 1
             print(f"{holder.name}: not resumed: {error}", file=sys.stderr)
