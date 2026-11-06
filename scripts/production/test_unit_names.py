@@ -21,7 +21,7 @@ class UnitNamesTests(unittest.TestCase):
                 for checkout in ("cargo-liner-style", "cargo-liner-style-trunk"):
                     self.assertEqual(unit_names.worktree(Path("/work") / checkout, stem), Path("/work") / expected)
 
-    def test_full_unit_id_keeps_its_prefix_through_normalization(self) -> None:
-        unit = unit_names.unit_id("cargo-liner-style-mul_add-unit")
-        self.assertEqual(unit, "cargo-liner-style-mul_add-unit")
+    def test_staff_name_keeps_its_prefix_through_normalization(self) -> None:
+        unit = "cargo-liner-style-mul_add"
+        self.assertEqual(unit_names.name(unit), "cargo-liner-style-mul_add")
         self.assertEqual(unit_names.branch("cargo-liner-style", unit_names.stem(unit)), "cargo-liner-style-mul-add")

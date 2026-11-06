@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,8 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_runtime
 from scripts.production import staff  # noqa: E402
 from scripts.astra.design_role_test_support import write_mesh_server_record  # noqa: E402
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
+from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 
 SCRIPT = Path(__file__).with_name("astra_review.py")
 # The stand-in for accounts.py: answers `role workers`, and for `exec` records its call and writes
@@ -126,9 +129,7 @@ class AstraReviewTests(StaffTestCase):
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:
         assignments: list[tuple[str, design_roles.ThreadAccessPolicy]] = []
 
-        def dispatch(design: design_roles.HeldDesign, role: design_roles.Role, prompt: Path, reply: Path,
-                     model: str, effort: str) -> None:
-            del model, effort
+        def dispatch(design: design_roles.HeldDesign, role: design_roles.Role, prompt: Path, reply: Path) -> None:
             instance = next(item for item in design.roles if item.role == role)
             self.assertIsInstance(instance.lifecycle, design_roles.RoleOpen)
             self.assertTrue(prompt.is_file())
@@ -138,7 +139,6 @@ class AstraReviewTests(StaffTestCase):
 
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
                 patch.object(staff, "runtime_id", return_value="fixture-holder"), \
-                patch.object(design_roles, "resolve_model", return_value=("fixture-model", "xhigh")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=dispatch), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("held review started a fresh exec")), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
@@ -287,6 +287,19 @@ class AstraReviewTests(StaffTestCase):
         self.assertEqual(during["records"], [])
         self.assertFalse(list((self.root / "roles").glob("*.json")))
 
+    def test_worker_and_unregistered_callers_keep_the_one_turn_review(self) -> None:
+        parent = unit_membership("demo", "review-unit")
+        caller = fixture_worker("review-caller", parent.id,
+                                backend=staff.CodexBackend(self.root / "codex-home"))
+        for identity in (str(caller.current_session), fixture_runtime_id("unregistered-review-caller")):
+            with self.subTest(identity=identity):
+                self.environment["CODEX_THREAD_ID"] = identity
+                result = self.run_script(str(self.document))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.call()["argv"][:3], ["exec", "codex7", "exec"])
+                self.assertIn("Verdict: clear.", result.stdout)
+                self.assertEqual(staff.snapshot().find(kind="worker", parent=parent.id), [caller])
+
 
 @final
 class ManagedAstraReviewTests(mesh_fixture.MeshCommandFixture):
@@ -295,8 +308,46 @@ class ManagedAstraReviewTests(mesh_fixture.MeshCommandFixture):
         super().setUp()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles"),
+            "PROCESS_TABLE_PS": "true",
             "CLAUDE_CODE_SESSION_ID": "",
         })))
+        director = self.session_dir.parent / "codex"
+        director.symlink_to(sys.executable)
+        scripts = self.session_dir.parent / "caller-scripts"
+        (scripts / "direct").mkdir(parents=True)
+        command = [str(director), "-c", "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))",
+                   "bash", str(astra_review.SCRIPTS / "direct/assign.sh")]
+        _ = (scripts / "direct/assign.sh").write_text("exec " + shlex.join(command) + ' "$@"\n')
+        _ = self.enterContext(patch.object(astra_review, "SCRIPTS", scripts))
+
+    def assert_review_transport(self, held_transport: str, configured_transport: str) -> None:
+        config = self.home / "transport-config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", f"WORKER_TRANSPORT={configured_transport}\n")
+        write_text_atomic(self.session_dir / "worker_transport", held_transport + "\n")
+        run = self.session_dir / "astra-review"
+        run.mkdir()
+        write_text_atomic(astra_review.SCRIPTS / "direct/assign.sh", """while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --session-dir) run="$2"; shift ;;
+        --summary) review="$2"; shift ;;
+    esac
+    shift
+done
+cat "$run/worker_transport" > "$review"
+""")
+        review = run / "review.md"
+        with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            code = astra_review.run_review("codex9", review, "Review the proposal.", run / "codex.log")
+        self.assertEqual(code, 0)
+        self.assertEqual(unit_runs.run_pin(run), held_transport)
+        self.assertEqual(review.read_text(), held_transport + "\n")
+
+    def test_mesh_pinned_caller_keeps_mesh_for_astra_review(self) -> None:
+        self.assert_review_transport("mesh", "herdr")
+
+    def test_herdr_pinned_caller_keeps_herdr_for_astra_review(self) -> None:
+        self.assert_review_transport("herdr", "mesh")
 
     def run_review(self) -> tuple[int, str]:
         document = self.session_dir / "proposal.md"

@@ -8,7 +8,6 @@ import io
 import json
 import multiprocessing
 import os
-import pwd
 import stat
 import subprocess
 import sys
@@ -25,7 +24,7 @@ from unittest import mock
 
 from scripts.production import staff
 from scripts.message import sessions
-from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase
+from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -69,6 +68,28 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_running_claude_registry_identifies_a_worker_before_its_first_transcript(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
+        native = staff.native_id(fixture_runtime_id("claude-before-first-message"))
+        worker = staff.ensure_worker(native, "impl", unit.id)
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
+        _ = registry.write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": native, "name": worker.name,
+            "messagingSocketPath": "", "procStart": sessions.process_start(os.getpid()), "updatedAt": 1,
+        }))
+        self.assertEqual(sessions.transcript_locations(native), [])
+        self.assertEqual(staff.backend(worker), staff.ClaudeBackend())
+        registry.unlink()
+        self.assertIsInstance(staff.backend(worker), staff.BackendUnavailable)
+
+    def test_agent_environment_removes_launch_and_editor_configuration(self) -> None:
+        environment = {"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
+                       "MODELS_REGISTRY_EDIT_BASE": "editor-generation", "KEEP": "agent-value"}
+        self.assertEqual(staff.child_environment(environment), {"KEEP": "agent-value"})
+        self.assertEqual(environment["MODELS_LAUNCH_CONFIGURATION"], "launch-generation")
+        self.assertEqual(environment["MODELS_REGISTRY_EDIT_BASE"], "editor-generation")
+
     def test_worker_rename_cli_keeps_identity_for_each_backend_and_holder(self) -> None:
         from scripts.production.cli_fixture import invoke_cli
         from scripts.production.rename_test_support import RenameDisplays
@@ -162,7 +183,7 @@ class NativeRuntimeIdentityTests(StaffTestCase):
 
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
         runner, unit, _ = self.tree()
-        location = self.root / "retired-unit"
+        location = self.root / "retired"
         unit = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", location), expected=unit.worktree)
         record = staff.snapshot()
         self.assertEqual(record.unit_by_worktree("natedev", location), unit)
@@ -197,7 +218,7 @@ class NativeRuntimeIdentityTests(StaffTestCase):
 
     def test_schema_two_decoder_keeps_native_sessions_and_wire_parent_fields(self) -> None:
         owner = fixture_runtime_id("stored-owner")
-        unit = fixture_runtime_id("stored-unit")
+        unit = fixture_runtime_id("stored")
         current = fixture_runtime_id("stored-unit-after-clear")
         rows: list[dict[str, object]] = [
             {"id": owner, "kind": "showrunner", "name": "owner", "parent": None,
@@ -508,6 +529,24 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_staff_fixture_keeps_registry_paths_under_its_private_folder(self) -> None:
+        from scripts.lib.session_paths import sessions_directory
+        from scripts.production import showrunners
+        from scripts.shutdown import pane_record
+
+        keys = ("SHOWRUNNER_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "HERDR_PANE_RECORD_DIR", "XDG_CONFIG_HOME")
+        root = self.root / "registry-fixture"
+        environment: dict[str, str] = {}
+        with (mock.patch.dict(os.environ, {key: "/fixture/live" for key in keys}),
+              isolated_staff_file(root / "staff.json", environment)):
+            for key in keys:
+                with self.subTest(key=key):
+                    self.assertTrue(Path(environment[key]).is_relative_to(root))
+                    self.assertEqual(os.environ[key], environment[key])
+            self.assertEqual(showrunners.SHOWRUNNER_STATE_DIR, Path(environment["SHOWRUNNER_STATE_DIR"]))
+            self.assertEqual(sessions_directory(), Path(environment["NOTIFIER_SESSIONS_DIR"]))
+            self.assertEqual(pane_record.record_directory(), Path(environment["HERDR_PANE_RECORD_DIR"]))
+
     def test_snapshots_keep_their_production_record_source(self) -> None:
         value: dict[str, object] = {"schema": 2, "rows": []}
         _ = self.write_document(value)
@@ -527,25 +566,29 @@ class StaffTests(StaffTestCase):
                   mock.patch.object(staff, "_remote", return_value=value)):
                 self.assertTrue(staff.snapshot().production)
 
-    def test_gate_module_writes_keep_the_real_staff_and_launch_folders_unchanged(self) -> None:
+    def test_gate_module_writes_keep_the_inherited_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
         from scripts.production import merge_gate
 
-        real_state = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state"
-        real_staff = real_state / "staff"
-        real_launches = real_state / "herdr-panes"
+        inherited_state = self.root / "inherited-state"
+        inherited_staff = inherited_state / "staff"
+        inherited_launches = inherited_state / "herdr-panes"
+        inherited_staff.mkdir(parents=True)
+        inherited_launches.mkdir(parents=True)
+        _ = (inherited_staff / "staff.json").write_text('{"rows": []}\n', encoding="utf-8")
+        _ = (inherited_launches / "agents.json").write_text('{}\n', encoding="utf-8")
 
         def folder_bytes(folder: Path) -> dict[Path, bytes]:
             return {path.relative_to(folder): path.read_bytes()
                     for path in folder.rglob("*") if path.is_file()}
 
-        before = folder_bytes(real_staff), folder_bytes(real_launches)
+        before = folder_bytes(inherited_staff), folder_bytes(inherited_launches)
         module_root = self.root / "gate-module"
         module_root.mkdir()
         environment = merge_gate.test_module_environment(module_root, {
             **os.environ,
-            "STAFF_FILE": str(real_staff / "staff.json"),
-            "HERDR_PANE_RECORD_DIR": str(real_launches),
+            "STAFF_FILE": str(inherited_staff / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(inherited_launches),
         })
         self.assertEqual(environment["STAFF_FILE"], str(module_root / "staff.json"))
         self.assertEqual(environment["HERDR_PANE_RECORD_DIR"], str(module_root / "herdr-panes"))
@@ -557,7 +600,7 @@ class StaffTests(StaffTestCase):
             self.assertEqual(staff.snapshot().by_id(owner.id), owner)
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"]["session_id"], owner.id)
         self.assertTrue((module_root / "staff.json").is_file())
-        self.assertEqual((folder_bytes(real_staff), folder_bytes(real_launches)), before)
+        self.assertEqual((folder_bytes(inherited_staff), folder_bytes(inherited_launches)), before)
 
     def test_stopped_test_owner_removal_is_unchanged_on_a_second_run(self) -> None:
         row = fixture_member("showrunner", name="fixture",
@@ -1486,7 +1529,7 @@ class StaffTests(StaffTestCase):
         _ = self.tree()
         before = self.staff_file.read_bytes()
         killed = subprocess.run(
-            [sys.executable, "-c", KILLED_WRITER], cwd=CHECKOUT,
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", KILLED_WRITER], cwd=CHECKOUT,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(killed.returncode, 73, killed.stderr)
@@ -1781,7 +1824,7 @@ class StaffTests(StaffTestCase):
         with staff.operation():
             with staff.operation():
                 _ = fixture_member("showrunner", name="outer")
-            child = subprocess.run([sys.executable, "-c",
+            child = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child', runtime_id='02fc3c9a-b345-56a6-ac99-fdd5685739a6')\")"],
                 cwd=CHECKOUT, pass_fds=staff.operation_fds(), capture_output=True,
@@ -1804,7 +1847,7 @@ class StaffTests(StaffTestCase):
                 pass_fds=(inherited.fileno(),))
             self.assertEqual(exited.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             environment = {**os.environ, "STAFF_OPERATION_FD": str(inherited.fileno())}
-            child = subprocess.run([sys.executable, "-c",
+            child = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan', runtime_id='bace30cb-17a4-5156-a98f-c0d41e973849')\")"],
                 cwd=CHECKOUT, env=environment, pass_fds=(inherited.fileno(),), capture_output=True,
@@ -1832,7 +1875,7 @@ class StaffTests(StaffTestCase):
                     "from scripts.production.staff_test_support import observe_operation_lock; "
                     "observe_operation_lock(); from scripts.production import staff; "
                     "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='fallback', runtime_id='e49bd66f-2aaa-5521-b99d-225ca97f55f8')\")")
-                child = subprocess.Popen([sys.executable, "-c", program], cwd=CHECKOUT,
+                child = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program], cwd=CHECKOUT,
                     env=environment, pass_fds=(unlocked.fileno(),), stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True)
                 self.assert_operation_blocks(child, listener)

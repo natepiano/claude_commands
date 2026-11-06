@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from scripts.whoami import note_file
+
 if TYPE_CHECKING:
     from scripts.production.staff import StaffRow, ClaudeBackend, CodexBackend, BackendUnavailable
 
@@ -36,6 +38,11 @@ class NotRunning:
 class StopFailed:
     session_id: str
     reason: str
+
+
+@dataclass(frozen=True)
+class StopUnproved(StopFailed):
+    """The read cannot prove absence or identify one process to signal."""
 
 
 class ClaudeStartState(StrEnum):
@@ -82,9 +89,11 @@ MoveResult = ResumeResult | MoveHandedOff | StopFailed | ResumePending
 
 
 def claude_up_line(result: ClaudeUp) -> str:
+    label = note_file.parse_account_label(result.account)
+    agent = "Codex" if isinstance(label, note_file.NumberedAccountLabel) and label.tool == "codex" else "Claude"
     if result.start_state is ClaudeStartState.ALREADY_RUNNING:
-        return f"{result.session_id}: unchanged; Claude runs on {result.account} in {result.pane_id}"
-    return (f"{result.session_id}: Claude is up on {result.account} in {result.pane_id} "
+        return f"{result.session_id}: unchanged; {agent} runs on {result.account} in {result.pane_id}"
+    return (f"{result.session_id}: {agent} is up on {result.account} in {result.pane_id} "
             + f"({result.elapsed_seconds:.1f} s)"
             + (f"; copied folder trust from {result.trust_copied_from}" if result.trust_copied_from else ""))
 

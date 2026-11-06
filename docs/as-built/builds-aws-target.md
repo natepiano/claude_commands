@@ -12,7 +12,7 @@ The user approved these spending and capacity values on 2026-11-03, all in `conf
 4. `start_min_waiting=2`, `start_after_wait_s=120` and `idle_stop_minutes=15`: the box starts when 2 steps wait 120 s, and stops after 15 idle minutes.
 5. `slots=2`, `slots.hana=4`, `slots.cargo-liner=4` and `build_budget_gib=32`: the slots per repository and the build space.
 
-The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws-unit wrote that private file on natedev (mode 0600) from the address the user gave.
+The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws wrote that private file on natedev (mode 0600) from the address the user gave.
 The user approved `deployment_price_file=~/.config/aws-build/deployment-price` on 2026-11-03. `deploy.py price` writes the Spot price and its read time there (mode 0600), outside the repository.
 
 The target is live. The user approved go-live on 2026-11-03. The stacks exist in `us-east-2`, and the box is instance `i-0216cf933a26bd1ea`. `offload=on`, and `targets=mac,natedev,aws` lists AWS after natedev. [The runbook](../plans/builds-aws-runbook.md) gives the steps. The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.

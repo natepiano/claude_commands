@@ -11,7 +11,7 @@
 - **Showrunner session:** builds
 - **Log:** `docs/plans/builds-log.md` — untracked: never added or committed (never `git add -A` or `-a`); one line per event
 - **Updates:** on demand (user, 2026-10-13: no timer unless asked); each update reports every unit in full
-- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` and `basedpyright scripts/buildlog scripts/build_hold scripts/build_queue scripts/build_targets scripts/mac_test scripts/lint scripts/direct` (pass is its `0 errors, 0 warnings` line), run in the showrunner checkout
+- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout . --tests-only` (run in the showrunner checkout; the installed gate code and config admit the run, and the module tests come from the merged tree; the full type check runs nightly, user 2026-11-05)
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** natedev has 32 cores and 60 GB of memory; three units. The work is Python and shell scripts and docs. The tests run under the merge gate's memory cap. Its workers share natedev's build slots with natedev and sdlc.

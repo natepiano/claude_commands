@@ -42,8 +42,8 @@ from user_zone import user_zone  # noqa: E402
 # The merge gate imports this module as scripts.production.change_review; its siblings still resolve.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
-from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
-from scripts.production import change_routing, session_staff, staff, unit_config, unit_lookup, unit_names
+from proposals_folder import owner_docs, scope_docs  # noqa: E402
+from scripts.production import change_routing, session_staff, staff, unit_config, unit_lookup
 from scripts.production.production_doc import Refusal, production_field
 from scripts.shutdown import remote
 
@@ -291,10 +291,10 @@ def _line_value(doc: Path) -> str | None:
 
 def list_path(doc: Path, *,
               record: staff.StaffSnapshot | None = None) -> Path | None:
-    """The production's list, or None when its doc has no Change review line.
+    """Return the root showrunner's list, or the document's path when its owner cannot be resolved.
 
-    The list is named for the top-level showrunner while it runs; otherwise it is the path the
-    line names. A line naming another path than the showrunner's list is warned about.
+    Return None when the document has no Change review line.
+    Report a different path in that line.
     """
     value = _line_value(doc)
     if value is None:
@@ -635,26 +635,23 @@ def pending(path: Path) -> list[dict[str, str]]:
     return _review_table(path, lines, SECTION)
 
 
-def scope_list(doc: Path) -> Path:
+def scope_list(doc: Path, *, record: staff.StaffSnapshot | None = None) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
-    from scripts.production import showrunners
     import showrunner_tree
 
     if doc.is_file() and (value := _line_value(doc)):
         return Path(value).expanduser()
+    record = staff.snapshot() if record is None else record
+    name = unit_lookup.doc_owner(doc, record).name
     if not doc.is_file():
-        for member in staff.snapshot().rows:
-            if (member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
-                    and member.doc.path == doc):
-                return list_file(member.name)
-    slug = slug_of(doc)
-    root = showrunner_tree.root_of(slug)
+        return list_file(name)
+    root = showrunner_tree.root_of(name, record=record)
     try:
-        return production_list(str(doc))
+        return production_list(name, record=record)
     except ChangeReviewError:
-        if slug == root:
+        if name == root:
             raise
-        return production_list(str(showrunners.timer_docs().get(root, doc)))
+        return production_list(root, record=record)
 
 
 @dataclass(frozen=True)
@@ -669,17 +666,17 @@ class ScopedReviewEntry:
     entry: urgency.Entry[dict[str, str]]
 
 
-def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionReviewList, ...]:
+def scope_lists(path: Path, doc: Path, below: bool = False, *,
+                record: staff.StaffSnapshot | None = None) -> tuple[ProductionReviewList, ...]:
     """The current list and each scoped production's own earlier list, once per path."""
-    import showrunner_tree
-
-    owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_tree.root_of(slug_of(doc))
+    record = staff.snapshot() if record is None else record
+    owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_of(doc, record=record)
     lists = {path.absolute(): ProductionReviewList(path, owner)}
-    for production in scope_docs(doc, below):
-        slug = slug_of(production)
-        earlier = list_file(slug)
+    for production in scope_docs(doc, below, record=record):
+        name = unit_lookup.doc_owner(production, record).name
+        earlier = list_file(name)
         if earlier.absolute() in lists or earlier.exists():
-            lists[earlier.absolute()] = ProductionReviewList(earlier, slug)
+            lists[earlier.absolute()] = ProductionReviewList(earlier, name)
     return tuple(lists.values())
 
 
@@ -691,12 +688,11 @@ def routed_review_entries(path: Path, doc: Path, below: bool = False,
 
 def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.StaffSnapshot) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
     """Route all rows with one consistent staff snapshot."""
-    from scripts.production import showrunners
-
-    listed = {item.path.absolute(): item for item in scope_lists(path, doc, below)}
+    listed = {item.path.absolute(): item for item in scope_lists(path, doc, below, record=record)}
     for source in lists_directory().glob(PREFIX + "*.md"):
         _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
-    documents = {**showrunners.timer_docs(), slug_of(doc): doc}
+    documents = {row.name: row.doc.path for row in record.find(kind="showrunner")
+                 if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))}
     snapshots: dict[Path, ReviewListSnapshot] = {}
     for source in listed:
         try:
@@ -723,10 +719,10 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
 
 def review_scope(doc: Path, below: bool, record: staff.StaffSnapshot) -> set[str]:
     """Name the staff tabs counted for this production."""
-    scope = {slug_of(each) for each in scope_docs(doc, below)}
-    scope.update(member.name for member in record.rows
-                 if member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
-                 and slug_of(member.doc.path) in scope)
+    documents = set(scope_docs(doc, below, record=record))
+    scope = {member.name for member in record.rows
+             if member.kind == "showrunner" and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+             and member.doc.path in documents}
     return scope
 
 
@@ -790,15 +786,15 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
         return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
     import showrunner_tree
 
-    slug = slug_of(scope)
-    name = queue(path) if slug == showrunner_tree.root_of(slug) else f"{queue(path)}-{slug}"
+    record = staff.snapshot()
+    name = unit_lookup.doc_owner(scope, record).name
+    name = queue(path) if name == showrunner_tree.root_of(name, record=record) else f"{queue(path)}-{name}"
     return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
 def row_production(production: Path, record: staff.StaffSnapshot) -> str:
     """Read the fixed showrunner id for a production-owned change."""
-    owner = record.by_doc(remote.local_machine(), credited(production, record))
-    return str(owner.id) if owner is not None else slug_of(production)
+    return str(unit_lookup.doc_owner(credited(production.expanduser(), record), record).id)
 
 
 def credited(production: Path, record: staff.StaffSnapshot) -> Path:
@@ -868,7 +864,7 @@ def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[st
             tree = row.worktree
             worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
                         else MissingUnitWorktree())
-            source = UnitSource(doc, worktree, unit_names.unit_id(row.name), row.id)
+            source = UnitSource(doc, worktree, row.name, row.id)
             branch = resolver.unit_branch(row)
             if isinstance(branch, session_staff.Branch):
                 _ = found.setdefault(branch.name, source)
@@ -922,12 +918,7 @@ def producer_at(directory: Path, record: staff.StaffSnapshot) -> staff.StaffId |
 
 def _publication_docs(production: Path, record: staff.StaffSnapshot) -> list[Path]:
     """Resolve child production documents with the held staff snapshot."""
-    from scripts.production import showrunners
-    import showrunner_tree
-
-    docs = showrunners.timer_docs()
-    children = showrunner_tree.descendants_of(slug_of(production), record=record)
-    return [production, *(docs[child] for child in children if child in docs)]
+    return scope_docs(production, below=True, record=record)
 
 
 def publication_changes(commits: list[Commit], production: Path, *,
@@ -1059,14 +1050,15 @@ def list_tree(path: Path, docs: Iterable[Path]) -> Tree:
     import showrunner_tree
 
     owned: list[Path] = []
+    record = staff.snapshot()
     for doc in docs:
-        slug = slug_of(doc)
+        name = unit_lookup.doc_owner(doc, record).name
         try:
-            if showrunner_tree.root_of(slug) != slug or list_path(doc) != path:
+            if showrunner_tree.root_of(name, record=record) != name or list_path(doc, record=record) != path:
                 continue
         except OSError:
             continue
-        owned.extend(owner_docs(doc))
+        owned.extend(owner_docs(doc, record=record))
     return Tree(owned)
 
 
@@ -1368,52 +1360,35 @@ def hold_for_row(path: Path, row: str, folders: list[str]) -> list[str]:
     return lines
 
 
-def production_doc(production: str) -> Path:
+def production_doc(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
     """The production doc given; without one, the calling showrunner's."""
-    if production:
-        return Path(production).expanduser()
-    from scripts.production import showrunners  # only the actions that name a production read the update timers
+    from scripts.production import showrunners
 
+    if production:
+        row = showrunners.owner_for(production, record)
+        if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            return row.doc.path
+        raise ChangeReviewError(f"{row.name}: no production document")
     found = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     if found is None:
-        raise ChangeReviewError("this session is no production's showrunner; pass --production <doc>")
+        raise ChangeReviewError("this session is no production's showrunner; pass --production <name>")
     return found
 
 
 def showrunner_of(doc: Path, *,
                   record: staff.StaffSnapshot | None = None) -> str:
-    """The name of the top-level showrunner whose list takes the production's rows.
-
-    A child production's rows go to its root's list. The name is the root showrunner's session
-    name as it is now, never the production slug, so it is read only while that showrunner runs.
-    """
-    from scripts.production import showrunners
+    """Read the staff name of the root showrunner."""
     import showrunner_tree
 
-    try:
-        slug = showrunners.production_slug(str(doc))
-        if record is None:
-            root = showrunner_tree.root_of(showrunners.canonical_slug(slug))
-            name = showrunners.current_name(root)
-        else:
-            if not any(isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
-                       and row.doc.path.name.removesuffix("-production.md") == slug
-                       for row in record.find(kind="showrunner")):
-                slug = showrunners.rename_history().get(slug, slug)
-            root = showrunner_tree.root_of(slug, record=record)
-            runners = showrunners.require_complete(showrunners.registered_showrunners(membership=record))
-            name = next((runner["session"] for runner in runners if runner["slug"] == root), "")
-    except ValueError as error:
-        raise ChangeReviewError(str(error)) from None
-    if not name:
-        raise ChangeReviewError(f"the showrunner of {root} is not running; the list is named for it")
-    return name
+    record = staff.snapshot() if record is None else record
+    row = unit_lookup.doc_owner(doc, record)
+    return showrunner_tree.root_of(row.name, record=record)
 
 
-def production_list(production: str) -> Path:
-    """The list the production doc names; without a doc, the calling showrunner's production."""
-    doc = production_doc(production)
-    path = list_path(doc)
+def production_list(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
+    """Return the review list for the staff name, or for the calling showrunner when the name is empty."""
+    doc = production_doc(production, record=record)
+    path = list_path(doc, record=record)
     if path is None:
         raise ChangeReviewError(f"{doc} has no `{LIST_HEADER}` line")
     return path
@@ -1460,14 +1435,12 @@ def foreign_units(production: Path, *,
     Empty when the productions cannot be read: drift then counts every checkpoint.
     """
     from scripts.production import showrunners
-    import showrunner_tree
-
     try:
         record = staff.snapshot() if record is None else record
-        docs = list(showrunners.timer_docs().values())
-        root = showrunner_tree.root_of(slug_of(production), record=record)
-        top = next((doc for doc in docs if slug_of(doc) == root), production)
-        return {name for name, source in _unit_branches(docs, record).items()
+        docs_by_name = showrunners.timer_docs()
+        root = showrunner_of(production, record=record)
+        top = docs_by_name.get(root, production)
+        return {name for name, source in _unit_branches(docs_by_name.values(), record).items()
                 if source.production not in set(_publication_docs(top, record))}
     except (OSError, ValueError, Refusal):
         return set()
@@ -1642,8 +1615,8 @@ def _run(options: CommandLine) -> int:
                 filled, untraced = backfill(path, list_tree(path, docs), options.write)
                 print(f"{path.name}: {len(filled)} {'filled' if options.write else 'to fill'}, "
                       + f"{len(untraced)} untraced")
-                for row, slug in filled.items():
-                    print(f"  {row}: {slug}")
+                for row, name in filled.items():
+                    print(f"  {row}: {name}")
                 for row, why in untraced.items():
                     print(f"  {row}: untraced, {why}")
         case "drift":

@@ -4,21 +4,516 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import unittest
+from collections.abc import Callable
 from pathlib import Path
-from typing import cast, final
+from typing import TextIO, TypedDict, cast, final, override
 from unittest.mock import patch
 
-from scripts.agents import test_codex_mesh as mesh_fixture
-from scripts.direct.assign_launcher_test_support import ASSIGN, AssignLauncherFixture, LauncherScript, read_object
+from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
+from scripts.direct import assign, progress_history
+from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
+from scripts.direct.findings_test_support import invoke_findings
 from scripts.lint import style_review
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
+from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import fixture_worker, transcript_fixture
+from scripts.usage import agents_log
+from datetime import datetime, timezone
+
+import herdr
 
 
 def setUpModule() -> None:
     mesh_fixture.setUpModule()
 
 
+class RepairState(TypedDict):
+    rounds: list[dict[str, object]]
+    findings: list[dict[str, object]]
+    in_flight: list[str]
+
+
+@final
+class PaneReviewLauncherTests(unittest.TestCase):
+    """The assignment launcher uses the real dispatch and its transcript receipts."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.fixture = worker_fixture.WorkerCommandTests("runTest")
+        self.ready = Path()
+        self.phase = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.ready = self.fixture.run_dir / "final.ready"
+        self.phase = self.fixture.run_dir / "phases/8"
+        write_text_atomic(self.fixture.run_dir / "worker_transport", "herdr\n")
+        write_text_atomic(self.fixture.prompt, "Phase 8 — Workers\nReview Stage 1, then review the final diff in Stage 2.\n")
+        opened = self.fixture.opened("impl", "impl")
+        _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="impl", phase="8", role="impl",
+            worker_name="impl", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run_worker_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) > 1 and Path(command[1]).resolve() == ROOT / "scripts/production/worker.py":
+                result = invoke_cli(worker, lambda: worker.main(command[2:]), command[2:],
+                                    cast(dict[str, str], options["env"]), ROOT)
+                output = cast(TextIO, options["stdout"])
+                _ = output.write(result.stdout + result.stderr)
+                return result
+            return run_process(command, **options)
+
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run_worker_command))
+        _ = self.enterContext(patch.object(assign, "require_live_director"))
+
+    def launch_review(self) -> subprocess.CompletedProcess[str]:
+        arguments = ["--role", "review", "--to", "review", "--cwd", str(self.fixture.fixture.root),
+                     "--phase", "8", "--session-dir", str(self.fixture.run_dir),
+                     "--prompt", str(self.fixture.prompt), "--early-ready", str(self.ready)]
+        return invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
+
+    def test_review_stage_two_uses_its_own_done_line_and_reuses_both_receipts(self) -> None:
+        reports: list[str] = []
+        summary = self.phase / "review_summary_1.txt"
+        summary.parent.mkdir(parents=True)
+        write_text_atomic(summary, "The previous full report.\n")
+
+        def final_diff_ready() -> None:
+            if len(self.fixture.agent.submitted) == 1:
+                write_text_atomic(self.ready.with_suffix(".diff"), "+the final change\n")
+                write_text_atomic(self.ready, "ready\n")
+            else:
+                reports.append(summary.read_text())
+
+        self.fixture.agent.during_prompt = final_diff_ready
+        prompt = self.fixture.prompt.read_bytes()
+        result = self.launch_review()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first, second = self.fixture.agent.submitted
+        self.assertEqual(first[0], second[0])
+        dispatch_id = first[1].split("DONE ")[-1].split(".")[0]
+        self.assertIn(f"DONE {dispatch_id}-2.", second[1])
+        self.assertIn(str(self.ready.with_suffix(".diff")), second[1])
+        self.assertEqual(reports, ["The previous full report.\n"])
+        self.assertTrue(summary.read_text().endswith(f"DONE {dispatch_id}-2\n"))
+        self.assertEqual((self.phase / "review_status_1").read_text(), "done\n")
+        panes = self.fixture.fixture.world.locations.copy()
+        repeated = self.launch_review()
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.fixture.agent.submitted, [first, second])
+        self.assertEqual(self.fixture.fixture.world.locations, panes)
+        self.assertEqual(self.fixture.prompt.read_bytes(), prompt)
+
+    def test_review_stage_two_retry_waits_for_the_submitted_turn_without_another_prompt(self) -> None:
+        def interrupt_stage_two() -> None:
+            if len(self.fixture.agent.submitted) == 1:
+                write_text_atomic(self.ready, "ready\n")
+            else:
+                pane = self.fixture.agent.submitted[-1][0]
+                self.fixture.fixture.world.locations[pane]["agent_status"] = "working"
+                self.fixture.agent.interrupt = "prompt"
+                self.fixture.agent.finish_after = 1
+
+        self.fixture.agent.during_prompt = interrupt_stage_two
+        first = self.launch_review()
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        submitted = self.fixture.agent.submitted.copy()
+        self.assertEqual(len(submitted), 2)
+        self.fixture.agent.during_prompt = lambda: None
+        repeated = self.launch_review()
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(self.fixture.agent.submitted, submitted)
+        self.assertEqual(self.fixture.agent.waited, [submitted[-1][0]])
+        second_id = submitted[-1][1].split("DONE ")[-1].split(".")[0]
+        self.assertTrue((self.phase / "review_summary_1.txt").read_text().endswith(f"DONE {second_id}\n"))
+
+    def test_review_stage_one_done_does_not_complete_stage_two_or_replace_the_report(self) -> None:
+        def omit_stage_two_done() -> None:
+            if len(self.fixture.agent.submitted) == 1:
+                write_text_atomic(self.ready, "ready\n")
+            else:
+                self.fixture.agent.without_done = True
+
+        self.fixture.agent.during_prompt = omit_stage_two_done
+        summary = self.phase / "review_summary_1.txt"
+        summary.parent.mkdir(parents=True)
+        write_text_atomic(summary, "The previous full report.\n")
+        result = self.launch_review()
+        self.assertEqual(result.returncode, worker.ExitCode.NO_DONE, result.stdout + result.stderr)
+        self.assertEqual(len(self.fixture.agent.submitted), 2)
+        self.assertEqual(summary.read_text(), "The previous full report.\n")
+        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+        state = read_object(self.fixture.run_dir / "progress_history_state.json")
+        self.assertEqual(assign.object_map(assign.object_map(state["pass"])["review"])["status"], "active")
+
+    def assert_start_not_delivered(self, code: worker.ExitCode, reason: str) -> None:
+        result = self.launch_review()
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        self.assertIn(reason, (self.phase / "review_agent_1.log").read_text())
+        self.assertEqual(self.fixture.agent.submitted, [])
+        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+
+    def test_review_incomplete_start_keeps_the_pane_without_either_stage(self) -> None:
+        self.fixture.fixture.world.outcome = herdr.PromptNotSubmitted("startup hook failed")
+        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication failed: startup hook failed")
+        self.assertEqual(len(self.fixture.fixture.world.launches), 2)
+        self.assertEqual(self.fixture.fixture.world.closed, [])
+
+    def test_review_failed_publication_keeps_the_backend_without_either_stage(self) -> None:
+        rows = staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id)
+        with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("publication unavailable")):
+            self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication refused: publication unavailable")
+        self.assertIn("review: publication failed: staff: review:", (self.phase / "review_agent_1.log").read_text())
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id), rows)
+        self.assertEqual(len(self.fixture.fixture.world.launches), 2)
+        self.assertEqual(self.fixture.fixture.world.closed, [])
+
+    def test_review_admission_failure_sends_neither_stage(self) -> None:
+        launches = self.fixture.fixture.world.launches.copy()
+        with patch.object(worker_admission, "worker_operation", side_effect=worker_admission.AdmissionRefused("admission unavailable")):
+            self.assert_start_not_delivered(worker.ExitCode.REFUSED, "staff: review: not opened: admission unavailable")
+        self.assertEqual(self.fixture.fixture.world.launches, launches)
+
+    def test_review_unknown_process_keeps_the_worker_without_either_stage(self) -> None:
+        opened = self.fixture.opened("review", "review")
+        self.fixture.fixture.world.unknown[opened.pane] = "native reader unavailable"
+        before = self.fixture.fixture.staff_state()
+        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "native reader unavailable")
+        self.assertEqual(self.fixture.fixture.staff_state(), before)
+
+    def test_review_missing_terminal_keeps_the_worker_without_either_stage(self) -> None:
+        opened = self.fixture.opened("review", "review")
+        self.fixture.fixture.world.locations[opened.pane]["terminal_id"] = ""
+        before = self.fixture.fixture.staff_state()
+        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "terminal")
+        self.assertEqual(self.fixture.fixture.staff_state(), before)
+
+    def test_review_role_refusal_keeps_the_active_worker_and_types_neither_stage(self) -> None:
+        opened = self.fixture.opened("review", "impl")
+        _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="review", phase="8", role="impl",
+            worker_name="review", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
+        before = self.fixture.fixture.staff_state()
+        self.assert_start_not_delivered(worker.ExitCode.REFUSED, "role change blocked by active work: active dispatch has another role")
+        self.assertEqual(self.fixture.fixture.staff_state(), before)
+        self.assertIn(opened.pane, self.fixture.fixture.world.foreground)
+        self.assertEqual(self.fixture.fixture.world.stops, [])
+
+
 @final
 class AssignLauncherTests(AssignLauncherFixture):
+    def test_claude_worker_returns_through_start_and_then_follows_its_codex_thread(self) -> None:
+        self.commit_project()
+        Path(os.environ["NOTIFIER_SESSIONS_DIR"]).mkdir(parents=True, exist_ok=True)
+        owner = staff.native_id(os.environ["CODEX_THREAD_ID"])
+        row = fixture_worker("switch1", owner, backend=staff.ClaudeBackend())
+        source, evidence = transcript_fixture(row, staff.ClaudeBackend())
+        agents_log.append(row.current_session, "interactive", None, datetime.now(timezone.utc))
+        roster = self.session_dir / codex_mesh.ROSTER_FILE
+        _ = roster.write_text(json.dumps({row.name: {"staff_id": row.id, "status": "done"}}))
+        commands = self.session_dir.parent / "mesh-commands.jsonl"
+        releases = self.session_dir.parent / "source-releases.jsonl"
+        directory = self.session_dir.parent / "instrument-mesh"
+        directory.mkdir()
+        code = "\n".join((
+            "import json, os, sys",
+            "from pathlib import Path",
+            "def enter(frame, event, argument):",
+            "    if event != 'call' or frame.f_code.co_name != 'main' or not frame.f_code.co_filename.endswith('/agents/codex_mesh.py'): return",
+            "    sys.setprofile(None)",
+            "    mesh = sys.modules['__main__']",
+            f"    with Path({str(commands)!r}).open('a') as output: output.write(json.dumps(sys.argv[1:]) + chr(10))",
+            "    def start_server(session_dir, workers_home, *extra):",
+            f"        Path(session_dir, mesh.SERVER_FILE).write_text(json.dumps({{'pid': os.getpid(), 'port': {self.server.port}, 'codex_home': str(workers_home), 'auto_compact_tokens': mesh.AUTO_COMPACT_TOKENS, 'dev_shell_worktree': {str(self.project)!r}}}))",
+            f"        return {self.server.port}",
+            "    mesh._start_server = start_server",
+            "    mesh._start_watcher = lambda *args: mesh.ExistingServerWatcher()",
+            "    def observe_release(frame, event, result):",
+            "        if event == 'return' and frame.f_code.co_name == 'release_source' and frame.f_code.co_filename.endswith('/shutdown/stop_resume.py'):",
+            "            row = frame.f_locals['row']",
+            f"            with Path({str(releases)!r}).open('a') as output: output.write(json.dumps({{'session': row.current_session, 'result': type(result).__name__}}) + chr(10))",
+            "    sys.setprofile(observe_release)",
+            "sys.setprofile(enter)",
+        ))
+        _ = (directory / "sitecustomize.py").write_text(code)
+        with patch.dict(os.environ, {"PYTHONPATH": str(directory) + os.pathsep + str(ASSIGN.parents[2])}):
+            for live_server, named in ((False, True), (True, True), (True, False)):
+                with self.subTest(live_server=live_server, named=named):
+                    if not live_server:
+                        (self.session_dir / codex_mesh.SERVER_FILE).unlink(missing_ok=True)
+                    else:
+                        mesh_fixture.write_server_record(self.session_dir, self.server.port, self.home / ".codex",
+                                                         str(self.project))
+                    if not named:
+                        agents_log.append(row.current_session, "impl", None, datetime.now(timezone.utc))
+                    commands.unlink(missing_ok=True)
+                    self.server.requests.clear()
+                    image = self.session_dir.parent / "attached.png"
+                    image.touch()
+                    result = self.launch("implement", "--image", str(image), *(("--to", row.name) if named else ()))
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    called = [cast(list[str], json.loads(line))[0] for line in commands.read_text().splitlines()]
+                    self.assertIn("start", called)
+                    self.assertNotIn("can-follow", called)
+                    self.assertNotIn("follow", called)
+                    current = staff.by_id(row.id)
+                    assert current is not None
+                    self.assertNotEqual(current.current_session, row.current_session)
+                    self.assertEqual(current.to_json() | {"current_session": row.current_session}, row.to_json())
+                    self.assertEqual(len(self.methods("turn/start")), 1)
+                    extract = worker_admission.handoff_path(self.session_dir, row)
+                    self.assertIn(evidence[0][0], extract.read_text())
+                    opening = self.turn_inputs[-1]
+                    self.assertLess(opening.index(str(extract)), opening.index(self.prompt.read_text()))
+                    self.assertIn(str(source), opening)
+                    self.assertIn(str(image.resolve()), opening)
+                    stopped = [cast(dict[str, object], json.loads(line)) for line in releases.read_text().splitlines()]
+                    self.assertEqual(stopped[-1], {"session": row.current_session, "result": "SourceReleased"})
+                    commands.unlink()
+                    self.server.requests.clear()
+                    follow = self.launch("implement", "--to", row.name)
+                    self.assertEqual(follow.returncode, 0, follow.stdout + follow.stderr)
+                    called = [cast(list[str], json.loads(line))[0] for line in commands.read_text().splitlines()]
+                    self.assertIn("can-follow", called)
+                    self.assertIn("follow", called)
+                    self.assertNotIn("start", called)
+                    self.assertEqual(staff.by_id(row.id), current)
+                    self.assertEqual(len(self.methods("turn/start")), 1)
+                    _ = staff.update_current_session(current.current_session, staff.native_id(row.current_session))
+                    _ = roster.write_text(json.dumps({row.name: {"staff_id": row.id, "status": "done"}}))
+
+    def test_codex_retry_starts_with_the_saved_handoff_and_accepted_or_unrelated_work_follows(self) -> None:
+        self.commit_project()
+        _ = self.successful("implement", "--new-worker", "retry1")
+        row = worker_admission.member(self.session_dir, "retry1", staff.local_snapshot())
+        assert row is not None
+        roster = self.session_dir / codex_mesh.ROSTER_FILE
+        original = read_object(roster)
+        _ = self.prompt.write_text("Continue the interrupted switch.\n")
+        request = worker_admission.assignment_id(self.prompt)
+        extract = worker_admission.handoff_path(self.session_dir, row)
+        _ = extract.write_text(f"{worker_admission.HANDOFF_SOURCE_PREFIX}{self.session_dir / 'source.jsonl'}\nKeep the source work.\n")
+        commands = self.session_dir.parent / "retry-commands.jsonl"
+        directory = self.session_dir.parent / "retry-observer"
+        directory.mkdir()
+        _ = (directory / "sitecustomize.py").write_text("\n".join((
+            "import json, sys",
+            "from pathlib import Path",
+            "def observe(frame, event, argument):",
+            "    if event == 'call' and frame.f_code.co_name == 'main' and frame.f_code.co_filename.endswith('/agents/codex_mesh.py'):",
+            f"        with Path({str(commands)!r}).open('a') as output: output.write(json.dumps(sys.argv[1:]) + chr(10))",
+            "        sys.setprofile(None)",
+            "sys.setprofile(observe)",
+        )))
+        cases = (("prepared", request, True), ("sending", request, True), ("", request, True),
+                 ("accepted", request, False), ("sending", "another-prompt", False))
+        with patch.dict(os.environ, {"PYTHONPATH": str(directory) + os.pathsep + str(ASSIGN.parents[2])}):
+            for state, identity, pending in cases:
+                with self.subTest(state=state, identity=identity):
+                    entry = cast(dict[str, object], original[row.name]).copy()
+                    entry.update(assignment_id=identity, dispatch_state=state)
+                    _ = roster.write_text(json.dumps({row.name: entry}))
+                    commands.unlink(missing_ok=True)
+                    self.server.requests.clear()
+                    result = self.launch("implement", "--to", row.name)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    called = [cast(list[str], json.loads(line))[0] for line in commands.read_text().splitlines()]
+                    self.assertIn("start" if pending else "follow", called)
+                    self.assertNotIn("can-follow" if pending else "start", called)
+                    if pending:
+                        self.assertNotIn("follow", called)
+                        opening = self.turn_inputs[-1]
+                        self.assertLess(opening.index(str(extract)), opening.index(self.prompt.read_text()))
+                    self.assertEqual(self.methods("thread/start"), [])
+                    self.assertEqual(staff.by_id(row.id), row)
+
+    def test_assignment_shares_one_generation_through_allocation_and_refreshes_the_next_launch(self) -> None:
+        probe = RegistryReadProbe(self.session_dir.parent, self.registry)
+        _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-kept-sol:high"},
+                                           "codex.agents": {"gpt-kept-sol": "high", "gpt-other-sol": "high,max"},
+                                           "direct.options": {"codex_service_tier": "fast"}})
+        original = self.server.respond
+        edited = False
+
+        @self.hang_guard.callback
+        def change_after_creation(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal edited
+            if request.get("method") == "thread/start" and not edited:
+                edited = True
+                _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-other-sol:max"},
+                                                   "codex.agents": {"gpt-other-sol": "high,max"},
+                                                   "direct.options": {"codex_service_tier": "flex"}})
+            return original(request)
+
+        self.server.respond = change_after_creation
+        with patch.dict(os.environ, probe.environment(os.environ)):
+            for expected in (("gpt-kept-sol", "high", "fast"), ("gpt-other-sol", "max", "flex")):
+                with self.subTest(expected=expected):
+                    probe.clear()
+                    self.server.requests.clear()
+                    _ = self.successful(execution=LauncherScript(ASSIGN))
+                    turns = self.methods("turn/start")
+                    self.assertEqual(len(turns), 1)
+                    params = cast(dict[str, object], turns[0]["params"])
+                    self.assertEqual((params.get("model"), params.get("effort"), params.get("serviceTier")), expected)
+                    self.assertEqual(len(probe.reads()), 1, probe.reads())
+        self.assertTrue(edited)
+
+    def test_herdr_assignment_retains_unknown_workers_without_a_mesh_backend(self) -> None:
+        _ = (self.session_dir / "worker_transport").write_text("herdr\n")
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        prompt = self.prompt.read_bytes()
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            result = self.launch(execution=LauncherScript(ASSIGN))
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        self.assertEqual(self.prompt.read_bytes(), prompt)
+        self.assertEqual((self.session_dir / "phases/7/impl_status").read_text(), "error\n")
+
+    def finding_command(self, verb: str, *options: str, phase: str = "7") -> str:
+        result = invoke_findings([verb, "--session-dir", str(self.session_dir), "--phase", phase, *options],
+                                 os.environ.copy(), self.project)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def repair_state(self, phase: str = "7") -> RepairState:
+        return cast(RepairState, json.loads(self.finding_command("status", phase=phase)))
+
+    def start_repair(self, phase: str = "7") -> None:
+        _ = self.finding_command("open", "--severity", "blocker", "--title", "Repair the worker",
+                                 "--caught-by", "main", phase=phase)
+        _ = self.finding_command("dispatch", "--covers", "F001", "--accepted-checks",
+                                 "none: the fixture has no accepted behavior", phase=phase)
+
+    def test_a_clean_fix_resolves_only_its_named_phase(self) -> None:
+        self.start_repair()
+        self.record("start-phase", "--phase-id", "8", "--phase-title", "Other repairs")
+        self.start_repair("8")
+        other = self.repair_state("8")
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            _ = self.successful("fix")
+        repaired = self.repair_state()
+        self.assertEqual(repaired["rounds"][-1]["outcome"], "landed")
+        self.assertEqual(repaired["findings"][0]["state"], "fixed_pending_review")
+        self.assertEqual(self.repair_state("8"), other)
+        self.assertEqual(self.turn_starts, 1)
+
+    def test_a_failed_fix_abandons_the_round_without_refunding_the_attempt(self) -> None:
+        self.start_repair()
+        self.outcomes = ["failed"]
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            result = self.launch("fix")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        repaired = self.repair_state()
+        self.assertEqual(repaired["rounds"][-1]["outcome"], "abandoned")
+        self.assertTrue(repaired["rounds"][-1]["edits_landed"])
+        self.assertEqual(repaired["findings"][0]["state"], "open")
+        self.assertEqual(repaired["findings"][0]["fix_attempts"], 1)
+
+    def test_a_fix_with_round_resolution_disabled_keeps_the_round_in_flight(self) -> None:
+        self.start_repair()
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "0"}):
+            _ = self.successful("fix")
+        self.assertEqual(self.repair_state()["in_flight"], ["F001"])
+
+    def test_an_implementation_dispatch_does_not_resolve_a_repair_round(self) -> None:
+        self.start_repair()
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            _ = self.successful()
+        self.assertEqual(self.repair_state()["in_flight"], ["F001"])
+
+    def run_resolution_commands(self, stderr: str) -> subprocess.CompletedProcess[str]:
+        commands = stderr.split("assign.sh: repair resolution failed; run these commands:\n", 1)[1]
+        environment = os.environ.copy()
+        _ = environment.pop("PYTHONPATH", None)
+        return subprocess.run(["bash", "-e", "-c", commands], env=environment, cwd=self.session_dir,
+                              capture_output=True, text=True)
+
+    def complete_repair_after_ledger_failure(self, worker_failed: bool) -> None:
+        self.start_repair()
+        if worker_failed:
+            self.outcomes = ["failed"]
+        ledger = self.session_dir / "findings_state.json"
+        saved = self.session_dir / "saved-findings.json"
+        self.instrument_launcher("\n".join((
+            "from pathlib import Path",
+            "from scripts.direct import assign",
+            "original_call = assign.call",
+            "def call(command, env, **options):",
+            f"    ledger, saved = Path({str(ledger)!r}), Path({str(saved)!r})",
+            "    if any(verb in command for verb in ('landed', 'abandon')) and not saved.exists():",
+            "        ledger.rename(saved)",
+            "        ledger.mkdir()",
+            "    return original_call(command, env, **options)",
+            "assign.call = call",
+        )))
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            result = self.launch("fix")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("repair resolution failed", result.stderr)
+        name = next(iter(self.assignment_records()))
+        status = self.session_dir / f"phases/7/{name}_status"
+        self.assertEqual(status.read_text(), "error\n")
+        ended = [event for event in self.events() if event.get("event_type") == "pass_finished"]
+        self.assertEqual([event["status"] for event in ended], ["error"])
+        ledger.rmdir()
+        _ = saved.rename(ledger)
+        repaired = self.run_resolution_commands(result.stderr)
+        self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+        self.assertEqual(self.turn_starts, 1)
+        self.assertEqual(self.repair_state()["rounds"][-1]["outcome"], "abandoned" if worker_failed else "landed")
+        self.assertEqual(status.read_text(), "error\n")
+
+    def test_manual_resolution_lands_a_clean_fix_without_another_worker_turn(self) -> None:
+        self.complete_repair_after_ledger_failure(False)
+
+    def test_manual_resolution_abandons_a_failed_fix_without_another_worker_turn(self) -> None:
+        self.complete_repair_after_ledger_failure(True)
+
+    def test_a_fix_without_an_open_pass_resolves_without_finishing_a_pass(self) -> None:
+        self.start_repair()
+        directory = self.session_dir / "phases/7"
+        directory.mkdir(parents=True, exist_ok=True)
+        summary, status, reply = (directory / name for name in ("fix-summary.txt", "fix-status", "fix-reply.txt"))
+        _ = summary.write_text("The worker failed before its pass opened.\n")
+        args = assign.Arguments()
+        args.role = "fix"
+        dispatch = assign.Dispatch(args, self.session_dir, self.project, self.prompt, "7", "fix", "unstarted-fix",
+                                   "codex", "gpt-kept-sol", "high", "default",
+                                   {**os.environ, "UNIT_RESOLVES_ROUND": "1"}, {})
+        finished: list[list[str]] = []
+        original_call = assign.call
+
+        def observe(command: list[str], env: dict[str, str], *, capture: bool = False,
+                    check: bool = True) -> subprocess.CompletedProcess[str]:
+            if any("finish-pass" in arg for arg in command):
+                finished.append(command)
+            return original_call(command, env, capture=capture, check=check)
+
+        with patch.object(assign, "call", observe):
+            result = assign.settle_dispatch(dispatch, 2, False, "unstarted-fix", status, summary, reply)
+        self.assertEqual(result, 2)
+        self.assertEqual(self.repair_state()["rounds"][-1]["outcome"], "abandoned")
+        self.assertEqual(finished, [])
+        self.assertEqual(status.read_text(), "error\n")
+
+    def test_each_pass_records_the_staff_id_from_the_worker_roster(self) -> None:
+        _ = self.successful()
+        name, worker = next(iter(self.assignment_records().items()))
+        passes = [event for event in self.events() if event.get("event_type") == "pass_started"]
+        self.assertEqual([event["worker_id"] for event in passes], [worker["staff_id"]])
+        self.assertEqual([event["worker_name"] for event in passes], [name])
+        command = cast(list[str], passes[0]["launcher_command"])
+        self.assertEqual(command[:4], ["bash", str(ASSIGN), "--role", "implement"])
+        self.assertEqual(command[command.index("--session-dir") + 1], str(self.session_dir))
+
     def test_only_a_live_claude_or_codex_ancestor_permits_assignment(self) -> None:
         for family in ("claude", "codex"):
             with self.subTest(family=family):

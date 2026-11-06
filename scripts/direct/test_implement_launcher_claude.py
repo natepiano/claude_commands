@@ -80,7 +80,7 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         transcript = self.claude_worker(run)
         before = (run / "progress_history_state.json").read_bytes(), transcript.read_bytes()
         _ = (self.root / "staff.json").write_text("{invalid staff")
-        result = self.claude_follow(run, transcript, "queued")
+        result = self.worker_launch(run, to="fixture-impl", behavior="queued")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertRegex(result.stderr, r"^staff: fixture-impl: not opened: [^\n]+\n$")
         self.assertEqual(((run / "progress_history_state.json").read_bytes(), transcript.read_bytes()), before)

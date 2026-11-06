@@ -96,7 +96,7 @@ def remote_control_who(session: Mapping[str, object]) -> str:
         print(f"{identity}: staff anomaly: {error}", file=sys.stderr)
         row = None
     if row is not None:
-        return row.name.removesuffix("-unit") + " " + row.kind
+        return row.name + " " + row.kind
     name = session.get("name") or identity
     return name if isinstance(name, str) else ""
 

@@ -121,7 +121,7 @@ Loop/verbose only:
    or `held` at the unit's HEAD and no tracked diff, make no commit. Capture
    `git rev-parse HEAD` once and require
    `git merge-base --is-ancestor <captured HEAD> refs/heads/<style merge branch>`.
-   The standing-unit fast-forward exception in `docs/production_format.md`
+   The standing fast-forward exception in `docs/production_format.md`
    item 5 keeps HEAD on the style merge branch's history after a phase-start sync.
    On failure, report one line to the style showrunner and leave the ticket
    assigned until it answers. On success, from `Active`, replace the durable

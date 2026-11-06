@@ -140,18 +140,30 @@ the director neither prepares style inputs nor pastes a style assignment.
 </TagReferenceContract>
 
 <LongLivedWorkers>
-Unit workers persist across phases and plans. Dispatch with `assign.sh --role
-implement|test|fix|review --prompt <path> --cwd <worktree>`. The unit owns its
-read-only `review` worker; a concurrent review uses `review2`.
+Read the run's transport through `unit_runs.worker_transport(run)` once.
+Use the pinned transport for <WorkerRuns/>, <WorkerLaunchFailure/>, <FixDispatch/>, and <PhaseCleanup/>.
+The default remains `mesh`. A mesh-pinned run finishes on the mesh.
 
-Keep each worker's thread. Pause, move and end it with the unit ledger as
-`docs/as-built/long-lived-workers.md` describes. Never open a fresh reviewer
-while its thread exists. Every review prompt names `config/review/code.md`
-under <ReviewPromptContract/>. Other prompts carry the Three Gods and Type
-Design Contract under <WritePromptContract/>.
+For `herdr`, dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
+The launcher calls `worker.py assign` with the explicit role.
+Use `worker.py list` to inspect workers and `worker.py restore` to resume retained workers.
+Use `worker.py end <name>` only for permanent removal.
+The worker command selects idle workers and reuses stopped workers.
+Keep every busy or unknown worker unchanged.
+The transcript records prompt submission and the matching `DONE <dispatch id>` reply.
+Only exit 0 completes a pass.
+Exit 3 means no DONE reply. Exit 4 means blocked. Exit 5 means stalled.
+Exit 6 means busy. Exit 7 means retained. Exit 8 means uncertain.
+Inspect the named pane before another dispatch after an incomplete result.
+Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
-The launcher compacts a worker above `UNIT_COMPACT_ABOVE_TOKENS`, then resumes
-it. A failed compaction leaves the thread available for its own compaction.
+For `mesh`, keep each worker's thread through the existing unit ledger.
+Use `docs/as-built/long-lived-workers.md` for pause, move, end, and compaction.
+A failed compaction keeps the thread available for its own compaction.
+Never create another reviewer while its retained thread exists.
+
+Every review prompt names `config/review/code.md` under <ReviewPromptContract/>.
+Other prompts carry the Three Gods and Type Design Contract under <WritePromptContract/>.
 </LongLivedWorkers>
 
 <CoreContract>
@@ -184,7 +196,7 @@ it. A failed compaction leaves the thread available for its own compaction.
 
 <ProductionUnit>
 Your staff row identifies your unit and its parent showrunner.
-The parent row identifies your production and its document.
+The parent row's `name` is your production name. Its `doc.path` gives the document.
 Read `~/.claude/docs/production_format.md` → <ProductionUnit/> at <PrepareSession/> and after every compaction.
 Apply it throughout the run when your staff row has a parent showrunner. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
@@ -227,7 +239,7 @@ The closed list:
 - **blocked** — a hard stop this command defines: a structural check that blocks
   checkpoint, a refused tool call, a launch failure that survived
   <WorkerLaunchFailure/>'s retry. With no showrunner, alert the user to an auto-mode
-  refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (`send.py --help`),
+  refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (read the send rule in `send.py --help`),
   and to a wait for the user to type a go with `send.py --to user --text-id session.needs_go`.
   An update to an earlier user push on the same subject reuses that push's `--key`,
   so silence keeps only the newest. A `--need blocked` push with a live earlier one
@@ -306,6 +318,9 @@ Applies to every implementation, test, fix, and review launcher.
 </DispatchContract>
 
 <WorkerRuns>
+For `herdr`, keep the pane and native session during detached work.
+Use the detached-run result without sending another dispatch prompt.
+The following mesh attachment and delivery rules apply only to `mesh`.
 A Codex worker runs only commands that finish within one call and never makes
 an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
 started with `mesh_runs.py start`, detaches and pushes its own result to the
@@ -342,6 +357,10 @@ only to complete a report.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
+For `herdr`, inspect `worker.py list` and the named pane.
+Keep incomplete, unpublished, busy, and unknown workers unchanged.
+Resume the same pass through its saved launcher command.
+The following mesh recovery rules apply only to `mesh`.
 A dispatch that dies in seconds never reached the provider, and a provider
 message it prints is a message some earlier call received. Workers launched
 together that fail within seconds of each other carrying **byte-identical text,
@@ -571,6 +590,17 @@ its own ledger, and `--phase` names which one: with two phases open, a call
 naming none is refused. Every launch names its phase (<PassOwnership/>), so the
 launcher's own `landed` and `abandon` reach that phase's ledger.
 
+When a daily simplify run reports items, its director performs these steps:
+
+1. Add a phase `simplify-<date>` to the plan from the report.
+2. Record every item under that phase with `--lens simplify`; discard none.
+3. Send in-scope items and items that remove a copy to Codex fix workers as one repair phase.
+   Use the normal checkpoint.
+4. Open other items with `--held-for-decision` and include the proposed change, files, and reason.
+
+A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. Settle every other held item under DecisionEconomy and state the call in one line (user, 2026-11-02).
+Record the user's answer with `decision --user-words`.
+
 | Command | Purpose |
 | --- | --- |
 | `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux\|rerun\|simplify>[,…]] [--detail <d>] [--held-for-decision]` | Create an id and record each lens. |
@@ -600,6 +630,9 @@ never becomes one: **report it in one line** — the pattern in ordinary words,
 beside the repair being dispatched — then continue. Never stop, ask permission,
 re-open a decision the user has already made about this run, or edit
 `~/.claude/config/direct.conf` mid-run to change what gets said.
+
+Count one repair round per ledger batch with a started fix pass. Relaunches of that batch add no round.
+A refunded batch adds no round unless it later lands.
 
 **Dispatching a repair fixes nothing.** `dispatch` leaves its batch
 `repair_in_flight`, and `gate` and `verdict` both refuse a finding still in
@@ -1203,23 +1236,25 @@ For the 30-phase P5 trial on all repairs, carry those checks in
 evidence. Dispatch refuses an empty value; its event records the list. A value
 without `none:` records P5 exposure (the user, 2026-10-28).
 
-Dispatch every open worker with `assign.sh --role implement --to <full-worker-name>` before the
+For `herdr`, dispatch repairs through `assign.sh --role fix --prompt <path> --cwd <worktree> --fix-cause "<defect>"`.
+The worker command selects the worker and keeps its native session.
+For `mesh`, dispatch every open worker with `assign.sh --role implement --to <full-worker-name>` before the
 usual positional arguments; the prompt file is the follow-up message. Omit
 `--to` only for a new worker allowed by <LongLivedWorkers/>. Messages without the
 launcher are for questions only.
 
-Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
+Use `history.py rounds` for repair counts. Relaunches of one ledger batch count as one repair round. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
 
 Work Orders state the acceptance observation, unit or comparison, and named real-path test or live check for changed behavior. Reuse established targets. Resolve choices through the showrunner before dependent work; do not invent a number to fill the form. A later changed goal updates the order explicitly. (the user, 2026-10-28)
 
-Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
+Use `history.py rounds` for repair counts. Relaunches of one ledger batch count as one repair round. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
 
 For retained work after two completed failed fixes, record the failure, approaches tried, cause diagnosis and next distinguishing test before another approach. Interrupted workers and account moves remain continuations, not completed rejected patches. (the user, 2026-10-28)
 
 At each fix limit, try something different. When a phase reaches repair round 4 with a finding still open, or a kept finding has failed two fixes, the director writes a short note: the finding, the tries so far and why each failed. It runs `/astra_review` on the note. Astra's approach goes into the next try, or into the follow-up Work Order when the finding moves out (the user, 2026-10-28).
 
 Before forming the batch, use the gate's `repair_round`, which counts
-`history.py rounds` repair intervals, for the round-4 checks; keep `round` for
+`history.py rounds` repair groups, for the round-4 checks; keep `round` for
 `${FIX_ROUND}` and ledger dispatches. P2 is a 30-exposed-phase trial from
 round 4; P3 is a 30-phase trial. For every `astra_review_due` id, write the note
 and run `/astra_review --run-directory "${SESSION_DIR}" --phase <id> <note>`.
@@ -1305,21 +1340,14 @@ reporting anything about the round.
 </FixDispatch>
 
 <Synthesize>
-1. Merge the `adversary`, `contract`, `simplify`, armed `rerun`, UX, and main review findings.
+1. Merge the `adversary`, `contract`, armed `rerun`, UX, and main review findings.
    Combine duplicate findings and record every contributing lens with `--lens`.
-   Record each simplify item; discard none.
-   Open behavior-preserving items within the phase as `minor --lens simplify`.
-   Add `--held-for-decision` for each behavior change or change outside the phase.
-   Open a change that removes a copy as `minor --lens simplify`, not held, also outside the phase.
-   Include the proposed change, files, and reason in its detail.
-   A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. Settle every other held item under DecisionEconomy and state the call in one line (user, 2026-11-02).
-   Record the user's answer with `decision --user-words`.
    Explain each refuted finding from another lens.
+   Handle daily simplify reports under <FindingsLedger/>.
    Report reviewer disagreements under <DelegationResultFormat/>.
 2. Present <DelegationResultFormat/>. If the user is confused, apply
    <ExplainOnDemand/> before any choice.
-3. Codex fix workers apply every simplify repair.
-   For other lenses, if every remaining issue is trivial — doc-only, an agreed rename, or a
+3. If every remaining issue is trivial — doc-only, an agreed rename, or a
    small mechanical change whose one correct edit is evident from the finding
    itself, with no design judgment and no reviewer disputing the reading —
    the unit director applies them all directly,
@@ -1507,6 +1535,9 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 </ShrinkCommit>
 
 <PhaseCleanup>
+For `herdr`, retain worker rows and panes for the next phase.
+Use `worker.py end <name>` only when permanent removal is required.
+The following Claude and mesh cleanup rules apply only to `mesh`.
 In `single`, run both halves under <ExecutionSteps/> step 9.
 At <PhaseEnd/>'s worker cleanup point, run
 `python3 ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.

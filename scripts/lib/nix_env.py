@@ -259,6 +259,10 @@ def main(arguments: list[str]) -> int:
         print(json.dumps(outcome.env))
         return 0
     if len(arguments) >= 2 and arguments[0] == "exec":
+        if not __package__:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from scripts.lib.models_registry import agent_environment
+
         program = arguments[1]
         if not Path(program).is_absolute():
             print("nix_env: exec requires an absolute program path", file=sys.stderr)
@@ -272,7 +276,7 @@ def main(arguments: list[str]) -> int:
         else:
             _ = outcome.env.pop("NIX_ENV_ENVRC", None)
         try:
-            os.execvpe(program, arguments[1:], outcome.env)
+            os.execvpe(program, arguments[1:], agent_environment(outcome.env))
         except OSError as error:
             print("nix_env: " + last_line(str(error), type(error).__name__), file=sys.stderr)
             return 1

@@ -21,9 +21,11 @@ A task, and what ends it:
   * `gate:<id>`: the gate's caller, with `scratch.py end`, when the gate ends;
   * `landed:<unit>/<branch>`: the branch is in its recorded land target and all work is saved;
   * `row:<showrunner>-C<n>`: change_review.py verdict;
-  * `until:<YYYY-MM-DDTHHMMZ>`: the hourly tmp sweep, once the time passes. `--until` takes
-    `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` in the user's zone. With no task, a folder gets
-    `until:` for scratch.conf default_life_seconds from now.
+  * `until:<YYYY-MM-DDTHHMMZ>/<id>`: the hourly temporary sweep ends the task when its time passes.
+    `--until` takes `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` in the user's zone.
+    Each call makes a random id with scratch.conf suffix_length characters.
+    With no task, a folder gets a separate deadline task for scratch.conf default_life_seconds from now.
+    Old deadline tasks without an id remain valid.
 
 A folder lives in ROOT as `<task>-<word>-<suffix>`; scratch.conf suffix_length sets the suffix length.
 `--visible` (rows only) puts it in VISIBLE_ROOT
@@ -479,8 +481,21 @@ def visible_root(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = Use
     return Path(os.environ.get(VISIBLE_ROOT_ENV) or scratch_settings.text("visible_root")).expanduser()
 
 
-def until_task(moment: float) -> str:
-    return "until:" + datetime.fromtimestamp(moment, timezone.utc).strftime(UNTIL_FORMAT)
+def random_suffix(scratch_settings: conf.ConfigRead) -> str:
+    return "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(scratch_settings.whole("suffix_length")))
+
+
+def until_task(moment: float, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> str:
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    stamp = datetime.fromtimestamp(moment, timezone.utc).strftime(UNTIL_FORMAT)
+    return f"until:{stamp}/{random_suffix(scratch_settings)}"
+
+
+def until_stamp(name: str) -> str:
+    return name.partition("/")[0]
 
 
 def parsed_until(text: str) -> str:
@@ -502,7 +517,7 @@ def task_end(task: str, now: float | None = None) -> Live | Ended | Unknown:
     if match["kind"] != "until":
         return Live(f"task {task} has not ended")
     try:
-        at = datetime.strptime(match["name"], UNTIL_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+        at = datetime.strptime(until_stamp(match["name"]), UNTIL_FORMAT).replace(tzinfo=timezone.utc).timestamp()
     except ValueError:
         return Unknown(f"invalid task deadline: {task}")
     return Ended(f"deadline {task} passed", at) if at <= (time.time() if now is None else now) else Live(f"task {task} has not ended")
@@ -520,7 +535,7 @@ def checked_task(task: str, visible: bool) -> re.Match[str]:
     if match["kind"] == "row" and not ROW_NAME.fullmatch(match["name"]):
         raise ScratchError(f"{task!r}: a row task is row:<showrunner>-C<n>")
     if match["kind"] == "until" and isinstance(task_end(task), Unknown):
-        raise ScratchError(f"{task!r}: an until task is until:YYYY-MM-DDTHHMMZ; use --until")
+        raise ScratchError(f"{task!r}: an until task is until:YYYY-MM-DDTHHMMZ/<id>; use --until")
     if visible and match["kind"] != "row":
         raise ScratchError("--visible is for a change review row's repro only")
     return match
@@ -533,7 +548,7 @@ def registered_plan(unit: str) -> Path:
     from scripts.production.production_doc import Refusal
 
     try:
-        parent = unit_lookup.unit_parent(unit, record=staff.snapshot(), sources=unit_lookup.member_sources())
+        parent = unit_lookup.unit_parent(unit, record=staff.snapshot())
         value = cast(object, json.loads(phase_table.show_production(Path(parent.doc))))
     except (OSError, UnicodeError, ValueError, Refusal) as error:
         raise ScratchError(f"{unit}: cannot resolve registered plan: {error}") from error
@@ -586,8 +601,9 @@ def target(task: str, word: str, visible: bool, *,
         if os.path.lexists(path):
             raise ScratchError(f"{path} exists")
         return path
-    suffix = "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(scratch_settings.whole("suffix_length")))
-    slug = f"{match['kind']}-{match['name'].replace('/', '-')}"
+    suffix = random_suffix(scratch_settings)
+    name = until_stamp(match["name"]) if match["kind"] == "until" else match["name"]
+    slug = f"{match['kind']}-{name.replace('/', '-')}"
     return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=scratch_settings.whole("suffix_length"),
                                             purpose="-".join(part for part in (slug, word) if part), suffix=suffix))
 
@@ -607,7 +623,7 @@ def task_or_default(task: str, now: float, *,
 ) -> str:
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    return task or until_task(now + scratch_settings.whole("default_life_seconds"))
+    return task or until_task(now + scratch_settings.whole("default_life_seconds"), scratch_settings=scratch_settings)
 
 
 def write_record(path: Path, task: str, now: float, *,

@@ -1,6 +1,5 @@
 # natedev shutdown-unit phases
 
-> **Production:** `docs/plans/natedev-production.md`
 > **Unit:** shutdown-unit · branch `natedev-shutdown` · as-built `docs/as-built/shutdown-and-restart.md`
 
 Earlier phases of this unit are recorded in the as-built and in the branch history. This plan holds Phase 4 and Phase 5, the follow-up Phase 4 routed.

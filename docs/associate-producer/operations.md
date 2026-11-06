@@ -7,9 +7,9 @@ Keep only the latest state in both files.
 ## Records
 
 Read `~/.local/state/staff/staff.json` for showrunner names, parents, and production documents.
-Query each showrunner with `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py questions-table --production <doc>`.
+Query each showrunner with `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py questions-table --production <showrunner name>`.
 Use the production document from its staff row. Count the returned question rows, including deferred questions.
-The old `outstanding/<slug>.json` files now hold reminders. Never use them to count questions.
+The old `outstanding/<showrunner name>.json` files now hold reminders. Never use them to count questions.
 Save the table, count, source and read time in `open-questions.json`.
 Report a failed query as unavailable, never as zero.
 Do not restart the old question-message rotation.
@@ -17,7 +17,7 @@ Do not restart the old question-message rotation.
 For relevant production queues, use the existing next skill and command:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/production/next_item.py show --production <doc> --all-below
+~/.claude/scripts/lib/py ~/.claude/scripts/production/next_item.py show --production <showrunner name> --all-below
 ```
 
 Resolve root documents from staff. Compare results with the tracking list; they do not replace its priority.

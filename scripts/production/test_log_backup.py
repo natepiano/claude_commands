@@ -110,17 +110,17 @@ class LogBackupTests(unittest.TestCase):
 
     def test_the_command_copies_into_the_production_s_own_directory(self) -> None:
         _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        result = self.run_script([sys.executable, str(SCRIPT), str(self.doc)])
+        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
         self.assertEqual(result.returncode, 0, result.stderr)
         names = self.names()
         self.assertEqual(len(names), 1)
         self.assertRegex(names[0], r"^log-\d{8}T\d{4}\.md$")
         self.assertEqual(result.stdout, f"copied to {self.backups / names[0]}\n")
-        self.assertEqual(self.run_script([sys.executable, str(SCRIPT), str(self.doc)]).stdout, "nothing new to copy\n")
+        self.assertEqual(self.run_script([sys.executable, str(SCRIPT), "backup-owner"]).stdout, "nothing new to copy\n")
 
     def test_the_command_refuses_a_doc_it_cannot_read(self) -> None:
         self.write_doc("running", log_field=False)
-        result = self.run_script([sys.executable, str(SCRIPT), str(self.doc)])
+        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
         self.assertEqual(result.returncode, 1)
         self.assertIn("log_backup: production doc lacks Log", result.stderr)
         self.assertEqual(self.run_script([sys.executable, str(SCRIPT)]).returncode, 2)
@@ -134,6 +134,11 @@ class LogBackupTests(unittest.TestCase):
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(len(self.names()), copied)
+
+    def test_an_unknown_staff_id_keeps_the_check_unsuccessful(self) -> None:
+        result = self.run_script(["zsh", str(CHECK), "00000000-0000-4000-8000-000000000000"])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.names(), [])
 
     def test_a_failed_copy_never_changes_the_check_s_answer(self) -> None:
         self.write_doc("running", log_field=False)

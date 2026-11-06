@@ -22,20 +22,20 @@ def setUpModule() -> None:
 
 @final
 class AddUnitRestoreTests(AddUnitTestCase):
-    def test_a_name_ending_in_unit_launches_as_the_name_without_it(self) -> None:
+    def test_unit_names_keep_their_exact_staff_spelling(self) -> None:
         def request(name: str) -> tuple[str, str, Path, str]:
             launched = add_unit.launch_request(argparse.Namespace(
-                production=str(self.doc), name=name, plan="docs/plans/given.md", brief=None,
+                production=self.production_name, name=name, plan="docs/plans/given.md", brief=None,
                 standby=False, permanent=False, port=None, timeout=90.0, check=False,
                 resume=None, cwd=None, restart_note=None, session_name=None, host_session=None, probe=False,
             ))
             return launched.unit, launched.branch, launched.worktree, launched.requested_name
 
         expected = request("feature-log")
-        self.assertEqual(expected[0], "feature-log-unit")
-        self.assertEqual(request("feature-log-unit"), expected)
-        self.assertEqual(request("feature_log_unit"), request("feature_log"))
-        self.assertEqual(request("unit")[0], "unit-unit")
+        self.assertEqual(expected[0], "feature-log")
+        self.assertEqual(request("feature-log-unit")[0], "feature-log-unit")
+        self.assertEqual(request("feature_log_unit")[0], "feature_log_unit")
+        self.assertEqual(request("unit")[0], "unit")
 
 
 

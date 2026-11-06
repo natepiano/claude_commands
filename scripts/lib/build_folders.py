@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import os
 import secrets
 import shutil
+import signal
 import stat
 from pathlib import Path
 import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import tempfile
+import threading
 from typing import TYPE_CHECKING, Literal, cast, override
+
+from scripts.lib.boot_identity import boot_identity
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
@@ -21,6 +26,31 @@ if TYPE_CHECKING:
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
+_CANCELLATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+@contextmanager
+def defer_signals() -> Generator[None]:
+    """Record cancellation and replay its first signal after handlers are restored."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending: list[int] = []
+
+    def record(number: int, frame: object) -> None:
+        del frame
+        pending.append(number)
+
+    previous = {number: signal.signal(number, record) for number in _CANCELLATION_SIGNALS}
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            _ = signal.signal(number, handler)
+        if pending:
+            signal.raise_signal(pending[0])
+
+
 class FolderPrefixes(Mapping[str, str]):
     """Read legacy caller prefixes from the current configuration."""
 
@@ -82,6 +112,13 @@ BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder
 def inherited_temporary_parent() -> Path:
     """Read the caller's current temporary parent."""
     return Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+
+
+def tmpfs_temporary_parent() -> Path:
+    """Keep nested work under the caller's tmpfs folder."""
+    root = Path(_settings().text("roots.gate"))
+    inherited = inherited_temporary_parent().resolve()
+    return inherited if inherited.is_relative_to(root) else root
 
 
 def _parent(parent: BuildFolderParent) -> Path:
@@ -221,36 +258,37 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec) -> Path:
 
 
 def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
-    def repair(function: object, name: str, error: BaseException) -> None:
-        if not isinstance(error, PermissionError):
-            raise error
-        os.chmod(Path(name).parent, 0o700, dir_fd=directory)
-        if not stat.S_ISLNK(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
-            os.chmod(name, 0o700, dir_fd=directory, follow_symlinks=False)
-        if function is os.open:
-            shutil.rmtree(name, dir_fd=directory, onexc=repair)
-        else:
-            _ = cast(Callable[..., object], function)(name, dir_fd=directory)
+    with defer_signals():
+        def repair(function: object, name: str, error: BaseException) -> None:
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(Path(name).parent, 0o700, dir_fd=directory)
+            if not stat.S_ISLNK(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
+                os.chmod(name, 0o700, dir_fd=directory, follow_symlinks=False)
+            if function is os.open:
+                shutil.rmtree(name, dir_fd=directory, onexc=repair)
+            else:
+                _ = cast(Callable[..., object], function)(name, dir_fd=directory)
 
-    try:
-        current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    if os.path.samestat(current, allocated):
-        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+        try:
+            current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if os.path.samestat(current, allocated):
+            shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
 
 
 @contextmanager
 def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec) -> Generator[Path]:
     """Remove private work after the caller ends, including interrupted callers."""
-    path = create_build_folder(request)
-    root = request.parent if isinstance(request, BuildFolderSpec) else _parent(request.parent)
-    with _folder_parent(path, root, create=False) as directory:
-        allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-        try:
-            yield path
-        finally:
-            _remove_folder(path, directory, allocated)
+    with ExitStack() as cleanup:
+        with defer_signals():
+            path = create_build_folder(request)
+            root = request.parent if isinstance(request, BuildFolderSpec) else _parent(request.parent)
+            directory = cleanup.enter_context(_folder_parent(path, root, create=False))
+            allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            _ = cleanup.callback(_remove_folder, path, directory, allocated)
+        yield path
 
 
 OWNER_MARKER = ".build-folder-owner.json"
@@ -260,7 +298,6 @@ def run_build(owner: str, name: str, command: Sequence[str]) -> int:
     """Keep the folder until the command and its descendants stop."""
     import ctypes
     import json
-    import signal
     import subprocess
     from scripts.lib.process_group import send_process_group
 
@@ -285,14 +322,14 @@ def run_build(owner: str, name: str, command: Sequence[str]) -> int:
         del frame
         raise CommandSignal(number)
 
-    watched = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    watched = _CANCELLATION_SIGNALS
     previous = {number: signal.signal(number, interrupted) for number in watched}
     try:
         with temporary_build_folder(spec) as path:
             pid = os.getpid()
             start_time = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
             marker = {"owner": owner, "pid": pid, "start_time": start_time,
-                      "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+                      "boot_id": boot_identity()}
             _ = (path / OWNER_MARKER).write_text(json.dumps(marker) + "\n")
             blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
 

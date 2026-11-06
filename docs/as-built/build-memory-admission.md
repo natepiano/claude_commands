@@ -64,7 +64,7 @@ Stable session folders retain their short paths and mode `0700`.
 The session hook defines the session temporary root.
 The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
 The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
-`memory_admit.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
+`step_estimator.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
 `tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
 
 ### Machine side (`/etc/nixos`, natedev only)
@@ -114,12 +114,11 @@ After a restart, the service restores live run places and removes ended run plac
 
 `scripts/build_queue/admission_service.py` is the only live admitter. Its epoll loop owns the queue and reservations.
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
-`memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
+`step_estimator.py` owns the estimates. `admission_records.py` owns the shared records, configuration, and wait phrases.
+`memory_admit.py` owns the readers, pure admission rules, projection, and finalizer.
 
-Each admitted run keeps aside `max(0, accepted need − anonymous use)`, plus its held slots.
-Room equals host free memory minus the 3 GiB safety minus run keep-asides minus the CI keep-aside.
+[Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.
 The first two minutes use the same calculation. A run never counts its use twice.
-The cap equals admitted anonymous use plus host free memory minus the safety.
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
@@ -270,7 +269,8 @@ The comparative replay does not run. The capacity rule is not adopted.
 
 ### Estimates and keep-asides
 
-The client calls `step_estimate` before admission and after `EstimateExpired`.
+The client imports `step_estimator` inside `step_request`. It calls `step_estimate` before admission and after `EstimateExpired`.
+`system_clock.py` owns the shared `SystemClock`. Cleanup commands load no service or queue view.
 Before each new build estimate, it reads `build_history` from the service, then reads history.
 `StepProfile.build_history_generation` keeps that generation through reconnects and delayed replies.
 The service grants a build only when its estimate generation equals `ServiceState.build_history_generation`.
@@ -281,10 +281,36 @@ A publication retry also advances the generation. The service never prunes or re
 A refresh uses the open admission connection. An unregistered client uses a read-only `build_history` query.
 A pass retries a retained finalization intent even while its owner remains alive.
 It preserves the first `since` and episode across refreshes and reconnects.
+
+With `--wait-events`, the client emits `first`, then `holder <json>`.
+It emits another holder event only when the holder changes.
+The JSON identifies a session (`kind`, `session_id`, `session_name`), a unit (`kind`, `unit`), or no holder (`kind=none`).
+The pass records the holder in `AdmissionWaitSnapshot.holder`.
+An order hold names its protected waiter, including a continuation that requests extra memory.
+A room wait names the run with the largest recorded charge, including held slots.
+A held slot keeps the run's recorded unit after its reservation ends.
+The charge uses grouped anonymous use and the current keep-aside.
+Unavailable run use retains the full keep-aside charge.
+Unregistered CI jobs never become holders.
+Pressure, unreadable host readings, start spacing, and estimate refresh report no holder.
+The holder defaults to `NoHolder` when an older service omits the field.
+An older client ignores the added field and keeps its wait.
+At a service restart, the client reconnects with the same episode and arrival time.
+It prints `admission service restarted; waiting again` once when the connection closes.
+The existing unreachable limit still applies until a valid reply arrives.
+`QueueInputs` and the queue snapshot version remain unchanged.
+
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
-A cap-source waiter never expires. A `FixedCapSizing` program holds its cap without a history estimate or refresh.
-The merge gate asks for its own `--memory-cap-mib`, default 6144 MiB.
-Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory cap` in explanations.
+A program uses its history estimate and refreshes it under the normal estimate policy.
+The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
+The gate removes its progress counter before reruns, which keep the full need.
+The merge-gate progress profile key includes `shape` (`tests` or `types`).
+Earlier profiles do not match, and nightly runs use separate profiles.
+It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
+The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
+Memory peaks do not kill jobs or fail the gate.
+The gate reports its first need as a fallback and explains any matching anonymous progress window.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -417,14 +443,16 @@ CI RAM and unowned scopes reduce host free memory. They do not create a run prom
 The service reads that value once with the other policy values.
 `AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
 `MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
+`MemoryRoom.ci_use` stores readable CI use separately from admitted anonymous use.
 `MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
 Idle CI and unavailable CI readings add no CI keep-aside.
 CI RAM already reduces host free memory. The room calculation never subtracts it again.
 The service does not require `memory.max` for admission.
-The cap remains anonymous use plus free memory minus safety.
+[Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the cap.
 The cap text names the CI keep-aside within kept memory.
-The page shows CI RAM outside the cap and the CI keep-aside beside it, before the cap.
-Neither CI part increases the page's taken total for admitted runs.
+The page shows CI use and the CI keep-aside inside the cap.
+The page and the queue text show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB.
+The page includes both CI amounts in its taken total. Room and admission do not change.
 `RunningServiceJob` and `IdleService` retain the CI job state.
 Anonymous scope counters use the same measure as the history peaks.
 Missing anonymous counters keep the full accepted need aside and make the cap unavailable.
@@ -482,10 +510,21 @@ The scoped wrapper requires a published sidecar and a live holder before program
 ### Startup, cut-over, and rollback
 
 The system socket starts the system service as the user. The service runs outside `builds.slice` with `OOMScoreAdjust=-900`.
-It clears the outage claim and sends `READY=1` after listener setup.
+It sends `READY=1` after listener setup.
+The main loop clears the outage claim once after `silence_seconds` of continuous operation.
+It uses the last usable configuration and retries a failed clear on a later loop.
+A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
 A restored head override receives reconnect grace only after the listener is ready.
-`down-alert` waits two minutes, claims `build-admission`, and sends one outage push. A later start clears that claim.
+`down-alert` waits `silence_seconds` and claims `build-admission`.
+It sends the outage message to the `builds` session first.
+The message names the journal command and the restart command.
+If the result is not `sent`, it sends an `alert.blocked` phone push.
+The phone action is `sudo systemctl restart build-admission.socket build-admission.service` on natedev.
+The push clears when `admission_client.py view`, through `scripts/lib/py`, succeeds.
+The sender releases the claim only when both sends return `failed`, `refused`, or `retry`.
+Every other outcome preserves the delivered claim.
+The sender prints each send outcome header to the journal.
 
 The builds showrunner owns cut-over. Workers do not change live units or admission state.
 
@@ -759,7 +798,47 @@ The audit and repository scan share `scratch.conf` `repo_skip`.
 The audit also keeps the configured `scratch.visible_root()`.
 `rust_roots.txt` remains a list file. All moved values retain their previous defaults.
 
-Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them; sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27). Each scratch folder now belongs to a task, and the task's end removes it. `scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes one and prints its path; `adopt`, `hold`, `release`, `renew`, `end` and `list` do the rest. A task is `run:<run id>`, which `end_session.sh` ends; `phase:<unit>/<phase>`, which `merge_checkpoint.py` ends after it records the phase's code checkpoint; `gate:<id>`, which the gate's caller ends; `row:<showrunner>-C<n>`, which `change_review.py verdict` ends whichever way the verdict goes; or `until:<time>` (`--until YYYY-MM-DD [HH:MM]`), which the hourly tmp sweep ends when the time passes. Creation and hand-over accept a `phase:<unit>/<phase>` task only when the phase id is in that unit's recorded plan. A missing or unreadable plan refuses the new task and names the cause; use a real phase id, `gate:<id>` or `--until <when>`. Existing tasks with an invalid phase id can still update and end. With no task a folder lasts 24 h. The sweep keeps a task's folder while the task is open and removes any after 7 idle days. `scratch.py hold <path> --reason <why>` (or `change_review.py add --hold <path>`) keeps a folder where it is until its task ends, recorded in `~/.local/state/scratch/holds.json`; `end` removes it then, unless a repo in it holds work on no remote (uncommitted changes, a stash, commits on no remote), which stays with its hold marked ended. A folder is `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`; `--visible` (rows only) puts it at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds `.scratch.json` with its task, maker session and times. A git worktree goes through `git worktree remove`. A failed removal warns and never fails the merge or the verdict.
+Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them.
+Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
+Each scratch folder belongs to a task. The task's end removes its folders.
+`scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py list` shows each folder's task and last change.
+The other commands are `adopt`, `hold`, `release`, `renew` and `end`.
+
+Tasks use these forms:
+
+- `run:<run id>` ends through `end_session.sh`.
+- `phase:<unit>/<phase>` ends through `merge_checkpoint.py` after the phase's code checkpoint.
+- `gate:<id>` ends through the gate's caller.
+- `row:<showrunner>-C<n>` ends through `change_review.py verdict` after either verdict.
+- `until:<YYYY-MM-DDTHHMMZ>/<id>` ends through the hourly temporary sweep when its time passes.
+
+`--until YYYY-MM-DD [HH:MM]` selects a deadline in the user's time zone.
+Each call creates a random task id from `scratch.conf` `suffix_length` characters.
+Folders with the same deadline have separate tasks.
+The folder name includes the deadline stamp but excludes the task id.
+With no task, each folder gets a separate deadline task that lasts 24 hours.
+The deadline reader also accepts old tasks without an id.
+`scratch.py end --task <task>` selects folders by their exact task.
+
+Creation and transfer accept a `phase:<unit>/<phase>` task only when the phase id appears in that unit's recorded plan.
+A missing or unreadable plan refuses the new task and names the cause.
+Use a recorded phase id, `gate:<id>` or `--until <when>`.
+Existing tasks with an invalid phase id can still update and end.
+The sweep keeps a task's folder while the task remains open.
+It removes folders after seven idle days, even when the task remains open.
+
+`scratch.py hold <path> --reason <why>` keeps a folder at its path until its task ends.
+`change_review.py add --hold <path>` also creates a hold.
+The hold record stays in `~/.local/state/scratch/holds.json`.
+`end` removes the held folder unless a repository in it has uncommitted changes, a stash or commits absent from all remotes.
+The folder stays with its hold marked ended.
+
+A folder uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
+`--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
+Each folder holds `.scratch.json` with its task, maker session and times.
+A Git worktree uses `git worktree remove` for removal.
+A failed removal prints a warning and does not fail the merge or the verdict.
 
 The scratch guard, a `PreToolUse` hook on `Bash` for Claude Code (`settings.json`) and Codex (`codex_hooks.py`), refuses a command that makes a new folder directly in /tmp, `$TMPDIR`, /tmp/claude, ~/rust or ~/rust/scratch (and judges a Write or NotebookEdit file path where its matcher names them): mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/-a, rsync, cargo new/init, and tar extraction into a root. Allowed there: the session scratchpads (`/tmp/claude-<uid>`), `/tmp/claude/unit`, `/tmp/claude/delegate`, `/tmp/claude/session` and both scratch roots; ~/worktrees is no root, and a `make_a_worktree` command is never judged. A heredoc body, a quoted argument and a comment are data. A path the hook cannot follow (a variable other than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed, and the hourly tmp sweep is the backstop. A `TMPDIR` inside a session scratchpad, a session temp root or a run folder is no root.
 Before its checks, the scratch guard uses the session-start path helper to restore only the input session id's missing temp folder with mode `0700`; an existing folder costs one `os.stat`, a missing or invalid id creates nothing, and a repair error allows the tool call to proceed to the checks.
@@ -956,7 +1035,7 @@ The nix-darwin job is a separate deployment step.
 `memory_room` calculates room from one captured admission pass.
 For each admitted run, kept bytes equal `max(0, selected need − anonymous use)` plus held slot bytes.
 Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
-The cap equals our anonymous use plus free memory minus safety. It does not limit an estimate.
+The cap equals our anonymous use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
 The first eligible run follows queue priority, first run arrival, and PID.
@@ -993,3 +1072,99 @@ The queue view and cards show captured process ids as `pid N` for each process r
 `HeadExplanation` retains that cause for the view and release advice.
 The formatters read the captured cause and room without a second room calculation.
 No adaptive controller, fixed admission limit, order window, CI growth promise, or test-phase estimate worker remains.
+
+### Progress memory profiles
+
+Cargo build, check, clippy, mend, nextest, and merge gates record attributed anonymous use in five-percent phase bins.
+The service applies each step's recorded headroom rule to the highest profile sample within its look-ahead window.
+`progress_lookahead_percent` is read at use; its initial value is 20.
+The window can cross a phase boundary. Each step has its own history key.
+Missing counters, profiles, or anonymous readings retain the full need.
+The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.
+CI keeps its configured margin until registered CI steps supply counters and profiles.
+`lint/invoke.sh` enables Cargo progress in its capture log. It removes redraw frames from worker output.
+Cargo-tile enables progress for its own captures. The cargo wrapper does not enable progress for other pipes.
+
+
+### CI cargo admission
+
+The pinned client entry is `scripts/build_queue/ci_cargo_front.py`.
+The runner package exposes this entry as `bin/cargo` from the pinned source tree.
+The package wrapper passes `--front "$0"` before the cargo arguments.
+Its PATH entry precedes the cargo-tile shim, which precedes the real cargo.
+The front excludes that wrapper and removes its directory from the child's PATH.
+An explicit `--cargo <shim> -- <arguments>` entry also selects the next shim.
+Building calls hold one reservation until the child and its descendants end.
+Non-building calls execute the next cargo without admission.
+A direct call to a cargo executable outside this front bypasses admission.
+Calls inside the admitted child tree retain the same reservation.
+
+`ServiceEstimateRequest` carries the owner, repository, worktree, arguments, runner, and job.
+The service reads configuration and history with its own account.
+It uses `step_estimator.step_estimate` with a recorded repository location.
+The service refreshes the estimate on each acquisition retry.
+Build estimates use the current service history generation.
+CI uses `NoRun`, so it claims no run place or continuation slot.
+The configured `ci_label` expands `RUNNER_NAME` and `GITHUB_JOB`.
+The configuration reader validates the template before the service uses it.
+An invalid template uses a committed value through the normal configuration reader.
+Without a usable committed value, configuration resolution fails as for other invalid values.
+The queue records this label as the session name.
+
+`SO_PEERCRED` supplies the connecting account before replay lookup.
+Authorization also precedes caller version records and saved state changes.
+Runner request ids start with `uid:<account>:`.
+The service checks the owner's account and process start time.
+It also checks a caller-named run's account and process start time.
+Runner accounts cannot change priority or admit the head.
+Cleanup and width changes require a reservation from the same account.
+The account prefix also binds replay and pending priority access.
+Saved reservation and ledger records retain their existing shapes.
+The service wraps saved grants as `RunnerAdmitted` only when it sends them.
+
+The runner owns its child process tree; it creates no user-manager scope.
+The front adopts orphaned descendants before it starts cargo.
+The cargo child sets a parent death signal before exec.
+SIGKILL of the front also kills that cargo process.
+Cargo descendants do not inherit that signal and can survive a SIGKILL of the front.
+`QueuePlace` tracks descendants and terminates surviving descendants before release.
+The runner samples anonymous use in its process tree.
+The service also samples anonymous use during each admission pass.
+The service reads the runner's peak and wave files beside its sidecar.
+It copies the maximum into its own peak files before finalization.
+The service writes completed and failed peaks through the normal history path.
+The runner creates its sidecar and progress counter in a temporary directory.
+The directory mode is `0755`; the sidecar, counter, peak, and wave modes are `0644`.
+The runner account owns these files; the service reads them without group write access.
+The service completes release when sample deletion fails with `PermissionError`.
+The front removes its temporary directory after release.
+A front killed by SIGKILL leaves that directory for the existing sweep.
+The service reads the counter through the sidecar path in the reservation.
+The child alone receives `CARGO_TERM_PROGRESS_WHEN=always` and `CARGO_TERM_PROGRESS_WIDTH=80`.
+The shared progress reader and profile history apply the existing look-ahead rule.
+A missing counter or profile retains the full need.
+
+Acquisition uses named protocol timing without a local configuration read.
+The deadline covers closed connections and connections without replies.
+A valid reply renews the deadline.
+Cleanup uses the separate timing from the grant.
+
+CI memory keeps the mixed accounting rule during activation.
+Registered process trees count through their reservations.
+The CI slice reading subtracts their anonymous use.
+The CI keep-aside remains while any busy runner has no registered tree.
+The keep-aside applies once to a mix of registered and unregistered jobs.
+`ci_memory_margin_gib` remains in configuration until the approved activation step.
+
+NixOS activation remains natedev's work.
+The socket uses group `build-admission` and mode `0660`.
+The group includes natepiano and the hana runner accounts.
+Runner sandboxes need `BindPaths=/run/build-admission` when `/run` is hidden.
+`ADMISSION_SOCKET` is needed only for a nondefault socket path.
+The package must contain the pinned source tree and a Python interpreter.
+No client code is copied into `/etc/nixos`.
+The service must read runner `/proc` records and runner temporary counter files.
+Set `TMPDIR` to a shared runner-owned directory if `PrivateTmp` hides the default directory.
+For example, `/run/build-admission/ci/<uid>` uses mode `0755` and the runner's ownership.
+The fixed slice limits remain `MemoryMax=34G` and `MemorySwapMax=2G`.
+The service authorization and protocol must be live before runner socket access starts.

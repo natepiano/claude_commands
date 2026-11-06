@@ -39,14 +39,14 @@ class StylePlanTests(StylePlanFixture):
             finding = ledger.hold(rule, self.sources[0], 1, "value", "type", "u32", "u64", blob, "outside")
             ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: {unit_staff_id("names-unit")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+                             + f'unit: {unit_staff_id("names")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
         self.proposals_field(folder)
         def start(*args: str) -> None:
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(proposal_issue.main(list(args)), 0)
         with mock.patch.object(style_proposals, "proposal_command", side_effect=start):
             self.assertEqual(self.run_next()[0], 0)
-            ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+            ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
             self.assertEqual(ticket["kind"], "proposal")
             self.assertEqual(ticket["files"], [self.sources[0]])
             first = self.plan.read_text()
