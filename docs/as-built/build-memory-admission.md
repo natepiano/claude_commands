@@ -283,6 +283,8 @@ A fresh nextest estimate expires after one running-pass interval. Other history 
 A program uses its history estimate and refreshes it under the normal estimate policy.
 The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the look-ahead window.
+The merge-gate progress profile key includes `shape` (`tests` or `types`).
+Earlier profiles do not match, and nightly runs use separate profiles.
 It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
 The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
 Memory peaks do not kill jobs or fail the gate.

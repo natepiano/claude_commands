@@ -4150,6 +4150,17 @@ class ProgressKeepAsideTests(unittest.TestCase):
         self.assertIn("need 1.5 GiB", text)
         self.assertIn("highest anonymous use in the next 20%", text)
 
+    def test_gate_profiles_separate_types_and_share_test_only_copies(self) -> None:
+        first = self.reservation("merge-gate")
+        first["shape"] = gate.merge_gate_shape(["merge-gate"])
+        second: gate.Reservation = {**first, "worktree": "/another/gate"}
+        nightly: gate.Reservation = {**second, "shape": gate.merge_gate_shape(["merge-gate", "--type-dirs", "scripts"])}
+
+        self.assertEqual(gate.reservation_profile_key(first, "host"),
+                         gate.reservation_profile_key(second, "host"))
+        self.assertNotEqual(gate.reservation_profile_key(second, "host"),
+                            gate.reservation_profile_key(nightly, "host"))
+
     def test_missing_progress_or_anonymous_use_keeps_the_full_need(self) -> None:
         row = self.reservation()
         counter = progress.ProgressCounter("build:1", 80, 100)

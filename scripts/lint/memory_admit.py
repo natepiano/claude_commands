@@ -202,6 +202,15 @@ def test_package(argv: list[str]) -> str:
     return test_selection(argv).package
 
 
+MERGE_GATE_TESTS = "tests"
+MERGE_GATE_TYPES = "types"
+
+
+def merge_gate_shape(argv: Sequence[str]) -> str:
+    """Separate type-check profiles from test-only profiles."""
+    return MERGE_GATE_TYPES if "--type-dirs" in argv else MERGE_GATE_TESTS
+
+
 def test_scope(argv: list[str]) -> TestScope:
     """Keep test selection separate from package, target and execution options."""
     return test_selection(argv).scope
@@ -3688,7 +3697,7 @@ PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "merge-gate", "
 def reservation_profile_key(row: Reservation, host: str) -> str:
     """Use the history identity for each step rather than its run owner."""
     if row["step"] == "merge-gate":
-        return progress.profile_key((host, row["step"]))
+        return progress.profile_key((host, row["step"], row.get("shape", MERGE_GATE_TESTS)))
     width = row["test_threads"].threads if isinstance(row["test_threads"], RequestedTestWidth) else "unknown"
     return progress.profile_key((host, row.get("repo_identity", row["repo"]), row["step"],
         row.get("shape", ""), row.get("test_scope", "full"), row.get("package", ""),

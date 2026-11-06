@@ -317,6 +317,39 @@ only I can bump
 
 **Workers:** `1 writer + 1 tester` — `impl` owns the counter parsers, the profile writer, `memory_admit.py`, `admission_service.py` (F044), `scripts/production/merge_gate.py` (sdlc devtools-unit's file: name it in the notice's also-touches line), the page's feed and hover (`memory_feed.py` and `memory_live.html` in the session design folder until 10m moves them) and the caller files that set the cargo progress variables (`scripts/build_hold/cargo` and each nextest or clippy launch path the design finds; name outside owners in the notice); `test` owns the parser fixtures, the transition tests, the feed and hover checks, `scripts/production/test_merge_gate*.py`, the merge gate admission suites and the caller suites, with production caller fixtures that use `loop_turn()`.
 
+### Phase 19 — The merge gate runs no type check, and the daily run does  · status: done
+
+**Asked by:** the user, 2026-11-05: "i think this basedpyright should come out out - we need a way to ensure that these are run but in the merge gate it is killing us", then "as far as i'm concerned we could also limit how often these happen - i.e., only running them once a day or something - basedpyright is not as urgent to keep up to date as getting all of our tests going faster".
+
+**Depends on:** 10k (it changes the gate's memory sizing in the same file).
+
+**Measured 2026-11-05:** 214 gate runs that day. Each full type check takes a median of 164 s and peaks at 4.07 GiB; it is 3.4% of a gate's CPU. The rest of a gate stays under 1 GiB in about 90% of samples. 35 of 301 recorded type checks failed, so the check finds real errors and must still run.
+
+#### Work Order
+
+**Goal:** A gate never holds 4 GiB for a type check, and the full type check runs once a day.
+
+**Spec:**
+1. **Out of the gate.** `merge_gate.py` with `--tests-only` or the merge path runs no type job. `--type-dirs` defaults to no folders. An explicit `--type-dirs scripts` still runs the check by hand.
+2. **Daily.** `merge_gate.py --nightly` (the 03:00 timer) runs the full check over `scripts` from a named constant. No new command and no new timer.
+3. **A red check.** A nightly run with only a type failure tells the showrunner, with the failing files, and writes no `full-required` marker. A type error does not force full test runs.
+4. **Memory need.** The gate's memory need comes from the test modules alone, also straight after this lands. Check the recorded gate windows and history that size the need. If old records that held a type check keep the need high, post blocked with the record and the measured effect.
+5. **Unit checks stay.** Workers keep the type check on their changed files and caller modules.
+6. **Docs.** Update the docstring of `merge_gate.py`, `docs/as-built/merge-gate-and-test-speed.md` and any `commands/` or `docs/direct/` text that says a gate type-checks.
+
+**Files:**
+- `scripts/production/merge_gate.py` — items 1-4.
+- `scripts/production/test_merge_gate_suites_types.py`, `scripts/production/test_merge_gate.py` — the tests.
+- `docs/as-built/merge-gate-and-test-speed.md` — the doc.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns `merge_gate.py` and the docs; `test` owns the test files.
+
+**State:** none.
+
+**Acceptance gate:** A real `--tests-only` gate on a scratch copy starts no `basedpyright`. A nightly test with a fake `MERGE_GATE_BASEDPYRIGHT` runs the check, and a type failure there tells a fake showrunner and writes no marker.
+
+**Notice:** Name `scripts/production/merge_gate.py` as also-touches (owner sdlc devtools-unit). Give the measured gate CPU and wall time before and after (builds, 2026-11-05).
+
 ### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: todo
 
 **Depends on:** 10k (runs after it; both may touch the client). Source: the 10x deploy check, 2026-11-05. User approval: "fix then" (2026-11-05, answer to the question whether a waiting build may stop with a clear message when the service keeps failing to start).

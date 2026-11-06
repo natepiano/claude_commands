@@ -13,7 +13,9 @@ builds.slice scope when its probe succeeds, unless disabled or already in that s
 --tests-only runs the same suite runner without changing git refs or files.
 Clean trees reuse full passes on the same host, or select affected modules from a
 certified ancestor. --full forces all modules; --nightly validates a shared clone.
-Type jobs still run as before.
+Merge and tests-only runs omit type checks unless --type-dirs names folders.
+The daily --nightly run checks all scripts, including hooks.
+A nightly type failure reports the checker output without requiring full test runs.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
 the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
@@ -89,6 +91,8 @@ RELEASE_LOCK_WAIT_S = 60
 # type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
 # later dates report new diagnostics in bake_textures.py.
 TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
+NIGHTLY_TYPE_DIRS = ("scripts",)
+NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
 TYPES_MEMORY_MIB = 3072
 MEMORY_PEAK_MARGIN = 1.2
@@ -334,11 +338,13 @@ def merge_gate_governor_gib() -> float:
 
 
 @contextmanager
-def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait) -> Generator[QueuePlace]:
+def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
+                     type_dirs: Sequence[str] = ()) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
     try:
-        with queue_place("merge-gate", repo,
+        program: str | Sequence[str] = ("merge-gate", "--type-dirs", *type_dirs) if type_dirs else "merge-gate"
+        with queue_place(program, repo,
                          before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
             yield place
     except QueuePlaceRefused as error:
@@ -1009,7 +1015,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with (record_on_abort(),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES["merge-gate"], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
-          gate_reservation(repo, temporary, hold) as reservation,
+          gate_reservation(repo, temporary, hold, type_dirs=type_dirs) as reservation,
           shared_cpu_pool() as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary)}
         types_python = typecheck_python() if type_dirs else ""
@@ -1552,17 +1558,29 @@ def nightly_owner(args: GateArguments) -> str:
     return showrunners.production_slug(str(doc))
 
 
-def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str]) -> None:
+def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
+                     type_failures: Sequence[GateJobResult] = ()) -> None:
     from scripts.production import showrunners
 
+    requires_full = bool(failed) or not type_failures
     try:
+        detail = (f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
+                  + "Every gate now requires the full suite until a full run passes."
+                  if requires_full else "Tests passed. A type failure does not require full test runs.")
+        if type_failures:
+            lines = [line for job in type_failures for line in job.output.splitlines()]
+            summaries = [line for line in lines if re.fullmatch(r"\d+ errors?, \d+ warnings?, \d+ notes?", line)]
+            diagnostics = [line for line in lines if line not in summaries]
+            detail += "\nType check failed:\n" + "\n".join(diagnostics[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
+            detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
+            if summaries:
+                detail += "\n" + summaries[-1]
         outcome = showrunners.tell(nightly_owner(args), f"merge-gate-nightly:{tree}",
-                                   f"Nightly merge gate is red: {args.merge_branch} tree {tree}. "
-                                   + f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
-                                   + "Every gate now requires the full suite until a full run passes.")
+                                   f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
     except (GateRefused, change_review.ChangeReviewError, OSError, ValueError) as error:
-        print(f"Nightly notice could not be sent: {error}; full-required marker kept", flush=True)
+        marker_note = "; full-required marker kept" if requires_full else ""
+        print(f"Nightly notice could not be sent: {error}{marker_note}", flush=True)
 
 
 def nightly_git(repo: Path, *arguments: str) -> str:
@@ -1593,18 +1611,23 @@ def nightly(args: GateArguments) -> int:
         if run.passed:
             marker.unlink(missing_ok=True)
             return 0
-        failed = [f"{job.suite}/{job.module}" for job in run.jobs if job.returncode]
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", dir=marker.parent, delete=False) as output:
-            pending = Path(output.name)
-            try:
-                _ = output.write(json.dumps({"tree": tree, "at": datetime.now(UTC).isoformat(),
-                                              "failed_modules": failed}) + "\n")
-                output.close()
-                _ = pending.replace(marker)
-            finally:
-                pending.unlink(missing_ok=True)
-        tell_nightly_red(args, tree, failed)
+        type_failures = [job for job in run.jobs if job.returncode and job.kind is GateJobKind.TYPE_CHECK]
+        failed = [f"{job.suite}/{job.module}" for job in run.jobs
+                  if job.returncode and job.kind is not GateJobKind.TYPE_CHECK]
+        if failed or not type_failures:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=marker.parent, delete=False) as output:
+                pending = Path(output.name)
+                try:
+                    _ = output.write(json.dumps({"tree": tree, "at": datetime.now(UTC).isoformat(),
+                                                  "failed_modules": failed}) + "\n")
+                    output.close()
+                    _ = pending.replace(marker)
+                finally:
+                    pending.unlink(missing_ok=True)
+        else:
+            marker.unlink(missing_ok=True)
+        tell_nightly_red(args, tree, failed, type_failures=type_failures)
         return 1
 
 
@@ -1617,7 +1640,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
                             help="the production doc whose header names the list (default: the calling showrunner's)")
-    _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
+    _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=[],
+                            help="check these folders by hand; nightly always checks scripts")
     _ = parser.add_argument("--promote", action="store_true")
     _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")
     _ = parser.add_argument("--ssh", default="ssh")
@@ -1637,6 +1661,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--nightly needs --merge-branch")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
+    if args.nightly:
+        args.type_dirs = list(NIGHTLY_TYPE_DIRS)
     if not args.tests_only and not args.promote_only and not args.nightly:
         required = ("merge_branch", "unit_branch", "checkpoint", "previous_checkpoint", "unit", "phase")
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]

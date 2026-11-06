@@ -1162,12 +1162,18 @@ class AdmissionServer:
             # The episode disambiguates grants at the same clock tick after release.
             while any(record.path == str(stem) for record in self.reservations.values()):
                 stem = stem.with_name(stem.name + "0")
+            if profile.step == "build":
+                shape = build_shape(list(request.argv)).key
+            elif profile.step == "merge-gate":
+                shape = gate.merge_gate_shape(request.argv)
+            else:
+                shape = ""
             record = ReservationRecord(request.episode, str(stem), request.owner, profile.peak.bytes,
                 profile.repo, profile.step, profile.worktree, store.utc_iso(now), request.sidecar,
                 request.test_width, request.call, stem.name, gate.stored_waiter(waiting.row),
                 profile.repository.key if isinstance(profile.repository, gate.RepositoryIdentity) else "",
                 profile.scope, gate.test_package(list(request.argv)), tuple(gate.test_filters(list(request.argv))),
-                build_shape(list(request.argv)).key if profile.step == "build" else "", run=request.run)
+                shape, run=request.run)
             record = self._freeze_test_phase_need(record, config)
             result = self.last_result
             candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()

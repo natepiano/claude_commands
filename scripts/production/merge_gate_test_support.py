@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 import json
 import contextlib
@@ -61,7 +61,7 @@ if name == "basedpyright":
         # The parent publishes only after measuring this type job's real RSS.
         wait_until((state / "types-sampled").exists, state, timeout=TEST_HANG_GUARD_SECS)
     if (state / "types-red").exists():
-        print("fixture type error")
+        print("scripts/fixture.py:1: error: fixture type error")
         print("1 error, 0 warnings, 0 notes")
         raise SystemExit(1)
     print("0 errors, 0 warnings, 0 notes")
@@ -518,13 +518,15 @@ class MergeGateFixture(unittest.TestCase):
         return self.git(checkout, "rev-parse", "HEAD")
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
-                 ignored_signals: bool = False, callers_production: bool = False) -> subprocess.CompletedProcess[str]:
+                 ignored_signals: bool = False, callers_production: bool = False,
+                 type_dirs: Sequence[str] = ("scripts/production",)) -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
              "--checkpoint", checkpoint or self.checkpoint,
              "--previous-checkpoint", previous or self.base,
              "--unit", "fixture-unit", "--phase", "phase-2",
-             "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
+             "--body", "Fixture checkpoint gate.",
+             *(["--type-dirs", *type_dirs] if type_dirs else []),
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
              *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
