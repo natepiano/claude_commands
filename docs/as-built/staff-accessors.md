@@ -18,6 +18,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `docs/associate-producer/operations.md` | read | staff.json (shell) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
+| `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/agent_bg.sh` | read | runtime_id |
@@ -61,6 +62,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/lib/resume_message.py` | read | none (StaffId type, type check only) |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, record_path |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
@@ -170,7 +172,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-156 accessors: 29 write, 126 read, 1 owner.
+158 accessors: 29 write, 128 read, 1 owner.
 
 ## Approved copies
 

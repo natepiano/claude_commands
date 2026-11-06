@@ -51,6 +51,7 @@ MoveCause = Literal["refusal", "credits off", "by hand", "auto"]
 
 
 class RequestedMove(MoveCommon, RequestedFields):
+    terminal: NotRequired[str]
     kind: Literal["requested"]
     cause: NotRequired[MoveCause]
 

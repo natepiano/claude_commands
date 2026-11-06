@@ -39,6 +39,7 @@ from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.lib.resume_message import (
+    AccountMove, NO_ACCOUNT_MOVE,
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
     resume_message as resume_message,
@@ -345,8 +346,29 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     return live
 
 
-def _running_on_account(identity: str, pane_id: str) -> ClaudeUp | ResumeFailed | sessions.SessionNotLive:
+def _codex_running_on_account(identity: str, pane_id: str, pid: int) -> ClaudeUp | ResumeFailed:
+    """Read one process that the conversation reader proves hosts this thread."""
+    from scripts.whoami import account
+    from scripts.accounts import accounts
+
+    setting = account.process_codex_home(pid)
+    if isinstance(setting, account.ProcessEnvironmentUnread):
+        return ResumeFailed(identity, setting.reason)
+    home = setting.home if isinstance(setting, account.ProcessCodexHome) else Path.home() / ".codex"
+    return ClaudeUp(identity, pane_id, accounts.codex_home_label(home), start_state=ClaudeStartState.ALREADY_RUNNING)
+
+
+def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> ClaudeUp | ResumeFailed | sessions.SessionNotLive:
     """Keep a running conversation on its current account."""
+    if kind == "codex":
+        observed = herdr.read_conversation(identity, "codex")
+        if isinstance(observed, herdr.StoppedConversation):
+            return sessions.SessionNotLive()
+        if isinstance(observed, herdr.UnknownConversation):
+            return ResumeFailed(identity, observed.reason)
+        if not observed.pids:
+            return ResumeFailed(identity, "live Codex thread has no process account proof")
+        return _codex_running_on_account(identity, pane_id, observed.pids[0])
     live = sessions.session_liveness(identity)
     if isinstance(live, sessions.SessionNotLive):
         return live
@@ -455,7 +477,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             entry = names.resume(entry)
         pane_id = entry["pane_id"] if isinstance(tab, SessionNotFound) and entry is not None else (
             tab.pane_id if isinstance(tab, herdr.TabSession) else "")
-        running = _running_on_account(identity, pane_id)
+        running = running_on_account(identity, pane_id)
         if not isinstance(running, sessions.SessionNotLive):
             return running
         if entry is None:
@@ -463,7 +485,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 return SessionNotFound(session)
             restart = cast(RowStarter, cast(object, import_module("scripts.shutdown.restart")))
             pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
-            result = _running_on_account(identity, pane)
+            result = running_on_account(identity, pane)
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
             return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
@@ -519,8 +541,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        message = resume_message(why, moved_from=source_label if to else None,
-                                 moved_to=to, workers=workers)
+        message = resume_message(why, move=AccountMove(source_label, to) if to else NO_ACCOUNT_MOVE,
+                                 workers=workers)
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             with pane_record.locked(client.session):
                 entries = pane_record.read_strict(client.session)
@@ -753,7 +775,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
             tab = _tab_of(session)
             if isinstance(tab, herdr.TabSession):
                 identities[session] = tab.session_id or session
-                running = _running_on_account(tab.session_id or "", tab.pane_id)
+                running = running_on_account(tab.session_id or "", tab.pane_id)
                 if isinstance(running, ClaudeUp):
                     sources[session] = running.account
                 if isinstance(running, ClaudeUp) and running.account == target:
