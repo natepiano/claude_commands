@@ -7,11 +7,29 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
 
 class MemoryGateWaitTests(unittest.TestCase):
+    def test_relative_source_keeps_the_launcher_after_a_directory_change(self) -> None:
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            cache = root / "cache"
+            seed_interpreter_cache(cache)
+            environment = {**os.environ, **config_environment(root),
+                           "HOME": str(root), "XDG_CACHE_HOME": str(cache)}
+            _ = environment.pop("CLAUDE_PYTHON", None)
+            shell = 'source scripts/lint/memory_gate.sh && cd "$1" && buildlog_memory_python -c \'print(123)\''
+            result = subprocess.run(
+                ["bash", "-c", shell, "test", str(root)],
+                cwd=Path(__file__).resolve().parents[2], env=environment,
+                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "123\n")
+
     def test_parent_queue_identity_does_not_age_a_new_launch_or_step(self) -> None:
         with tempfile.TemporaryDirectory() as work:
             root = Path(work)

@@ -25,7 +25,7 @@ printf 'Check the change.\n' > "${FRIEND_TEST_SESSION}/question.md"
 for FRIEND_TEST_FAMILY in claude codex; do
   export FRIEND_TEST_FAMILY
   bash "${TEST_DIR}/scripts/ask_a_friend/launch_friend.sh" "$FRIEND_TEST_SESSION" "$TEST_DIR"
-  python3 - "$FRIEND_TEST_SESSION" "$TEST_DIR" "$FRIEND_TEST_FAMILY" <<'PYTEST'
+  "$SCRIPT_DIR/../lib/py" - "$FRIEND_TEST_SESSION" "$TEST_DIR" "$FRIEND_TEST_FAMILY" <<'PYTEST'
 import pathlib
 import sys
 

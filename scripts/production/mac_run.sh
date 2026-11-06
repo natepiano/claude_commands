@@ -71,7 +71,7 @@ on_mac() {
 ssh -o ConnectTimeout=$connect_seconds -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
 
 mac_test=$HOME/.claude/scripts/mac_test/mac_test.py
-claim_output=$(python3 $mac_test claim --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait $claim_seconds)
+claim_output=$("$lib/py" $mac_test claim --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait $claim_seconds)
 claim_status=$?
 if (( claim_status == 10 || claim_status == 11 || claim_status == 12 )); then
   print -r -- $claim_output
@@ -93,7 +93,7 @@ release_mac_claim() {
       cleanup_failed=1
     fi
   fi
-  python3 $mac_test release --pid $$ >/dev/null 2>&1
+  "$lib/py" $mac_test release --pid $$ >/dev/null 2>&1
   mac_claimed=0
   return $cleanup_failed
 }

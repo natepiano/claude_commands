@@ -45,7 +45,7 @@ count_patterns() {
 }
 
 json_key() {
-    python3 -c 'import json, sys; print(json.dumps(sys.argv[1]), end="")' "$1"
+    "$HOME/.claude/scripts/lib/py" -c 'import json, sys; print(json.dumps(sys.argv[1]), end="")' "$1"
 }
 
 if [[ "$1" == "--verify" ]]; then

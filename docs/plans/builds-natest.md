@@ -1077,7 +1077,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Ruled out:** Moving the hook's import saves 0.25 ms next to 20 ms of start. The admission client wait notice keeps the raw step, because no user reads it.
 
-### Phase 49 — Every shell script starts Python through `scripts/lib/py`  · status: todo
+### Phase 49 — Every shell script starts Python through `scripts/lib/py`  · status: done
 **Depends on:** Phase 36
 
 #### Work Order

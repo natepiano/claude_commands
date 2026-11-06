@@ -17,6 +17,7 @@ from typing import NotRequired, TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import session_labels, showrunners, staff
 from scripts.shutdown import remote
 from scripts.statusline import assignment, rebuild_row
@@ -62,6 +63,7 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
 
 def seed_rebuild_cache(home: Path) -> None:
     """Keep shell tests on temporary answers without calling Nix or SSH."""
+    seed_interpreter_cache(home / ".cache")
     cache = home / ".local/state/showrunner/rebuilds"
     cache.parent.mkdir(parents=True, exist_ok=True)
     _ = cache.write_text("\n9999999999\n" + str(SHIPPED_COLORS) + "\n", encoding="utf-8")
@@ -662,6 +664,9 @@ class RoleTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in ("statusline.sh", "statusline.jq"):
             _ = (scripts / name).write_text((PROGRAM.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
+        library = scripts.parent / "lib"
+        library.mkdir()
+        _ = shutil.copy2(PROGRAM.parents[1] / "lib/py", library / "py")
         (scripts / "assignment.py").symlink_to(PROGRAM.with_name("assignment.py"))
         command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
