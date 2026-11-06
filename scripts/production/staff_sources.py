@@ -155,6 +155,12 @@ class CodexProcessThreads:
         import herdr
         from scripts.message import codex_daemon
 
+        try:
+            return herdr.codex_rollout_thread(pid)
+        except herdr.NoOpenCodexRollout:
+            pass
+        except (OSError, ValueError, herdr.HerdrFailure):
+            return ""
         if identity := environment.get("CODEX_THREAD_ID", ""):
             return identity
         try:

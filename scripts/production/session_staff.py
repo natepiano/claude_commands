@@ -793,6 +793,9 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
                     owner = record.by_current_session(launch["session_id"])
                     if owner is not None:
                         candidates.add(owner.id)
+            if candidates:
+                report_anomaly(f"{holder_text(unit)}: cannot read its thread; staff status may be incomplete",
+                               pid=process_pid(unit))
             if len(candidates) != 1:
                 continue
             runtime_row = record.by_id(next(iter(candidates)))

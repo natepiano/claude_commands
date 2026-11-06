@@ -67,10 +67,35 @@ class StatusDiscoveryTests(StaffTestCase):
             observed = unit_lookup.observed_session_labels(record=staff.snapshot(), running=[])
             grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(),
                                                     sources=labels.MemberSources((launch,)))
-        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(errors.getvalue(),
+                         "anomaly: pid 910001 (claude) in herdr:agents:w1:p1: "
+                         + "cannot read its thread; staff status may be incomplete\n")
         states = grouped.status_units("show")
         self.assertIsInstance(states["broken"].claude, labels.ClaudeUnknown)
         self.assertIsInstance(states["healthy"].claude, labels.ClaudeNotRunning)
+
+    def test_denied_thread_read_reports_only_when_the_pane_holds_staff(self) -> None:
+        row = unit_membership("show", "unit")
+        place = labels.Place("agents", "w2C")
+        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+                            name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
+        unknown = labels.LabeledSession("", labels.ClaudeUnknown("thread read denied"), place,
+                                        labels.ObservedProcess(910001, "codex"))
+        for launches in ((launch,), ()):
+            with (self.subTest(staff_pane=bool(launches)),
+                  mock.patch.object(herdr, "shared_session", return_value=place.session),
+                  mock.patch.object(herdr, "process_environment", return_value={}),
+                  mock.patch.object(herdr, "codex_rollout_thread", side_effect=PermissionError("rollout denied")),
+                  labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
+                grouped = labels.group_labeled_sessions([unknown], record=staff.snapshot(),
+                                                        sources=labels.MemberSources(launches))
+            if launches:
+                self.assertEqual(lines, [f"anomaly: {labels.holder_text(unknown)}: "
+                                         + "cannot read its thread; staff status may be incomplete"])
+                self.assertIsInstance(grouped.status_units("show")[row.name].claude, labels.ClaudeUnknown)
+            else:
+                self.assertEqual(lines, [])
+                self.assertEqual(grouped.status_units("show"), {})
 
     def test_unregistered_thread_in_a_unit_pane_is_quiet_and_not_placed(self) -> None:
         row = unit_membership("show", "unit")
@@ -139,6 +164,7 @@ class StatusDiscoveryTests(StaffTestCase):
             return identity == morty
 
         with (mock.patch.object(herdr, "shared_session", return_value=place.session),
+              mock.patch.object(herdr, "codex_rollout_thread", side_effect=herdr.NoOpenCodexRollout("no rollout")),
               mock.patch.object(herdr, "process_environment", return_value={}),
               mock.patch.object(herdr, "herdr_place_of", return_value=place),
               mock.patch.object(herdr.Herdr, "result", return_value={"pane": {"terminal_title_stripped": "morty | idle"}}),

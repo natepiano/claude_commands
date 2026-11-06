@@ -54,7 +54,8 @@ thousands commas. Times and the date use the production zone.
 Read failures that make the table wrong or incomplete appear as `anomaly:` lines below the table.
 Staff name conflicts also produce lines. The command does not scan other processes.
 A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
-A process without an identity can retain its pane placement for status and recovery.
+A process without an identity reports an unreadable thread when its pane holds staff.
+One staff candidate retains its pane placement with unknown status.
 Morty produces no anomaly when its thread matches `MORTY_NATIVE_ID` in `config/send.conf`.
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
 A failed send adds one anomaly line. It changes neither the table nor the exit code.

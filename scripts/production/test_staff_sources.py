@@ -172,6 +172,9 @@ class StaffSourcesTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # Synthetic processes have no open rollout unless the test supplies one.
+        _ = self.enterContext(mock.patch.object(herdr, "codex_rollout_thread",
+                                                side_effect=herdr.NoOpenCodexRollout("no open rollout")))
         # Keep the host's scratch policy, with a private root for this fixture.
         _ = self.enterContext(mock.patch.object(showrunners, "SCRATCH_ROOT", self.root / "scratch-checkout"))
 
@@ -372,6 +375,37 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertEqual(evidence.diagnostics, ())
                 self.assertEqual(evidence.identities[worker.id], {"codex": worker.current_session})
                 self.assertEqual([entry.row for entry in evidence.workers], [worker])
+
+    def test_current_rollout_overrides_resume_and_does_not_block_the_old_thread(self) -> None:
+        from scripts.message import process_table
+
+        owner = unit_membership("show", "unit")
+        old = fixture_worker("old", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        current = fixture_worker("current", owner.id, backend=staff.CodexBackend(self.root / "codex"))
+        table = {42401: process_table.Process(42401, 1, "codex", f"codex resume {old.current_session}")}
+        record = staff.snapshot()
+        with (mock.patch.object(herdr, "codex_rollout_thread", return_value=current.current_session),
+              mock.patch.object(herdr, "codex_resume_thread", return_value=old.current_session) as resume,
+              mock.patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": old.current_session}),
+              mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(session_staff, "member_sources", return_value=MemberSources(()))):
+            reader = staff_sources.CodexProcessThreads()
+            self.assertEqual(reader.thread(42401, {"CODEX_THREAD_ID": old.current_session}), current.current_session)
+            staff_sources.require_worker_stopped(record, old.id)
+            with self.assertRaises(staff.StaffRefused):
+                staff_sources.require_worker_stopped(record, current.id)
+        resume.assert_not_called()
+
+    def test_unreadable_open_rollout_never_uses_a_lower_identity_source(self) -> None:
+        for failure in (PermissionError("rollout denied"), ValueError("rollout ambiguous"),
+                        herdr.HerdrFailure("rollout read failed")):
+            with (self.subTest(failure=type(failure).__name__),
+                  mock.patch.object(herdr, "codex_rollout_thread", side_effect=failure),
+                  mock.patch.object(herdr, "codex_resume_thread") as resume,
+                  mock.patch.object(herdr, "herdr_place_of") as place):
+                self.assertEqual(staff_sources.CodexProcessThreads().thread(42401, {"CODEX_THREAD_ID": "old"}), "")
+            resume.assert_not_called()
+            place.assert_not_called()
 
     def test_resumed_codex_session_without_a_staff_row_is_quiet(self) -> None:
         from scripts.message import process_table
