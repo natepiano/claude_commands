@@ -1372,7 +1372,7 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 - A cause outside the test: the summary gives the reproduction evidence, the owner and the condition that closes the follow-up.
 - Each file green in 5 runs at normal load. basedpyright 0/0/0 on the changed files. Lint and the tests of the changed files only.
 
-### Phase 64 — `module_cost.py` names the tests with the most CPU  · status: todo
+### Phase 64 — `module_cost.py` names the tests with the most CPU  · status: done
 **Depends on:** Phase 60, Phase 62
 
 #### Work Order

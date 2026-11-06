@@ -23,6 +23,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.test_times.gate_record import ModuleTimes
+from scripts.test_times.module_run import FixtureMeasure, TestMeasure
 
 RUNNER = Path(__file__).with_name("module_run.py").resolve()
 
@@ -385,6 +386,74 @@ class ModuleRunnerTests(unittest.TestCase):
         self.assertEqual(imported[0]["status"], "pass")
         self.assertEqual(times["tests_run"], 2)
         self.assertEqual(times["failures"], 1)
+
+    def test_none_fixtures_keep_the_standard_runner_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = run_fixture(Path(directory), "none_fixtures", """import unittest
+setUpModule = None
+tearDownModule = None
+class Fixtures(unittest.TestCase):
+    setUpClass = None
+    tearDownClass = None
+    def test_runs(self):
+        pass
+""")
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
+        self.assertEqual(fixture.times["tests_run"], 1)
+
+    def test_a_class_without_an_imported_module_keeps_the_standard_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = run_fixture(Path(directory), "absent_module", """import unittest
+class Fixtures(unittest.TestCase):
+    __module__ = "absent_module"
+    def test_runs(self):
+        pass
+""")
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
+        self.assertEqual(fixture.times["tests_run"], 1)
+
+    def test_successful_class_fixture_has_its_own_cpu_measure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = """import time
+import unittest
+
+module_value = 0
+
+def setUpModule():
+    global module_value
+    module_value = 7
+
+class FixtureCPU(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        deadline = time.process_time() + 0.15
+        while time.process_time() < deadline:
+            pass
+        cls.value = module_value
+
+    def test_value(self):
+        self.assertEqual(self.value, 7)
+"""
+            fixture = run_fixture(root, "fixture_cpu", source)
+            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+            self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+            report = cast(dict[str, object], cast(object, fixture.times))
+            fixtures = cast(list[FixtureMeasure], report["fixtures"])
+            setup = next(row for row in fixtures if row["test"] == "setUpClass (test_fixture.FixtureCPU)")
+            test = cast(TestMeasure, fixture.times["tests"][0])
+            self.assertEqual(setup["kind"], "fixture")
+            self.assertEqual(test["kind"], "test")
+            self.assertGreater(setup["cpu_s"], 0.1)
+            self.assertGreater(setup["cpu_s"], test["cpu_s"])
+            self.assertGreater(setup["s"], 0)
+            self.assertEqual(fixture.times["tests_run"], 1)
+            self.assertEqual(fixture.times["tests_s"], test["s"])
+            self.assertTrue(any(row["test"] == "setUpModule (test_fixture)" for row in fixtures))
 
     def test_missing_arguments_print_one_usage_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

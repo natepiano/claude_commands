@@ -6,22 +6,26 @@ import time
 
 _STARTED_AT = time.perf_counter()
 startup_cpu_s = 0.0
+__unittest = True
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 import resource
 import signal
 import sys
 import tempfile
-from types import TracebackType
-from typing import TYPE_CHECKING, ClassVar, Protocol, cast, override
+from types import MethodType, TracebackType
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, override
 import unittest
+import unittest.case as unittest_case
 
 if TYPE_CHECKING:
-    from scripts.test_times.gate_record import ModuleTimes, TestStatus, TestTime
+    from scripts.test_times.gate_record import TestStatus, TestTime
 
 
 ExceptionInfo = tuple[type[BaseException], BaseException, TracebackType] | tuple[None, None, None]
@@ -76,14 +80,18 @@ class TimedResult(TimedResultBase):
         self.open_test: OpenTest | NoOpenTest = NoOpenTest()
         self.outcomes: dict[str, TestStatus] = {}
         self.fixtures: set[str] = set()
+        self.cpu_times: dict[str, float] = {}
+        self.test_cpu_started: float = 0.0
 
     @override
     def startTest(self, test: unittest.TestCase) -> None:
+        self.test_cpu_started = cpu_seconds()
         self.open_test = OpenTest(test.id())
         super().startTest(test)
 
     @override
     def stopTest(self, test: unittest.TestCase) -> None:
+        self.cpu_times[test.id()] = cpu_seconds() - self.test_cpu_started
         super().stopTest(test)
         self.open_test = NoOpenTest()
 
@@ -150,21 +158,141 @@ def timed_outcomes(result: TimedResult) -> list[tuple[str, TestStatus, float]]:
             for test_id, status in result.outcomes.items()]
 
 
+def cpu_seconds() -> float:
+    """Read own CPU and the CPU of children already reaped by this process."""
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
+
+
+class TestMeasure(TypedDict):
+    test: str
+    s: float
+    status: TestStatus
+    kind: Literal["test", "fixture"]
+    cpu_s: float
+
+
+class FixtureMeasure(TypedDict):
+    kind: Literal["fixture"]
+    test: str
+    s: float
+    cpu_s: float
+
+
 def test_times(result: TimedResult) -> list[TestTime]:
-    """Use short test names for the timing output."""
-    return [{"test": test_id if test_id in result.fixtures else test_id.partition(".")[2] or test_id,
-             "s": seconds, "status": status}
-            for test_id, status, seconds in timed_outcomes(result)]
+    """Keep legacy outcome rows and add the CPU and measure kind."""
+    rows: list[TestTime] = []
+    for test_id, status, elapsed in timed_outcomes(result):
+        fixture = test_id in result.fixtures
+        row: TestMeasure = {
+            "test": test_id if fixture else test_id.partition(".")[2] or test_id,
+            "s": elapsed, "status": status,
+            "kind": "fixture" if fixture else "test",
+            "cpu_s": result.cpu_times.get(test_id, 0.0),
+        }
+        rows.append(row)
+    return rows
 
 
-def write_times(path: Path, result: TimedResult, wall_s: float) -> None:
+@contextmanager
+def fixture_measures(suite: unittest.TestSuite | unittest.TestCase
+                     ) -> Generator[list[FixtureMeasure], None, None]:
+    """Measure fixture calls without changing unittest's fixture dispatch."""
+    rows: list[FixtureMeasure] = []
+    restorations: list[tuple[object, str, dict[str, object]]] = []
+    classes: set[type[unittest.TestCase]] = set()
+    modules: set[str] = set()
+    pending: list[tuple[object, str, Callable[[], object], str, bool]] = []
+    depth = 0
+
+    def measured(function: Callable[[], object], name: str) -> Callable[[], object]:
+        @wraps(function)
+        def call() -> object:
+            nonlocal depth
+            if depth:
+                return function()
+            depth += 1
+            cpu = cpu_seconds()
+            started = time.perf_counter()
+            try:
+                return function()
+            finally:
+                depth -= 1
+                rows.append({"kind": "fixture", "test": name,
+                             "s": time.perf_counter() - started,
+                             "cpu_s": cpu_seconds() - cpu})
+        return call
+
+    def install(owner: object, name: str, function: Callable[[], object], label: str,
+                *, class_method: bool = False) -> None:
+        original = {name: vars(owner)[name]} if name in vars(owner) else {}
+        restorations.append((owner, name, original))
+        if class_method and isinstance(function, MethodType):
+            unbound = cast(Callable[[type[unittest.TestCase]], object], function.__func__)
+
+            def class_call(cls: type[unittest.TestCase]) -> object:
+                return measured(lambda: unbound(cls), f"{name} ({cls.__module__}.{cls.__qualname__})")()
+
+            setattr(owner, name, classmethod(class_call))
+        elif class_method:
+            setattr(owner, name, staticmethod(measured(function, label)))
+        else:
+            setattr(owner, name, measured(function, label))
+
+    def visit(test: unittest.TestSuite | unittest.TestCase) -> None:
+        if isinstance(test, unittest.TestSuite):
+            for child in test:
+                visit(child)
+            return
+        cls = type(test)
+        if cls not in classes:
+            classes.add(cls)
+            for name in ("setUpClass", "tearDownClass", "doClassCleanups"):
+                value = cast(object, getattr(cls, name))
+                if value is None:
+                    continue
+                pending.append((cls, name, cast(Callable[[], object], value), f"{name} ({cls.__module__}.{cls.__qualname__})", True))
+        module_name = cls.__module__
+        if module_name not in modules:
+            modules.add(module_name)
+            module = sys.modules.get(module_name)
+            if module is None:
+                return
+            for name in ("setUpModule", "tearDownModule"):
+                if name in vars(module):
+                    value = cast(object, getattr(module, name))
+                    if value is None:
+                        continue
+                    pending.append((module, name, cast(Callable[[], object], value), f"{name} ({module_name})", False))
+
+    try:
+        visit(suite)
+        for owner, name, function, label, class_method in pending:
+            install(owner, name, function, label, class_method=class_method)
+        install(unittest_case, "doModuleCleanups", unittest_case.doModuleCleanups, "doModuleCleanups")
+        yield rows
+    finally:
+        for owner, name, original in reversed(restorations):
+            if name in original:
+                setattr(owner, name, original[name])
+            else:
+                delattr(owner, name)
+
+
+def write_times(path: Path, result: TimedResult, wall_s: float,
+                fixtures: list[FixtureMeasure]) -> None:
     """Replace the output file without changing the test result on failure."""
     temporary = ""
     try:
         own = resource.getrusage(resource.RUSAGE_SELF)
         children = resource.getrusage(resource.RUSAGE_CHILDREN)
         tests = test_times(result)
-        times: ModuleTimes = {
+        for row in tests:
+            if row["test"] in result.fixtures:
+                cast(TestMeasure, row)["cpu_s"] = sum(
+                    fixture["cpu_s"] for fixture in fixtures if fixture["test"] == row["test"])
+        times: dict[str, object] = {
             "wall_s": wall_s,
             "cpu_s": startup_cpu_s + own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime,
             "tests_s": sum(test["s"] for test in tests),
@@ -173,6 +301,7 @@ def write_times(path: Path, result: TimedResult, wall_s: float) -> None:
             "errors": len(result.errors),
             "skipped": len(result.skipped),
             "tests": tests,
+            "fixtures": fixtures,
         }
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=f".{path.name}.", delete=False) as handle:
@@ -197,10 +326,11 @@ class TimedRunner(unittest.TextTestRunner):
 
     @override
     def run(self, test: unittest.TestSuite | unittest.TestCase) -> unittest.TextTestResult:
-        result = super().run(test)
+        with fixture_measures(test) as fixtures:
+            result = super().run(test)
         wall_s = time.perf_counter() - _STARTED_AT
         if isinstance(self.destination, TimesOutput):
-            write_times(self.destination.path, cast(TimedResult, result), wall_s)
+            write_times(self.destination.path, cast(TimedResult, result), wall_s, fixtures)
         return result
 
 

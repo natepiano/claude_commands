@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.terminal_cells import print_table, seconds
@@ -50,6 +52,18 @@ def count_starts(lines: Iterable[str]) -> ProcessStarts:
     return ProcessStarts(processes, execs)
 
 
+class MeasuredTest(TypedDict):
+    test: str
+    kind: Literal["test", "fixture"]
+    cpu_s: float
+    s: float
+
+
+class TimeReport(TypedDict):
+    tests: list[MeasuredTest]
+    fixtures: list[MeasuredTest]
+
+
 @dataclass(frozen=True)
 class ModuleCost:
     module: str
@@ -58,6 +72,7 @@ class ModuleCost:
     wall_s: float
     test_status: int
     trace_status: int
+    tests: list[MeasuredTest]
 
     @property
     def passed(self) -> bool:
@@ -71,10 +86,12 @@ class ModuleCost:
 
 def measure(tree: Path, module: str, strace: str) -> ModuleCost:
     folder, filename = module.rsplit("/", 1)
-    command = [sys.executable, "-m", "unittest", "discover", "-s", f"scripts/{folder}", "-p", filename]
+    command = [sys.executable, str(Path(__file__).with_name("module_run.py")), f"scripts/{folder}", filename]
     environment = dict(os.environ, HERDR_BIN="/nonexistent/herdr", PYTHONDONTWRITEBYTECODE="1")
     with tempfile.TemporaryDirectory(prefix="module-cost-") as temporary:
         root = Path(temporary)
+        report = root / "times.json"
+        environment["TEST_TIMES_OUT"] = str(report)
         with (root / "time.log").open("w+") as output:
             started = time.perf_counter()
             with subprocess.Popen(command, cwd=tree, env=environment,
@@ -85,6 +102,11 @@ def measure(tree: Path, module: str, strace: str) -> ModuleCost:
             if test_status:
                 _ = output.seek(0)
                 _ = shutil.copyfileobj(output, sys.stderr)
+        tests: list[MeasuredTest] = []
+        if report.is_file():
+            data = cast(TimeReport, json.loads(report.read_text()))
+            tests = [row for row in data["tests"] if row["kind"] == "test"] + data["fixtures"]
+        del environment["TEST_TIMES_OUT"]
         trace = root / "starts.trace"
         trace.touch()
         with (root / "trace.log").open("w+") as output:
@@ -97,18 +119,22 @@ def measure(tree: Path, module: str, strace: str) -> ModuleCost:
                 _ = shutil.copyfileobj(output, sys.stderr)
         with trace.open() as lines:
             starts = count_starts(lines)
-    return ModuleCost(module, usage.ru_utime + usage.ru_stime, starts, wall_s, test_status, traced.returncode)
+    return ModuleCost(module, usage.ru_utime + usage.ru_stime, starts, wall_s, test_status, traced.returncode, tests)
 
 
 @dataclass(init=False)
 class CostArguments(argparse.Namespace):
     tree: Path
     modules: list[str]
+    tests: int
+    commands: int
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--tree", type=Path, required=True)
+    _ = parser.add_argument("--tests", type=int, default=0, metavar="N")
+    _ = parser.add_argument("--commands", type=int, default=0, metavar="N")
     _ = parser.add_argument("modules", nargs="+", metavar="folder/file")
     request = parser.parse_args(argv, namespace=CostArguments())
     strace = shutil.which("strace")
@@ -122,6 +148,27 @@ def main(argv: list[str] | None = None) -> int:
              seconds(sum(cost.wall_s for cost in costs)), "PASS" if passed else "RED"]
     print_table(["module", "CPU s", "processes", "execs", "wall s", "test status"],
                 [*[cost.row() for cost in costs], total])
+    print("Counts include the module_run supervisor: one extra process and no extra exec.")
+    if request.tests:
+        rows = [[cost.module, row["test"], row["kind"], seconds(row["cpu_s"]), seconds(row["s"])]
+                for cost in costs
+                for row in sorted(cost.tests, key=lambda row: (-row["cpu_s"], row["test"]))[:request.tests]]
+        print_table(["module", "test or fixture", "kind", "CPU s", "wall s"], rows)
+    if request.commands:
+        from scripts.test_times import task_cpu
+
+        environment = dict(os.environ, HERDR_BIN="/nonexistent/herdr", PYTHONDONTWRITEBYTECODE="1")
+        _ = environment.pop("TEST_TIMES_OUT", None)
+        for cost in costs:
+            folder, filename = cost.module.rsplit("/", 1)
+            command = [sys.executable, str(Path(__file__).with_name("module_run.py")),
+                       f"scripts/{folder}", filename]
+            tasks = task_cpu.measure(command, cwd=request.tree.resolve(), environment=environment)
+            print_table([cost.module + " command", "starts", "CPU s"],
+                        [[row.command, str(row.starts), seconds(row.cpu_s)]
+                         for row in tasks.commands[:request.commands]])
+            print(f"unassigned {tasks.cpu_s - sum(row.cpu_s for row in tasks.commands):+.6f} CPU s")
+            passed = passed and tasks.status == 0
     return int(not passed)
 
 
