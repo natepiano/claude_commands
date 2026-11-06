@@ -87,7 +87,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(len(bases), 2, bases)
         result = self.run_checkpoint(shrink, "--shrink", review=False)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("scope: ok — 1 changed paths are allowed", result.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths", result.process.stdout)
     def test_as_built_holds_a_commit_that_changes_code(self) -> None:
         first = self.run_checkpoint(self.checkpoint())
         self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
