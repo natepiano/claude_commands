@@ -84,10 +84,19 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Completion condition: same-load pairs on builds after each change lands; the Floors row moves to the new median.
   - Revealed by: Phase 31, 2026-11-05.
 - [ ] **Every test runs from the repo root with no PYTHONPATH.**
-  - Target: `scripts/production/test_next_item.py`, two `scripts/notify` test modules, and `scripts/lib` (no package file; needs a module list)
-  - Why needed: these modules fail with an import error unless PYTHONPATH names their folder (natedev, via the showrunner, 2026-11-05; priority later).
-  - Completion condition: each module passes from the repo root with no PYTHONPATH. Fix the imports at the cause; add no new check.
+  - Target: `scripts/production/test_next_item.py`, two `scripts/notify` test modules, `scripts/lib` (no package file; needs a module list), `scripts/production/test_production_lifecycle.py` (cannot import `fake_unit_host`), `scripts/mac_test/test_offload.py` (cannot import `offload`), `scripts/build_hold`, `scripts/buildlog` (`test_width_trial`: no module `store`), `scripts/notify` (`pushover`) and `scripts/shutdown` (`test_support`)
+  - Why needed: these modules fail with an import error unless PYTHONPATH names their folder (natedev, via the showrunner, 2026-11-05).
+  - Priority: the next phase after Phase 33 (showrunner, 2026-11-05). Send the showrunner an ETA when the phase is planned.
+  - Completion condition: each module passes from the repo root with no PYTHONPATH. Fix the test layout once for every folder, not folder by folder (natedev). Fix the imports at the cause; add no new check.
   - Revealed by: natedev, 2026-11-05.
+- [ ] **Three scripts start Python through `scripts/lib/py`, not bare `python3`.**
+  - Target: `scripts/build_hold/cargo:59`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh:35`, `scripts/lint/lint:75`
+  - Why needed: on a Mac with Apple's Python 3.9 first on PATH, a bare `python3` can start the wrong interpreter. Phase 32 fixed the same fault in `conf.sh` (simplify lens, Phase 32).
+  - Priority: after the PYTHONPATH layout phase (showrunner, 2026-11-05).
+  - Steps: 1. Run each of the three scripts on the Mac to learn whether it fails today. 2. Switch all three to `scripts/lib/py`, as one owner of the interpreter rule.
+  - Ownership: `scripts/build_hold/cargo` is in builds; natest takes it. Before an edit to the hook or `scripts/lint/lint`, send the file to the showrunner, who checks the holder.
+  - Completion condition: the three scripts start Python through `scripts/lib/py`; the notice carries the Mac result. Add no new check.
+  - Revealed by: Phase 32 simplify review, 2026-11-05.
 - [ ] **Architecture proposal: the build target commands import less**
   - Target: `scripts/build_hold/build_hold.py` (owner resources; queue-unit takes the cut), `scripts/build_targets/build_targets.py` `eligible` answer (owner verify-unit)
   - Why needed: after Phase 24, `eligible` and `reserve` set the floor of `test_verify_ssh_targets_routing.py`: they import `build_hold`, which imports `admission_service` and `memory_admit` at once (`build_hold.py:40-46`). `eligible` runs 24 times (23.4 traced s).

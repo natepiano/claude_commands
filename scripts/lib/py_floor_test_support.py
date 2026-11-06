@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import re
+import sys
 from typing import cast
 
 
@@ -27,3 +28,10 @@ def cache_file_name() -> str:
     """Use the finder's version floor for the cache name."""
     major, minor = floor()
     return f"python3-{major}.{minor}"
+
+
+def seed_interpreter_cache(cache_home: Path, interpreter: Path | str = sys.executable) -> None:
+    """Seed the launcher cache with the fixture interpreter."""
+    cache = cache_home / "claude" / cache_file_name()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    _ = cache.write_text(str(interpreter) + "\n", encoding="utf-8")
