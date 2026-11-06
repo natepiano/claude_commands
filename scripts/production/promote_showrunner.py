@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote, stop_resume
 from scripts.lib import operation_deadline
+from scripts.herdr import worker_panes
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -207,8 +208,16 @@ def stop(promotion: Promotion) -> bool:
     stopped = isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning))
     if stopped and not unresolved:
         place = promotion.marked.place
+        client = herdr.Herdr(place.session)
+        for state in worker_panes.observe(row.id, staff.snapshot()) if row is not None else []:
+            if isinstance(state, worker_panes.StoppedWorker):
+                try:
+                    if not client.close_tab_confirmed(state.pane, terminal=state.terminal):
+                        print(f"anomaly: {state.row.name}: old worker shell close failed", file=sys.stderr)
+                except (OSError, ValueError, herdr.HerdrFailure) as error:
+                    print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         try:
-            if not herdr.Herdr(place.session).close_tab_confirmed(place.pane, target=promotion.claude.session_id):
+            if not client.close_tab_confirmed(place.pane, target=promotion.claude.session_id):
                 print(f"anomaly: {promotion.unit}: old director tab close failed", file=sys.stderr)
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             print(f"anomaly: {promotion.unit}: {' '.join(str(error).splitlines())}", file=sys.stderr)

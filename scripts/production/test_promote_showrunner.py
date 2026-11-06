@@ -34,7 +34,8 @@ import herdr
 import sessions
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.accounts import accounts
-from scripts.herdr import herdr as trust_reader
+from scripts.herdr import herdr as trust_reader, worker_panes
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.whoami import account
 
 from scripts.production.staff_test_support import StaffTestCase
@@ -82,17 +83,50 @@ def commit_all(path: Path) -> None:
 
 @final
 class PromoteShowrunnerTests(unittest.TestCase):
-    def test_promotion_closes_the_old_tab_only_after_every_stop_proves_success(self) -> None:
-        for unresolved in ([], ["impl: not proved stopped"]):
-            with (self.subTest(unresolved=unresolved),
+    def test_promotion_closes_retained_shells_only_after_every_stop_proves_success(self) -> None:
+        unit = self.staff_unit()
+        retained = fixture_member("worker", name="impl", parent=unit.id)
+        promotion = promote_showrunner.checked("demo", self.child_doc)
+        for unresolved, close_result in (([], True), ([], False), ([], OSError("worker close failed")),
+                                         (["impl: not proved stopped"], True)):
+            world = PaneWorld()
+            world.add(unit, PANE)
+            world.add(retained, "w7:p2", live=False)
+            before = staff.snapshot()
+            def close(pane: str, *, target: str = "", terminal: str = "") -> bool:
+                self.assertEqual((target, terminal), (SESSION, "") if pane == PANE else ("", "terminal-w7:p2"))
+                if pane != PANE:
+                    if isinstance(close_result, OSError):
+                        raise close_result
+                    if not close_result:
+                        return False
+                _ = world.locations.pop(pane)
+                _ = world.foreground.pop(pane, None)
+                return True
+            with (self.subTest(unresolved=unresolved, close_result=close_result),
+                  mock.patch.object(worker_panes, "_client", return_value=world),
+                  mock.patch.object(herdr, "native_process", side_effect=world.native_process),
+                  mock.patch.object(herdr, "_startup_processes", side_effect=world.descendants),
                   mock.patch.object(stop_resume, "stop_unit_workers", return_value=unresolved),
-                  mock.patch.object(herdr.Herdr, "close_tab_confirmed", return_value=True) as close):
-                promotion = promote_showrunner.checked("demo", self.child_doc)
+                  mock.patch.object(herdr.Herdr, "close_tab_confirmed", side_effect=close) as closed,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertIsInstance(worker_panes.observe(unit.id, before)[0], worker_panes.StoppedWorker)
                 self.assertTrue(promote_showrunner.stop(promotion))
-            if unresolved:
-                close.assert_not_called()
-            else:
-                close.assert_called_once_with(PANE, target=SESSION)
+                if unresolved:
+                    closed.assert_not_called()
+                    self.assertEqual(set(world.locations), {PANE, "w7:p2"})
+                else:
+                    self.assertEqual(closed.call_count, 2)
+                    closed.assert_any_call(PANE, target=SESSION)
+                    closed.assert_any_call("w7:p2", terminal="terminal-w7:p2")
+                    self.assertIsInstance(worker_panes.observe(unit.id, staff.snapshot())[0], worker_panes.ClosedWorker)
+                self.assertEqual(staff.snapshot().rows, before.rows)
+                if not unresolved and close_result is not True:
+                    self.assertEqual(set(world.locations), {"w7:p2"})
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn("anomaly: impl:", errors.getvalue())
+                else:
+                    self.assertEqual(errors.getvalue(), "")
 
     def test_promotion_continues_after_a_failed_confirmed_close(self) -> None:
         promotion = promote_showrunner.checked("demo", self.child_doc)
@@ -209,10 +243,14 @@ class PromoteShowrunnerTests(unittest.TestCase):
         def pane_result(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
             del client, deadline
             if arguments[:2] == ("pane", "list"):
+                if "demo-unit" not in self.marked:
+                    return {"panes": []}
                 place = self.marked["demo-unit"].place
                 assert isinstance(place, herdr.HerdrPlace)
                 return {"panes": [{"pane_id": place.pane, "terminal_id": "unit-terminal",
                                    "workspace_id": place.pane.split(":")[0]}]}
+            if arguments[:2] == ("agent", "list"):
+                return {"agents": []}
             if arguments[:2] == ("pane", "process-info"):
                 return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": PID,
                     "foreground_processes": [{"pid": PID, "name": "claude", "argv": ["claude"]}]}}

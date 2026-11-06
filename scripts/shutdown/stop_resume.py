@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 from importlib import import_module
 from threading import Event
@@ -339,20 +339,16 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
         return []
     try:
         deadline = stop_deadline()
-        with redirect_stderr(StringIO()) as notes:
-            states = worker_panes.observe(unit, record)
-            unresolved = [f"{item.row.name}: {item.reason}" for item in states
-                          if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
-            live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
-            client = herdr.Herdr(herdr.shared_session())
-            with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
-                futures = [(item, pool.submit(restart.stop_row, item.row, client, deadline=deadline)) for item in live]
-                for item, future in futures:
-                    if not future.result():
-                        unresolved.append(f"{item.row.name}: not proved stopped")
-        for line in notes.getvalue().splitlines():
-            if line.startswith("warning:"):
-                print(line, file=sys.stderr)
+        states = worker_panes.observe(unit, record)
+        unresolved = [f"{item.row.name}: {item.reason}" for item in states
+                      if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
+        live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
+        client = herdr.Herdr(herdr.shared_session())
+        with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
+            futures = [(item, pool.submit(restart.stop_row, item.row, client, deadline=deadline)) for item in live]
+            for item, future in futures:
+                if not future.result():
+                    unresolved.append(f"{item.row.name}: not proved stopped")
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         unresolved = [f"{unit}: {error}"]
     for line in unresolved:

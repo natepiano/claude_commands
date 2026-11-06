@@ -76,7 +76,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(stop.call_count, 1)
         self.assertEqual(record.rows, tuple(rows))
 
-    def test_unresolved_worker_has_one_report_line_and_keeps_config_warnings(self) -> None:
+    def test_unresolved_worker_has_one_report_line_and_keeps_stop_diagnostics(self) -> None:
         parent = staff.StaffId("holder")
         row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(parent),
                              current_session=staff.StaffId("native-worker"))
@@ -88,7 +88,8 @@ class StopResumeTests(unittest.TestCase):
         with (patch.object(worker_panes, "observe", return_value=[worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)]),
               patch.object(restart, "stop_row", side_effect=stop), redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(stop_resume.stop_unit_workers(parent, staff.StaffSnapshot((row,))), ["impl: not proved stopped"])
-        self.assertEqual(errors.getvalue().splitlines(), ["warning: recovered shutdown configuration", "anomaly: impl: not proved stopped"])
+        self.assertEqual(errors.getvalue().splitlines(), ["warning: recovered shutdown configuration",
+            "impl: restart anomaly: no shell proof", "anomaly: impl: not proved stopped"])
 
     def test_worker_stop_proves_the_retained_pane_without_a_director_tab(self) -> None:
         parent = staff.StaffId("holder")
