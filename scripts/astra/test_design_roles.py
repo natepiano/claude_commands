@@ -317,7 +317,7 @@ class DurableRolesTests(unittest.TestCase):
                                  "held_design_id": design.placement.design_id, "held_role": role,
                                  "launcher_pid": 0}
         _ = path.write_text(json.dumps(roster))
-        write_mesh_server_record(mesh, self.root / "codex-home")
+        self.enterContext(write_mesh_server_record(mesh, self.root / "codex-home"))
         _ = worker_admission.publish(admitted, thread)
         self.launches.append((role, thread))
         if self.lose_creation_ack:
@@ -1893,7 +1893,8 @@ class DurableRolesTests(unittest.TestCase):
                     for path in (directory / folder).rglob("*") if path.is_file()}
         authority_before = self.authority("lookup", {"repository_id": "fixture-repo", "document": "design.md",
                                                   "host": "natedev"})
-        process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+        process = subprocess.Popen(["codex", "-c", "import sys; sys.stdin.read()", "app-server", "--listen",
+                                    "ws://127.0.0.1:32100"], executable=sys.executable,
                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         def clean_process() -> None:
@@ -1920,7 +1921,11 @@ class DurableRolesTests(unittest.TestCase):
                 return {"result": {"status": "notLoaded"}}
             raise AssertionError("unexpected end request: " + method)
 
+        run_command = subprocess.run
+
         def end_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "ps":
+                return run_command(command, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             del options
             self.assertEqual(command[2], "end")
             result = codex_mesh.command_end(argparse.Namespace(session_dir=str(mesh), to=command[-1]))

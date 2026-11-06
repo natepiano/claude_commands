@@ -19,6 +19,7 @@ from scripts.production import staff, session_staff
 
 
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.lib.server_test_support import owned_server_record
 from scripts.lib.signal_test_support import SignalPidGuard, install_signal_pid_guard
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
@@ -1096,6 +1097,12 @@ class MeshCommandFixture(unittest.TestCase):
         self.start_args_timeout = TEST_HANG_GUARD_SECS
         select_fixture_workers(self.home, notes=self.home)
         self.server = StubAppServer(self.respond)
+        list_server_processes = codex_mesh._list_server_processes  # pyright: ignore[reportPrivateUsage]
+
+        def list_fixture_servers() -> str:
+            return list_server_processes() + f"\n{os.getpid()} 0 codex app-server --listen ws://127.0.0.1:{self.server.port}"
+
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_list_server_processes", list_fixture_servers))
         signal_process = codex_mesh._signal_process  # pyright: ignore[reportPrivateUsage]
         reap_process = codex_mesh._reap  # pyright: ignore[reportPrivateUsage]
 
@@ -10334,10 +10341,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
                 row = session_staff.worker_row(self.worker_record())
                 assert row is not None
-                with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                      stdin=subprocess.PIPE) as process:
-                    atomic_file.write_text_atomic(self.session_dir / codex_mesh.SERVER_FILE,
-                        json.dumps({"pid": process.pid, "port": self.server.port}))
+                server = self.session_dir / codex_mesh.SERVER_FILE
+                atomic_file.write_text_atomic(server, json.dumps({"port": self.server.port}))
+                with owned_server_record(server) as process:
                     retire = staff.retire
 
                     def retire_after_stop(identity: staff.StaffId) -> staff.StaffRow | None:
@@ -10359,6 +10365,39 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                     else:
                         self.assertEqual(errors, "")
                         self.assertIsNone(staff.by_id(row.id))
+
+    def test_end_keeps_an_unrelated_process_and_forgets_its_server_record(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE) as process:
+            server = self.session_dir / codex_mesh.SERVER_FILE
+            atomic_file.write_text_atomic(server, json.dumps({"pid": process.pid, "port": self.server.port}))
+            code, output, errors = self.run_mesh(["end", "--to", "worker"])
+            self.assertEqual(code, 0, errors)
+            self.assertEqual(errors.splitlines(), [
+                f"anomaly: app-server {process.pid} on port {self.server.port} is not the recorded server; not signaled"])
+            self.assertNotIn("stopped app-server", output)
+            self.assertIsNone(process.poll())
+            self.assertFalse(server.exists())
+            self.assertEqual(self.worker_record()["status"], "ended")
+            assert process.stdin is not None
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=LauncherHangGuard("unrelated process cleanup").remaining()), 0)
+
+    def test_end_reports_a_failed_process_scan_without_signaling_the_server(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        server = self.session_dir / codex_mesh.SERVER_FILE
+        atomic_file.write_text_atomic(server, json.dumps({"pid": os.getpid(), "port": self.server.port}))
+        with patch.object(codex_mesh, "_running_servers", side_effect=OSError("scan unavailable")), \
+             patch.object(codex_mesh, "_reap") as reap:
+            code, output, errors = self.run_mesh(["end", "--to", "worker"])
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(errors.splitlines(), [
+            f"anomaly: app-server {os.getpid()} on port {self.server.port}: process scan failed: scan unavailable; not signaled"])
+        reap.assert_not_called()
+        self.assertNotIn("stopped app-server", output)
+        self.assertFalse(server.exists())
+        self.assertEqual(self.worker_record()["status"], "ended")
 
     def test_end_keeps_the_server_for_another_open_worker(self) -> None:
         self.write_pool_roster({
@@ -12136,6 +12175,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
               patch.object(worker_lifecycle, "time", self.lifecycle_clock),
               patch.object(self.lifecycle_clock, "sleep", self.lifecycle_clock.advance),
               patch.object(codex_mesh, "_pid_alive", return_value=True),
+              patch.object(codex_mesh, "_list_server_processes",
+                           return_value=f"{pid} 0 codex app-server --listen ws://127.0.0.1:{self.server.port}"),
               patch.object(os, "kill", signal_server),
               contextlib.redirect_stdout(io.StringIO()) as output):
             with self.assertRaisesRegex(SystemExit, "shutdown incomplete.*not confirmed stopped"):
@@ -14064,7 +14105,13 @@ class WorkerPauseTests(MeshCommandFixture):
             self.assertCountEqual(cast(list[object], messages), ["current server task", "retired server task"])
             return True
 
-        with patch.object(codex_mesh, "_reap", side_effect=reap_after_preservation) as reaped:
+        list_server_processes = codex_mesh._list_server_processes  # pyright: ignore[reportPrivateUsage]
+
+        def list_both_servers() -> str:
+            return list_server_processes() + f"\n{os.getpid()} 0 codex app-server --listen ws://127.0.0.1:{retired.port}"
+
+        with (patch.object(codex_mesh, "_reap", side_effect=reap_after_preservation) as reaped,
+              patch.object(codex_mesh, "_list_server_processes", list_both_servers)):
             code, _output, errors = self.run_mesh(["stop", "--pause"])
         self.assertEqual(code, 0, errors)
         self.assertEqual(reaped.call_count, 2)
@@ -19178,12 +19225,19 @@ class ServerRecordTests(unittest.TestCase):
     def test_stop_reaps_the_retired_server_as_well_as_the_live_one(self) -> None:
         # A retired server is abandoned rather than signalled while the run is
         # going, so the end of the run is the only place that can free it.
-        stale_pid = self.sleeper()
+        server = self.session_dir / codex_mesh.SERVER_FILE
+        atomic_file.write_text_atomic(server, json.dumps({"port": 4321}))
+        stale_process = self.enterContext(owned_server_record(server))
+        stale_pid = stale_process.pid
         self.write_server(4321, stale_pid)
         _ = codex_mesh._retire_server(  # pyright: ignore[reportPrivateUsage]
             str(self.session_dir), 4321
         )
-        live_pid = self.sleeper()
+        next_server = current_server(self.session_dir)
+        next_server["port"] = 9876
+        atomic_file.write_text_atomic(server, json.dumps(next_server))
+        live_process = self.enterContext(owned_server_record(server))
+        live_pid = live_process.pid
         self.write_server(9876, live_pid)
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(published_worker_records({
             "project-impl": {
@@ -19203,8 +19257,7 @@ class ServerRecordTests(unittest.TestCase):
         # Reap before asserting: these stand-ins are children of the test
         # process, so an unwaited one leaves a pid `os.kill(pid, 0)` accepts.
         # A real app-server is nobody's child and leaves no such entry.
-        self.assertEqual([stale_pid, live_pid], [each.pid for each in self.spawned])
-        for process in self.spawned:
+        for process in (stale_process, live_process):
             self.assertIsNotNone(
                 process.wait(timeout=LauncherHangGuard('test_stop_reaps_the_retired_server_as_well_as_the_live_one').remaining()), f"app-server {process.pid} outlived stop"
             )

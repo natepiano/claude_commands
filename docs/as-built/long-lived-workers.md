@@ -187,6 +187,8 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 ### Cleanup
 
 - **Worker end.** `codex_mesh.py end` stops the recorded servers when every roster worker has status `ended`.
+  It signals only a process whose pid and `app-server --listen` port match the record.
+  It reports another live process and forgets its record without a signal.
   It stops them before staff retirement, including when retirement refuses.
   Another open worker keeps the servers.
   Held design roles keep their existing lifecycle.

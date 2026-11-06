@@ -2733,6 +2733,7 @@ def _release_held_server_locked(session_dir: str, workers: BulkWorkers) -> None:
     for server in _recorded_run_servers(session_dir):
         port, pid = _as_int(server.get("port")), _as_int(server.get("pid"))
         if not _pid_alive(pid):
+            _forget_run_server(Path(session_dir), pid, port)
             continue
         for name, value in roster.items():
             entry = _as_dict(value)
@@ -2758,11 +2759,10 @@ def _release_held_server_locked(session_dir: str, workers: BulkWorkers) -> None:
                 client.close()
         if time.monotonic() >= workers.deadline:
             raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: held server release deadline expired")
-        if not _reap(pid, deadline=workers.deadline) and _pid_alive(pid):
+        outcome = _reap_recorded_server(server, workers.deadline)
+        if outcome is RecordedServerReap.UNCONFIRMED and _pid_alive(pid):
             raise SystemExit("RoleNeedsRecovery: old server release is uncertain")
-        current = _read_json_object(_session_path(session_dir, SERVER_FILE))
-        if _record_names_server(current, pid, port):
-            _forget_run_server(Path(session_dir), pid, port)
+        _forget_run_server(Path(session_dir), pid, port)
 
 
 def command_release_held_server(args: argparse.Namespace) -> int:
@@ -7133,6 +7133,28 @@ def _reap_run_servers(session_dir: str, *, operation: BulkWorkers | AcquireMembe
         _reap_validated_servers(session_dir, operation.deadline)
 
 
+class RecordedServerReap(Enum):
+    NOT_SIGNALED = "not_signaled"
+    STOPPED = "stopped"
+    UNCONFIRMED = "unconfirmed"
+
+
+def _reap_recorded_server(record: dict[str, object], deadline: float) -> RecordedServerReap:
+    """Signal only the app-server whose process arguments match the record."""
+    pid, port = _as_int(record.get("pid")), _as_int(record.get("port"))
+    if not _pid_alive(pid):
+        return RecordedServerReap.NOT_SIGNALED
+    try:
+        running: set[tuple[int, int]] = {(server.pid, server.port) for server in _running_servers()}
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"anomaly: app-server {pid} on port {port}: process scan failed: {error}; not signaled", file=sys.stderr)
+        return RecordedServerReap.NOT_SIGNALED
+    if (pid, port) not in running:
+        print(f"anomaly: app-server {pid} on port {port} is not the recorded server; not signaled", file=sys.stderr)
+        return RecordedServerReap.NOT_SIGNALED
+    return RecordedServerReap.STOPPED if _reap(pid, deadline=deadline) else RecordedServerReap.UNCONFIRMED
+
+
 def _reap_validated_servers(session_dir: str, deadline: float) -> None:
     """Remove only identities selected under this operation's server lock."""
     selected = [record for record in _recorded_run_servers(session_dir)
@@ -7142,10 +7164,10 @@ def _reap_validated_servers(session_dir: str, deadline: float) -> None:
         if time.monotonic() >= deadline:
             raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: server cleanup deadline expired")
         pid, port = _as_int(record.get("pid")), _as_int(record.get("port"))
-        reaped = _reap(pid, deadline=deadline)
-        if reaped:
+        outcome = _reap_recorded_server(record, deadline)
+        if outcome is RecordedServerReap.STOPPED:
             stopped.append(pid)
-        if not reaped and _pid_alive(pid):
+        if outcome is RecordedServerReap.UNCONFIRMED and _pid_alive(pid):
             raise SystemExit(f"codex_mesh: shutdown incomplete; workers and servers are not confirmed stopped: app-server {pid} is still alive")
         _forget_run_server(Path(session_dir), pid, port)
     print(f"stopped app-server {', '.join(str(pid) for pid in stopped)}" if stopped else "no app-server running")
