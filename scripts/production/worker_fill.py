@@ -18,7 +18,7 @@ from scripts.agents import worker_lifecycle
 def coordinate_claude(name: str, run: Path, prompt: Path, reference: str = "") -> int:
     """Hold the row until the Bash parent confirms dispatch."""
     wait_seconds = conf.read("direct").whole("CLAUDE_WORKER_REGISTER_WAIT_SECS")
-    allowed = worker_admission.admit(name, run, role="", reference=reference)
+    allowed = worker_admission.admit(name, run, reference=reference)
     request = worker_admission.assignment_id(prompt)
     started = False
 
@@ -61,11 +61,18 @@ def coordinate_claude(name: str, run: Path, prompt: Path, reference: str = "") -
 
     def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
         if not started:
-            if worker_admission.dispatch_record(allowed, report_anomaly=False).state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
-                source = worker_admission.transcript_source(published.row, staff.ClaudeBackend())
+            if worker_admission.dispatch_record(allowed.run, allowed.name, report_anomaly=False).state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
+                try:
+                    source = worker_admission.transcript_source(published.row, staff.ClaudeBackend())
+                except ValueError as error:
+                    if str(error) != "no source transcript found":
+                        raise
+                    entries = ()
+                else:
+                    entries = worker_admission.transcript_entries(source, set())
                 torn = False
                 text = prompt.read_text()
-                for entry in worker_admission.transcript_entries(source, set()):
+                for entry in entries:
                     if isinstance(entry, worker_admission.TornTranscriptRecord):
                         torn = True
                     elif entry.startswith("user:\n") and entry.endswith(text):

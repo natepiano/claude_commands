@@ -263,9 +263,9 @@ def agent_inventory(client: herdr.Herdr) -> list[herdr.AgentOccupant]:
     return client.agents()
 
 
-def _stop_row(row: staff.StaffRow, client: herdr.Herdr) -> bool:
-    stop = cast(Callable[[staff.StaffRow, herdr.Herdr], bool], import_module("scripts.shutdown.restart").stop_row)
-    return stop(row, client)
+def _stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
+    stop = cast(Callable[..., bool], import_module("scripts.shutdown.restart").stop_row)
+    return stop(row, client, deadline=deadline)
 
 
 def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | PaneReadUnavailable:
@@ -386,12 +386,13 @@ def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
-    """Read the worker's recorded role through the current shared pass reader."""
-    parent = staff.snapshot().parent_of(row)
-    if parent is None:
-        return WorkerRoleUnavailable("worker parent is unavailable")
-    role = worker_pass(row, worker_run(parent)).get("kind")
-    return role if isinstance(role, str) and role in staff.WORKER_ROLES else WorkerRoleUnavailable("dispatch role is unavailable")
+    """Read the worker's role from its newest open or finished dispatch."""
+    from scripts.direct import progress_history
+
+    dispatch = progress_history.last_dispatch(row.id)
+    if isinstance(dispatch, progress_history.RecordedDispatch) and dispatch.role in staff.WORKER_ROLES:
+        return dispatch.role
+    return WorkerRoleUnavailable("dispatch role is unavailable")
 
 
 def _idle_checks(row: staff.StaffRow, run: Path,
@@ -642,6 +643,12 @@ def _codex_start_session(client: herdr.Herdr, pane: str) -> str:
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold) -> WorkerStart:
+    started = time.monotonic()
+    try:
+        start_seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
+    except conf.Unusable as error:
+        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
+    deadline = started + start_seconds
     client = _client()
     record = staff.snapshot()
     evidence = _evidence(owner.id, record, client)
@@ -699,10 +706,6 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
-    try:
-        start_seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
-    except conf.Unusable as error:
-        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     environment = launch_environment(policy, account, row is not None)
     if isinstance(environment, StartRefused):
         return environment
@@ -717,7 +720,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
     if isinstance(current, OpenWorker):
-        if not _stop_row(current.row, client):
+        if not _stop_row(current.row, client, deadline=deadline):
             return _uncertain(current.row, "agent stop is incomplete; pane retained")
         current = StoppedWorker(current.row, current.pane, current.terminal)
     if isinstance(current, StoppedWorker):
@@ -807,8 +810,13 @@ def close(parent: StaffId, name: WorkerName, *,
                         else Kept("worker parent is unavailable"))
             if isinstance(closable, Kept):
                 return closable
-            if isinstance(observed, OpenWorker) and not _stop_row(observed.row, client):
-                return _uncertain(row, "agent stop is incomplete; pane retained")
+            if isinstance(observed, OpenWorker):
+                try:
+                    seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
+                except conf.Unusable as error:
+                    return Kept(str(error))
+                if not _stop_row(observed.row, client, deadline=time.monotonic() + seconds):
+                    return _uncertain(row, "agent stop is incomplete; pane retained")
             panes = client.panes()
             matches = [pane for pane in panes if pane.get("terminal_id") == observed.terminal]
             if len(matches) != 1 or matches[0]["pane_id"] != observed.pane:

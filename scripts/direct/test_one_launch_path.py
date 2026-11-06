@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from scripts.direct.progress_history import DispatchDetailNotRecorded, RecordedDispatch
 from scripts.lib import resume_message
-from scripts.shutdown.inventory import PausedSeat
+from scripts.lib.resume_message import PausedSeat
 
 from scripts.lib.code_kind import is_test_code
 

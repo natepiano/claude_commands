@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 from scripts.agents import mesh_run_process, worker_lifecycle
 from scripts.production import staff, worker_admission, session_staff
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import models_registry
 from scripts.usage import agents_log
 
 ROSTER = "mesh_roster.json"
@@ -497,7 +498,7 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                         continue
                     if codex_mesh.worker_idle_reason(str(run), name, record, paused=paused, membership=membership):
                         continue
-                    permission = worker_admission.admit(name, run, role=role)
+                    permission = worker_admission.admit(name, run)
                     _ = worker_admission.publish(permission, _text(session_staff.worker_session(record, membership)))
                 elif record.get("status") in ("ended", "running", "starting"):
                     if codex_mesh.worker_idle_reason(str(run), name, record, membership=membership):
@@ -539,7 +540,8 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
             if new_name in ledger.workers or new_name in roster:
                 raise WorkerUnavailable(f"{new_name}: worker name already exists")
             name = new_name
-        record = codex_mesh.open_unit_worker(str(run), name, role,
+        configuration = models_registry.launch_configuration(os.environ)
+        record = codex_mesh.open_unit_worker(str(run), name, role, configuration=configuration,
             model=model or (carried.model if carried is not None else ""),
             effort=effort or (carried.effort if carried is not None else ""),
             cwd=str(working_dir) if working_dir is not None else "")

@@ -20,6 +20,7 @@ from scripts.herdr import herdr
 from scripts.production import session_staff
 from scripts.shutdown import pane_record
 from scripts.lib.agent_program import resolve_program
+from scripts.lib.models_registry import agent_environment
 from scripts.lib.resume_message import resume_message
 
 HOLD_SECONDS = 300
@@ -162,7 +163,7 @@ def run(argv: list[str]) -> int:
             _ = signal.signal(number, ignore)
         for number in (signal.SIGTERM, signal.SIGHUP):
             _ = signal.signal(number, forward)
-        child = subprocess.Popen(argv, env={**environment, "RELAUNCH_SUPERVISED": "1"})
+        child = subprocess.Popen(argv, env=agent_environment({**environment, "RELAUNCH_SUPERVISED": "1"}))
         code = child.wait()
     finally:
         for number, handler in previous.items():
