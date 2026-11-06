@@ -3640,6 +3640,183 @@ with patch.object(fcntl, "flock", admission):
         )
         self.assertEqual(self.pass_events("two-slots", "pass_finished"), [])
 
+    def test_all_dispatch_roles_record_launcher_arguments_for_each_parent_kind(self) -> None:
+        showrunner = fixture_member("showrunner", name="role-owner")
+        unit = fixture_member("unit", name="role-unit", parent=showrunner.id)
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.working_dir), expected=unit.worktree)
+        roles = ("impl", "test", "fix", "review", "astra-designer", "astra-reviewer")
+        plan = self.working_dir / "roles.md"
+        _ = (self.working_dir / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
+        _ = plan.write_text("## Delegation Context\n\n- **Project started:** 1970-01-01T00:00:00+00:00\n")
+        for owner in (showrunner, unit):
+            name = f"roles-{owner.kind}"
+            session = self.root / name
+            _ = self.run_command(
+                "start-run", "--session-dir", str(session), "--working-dir", str(self.working_dir),
+                "--plan-doc", plan.name, "--main-family", "codex", "--main-model", "gpt-main",
+                "--main-session-id", str(owner.current_session), at=41_000,
+            )
+            self.start_phase(session, 41_010)
+            for offset, role in enumerate(roles):
+                with self.subTest(parent=owner.kind, role=role):
+                    command = ["bash", "assign.sh", role, "prompt with spaces", "--literal=$HOME"]
+                    _ = self.run_command(
+                        "check-launch", "--session-dir", str(session), "--phase-id", "3",
+                        "--pass-kind", role, "--fix-cause", "fixture failed gate", at=41_020 + offset,
+                    )
+                    self.start_slot_pass(session, "worker", role, 41_030 + offset, "gpt-called", 0,
+                                         "--launcher-command", json.dumps(command), worker_name="worker")
+                    self.assertEqual(self.pass_slots(session)["worker"]["kind"], role)
+                    self.assertEqual(self.pass_slots(session)["worker"]["launcher_command"], command)
+                    self.finish_slot_pass(session, "worker", "completed", 41_040 + offset)
+            finished = self.pass_events(name, "pass_finished")
+            self.assertEqual([event["pass_kind"] for event in finished], list(roles))
+            self.assertEqual([event["launcher_command"] for event in finished],
+                             [["bash", "assign.sh", role, "prompt with spaces", "--literal=$HOME"] for role in roles])
+
+    def test_launcher_recovery_keeps_the_active_pass_and_saved_command(self) -> None:
+        session = self.start_run("launcher-recovery", 41_000)
+        self.start_phase(session, 41_010)
+        command = ["bash", "review.sh", "prompt with spaces", "--phase", "3"]
+        self.start_slot_pass(session, "review", "review", 41_020, "gpt-called", 0,
+                             "--launcher-command", json.dumps(command), worker_name="review2")
+        path = session / "progress_history_state.json"
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        active = self.pass_slots(session)["review"]
+        self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", worker_name="review2")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.pass_slots(session)["review"], active)
+        self.assertEqual(len(self.pass_events("launcher-recovery", "pass_started")), 1)
+        self.assertEqual(self.pass_events("launcher-recovery", "pass_finished"), [])
+        self.finish_slot_pass(session, "review", "completed", 41_040)
+        finished, = self.pass_events("launcher-recovery", "pass_finished")
+        self.assertEqual(finished["pass_instance_id"], active["instance_id"])
+        self.assertEqual(finished["launcher_command"], command)
+        self.start_slot_pass(session, "review", "review", 41_050, worker_name="review2")
+        self.assertNotEqual(self.pass_slots(session)["review"]["instance_id"], active["instance_id"])
+
+    def test_invalid_launcher_arguments_leave_the_active_pass_unchanged(self) -> None:
+        session = self.start_run("invalid-launcher", 41_000)
+        self.start_phase(session, 41_010)
+        self.start_slot_pass(session, "impl", "impl", 41_020)
+        path = session / "progress_history_state.json"
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        for command in ('"bash assign.sh"', '["bash", 3]', '{}', '[', '[]'):
+            with self.subTest(command=command):
+                result = self.launch_probe(session, "--phase-id", "3", "--launcher-command", command)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--launcher-command", result.stderr)
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(len(self.pass_events("invalid-launcher", "pass_started")), 1)
+        self.assertEqual(self.pass_events("invalid-launcher", "pass_finished"), [])
+
+    def test_dispatch_api_reuses_active_and_completed_passes_after_launcher_loss(self) -> None:
+        session = self.start_run("dispatch-api", 41_000)
+        self.start_phase(session, 41_010)
+        prompt = self.root / "dispatch-prompt.txt"
+        _ = prompt.write_text("Phase 3 — Retry handling\nRead the requested files.\n")
+        command = ["bash", "assign.sh", "impl", str(prompt)]
+        with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
+                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+            first = progress_history.begin_dispatch(
+                session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                launcher_command=command, prompt=prompt, kind="broad", lens="contract",
+            )
+            path = session / "progress_history_state.json"
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            resumed = progress_history.begin_dispatch(
+                session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                launcher_command=command, prompt=prompt, kind="broad", lens="contract",
+            )
+            self.assertEqual(resumed, first)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            stage_two = self.root / "stage-two-prompt.txt"
+            _ = stage_two.write_text("Phase 3 — Retry handling\nComplete the second review stage.\n")
+            second_stage = progress_history.begin_dispatch(
+                session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                launcher_command=command, prompt=stage_two, kind="broad", lens="contract",
+            )
+            self.assertEqual(second_stage, first)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            self.finish_slot_pass(session, "impl2", "completed", 41_030)
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            finished = progress_history.begin_dispatch(
+                session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                launcher_command=command, prompt=prompt, kind="broad", lens="contract",
+            )
+            self.assertEqual(finished, first)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        record = self.pass_slots(session)["impl2"]
+        self.assertEqual((record["kind"], record["worker_name"], record["status"]), ("review", "impl2", "completed"))
+        self.assertEqual(record["launcher_command"], command)
+        self.assertEqual(len(self.pass_events("dispatch-api", "pass_started")), 1)
+        self.assertEqual(len(self.pass_events("dispatch-api", "pass_finished")), 1)
+
+    def test_dispatch_worker_recovers_the_active_and_completed_worker_without_writes(self) -> None:
+        session = self.start_run("dispatch-worker", 41_000)
+        self.start_phase(session, 41_010)
+        prompt = self.root / "retry-prompt.txt"
+        _ = prompt.write_text("Phase 3 — Retry handling\nRead the requested files.\n")
+        command = ["bash", "assign.sh", "review", str(prompt)]
+        with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
+                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+            instance = progress_history.begin_dispatch(
+                session, slot="test", phase="3", role="review", worker_name="impl2",
+                launcher_command=command, prompt=prompt, kind="broad", lens="contract",
+            )
+            for status in ("active", "completed"):
+                with self.subTest(status=status):
+                    if status == "completed":
+                        self.finish_slot_pass(session, "test", "completed", 41_030)
+                    before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                              for path in session.rglob("*") if path.is_file()}
+                    result = progress_history.dispatch_worker(
+                        session, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command,
+                    )
+                    self.assertEqual(result, progress_history.MatchedDispatch("impl2", instance))
+                    for changed_prompt, changed_command in (
+                        (self.root / "different-prompt.txt", command),
+                        (prompt, [*command, "--new-dispatch"]),
+                    ):
+                        result = progress_history.dispatch_worker(
+                            session, slot="test", phase="3", role="review",
+                            prompt=changed_prompt, launcher_command=changed_command,
+                        )
+                        self.assertIsInstance(result, progress_history.NoMatchedDispatch)
+                    self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                      for path in session.rglob("*") if path.is_file()}, before)
+            missing = self.root / "no-recorder-state"
+            before_paths = set(self.root.rglob("*"))
+            self.assertIsInstance(progress_history.dispatch_worker(
+                missing, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command,
+            ), progress_history.NoMatchedDispatch)
+            self.assertEqual(set(self.root.rglob("*")), before_paths)
+
+    def test_fix_dispatch_requires_and_records_the_launcher_repair_metadata(self) -> None:
+        session = self.start_run("fix-dispatch", 41_000)
+        self.start_phase(session, 41_010)
+        prompt = self.root / "repair-prompt.txt"
+        _ = prompt.write_text("Phase 3 — Retry handling\nRepair the failed gate.\n")
+        command = ["bash", "implement.sh", "--role", "fix", str(prompt)]
+        with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
+                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+            with self.assertRaisesRegex(SystemExit, "Fix launch has no ledger round"):
+                _ = progress_history.begin_dispatch(
+                    session, slot="test", phase="3", role="fix", worker_name="fix",
+                    launcher_command=command, prompt=prompt, kind="implementation", lens="",
+                )
+            self.assertEqual(self.pass_slots(session), {})
+            instance = progress_history.begin_dispatch(
+                session, slot="test", phase="3", role="fix", worker_name="fix",
+                launcher_command=command, prompt=prompt, kind="implementation", lens="",
+                fix_cause="The recorder gate failed", fix_pass=2, activity="repair the recorder gate",
+            )
+        record = self.pass_slots(session)["test"]
+        self.assertEqual(record["instance_id"], instance)
+        self.assertEqual((record["fix_pass"], record["activity"]), (2, "repair the recorder gate"))
+        started, = self.pass_events("fix-dispatch", "pass_started")
+        self.assertEqual(cast(dict[str, object], started["launch_check"])["fix_cause"], "The recorder gate failed")
+
     def test_three_slots_each_record_a_start_and_a_finish_of_their_own(self) -> None:
         """The whole team's work reaches the ledger, in the order it happened."""
         session_dir = self.start_run("three-slots", 41_000)

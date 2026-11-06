@@ -53,10 +53,8 @@ The settings.json entry, one more SessionStart item:
   `--settings '{"disableAgentView": true}'`, with no opening prompt. Then it closes the restored
   tab by its pane id: ordering the tabs keeps pane ids. A failed start closes the new tab and
   keeps the restored one. Any failure makes the exit status 1.
-- `herdr.keeps_restored_layout(session)` is true for `shared_session()` only when herdr's
-  config sets `[session] resume_agents_on_restore = false`. Else herdr resumes each pane itself
-  on the server's account, so `_clear_restored_workspaces` clears the layout, as for every other
-  session.
+- Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
+  herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
 - `shutdown.py restart --all` stops and starts the local live Claude staff rows.
 - `shutdown.py restart` starts the missing rows from the saved row ID list.
 - Staff supplies the current session and worktree. Herdr saves tab order by staff row ID.
