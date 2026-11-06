@@ -392,7 +392,7 @@ subprocess.run([sys.executable, '-c',
         case_id = rca.open_case(HANDLER._replace(kind="auto_mode", commands=("write progress.json",)), OPENED).split()[-1]
         case = self.case(case_id)
         delivered = flags(self.sends()[0])["--text"]
-        self.assertIn("handler-unit on natedev had a command refused by auto mode.", delivered)
+        self.assertIn("handler on natedev had a command refused by auto mode.", delivered)
         self.assertIn("Find why this happened and fix the source.", delivered)
         for text in (delivered, rca.owner_message(case, reminder=True), *rca.story(case).values()):
             with self.subTest(text=text):
