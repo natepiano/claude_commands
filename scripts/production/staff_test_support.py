@@ -24,6 +24,7 @@ from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import pane_record, remote
@@ -832,8 +833,8 @@ class StaffTestCase(unittest.TestCase):
 
     @contextmanager
     def lock_notice(self, lock: Path) -> Generator[socket.socket]:
-        path = self.root / "operation-notice.sock"
-        with socket.socket(socket.AF_UNIX) as listener:
+        with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+            path = Path(directory) / "operation-notice.sock"
             listener.bind(str(path))
             listener.listen()
             listener.settimeout(TEST_HANG_GUARD_SECS)
