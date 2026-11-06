@@ -5,12 +5,14 @@ The separate asyncRewake Stop entry runs this hook in the background.
 Exit 2 sends the reason from stderr to the agent in a system-reminder.
 The guards permit declared waits, background tasks, and stops without context measurements.
 The hook repeats the wake above the threshold until compaction reduces the context.
+Paused status lines permit the stop without a wake.
 Exceptions permit the stop without output.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import cast
@@ -73,6 +75,15 @@ def main() -> None:
         return
     tokens = measurement["tokens"]
     if tokens < handoff_threshold(window):
+        return
+
+    from scripts.production.stall_watch import watch_config
+
+    lines = final_message.strip().splitlines()
+    status = lines[-1].strip().removeprefix("— ") if lines else ""
+    if re.search(
+        watch_config(status_defaults=True)["paused_status_pattern"].strip(), status, re.IGNORECASE
+    ):
         return
 
     # Only live tasks reported by the CLI supply a later request. A worker's

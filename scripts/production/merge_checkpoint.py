@@ -185,7 +185,6 @@ class Unit(NamedTuple):
     plan: Path
     worktree: Path
     branch: str
-    owns: tuple[str, ...]
     staff_id: staff.StaffId
 
 
@@ -199,7 +198,6 @@ class MergeRequest(NamedTuple):
     unit: Unit
     phase: str
     commit: str
-    also: tuple[str, ...]
     kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit
     push: ValidateAndPush | GitPush
     promotion: production_doc.NoPromotion | production_doc.PromoteTo
@@ -207,7 +205,6 @@ class MergeRequest(NamedTuple):
     flakes: frozenset[str]
     flaky_tests: frozenset[str]
     units: tuple[Unit | UnitUnavailable, ...]
-    lines: tuple[str, ...]
     scratch: Path
     trailer: tuple[str, ...]
     review_trial: ReviewTrial | NoReviewTrial
@@ -311,7 +308,7 @@ def unit_from_row(row: staff.StaffRow, resolver: session_staff.RowResolver) -> U
         return UnitUnavailable(name, config.reason)
     plan = (config.plan.path if isinstance(config.plan, unit_config.PlanFile)
             else Path("standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"))
-    return Unit(name, plan, location.path, branch.name, config.responsibilities, row.id)
+    return Unit(name, plan, location.path, branch.name, row.id)
 
 
 def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...], ...]:
@@ -416,8 +413,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     scratch = Path(cast(str | None, args.scratch) or os.environ.get("MERGE_CHECKPOINT_SCRATCH")
                    or tempfile.gettempdir()).expanduser()
     return MergeRequest(production, unit, cast(str, args.phase), cast(str, args.hash),
-                        tuple(cast(list[str], args.also)), kind, push, promotion,
-                        parse_merge_tests(lines, production.checkout), flakes, flaky_tests, units, tuple(lines), scratch,
+                        kind, push, promotion,
+                        parse_merge_tests(lines, production.checkout), flakes, flaky_tests, units, scratch,
                         tuple(cast(list[str], args.trailer)), review_trial, delivers or "",
                         cast(bool, args.cancel_prior), cast(str, args.started),
                         cast(str, args.regime), cast(int, args.holds), cast(int, args.merge_defects),
@@ -593,10 +590,6 @@ def changed_paths(request: MergeRequest, base: str = "") -> tuple[str, ...]:
     return merge_paths(request.production.checkout, base or request.production.merge_branch, request.commit)
 
 
-def allowed(path: str, ownership: tuple[str, ...]) -> bool:
-    return any(path == item or path.startswith(item.rstrip("/") + "/") for item in ownership)
-
-
 def _origin_merge_refs(request: MergeRequest) -> list[str]:
     return list(dict.fromkeys([
         f"origin/{request.production.merge_branch}",
@@ -625,11 +618,6 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
 
 
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
-    if isinstance(request.kind, CodeCheckpoint) and not request.unit.owns:
-        raise Refusal(f"unit {request.unit.name}: .unit.toml has no responsibilities; "
-                      + "run python3 -m scripts.production.owns_fill, then rerun the checkpoint")
-    board_free = isinstance(request.kind, CodeCheckpoint) and unit_config.BOARD_FREE in request.unit.owns
-    outside: list[str] = []
     staged = good(git(request.production.checkout, "diff", "--cached", "--name-only"), "scope")
     if staged:
         raise Stop("scope", "held", f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}",
@@ -651,33 +639,8 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
             raise Stop("scope", "held", f"an as-built commit carries only docs and must change or delete {plan}; "
                        + f"got {', '.join(paths)}",
                        "commit only the as-built docs and the plan's deletion, then resend the as-built")
-    elif not board_free:
-        hubs = hub_paths(request.lines, request.unit.name)
-        outside = [path for path in paths if not allowed(path, (*request.unit.owns, *hubs))]
-        unexpected = [path for path in outside if not allowed(path, request.also)]
-        if unexpected:
-            raise Stop("scope", "held", f"outside responsibilities: {', '.join(unexpected)}",
-                       f"explain why these paths changed: {', '.join(unexpected)}")
-    report("scope", "ok", f"{len(paths)} changed paths are allowed"
-           + (" (board-free)" if board_free else "")
-           + (f"; {len(outside)} only by --also" if outside else "")
+    report("scope", "ok", f"{len(paths)} changed paths"
            + (f"; {imported} came from origin merge branches" if imported else ""))
-
-
-def hub_paths(lines: tuple[str, ...], unit: str) -> tuple[str, ...]:
-    if "## Hub files" not in lines:
-        return ()
-    start = lines.index("## Hub files") + 1
-    result: list[str] = []
-    for line in lines[start:]:
-        if line.startswith("## "):
-            break
-        if not line.startswith("|") or line.startswith("| ---") or line.startswith("| File"):
-            continue
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) >= 3 and unit in (cells[1] + " " + cells[2]):
-            result.append(cell_value(cells[0]))
-    return tuple(result)
 
 
 def conflicts(request: MergeRequest) -> None:
@@ -1886,7 +1849,6 @@ def main() -> int:
     _ = parser.add_argument("--from-child")
     _ = parser.add_argument("--checkpoint")
     _ = parser.add_argument("--root-self", action="store_true")
-    _ = parser.add_argument("--also", action="append", default=[])
     _ = parser.add_argument("--shrink", action="store_true")
     _ = parser.add_argument("--as-built", action="store_true")
     _ = parser.add_argument("--trailer", action="append", default=[])
@@ -1911,7 +1873,7 @@ def main() -> int:
             if any((cast(str | None, args.unit), cast(str | None, args.phase), cast(str | None, args.hash),
                     cast(bool, args.shrink), cast(bool, args.as_built), cast(bool, args.bump), cast(str | None, args.review_trial),
                     cast(str | None, args.parallel), cast(str | None, args.delivers), cast(bool, args.cancel_prior),
-                    cast(list[str], args.also), cast(list[str], args.trailer),
+                    cast(list[str], args.trailer),
                     cast(str, args.regime) != "after", cast(int, args.holds), cast(int, args.merge_defects),
                     cast(str | None, args.excluded), cast(str | None, args.scratch))):
                 raise Refusal("--from-child is separate from unit checkpoint arguments")

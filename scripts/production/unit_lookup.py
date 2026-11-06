@@ -154,8 +154,6 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
                     cells["Plan"] = "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
                 if isinstance(config.port, unit_config.AppPort):
                     cells["Port"] = str(config.port.number)
-                if config.responsibilities:
-                    cells["Owns"] = ", ".join(config.responsibilities)
             else:
                 reason = config.reason if not isinstance(config, session_staff.NoUnitConfig) else "no unit configuration"
                 cells["Plan"] = "unavailable: " + reason

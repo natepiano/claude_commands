@@ -349,11 +349,11 @@ class WaitingTests(unittest.TestCase):
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
-                                     "alpha-branch", ("shared.txt",), unit_membership("showrunner-example", ALPHA).id)
+                                     "alpha-branch", unit_membership("showrunner-example", ALPHA).id)
         request = merge_checkpoint.MergeRequest(
-            production._replace(log=producer_log), unit, phase, unit_tip, (),
+            production._replace(log=producer_log), unit, phase, unit_tip,
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with redirect_stdout(io.StringIO()):
