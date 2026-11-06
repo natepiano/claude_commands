@@ -525,7 +525,9 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.add_unit("alpha")
         self.die("alpha")
         with patch.object(staff, "snapshot", side_effect=self.current_staff):
-            return unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
+            source = unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(source, unit_watchdog.RecoverySource)
+        return source
 
     def test_newest_moved_launch_decides_recovery_account_after_one_tick(self) -> None:
         _ = self.add_unit("alpha")
@@ -595,6 +597,7 @@ class UnitWatchdogTests(unittest.TestCase):
         pane_record.write("shared", entry)
         with patch.object(staff, "snapshot", side_effect=self.current_staff):
             source = unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(source, unit_watchdog.RecoverySource)
         failure, launches = self.recover_queued(source)
         self.assertEqual(failure, "")
         self.assertEqual(len(launches), 1)
@@ -811,10 +814,10 @@ class UnitWatchdogTests(unittest.TestCase):
     def test_finished_recovery_without_a_source_removes_the_outage_and_result(self) -> None:
         state, result = self.finished_recovery()
         unit_watchdog._write_state(state)  # pyright: ignore[reportPrivateUsage]
-        _ = pane_record.forget_unit("unit")
+        with patch.object(staff, "snapshot", side_effect=self.current_staff):
+            _ = pane_record.forget_unit("unit")
         self.die("unit")
-        with (patch.object(unit_watchdog, "_sources", return_value={}),
-              patch.object(unit_watchdog, "_restart") as resumed):
+        with patch.object(unit_watchdog, "_restart") as resumed:
             lines = self.pass_at(3)
         resumed.assert_not_called()
         self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
@@ -948,6 +951,26 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = self.pass_at(14)
             _ = self.pass_at(16)
             self.assertEqual(phone.call_count, 0)
+
+    def test_failed_launch_read_keeps_the_running_job_without_duplicate_recovery(self) -> None:
+        _ = self.add_unit("alpha")
+        self.finish_jobs = False
+        self.die("alpha")
+        _ = self.pass_at(0)
+        _ = self.pass_at(2)
+        state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("job", state["alpha"])
+        self.assertEqual(len(self.pending), 1)
+        with patch.object(pane_record, "launch_for_session", side_effect=OSError("launch unreadable")):
+            lines = self.pass_at(3)
+        self.assertEqual(lines, ["watchdog: fixture/alpha session alpha: launch unreadable"])
+        with self.subTest(pass_kind="failed read"):
+            self.assertEqual(unit_watchdog._read_state(), state)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.pass_at(4), [])
+        self.assertEqual(self.pass_at(5), [])
+        self.assertEqual(unit_watchdog._read_state(), state)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(self.pending), 1)
+        self.assertEqual(self.commands, [])
 
     def test_pending_detached_restarts_do_not_wait_or_start_duplicate_commands(self) -> None:
         self.finish_jobs = False

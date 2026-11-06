@@ -91,6 +91,12 @@ class RecoverySource:
     identity: str
 
 
+@dataclass(frozen=True)
+class NoRecovery:
+    """The unit has no launch record or its newest launch has ended."""
+    session_id: str
+
+
 def _state_file() -> Path:
     return Path.home() / ".local/state/accounts/unit_watchdog.json"
 
@@ -145,11 +151,11 @@ def _write_state(state: dict[str, DownOutage]) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> dict[tuple[str, str], RecoverySource]:
+def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> dict[tuple[str, str], RecoverySource | NoRecovery]:
     from scripts.accounts import accounts
 
     record = staff.initial_snapshot()
-    sources: dict[tuple[str, str], RecoverySource] = {}
+    sources: dict[tuple[str, str], RecoverySource | NoRecovery] = {}
     for member in staff.active(record, "unit"):
         if not isinstance(member.worktree, staff.PresentWorktree) or member.worktree.machine != local_machine():
             continue
@@ -161,6 +167,7 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
             report_failure(f"watchdog: {production}/{member.name} session {member.current_session}: {error}")
             continue
         if entry is None or entry.get("ended", False):
+            sources[(production, member.name)] = NoRecovery(member.current_session)
             continue
         label = accounts.claude_config_label(Path(entry["config_dir"]))
         owner = RecoverableUnit(session_id=member.current_session, name=member.name,
@@ -310,9 +317,10 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                     try:
                         source = sources.get((runner["name"], unit))
                         if source is None:
-                            member = staff.snapshot().by_path(f"{runner['name']}/{unit}")
-                            if member is not None and not dry_run:
-                                key = member.current_session
+                            continue
+                        if isinstance(source, NoRecovery):
+                            if not dry_run:
+                                key = source.session_id
                                 outage = state.get(key)
                                 if outage is not None and "job" in outage:
                                     Path(outage["job"]["result"]).unlink(missing_ok=True)
