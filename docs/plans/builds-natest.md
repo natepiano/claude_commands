@@ -82,6 +82,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
      - Remove trivial tests (Invariants above) only when step 2 shows tests that read as repeats: tests with the same setup and the same assertion target. Then run `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` and compare each candidate's assertions with its covering tests; a candidate whose result a covering test also checks is a trivial test. Skip the sweep in a module whose time is in process starts: Phase 13 found no repeat in five such modules.
      - Remove a fixed wait: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. This cut gains wall time and no CPU (Phase 56: 30.5 to 31.1 CPU s), so it does not reach the target alone. A fixed wait often causes flakes, so a flaky module is a target too.
      - Split a module only to gain wall time. A split adds CPU, so it never counts as a CPU gain. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time.
+     - Cuts add up. A cut that cannot reach half alone still counts, so state a floor only after the available cuts. Look first for repeated first launches that are setup (Phase 55).
   4. A change to a shared support file (for example `scripts/lint/memory_test_support.py`) is allowed only when every module that imports it stays green; name those importers in the final run. A cut in `verify.sh` or another production file goes to its owner: verify for `verify.sh` (showrunner, 2026-11-06).
   5. After the edit, measure the gain. Run `module_cost.py` on the phase base and on the result, one after the other, for processes and execs. Same-load pairs give CPU s and wall s: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. Each side sets `TMPDIR` to its own folder under `/dev/shm` and removes it after the round, because the gate runs there and pays no `fsync` cost (Phase 47). The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the CPU is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. A floor names its cost breakdown and the one operation that limits it. A proposal names its owner, its revisit condition, and whether its gain is measured or estimated. Report CPU s and process count first, then wall s, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
 
@@ -1136,34 +1137,23 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 ### Phase 55 — The Claude launcher records test uses half its CPU  · status: done
 **Depends on:** Phase 54
 
-#### Work Order
+#### As-built
 
-**Goal:** `test_implement_launcher_records.py` (43.6 CPU s per gate on 2026-11-06) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+`FindingsFixture` shares one real first launch per setup kind. `setUpClass` clears the class's `completed_setups`, and `first_worker_launch(*, repair=False)` copies a finished launch's files for each later test. Each decision stays on a real launch.
 
-**Spec:** Follow the Speed method.
-1. Take a new baseline with `module_cost.py --tests 10 --commands 10`. Name the test count, and each real launcher process that each test starts.
-2. Six tests start the same first launch as setup, and only the second launch carries their proof. Run that first launch once per class, and copy its state for each test, in the form of `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. Shared setup needs no direct call, and all decisions stay on the real launch.
-3. Test launcher logic by direct calls where a function exists. Keep a few real dispatches, each for a path that no direct call can prove.
-4. A cut in a production file goes to the director first, with the measured gain.
-5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+Same-load medians of three pairs: CPU 62.325 to 33.024 s (47.0%), processes 1,687 to 1,116, execs 2,217 to 1,478, wall 101.245 to 59.589 s. Real launches 16 to 11. Findings setup commands 12 to 4. 51 assertions and nine test names stay. The tests pass in reverse order, and each passes alone.
+
+The targeted test on the gate had three red modules, and none came from this phase. Phase 65 caused two. The third, `production/test_merge_gate_suites_admission.py`, hung at load 140 and passes alone on the base.
 
 **Files:**
-- `scripts/direct/test_implement_launcher_records.py` — 43.6 CPU s
-- `scripts/direct/implement_launcher_test_support.py` — the Claude records fixture
+- `scripts/direct/test_implement_launcher_records.py` — the tests call `first_worker_launch`
+- `scripts/direct/implement_launcher_test_support.py` — the shared first launch
 
-**Workers:** 1 writer on slot `test` (one test file and its fixture)
-- `test` — all files above, role impl
+**Binds later work:** the floor is 1.861 CPU s above half. The rest is repeated interpreter starts at inline Python sites in `implement.sh`, `agent_bg.sh`, `claude_account.sh` and `heartbeat_watch.sh`, a proposal the showrunner holds.
 
-**Constraints from prior phases:**
-- Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:** the snapshot lines repeat `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. Phase 68 settles that copy.
 
-**Acceptance gate:**
-- the changed file and each module that imports the fixture are green; the behavior map has one row per assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- CPU s, processes, execs and wall s before and after, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** a floor claimed from each cut alone. The first worker's result missed the repeated first launches.
 
 ### Phase 56 — The SSH retained and retry tests run in half their time  · status: done
 **Depends on:** none
@@ -1511,11 +1501,13 @@ SIGINT at its default did not prove the cause of any failure in Spec step 5. `ev
 - `scripts/direct/test_assign_launcher_identity.py` — 64.5 CPU s
 - `scripts/direct/test_assign_launcher_review.py` — 43.8 CPU s
 - `scripts/direct/assign_launcher_test_support.py` — the assign fixture
+- `scripts/direct/implement_launcher_test_support.py` — the Phase 55 snapshot lines
 
 **Workers:** 1 writer on slot `impl4` (one fixture family)
 - `impl4` — all files above, role impl
 
 **Constraints from prior phases:**
+- Phase 55: `implement_launcher_test_support.py` repeats the snapshot lines of `FirstDispatchFixture.first_assignment`. Put both on one shared helper in this phase.
 - Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. Before the coordinator change, the coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
 - Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
