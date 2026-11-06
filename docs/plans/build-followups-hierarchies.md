@@ -620,7 +620,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Gotchas:** the gate on this checkpoint was red in 4 modules: `test_progress_history`, `test_session_pane`, `test_roles_audit` and `test_stop_resume`. The cause is outside this phase. Tests with a private staff record read the real timer folder, and the sdlc-devtools fix ec4762af6 repairs it.
 
-### Phase 24 — A worker list prints each run anomaly once  · status: todo
+### Phase 24 — A worker list prints each run anomaly once  · status: done
 
 **Depends on:** none
 
@@ -631,6 +631,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Cause (found by the unit director, on sdlc 5918b1e28):**
 - `worker.py list_workers` calls `worker_panes.dispatch_role(row)` per worker. That calls `worker_run(parent)`, `unit_runs.held` with no `scanned`, and a full `held_by_session` scan. `unit_runs.director` prints one line per ownerless folder in each scan. So the block repeats once per worker. Each scan also costs about 0.5 s. The other `dispatch_role` loops in `worker.py` do the same.
 - A read creates a run folder. `session_staff.read_worker_roster` goes through `worker_lifecycle.locked_state`, which makes the folder and a `mesh_roster.json.lock`. So a read with a wrong run path leaves a new folder behind.
+- The anomaly line has an empty name. Every `send.py` call prints `anomaly: <run>: no showrunner staff row for ` for each run that names no owner. `worker_admission.parent` found no unit, no production and no staffed worker, and its last step looks up a showrunner named "". sdlc added this on 2026-11-06.
 
 **Spec:**
 1. `scripts/lib/unit_runs.py` `director`: print each anomaly line once per process.
@@ -638,16 +639,19 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 3. A read of a worker roster in a folder that does not exist reads as a missing roster and creates nothing. A write still creates its folder.
 4. Tests: one `worker.py list` over several workers and an ownerless folder prints each anomaly line once and makes one `held_by_session` scan. A roster read of a missing folder leaves no folder.
 5. Delete no folder under `/tmp/claude`. Add no check, guard or refusal.
+6. `scripts/production/worker_admission.py` `parent`: when no unit and no production name is known, the error is a whole sentence that names what is missing. With a run: `this run has no owner because progress_history_state.json and mesh_roster.json name no unit, production or staff row`. With no run: `the caller has no staff row and names no unit or production`. The state-file read anomaly in `parent` also prints once per process, through `unit_runs.report_anomaly`. Tests expect the new text.
 
 **Files:**
 - `scripts/lib/unit_runs.py`
 - `scripts/herdr/worker_panes.py`
 - `scripts/production/worker.py`
 - `scripts/production/session_staff.py`
+- `scripts/production/worker_admission.py`
 - `scripts/agents/worker_lifecycle.py`
 - `scripts/lib/test_unit_runs.py`
 - `scripts/herdr/test_worker_panes.py`
 - `scripts/production/test_worker.py`
+- `scripts/production/test_worker_admission.py`
 - `scripts/production/test_session_staff.py`
 
 **Workers:** 1 writer, slot impl2.

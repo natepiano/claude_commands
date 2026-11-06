@@ -299,8 +299,9 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
             name = matched.worker_name
     record = staff.snapshot()
     rows = record.find(kind="worker", parent=parent)
+    run = worker_panes.worker_run(record.rows_by_id[parent])
     if role in ("impl", "fix", "review", "test") and not any(
-            isinstance(worker_panes.dispatch_role(row), str) for row in rows):
+            isinstance(worker_panes.dispatch_role(row, run), str) for row in rows):
         names = {row.name for row in rows}
         for default_role in ("impl", "fix", "review", "test"):
             if default_role in names:
@@ -342,6 +343,7 @@ def end(parent: StaffId, name: WorkerName) -> ExitCode:
 
 def restore(parent: StaffId) -> ExitCode:
     record = staff.snapshot()
+    run = worker_panes.worker_run(record.rows_by_id[parent])
     changed = False
     outcome = ExitCode.OK
     for state in worker_panes.observe(parent, record):
@@ -351,7 +353,7 @@ def restore(parent: StaffId) -> ExitCode:
             outcome = ExitCode.UNCERTAIN
             continue
         try:
-            role = worker_panes.dispatch_role(state.row)
+            role = worker_panes.dispatch_role(state.row, run)
             result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role)
             code = _startup_result(WorkerName.parse(state.row.name), result)
         except (herdr.HerdrFailure, OSError) as error:
@@ -369,8 +371,9 @@ def restore(parent: StaffId) -> ExitCode:
 
 def list_workers(parent: StaffId, record: staff.StaffSnapshot) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
+    run = worker_panes.worker_run(record.rows_by_id[parent])
     for state in worker_panes.observe(parent, record):
-        role = worker_panes.dispatch_role(state.row)
+        role = worker_panes.dispatch_role(state.row, run)
         fields: dict[str, object] = {"name": state.row.name, "id": str(state.row.id),
             "current_session": str(state.row.current_session), "state": type(state).__name__}
         fields["role"] = role if isinstance(role, str) else {"state": "WorkerRoleUnavailable", "reason": role.reason}
@@ -449,10 +452,11 @@ def main(arguments: list[str] | None = None) -> int:
                     print(f"{fields['name']} {fields['role']} {fields['state']} {fields.get('activity', '')} {fields.get('reason', '')}".rstrip())
             return ExitCode.OK
         if args.command == "check":
+            run = worker_panes.worker_run(owner)
             wrong = [state for state in worker_panes.observe(owner.id, record)
                      if not isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker, worker_panes.ClosedWorker))
                      or (not isinstance(state, worker_panes.OpenWorker)
-                         and isinstance(worker_panes.dispatch_role(state.row), worker_panes.WorkerRoleUnavailable))]
+                         and isinstance(worker_panes.dispatch_role(state.row, run), worker_panes.WorkerRoleUnavailable))]
             for state in wrong:
                 print(f"{state.row.name}: {getattr(state, 'reason', 'dispatch role is unavailable')}")
             return int(bool(wrong))

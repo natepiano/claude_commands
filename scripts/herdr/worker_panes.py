@@ -371,12 +371,9 @@ def _worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
                  or item.get("team_slot") == row.name), no_pass)
 
 
-def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
+def dispatch_role(row: staff.StaffRow, run: Path) -> WorkerRole | WorkerRoleUnavailable:
     """Read the worker's recorded role through the current shared pass reader."""
-    parent = staff.snapshot().parent_of(row)
-    if parent is None:
-        return WorkerRoleUnavailable("worker parent is unavailable")
-    role = _worker_pass(row, worker_run(parent)).get("kind")
+    role = _worker_pass(row, run).get("kind")
     return role if isinstance(role, str) and role in staff.WORKER_ROLES else WorkerRoleUnavailable("dispatch role is unavailable")
 
 

@@ -9,6 +9,7 @@ import os
 from unittest import mock
 
 from scripts.lib import unit_runs
+from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import session_staff as labels, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
@@ -17,6 +18,15 @@ from pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_missing_roster_read_creates_nothing_and_a_writer_creates_the_folder(self) -> None:
+        path = self.root / "missing/run/mesh_roster.json"
+        self.assertEqual(labels.read_worker_roster(path), {})
+        self.assertFalse(path.parent.parent.exists())
+        with worker_lifecycle.locked_state(path) as handle:
+            handle.publish('{}')
+        self.assertEqual(path.read_text(), '{}')
+        self.assertEqual(labels.read_worker_roster(path), {})
+
     def test_pane_parents_selects_only_local_pane_workers_from_the_record(self) -> None:
         config, runs = self.root / "config", self.root / "runs"
         config.mkdir()

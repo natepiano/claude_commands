@@ -401,6 +401,9 @@ class WorkerStateFile:
 def locked_state(path: Path, *, mode: int = fcntl.LOCK_EX,
                  deadline: float = NO_LOCK_DEADLINE) -> Generator[WorkerStateFile]:
     """Lock before opening data; replacement never changes the lock's inode."""
+    if mode == fcntl.LOCK_SH and not path.parent.exists():
+        yield WorkerStateFile(path)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
         acquire_flock(lock, mode=mode, deadline=deadline)

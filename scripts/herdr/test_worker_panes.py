@@ -481,9 +481,10 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_dispatch_role_reports_missing_history_and_uses_the_recorded_role(self) -> None:
         row = self.worker("impl2")
-        self.assertIsInstance(worker_panes.dispatch_role(row), worker_panes.WorkerRoleUnavailable)
+        run = worker_panes.worker_run(self.parent)
+        self.assertIsInstance(worker_panes.dispatch_role(row, run), worker_panes.WorkerRoleUnavailable)
         self.dispatch(row, "astra-reviewer")
-        self.assertEqual(worker_panes.dispatch_role(row), "astra-reviewer")
+        self.assertEqual(worker_panes.dispatch_role(row, run), "astra-reviewer")
         self.assertEqual(staff.snapshot().by_id(row.id), row)
 
     def test_herdr_pinned_close_ignores_a_mesh_phase_lock(self) -> None:
