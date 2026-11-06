@@ -1063,46 +1063,82 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Ruled out:**
 - A direct call of the retry deadline check: it does not pass through `route_test`.
 
-### Phase 41b — Run verify.sh check on a workspace with no library, and name the lasting tree path in the refusal  · status: todo
+### Phase 41b — Run verify.sh check on a workspace with no library, and name the lasting tree path in the refusal  · status: done
 
-**Depends on:** none.
+#### As-built
+
+- `verify.sh check` sends `--lib` only when a workspace member has a library target. A workspace of binaries passes. A mixed workspace keeps `--lib`.
+- The refusal of a bare `git worktree add` names `make_worktree.sh` for a lasting tree. `/unit:direct` names the same script.
+- Live check on a tempdir workspace with no library: the old `verify.sh check` exits 101 with `no library targets found`, and the new one exits 0.
+
+**Files:**
+- `scripts/direct/verify_metadata.py` — `package_has_library`, `check_targets`, the `check-targets` request.
+- `scripts/direct/verify.sh` — `take_check_targets`, the check verb's selection.
+- `scripts/direct/test_verify_check_no_library.py` — a real no-library run, and the mixed workspace selection.
+- `scripts/copies/copy_guard.py` — `REFUSAL` text.
+- `scripts/copies/test_copy_guard.py` — the assertion on both paths.
+- `commands/unit/direct.md`, `docs/as-built/gate-checkouts.md` — one sentence each.
+
+**Gotchas:**
+- Metadata is `cargo metadata --no-deps`, so `packages` holds only workspace members. A dependency's library does not count.
+
+**Ruled out:**
+- A change to a guard decision or the allow list: the builds showrunner ruled that this phase is the text and one line only.
+
+### Phase 41e — Answer not free for a target whose last probe failed  · status: todo
+
+**Depends on:** Phase 41b, and aws's `offload.py` work on `builds`.
 
 #### Work Order
 
-**Source:** builds showrunner, 2026-11-06: two defects from the hana showrunner, in one small checkpoint.
+**Source:** builds showrunner, 2026-11-06: defect from hana (hana-migration). A nateroids nextest left its natedev memory wait twice for aws, aws failed each time, and the build started about 50 min after submission. Builds accepted this phase with one rule: a good probe clears the mark without a build waiting on that target, through the existing probe path, with no new timer.
 
-**Goal:** `verify.sh check` passes on a workspace with no library target. A session that runs a bare `git worktree add` reads the path it needs in the refusal.
+**Goal:** a step in a natedev memory wait never leaves for a target whose last probe failed. A fixed target returns by itself, at the next step that starts.
+
+**Causes found:**
+- A probe or stream version mismatch writes no record that `free_now` reads. `free_now` keeps answering free.
+- A failed reach writes a backoff of 300 s, and the backoff ends while the target is still bad. Hana's second leave came at 4 min 56 s.
+- The `could not reach` line prints all of the remote stderr, a Python traceback included.
+
+**Base:** aws's commit f0850070b adds `version-decline-<repository>` in `offload.py`: `run_offload` writes it on a mismatch against `box-tools.json`, and removes it on a match. This phase starts from `builds` after that commit lands, in its own tree, because it reads that record.
 
 **Spec:**
 
-1. **One library decision.** `verify_metadata.py` `test_targets` computes `has_lib` for one package. Move that test to one function. A new metadata request answers the `check` selection for the whole workspace: `--lib` when any workspace member has a library target, and `--bins` always. Cargo refuses `--lib` only when no selected package has a library, so a mixed workspace keeps `--lib`.
-2. **The check verb.** `verify.sh` `check` takes its selection from that request, in the way `take_test_targets` reads its answer. A workspace with a library sends the same command as before. Add the request to the metadata the `check` verb already loads, and start no further Python process.
-3. **The refusal text.** `REFUSAL` in `scripts/copies/copy_guard.py` keeps its `copies.py run` example, and adds the lasting tree path: `A lasting phase tree: bash ~/.claude/scripts/worktree/make_worktree.sh <path> <branch>, from the source repository.` The guard already allows that script. Do not change a guard decision or the allow list. The builds showrunner ruled that the guard part of this phase is this text and the line in item 4 only.
-4. **The /unit:direct line.** In `commands/unit/direct.md`, the `<CoreContract/>` sentence on a worktree for the director's own workers names `scripts/worktree/make_worktree.sh` as the way to make that tree.
-5. **Docs.** Update the sentence on the refusal in `docs/as-built/gate-checkouts.md`.
+1. **A version mismatch is per repository.** Tools depend on the tree, so one repository's mismatch says nothing about another. The probe's `detail` branch and the stream path's `ToolVersionMismatch` branch write the existing `version-decline-<repository>` record, through one function shared with `run_offload`. Do not write the timed backoff here: it stops every repository on that target.
+2. **A failed reach is per target.** A new file `failed_probe` in `state_directory(target)`, beside `unreachable_until`, holds no time. Read it through a typed function in the form of `read_backoff`, with a state type in the form of `BackoffState`.
+3. **The probe owns the target mark.** `probe_mac` is the one writer. An `UnavailableProbe` result with no `detail` writes the mark, from each of its return points. A good `ProbeSnapshot` removes it. `UnresolvedSlotStartup` and `InterruptedTargetStatus` leave it as it is.
+4. **`free_now` answers not free.** Add `"bad"` to `FreeNowAnswer`. `free_now` returns `"bad"` where it would return `"free"` when the target mark exists, or when the record for this repository exists. The record's age does not matter: only a match removes it. Each earlier answer keeps its place, and the function stays local: no SSH, no lock. `free-now` exits 1 on `"bad"`, so each leave hook and the `reserve` form of the retry hook answer no. Make no change to `verify.sh`.
+5. **A new step still tries.** A new step's own try is the existing probe path that clears the marks. `ssh_target_eligibility` and the `reserve` command in `build_targets.py` accept `"bad"` as they accept `"free"`, and go on to their reach check and claim. The timed backoff keeps its current effect on new steps.
+6. **One line in the log.** The `could not reach` reason is the last non-empty line of the remote stderr. A traceback never reaches the log.
+7. **Status tells the truth.** `/build:status` (`targets.py` `target_state`) and `mac_test.py status` report a target with the mark as unreachable, not free.
+8. **Docs.** Update `docs/as-built/mac-test-offload.md`: the probe, the decline list and the two records.
+
+**Not in this phase:** the toolchain on the aws box (aws owns it), a new timer, an SSH call from `free_now`, a change to `mac_idle.py`, a change to the controller's `version_decline_hold_s`.
+
+**Remaining risk, stated to builds:** a fixed target stays unused by steps already in the memory wait until the next step starts and probes it. With no new step, those steps run on natedev in their queue place, as they would with no target.
 
 **Files:**
-- `scripts/direct/verify.sh`
-- `scripts/direct/verify_metadata.py`
-- `scripts/direct/test_verify_check_no_library.py` (new)
-- `scripts/copies/copy_guard.py`
-- `scripts/copies/test_copy_guard.py`
-- `commands/unit/direct.md`
-- `docs/as-built/gate-checkouts.md`
+- `scripts/mac_test/offload.py`
+- `scripts/mac_test/mac_test.py`
+- `scripts/build_targets/build_targets.py`
+- `scripts/build_targets/targets.py`
+- `scripts/mac_test/test_failed_probe_mark.py`
+- `docs/as-built/mac-test-offload.md`
 
-**Workers:** 1 writer: merge16 holds all files. The director runs the live check.
+**Workers:** 1 writer: fix16.
 
 **Constraints from prior phases:**
 - Add no guard, refusal or check that this Spec does not ask for.
 - A test project is made in a tempdir at run time. No test commits one.
-- natest owns the other `test_verify*` files. Put a new test in its own new file.
-- This phase lands on `verify-plain`. A merge commit on this branch carries no visible Change-Review line.
-- Natest Phase 49 edits only `verify.sh` line 259, the `CLAUDE_PYTHON` default.
+- Tests use a temporary state folder. Live state stays out of worker prompts.
+- natest owns the `test_verify*` files. Put new tests in the new file.
+- A merge commit on this branch carries no visible Change-Review line.
 
 **Acceptance gate:**
-- A regression test on a tempdir workspace with no library shows the recorded command `check --workspace --bins`. It fails without the fix. `test_verify_dev_features.py`, `test_verify_dev_features_defaults.py` and `test_verify_token_check.py` still pass with `check --workspace --lib --bins`.
-- Live check by the director, real `cargo` on a tempdir workspace with no library: the old `verify.sh check` exits non-zero with `no library targets found`, and the new one exits 0.
-- `test_copy_guard.py` passes, and it asserts that the hook refusal of a bare `git worktree add` holds both `copies.py run` and `make_worktree.sh`. `test_verify_python_starts.py` passes.
+- The hana sequence, in `test_failed_probe_mark.py`, through the real `probe_mac`, `free_now`, `free-now` and `reserve` with a fake SSH: a mismatch probe, then the end of the timed backoff, then `free-now` still exits 1 with `bad` for that repository and exits 0 for another. A failed reach, then the end of the timed backoff, then `free-now` exits 1 with `bad` for each repository. A good probe by a new step removes the mark, and `free-now` exits 0 with no waiting step involved.
+- `busy`, `blocked` and `off` keep their answers with the mark set. A remote stderr with a traceback prints one `could not reach` line that holds no `Traceback`.
+- Each case fails when the matching code is removed. Show this on a tempdir copy.
+- `test_mac_test.py`, `test_offload.py`, `test_ssh_eligibility.py`, `test_build_targets.py`, `test_targets.py`, `test_verify_ssh_targets.py` and `scripts/aws_target/test_control.py` pass.
 - basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
 
 ### Phase 41c — Send a lint that waits for memory to a free Mac  · status: todo
@@ -1128,7 +1164,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Files:**
 - `scripts/direct/verify.sh`
-- `scripts/direct/test_verify_lint_free_mac.py` (new)
+- `scripts/direct/test_verify_lint_free_mac.py`
 - `docs/as-built/mac-test-offload.md`
 
 **Workers:** 1 writer: merge16. The director measures the Mac-idle minutes from the build index.
@@ -1164,7 +1200,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 **Files:**
 - `scripts/direct/verify.sh`
-- `scripts/direct/test_verify_argument_parser.py` (new)
+- `scripts/direct/test_verify_argument_parser.py`
 
 **Workers:** 1 writer: merge16.
 
