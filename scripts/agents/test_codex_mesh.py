@@ -18577,7 +18577,7 @@ class LegacyRosterTests(unittest.TestCase):
         self.session_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.owner = unit_membership("legacy-production", "legacy")
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
-            "production": "legacy-production", "unit": self.owner.name,
+            "owner_staff_id": self.owner.id,
         }))
         self.worker = fixture_worker("legacy-worker", self.owner.id,
                                      backend=staff.CodexBackend(self.session_dir))
