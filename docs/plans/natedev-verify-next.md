@@ -35,14 +35,6 @@
 
 **Needed:** before lint runs mend, check that cargo-mend loads against the active rustc (`cargo mend --version` exits 0). On a failure, print one line with the cause (rustc changed since mend was installed) and the repair (`imend` in a cargo-liner worktree), then stop that lint step. Add no pin and no Nix change: natedev and the Mac keep cargo-mend in `~/.cargo/bin` by design (nixos `shell.nix:25-28`).
 
-## Load flake in test_verify_token_mac_step.py
-
-**Source:** builds (showrunner), 2026-11-05.
-
-**Today:** the module failed once at load 59 in natest's gate and passed alone on the rerun.
-
-**Needed:** fix it in the next phase that touches that module, beside the `verify_hold_wait_test_support.py:327` flake fix.
-
 ## Report Phase 28 metadata items
 
 **Source:** builds (showrunner), 2026-11-05. Report Phase 28 (`eb4210b92`) is on this branch.
@@ -84,3 +76,14 @@
 2. Share one Mac `lsof` scan between mirror protection and the approved floor roots. Keep the current rule in `mirror_lease_set`: all candidate leases before the one scan.
 3. Keep unavailable-scan protection, unreadable-process protection, path matching and cancellation behavior. Keep the existing scan and floor tests.
 4. Put the measured scan count and time before and after in the notice. Close the routes F028 and F029 from the Phase 35b ledger.
+
+## Each verify run starts fewer helper processes
+
+**Source:** Phase 41's profile. The builds showrunner placed it after Phase 41a, 2026-11-06.
+
+**Today:** one `verify.sh` run of a plain package, with the test fixture's fake tools, starts about 300 processes and costs about 8 CPU s. The `strace` count is 38 git, 37 bash, 35 python3, 32 `py`, 19 rm, 12 dirname, 12 mv. The Python starts are 7 `-c`, 7 `tree_watch.py`, 4 `build_folders.py`, 3 `build_targets.py`, 2 `step_record.py`, 2 `mac_idle.py`, 2 `admission_client.py`, and one each of 7 others.
+
+**Needed:**
+1. Measure the baseline first, on one real plain-package run: processes by command name, CPU s and wall s. Name the method. The count above comes from fake tools, so it is not this baseline.
+2. Remove the starts that the measure shows give no needed answer, largest first. Keep each behavior and its tests.
+3. Measure the same run with the same method. Put before and after in the notice.

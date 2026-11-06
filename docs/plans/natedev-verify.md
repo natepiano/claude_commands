@@ -1052,7 +1052,8 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 3. **Shared fixtures.** When files share a fake tool or a fixture, change the fixture once. Make no copy of a fixture.
 4. **Whole set.** After the last batch, measure the whole `test_verify*` set from the gate records, with the method of the baseline. Write before and after CPU s in the cost doc, and send the numbers to the showrunner.
 5. **Checks stay at the consumer.** A direct test reads a value where its consumer receives it, not only where it is composed. Each result word with its own branch in `route_test` or `remember_mac_retry` keeps a check that the following step ran. A test uses no stand-in for the decision that it exists to prove. Phase 41's first version lost two checks in this way.
-6. **The first batch.** Ten files, largest CPU first, about 322 median CPU s. A file with few lines and high CPU s has its work in the support file: `test_verify_mac_retry_hold.py` spends its CPU in `VerifyMacOffloadFixture.check_temporary_mac_decline`.
+6. **This batch is the last in this plan.** The builds showrunner, 2026-11-06 12:20 EST, relays the user's ruling: natest does the test work. This unit finishes this batch of ten files, and sends it as a bumped checkpoint. natest takes the other `test_verify*` files, and it measures the whole set. It also takes three flaky files: `test_verify_token_mac_step.py`, `test_verify_mac_copy_ownership.py` and `test_verify_example_edits.py`. A cut in `verify.sh` or another production file stays with this unit. Spec items 1 and 4 now describe natest's work.
+7. **The batch.** Ten files, largest CPU first, about 322 median CPU s. A file with few lines and high CPU s has its work in the support file: `test_verify_mac_retry_hold.py` spends its CPU in `VerifyMacOffloadFixture.check_temporary_mac_decline`.
 
 **Files:**
 - `scripts/direct/test_verify_mac_retry_hold.py`
