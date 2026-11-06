@@ -315,6 +315,18 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     os.execvp(command[0], [*command, message])
 
 
+def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
+    """Wait for the pane to expose its native identity within the start deadline."""
+    while True:
+        try:
+            return client.native_session(pane, "claude", max(0.001, deadline - monotonic()))
+        except (OSError, ValueError, subprocess.SubprocessError, herdr.HerdrFailure):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.5, remaining))
+
+
 def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
     """Run the account command in the session's own pane, with one resume message."""
     client = herdr.Herdr(herdr.shared_session())
@@ -332,8 +344,8 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     if isinstance(live, sessions.SessionLivenessUnknown):
         raise herdr.HerdrFailure(live.reason)
     try:
-        identity = client.native_session(tab.pane_id, "claude", START_SECONDS)
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+        identity = _prompt_identity(client, tab.pane_id, deadline)
+    except (OSError, ValueError, subprocess.SubprocessError, herdr.HerdrFailure) as error:
         print(f"{entry['session_id']}: prompt identity anomaly: {error}", file=sys.stderr)
         return live
     if identity != entry["session_id"]:

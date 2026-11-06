@@ -261,9 +261,6 @@ class UnspecifiedPromptTranscript:
     """The caller has not identified the conversation that must receive the prompt."""
 
 
-UNSPECIFIED_PROMPT_TRANSCRIPT = UnspecifiedPromptTranscript()
-
-
 @dataclass(frozen=True)
 class PromptScreenNotRead:
     """No visible screen has been read for this submission."""
@@ -2049,22 +2046,13 @@ class Herdr:
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")
         status = AgentStatus.decode(agent.get("agent_status"))
-        ready = agent.get("interactive_ready")
+        ready = agent.get("interactive_ready", True)
         if not isinstance(ready, bool):
             print(f"herdr {self.session}:{pane}: readiness is unknown", file=sys.stderr)
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
-    @staticmethod
-    def _remote_control_turn(row: dict[str, object]) -> bool:
-        """Identify a system turn that confirms Remote Control."""
-        return row.get("type") == "system" and (
-            row.get("subtype") == "bridge_status" or "/remote-control is active" in _turn_text(row))
-
-    def prompt_input_state(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript,
-                           launched_at: datetime, *,
-                           cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
-                           ) -> PromptInputReady | PromptInputNotReady:
+    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputNotReady:
         ready, idle = False, False
         try:
             observation = self.readiness(pane)
@@ -2072,9 +2060,6 @@ class Herdr:
             ready = observation["agent_status"] in {AgentStatus.WORKING, AgentStatus.IDLE} and observation["interactive_ready"]
         except (OSError, subprocess.SubprocessError, HerdrFailure):
             pass
-        if not ready and isinstance(transcript, SessionTranscript):
-            reader = cursor if isinstance(cursor, TranscriptCursor) else TranscriptCursor(transcript, launched_at)
-            ready = any(self._remote_control_turn(row) for _, row in reader.read_turns())
         if not ready:
             return PromptInputNotReady("destination session is still loading")
         raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
@@ -2084,16 +2069,11 @@ class Herdr:
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
 
-    def wait_for_prompt_input(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript, launched_at: datetime,
-                              timeout_ms: int, *,
-                              cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
-                              ) -> PromptInputReady | PromptInputTimedOut:
-        if isinstance(cursor, UnspecifiedPromptTranscript) and isinstance(transcript, SessionTranscript):
-            cursor = TranscriptCursor(transcript, launched_at)
+    def wait_for_prompt_input(self, pane: str, timeout_ms: int) -> PromptInputReady | PromptInputTimedOut:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         while time.monotonic() < deadline:
-            state = self.prompt_input_state(pane, transcript, launched_at, cursor=cursor)
+            state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
@@ -2161,7 +2141,7 @@ class Herdr:
             return failure(reason)
 
         try:
-            ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at, timeout_ms, cursor=cursor)
+            ready = self.wait_for_prompt_input(pane, timeout_ms)
             screen = ready.screen
             if isinstance(ready, PromptInputTimedOut):
                 if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
@@ -2191,8 +2171,8 @@ class Herdr:
                     if time.monotonic() >= deadline:
                         return deadline_failure()
                     if isinstance(cursor.readability, TranscriptReadable):
-                        ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
-                            max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                        ready = self.wait_for_prompt_input(pane,
+                            max(0, int((deadline - time.monotonic()) * 1000)))
                         if isinstance(ready.screen, str):
                             screen = ready.screen
                         if isinstance(ready, PromptInputTimedOut):
@@ -2282,8 +2262,8 @@ class Herdr:
                         continue
                     if typings == 3:
                         return failure("no user turn after three typings")
-                    ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
-                        max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                    ready = self.wait_for_prompt_input(pane,
+                        max(0, int((deadline - time.monotonic()) * 1000)))
                     if isinstance(ready.screen, str):
                         screen = ready.screen
                     if isinstance(ready, PromptInputTimedOut):

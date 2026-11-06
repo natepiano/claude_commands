@@ -1431,25 +1431,69 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("Continue where you stopped", opening.text)
 
 
-    def test_resume_identity_mismatch_or_missing_proof_dispatches_no_work(self) -> None:
-        for proof in ("019b3a40-4250-7000-8000-000000000199", herdr.HerdrFailure("registry unavailable")):
-            with self.subTest(proof=proof):
-                self.launched.clear()
-                self.client.prompts.clear()
-                self.start.reset_mock()
-                errors = io.StringIO()
-                identity = staff.StaffId(self.entry["session_id"])
-                row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
-                with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-                      patch.object(self.client, "native_session", return_value=proof if isinstance(proof, str) else "",
-                                   side_effect=None if isinstance(proof, str) else proof),
-                      redirect_stderr(errors)):
-                    result = stop_resume.resume("alpha", why="maintenance")
-                self.assertIsInstance(result, stop_resume.ClaudeUp)
-                self.assertEqual(self.client.prompts, [])
-                self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                self.assertIn("prompt identity anomaly:", errors.getvalue())
-                self.detach.assert_called()
+    def test_resume_retries_identity_until_proved_and_submits_one_prompt(self) -> None:
+        errors = io.StringIO()
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(self.client, "native_session", side_effect=[
+                  herdr.HerdrFailure("registry unavailable"), self.entry["session_id"]]) as observed,
+              redirect_stderr(errors)):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(observed.call_count, 2)
+        self.assertEqual(self.clock.elapsed, 0.5)
+        self.assertEqual(len(self.client.prompts), 1)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_resume_retries_a_timed_out_identity_read_and_submits_one_prompt(self) -> None:
+        errors = io.StringIO()
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(self.client, "native_session", side_effect=[
+                  subprocess.TimeoutExpired("herdr pane process-info", 0.1), self.entry["session_id"]]) as observed,
+              redirect_stderr(errors)):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(observed.call_count, 2)
+        self.assertEqual(self.clock.elapsed, 0.5)
+        self.assertEqual(len(self.client.prompts), 1)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_resume_reports_identity_failure_once_at_the_deadline(self) -> None:
+        errors = io.StringIO()
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(self.client, "native_session", side_effect=herdr.HerdrFailure(
+                  "registry unavailable")) as observed,
+              redirect_stderr(errors)):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertGreater(observed.call_count, 1)
+        self.assertEqual(self.clock.elapsed, stop_resume.START_SECONDS)
+        self.assertEqual(self.client.prompts, [])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"{self.entry['session_id']}: prompt identity anomaly: registry unavailable"])
+        self.detach.assert_called()
+
+    def test_resume_identity_mismatch_dispatches_no_work_without_retry(self) -> None:
+        proof = "019b3a40-4250-7000-8000-000000000199"
+        errors = io.StringIO()
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(self.client, "native_session", return_value=proof) as observed,
+              redirect_stderr(errors)):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(self.client.prompts, [])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"{identity}: prompt identity anomaly: observed {proof}"])
+        observed.assert_called_once()
+        self.assertEqual(self.clock.elapsed, 0)
+        self.detach.assert_called()
 
     def test_resume_runs_account_exec_in_its_own_pane_with_one_message(self) -> None:
         self.entry["environment"].update(HERDR_PANE_ID="w9:p9", HERDR_WORKSPACE_ID="w9")
