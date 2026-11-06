@@ -1305,38 +1305,23 @@ Source: sdlc [6d2745c7], [68b227b5]. Only `end_session.sh` removes a run's marke
 
 ### Phase 8g — The review links service restarts when its code changes  · status: done
 
-Source: sdlc [fc249e32], [c4e2eefc], [ecddfb26]. review-links.service ran from 11-05 17:14 EST and kept the old `change_page.py` in memory after 486e87bb0 moved `--production` to the showrunner name. Each Works press then failed: `ValueError: .../natedev-production.md: no showrunner staff row`, POST 400, page "Not saved". natedev restarted it at 09:42 EST 11-06. This is the second time. The user also set the rule "a change cannot be in the change list unless it is ready to check" and said yes to a refusal in `change_review.py add`. The Mac final read shows staff ids in every open row, so the one-off `migrate-owners` command goes.
+#### As-built
 
-**Depends on:** 3z
+A running review links server replaces itself when a module it loaded changes. `ReviewLinksServer.service_actions` in `scripts/review_links/serve.py` runs `loaded_module_stamps()` every `code_check_seconds` (`config/review_links.conf`, default 5). The function reads `st_mtime_ns` and `st_size` of each `sys.modules` file under the server's checkout. A file with no stamp (`ModuleStampUnavailable.UNREADABLE`), a file modified at or after process start (`STARTED_NS`) and a changed stamp each raise `CodeChanged`. `main` prints `review-links: code changed: <path>`, closes the socket through its `with` block and runs `os.execv(sys.executable, sys.orig_argv)`. The pid and the environment stay. A failed start of the new code exits 1, and the service manager starts it again.
 
-#### Work Order
+While a verdict delivery request is live, the check returns and keeps its recorded stamps, so the next check restarts.
 
-**Goal:** a running review links server never serves old code after a merge or a promotion. `change_review.py add` refuses a merged hash that is not on `origin/main`, and the docs state the ready-to-check rule.
-
-**Spec:**
-1. **The check.** `ReviewLinksServer.service_actions` in `scripts/review_links/serve.py` reads the stamp (`st_mtime_ns`, `st_size`) of each loaded module file under the server's own checkout, every `code_check_seconds`. The list comes from `sys.modules`, so it holds every module the server imports and each module it imports later. A file that cannot be read has no stamp, and that counts as a change.
-2. **The restart.** On a change the server prints one line, `review-links: code changed: <path>`, closes its socket and replaces its process with `os.execv(sys.executable, sys.orig_argv)`. The pid and the environment stay, so the page is away for milliseconds and not for the service manager's ten seconds. A failed start of the new code exits 1, and the service manager starts it again, as it does for a lost address.
-3. **Config.** `config/review_links.conf` gets `code_check_seconds=5`, with its comment and range. The server reads it only when a check is due, as the other two checks do.
-4. **Refusal.** `change_review.py add` with `--merged <hash>` runs `git merge-base --is-ancestor <hash> origin/main` in `--repo` before it writes. Any nonzero result prints one line and exits 1: `<hash> is not on origin/main; no row added. A change goes on the list only when the user can check it now. If it just landed, run git fetch and retry.` No `--merged` means no check. `append` and the merge paths do not change.
-5. **Deletion.** Remove the `migrate-owners` action, `migrate_owners`, its by_id and by_path condition, its usage lines, its section in `commands/change_review.md` and its tests. `scripts/lib/unit_runs.py` has its own `migrate_owners`; leave it.
-6. **Docs.** `commands/change_review.md` add and `docs/production_format.md` item 17 state: a row is added only when the user can check it now, merged to where the user runs it and live (rebuild, restart or deploy done); until then, no row. `docs/as-built/review-links.md` states the code check and replaces its "Code changes need a restart" limit.
-
-**Acceptance:**
-- A real child process runs the server loop on a temporary address and checkout. A write to a loaded module makes that process start again with the same pid and the new code, and it answers HTTP on the port. An unchanged tree keeps the process, and it checks again after `code_check_seconds`.
-- `change_review.py add --merged` on a temporary repository with a bare origin: a hash on `origin/main` writes its row; a hash on a side branch and an unknown hash each print the one line, exit 1 and write nothing.
-- `change_review.py migrate-owners` is an argparse error.
+`change_review.py add --merged <hash>` refuses a hash that is not an ancestor of `origin/main`: one line, exit 1, no row. The `migrate-owners` action is gone. `commands/change_review.md` and `docs/production_format.md` item 17 state the rule: a row is added only when the user can check it now, merged to where the user runs it and live.
 
 **Files:**
 - `scripts/review_links/serve.py`, `config/review_links.conf`, `docs/as-built/review-links.md` — the code check.
-- `scripts/review_links/test_serve.py` — its tests.
+- `scripts/review_links/test_serve.py` — a real child process, the same pid, new code, HTTP after the restart.
 - `scripts/production/change_review.py`, `commands/change_review.md`, `docs/production_format.md` — the refusal, the deletion and the rule.
-- `scripts/production/test_change_review.py` — their tests.
+- `scripts/production/test_change_review.py` — `MergedAddTests` on a real bare origin.
 
-**Workers:** `2 writers + 2 testers`. Each worker does one thing.
-- `item41` — the code check source and doc. `item54` — its tests.
-- `item49` — the refusal, the deletion and the rule docs. `item51` — their tests.
+**Gotchas:** a test fixture must set old modification times, because a file written after process start counts as changed.
 
-**State:** none. The phase writes no new lasting record.
+**Ruled out:** a merge-time restart command; the server finds each change itself.
 
 ### Phase 8h — A change reaches the list only when it is on main and live  · status: done
 
