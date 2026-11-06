@@ -5026,71 +5026,22 @@ with patch.object(fcntl, "flock", admission):
         return (f"review trial: ux 0 findings, code {code_findings} findings, "
                 f"review-worker minutes {review_minutes}, ux check minutes 0, ux repair minutes 0")
 
-    def test_review_trial_shows_simplify_metrics_only_for_the_phase_with_a_review_record(self) -> None:
-        self.write_full_config()
-        started_at = 71_300
-        session = self.start_run("simplify-review-metrics", started_at)
-        self.start_phase(session, started_at + 10)
-        instance, records = self.phase_review_records(session)
-        legacy = self.trial_line()
-        for name, phase, status, raised, elapsed, expected in (
-            ("other-phase", "other-instance", "reviewed", 9, 600, legacy),
-            ("failed", instance, "error", 7, 60, legacy + ", simplify 0 findings, simplify minutes 1"),
-            ("reviewed", instance, "reviewed", 3, 90, legacy + ", simplify 3 findings, simplify minutes 3"),
-        ):
-            with self.subTest(record=name):
-                self.write_review_record(records, name, phase, lens="simplify", status=status,
-                                         raised=raised, started_at=started_at + 20, elapsed=elapsed)
-                self.assertEqual(self.run_command("review-trial", "--session-dir", str(session), at=started_at + 700),
-                                 expected)
-
-    def test_review_trial_counts_a_simplify_finding_without_a_review_record_separately_from_code(self) -> None:
-        self.write_full_config()
-        started_at = 71_400
-        session = self.start_run("simplify-finding-metrics", started_at)
-        self.start_phase(session, started_at + 10)
-        _ = self.run_findings(session, "open", "--severity", "minor", "--title", "Reuse the phase helper",
-                              "--caught-by", "worker", "--lens", "simplify", at=started_at + 20)
-        self.assertEqual(self.run_command("review-trial", "--session-dir", str(session), at=started_at + 30),
-                         self.trial_line() + ", simplify 1 findings, simplify minutes 0")
-
-    def test_review_trial_reads_one_snapshot_for_code_and_simplify_counts(self) -> None:
+    def test_review_trial_reads_one_snapshot_for_code_counts(self) -> None:
         self.write_full_config()
         session = self.start_run("review-snapshot", 71_500)
         self.start_phase(session, 71_510)
         instance, records = self.phase_review_records(session)
-        _ = self.run_findings(session, "open", "--severity", "minor", "--title", "Director item",
-                              "--caught-by", "worker", "--lens", "simplify", at=71_520)
         for name, lens, status, raised in (
             ("code", "contract", "reviewed", 4),
             ("ux", "ux", "reviewed", 7),
-            ("simplify", "simplify", "reviewed", 0),
-            ("failed", "simplify", "error", 8),
         ):
             self.write_review_record(records, name, instance, lens=lens, status=status,
                                      raised=raised, started_at=71_520, elapsed=60)
         with patch.object(progress_history, "_phase_review_records",
                           wraps=progress_history._phase_review_records) as reads:  # pyright: ignore[reportPrivateUsage]
             trial = self.run_command("review-trial", "--session-dir", str(session), at=71_600)
-        self.assertEqual(trial, self.trial_line(code_findings=4) + ", simplify 0 findings, simplify minutes 2")
+        self.assertEqual(trial, self.trial_line(code_findings=4))
         reads.assert_called_once_with(session, instance)
-
-    def test_simplify_pass_minutes_do_not_count_as_review_worker_minutes(self) -> None:
-        self.write_full_config()
-        session = self.start_run("separate-review-minutes", 71_700)
-        self.start_phase(session, 71_710)
-        instance, records = self.phase_review_records(session)
-        # The slot name must not determine which metric receives the time.
-        for slot, task, elapsed, status in (
-            ("review-simplify", "direct.review", 120, "completed"),
-            ("claude-review", "direct.simplify", 180, "error"),
-        ):
-            self.start_slot_pass(session, slot, "review", 71_720, "gpt-called", 0, "--called-task", task)
-            self.finish_slot_pass(session, slot, status, 71_720 + elapsed)
-        self.write_review_record(records, "simplify", instance, lens="simplify", status="error",
-                                 raised=0, started_at=71_720, elapsed=180)
-        self.assertEqual(self.run_command("review-trial", "--session-dir", str(session), at=72_000),
-                         self.trial_line(review_minutes=2) + ", simplify 0 findings, simplify minutes 3")
 
     def test_review_trial_counts_each_code_finding_once(self) -> None:
         self.write_full_config()
@@ -5647,14 +5598,6 @@ with patch.object(fcntl, "flock", admission):
             "direct.review",
             at=at,
         )
-
-    def test_an_armed_review_recognizes_the_simplify_status_writer(self) -> None:
-        from scripts.lib.atomic_file import write_text_atomic
-
-        status = self.root / "review_status_simplify"
-        write_text_atomic(status, "reviewing\n")
-        working = cast(Callable[[dict[str, object]], bool], vars(progress_history)["_early_reviewer_working"])
-        self.assertTrue(working({"status_file": str(status), "started_at": 0}))
 
     def test_an_early_review_naming_its_phase_watches_that_phase_directory(self) -> None:
         """`review.sh --phase` writes its status there, so the marker must watch the same file."""

@@ -40,7 +40,7 @@ The showrunner approved the plan on 2026-11-05 and told this unit to keep `SIMPL
 
 ## Phases
 
-### Phase 1 — One simplify run per day replaces the lens in each phase review  · status: todo
+### Phase 1 — One simplify run per day replaces the lens in each phase review  · status: done
 
 #### Work Order
 
