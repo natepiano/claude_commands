@@ -2226,9 +2226,9 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         _ = self.transcript("unit")
         original = accounts.move_sessions
-        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[accounts.SessionMoveOutcome, ...]:
+        def requested(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause) -> tuple[accounts.SessionMoveOutcome, ...]:
             self.assertEqual(stored_group_labels(path)["units"], target)
-            return original(ids, target, why=why)
+            return original(ids, target, why=why, cause=cause)
         with patch.object(accounts, "move_sessions", side_effect=requested):
             _ = self.cli()
         history = [cast(dict[str, object], json.loads(line)) for line in accounts.roles_history_file().read_text().splitlines()]
@@ -3359,6 +3359,24 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli("--dry-run", "--assume-refused", "assumed", "weekly")
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.moves.calls, [])
+
+    def test_refusal_move_passes_its_cause_to_the_session_batch(self) -> None:
+        _ = self.owner("refused")
+        _ = self.transcript("refused")
+        with patch.object(accounts, "move_sessions", wraps=accounts.move_sessions) as move:
+            _ = self.cli()
+        move.assert_called_once()
+        self.assertEqual(move.call_args.kwargs["cause"], "refusal")
+
+    def test_auto_move_passes_its_cause_to_the_session_batch(self) -> None:
+        _ = self.groups()
+        _ = self.owner("unit", host="unit")
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        with patch.object(accounts, "move_sessions", wraps=accounts.move_sessions) as move:
+            _ = self.cli()
+        move.assert_called_once()
+        self.assertEqual(move.call_args.kwargs["cause"], "auto")
 
     def test_showrunner_batch_uses_the_same_move_sessions_path_as_watcher(self) -> None:
         _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
