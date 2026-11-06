@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -87,22 +89,35 @@ def run_workers(run: Path, record: staff.StaffSnapshot) -> set[staff.StaffId]:
     return members
 
 
+@contextmanager
+def _run_owner_read(run: Path) -> Generator[None]:
+    try:
+        yield
+    except (ValueError, staff.StaffUnreadable) as error:
+        print(f"anomaly: {run}: {error}", file=sys.stderr)
+
+
 def removal_targets(own_runs: set[Path], rows: list[AgentRow], *,
                     roots: tuple[Path, ...] | None = None) -> dict[str, str]:
     record = staff.local_snapshot()
-    owners = {worker_admission.parent(record, run=run).id for run in own_runs}
+    owners: set[staff.StaffId] = set()
+    for run in own_runs:
+        with _run_owner_read(run):
+            owners.add(worker_admission.parent(record, run=run).id)
     protected: set[staff.StaffId] = set()
     for run in unit_runs.live_run_folders(time.time(), roots):
-        try:
+        with _run_owner_read(run):
             protected.add(worker_admission.parent(record, run=run).id)
-        except ValueError as error:
-            print(f"anomaly: {run}: {error}", file=sys.stderr)
-    selected = {identity for run in own_runs for identity in run_workers(run, record)}
+    selected: set[staff.StaffId] = set()
+    for run in own_runs:
+        with _run_owner_read(run):
+            selected.update(run_workers(run, record))
     pane_workers: set[staff.StaffId] = set()
     for root in unit_runs.run_roots() if roots is None else roots:
         for pin in root.glob("*/worker_transport"):
             if unit_runs.worker_transport(pin.parent) == "herdr":
-                pane_workers.update(run_workers(pin.parent, record))
+                with _run_owner_read(pin.parent):
+                    pane_workers.update(run_workers(pin.parent, record))
     listed = {row.get("sessionId", "") for row in rows}
     targets: dict[str, str] = {}
     for member in record.find(kind="worker"):

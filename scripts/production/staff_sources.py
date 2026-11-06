@@ -258,7 +258,12 @@ class _WorkerSources:
                     continue
                 if not herdr.is_codex_process(arguments) or codex_thread_host(arguments):
                     continue
-                environment = herdr.process_environment(process.pid)
+                try:
+                    environment = herdr.process_environment(process.pid)
+                except (OSError, herdr.HerdrFailure):
+                    if process.pid in process_table.snapshot():
+                        raise
+                    continue
                 if native := environment.get("CODEX_THREAD_ID", ""):
                     self.native_running[native] = {"codex": native}
                 elif reason := codex_non_staff_reason(record, sources, environment):
