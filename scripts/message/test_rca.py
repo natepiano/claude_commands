@@ -303,10 +303,10 @@ subprocess.run([sys.executable, '-c',
                 self.assertEqual(receipt.read_text(), "delivered")
 
     def test_the_same_session_and_commands_join_the_case_until_it_is_fixed(self) -> None:
-        two = rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl",
+        two = rca.Report("modules", "natedev", "auto_mode", ("assign.sh --role implement --to modules-impl",
                                                              "review.sh  --to modules-test"), production="cargo-liner")
         self.assertEqual(rca.open_case(two, OPENED), "rca: opened 261023-1")
-        swapped = two._replace(commands=("review.sh --to modules-test", "implement.sh --to modules-impl"))
+        swapped = two._replace(commands=("review.sh --to modules-test", "assign.sh --role implement --to modules-impl"))
         self.assertEqual(rca.open_case(swapped, OPENED), "rca: joined 261023-1")
         self.assertEqual(self.case("261023-1")["alerts"], 2)
         self.assertEqual(len(self.sends()), 1)
@@ -382,7 +382,7 @@ subprocess.run([sys.executable, '-c',
                                  (("write phases/34h/state.json (34h phase record)",), "a file change"),
                                  (("Edit",), "a file change"), (("WebFetch",), "an action"),
                                  (("mcp__brp__brp_launch",), "an action"), (("cargo",), "a shell command"),
-                                 (("implement.sh --to modules-impl", "review.sh --to modules-test"), "2 shell commands"),
+                                 (("assign.sh --role implement --to modules-impl", "review.sh --to modules-test"), "2 shell commands"),
                                  (("write a.json", "edit b.py"), "2 file changes"),
                                  (("write a.json", "cargo build"), "2 actions"), ((), "an action"), ((" ",), "an action")):
             with self.subTest(commands=commands):

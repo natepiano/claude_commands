@@ -72,7 +72,7 @@ table|json|csv`. Beyond those:
 - `--stage`, `--label`, `--agent` substring filters on `stages` and `runs`
 - `--group slot` — which worker of the phase team (`impl`, `impl2`, `test`,
   `review`) recorded the pass. **Empty on every pass before 2026-08-31**, and on
-  any recorder outside `implement.sh`, where it groups as `-`. A worker, not a
+  recorders that omit the slot, where it groups as `-`. A worker, not a
   role: a worker's role changes within a run — all three implementing, then all
   three testing, any mix — so this names the chair, and `stage` names the work.
   It does not yet make a team phase visible. The recorder can now hold one open

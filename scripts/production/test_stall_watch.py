@@ -2005,7 +2005,7 @@ always=natedev
                 self.send_log.unlink(missing_ok=True)
                 # The recording ps fixture models the unit's worker launcher, then its termination.
                 director_pid = self.children[0].pid
-                self.process_rows.append(f"{director_pid + 1} {director_pid} implement.sh running")
+                self.process_rows.append(f"{director_pid + 1} {director_pid} bash scripts/agents/agent_bg.sh running")
                 for at in (START, START + 300):
                     result = self.tick(at)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -2525,7 +2525,7 @@ always=natedev
         self.assertEqual(len(self.sent()), 4)
 
     def test_running_shell_or_worker_launcher_prevents_a_bump(self) -> None:
-        for command in ("bash", "implement.sh"):
+        for command in ("bash", "bash scripts/agents/agent_bg.sh"):
             with self.subTest(command=command):
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
@@ -2639,7 +2639,7 @@ always=natedev
     def test_defunct_worker_process_does_not_count_as_running_work(self) -> None:
         _ = self.tick(START)
         claude_pid = self.children[0].pid
-        self.process_rows.append(f"999999 {claude_pid} implement.sh <defunct>")
+        self.process_rows.append(f"999999 {claude_pid} bash scripts/agents/agent_bg.sh <defunct>")
         _ = self.tick(START + 300)
         self.assertEqual(len(self.sent()), 2)
 

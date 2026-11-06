@@ -4150,7 +4150,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def failure_marker(self) -> Path:
         return self.root / "notify/failed/writer-id.json"
 
-    def auto_mode_arguments(self, *extra: str, commands: tuple[str, ...] = ("implement.sh --to modules-impl",
+    def auto_mode_arguments(self, *extra: str, commands: tuple[str, ...] = ("assign.sh --role implement --to modules-impl",
                             "review.sh --to modules-test"), **changed: str) -> list[str]:
         values = {"session": "modules", "machine": "natedev", "waits": "The P542 build waits for them"} | changed
         return ["--to", "user", "--text-id", "auto_mode.refused",
@@ -4167,7 +4167,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=cargo-liner-style", options.values)
         self.assertIn("rule_line=", options.values)
         self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n"
-                      + "implement.sh --to modules-impl\nreview.sh --to modules-test\n\n"
+                      + "assign.sh --role implement --to modules-impl\nreview.sh --to modules-test\n\n"
                       + "Go: the session runs these commands now, and auto mode can refuse these commands again.", options.text or "")
         self.assertTrue((options.text or "").endswith("Allow rule: auto mode lets these commands run from then on."))
         one = local_options(self.auto_mode_arguments(commands=("git push origin build-followups-messaging",),
@@ -4183,7 +4183,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=cargo-liner-style", command)
         for arguments in (self.auto_mode_arguments("--value", "sender=someone"), self.auto_mode_arguments("--from", "someone"),
                           self.auto_mode_arguments("--machine", "mac"), self.auto_mode_arguments(commands=()),
-                          self.auto_mode_arguments(commands=("implement.sh", " ")), self.auto_mode_arguments(count="2"),
+                          self.auto_mode_arguments(commands=("assign.sh", " ")), self.auto_mode_arguments(count="2"),
                           self.auto_mode_arguments(does="dispatch the writer"), self.auto_mode_arguments(colour="red"),
                           self.auto_mode_arguments("--value", "waits=twice")):
             with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -4195,7 +4195,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_an_auto_mode_push_that_is_sent_or_kept_opens_a_case_for_the_stopped_session(self) -> None:
         self.writer_session()
         long = "cargo test --workspace --all-features " + "b" * 60
-        options = local_options(self.auto_mode_arguments(commands=("implement.sh --to modules-impl", long)))
+        options = local_options(self.auto_mode_arguments(commands=("assign.sh --role implement --to modules-impl", long)))
         replies = {"sent": (0, "pushover: sent\n", ""), "kept": (0, "pushover: kept: silence is on\n", ""),
                    "held": (4, "", "pushover: held\n"), "failed": (1, "", "pushover: unreachable\n")}
         for outcome, reply in replies.items():
@@ -4203,9 +4203,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             with self.subTest(outcome=outcome), mock.patch.object(send, "run", return_value=reply):
                 self.assertEqual(send.send(options).outcome, outcome)
                 # The case names the stopped session, not the sender, and each command in full.
-                expected = [rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl", long),
+                expected = [rca.Report("modules", "natedev", "auto_mode", ("assign.sh --role implement --to modules-impl", long),
                                        waits="The P542 build waits for them", source="Build writer",
-                                       key=send.auto_mode_key("modules", ("implement.sh --to modules-impl", long)))]
+                                       key=send.auto_mode_key("modules", ("assign.sh --role implement --to modules-impl", long)))]
                 self.assertEqual(self.cases, expected if outcome in ("sent", "kept") else [])
         self.cases.clear()
         with mock.patch.object(send, "run", return_value=replies["sent"]):
@@ -4253,7 +4253,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 _ = send.parse(self.auto_mode_arguments(session="tile", commands=("cargo test -p tile",), waits=waits))
             self.assertIn("waits says only what waits", errors.getvalue())
         options = local_options(self.auto_mode_arguments(waits="The merge waits for them.."))
-        self.assertIn(" in the modules session. The merge waits for them.\nimplement.sh", options.text or "")
+        self.assertIn(" in the modules session. The merge waits for them.\nassign.sh", options.text or "")
 
     def test_auto_mode_keeps_its_waits_sentence_only_when_the_review_approves_it_within_30_seconds(self) -> None:
         self.writer_session()
@@ -4275,8 +4275,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             pushed = cast(list[str], run.call_args.args[0])
             self.assertIn("waits_line= The P542 build waits for them." if kept else "waits_line=", pushed)
             text = cast(str, self.log()[-1]["text"])
-            self.assertIn("in the modules session. The P542 build waits for them.\nimplement.sh" if kept else
-                          "Auto mode refused 2 shell commands in the modules session.\nimplement.sh", text)
+            self.assertIn("in the modules session. The P542 build waits for them.\nassign.sh" if kept else
+                          "Auto mode refused 2 shell commands in the modules session.\nassign.sh", text)
             self.assertEqual(self.cases[0].waits, "The P542 build waits for them" if kept else "")
             self.assertEqual("goes without its waits sentence" in errors.getvalue(), not kept)
         # With the review off, or no waits sentence, nothing is reviewed.
@@ -4290,10 +4290,10 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_auto_mode_goes_with_one_key_per_session_and_set_of_commands_unless_the_session_gives_one(self) -> None:
         self.writer_session()
         key = local_options(self.auto_mode_arguments()).key
-        self.assertEqual(key, send.auto_mode_key("modules", ("implement.sh --to modules-impl", "review.sh --to modules-test")))
+        self.assertEqual(key, send.auto_mode_key("modules", ("assign.sh --role implement --to modules-impl", "review.sh --to modules-test")))
         assert key is not None
         self.assertRegex(key, r"^auto-mode:modules:[0-9a-f]{12}$")
-        swapped = local_options(self.auto_mode_arguments(commands=("review.sh  --to modules-test", "implement.sh --to modules-impl")))
+        swapped = local_options(self.auto_mode_arguments(commands=("review.sh  --to modules-test", "assign.sh --role implement --to modules-impl")))
         self.assertEqual(swapped.key, key)
         self.assertNotEqual(local_options(self.auto_mode_arguments(session="tile")).key, key)
         self.assertEqual(local_options([*self.auto_mode_arguments(), "--key", "auto"]).key, "auto")

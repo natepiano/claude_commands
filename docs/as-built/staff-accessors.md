@@ -66,10 +66,10 @@ They also include `set_doc`, `set_worktree`, and `update_current_session`.
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
 | `scripts/direct/assign.py` | read | runtime_id |
+| `scripts/direct/assign_claude.py` | read | local_snapshot |
+| `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
-| `scripts/direct/implement.sh` | read | local_snapshot |
-| `scripts/direct/implement_launcher_test_support.py` | read | staff.json path |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |

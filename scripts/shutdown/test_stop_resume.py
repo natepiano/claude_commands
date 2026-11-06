@@ -651,10 +651,10 @@ class StopResumeTests(unittest.TestCase):
         run = str(self.root / "worker run")
         for phase in ("ad hoc", ""):
             with self.subTest(phase=phase):
-                command = ["bash", str(stop_resume.SCRIPTS / "direct/implement.sh")]
+                command = ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"), "--role", "implement",
+                           "--session-dir", run, "--cwd", "/old tree", "--prompt", "old prompt", "--to", "writer"]
                 if phase:
                     command.extend(("--phase", phase))
-                command.extend((run, "/old tree", "old prompt", "impl", "the task", "impl", "writing", "0", "impl"))
                 seat = PausedSeat(run_dir=run, seat="writer", role="impl", staff_id="worker-id",
                                   turn_live=True, launcher_command=command)
                 rebuilt = shlex.split(stop_resume.resume_worker_command(seat, "/current tree"))

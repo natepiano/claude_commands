@@ -790,7 +790,7 @@ other_names = []
             "docs/as-built/build-memory-admission.md",
             "docs/production_format.md",
             "scripts/production/rename_unit.py",
-            "scripts/direct/implement.sh",
+            "scripts/direct/assign.sh",
             "scripts/usage/collect.py",
         )
         with tempfile.TemporaryDirectory() as directory:
