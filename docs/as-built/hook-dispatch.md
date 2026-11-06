@@ -48,6 +48,8 @@ It runs after the turn ends.
 Exit 2 sends its stderr reason to the agent in a system-reminder.
 The user sees only "Continuing the unit run".
 The hook repeats the wake above the threshold until compaction reduces the context.
+The hook permits a stop when the final status matches `paused_status_pattern`.
+Holding and blocked prefixes alone do not prevent the wake.
 The existing guards and declared wait records stay the same.
 
 These hooks stay outside the dispatcher, as their own entries:

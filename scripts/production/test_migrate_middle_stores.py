@@ -27,7 +27,7 @@ class MiddleStoreMigrationTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = source_environment(self.root / "sources")
         self.enterContext(mock.patch.dict(os.environ, environment))
-        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
         self.enterContext(isolated_source_readers())
         self.outstanding = Path(environment["SHOWRUNNER_STATE_DIR"]) / "outstanding"
         self.outstanding.mkdir(parents=True)
