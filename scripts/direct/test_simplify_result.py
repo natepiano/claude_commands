@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
@@ -17,7 +16,6 @@ from unittest.mock import patch
 from scripts.direct import simplify_result
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.whoami.account_test_support import write_claude_account
 
 
 class SimplifyResultTests(unittest.TestCase):
@@ -159,20 +157,6 @@ class SimplifyResultTests(unittest.TestCase):
 
 
 class ClaudeQuotaSelectionTests(NixFixture):
-    def test_quota_selection_uses_the_soonest_reset_and_prints_the_selected_label(self) -> None:
-        reset = datetime.now(timezone.utc) + timedelta(days=2)
-        _ = (self.home / ".claude.json").write_text("{}")
-        with patch.dict(os.environ, {**self.env, "AGENT_NOTES_DIR": str(self.root / "notes")}):
-            write_claude_account("claude1", "one@example.invalid", 90, reset)
-            write_claude_account("claude2", "two@example.invalid", 25, reset - timedelta(days=1))
-            result = subprocess.run([
-                "bash", "-c", 'source "$1"; claude_launch_environment quota && printf "%s\\n" "$CLAUDE_CONFIG_DIR"',
-                "select", str(ROOT / "scripts/agents/claude_account.sh"),
-            ], env=dict(os.environ), capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip(), str(self.home / ".claude2"))
-            self.assertEqual(result.stderr, "Claude account claude2\n")
-
     def test_other_account_modes_keep_stdout_empty_when_selection_fails(self) -> None:
         result = subprocess.run([
             "bash", "-c", 'source "$1"; claude_launch_environment',

@@ -20,7 +20,7 @@ The `contract` reviewer owns style review.
 | `docs/direct/dual_review.md` | Defines the lens and its launch during `<DualReview/>` step 3. |
 | `commands/unit/direct.md` | Defines synthesis, repair dispatch, and the findings commands. |
 | `config/direct.conf` | Sets `SIMPLIFY_LENS=on` and the four names in `SIMPLIFY_AGENTS`. |
-| `config/models.conf` | Selects `direct.simplify=claude` and `simplify=opus:xhigh`. |
+| `config/models.conf` | Selects `direct.simplify=claude` and `simplify=opus:high`. |
 | `config/review/simplify.md` | Supplies the standing review instructions and report format. |
 | `scripts/direct/assign.py` | Checks the switch and replaces its process with `review.sh`. |
 | `scripts/direct/review.sh` | Owns the launch lock, review process, files, and completion records. |
@@ -45,8 +45,7 @@ It combines the standing instructions with the supplied phase prompt, including 
 Every launch uses a fresh Claude session, including a retry after failure.
 It uses no persistent Codex reviewer address.
 
-The shared account picker selects a Claude account with available quota.
-The launcher records its label in stderr and the review log.
+The lens runs on the Claude account of the unit director that starts it, through the caller's `CLAUDE_CONFIG_DIR`.
 `agent_exec.sh` uses `--print --permission-mode plan --disallowedTools Edit,Write,NotebookEdit`.
 It keeps `Agent` for the four review agents.
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` disables background tasks.
