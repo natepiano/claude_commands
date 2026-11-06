@@ -20,6 +20,8 @@ from unittest import mock
 from scripts.production.rename_test_support import FolderMoveBackend, FolderMoveFixture
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
+from scripts.whoami import agent_accounts
+from scripts.shutdown import restart
 from scripts.production import staff, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import unit_runs
@@ -197,6 +199,10 @@ class PaneRestoreTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.config = self.root / ".claude3"
+        def codex_home(label: str) -> agent_accounts.CodexHomeHoldingLogin:
+            return agent_accounts.CodexHomeHoldingLogin(label, self.root / f".{label}", "private@example.test")
+        _ = self.enterContext(mock.patch.object(agent_accounts, "codex_account_home", side_effect=codex_home))
+        _ = self.enterContext(mock.patch.object(agent_accounts, "codex_home_role_label", return_value="codex2"))
         select_role = accounts.role_account
         def role_account(role: str) -> accounts.AccountSelection:
             return (accounts.CodexWorkersAccount("codex1", self.root / ".codex1")
@@ -247,6 +253,9 @@ class PaneRestoreTests(unittest.TestCase):
         return "w1:p3"
 
     def entry(self, **changes: object) -> None:
+        if changes.get("kind") == "codex":
+            changes = {"config_dir": str(self.root / ".codex2"),
+                       "environment": {"CODEX_HOME": str(self.root / ".codex2")}, **changes}
         launch = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha",
                                     {"CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT": "demo",
                                      "CLAUDE_CODE_OAUTH_TOKEN": "secret"},
@@ -341,6 +350,18 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertIn("pane close anomaly:", output)
                 self.assertEqual(output.count("pane close anomaly:"), 1)
                 self.assertIn("w1:p2", pane_record.read("agents"))
+
+    def test_server_restore_keeps_the_saved_codex_account(self) -> None:
+        saved = self.root / ".codex2"
+        self.entry(kind="codex", config_dir=str(saved), environment={"CODEX_HOME": str(saved)})
+        client = self.restored()
+        with (mock.patch.object(agent_accounts, "codex_home_role_label", return_value="codex2"),
+              mock.patch.object(agent_accounts, "codex_account_home",
+                  return_value=agent_accounts.CodexHomeHoldingLogin("codex2", saved, "private@example.test")),
+              mock.patch.object(restart, "start_row", return_value="w1:p3") as start):
+            code, output = self.run_restore(client)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(start.call_args.kwargs["target_account"], "codex2")
 
     def test_restore_of_a_unit_uses_the_saved_account(self) -> None:
         self.row = replace(self.row, kind="unit")
@@ -664,6 +685,10 @@ class CodexPaneRestoreTests(FolderMoveFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        def codex_home(label: str) -> agent_accounts.CodexHomeHoldingLogin:
+            return agent_accounts.CodexHomeHoldingLogin(label, self.root / "home" / f".{label}", "private@example.test")
+        _ = self.enterContext(mock.patch.object(agent_accounts, "codex_account_home", side_effect=codex_home))
+        _ = self.enterContext(mock.patch.object(agent_accounts, "codex_home_role_label", return_value="codex2"))
         select_role = accounts.role_account
         def role_account(role: str) -> accounts.AccountSelection:
             return (accounts.CodexWorkersAccount("codex2", self.root / "home/.codex2")

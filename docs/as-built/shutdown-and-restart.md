@@ -23,6 +23,8 @@ The installation link belongs in `~/.local/bin` after merge.
 
 One `LaunchNames.read()` supplies the staff snapshot for lookup, labels, and restore.
 The lookup accepts a short name, a staff id, or a current session id.
+An exact Codex thread name resolves through the shared `session_index.jsonl`.
+A raw session id takes priority over a thread name.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
@@ -31,10 +33,13 @@ A running session returns status 0 with an `unchanged` line that names its curre
 Resume does not stop or move a running session.
 The default reason is `resumed by name`.
 
-The shared resume path reads the saved account, environment, arguments, and folder.
-Claude units and showrunners use their group's configured account unless `--to` supplies an account.
-This rule also applies when no pane launch record exists.
-Ad hoc sessions keep their saved account.
+The shared resume path reads the saved environment, arguments, and folder.
+A named Codex resume uses the configured `workers` account, with or without a staff row.
+Claude units and showrunners use their configured role account, even without a pane launch record.
+Other Claude sessions keep their saved account.
+`--to ACCOUNT` overrides the account for either family.
+Restart and folder moves use the role account.
+A herdr server restore keeps the saved account for both families.
 It restores a closed tab when a saved launch exists.
 An explicit CLI resume can restore an intentionally stopped session.
 Automatic recovery preserves an intentional stop.
@@ -79,6 +84,7 @@ Retirement, checkout moves, running-session attach and nix-shell healing use thi
 
 Watchdog recovery uses the retained pane launch and staff row.
 An ended pane launch keeps an intentionally stopped session down.
+A unit with no pane launch record stays down.
 The watchdog does not read shutdown session records.
 
 ## Restart

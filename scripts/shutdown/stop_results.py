@@ -54,6 +54,11 @@ class ClaudeStartState(StrEnum):
 
 
 @dataclass(frozen=True)
+class UnknownProcessId:
+    """The resume result has no proved process id."""
+
+
+@dataclass(frozen=True)
 class ClaudeUp:
     session_id: str
     pane_id: str
@@ -61,6 +66,7 @@ class ClaudeUp:
     elapsed_seconds: float = field(default=0.0, compare=False)
     trust_copied_from: str = field(default="", compare=False)
     start_state: ClaudeStartState = field(default=ClaudeStartState.STARTED, compare=False)
+    pid: int | UnknownProcessId = field(default_factory=UnknownProcessId, compare=False)
 
 
 @dataclass(frozen=True)

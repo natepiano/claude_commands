@@ -14,7 +14,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Barrier, Lock, local
@@ -23,7 +23,7 @@ from unittest.mock import Mock, call, patch
 
 from scripts.message import sessions as runtime_sessions
 from scripts.accounts import accounts, moves
-from scripts.whoami import account
+from scripts.whoami import account, agent_accounts
 from scripts.shutdown import restart, stop_resume, stop_results
 from scripts.lib import atomic_file, conf, operation_deadline, unit_runs
 from scripts.herdr import worker_panes
@@ -390,7 +390,7 @@ class StopResumeTests(unittest.TestCase):
         atomic_file.write_text_atomic(home / "sessions" / f"rollout-{identity}.jsonl", json.dumps({
             "type": "session_meta", "payload": {"id": identity, "cwd": str(self.root / "project")}}) + "\n")
         for label in ("codex1", "codex2"):
-            with sqlite3.connect(":memory:") as database:
+            with closing(sqlite3.connect(":memory:")) as database:
                 _ = database.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
                 if label == "codex2":
                     _ = database.execute("INSERT INTO threads VALUES (?)", (identity,))
@@ -422,6 +422,67 @@ class StopResumeTests(unittest.TestCase):
             once.return_value = stop_resume.SessionNotFound("saved")
             self.assertEqual(stop_resume.resume("SAVED-WORKER"), stop_resume.ResumeFailed("SAVED-WORKER", "unknown name"))
 
+    def test_raw_codex_id_wins_over_another_threads_name(self) -> None:
+        identity = self.saved_codex_name()
+        path = self.root / ".codex2/session_index.jsonl"
+        write = json.dumps({"id": "another-id", "thread_name": identity}) + "\n"
+        atomic_file.write_text_atomic(path, path.read_text() + write)
+        with (patch.dict(os.environ, {"CODEX_HOME": str(path.parent)}),
+              patch.object(stop_resume, "_resume_once", return_value=stop_resume.SessionNotFound(identity)) as once):
+            _ = stop_resume.resume(identity)
+        self.assertEqual(once.call_args.args[0], identity)
+
+    def resume_codex_staff(self, observed: herdr.LiveConversation | herdr.UnknownConversation) -> tuple[stop_resume.ResumeResult, Mock, Mock, Mock, str]:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("codex-holder"), "agent", "alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(identity))
+        self.entry["kind"] = "codex"
+        self.entry["config_dir"] = str(self.root / ".codex2")
+        self.entry["environment"] = {"CODEX_HOME": self.entry["config_dir"]}
+        pane_record.save("agents", {"w1:p2": self.entry})
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+                  "codex1", self.root / ".codex1")),
+              patch.object(agent_accounts, "codex_home_role_label", return_value="codex7") as source_label,
+              patch.object(herdr, "read_conversation", side_effect=[herdr.StoppedConversation(), observed]),
+              patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.root / ".codex1")),
+              patch.object(accounts, "codex_home_label", return_value="codex1"),
+              patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                  self.root, {"CODEX_HOME": str(self.root / ".codex1")})),
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p2", herdr.PromptSubmissionNotRequired())) as launch,
+              patch.object(self.client, "prompt") as prompt,
+              redirect_stderr(io.StringIO()) as errors):
+            result = stop_resume.resume("alpha")
+        return result, launch, prompt, source_label, errors.getvalue()
+
+    def test_codex_staff_resume_uses_native_prompt_delivery(self) -> None:
+        result, launch, prompt, _label, _errors = self.resume_codex_staff(herdr.LiveConversation("codex", (456,)))
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertIsInstance(cast(object, launch.call_args.args[5]), herdr.NoOpeningPrompt)
+        prompt.assert_called_once()
+        self.assertEqual(prompt.call_args.kwargs["target"], self.entry["session_id"])
+
+    def test_codex_resume_message_uses_the_source_login_label(self) -> None:
+        _result, _launch, prompt, label, _errors = self.resume_codex_staff(herdr.LiveConversation("codex", (456,)))
+        label.assert_called_once_with(self.root / ".codex2")
+        self.assertIn("codex7", cast(str, prompt.call_args.args[1]))
+
+    def test_codex_resume_observes_the_started_process_generation(self) -> None:
+        _result, _launch, _prompt, _label, errors = self.resume_codex_staff(herdr.LiveConversation("codex", (456,)))
+        self.detach.assert_called_once()
+        arguments = cast(list[str], self.detach.call_args.args[0])
+        self.assertEqual(arguments[arguments.index("--pid") + 1], "456")
+        self.assertEqual(arguments[arguments.index("--generation") + 1], "generation-1")
+        self.assertEqual(errors, "")
+
+    def test_codex_resume_reports_one_anomaly_when_the_started_pid_is_unreadable(self) -> None:
+        result, _launch, _prompt, _label, errors = self.resume_codex_staff(herdr.UnknownConversation("pid unreadable"))
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.detach.assert_not_called()
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertIn("observer anomaly:", errors)
+
     def test_resume_codex_name_uses_the_workers_account_and_the_rollout_folder(self) -> None:
         identity = self.saved_codex_name()
         source = self.root / ".codex2"
@@ -431,6 +492,7 @@ class StopResumeTests(unittest.TestCase):
                   patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
                       "codex1", self.root / ".codex1")) as role,
                   patch.object(self.client, "open_tab", return_value="w1:p2"),
+                  patch.object(self.client, "prompt") as prompt,
                   patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
                   patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
                       self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
@@ -443,6 +505,8 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(prepare.call_args.args[1], str(self.root / "project"))
                 self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
                 self.assertEqual(launch.call_args.args[3], "codex")
+                self.assertIsInstance(cast(object, launch.call_args.args[5]), herdr.NoOpeningPrompt)
+                prompt.assert_not_called()
                 self.assertEqual(launch.call_args.args[4][-2:], ["resume", identity])
                 if target is None:
                     role.assert_called_once_with("workers")

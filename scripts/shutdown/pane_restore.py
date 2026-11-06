@@ -23,6 +23,7 @@ import pane_record  # noqa: E402
 import pane_launch
 from scripts.lib import conf
 from scripts.shutdown.codex_trust import trust_arguments
+from scripts.whoami import agent_accounts
 from scripts.whoami.account import named_account_environment
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import staff  # noqa: E402
@@ -82,8 +83,10 @@ def restore(session: str, *, dry_run: bool) -> int:
         parent = record.parent_of(row) if row.kind == "worker" else None
         holder = parent if parent is not None and restart.pane_workers(parent) else row
         selected[holder.id] = holder
-        if saved is not None and pane_launch.agent_kind(saved) == "claude" and holder.id == row.id:
-            target_accounts[holder.id] = accounts.claude_config_label(Path(saved["config_dir"]))
+        if saved is not None and holder.id == row.id:
+            home = Path(saved["config_dir"])
+            target_accounts[holder.id] = (agent_accounts.codex_home_role_label(home) if pane_launch.agent_kind(saved) == "codex"
+                                          else accounts.claude_config_label(home))
         if dry_run:
             entry = names.resume(saved) if saved is not None else None
             account = entry["config_dir"] if entry is not None else "retained account"

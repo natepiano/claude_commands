@@ -452,7 +452,7 @@ def _codex_running_on_account(identity: str, pane_id: str, pid: int) -> ClaudeUp
     if isinstance(setting, account.ProcessEnvironmentUnread):
         return ResumeFailed(identity, setting.reason)
     home = setting.home if isinstance(setting, account.ProcessCodexHome) else Path.home() / ".codex"
-    return ClaudeUp(identity, pane_id, accounts.codex_home_label(home), start_state=ClaudeStartState.ALREADY_RUNNING)
+    return ClaudeUp(identity, pane_id, accounts.codex_home_label(home), start_state=ClaudeStartState.ALREADY_RUNNING, pid=pid)
 
 
 def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> ClaudeUp | ResumeFailed | sessions.SessionNotLive:
@@ -481,7 +481,7 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
             label = accounts.claude_config_label(setting.path)
     except (OSError, ValueError) as error:
         print(f"{identity}: account anomaly: {error}", file=sys.stderr)
-    return ClaudeUp(identity, pane_id, label, start_state=ClaudeStartState.ALREADY_RUNNING)
+    return ClaudeUp(identity, pane_id, label, start_state=ClaudeStartState.ALREADY_RUNNING, pid=live.pid)
 
 
 def _member_machine(member: StaffRow) -> str:
@@ -522,7 +522,8 @@ def _codex_name_ids(name: str) -> list[str]:
     try:
         entries = [cast(dict[str, str], json.loads(line))
                    for line in (agent_accounts.codex_home() / "session_index.jsonl").read_text().splitlines() if line.strip()]
-        return sorted({entry["id"] for entry in entries if entry.get("thread_name") == name})
+        return ([name] if any(entry.get("id") == name for entry in entries) else
+                sorted({entry["id"] for entry in entries if entry.get("thread_name") == name}))
     except FileNotFoundError:
         return []
     except (OSError, ValueError) as error:
@@ -658,7 +659,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
 
         selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         source = Path(entry["config_dir"])
-        source_label = accounts.claude_config_label(source)
+        source_label = agent_accounts.codex_home_role_label(source) if kind == "codex" else accounts.claude_config_label(source)
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label
@@ -706,7 +707,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
         message = resume_message(why, move=AccountMove(source_label, label) if not isinstance(selected, NoRoleAccount) else NO_ACCOUNT_MOVE,
-                                 workers=workers, own_pass=own) if row is None or row.kind != "worker" or isinstance(own, BusyPass) else ""
+                                 workers=workers, own_pass=own) if (kind != "codex" or row is not None) and (
+                                     row is None or row.kind != "worker" or isinstance(own, BusyPass)) else ""
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             with pane_record.locked(client.session):
                 entries = pane_record.read_strict(client.session)
@@ -723,14 +725,14 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             prepared = herdr.prepare_session_environment(identity, entry["cwd"], entry["environment"], herdr.NO_ENVIRONMENT_REMOVALS)
             if isinstance(prepared, nix_env.Refused):
                 raise OSError(str(prepared))
-            opening = (herdr.OpeningPrompt(message, herdr.SessionTranscript(target_dir, identity))
-                       if message else herdr.NoOpeningPrompt())
             attempt_pane = tab.pane_id
             launched = herdr.launch_prepared_agent(client.session, herdr.ExistingPane(tab.pane_id, ""), prepared, kind,
-                trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), opening,
+                trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), herdr.NoOpeningPrompt(),
                 int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000), agent=entry["name"] or identity)
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr.HerdrFailure(launched.outcome.reason)
+            if message:
+                client.prompt(tab.pane_id, message, target=identity)
             started = launched
         else:
             live = sessions.session_liveness(identity)
@@ -748,13 +750,18 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: launch record anomaly: {error}", file=sys.stderr)
         attempt_pane = ""
-        if isinstance(started, herdr.AgentLaunched):
-            return ClaudeUp(identity, tab.pane_id, label, monotonic() - began)
         try:
-            generation = sessions.process_start(started.pid)
+            if isinstance(started, herdr.AgentLaunched):
+                observed = running_on_account(identity, tab.pane_id, kind="codex")
+                if not isinstance(observed, ClaudeUp) or not isinstance(observed.pid, int):
+                    raise OSError(observed.reason if isinstance(observed, ResumeFailed) else "process id is unavailable")
+                pid = observed.pid
+            else:
+                pid = started.pid
+            generation = sessions.process_start(pid)
             if generation:
                 _detach(["stay", "--session", identity, "--pane", tab.pane_id,
-                         "--account", label, "--pid", str(started.pid), "--generation", generation, "--why", why,
+                         "--account", label, "--pid", str(pid), "--generation", generation, "--why", why,
                          *(["--requester", requester] if requester else [])], "stay")
             else:
                 print(f"{identity}: observer anomaly: process generation is unavailable", file=sys.stderr)
