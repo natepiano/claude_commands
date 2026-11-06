@@ -65,6 +65,7 @@ from scripts.accounts.role_map import (  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.shutdown.inventory import ListedSession, Session
+    from scripts.production import staff
 
 
 MoveAlerts = Literal["user", "none"]
@@ -2675,16 +2676,24 @@ class MoveRefused:
 class SessionMoveRefused:
     session_id: str
     reason: str
+    returncode: int = 1
 
 
 SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused
 
 
+class PaneMoves(Protocol):
+    def move_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot, target: str,
+                    why: str, run: Path) -> SessionMoveOutcome: ...
+
+    def run_for_worker(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> Path: ...
+
+
 class SessionBatchMove(Protocol):
-    def __call__(self, sessions: list[str], target: str, *, why: str) -> list[stop_results.MoveResult]: ...
+    def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
     """Stop and resume each selected local owner through the shared move API."""
 
     account_config = read_account_settings(account_config)
@@ -2708,7 +2717,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config
             eligible.append(identity)
     outcomes: dict[str, SessionMoveOutcome] = dict(refused)
     batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
-    results = batch(eligible, checked.destination.label, why=why)
+    results = batch(eligible, checked.destination.label, why=why, cause=cause)
     for identity, result in zip(eligible, results):
         if isinstance(result, stop_results.SessionNotFound):
             account_anomaly(f"{identity}: no saved session was found")
@@ -2776,9 +2785,14 @@ class GroupMoveStarted:
 def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS
                  ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
-    """Stop workers and retain their staff rows until assign.sh can restart them."""
+    """Resume pane workers on the destination; keep mesh-pinned workers on their existing path."""
     from scripts.production import staff, session_staff
-    del why
+    pane_moves = cast(PaneMoves, cast(object, import_module("scripts.accounts.pane_moves")))
+    if TYPE_CHECKING:
+        from scripts.herdr import herdr
+    else:
+        import herdr
+
     target = note_file.canonical_label(target)
     if _label_is(target, "codex"):
         _ = _codex_move_target(target)
@@ -2795,18 +2809,29 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
             return f"cannot restart on {target} through assign.sh"
         return ""
 
+    runs_by_worker = session_staff.worker_run_index(record)
+
     if dry_run:
         lines: list[str] = []
         for row in rows:
+            run = pane_moves.run_for_worker(row, record)
             reason = restart_refusal(row.id)
-            preview = f"not moved: {reason}" if reason else f"would stop; restart on {target} stays pending"
+            preview = (f"would stop; restart on {target} stays pending" if unit_runs.worker_transport(run) == "mesh"
+                       else f"would stop and resume the same conversation on {target} in its worker pane")
+            if reason:
+                preview = f"not moved: {reason}"
             lines.append(f"{row.name} ({row.id}): {preview}")
         return GroupMoveDryRun(identities, tuple(lines))
     release_source = cast(stop_results.ReleaseSource, import_module("scripts.shutdown.stop_resume").release_source)
-    runs_by_worker = session_staff.worker_run_index(record)
     results: list[SessionMoveOutcome] = []
     for row in rows:
         try:
+            run = pane_moves.run_for_worker(row, record)
+            if unit_runs.worker_transport(run) != "mesh":
+                reason = restart_refusal(row.id) if row.current_session else ""
+                results.append(SessionMoveRefused(row.id, reason) if reason else
+                               pane_moves.move_worker(row, record, target, why, run))
+                continue
             with staff.row_operation(row.id):
                 if reason := restart_refusal(row.id):
                     raise AccountsError(f"{reason}; source remains running")
@@ -2815,12 +2840,13 @@ def move_workers(target: str, *, dry_run: bool = False, why: str = "by hand",
                     raise AccountsError(released.reason)
                 results.append(stop_results.ResumePending(row.id, target,
                     "assign.sh cannot carry the staff id and destination account yet"))
-        except (OSError, ValueError, AccountsError, staff.StaffRefused) as error:
+        except (OSError, ValueError, AccountsError, staff.StaffRefused, herdr.HerdrFailure) as error:
             results.append(SessionMoveRefused(row.id, str(error).replace("\n", " ")))
     outcomes = tuple(results)
     stdout, stderr, code = _move_output(outcomes, ())
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
     return outcome(identities, target, stdout, stderr, code, outcomes=outcomes)
+
 
 
 def _move_target(target: str, *, repair: bool = True) -> NamedAccount | MoveRefused:
@@ -2890,7 +2916,8 @@ def _move_output(results: tuple[SessionMoveOutcome, ...],
             stderr += line
         else:
             stdout += line
-    return stdout, stderr, int(any(isinstance(item, (SessionMoveRefused, stop_results.ResumePending)) for item in results))
+    return stdout, stderr, max((item.returncode if isinstance(item, SessionMoveRefused) else
+                               int(isinstance(item, stop_results.ResumePending)) for item in results), default=0)
 
 
 @role_map.role_map_command
@@ -2930,6 +2957,8 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
 
 
 def session_on_account(session: ListedSession | LiveGroupMember, label: str) -> bool:
+    if _label_is(label, "codex"):
+        return agent_accounts.codex_home_matches_label(session.config_dir, label)
     return _label_is(label, "claude") and session.config_dir == claude_account_dir(label)
 
 
