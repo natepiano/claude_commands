@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+
 from scripts.production import staff, unit_lookup
 from scripts.production import showrunner_tree
 from scripts.production.issues import Issue, open_issues
-# Callers such as rename_unit read the tag here.
+# Callers such as rename read the tag here.
 from scripts.production.issues import PROPOSAL_TAG as PROPOSAL_TAG
 from scripts.production.production_doc import Refusal, production_field
 

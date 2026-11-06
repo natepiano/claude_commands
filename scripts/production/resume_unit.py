@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production import completion_receipt, staff, staff_sources, unit_config
+from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote
 from scripts.lib import conf
 from scripts.message import sessions
@@ -206,12 +206,13 @@ def resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
     launch(unit)
     if not resumed_session_proven(unit.production.name, unit.name, unit.session_id, row):
         raise Refused(f"{unit.name}: resumed native session identity is not proven; parked facts kept")
-    print(f"{unit.name} resumed")
     completed = resume_record(unit.production, unit.name).with_suffix(".done")
     completion_receipt.write_receipt(completed, row.id, {"session_id": unit.session_id,
                                                    "doc": str(unit.production.doc), "unit": unit.name})
     unit_config.discard_parked(row.id)
-    return 0
+    code = worker.restore(row.id)
+    print(f"{unit.name} resumed")
+    return int(code)
 
 
 def _main(argv: list[str]) -> int:
@@ -232,8 +233,9 @@ def _main(argv: list[str]) -> int:
                 and isinstance(completed.fields.get("session_id"), str)
                 and resumed_session_proven(unit.production.name, unit.name,
                     cast(str, completed.fields["session_id"]), completed.owner)):
+            code = worker.ExitCode.OK if cast(bool, options.dry_run) else worker.restore(completed.owner.id)
             print(f"{unit.name} already resumed")
-            return 0
+            return int(code)
         if isinstance(unit, NoRecoveryRequired):
             raise Refused(f"{unit.name} is not retired")
         return dry_run(unit) if cast(bool, options.dry_run) else resume(unit, record)

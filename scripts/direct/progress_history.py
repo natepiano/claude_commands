@@ -1044,6 +1044,50 @@ def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
     }
 
 
+@dataclass(frozen=True)
+class ActiveDispatch:
+    instance_id: str
+    launcher_command: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoActiveDispatch:
+    """The worker has no active pass."""
+
+
+@dataclass(frozen=True)
+class ActiveDispatchUnavailable:
+    reason: str
+
+
+def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoActiveDispatch | ActiveDispatchUnavailable:
+    """Read the active pass through the worker's fixed staff id."""
+    try:
+        row = staff.snapshot().by_id(worker_id)
+        if row is None:
+            return ActiveDispatchUnavailable(f"worker {worker_id}: staff row is unavailable")
+        state = worker_lifecycle.read_json_object(_state_path(run))
+        roster = session_staff.read_worker_roster(run / "mesh_roster.json")
+        names = {row.name, *(name for name, entry in roster.items()
+                           if (_object_dict(entry) or {}).get("staff_id") == worker_id)}
+        matches = [item for slot, item in _open_passes(state).items()
+                   if item.get("worker_name", slot) in names]
+        if not matches:
+            return NoActiveDispatch()
+        if len(matches) != 1:
+            return ActiveDispatchUnavailable(f"worker {worker_id}: multiple active passes")
+        instance = _string(matches[0].get("instance_id"))
+        command = matches[0].get("launcher_command")
+        if not instance or not isinstance(command, list) or not command or any(
+                not isinstance(part, str) for part in cast(list[object], command)):
+            return ActiveDispatchUnavailable(f"worker {worker_id}: active pass identity or launcher command is unavailable")
+        return ActiveDispatch(instance, tuple(cast(list[str], command)))
+    except FileNotFoundError:
+        return NoActiveDispatch()
+    except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable) as error:
+        return ActiveDispatchUnavailable(f"worker {worker_id}: {error}")
+
+
 class DispatchDetailNotRecorded(Enum):
     """The dispatch has no unique value for this detail."""
 

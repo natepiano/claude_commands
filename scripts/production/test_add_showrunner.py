@@ -11,6 +11,7 @@ import math
 import os
 import shlex
 import subprocess
+import sys
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
-
 
 
 from scripts.accounts import accounts
@@ -115,7 +115,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
                subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
         if subprocess_cli:
-            return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", LINUX_LAUNCHER_CLI, str(SCRIPT), *arguments],
+            return subprocess.run([sys.executable, "-c", LINUX_LAUNCHER_CLI, str(SCRIPT), *arguments],
                                   env=self.env, capture_output=True, text=True, check=False, cwd=cwd,
                                   timeout=TEST_HANG_GUARD_SECS)
         return super().invoke(arguments, cwd=cwd)
@@ -138,7 +138,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual((rows[0].id, rows[0].current_session), (registry["sessionId"], registry["sessionId"]))
 
     def test_showrunner_and_unit_add_paths_share_the_live_doc_admission_writer(self) -> None:
-        from scripts.production import add_unit
+        import add_unit
 
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         original = add_showrunner.ensure_staff_showrunner
@@ -494,7 +494,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
               patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
               patch.object(herdr.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "terminal_id": "destination-terminal", "workspace_id": "destination", "label": "kid"}]),
               patch.object(herdr.Herdr, "start_command", side_effect=started),
-              patch.object(herdr.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
+              patch.object(herdr.Herdr, "readiness", return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}) as readiness,
               patch.object(herdr.Herdr, "_prompt", autospec=True, side_effect=typed) as prompt,
               patch.object(herdr.Herdr, "run", side_effect=visible),
               patch.object(herdr.Herdr, "_send_keys", autospec=True, side_effect=enter) as keys):

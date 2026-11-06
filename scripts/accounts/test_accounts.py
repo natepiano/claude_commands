@@ -7229,13 +7229,10 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("dispatch role is unavailable", result.stderr)
 
-    def test_resume_message_uses_the_phase_ten_busy_and_idle_contract(self) -> None:
-        from scripts.lib.resume_message import AccountMove, BusyPass, IdleWorker, PaneWorkerResume, ResumeWorkers, resume_message
+    def test_resume_message_continues_the_moved_workers_own_pass(self) -> None:
+        from scripts.lib.resume_message import AccountMove, BusyPass, resume_message
 
-        idle = PaneWorkerResume(staff_id=staff.StaffId("idle"), turn=IdleWorker())
-        busy = PaneWorkerResume(staff_id=staff.StaffId("busy"), turn=BusyPass("dispatch-busy"))
-        self.assertEqual(resume_message("quota", workers=ResumeWorkers(panes=[idle])), "")
-        text = resume_message("quota", move=AccountMove("claude1", "claude2"), workers=ResumeWorkers(panes=[idle, busy]))
+        text = resume_message("quota", move=AccountMove("claude1", "claude2"), own_pass=BusyPass("dispatch-busy"))
         self.assertIn("Continue pass dispatch-busy", text)
         self.assertIn("moved from claude1 to claude2", text)
         self.assertNotIn("idle", text)
