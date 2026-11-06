@@ -1,23 +1,19 @@
 """Check simplify result rules without starting a complete review."""
 from __future__ import annotations
 
-import contextlib
-from datetime import datetime, timedelta, timezone
-import io
 import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 from typing import override
 import unittest
 from unittest.mock import patch
 
 from scripts.direct import simplify_result
+from scripts.lib import conf
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.whoami.account_test_support import write_claude_account
 
 
 class SimplifyResultTests(unittest.TestCase):
@@ -27,18 +23,9 @@ class SimplifyResultTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
-    def review_files(self) -> simplify_result.ReviewFiles:
-        return simplify_result.ReviewFiles(self.directory / "findings.txt", self.directory / "status",
-                                           self.directory / "agent.log", self.directory / "summary.txt")
-
-    def check_options(self, report: Path, log: Path) -> list[str]:
-        files = self.review_files()
-        return ["--findings-file", str(report), "--log-file", str(log), "--status-file", str(files.status),
-                "--summary-file", str(files.summary)]
-
     def test_report_validation_accepts_real_review_headings_and_preambles(self) -> None:
         for report in (
-            "**Simplify review: aws-unit, phase 8**\n\nScope: ...\n\n1. **`scripts/aws_target/remote.py:216`**",
+            "**Simplify review: aws, phase 8**\n\nScope: ...\n\n1. **`scripts/aws_target/remote.py:216`**",
             "# Simplify review: phase 101y\n\nI found 16 in-phase items...\n\n### In-phase\n\n1. **minor** · ...",
             "Verification is done. I am writing the report now.\n\n1. **`scripts/review_links/change_browser.py:35-38`** — `in-phase`",
             "# Review\n\nPass\n\nAgent results",
@@ -50,17 +37,14 @@ class SimplifyResultTests(unittest.TestCase):
         with patch.object(simplify_result, "claude_result", side_effect=AssertionError("repeated scan")):
             self.assertEqual(simplify_result.validate("ERROR: credentials expired", "large log", 4), "credentials expired")
 
-    def test_failure_reason_keeps_the_stated_reason_before_report_and_log_evidence(self) -> None:
-        for stated, report, log, expected in (
-            ("stopped", "ERROR: report", "ERROR: log", "stopped"),
-            ("", "ERROR: report", "ERROR: log", "report"),
-            ("", "", "account detail\nERROR: no quota", "no quota"),
-            ("", "", "", "the simplify review did not finish successfully (exit 9)"),
+    def test_failure_reason_uses_log_errors_or_the_exit_code(self) -> None:
+        for log, expected in (
+            ("account detail\nERROR: no quota", "no quota"),
+            ("", "the simplify review did not finish successfully (exit 9)"),
         ):
             with self.subTest(expected=expected):
-                log_path = self.directory / "reason.log"
-                _ = log_path.write_text(log)
-                self.assertEqual(simplify_result.failure_reason(stated, report, log_path, 9), expected)
+                self.assertEqual(simplify_result.failure_reason(log, 9), expected)
+        self.assertEqual(simplify_result.validate("ERROR: report", "ERROR: log", 4), "report")
 
     def test_report_validation_preserves_unicode_whitespace_and_checks_agent_completion(self) -> None:
         cases: tuple[tuple[str, dict[str, int], str], ...] = (
@@ -86,22 +70,16 @@ class SimplifyResultTests(unittest.TestCase):
 
         config = self.directory / "config"
         config.mkdir()
-        report = self.directory / "report.txt"
-        log = self.directory / "review.log"
-        _ = log.write_text(json.dumps({"type": "result", "subagent_stats": {"completed": 2, "failed": 0}}))
-        for agents, code in (("reuse efficiency", 0), ("reuse efficiency altitude", 1)):
+        log = json.dumps({"type": "result", "subagent_stats": {"completed": 2, "failed": 0}})
+        for agents, expected in (("reuse efficiency", ""), ("reuse efficiency altitude", "3 simplify agents")):
             with self.subTest(agents=agents):
                 _ = write_config_fixture(config / "direct.conf", f"SIMPLIFY_AGENTS={agents}\n")
-                _ = report.write_text("Pass")
-                result = subprocess.run([
-                    sys.executable, str(ROOT / "scripts/direct/simplify_result.py"), "check",
-                    *self.check_options(report, log),
-                ], env={**os.environ, "CONF_DIR": str(config)}, capture_output=True, text=True,
-                    check=False, timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, code, result.stderr)
-                if code:
-                    self.assertIn("3 simplify agents", result.stdout)
-                    self.assertIn("ERROR:", report.read_text())
+                with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                    reason = simplify_result.validate("Pass", log, len(conf.read("direct").words("SIMPLIFY_AGENTS")))
+                if expected:
+                    self.assertIn(expected, reason)
+                else:
+                    self.assertEqual(reason, "")
 
     def preparation_inputs(self) -> tuple[Path, Path, Path, Path]:
         from scripts.lint.memory_test_support import write_config_fixture
@@ -123,33 +101,16 @@ class SimplifyResultTests(unittest.TestCase):
         with patch.dict(os.environ, {"CONF_DIR": str(config)}):
             with patch("scripts.lib.atomic_file.os.replace", side_effect=PermissionError("publication refused")):
                 with self.assertRaisesRegex(OSError, "publication refused"):
-                    _ = simplify_result.prepare(diff, self.directory, source, prompt, self.review_files())
+                    simplify_result.prepare(diff, source, prompt, self.directory / "report.txt", conf.read("direct"))
         self.assertEqual(prompt.read_text(), "Previous complete prompt")
 
     def test_preparation_uses_the_configured_agent_list_for_the_prompt(self) -> None:
         config, diff, source, prompt = self.preparation_inputs()
         with patch.dict(os.environ, {"CONF_DIR": str(config)}):
-            _ = simplify_result.prepare(diff, self.directory, source, prompt, self.review_files())
+            simplify_result.prepare(diff, source, prompt, self.directory / "report.txt", conf.read("direct"))
         self.assertEqual((self.directory / "prompt.md").read_text(),
                          f"/simplify {diff}\n\nKeep these agents: reuse,altitude.\n\n\nUser instructions\n")
         self.assertEqual(source.read_text(), "User instructions")
-
-    def test_finish_copies_the_report_and_prints_a_failure_reason_once(self) -> None:
-        files = self.review_files()
-        _ = files.findings.write_text("Pass")
-        _ = files.status.write_text("reviewed\n")
-        with contextlib.redirect_stdout(io.StringIO()):
-            state = simplify_result.finish(files, "", 0)
-        self.assertEqual(state, "reviewed")
-        self.assertEqual(Path(files.summary).read_text(), "Pass")
-        errors = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
-            state = simplify_result.finish(files, "stopped", 143)
-        self.assertEqual(state, "error")
-        self.assertEqual(errors.getvalue(), "simplify: error: stopped\n")
-        self.assertEqual(files.findings.read_text(), "ERROR: stopped\n")
-        self.assertEqual(files.summary.read_text(), files.findings.read_text())
-        self.assertEqual(files.status.read_text(), "reviewed\n")
 
     def test_empty_reports_preserve_account_failure_reasons_from_the_log(self) -> None:
         self.assertEqual(simplify_result.validate("", "ERROR: no claude account has room", 4),
@@ -159,20 +120,6 @@ class SimplifyResultTests(unittest.TestCase):
 
 
 class ClaudeQuotaSelectionTests(NixFixture):
-    def test_quota_selection_uses_the_soonest_reset_and_prints_the_selected_label(self) -> None:
-        reset = datetime.now(timezone.utc) + timedelta(days=2)
-        _ = (self.home / ".claude.json").write_text("{}")
-        with patch.dict(os.environ, {**self.env, "AGENT_NOTES_DIR": str(self.root / "notes")}):
-            write_claude_account("claude1", "one@example.invalid", 90, reset)
-            write_claude_account("claude2", "two@example.invalid", 25, reset - timedelta(days=1))
-            result = subprocess.run([
-                "bash", "-c", 'source "$1"; claude_launch_environment quota && printf "%s\\n" "$CLAUDE_CONFIG_DIR"',
-                "select", str(ROOT / "scripts/agents/claude_account.sh"),
-            ], env=dict(os.environ), capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip(), str(self.home / ".claude2"))
-            self.assertEqual(result.stderr, "Claude account claude2\n")
-
     def test_other_account_modes_keep_stdout_empty_when_selection_fails(self) -> None:
         result = subprocess.run([
             "bash", "-c", 'source "$1"; claude_launch_environment',

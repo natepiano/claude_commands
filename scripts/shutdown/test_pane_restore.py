@@ -332,9 +332,9 @@ class RestoreStaffNamesTests(StaffTestCase):
     def saved_batch(self) -> tuple[Path, FakeClient]:
         parent, unit, worker = self.tree()
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("unit-after-clear")))
-        unit = staff.rename(unit.id, "renamed-unit")
+        unit = staff.rename(unit.id, "renamed")
         worker = staff.update_current_session(worker.current_session, staff.native_id(fixture_runtime_id("worker-after-clear")))
-        _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("decoy-unit"))
+        _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("decoy"))
         missing = fixture_runtime_id("missing-row")
         directory = self.root / "saved-panes"
         config = self.root / "account"
@@ -418,7 +418,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         self.assertEqual(output.getvalue().count("no staff row"), 1)
         self.assertIn(fixture_runtime_id("missing-row"), output.getvalue())
         self.assertEqual(output.getvalue().count(": resume "), 3)
-        self.assertIn("w1:p1 renamed-unit: resume", output.getvalue())
+        self.assertIn("w1:p1 renamed: resume", output.getvalue())
         self.assertIn("w1:p2 impl1: resume", output.getvalue())
         self.assertIn("w1:p3 models: resume", output.getvalue())
         self.assertEqual(client.started, [])
@@ -526,9 +526,9 @@ class RestoreStaffNamesTests(StaffTestCase):
         self.assertEqual(len(self.ssh_commands()), 7)
         self.assertTrue(all("--snapshot" in command for command in self.ssh_commands()))
         self.assertEqual(order.call_count, 3)
-        self.assertEqual(started, ["renamed-unit", "impl1", "models"])
+        self.assertEqual(started, ["renamed", "impl1", "models"])
         self.assertEqual(sorted(title for _, titles in client.layout() for title in titles),
-                         ["impl1", "models", "renamed-unit"])
+                         ["impl1", "models", "renamed"])
 
 
 class CodexPaneRestoreTests(FolderMoveFixture):
@@ -862,9 +862,16 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             if publish:
                 info: dict[str, object] = {"process_info": {"foreground_processes": [{
                     "pid": backend.pid, "argv": ["codex", *agent_arguments], "cwd": str(self.new_folder)}]}}
+
+                def publication_result(*arguments: str) -> dict[str, object]:
+                    if arguments[:2] == ("pane", "process-info"):
+                        return info
+                    return {"panes": [{"pane_id": "w1:p3", "terminal_id": "w1:p3-terminal",
+                        "workspace_id": "w1", "agent_session": {"kind": "id", "value": held_id}}]}
+
                 publishing = True
                 try:
-                    with mock.patch.object(client, "result", return_value=info):
+                    with mock.patch.object(client, "result", side_effect=publication_result):
                         launch = client.codex_launch(pane, agent_arguments)
                         launch["name"] = name
                         pane_launch.write(pane_record.record_path(client.session), launch)

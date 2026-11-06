@@ -32,6 +32,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         super().setUp()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         _ = fixture_member("showrunner", name="unrelated")
+        _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc("natedev", self.quiet_production))
         environment = source_environment(self.root / "staff-sources")
         environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
         self.environment.update(environment)
@@ -46,7 +47,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
         runner = recorded_showrunner("fixture-showrunner", doc)
         self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
-        unit = fixture_unit_location(runner, "fixture-unit", self.unit)
+        unit = fixture_unit_location(runner, "fixture", self.unit)
         return unit.id
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
@@ -87,11 +88,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
         with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
             result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(observed, ["fixture-unit"])
+        self.assertEqual(observed, ["fixture"])
 
     def test_checkpoint_restores_the_unit_after_success_and_failure(self) -> None:
         checkpoint = merge_gate.merge_checkpoint
-        for previous in (None, "previous-unit"):
+        for previous in (None, "previous"):
             for outcome in ("pass", "red", "exception"):
                 with self.subTest(previous=previous, outcome=outcome):
                     if previous is None:
@@ -101,7 +102,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     restored: list[str | None] = []
 
                     def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
-                        self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture-unit")
+                        self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture")
                         if outcome == "exception":
                             raise GateRefused("injected suite failure")
                         return merge_gate.GateRun((), 0, 0, memory_within_cap=outcome != "red", tests_reused=True)
@@ -268,7 +269,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
     def test_a_local_production_doc_commit_goes_out_with_the_merge(self) -> None:
         # retire_unit, add_unit and promote_showrunner leave their doc commit to the next merge push.
         self.write(self.checkout / "local.txt", "retired\n")
-        local = self.commit(self.checkout, "production(fixture): retire alpha-unit")
+        local = self.commit(self.checkout, "production(fixture): retire alpha")
         result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"Local doc commit goes out with this merge: {local[:12]}", result.stdout)
@@ -279,7 +280,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_red_gate_keeps_the_local_production_doc_commit(self) -> None:
         self.write(self.checkout / "local.txt", "retired\n")
-        local = self.commit(self.checkout, "production(fixture): retire alpha-unit")
+        local = self.commit(self.checkout, "production(fixture): retire alpha")
         self.write(self.state / "modify-tracked", "modify")
         result = self.run_gate()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -344,7 +345,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         # The row carries today in the user's zone, as the gate reads it; a run across midnight may take either day.
         with mock.patch.dict(os.environ, self.environment, clear=True):
             before = change_review.today()
-            result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+            result = self.run_gate("--production", "fixture-showrunner", checkpoint=checkpoint)
             days = {before.isoformat(), change_review.today().isoformat()}
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
@@ -367,7 +368,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         self.environment["USER_ZONE"] = "America/New_York"
         with mock.patch.object(change_review, "datetime", mock.Mock(wraps=datetime, now=now)):
-            result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+            result = self.run_gate("--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[0], "2026-11-03")
 
@@ -396,29 +397,19 @@ class MergeGateCheckpointTests(MergeGateFixture):
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away")
         result = self.run_gate(checkpoint=checkpoint, callers_production=True)
         self.assert_refused_before_gate(result)
-        self.assertIn("pass --production <doc>: the gate adds this merge's change-review rows to its list",
+        self.assertIn("pass --production <name>: the gate adds this merge's change-review rows to its list",
                       result.stderr)
 
     def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
         doc = self.root / "production.md"
         self.write(doc, "# p\n")
+        _ = self.review_producer(doc)
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
-        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        result = self.run_gate("--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Change review: the production doc has no Change review line; no rows written",
                       result.stdout)
 
-    def test_a_production_without_a_list_does_not_read_the_staff_record(self) -> None:
-        doc = self.root / "production.md"
-        self.write(doc, "# p\n")
-        _ = self.review_producer(doc)
-        Path(self.environment["STAFF_FILE"]).unlink()
-        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Run hana | The grid fades")
-        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"),
-                         self.git(self.origin, "rev-parse", "integration"))
 
     @gate_suites(*FIXTURE_FOLDERS)
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
@@ -444,7 +435,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
                          [head, self.base, self.checkpoint])
         message = self.git(self.checkout, "log", "-1", "--format=%B")
-        self.assertIn(f"Merge fixture-unit phase-2 ({self.checkpoint}) into integration", message)
+        self.assertIn(f"Merge fixture phase-2 ({self.checkpoint}) into integration", message)
         self.assertIn("Fixture checkpoint gate.", message)
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertCountEqual([(row["suite"], row["module"]) for row in starts],
@@ -504,10 +495,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         arguments = ["--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
-                     "--previous-checkpoint", self.base, "--unit", "fixture-unit", "--phase", "phase-2",
+                     "--previous-checkpoint", self.base, "--unit", "fixture", "--phase", "phase-2",
                      "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
                      "--main-repo", str(self.main),
-                     "--ssh", str(self.bin / "ssh"), "--production", str(self.quiet_production)]
+                     "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
             merge_gate, "notify_style", side_effect=malformed_notification,
@@ -542,9 +533,10 @@ class MergeGateProducerTests(ProducerFixture):
     def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
         merged = self.merge()
         commits = change_review.merge_commits(self.repo, merged)
+        record = staff.StaffSnapshot(tuple(row for row in staff.snapshot().rows if row.id != self.unit.id))
         output = io.StringIO()
         with (mock.patch.object(change_review, "drift", return_value=[]),
-              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), redirect_stdout(output)):
+              mock.patch.object(staff, "snapshot", return_value=record), redirect_stdout(output)):
             merge_gate.record_changes(self.repo, self.listing, self.doc,
                                       change_review.publication_changes(commits, self.doc), "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], "")

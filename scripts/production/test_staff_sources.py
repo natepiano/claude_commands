@@ -28,9 +28,9 @@ from scripts.production.session_staff import MemberSources
 
 class StaffSourcesTests(StaffTestCase):
     @override
-    def production(self, slug: str, *units: str, workspace: str = "", parent: str = "") -> Path:
-        doc = super().production(slug, *units, workspace=workspace)
-        owner = fixture_member("showrunner", name=workspace or slug)
+    def production(self, production_name: str, *units: str, workspace: str = "", parent: str = "") -> Path:
+        doc = super().production(production_name, *units, workspace=workspace)
+        owner = fixture_member("showrunner", name=workspace or production_name)
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
         if parent:
             ancestor = fixture_member("showrunner", name=parent)
@@ -87,16 +87,16 @@ class StaffSourcesTests(StaffTestCase):
 
     def test_live_staff_roots_a_surviving_style_child_and_keeps_its_unit_after_parent_wrap(self) -> None:
         parent_doc = self.production("parent")
-        style_doc = self.production("style", "names-unit", parent="parent")
+        style_doc = self.production("style", "names", parent="parent")
         write_text_atomic(style_doc, "- **Kind:** style\n" + style_doc.read_text())
         self.pane("w1:style", session_id="ffa0f240-6489-5d0c-a907-083d633c124a", environment={})
         self.pane("w1:names", session_id="7f89b939-c570-5fd3-9802-e62dfb8aeea6", environment={
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "style", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "names-unit"})
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "style", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "names"})
         _ = self.session_record("ffa0f240-6489-5d0c-a907-083d633c124a", "style")
-        _ = self.session_record("7f89b939-c570-5fd3-9802-e62dfb8aeea6", "names-unit")
+        _ = self.session_record("7f89b939-c570-5fd3-9802-e62dfb8aeea6", "names")
         parent = next(row for row in staff.find(kind="showrunner") if row.name == "parent")
         child = next(row for row in staff.find(kind="showrunner") if row.name == "style")
-        unit = unit_membership("style", "names-unit")
+        unit = unit_membership("style", "names")
         _ = staff.set_doc(parent.id, staff.WrappedDoc("natedev", parent_doc))
         before = self.staff_file.read_bytes()
         members = cast(list[dict[str, object]], staff_sources.live()["members"])
@@ -111,9 +111,9 @@ class StaffSourcesTests(StaffTestCase):
 
 
     def test_live_inputs_keep_rejected_production_documents_and_read_them_after_correction(self) -> None:
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
-        rejected = self.production("recovering", "later-unit")
+        rejected = self.production("recovering", "later")
         _ = self.session_record("8e2a7bad-d715-5c2d-9ec5-2a8bf9a81289", "recovering")
         owner = staff.by_path("recovering")
         assert owner is not None
@@ -137,7 +137,7 @@ class StaffSourcesTests(StaffTestCase):
 
 
     def test_live_inputs_include_present_and_missing_shared_session_configuration(self) -> None:
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
         config = Path(os.environ["XDG_CONFIG_HOME"]) / "herdr/shared-session"
         for present in (False, True):
@@ -155,11 +155,11 @@ class StaffSourcesTests(StaffTestCase):
 
 
     def test_live_owner_ignores_a_newer_launch_whose_session_has_ended(self) -> None:
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         unit = staff.by_path("sdlc/models")
         assert unit is not None
         _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
-        _ = self.session_record(unit.id, "models-unit")
+        _ = self.session_record(unit.id, "models")
         self.pane("w1:running", session_id=unit.id, environment={"STAFF_ID": unit.id},
                   written_at="2026-10-30T09:00:00+00:00")
         self.pane("w1:ended", session_id="3790170d-f8c8-5dbd-ba9b-38eb5179177f", environment={"STAFF_ID": unit.id},
@@ -178,7 +178,7 @@ class StaffSourcesTests(StaffTestCase):
             with self.subTest(machine=machine), self.machine(machine):
                 if machine == "mac":
                     self.assertNotIn("STAFF_FILE", os.environ)
-                _ = self.production("sdlc", "models-unit")
+                _ = self.production("sdlc", "models")
                 _ = self.session_record("cdc4420c-ae5d-5a9a-8135-75e8c0875088", "sdlc")
                 remote_reads = len(self.ssh_commands()) if machine == "mac" else 0
                 with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
@@ -276,7 +276,7 @@ class StaffSourcesTests(StaffTestCase):
     def test_missing_codex_thread_reports_one_codex_problem(self) -> None:
         from scripts.message import process_table
 
-        _ = self.fill_production("pane-demo", "models-unit")
+        _ = self.fill_production("pane-demo", "models")
         unit = staff.by_path("pane-demo/models")
         assert unit is not None
         launch = pane_record.launch("test:pane", unit.id, str(self.root), {}, [])
@@ -295,10 +295,36 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(evidence.diagnostics, (expected,))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
 
+
+    def test_codex_process_that_exits_during_environment_read_leaves_no_diagnostic(self) -> None:
+        from scripts.message import process_table
+
+        table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
+        for failure in (FileNotFoundError("process exited"), PermissionError("permission denied"),
+                        herdr.HerdrFailure("process 42401: exited")):
+            with (self.subTest(failure=type(failure).__name__),
+                  mock.patch.object(process_table, "snapshot", side_effect=[table, {}]),
+                  mock.patch.object(herdr, "process_environment", side_effect=failure),
+                  redirect_stderr(io.StringIO()) as errors):
+                evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+            self.assertEqual(evidence.diagnostics, ())
+            self.assertEqual(errors.getvalue(), "")
+
+
+    def test_codex_process_with_unreadable_environment_keeps_the_scan_incomplete(self) -> None:
+        from scripts.message import process_table
+
+        table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
+        with (mock.patch.object(process_table, "snapshot", side_effect=[table, table]),
+              mock.patch.object(herdr, "process_environment", side_effect=PermissionError("permission denied"))):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "Codex process 42401: permission denied"):
+                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+
+
     def test_codex_without_a_thread_in_an_unowned_pane_reports_a_diagnostic_without_refusal(self) -> None:
         from scripts.message import process_table
 
-        _ = self.fill_production("other-pane-demo", "models-unit")
+        _ = self.fill_production("other-pane-demo", "models")
         unit = staff.by_path("other-pane-demo/models")
         assert unit is not None
         held = pane_record.launch("other:pane", unit.id, str(self.root), {}, [])
@@ -316,11 +342,11 @@ class StaffSourcesTests(StaffTestCase):
     def test_missing_codex_thread_in_a_pane_with_staff_unit_labels_keeps_the_scan_incomplete(self) -> None:
         from scripts.message import process_table
 
-        _ = self.fill_production("label-pane-demo", "models-unit")
+        _ = self.fill_production("label-pane-demo", "models")
         row = staff.by_path("label-pane-demo/models")
         assert row is not None
         launch = pane_record.launch("test:pane", row.current_session, str(self.root), {
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "label-pane-demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit"}, [])
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "label-pane-demo", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models"}, [])
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
@@ -395,7 +421,7 @@ class StaffSourcesTests(StaffTestCase):
     def test_live_staff_includes_codex_showrunner_and_unit_by_current_thread_without_role_inference(self) -> None:
         from scripts.message import process_table
 
-        _ = self.fill_production("codex-demo", "models-unit")
+        _ = self.fill_production("codex-demo", "models")
         owner = staff.by_path("codex-demo")
         unit = staff.by_path("codex-demo/models")
         assert owner is not None and unit is not None
@@ -428,8 +454,8 @@ class StaffSourcesTests(StaffTestCase):
 
     def test_persisted_member_reference_survives_two_clears_rename_and_name_reuse(self) -> None:
         parent, unit, _ = self.tree()
-        _ = self.production("sdlc", "models-unit")
-        launch = pane_record.read_strict("agents")["fixture:sdlc/models-unit"]
+        _ = self.production("sdlc", "models")
+        launch = pane_record.read_strict("agents")["fixture:sdlc/models"]
         pane_record.write("agents", launch)
         second = staff.StaffId(fixture_runtime_id("member-clear-B"))
         third = staff.StaffId(fixture_runtime_id("member-clear-C"))
@@ -439,7 +465,7 @@ class StaffSourcesTests(StaffTestCase):
         replacement = fixture_member("unit", name="models", parent=parent.id,
                                      runtime_id=fixture_runtime_id("replacement-models"))
         path = pane_record.record_path("agents")
-        selector = staff_sources.UnitMember("sdlc", "models-unit")
+        selector = staff_sources.UnitMember("sdlc", "models")
         for reference in (unit.id, third):
             with self.subTest(reference=reference):
                 # The first case is the writer's retained A; the second models a
@@ -459,22 +485,22 @@ class StaffSourcesTests(StaffTestCase):
 
     def test_persisted_member_continues_past_a_cleared_launch_under_another_parent(self) -> None:
         parent, moved, _ = self.tree()
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         other = fixture_member("showrunner", name="elsewhere")
         moved = staff.move(moved.id, staff.ReportsTo(other.id))
         moved = staff.update_current_session(moved.current_session, staff.StaffId(fixture_runtime_id("moved-B")))
         target = fixture_member("unit", name="actual", parent=parent.id)
         self.pane("newest-local", session_id=moved.id, written_at="2026-11-01T12:00:00Z",
-                  environment={('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit"})
+                  environment={('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models"})
         self.pane("older-transferred", session_id=target.id, written_at="2026-10-31T12:00:00Z",
-                  environment={('' + 'SHOWRUNNER_' + 'UNIT'): "former", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit"})
-        selector = staff_sources.UnitMember("sdlc", "models-unit")
+                  environment={('' + 'SHOWRUNNER_' + 'UNIT'): "former", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models"})
+        selector = staff_sources.UnitMember("sdlc", "models")
         self.assertEqual(session_staff.unit_match(selector, staff.snapshot(), session_staff.StoredReference(target.id),
             parent=session_staff.RequiredParent(parent)), staff_sources.MemberFound(target))
         # Each stored reference selects one row without copied labels.
         competing = fixture_member("unit", name="competing", parent=parent.id)
         self.pane("competing", session_id=competing.id,
-                  environment={('' + 'SHOWRUNNER_' + 'UNIT'): "former", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit"})
+                  environment={('' + 'SHOWRUNNER_' + 'UNIT'): "former", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models"})
         self.assertEqual(session_staff.unit_match(selector, staff.snapshot(),
             session_staff.StoredReference(competing.id), parent=session_staff.RequiredParent(parent)),
             staff_sources.MemberFound(competing))
@@ -485,16 +511,16 @@ class StaffSourcesTests(StaffTestCase):
 
     def test_persisted_cleared_references_preserve_kind_and_parent_safeguards(self) -> None:
         parent, unit, worker = self.tree()
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         other = fixture_member("showrunner", name="elsewhere")
         moved = staff.move(unit.id, staff.ReportsTo(other.id))
         _ = staff.update_current_session(moved.current_session, staff.StaffId(fixture_runtime_id("wrong-parent-B")))
         _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("same-name"))
-        selector = staff_sources.UnitMember("sdlc", "models-unit")
+        selector = staff_sources.UnitMember("sdlc", "models")
         for reference in (fixture_runtime_id("missing"), parent.id, worker.id, unit.id):
             with self.subTest(reference=reference):
                 self.pane("latest", session_id=reference, written_at="2026-11-01T12:00:00Z",
-                          environment={('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit"})
+                          environment={('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models"})
                 self.assertEqual(session_staff.unit_match(selector, staff.snapshot(), session_staff.StoredReference(reference),
                     parent=session_staff.RequiredParent(parent)), staff_sources.NoSuchMember(selector))
 
@@ -503,7 +529,7 @@ class StaffSourcesTests(StaffTestCase):
         from scripts.production import session_staff
 
         _, unit, _ = self.tree()
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         second = staff.StaffId(fixture_runtime_id("group-B"))
         third = staff.StaffId(fixture_runtime_id("group-C"))
         _ = staff.update_current_session(unit.current_session, second)
@@ -514,7 +540,7 @@ class StaffSourcesTests(StaffTestCase):
             with self.subTest(runtime=runtime):
                 marked = session_staff.LabeledSession("models",
                     session_staff.LiveClaude("models", runtime, "", 123),
-                    herdr.HerdrPlace("agents", "fixture:sdlc/models-unit"), identity=session_staff.LiveSession(runtime))
+                    herdr.HerdrPlace("agents", "fixture:sdlc/models"), identity=session_staff.LiveSession(runtime))
                 with mock.patch.object(staff, "snapshot", side_effect=AssertionError("owner reread")):
                     grouped = session_staff.group_labeled_sessions((marked,), record=record, sources=sources)
                     if runtime != third:
@@ -527,7 +553,7 @@ class StaffSourcesTests(StaffTestCase):
         from scripts.production import session_staff
 
         parent, unit, _ = self.tree()
-        doc = self.production("sdlc", "models-unit")
+        doc = self.production("sdlc", "models")
         parent = staff.set_doc(parent.id, staff.LiveDoc("natedev", doc))
         current = staff.update_current_session(unit.current_session, staff.StaffId(fixture_runtime_id("lookup-B")))
         current = staff.rename(current.id, "renamed")
@@ -539,116 +565,116 @@ class StaffSourcesTests(StaffTestCase):
         with mock.patch.object(staff, "snapshot", side_effect=AssertionError("owner reread")):
             self.assertEqual(unit_lookup.session_showrunner(current.current_session, record=record, sources=sources),
                              session_staff.MemberFound(parent))
-            self.assertEqual(unit_lookup.unit_parent("models-unit", session_staff.LiveSession(current.current_session), record=record, sources=sources),
+            self.assertEqual(unit_lookup.unit_parent("models", session_staff.LiveSession(current.current_session), record=record),
                              unit_lookup.UnitProduction("sdlc", str(doc)))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
 
     def test_member_result_is_explicit_and_uses_only_the_supplied_snapshot(self) -> None:
         showrunner, unit, _ = self.tree()
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         record = staff.snapshot()
         missing = staff_sources.UnitMember("sdlc", "missing")
         with mock.patch.object(staff, "snapshot", side_effect=AssertionError("member reread the staff file")):
             self.assertEqual(staff_sources.member(missing, record), staff_sources.NoSuchMember(missing))
             self.assertEqual(staff_sources.member(staff_sources.ShowrunnerMember("sdlc"), record), staff_sources.MemberFound(showrunner))
-            self.assertEqual(staff_sources.member(staff_sources.UnitMember("sdlc", "models-unit"), record), staff_sources.MemberFound(unit))
+            self.assertEqual(staff_sources.member(staff_sources.UnitMember("sdlc", "models"), record), staff_sources.MemberFound(unit))
 
 
     def test_member_uses_newest_matching_launch_and_id_before_name(self) -> None:
         showrunner, unit, _ = self.tree()
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         renamed = staff.rename(unit.id, "panes")
         fallback = fixture_member("unit", name="models", parent=showrunner.id,
                                   runtime_id=fixture_runtime_id("new-models-backend"))
         self.pane("w1:old", session_id=fallback.id, written_at="2026-10-29T09:00:00+00:00", environment={
-            "STAFF_ID": fallback.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            "STAFF_ID": fallback.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
         self.pane("w1:new", session_id=renamed.id, environment={
-            "STAFF_ID": renamed.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            "STAFF_ID": renamed.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
         self.pane("w1:other", session_id=fallback.id, written_at="2026-10-31T09:00:00+00:00", environment={
-            "STAFF_ID": fallback.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "other", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            "STAFF_ID": fallback.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "other", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
-        result = session_staff.unit_match(staff_sources.UnitMember("sdlc", "models-unit"), staff.snapshot(),
+        result = session_staff.unit_match(staff_sources.UnitMember("sdlc", "models"), staff.snapshot(),
             session_staff.StoredReference(renamed.id), parent=session_staff.RequiredParent(showrunner))
         self.assertEqual(result, staff_sources.MemberFound(renamed))
 
 
     def test_member_with_no_staff_id_matches_unit_by_short_name(self) -> None:
         showrunner, unit, _ = self.tree()
-        _ = self.production("sdlc", "models-unit")
-        self.pane("w1:p2", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit"})
+        _ = self.production("sdlc", "models")
+        self.pane("w1:p2", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models"})
         record = staff.snapshot()
-        self.assertEqual(staff_sources.member(staff_sources.UnitMember("sdlc", "models-unit"), record), staff_sources.MemberFound(unit))
+        self.assertEqual(staff_sources.member(staff_sources.UnitMember("sdlc", "models"), record), staff_sources.MemberFound(unit))
         self.assertEqual(staff_sources.member(staff_sources.ShowrunnerMember("sdlc"), record), staff_sources.MemberFound(showrunner))
 
 
     def test_legacy_member_follows_a_transfer_without_using_the_production_mark(self) -> None:
         _original, unit, _worker = self.tree()
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         _ = self.production("receiving")
         receiving = fixture_member("showrunner", name="receiving",
                                    doc=staff.LiveDoc("natedev", self.source_root / "receiving-production.md"))
         moved = staff.move(unit.id, staff.ReportsTo(receiving.id))
         self.pane("w1:unit", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
         record = staff.snapshot()
-        for slug in ("sdlc", "missing-source"):
-            with self.subTest(slug=slug):
-                self.assertEqual(staff_sources.member(staff_sources.UnitMember(slug, "models-unit"), record),
-                                 staff_sources.NoSuchMember(staff_sources.UnitMember(slug, "models-unit")))
-        self.assertEqual(staff_sources.member(staff_sources.UnitMember("receiving", "models-unit"), record),
+        for production_name in ("sdlc", "missing-source"):
+            with self.subTest(name=production_name):
+                self.assertEqual(staff_sources.member(staff_sources.UnitMember(production_name, "models"), record),
+                                 staff_sources.NoSuchMember(staff_sources.UnitMember(production_name, "models")))
+        self.assertEqual(staff_sources.member(staff_sources.UnitMember("receiving", "models"), record),
                          staff_sources.MemberFound(moved))
-        self.assertEqual(staff_sources.unit_parent("models-unit", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721"),
+        self.assertEqual(staff_sources.unit_parent("models", "bae0b3d7-3d25-5a1f-9630-b7991a2f9721"),
                          staff_sources.UnitProduction("receiving", str(self.source_root / "receiving-production.md")))
 
 
     def test_production_member_rejects_a_moved_row_despite_its_old_id_bearing_launch(self) -> None:
         _original, unit, _worker = self.tree()
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         _ = self.production("receiving", workspace="control")
         receiving = fixture_member("showrunner", name="control",
                                    doc=staff.LiveDoc("natedev", self.source_root / "receiving-production.md"))
         moved = staff.move(unit.id, staff.ReportsTo(receiving.id))
         self.pane("w1:unit", session_id=unit.id, environment={
-            "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
-        selector = staff_sources.UnitMember("sdlc", "models-unit")
+        selector = staff_sources.UnitMember("sdlc", "models")
         self.assertEqual(staff_sources.member(selector, staff.snapshot()), staff_sources.NoSuchMember(selector))
-        self.assertEqual(staff_sources.unit_parent("models-unit", unit.id),
-                         staff_sources.UnitProduction("receiving", str(self.source_root / "receiving-production.md")))
+        self.assertEqual(staff_sources.unit_parent("models", unit.id),
+                         staff_sources.UnitProduction("control", str(self.source_root / "receiving-production.md")))
         self.assertEqual(staff.by_id(unit.id), moved)
 
 
     def test_observed_id_bearing_pane_follows_its_current_parent(self) -> None:
         _original, unit, _worker = self.tree()
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         new_doc = self.production("receiving")
         receiving = fixture_member("showrunner", name="receiving",
                                    doc=staff.LiveDoc("natedev", self.source_root / "receiving-production.md"))
         moved = staff.move(unit.id, staff.ReportsTo(receiving.id))
         self.pane("w1:unit", session_id=unit.id, environment={
-            "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
         other = fixture_member("showrunner", name="other")
         _ = fixture_member("unit", name="models", parent=other.id)
-        self.assertEqual(staff_sources.member(staff_sources.ObservedUnit("models-unit", session_staff.LiveSession(unit.current_session)), staff.snapshot()),
+        self.assertEqual(staff_sources.member(staff_sources.ObservedUnit("models", session_staff.LiveSession(unit.current_session)), staff.snapshot()),
                          staff_sources.MemberFound(moved))
-        self.assertEqual(staff_sources.unit_parent("models-unit", unit.id),
+        self.assertEqual(staff_sources.unit_parent("models", unit.id),
                          staff_sources.UnitProduction("receiving", str(new_doc)))
 
 
     def test_ambiguous_legacy_member_never_uses_the_mark_to_choose_a_row(self) -> None:
-        _ = self.production("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
         _original, _unit, _worker = self.tree()
         receiving = fixture_member("showrunner", name="receiving")
         _ = fixture_member("unit", name="models", parent=receiving.id)
         self.pane("w1:unit", session_id="bae0b3d7-3d25-5a1f-9630-b7991a2f9721", environment={
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
-        selector = staff_sources.ObservedUnit("models-unit")
+        selector = staff_sources.ObservedUnit("models")
         with self.assertRaisesRegex(staff.StaffUnreadable, "no native runtime identity"):
             _ = staff_sources.member(selector, staff.snapshot())
 
@@ -656,23 +682,23 @@ class StaffSourcesTests(StaffTestCase):
     def test_mac_unit_parent_uses_one_owner_read_for_the_whole_resolution(self) -> None:
         _original, unit, _worker = self.tree()
         with self.machine("mac"):
-            _ = self.production("sdlc", "models-unit")
+            _ = self.production("sdlc", "models")
             _ = self.production("receiving")
             receiving = fixture_member("showrunner", name="receiving",
                                        doc=staff.LiveDoc(remote.local_machine(), self.source_root / "receiving-production.md"))
             _ = staff.move(unit.id, staff.ReportsTo(receiving.id))
             self.pane("w1:unit", session_id=unit.id, environment={
-                "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+                "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
             })
             before = len(self.ssh_commands())
-            parent = staff_sources.unit_parent("models-unit", unit.id)
-            self.assertEqual(parent.slug, "receiving")
+            parent = staff_sources.unit_parent("models", unit.id)
+            self.assertEqual(parent.name, "receiving")
             self.assertEqual(len(self.ssh_commands()) - before, 1)
 
 
     def test_unit_parent_agrees_with_showrunner_members_after_transfer(self) -> None:
         original, unit, _worker = self.tree()
-        old_doc = self.production("sdlc", "models-unit", workspace="sdlc")
+        old_doc = self.production("sdlc", "models", workspace="sdlc")
         new_doc = self.production("receiving", workspace="new-tools")
         destination = fixture_member("showrunner", name="new-tools")
         original = staff.set_doc(original.id, staff.LiveDoc("natedev", old_doc))
@@ -680,34 +706,34 @@ class StaffSourcesTests(StaffTestCase):
         destination = staff.rename(destination.id, "control")
         self.pane("w1:showrunner", session_id=destination.id, environment={"STAFF_ID": destination.id})
         self.pane("w1:unit", session_id=unit.id, environment={
-            "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+            "STAFF_ID": unit.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
         })
-        for slug, expected_parent, doc in (("sdlc", original, old_doc), ("receiving", destination, new_doc)):
-            with self.subTest(slug=slug):
+        for production_name, expected_parent, doc in (("sdlc", original, old_doc), ("control", destination, new_doc)):
+            with self.subTest(name=production_name):
                 _ = staff.move(unit.id, staff.ReportsTo(expected_parent.id))
                 record = staff.snapshot()
                 members = staff_sources.showrunner_members(record)
                 with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot, \
                         mock.patch.object(pane_record, "read_strict", wraps=pane_record.read_strict) as launches, \
                         mock.patch.object(showrunners, "read_sources", wraps=showrunners.read_sources) as productions:
-                    parent = staff_sources.unit_parent("models-unit", unit.id)
-                self.assertEqual(parent, staff_sources.UnitProduction(slug, str(doc)))
-                self.assertEqual(members[parent.slug], expected_parent)
+                    parent = staff_sources.unit_parent("models", unit.id)
+                self.assertEqual(parent, staff_sources.UnitProduction(production_name, str(doc)))
+                self.assertEqual(members[parent.name], expected_parent)
                 recorded_unit = record.by_id(unit.id)
                 assert recorded_unit is not None
-                self.assertEqual(staff.ReportsTo(members[parent.slug].id), recorded_unit.parent)
+                self.assertEqual(staff.ReportsTo(members[parent.name].id), recorded_unit.parent)
                 self.assertEqual(snapshot.call_count, 1)
-                self.assertEqual(launches.call_count, 1)
-                self.assertEqual(productions.call_count, 1)
+                self.assertEqual(launches.call_count, 0)
+                self.assertEqual(productions.call_count, 0)
 
 
     def test_member_with_unresolved_or_wrong_kind_id_does_not_take_an_unrelated_name(self) -> None:
         showrunner, _unit, worker = self.tree()
-        _ = self.production("sdlc", "models-unit")
-        selector = staff_sources.UnitMember("sdlc", "models-unit")
+        _ = self.production("sdlc", "models")
+        selector = staff_sources.UnitMember("sdlc", "models")
         for staff_id in (fixture_runtime_id("missing-member"), showrunner.id, worker.id):
             with self.subTest(staff_id=staff_id):
-                self.pane("w1:p2", session_id=staff_id, environment={ ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models-unit",
+                self.pane("w1:p2", session_id=staff_id, environment={ ('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "models",
                 })
                 self.assertEqual(session_staff.unit_match(selector, staff.snapshot(), session_staff.StoredReference(staff_id),
                     parent=session_staff.RequiredParent(showrunner)), staff_sources.NoSuchMember(selector))
@@ -795,17 +821,17 @@ class NonLocalMemberReferenceTests(unittest.TestCase):
         from scripts.production import session_staff
 
         parent_id = staff.StaffId(fixture_runtime_id("nonlocal-parent"))
-        unit_id = staff.StaffId(fixture_runtime_id("nonlocal-unit"))
+        unit_id = staff.StaffId(fixture_runtime_id("nonlocal"))
         worker_id = staff.StaffId(fixture_runtime_id("nonlocal-worker"))
         other_id = staff.StaffId(fixture_runtime_id("nonlocal-other-parent"))
-        moved_id = staff.StaffId(fixture_runtime_id("nonlocal-moved-unit"))
+        moved_id = staff.StaffId(fixture_runtime_id("nonlocal-moved"))
         parent = staff.StaffRow(parent_id, "showrunner", "demo", staff.StaffRoot(), current_session=parent_id)
         unit = staff.StaffRow(unit_id, "unit", "alpha", staff.ReportsTo(parent_id), current_session=unit_id)
         worker = staff.StaffRow(worker_id, "worker", "impl", staff.ReportsTo(unit_id), current_session=worker_id)
         other = staff.StaffRow(other_id, "showrunner", "other", staff.StaffRoot(), current_session=other_id)
         moved = staff.StaffRow(moved_id, "unit", "alpha", staff.ReportsTo(other_id), current_session=moved_id)
         record = staff.StaffSnapshot((parent, unit, worker, other, moved))
-        selector = session_staff.UnitMember("demo", "alpha-unit")
+        selector = session_staff.UnitMember("demo", "alpha")
         missing = fixture_runtime_id("nonlocal-unregistered-session")
         for reference in (missing, worker.id, parent.id, moved.id):
             with self.subTest(reference=reference):
@@ -813,8 +839,8 @@ class NonLocalMemberReferenceTests(unittest.TestCase):
                 launch: pane_record.PaneLaunch = {
                     "pane_id": "w1:p1", "session_id": reference,
                     "config_dir": "/fixture/claude", "cwd": "/fixture/unit",
-                    "name": "alpha-unit", "model": "", "remote_control": False,
-                    "environment": {('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"},
+                    "name": "alpha", "model": "", "remote_control": False,
+                    "environment": {('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"},
                     "flags_read": True, "written_at": "2026-11-01T12:00:00Z",
                 }
                 sources = session_staff.MemberSources({}, (launch,))

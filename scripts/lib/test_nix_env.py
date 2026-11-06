@@ -423,6 +423,83 @@ class RegisteredCopyTests(GitNixFixture):
         self.assert_explicit_approval_required(outside)
 
 
+class RegisteredCloneTests(GitNixFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        locations = {copy_record.ROOT_ENV: str(self.root / "scratch"),
+                     copy_record.COPIES_ENV: str(self.root / "copies")}
+        self.env.update(locations)
+        os.environ.update(locations)
+
+    def clone(self, repository: Path, task_folder: Path | None = None) -> Path:
+        folder = task_folder if task_folder is not None else copy_record.root() / "task"
+        folder.mkdir(parents=True)
+        checkout = folder / "checkout"
+        _ = self.git(self.root, "clone", "--shared", str(repository), str(checkout))
+        fields = {"task": "gate:nix-env", "test_hana_clone": True,
+                  "source_path": str(repository), "source_commit": self.git(checkout, "rev-parse", "HEAD")}
+        _ = (folder / copy_record.RECORD).write_text(json.dumps(fields), encoding="utf-8")
+        return checkout
+
+    def assert_clone_refused(self, checkout: Path) -> None:
+        self.assertFalse(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertFalse(nix_env.trusted_envrc(checkout / ".envrc"))
+        self.assert_explicit_approval_required(checkout)
+
+    def test_registered_clone_with_unchanged_envrc_is_approved_and_loads(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.assertEqual(copy_record.record_path(checkout), checkout.parent / copy_record.RECORD)
+        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
+        _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
+        self.assertIsInstance(nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"}), nix_env.Loaded)
+        self.assertEqual(self.direnv_calls(), [
+            {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
+            {"args": ["export", "json"], "cwd": str(checkout)}])
+
+    def test_registered_clone_with_edited_envrc_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        _ = (checkout / ".envrc").write_text("use another flake\n", encoding="utf-8")
+        self.assert_clone_refused(checkout)
+
+    def test_clone_without_source_commit_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        path = checkout.parent / copy_record.RECORD
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["source_commit"]
+        _ = path.write_text(json.dumps(fields), encoding="utf-8")
+        self.assert_clone_refused(checkout)
+
+    def test_checkout_outside_scratch_root_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"), self.root / "outside/task")
+        self.assertIsNone(copy_record.record_path(checkout))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_without_test_hana_clone_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        path = checkout.parent / copy_record.RECORD
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["test_hana_clone"]
+        _ = path.write_text(json.dumps(fields), encoding="utf-8")
+        self.assertIsNone(copy_record.record_path(checkout))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_from_untrusted_source_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.root / "outside/repo"))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_under_symlink_scratch_root_is_approved(self) -> None:
+        physical = self.root / "physical-scratch"
+        physical.mkdir()
+        copy_record.root().symlink_to(physical, target_is_directory=True)
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        self.assertEqual(copy_record.record_path(checkout), checkout.parent.resolve() / copy_record.RECORD)
+        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
+
+
 class NixConfigTests(NixFixture):
     def test_direnv_commands_read_the_timeout_setting_at_use(self) -> None:
         _ = self.envrc(self.work)

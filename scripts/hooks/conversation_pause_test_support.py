@@ -326,11 +326,11 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         """Record the production owner that review checks require."""
         if not name.startswith("showrunner-"):
             return
-        slug = name.removeprefix("showrunner-")
-        doc = self.root / f"{slug}-production.md"
+        name = name.removeprefix("showrunner-")
+        doc = self.root / f"{name}-production.md"
         if not doc.exists():
-            _ = doc.write_text(f"# {slug}\n")
-        _ = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", doc))
+            _ = doc.write_text(f"# {name}\n")
+        _ = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
 
     def create_instance(
         self,

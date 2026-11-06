@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** A true count of repair rounds per phase, a study of the phases with the most rounds, and process changes that cut rounds and still deliver the work.
 
-> **Production: sdlc** — unit `fix-rounds-unit`; production doc `docs/plans/sdlc-production.md`
 
 > **Issues:** ~/rust/hanadocs/issues/run command only repairs without a worker.md, ~/rust/hanadocs/issues/route missing criteria after landing.md, ~/rust/hanadocs/issues/route repeated repairs outside kept categories.md, ~/rust/hanadocs/issues/verify phase and activity boundaries.md, ~/rust/hanadocs/issues/preserve accepted behavior in repairs.md
 
@@ -291,6 +290,10 @@ From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-
 From the sdlc showrunner, 2026-11-05. Dropped on 2026-11-06: hash `50bfbdcf6` does not merge.
 
 Devtools 3y `finish_repair` in `scripts/direct/assign.py` resolves the round: `landed` on a clean exit, `abandon --edits-landed` on an error. The fix call in `commands/unit/direct.md` sets `UNIT_RESOLVES_ROUND=1`, so a director passes that prefix on each repair round.
+
+### Phase 9u — The units hash merges with the staff-name change on sdlc  · status: done
+
+From the sdlc showrunner, 2026-11-06. Devtools 7u replaced the production slug with the showrunner's staff name. Merge sdlc into this branch. Keep that name, and keep the Status column, pause records and anomaly lines from Phase 9. Add no new check.
 
 ### Phase 9t — A commit that exists is not reported as failed  · status: done
 

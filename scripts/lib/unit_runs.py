@@ -24,7 +24,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from importlib import import_module
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
@@ -104,6 +104,27 @@ def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
 def run_temp_path(run: Path) -> Path:
     """Name the temporary folder that shares the run's lifetime."""
     return run / RUN_TEMP_NAME
+
+
+def worker_transport(run: Path) -> Literal["mesh", "herdr"]:
+    """Pin the configured worker transport for this run."""
+    from scripts.lib import conf
+    from scripts.lib.atomic_file import write_text_atomic
+
+    run.mkdir(parents=True, exist_ok=True)
+    pin = run / "worker_transport"
+    with (run / "worker_transport.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            selected = pin.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            selected = conf.read("direct").text("WORKER_TRANSPORT")
+            if selected not in ("mesh", "herdr"):
+                raise ValueError(f"{run}: invalid worker transport: {selected}")
+            write_text_atomic(pin, selected + "\n")
+        if selected not in ("mesh", "herdr"):
+            raise ValueError(f"{pin}: invalid worker transport: {selected}")
+        return selected
 
 
 def activate(run: Path, session_id: str) -> None:
@@ -255,7 +276,7 @@ def migrate_owners(root: Path, *, dry_run: bool = False) -> int:
                     production, unit = fields.get("production"), fields.get("unit")
                     parents = {row.id for row in record.find(kind="showrunner") if row.name == production}
                     matches = [row for row in record.find(kind="unit") if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents
-                               and isinstance(unit, str) and row.name.removesuffix("-unit") == unit.removesuffix("-unit")]
+                               and isinstance(unit, str) and row.name == unit]
                     if len(matches) != 1:
                         raise staff.StaffUnreadable(f"{path}: run owner is unavailable")
                     owner = matches[0]
@@ -368,6 +389,13 @@ def _held_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "worker-transport":
+        try:
+            print(worker_transport(Path(argv[1])))
+        except (OSError, ValueError) as error:
+            print(f"unit_runs: {error}", file=sys.stderr)
+            return 2
+        return 0
     if argv and argv[0] == "migrate-owners":
         parser = argparse.ArgumentParser(description="Migrate active run owners to staff ids.")
         _ = parser.add_argument("--root", type=Path, required=True)
@@ -389,7 +417,7 @@ def main(argv: list[str]) -> int:
     if argv == ["move-history"]:
         return move_history(time.time())
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id>",
+        print("usage: unit_runs.py removal-check | history-root | move-history | activate <run folder> <session id> | held <session id> | worker-transport <run folder>",
               file=sys.stderr)
         return 2
     if TYPE_CHECKING:

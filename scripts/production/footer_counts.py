@@ -105,7 +105,7 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
     """Watch the count sources and each open record."""
     try:
         listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
-    except (change_review.ChangeReviewError, OSError):
+    except (change_review.ChangeReviewError, staff.StaffRefused, OSError):
         listed = []
     folder = proposals_folder.issues_folder(doc)
     queue = proposals_folder.ledger(doc)

@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file, unit_runs  # noqa: E402
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
 if TYPE_CHECKING:
@@ -97,6 +98,42 @@ class RunOwnerMigrationTests(StaffTestCase):
 
 
 class UnitRunsTest(StaffTestCase):
+    def test_run_transport_remains_pinned_after_configuration_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = root / "config"
+            config.mkdir()
+            run = root / "first"
+            with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=mesh\n")
+                self.assertEqual(unit_runs.worker_transport(run), "mesh")
+                pin = run / "worker_transport"
+                unchanged = pin.stat().st_mtime_ns
+                write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+                self.assertEqual(unit_runs.worker_transport(run), "mesh")
+                self.assertEqual(pin.read_text(), "mesh\n")
+                self.assertEqual(pin.stat().st_mtime_ns, unchanged)
+                self.assertEqual(unit_runs.worker_transport(root / "second"), "herdr")
+                self.assertEqual((root / "second/worker_transport").read_text(), "herdr\n")
+
+    def test_unreadable_transport_configuration_does_not_replace_a_saved_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            run = root / "run"
+            run.mkdir()
+            write_text_atomic(run / "worker_transport", "herdr\n")
+            with patch.dict(os.environ, {"CONF_DIR": str(root / "missing")}):
+                self.assertEqual(unit_runs.worker_transport(run), "herdr")
+            self.assertEqual((run / "worker_transport").read_text(), "herdr\n")
+
+    def test_invalid_saved_transport_stays_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder)
+            write_text_atomic(run / "worker_transport", "unknown\n")
+            with self.assertRaisesRegex(ValueError, "invalid worker transport"):
+                _ = unit_runs.worker_transport(run)
+            self.assertEqual((run / "worker_transport").read_text(), "unknown\n")
+
     def staff_owner(self, run: Path, session_id: str) -> None:
         parent = showrunner_relationship("runs-fixture")
         owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
@@ -104,7 +141,7 @@ class UnitRunsTest(StaffTestCase):
 
     def test_director_without_progress_state_resolves_roster_parent_without_output(self) -> None:
         production = fixture_member("showrunner", name="roster-production")
-        owner = fixture_member("unit", name="roster-unit", parent=production.id)
+        owner = fixture_member("unit", name="roster", parent=production.id)
         worker = fixture_worker("impl", owner.id)
         run = self.root / "roster-run"
         run.mkdir()

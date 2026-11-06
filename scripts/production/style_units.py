@@ -19,7 +19,7 @@ import live_units
 import rules
 import style_ledger
 import display_cells
-from scripts.production import staff, session_staff, unit_lookup, unit_names
+from scripts.production import staff, session_staff, unit_lookup
 from issues import Issue, frontmatter
 from proposal_issue import ApprovedDecision, decision_answer, proposal_unit
 from scripts.direct import plan_history
@@ -289,7 +289,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: 
     zone = zone if zone is not None else user_zone()
     paths = ledger_paths
     resolver = session_staff.RowResolver(staff.snapshot())
-    holders = {unit_names.unit_id(row.name): row for row in unit_lookup.doc_units(doc, resolver.record)}
+    holders = {row.name: row for row in unit_lookup.doc_units(doc, resolver.record)}
     decisions: dict[Path, DecisionFamily | DecisionFileMissing] = {}
     snapshots: dict[Path, LedgerSnapshot] = {}
     with ThreadPoolExecutor(max_workers=1) as reads:
