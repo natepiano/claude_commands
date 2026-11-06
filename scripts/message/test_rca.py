@@ -630,7 +630,9 @@ subprocess.run([sys.executable, '-c',
         with (rca.STATE / ".lock").open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             began = monotonic()
-            with redirect_stderr(errors):
+            # The lock deadline must cover lock contention, without interpreter startup.
+            with (redirect_stderr(errors),
+                  mock.patch.object(rca, "send", return_value=(True, "SENT: fixture"))):
                 rca.remind(OPENED, deadline=began + 0.2)
             self.assertLess(monotonic() - began, 1.5)
         self.assertFalse(self.case("261023-1").get("owner_told", True))

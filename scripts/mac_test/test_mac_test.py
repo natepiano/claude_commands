@@ -3216,20 +3216,36 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
     def test_idle_alert_config_uses_shipped_values_and_rejects_invalid_overrides(self) -> None:
         path = self.root / "mac_test.conf"
-        shipped = mac_test.read_config().idle
+        _ = mac_test.read_config()
+        shipped = mac_test.idle_config(conf.read(path))
         committed = path.read_text()
         _ = write_config_fixture(path, "alert_seconds=7\npush_seconds=11\nstale_seconds=13\n"
                                  + "repeat_minutes=17\nsend_timeout_s=19\n")
-        configured = mac_test.read_config().idle
+        _ = mac_test.read_config()
+        configured = mac_test.idle_config(conf.read(path))
         self.assertEqual((configured.alert_seconds, configured.push_seconds, configured.stale_seconds,
                           configured.repeat_minutes, configured.send_timeout_s), (7, 11, 13, 17, 19))
         _ = write_config_fixture(path, "alert_seconds=nan\npush_seconds=0\nstale_seconds=-1\n"
                                  + "repeat_minutes=bad\nsend_timeout_s=inf\n")
         with mock.patch.object(conf, "_committed_files", return_value=(committed,)), conf.diagnostics(report=False):
-            self.assertEqual(mac_test.read_config().idle, shipped)
+            _ = mac_test.read_config()
+            self.assertEqual(mac_test.idle_config(conf.read(path)), shipped)
         with mock.patch.object(conf, "_committed_files", return_value=iter(())), \
              self.assertRaises(conf.Unusable):
             _ = mac_test.read_config()
+
+    def test_default_and_named_macos_targets_require_idle_settings(self) -> None:
+        path = self.root / "mac_test.conf"
+        for target in ("", "mac"):
+            with self.subTest(target=target):
+                _ = write_config_fixture(path)
+                self.assertEqual(mac_test.read_config(target).host, conf.read(path).text("host"))
+                _ = path.write_text("\n".join(
+                    line for line in path.read_text().splitlines() if not line.startswith("alert_seconds=")
+                ) + "\n")
+                with mock.patch.object(conf, "_committed_files", return_value=iter(())), \
+                     conf.diagnostics(report=False), self.assertRaisesRegex(conf.Unusable, "alert_seconds"):
+                    _ = mac_test.read_config(target)
 
     def test_claim_idle_settings_read_configured_values(self) -> None:
         path = self.root / "mac_test.conf"

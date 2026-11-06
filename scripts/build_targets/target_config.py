@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
+from enum import Enum, auto
 from pathlib import Path
 import os
 import json
@@ -38,6 +40,22 @@ Target = LocalTarget | SshTarget
 
 
 ConfigError = conf.Unusable
+
+
+class MissingSlotCapacity(Enum):
+    REQUIRE_CONFIGURED = auto()
+    SINGLE_SLOT = auto()
+
+
+def slot_capacity(values: Mapping[str, str], repository: str, *,
+                  missing: MissingSlotCapacity) -> int:
+    """Read one positive slot capacity for claims and admission."""
+    value = values.get(f"slots.{repository}", values.get("slots", ""))
+    if f"slots.{repository}" not in values and "slots" not in values and missing is MissingSlotCapacity.SINGLE_SLOT:
+        return 1
+    if not value.isascii() or not value.isdecimal() or int(value) < 1:
+        raise ConfigError(f"slots.{repository}: expected a positive integer")
+    return int(value)
 
 
 def require_target_name(target: str) -> None:

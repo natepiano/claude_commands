@@ -62,7 +62,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assert_wire("passed", "")
 
     def test_default_remote_command_is_byte_equal_and_fetch_alone_keeps_artifacts(self) -> None:
-        request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",))
+        request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         config = offload.read_config(self.config_path)
         expected = (
             'cd .local/state/mac-test/mirror/hana && PATH="$HOME/.cargo/bin:$PATH" '
