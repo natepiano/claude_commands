@@ -15,6 +15,7 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.direct import remove_workers, workers
+from scripts.message import process_table
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_worker, fixture_runtime_id, unit_membership
 from scripts.agents import worker_lifecycle
@@ -57,6 +58,7 @@ class RemoveWorkersTest(unittest.TestCase):
         fixture.setUp()
         fixture.write_json(fixture.staff_file, {"schema": 2, "rows": []})
         self.addCleanup(fixture.doCleanups)
+        _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
         self.temporary = tempfile.TemporaryDirectory()
         base = Path(self.temporary.name)
         self.root = base / "runs"
@@ -147,6 +149,7 @@ class RemoveWorkersTest(unittest.TestCase):
             STUB_ACCOUNTS=str(self.account_log),
             CLAUDE_CODE_SESSION_ID=fixture_runtime_id(caller) if caller else "",
             SHUTDOWN_STATE_DIR=str(self.state_root),
+            PROCESS_TABLE_PS="true",
         )
         command = [sys.executable, str(SCRIPT), "--run-root", str(self.root)]
         for run in [session_dir] if isinstance(session_dir, Path) else session_dir or []:
