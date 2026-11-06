@@ -2017,6 +2017,24 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
+    def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
+        from scripts.shutdown.inventory import ListedSession
+
+        inventory = import_module("inventory")
+        owner = ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
+                              self.home / ".claude1", "", "", "")
+        target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
+        outcome = stop_results.ClaudeUp(owner.session_id, "w1:p1", "claude2")
+        for live in ([owner], []):
+            with (self.subTest(live=bool(live)),
+                  patch.object(inventory, "listing", return_value=live) as listing,
+                  patch.object(accounts, "check_move_target", return_value=target),
+                  patch.object(stop_resume, "move_sessions", return_value=[outcome]) as moved):
+                result = accounts.move(owner.session_id, "claude2", why="fixture move")
+            self.assertIsInstance(result, accounts.MoveStarted)
+            listing.assert_called_once_with()
+            moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand")
+
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
 

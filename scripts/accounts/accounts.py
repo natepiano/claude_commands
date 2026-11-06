@@ -2693,7 +2693,7 @@ class SessionBatchMove(Protocol):
     def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
     """Stop and resume each selected local owner through the shared move API."""
 
     account_config = read_account_settings(account_config)
@@ -2705,7 +2705,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
     if isinstance(checked, MoveRefused):
         return tuple(SessionMoveRefused(identity, checked.reason) for identity in ids)
-    live = inventory.listing()
+    live = inventory.listing() if live is None else live
     selected = list(dict.fromkeys(ids))
     refused: dict[str, SessionMoveRefused] = {}
     eligible: list[str] = []
@@ -2996,7 +2996,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         if not matches:
             if dry_run:
                 return MoveDryRun(session, (f"{session}: would resume on {target} if its saved tab is local",))
-            results = move_sessions((session,), target, why=why or "finish account move", account_config=account_config)
+            results = move_sessions((session,), target, why=why or "finish account move", live=live, account_config=account_config)
             stdout, stderr, code = _move_output(results, ())
             outcome = MoveStartFailed if code else MoveStarted
             return outcome(session, target, stdout, stderr, code)
@@ -3013,7 +3013,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         reason = why or f"{session_account_label(owner)} is out of usage"
         if dry_run:
             return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, target), *return_notice))
-        results = move_sessions((owner.session_id,), target, why=reason, account_config=account_config)
+        results = move_sessions((owner.session_id,), target, why=reason, live=live, account_config=account_config)
         stdout, stderr, code = _move_output(results, checked.notices)
         stdout += "".join(line + "\n" for line in return_notice)
         outcome = MoveStartFailed if code else MoveStarted

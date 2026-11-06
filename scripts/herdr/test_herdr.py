@@ -3764,6 +3764,14 @@ class HerdrTests(unittest.TestCase):
                 self.assertEqual([command for command in self.commands() if command[2:4] == ["pane", "list"]],
                                  [["--session", "writing", "pane", "list"]])
 
+    def test_process_sessions_without_scope_reads_does_not_read_the_agent_slice(self) -> None:
+        server = self.process(30, 1, ["herdr", "server"], {})
+        shell = self.process(11, 30, ["zsh"], {})
+        with patch.object(herdr, "agents_slice", side_effect=AssertionError("no scope read")) as setting:
+            self.assertEqual(herdr._process_sessions([server, shell], {30: "writing"}),  # pyright: ignore[reportPrivateUsage]
+                             {11: "writing"})
+        setting.assert_not_called()
+
     def test_process_sessions_reads_the_agent_slice_once_for_multiple_pane_scopes(self) -> None:
         server = self.process(30, 1, ["herdr", "server"], {})
         shell = self.process(11, 30, ["zsh"], {})

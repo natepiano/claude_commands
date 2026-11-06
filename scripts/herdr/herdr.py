@@ -4221,7 +4221,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
         return {}
-    slice_name = agents_slice()
+    read_slice = cache(agents_slice)
     unit_groups: dict[tuple[str, Path], str] = {}
     shared_groups: dict[tuple[str, Path], set[str]] = {}
     for pid, session in servers.items():
@@ -4277,14 +4277,14 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         break
                 if pid in sessions:
                     break
-            if pid not in sessions and (scopes := pane_scopes(groups, slice_name)):
+            if pid not in sessions and (scopes := pane_scopes(groups, read_slice())):
                 loose[pid] = scopes
         # A pane scope holds one pane's processes, as the unit's cgroup held
         # them before. Only a scope that no matched process explains needs the
         # unit servers' pane shells.
         owners: dict[tuple[str, Path], set[str]] = {}
         if loose:
-            _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions, slice_name)
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions, read_slice())
             if any(not any(scope in owners for scope in scopes) for scopes in loose.values()):
                 shared_sessions.update(unit_groups.values())
         walked = set(sessions)
@@ -4301,7 +4301,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                     sessions[pid] = owner
                     descendants.extend((child, owner) for child in children.get(pid, []))
         if loose:
-            _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions, slice_name)
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions, read_slice())
             for pid, scopes in loose.items():
                 found = {session for scope in scopes for session in owners.get(scope, set())}
                 # A scope with two owners holds a server started inside a pane; it names neither.
