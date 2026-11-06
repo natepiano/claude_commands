@@ -277,47 +277,22 @@ A worker switches between Claude and Codex in the same slot. Its staff `id`, `na
 
 ### Phase 3t — A retry after a failed delivery restores the handoff  · status: done
 
-**Owner:** models-unit. Phase 3r routed this case here (ledger 3r F008).
+#### As-built
 
-**Depends on:** 3r.
-
-#### Work Order
-
-**Goal:** A worker switch retry after a failed first delivery still gives the destination the transcript extract before its assignment.
-
-**Spec:**
-
-1. Cause: after a failed delivery, the destination is live and reads the requested family. `worker_record switch` in `scripts/direct/implement.sh` returns 1, so the retry takes a plain follow-up. `coordinate_claude` does not run, the extract is not delivered, and the dispatch record stays `sending`.
-2. `worker_record switch` also returns 0 when the dispatch record is pending for this prompt. The retry then reaches `coordinate_claude`, which restores the saved handoff through `switch_worker`.
-3. A follow-up with no pending dispatch record keeps the follow path.
-4. Add no guard, refusal or check.
-5. The same retry in the Claude to Codex direction goes through `assign.py`, which selects plain follow when the families match. A pending record for this prompt also sends that dispatch to the launcher, so `codex_mesh.py start` restores the handoff. One helper in `worker_admission.py` answers "pending for this prompt" for `assign.py` and `implement.sh`.
-6. `dispatch_record` takes the run and the name. The switch check calls no `admit`.
+- `worker_admission.dispatch_pending(run, name, prompt)` answers whether the dispatch record holds this prompt's `assignment_id` in a state other than `ASSIGNMENT_ACCEPTED`. An unreadable record prints one `anomaly:` line and reads as not pending.
+- `dispatch_record(run, name, *, report_anomaly=True)` takes the run and the name. `worker_fill.py` and `codex_mesh.py` call this form.
+- `worker_record switch` in `scripts/direct/implement.sh` exits 0 on a family change or a pending dispatch, which clears the follow. A retry then reaches `worker_fill.coordinate_claude`, which restores the saved handoff through `worker_admission.switch_worker`.
+- `scripts/direct/assign.py` sends a Codex dispatch to the launcher on a family change or a pending dispatch, so `codex_mesh.py start` restores the handoff in the Claude to Codex direction. Any other dispatch follows.
 
 **Files:**
+- `scripts/production/worker_admission.py` — `dispatch_pending` and `dispatch_record`.
 - `scripts/direct/implement.sh` — the switch check.
 - `scripts/direct/assign.py` — the route for a pending retry.
-- `scripts/production/worker_admission.py` — the pending helper and the `dispatch_record` signature.
-- `scripts/production/worker_fill.py`, `scripts/agents/codex_mesh.py` — `dispatch_record` callers only.
-- `scripts/direct/test_implement_launcher_claude_follow.py`, `scripts/direct/test_assign_launcher.py`, `scripts/direct/implement_launcher_test_support.py`, `scripts/production/test_worker_admission.py`, `scripts/production/test_worker_fill.py`, `scripts/agents/test_codex_mesh.py` — real-path regression tests and the `dispatch_record` call sites.
-- `scripts/production/worker_fill.py` — read only for `coordinate_claude` (lines 18-91).
+- `scripts/direct/test_implement_launcher_claude_follow.py`, `scripts/direct/test_assign_launcher.py`, `scripts/production/test_worker_admission.py`, `scripts/agents/test_codex_mesh.py` — retry order, unreadable state and accepted or unrelated work.
 
-**Workers:** `1 writer`
+**Gotchas:** `review.sh` has no such check: a review worker retry uses follow and does not restore the extract.
 
-- `impl` — the source repair and its tests.
-
-**Constraints from prior phases:**
-
-1. 3r: the dispatch role goes to `agent_bg.sh` as `AGENT_BG_ROLE`, and a live Claude session with no transcript reads `ClaudeBackend`.
-2. No unasked guards (user via sdlc, 2026-11-05).
-3. Use the existing `assignment_id` and dispatch record helpers. Keep the original prompt file: its identity includes its path, modification time and contents.
-4. A test that needs a project makes it in a tempdir at run time (user via sdlc, 2026-11-05).
-
-**Acceptance gate:**
-
-1. Observation: a retry with a pending dispatch record delivers one prompt whose extract path comes before the assignment, to the same destination session. Real-path check: a test through `implement.sh`.
-2. The dispatch record reads `accepted` after that delivery, and a plain follow-up leaves the record unchanged.
-3. The merge gate passes; basedpyright 0/0 on changed files and on caller modules.
+**Ruled out:** a refusal on an unreadable dispatch record; it stays a follow plus one anomaly line.
 
 ### Phase 5a — Bash reads the resolved model registry in one call  · status: done
 
