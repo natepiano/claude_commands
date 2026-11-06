@@ -35,6 +35,7 @@ from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
 from scripts.production.add_showrunner_test_support import AddShowrunnerFixture, SCRIPT
+from scripts.production.add_unit_test_support import LINUX_LAUNCHER_CLI
 
 
 from scripts.production import staff
@@ -98,7 +99,17 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(add_showrunner, "local_machine", return_value="natedev"))
         _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc("top")))
+
+    @override
+    def invoke(self, arguments: list[str], *, cwd: Path | None = None,
+               subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
+        if subprocess_cli:
+            return subprocess.run([sys.executable, "-c", LINUX_LAUNCHER_CLI, str(SCRIPT), *arguments],
+                                  env=self.env, capture_output=True, text=True, check=False, cwd=cwd,
+                                  timeout=TEST_HANG_GUARD_SECS)
+        return super().invoke(arguments, cwd=cwd)
 
     def test_launch_passes_the_ensured_showrunner_staff_id_to_the_pane(self) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")

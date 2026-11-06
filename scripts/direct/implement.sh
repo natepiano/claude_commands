@@ -6,6 +6,7 @@
 
 set -euo pipefail
 "${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
+LAUNCHER_COMMAND=(bash "${BASH_SOURCE[0]}" "$@")
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -72,18 +73,25 @@ export UNIT_TEAM_ROLE="${TEAM_ROLE}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-MESH_PREFIX="${10:-}"
-LEGACY_PREFIX="$(basename "${SESSION_DIR}")"
-if [[ -z "${MESH_PREFIX}" ]] && grep -qF "mesh=${LEGACY_PREFIX}-" "${SESSION_DIR}/board.log" 2>/dev/null; then
-  MESH_PREFIX="${LEGACY_PREFIX}"
-fi
-if [[ -n "${FOLLOW_TO}" ]]; then
-  MESH_NAME="${FOLLOW_TO}"
+PY="${SCRIPT_DIR}/../lib/py"
+TRANSPORT="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" worker-transport "${SESSION_DIR}")"
+MESH_NAME="${FOLLOW_TO:-${TEAM_ROLE}}"
+if [[ "${TRANSPORT}" == mesh ]]; then
+  MESH_PREFIX="${10:-}"
+  LEGACY_PREFIX="$(basename "${SESSION_DIR}")"
+  if [[ -z "${MESH_PREFIX}" ]] && grep -qF "mesh=${LEGACY_PREFIX}-" "${SESSION_DIR}/board.log" 2>/dev/null; then
+    MESH_PREFIX="${LEGACY_PREFIX}"
+  fi
+  if [[ -n "${FOLLOW_TO}" ]]; then
+    MESH_NAME="${FOLLOW_TO}"
+  else
+    MESH_NAME="$(bash "${SCRIPT_DIR}/worker_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
+  fi
+
 else
-  MESH_NAME="$(bash "${SCRIPT_DIR}/worker_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
+  TASK="direct.${PASS_KIND}"
 fi
 
-PY="${SCRIPT_DIR}/../lib/py"
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
 REPLY_FILE="${ARTIFACT_DIR}/impl_reply${SLOT}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/impl_status${SLOT}"
@@ -276,15 +284,17 @@ if action == "claim" and family == "codex":
 PY
 }
 
-worker_record admit
-"$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
+if [[ "${TRANSPORT}" == mesh ]]; then
+  worker_record admit
+  "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
+fi
 mkdir -p "${ARTIFACT_DIR}"
 
-if [[ -n "${FOLLOW_TO}" ]] && worker_record switch; then
+if [[ "${TRANSPORT}" == mesh && -n "${FOLLOW_TO}" ]] && worker_record switch; then
   FOLLOW_TO=""
 fi
 
-if [[ -n "${FOLLOW_TO}" ]]; then
+if [[ "${TRANSPORT}" == mesh && -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
   trap 'worker_record release' EXIT
   AGENT_MODEL="$(worker_record claim)"
@@ -308,7 +318,7 @@ echo "implementing" > "${STATUS_FILE}"
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
-if [[ -f "${PROGRESS_STATE}" ]]; then
+if [[ "${TRANSPORT}" == mesh && -f "${PROGRESS_STATE}" ]]; then
   if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind "${PASS_KIND}" \
@@ -332,7 +342,9 @@ fi
 
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
-if [[ "${AGENT_FAMILY}" == "claude" ]]; then
+if [[ "${TRANSPORT}" == herdr ]]; then
+  MESH_FIELD="transport=herdr; reach=worker.py"
+elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
   MESH_FIELD="mesh=${MESH_NAME}; reach=SendMessage"
 else
   MESH_FIELD="mesh=${MESH_NAME}; reach=codex_mesh.py"
@@ -356,7 +368,14 @@ if [[ ! -d "$TMPDIR" ]]; then
 fi
 export TMPDIR
 
-if [[ -n "${FOLLOW_TO}" ]]; then
+if [[ "${TRANSPORT}" == herdr ]]; then
+  WORKER_ARGS=(assign "${PASS_KIND}" "${PROMPT_FILE}" --session-dir "${SESSION_DIR}"
+    --slot "${TEAM_ROLE}" --phase "${PHASE_ID}" --kind implement --reply "${REPLY_FILE}"
+    --fix-cause "${FIX_CAUSE}"
+    --fix-pass "${FIX_PASS}" --activity "${PASS_ACTIVITY}")
+  [[ -z "${FOLLOW_TO}" ]] || WORKER_ARGS+=(--name "${FOLLOW_TO}")
+  "$PY" "${SCRIPT_DIR}/../production/worker.py" "${WORKER_ARGS[@]}" --launcher-command "$("$PY" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${LAUNCHER_COMMAND[@]}")" >"${LOG_FILE}" 2>&1 &
+elif [[ -n "${FOLLOW_TO}" ]]; then
   FOLLOW_MESSAGE="${ARTIFACT_DIR}/impl_follow_message${SLOT}.$$.txt"
   cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
   printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
@@ -388,7 +407,7 @@ else
     --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 fi
 AGENT_PID=$!
-if [[ -z "$FOLLOW_TO" || "$AGENT_FAMILY" == codex ]]; then
+if [[ "${TRANSPORT}" == mesh && ( -z "$FOLLOW_TO" || "$AGENT_FAMILY" == codex ) ]]; then
   RECORD_ACTION=record
   [[ -z "$FOLLOW_TO" ]] || RECORD_ACTION=turn
   for ((worker_wait=0; worker_wait<${UNIT_WORKER_WAIT_ATTEMPTS:-30}; worker_wait++)); do
@@ -408,12 +427,12 @@ HEARTBEAT_LOOP_PID=$!
 
 AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
-if [[ -n "${FOLLOW_TO}" ]]; then
+if [[ "${TRANSPORT}" == mesh && -n "${FOLLOW_TO}" ]]; then
   if [[ "${AGENT_FAMILY}" == "codex" ]]; then
     worker_record turn >/dev/null || true
   fi
   rm -f "${FOLLOW_MESSAGE}"
-else
+elif [[ "${TRANSPORT}" == mesh ]]; then
   worker_record record 2>/dev/null || true
 fi
 
@@ -455,7 +474,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
 else
   LEDGER_CODE=0
-  if [[ -f "${PROGRESS_STATE}" ]]; then
+  if [[ "${TRANSPORT}" == mesh && -f "${PROGRESS_STATE}" ]]; then
     UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       || { echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2; LEDGER_CODE=1; }

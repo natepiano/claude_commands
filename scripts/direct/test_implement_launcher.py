@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.production import staff
 from scripts.production.staff_test_support import transcript_fixture, switch_backend_stub, isolated_staff_file
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
+from scripts.whoami.account_test_support import write_codex_auth
 
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -14,7 +15,7 @@ import contextlib
 from pathlib import Path
 from scripts.direct import implement_launcher_test_support as support
 from scripts.direct.implement_launcher_test_support import STUB_MESH as STUB_MESH
-from typing import cast
+from typing import cast, override
 import json
 import os
 import select
@@ -25,7 +26,58 @@ from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.direct.wait_for_test_state import wait_for_pid
 
 
+def configure_transport(root: Path) -> None:
+    """Keep copied launcher configuration private and complete."""
+    configuration = root / "direct.conf"
+    text = configuration.read_text()
+    if "WORKER_TRANSPORT=" not in text:
+        _ = configuration.write_text(text + "\nWORKER_TRANSPORT=mesh\n")
+
+
+def configure_pane_account(home: Path, notes: Path) -> None:
+    """Give the child command a signed-in private worker account."""
+    configuration = home / ".claude/config"
+    configuration.mkdir(parents=True, exist_ok=True)
+    _ = (configuration / "accounts.json").write_text(json.dumps({"workers": "codex1"}))
+    notes.mkdir(parents=True, exist_ok=True)
+    _ = (notes / "codex1.md").write_text("---\nlogin: worker@example.invalid\n---\n")
+    account = home / ".codex"
+    account.mkdir(parents=True, exist_ok=True)
+    write_codex_auth(account, "worker@example.invalid")
+
+
+def install_worker_command(root: Path) -> None:
+    """Use the real command with the launcher's private state."""
+    command = root / "scripts/production/worker.py"
+    command.symlink_to(Path(__file__).resolve().parents[1] / "production/worker.py")
+
+
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        configure_transport(self.root)
+
+    def test_herdr_dispatch_keeps_unknown_evidence_out_of_the_mesh_path(self) -> None:
+        run = self.start_phase("pane-unknown")
+        _ = (run / "worker_transport").write_text("herdr\n")
+        install_worker_command(self.root)
+        _ = self.claude_worker(run)
+        environment = self.environment()
+        environment["HERDR_BIN"] = "/nonexistent/herdr"
+        configure_pane_account(self.root, Path(environment["AGENT_NOTES_DIR"]))
+        before = (self.root / "staff.json").read_bytes()
+        prompt = self.prompt_file.read_bytes()
+        result = subprocess.run([
+            "bash", str(self.implement_script), "--phase", "3", str(run), str(self.working_dir),
+            str(self.prompt_file), "impl", "the retry path", "impl", "writing the retry path", "0", "impl",
+        ], env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 8, result.stdout + result.stderr)
+        self.assertEqual((run / "phases/3/impl_status_impl").read_text(), "error\n")
+        self.assertEqual((self.root / "staff.json").read_bytes(), before)
+        self.assertEqual(self.prompt_file.read_bytes(), prompt)
+        self.assertIn("/nonexistent/herdr", (run / "phases/3/impl_agent_impl.log").read_text())
+
     def test_implementation_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
         session = self.start_phase("registry-snapshot")
         environment = self.mesh_environment()
