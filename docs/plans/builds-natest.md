@@ -833,50 +833,16 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 36 — A unit's run is a full test, and only a merge is a merge gate  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a unit's run before a checkpoint is named `full test` and selects the modules its change reaches. The showrunner's merge gate runs all modules. The user asked for this through the showrunner, 2026-11-05.
-
-**Spec:** the user's words: "if they're not the showrunner they are not a merge gate - and it's the full tests taht should be limited to what they're changing and the actual merge gate would make sense to run all tsets." In the 24 hours to 2026-11-05 17:00 EST, all 204 runs used `merge_gate.py --tests-only`: 115 from units (112 full, 55 red) and 89 from merge branches (80 full, 25 red).
-1. Add `scripts/production/full_test.py --checkout <tree> [--full]`. It selects affected modules with today's selection code and records its own step name. It shares the suite runner in `merge_gate.py`: no copy of the runner.
-2. `merge_gate.py --tests-only` always runs all modules. It never calls `select_affected`. A full pass on the exact same tree stays reusable. An affected pass never certifies a tree, as today.
-3. The step name and the shown name come from config (Names through config). The step is `full-test`; the shown name is `full test`. Find each reader of the step `merge-gate` and of the path `merge_gate.py`, and make each one treat the new step: the queue page, `queue_place`, the buildlog records and index, build folders, memory admission, build holds.
-4. Keep old records as history. No code reads the old name for a unit's run.
-5. Switch all callers in this phase (One owner switches all callers):
-   - every doc and command that tells a unit to run the gate;
-   - the memory `shared-module-full-gate.md`;
-   - at the end, a `/unit:announce`-form broadcast to the units on both productions, with the new command.
-   `**Merge tests:**` lines stay as they are.
-6. An unswitched caller of `merge_gate.py --tests-only` gets a correct all-module run under the merge name. Do not refuse it.
-7. Add no guard, refusal or check (user rule, 2026-11-05). The nightly full run stays.
-8. `scripts/build_hold/build_hold.py` is on hold until the showrunner sends natedev messaging's main hash. If it needs an edit, tell the director; the director asks the showrunner.
-9. When a run finds a dirty checkout, its record writes the dirty paths. This is a record only, with no refusal (showrunner, 2026-11-05: 22 of 104 replayed runs had an unknown dirty cause).
-
-**Files:**
-- `scripts/production/full_test.py` — new command
-- `scripts/production/test_full_test.py` — new tests
-- `scripts/production/merge_gate.py`, `scripts/production/merge_gate_test_support.py`, `scripts/production/merge_gate_suites_test_support.py`, `scripts/production/test_merge_gate.py`, `scripts/production/test_merge_gate_suites.py` — all modules, step name
-- `scripts/test_times/gate_record.py` — the step and dirty paths in the record
-- `scripts/build_queue/admission_client.py`, `scripts/build_queue/admission_code.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/scope_activity.py` — the new step (owner: queue unit)
-- `scripts/buildlog/index.py`, `scripts/buildlog/test_gate_index.py` — the new step
-- `scripts/build_hold/hold_enforcer.py`, `scripts/hooks/pre-tool-use-build-hold-guard.py`, `scripts/hooks/pre-tool-use-build-hold-guard.sh` — the new step
-- `config/build_folders.conf`, `config/build_admission.conf` — the step's prefix and peak hold; the shown name
-- `docs/direct/write_prompt_contract.md`, `docs/as-built/` — the command, where a page names the unit's run
-
-**Workers:** 1 writer on slot `impl3` (the step name crosses every file; slot `impl` holds the Phase 37 replay)
-- `impl3` — all files above
-
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- The admission service restart fault (queue unit, 2026-11-05): merge `origin/builds` with its fix before the live check.
-
-**Acceptance gate:**
-- A test runs `full_test.py` on a small change: it selects a subset, and the record carries step `full-test`.
-- A test runs `merge_gate.py --tests-only` on the same change: it runs all modules, and the record carries step `merge-gate`.
-- Live check on natedev: a `full_test.py` run shows as `full test` on the queue page. The director reads the page and quotes the line in the notice.
-- `grep` finds no doc that tells a unit to run `merge_gate.py`.
-- Each caller module of the changed files green in the gate form, and `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`.
-- The checkpoint carries a Change-Review line: the user opens the queue page during a unit's run and sees `full test`.
+- `scripts/production/full_test.py --checkout <tree> [--full]` runs `merge_gate.run_tests_only(args, SuiteMode.FULL_TEST)` and selects affected modules. `merge_gate.py --tests-only` runs all modules under `SuiteMode.MERGE_GATE`; an unswitched caller gets that correct run.
+- `run_suites(..., mode=)` carries the mode into the build-queue step, the build-folder prefix, `BUILDLOG_CALLER` and the gate record.
+- `config/build_steps.conf` holds the shown names. `scripts/lib/build_steps.py` has `read_step_names` and `StepNames.shown`, `.prose`, `.memory_cap_text`. The step id `full-test` shows as `full test`; `merge-gate` and `build` stay as ids.
+- `config/build_folders.conf` has `prefixes.full-test` and `prefixes.suite-module`. `config/build_admission.conf` has `peak_hold_seconds.full-test=180`.
+- `gate_record` has required `step`, and `dirty_paths`, `dirty_path_count` for a dirty checkout. `buildlog/index.py` is schema 34 with `step`.
+- The queue files, the build-hold enforcer and hook, as-built docs, `docs/direct/write_prompt_contract.md` and the unit plans use the new names.
+- Live check: the queue page showed `7▸builds  natest  full test  2 pid 1674416 ██████ 6.0`.
+- Phase 48 owns the raw step id in the running and release sentences, the three copies of the suite-runner names, and `build_hold.py:493`.
 
 ### Phase 37 — A unit's full test runs under 40% of the test modules  · status: todo
 **Depends on:** none
