@@ -26,6 +26,32 @@ This doc holds the cost of the `scripts/direct/test_verify*.py` files. It also s
 2. The real offload's busy answer reaches the call record.
 3. A plain-package `no_tests` answer reaches `route_test`, and the local run follows, with `--no-tests=warn` at both machines.
 
+## Batch of Phase 41a
+
+Each number is one `measure_set.py` run on a `copies.py` copy: the `wait4` CPU s and the clock of the file's `python3 -m unittest` run. This batch has no process count. Before is `138dcf10e`. After is the batch on the `verify-plain` history. Wall s depends on the machine load of that minute.
+
+| File | Tests | CPU s before | CPU s after | Wall s before | Wall s after | Test code changed |
+| --- | --- | --- | --- | --- | --- | --- |
+| `test_verify_mac_retry_hold.py` | 3 | 48.8 | 50.8 | 61.1 | 79.6 | yes |
+| `test_verify_token_renew.py` | 14 | 45.6 | 42.9 | 81.8 | 82.2 | yes |
+| `test_verify_mac_lifecycle.py` | 3 | 39.5 | 40.6 | 65.7 | 69.9 | no |
+| `test_verify_token_memory_history.py` | 8 | 36.0 | 34.4 | 59.3 | 60.5 | no |
+| `test_verify_mac_retry_clock.py` | 3 | 35.0 | 27.3 | 57.3 | 50.6 | yes |
+| `test_verify_mac_results.py` | 4 | 34.4 | 32.4 | 38.5 | 39.5 | yes |
+| `test_verify_hold_wait.py` | 6 | 30.0 | 21.5 | 37.0 | 26.9 | yes |
+| `test_verify_tree_cancel_lint.py` | 6 | 29.4 | 29.8 | 42.8 | 46.0 | no |
+| `test_verify_lint_taplo.py` | 11 | 23.2 | 14.2 | 30.6 | 29.9 | yes |
+| `test_verify_lint_scope.py` | 5 | 18.8 | 19.6 | 23.5 | 31.7 | no |
+| **Total** | 63 | 340.7 | 313.5 | 497.6 | 516.9 | |
+
+CPU s fell by 27.2, or 8%. Wall s did not fall in these runs.
+
+The four files with no test code change moved by at most 1.6 CPU s. Read that as the noise of one run.
+
+`test_verify_mac_retry_hold.py` saved nothing. Review showed that a direct call of its deadline check passed with the deadline check removed from `verify.sh`, so that test keeps its full `verify.sh` run. The memory and token idle-marker tests in `test_verify_mac_retry_clock.py` keep their full runs for the same reason. The routing idle-marker test calls the hook directly.
+
+natest takes the other files, and measures the whole set. The builds showrunner relayed this ruling from the user on 2026-11-06.
+
 ## Baseline for the whole set
 
 The total is 1,618.6 median CPU s over 122 files, largest first.
@@ -182,4 +208,4 @@ The total is 1,618.6 median CPU s over 122 files, largest first.
 
 ## Whole set after
 
-This section is empty until the last batch of the plan's Phase 41a.
+natest writes this section after its last batch.

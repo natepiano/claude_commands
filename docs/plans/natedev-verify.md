@@ -1035,7 +1035,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - One real `verify.sh` run costs about 8 CPU s and about 300 processes in this fixture.
 - Some small files use much CPU: `test_verify_mac_retry_hold.py` has 28 lines and 3 tests, and its cost is in `VerifyMacOffloadFixture`.
 
-### Phase 41a — Test the other verify files by direct calls, largest CPU first  · status: todo
+### Phase 41a — Test the other verify files by direct calls, largest CPU first  · status: done
 
 **Depends on:** Phase 41.
 
