@@ -351,7 +351,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Files:**
 - `scripts/direct/verify.sh` — the token branch of `phase_wait_holder_flags`, and `phase_wait_start`.
-- `scripts/direct/test_verify_wait_holder.py`.
+- `scripts/direct/test_verify_wait_holder.py`
 
 **Workers:** 1 integration writer + 1 tester.
 
@@ -1017,42 +1017,23 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 41 — Test Mac arguments by direct calls, and measure the verify test set  · status: done
 
-**Depends on:** none. The bump of 2026-11-06 11:24 EST removed the wait on Phase 8.
+#### As-built
 
-#### Work Order
-
-**Source:** builds showrunner, 2026-11-06 11:21 EST. Queue measured `direct/test_verify_mac_arguments.py` at 1,890 processes for 4 tests. The 136 `test_verify*` files hold about 2% of all tests and used 2,113 of 5,610 CPU s in the 5 fastest full gates of 11-05.
-
-**Goal:** the argument and routing checks of this file run through direct calls of the functions they test. Each checked behavior stays checked. A few end-to-end `verify.sh` cases stay. The phase also records the baseline and the order for the other files.
-
-**Spec:**
-
-1. **Baseline.** Before any test edit, measure `test_verify_mac_arguments.py`: processes started, CPU s and wall s. Count processes with one method that follows every child, and name the method. Save the method with the numbers. Measure the whole `test_verify*` set from the gate records (`show.py`): median CPU s for each file, and the total. Write the list, largest CPU first, in `docs/plans/natedev-verify-test-cost.md`.
-2. **Behavior map.** List each behavior the 4 tests check, with its assertion. Each behavior gets one row: the test that checks it after the phase, and whether it is a direct call or an end-to-end run.
-3. **Direct calls.** Move the argument and routing checks onto direct calls of the Bash functions in `verify.sh` and the Python functions they use. Use `scripts/lib/shell_test_support.py` for Bash functions, and run many cases in one shell where the cases allow it. Make no second extractor. Replace a fake `cargo`, `git` or `rustc` with a direct call where the check does not need the tool.
-4. **End to end.** Keep the smallest set of real `verify.sh` runs that proves the path from the command line to the recorded call: one Mac decline that runs locally, one real offload busy result, and one plain-package `no_tests` decline, because the reviews showed that `route_test` and the local run after that answer have no direct call without a stand-in for the routing decision. A further run stays only when it proves something that no direct call can prove. Say why in the map.
-5. **Production code.** Move a piece of `verify.sh` into a function only when a check has no function to call. Such a move changes no behavior.
-6. **Measure again.** Measure the file with the same method, and write before and after in `docs/plans/natedev-verify-test-cost.md`.
+- `NextestArgumentTests` in `test_verify_mac_arguments.py` calls the real `compose_nextest_args` and the metadata helpers in one Bash process, for a plain package, a filter and a target.
+- The file keeps three real `verify.sh` runs: one Mac decline that runs locally, one real offload busy result, and one plain-package `no_tests` result. `route_test` needs admission, reservations and hold decisions, so a direct call of the `no_tests` fallback needs a stand-in for the routing decision.
+- The `no_tests` run reads `--no-tests=warn` at the Mac runner and at the local run, and counts one call of each.
+- Measured the file with `strace`, following each child: CPU 56.0 to 30.2 s, processes 1,925 to 982, wall 62.1 to 34.0 s.
+- `docs/plans/natedev-verify-test-cost.md` holds the method, the per-file rows and the baseline: 1,618.6 median CPU s over 122 files, largest first, and 22 files with no gate record.
 
 **Files:**
-- `scripts/direct/test_verify_mac_arguments.py`, and `scripts/direct/verify_mac_offload_test_support.py` if the fixture needs a change.
-- `scripts/direct/verify.sh`, only under Spec item 5.
-- `docs/plans/natedev-verify-test-cost.md` (new).
+- `scripts/direct/test_verify_mac_arguments.py` — the direct tests and the three kept runs.
+- `docs/plans/natedev-verify-test-cost.md` — the method, the rows and the baseline.
 
-**Workers:** 1 integration writer. The director runs the measures. The review reads the behavior map.
-
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- A test project is made in a tempdir at run time. No test commits one.
-- Point measurement work at a temporary hold folder. Live state stays out of worker prompts.
-- At most one detached run at a time, with at most 4 named test files.
-- `test_verify_wait_holder.py` belongs to Phases 8 and 8a. Do not change it here.
-
-**Acceptance gate:**
-- The behavior map has a row for each assertion of the 4 tests, and no row lacks a test. A reviewer reads the old assertions against the map.
-- For each moved check, breaking the function it calls makes the new test fail. Show this on a tempdir copy for each moved behavior.
-- The before and after numbers for this file are in the cost doc: processes, CPU s and wall s, by one named method. The observation is the drop in processes and in CPU s for this file.
-- `test_verify_mac_arguments.py` and `test_verify_python_starts.py` pass; basedpyright 0/0/0 on the changed Python files; no full suite: the bump (builds showrunner, 2026-11-06 11:24 EST) runs lint and the tests of the changed files only, and the merge gate runs all modules.
+**Gotchas:**
+- A check on a composed value proves nothing about the value that a consumer receives.
+- A result word with its own branch in `route_test` or `remember_mac_retry` needs a check that the following step ran.
+- One real `verify.sh` run costs about 8 CPU s and about 300 processes in this fixture.
+- Some small files use much CPU: `test_verify_mac_retry_hold.py` has 28 lines and 3 tests, and its cost is in `VerifyMacOffloadFixture`.
 
 ### Phase 41a — Test the other verify files by direct calls, largest CPU first  · status: todo
 
@@ -1070,18 +1051,46 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 2. **Method.** Each file gets the behavior map, the direct calls and the kept end-to-end runs of Phase 41. A file is finished when each real `verify.sh` run left in it proves something that no direct call can prove.
 3. **Shared fixtures.** When files share a fake tool or a fixture, change the fixture once. Make no copy of a fixture.
 4. **Whole set.** After the last batch, measure the whole `test_verify*` set from the gate records, with the method of the baseline. Write before and after CPU s in the cost doc, and send the numbers to the showrunner.
+5. **Checks stay at the consumer.** A direct test reads a value where its consumer receives it, not only where it is composed. Each result word with its own branch in `route_test` or `remember_mac_retry` keeps a check that the following step ran. A test uses no stand-in for the decision that it exists to prove. Phase 41's first version lost two checks in this way.
+6. **The first batch.** Ten files, largest CPU first, about 322 median CPU s. A file with few lines and high CPU s has its work in the support file: `test_verify_mac_retry_hold.py` spends its CPU in `VerifyMacOffloadFixture.check_temporary_mac_decline`.
 
 **Files:**
-- `scripts/direct/test_verify*.py` and `scripts/direct/verify_*_test_support.py`, named batch by batch.
-- `scripts/direct/verify.sh`, only under Phase 41's Spec item 5.
-- `docs/plans/natedev-verify-test-cost.md`.
+- `scripts/direct/test_verify_mac_retry_hold.py`
+- `scripts/direct/test_verify_mac_lifecycle.py`
+- `scripts/direct/test_verify_mac_results.py`
+- `scripts/direct/test_verify_mac_retry_clock.py`
+- `scripts/direct/test_verify_token_renew.py`
+- `scripts/direct/test_verify_token_memory_history.py`
+- `scripts/direct/test_verify_hold_wait.py`
+- `scripts/direct/test_verify_tree_cancel_lint.py`
+- `scripts/direct/test_verify_lint_taplo.py`
+- `scripts/direct/test_verify_lint_scope.py`
+- `scripts/direct/verify_mac_offload_test_support.py`
+- `scripts/direct/verify_token_wait_test_support.py`
+- `scripts/direct/verify_hold_wait_test_support.py`
+- `scripts/direct/verify_tree_cancel_test_support.py`
+- `scripts/direct/verify_lint_scope_test_support.py`
+- `scripts/direct/verify_lint_cache_test_support.py`
+- `docs/plans/natedev-verify-test-cost.md`
 
-**Workers:** Set at each batch; one writer per file set that no other writer touches.
+**Workers:** 3 writers. Each support file has one owner. A support file that a slot does not own is read-only for that slot.
+- merge16: the four `test_verify_mac_*` files above; owns `verify_mac_offload_test_support.py`.
+- fix16: `test_verify_token_renew.py`, `test_verify_token_memory_history.py`, `test_verify_hold_wait.py`; owns `verify_token_wait_test_support.py` and `verify_hold_wait_test_support.py`.
+- symlinkfix: `test_verify_tree_cancel_lint.py`, `test_verify_lint_taplo.py`, `test_verify_lint_scope.py`; owns `verify_tree_cancel_test_support.py`, `verify_lint_scope_test_support.py` and `verify_lint_cache_test_support.py`.
+- The director measures and writes the cost doc. Set the next batch's Workers at this phase's end.
 
 **Constraints from prior phases:**
-- The constraints in Phase 41 apply.
+- Add no guard, refusal or check that this Spec does not ask for.
+- A test project is made in a tempdir at run time. No test commits one.
+- Point measurement work at a temporary hold folder. Live state stays out of worker prompts.
+- At most one detached run at a time per writer, with at most 4 named test files.
+- `test_verify_wait_holder.py` belongs to Phases 8 and 8a. Do not change it here.
+- `verify.sh` is read-only in this batch, because three writers cannot share it. A check that needs a production move stays unmoved, and the summary names it.
+- A shared helper keeps its behavior for its other consumers. Add a helper before changing one. A writer that changes one names its consumers, and the director runs them.
+- natest Phase 53 removes `readlink` from `isolate_path_without_taplo` in `verify_lint_scope_test_support.py`. Do not change that function.
 
 **Acceptance gate:**
-- Each changed file has a complete behavior map, and breaking a function makes its moved test fail, as in Phase 41.
-- The cost doc holds before and after CPU s for each changed file and, after the last batch, for the whole set.
-- basedpyright 0/0/0 on the changed Python files; no full suite: the bump (builds showrunner, 2026-11-06 11:24 EST) runs lint and the tests of the changed files only, and the merge gate runs all modules.
+- Each changed file has a complete behavior map: one row for each old assertion, and no row lacks a test. A reviewer reads the old assertions against the map.
+- For each moved check, breaking the step that the check names makes its test fail. The proof breaks the consumer or the routing branch, not only the function that composes the value. Show this on a tempdir copy for each moved behavior.
+- The cost doc holds before and after CPU s for each changed file and, after the last batch, for the whole set. The observation is the drop in CPU s for each file.
+- The changed test files pass; basedpyright 0/0/0 on the changed Python files; no full suite: the bump (builds showrunner, 2026-11-06 11:24 EST) runs lint and the tests of the changed files only, and the merge gate runs all modules.
