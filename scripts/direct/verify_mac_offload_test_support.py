@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_queue import admission_protocol as wire
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
@@ -822,9 +822,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        cache = self.root / "cache/claude" / cache_file_name()
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        _ = cache.write_text(sys.executable + "\n")
+        seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def write_executable(self, path: Path, source: str) -> None:

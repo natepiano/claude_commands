@@ -7,7 +7,6 @@ import argparse
 import fcntl
 import json
 import os
-import re
 import statistics
 import subprocess
 import sys
@@ -17,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import NamedTuple, Protocol, cast
+from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -28,7 +27,7 @@ sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
-from scripts.production import showrunners, session_staff, staff, unit_config, unit_names
+from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
 from scripts.production.production_doc import Refusal, production_field
 from scripts.shutdown import remote
 
@@ -37,25 +36,18 @@ from scripts.shutdown import remote
 FINDING_SEVERITIES = ("blocker", "minor", "nit")
 
 
-class ProductionSlug(Protocol):
-    @property
-    def doc(self) -> Path: ...
-
-    @property
-    def slug(self) -> str: ...
-
-
 class Production(NamedTuple):
     doc: Path
-    slug: str
+    name: str
     zone: ZoneInfo
 
 
 def read_production(path: Path, *, resolver: session_staff.RowResolver | None = None) -> Production:
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
-    owner = resolver.record.by_doc(remote.local_machine(), path.expanduser().resolve())
-    if owner is None:
-        raise Refusal(f"cannot read production doc: {path}: no staff owner binds the production document")
+    try:
+        owner = unit_lookup.doc_owner(path.expanduser(), resolver.record)
+    except staff.StaffUnreadable as error:
+        raise Refusal(f"cannot read production doc: {error}") from error
     doc = resolver.production_doc(owner)
     if not isinstance(doc, session_staff.ProductionDoc):
         raise Refusal(f"cannot read production doc: {path}: {owner.name}: {doc.reason}")
@@ -67,7 +59,7 @@ def read_production(path: Path, *, resolver: session_staff.RowResolver | None = 
     _ = production_field(lines, "Showrunner checkout")
     if Path(production_field(lines, "Log")).is_absolute():
         raise Refusal("production Log must be relative to Showrunner checkout")
-    return Production(doc.path, showrunners.owner_slug(owner), user_zone())
+    return Production(doc.path, owner.name, user_zone())
 
 
 class ProjectedEta(NamedTuple):
@@ -356,7 +348,7 @@ class OutsidePlan(NamedTuple):
 class ProductionReference(NamedTuple):
     """The production and unit named by a worker plan."""
 
-    production: str
+    name: str
     unit: str
     document: str
 
@@ -377,13 +369,6 @@ class NoteOwnership(NamedTuple):
 
     production: str
     unit: str
-
-
-class ProductionIdentity(NamedTuple):
-    """The current slug and former names of one production."""
-
-    slug: str
-    recorded_names: tuple[str, ...]
 
 
 class NoteWithoutPhaseTableOwnership(NamedTuple):
@@ -1575,24 +1560,8 @@ def _production_reference(plan_path: Path, *, resolver: session_staff.RowResolve
     if not isinstance(doc, session_staff.ProductionDoc):
         print(f"phase_table: {member.row.name}: {doc.reason}", file=sys.stderr)
         return PlanOutsideProduction()
-    parent = resolver.record.parent_of(member.row)
-    if parent is None:
-        return PlanOutsideProduction()
-    slug = showrunners.owner_slug(parent)
-    unit = unit_names.unit_id(member.row.name)
-    try:
-        text = plan_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise NoPlan(f"Unable to read plan {plan_path}") from error
-    # The row selects membership. The artifact keeps its spelling for the same unit.
-    recorded = re.search(r"^> .* — unit `([^`]+)`;", text, re.MULTILINE)
-    if recorded is not None:
-        try:
-            if unit_names.name(recorded.group(1)) == unit_names.name(member.row.name):
-                unit = recorded.group(1)
-        except unit_names.BadName:
-            pass
-    return ProductionReference(slug, unit, str(doc.path))
+    unit = member.row.name
+    return ProductionReference(doc.owner.name, unit, str(doc.path))
 
 
 def _git_output(directory: Path, *arguments: str) -> str:
@@ -1624,8 +1593,7 @@ def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowR
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     name = unit
     for owner in staff.active(resolver.record, "showrunner"):
-        slug = showrunners.owner_slug(owner)
-        if slug != production:
+        if owner.name != production:
             continue
         row = next((item for item in resolver.record.find(kind="unit", parent=owner.id)
                     if unit_names.name(item.name) == unit_names.name(unit)), None)
@@ -1639,15 +1607,15 @@ def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowR
     return cleaned or unit
 
 
-def _note_ownership(path: Path) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
+def _note_ownership(path: Path, record: staff.StaffSnapshot) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return NoteWithoutPhaseTableOwnership()
-    return phase_note_ownership(text)
+    return phase_note_ownership(text, record)
 
 
-def phase_note_ownership(text: str) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
+def phase_note_ownership(text: str, record: staff.StaffSnapshot) -> NoteOwnership | NoteWithoutPhaseTableOwnership:
     """Read the writer's ownership marker and identity from note content."""
     lines = text.splitlines()
     if not lines or lines[0] != "---":
@@ -1664,58 +1632,36 @@ def phase_note_ownership(text: str) -> NoteOwnership | NoteWithoutPhaseTableOwne
     if not closed or fields.get("phase_table") != "true":
         return NoteWithoutPhaseTableOwnership()
     unit = fields.get("unit", "")
-    record = staff.snapshot()
     row = record.by_id(staff.StaffId(unit))
     if row is None or row.kind != "unit" or not isinstance(row.parent, staff.ReportsTo):
         return NoteWithoutPhaseTableOwnership()
     owner = record.by_id(row.parent.id)
     if owner is None:
         return NoteWithoutPhaseTableOwnership()
-    production = showrunners.owner_slug(owner)
-    return NoteOwnership(production=production, unit=row.id)
-
-
-def production_identity(production: ProductionSlug) -> ProductionIdentity:
-    """Keep journal names beside the current row identity."""
-    return ProductionIdentity(production.slug, tuple(
-        old for old, new in showrunners.rename_history().items() if new == production.slug
-    ))
+    return NoteOwnership(production=owner.name, unit=row.id)
 
 
 def _owns_note(
     ownership: NoteOwnership | NoteWithoutPhaseTableOwnership,
-    production: ProductionIdentity,
+    production: str,
     unit: str,
+    record: staff.StaffSnapshot,
 ) -> bool:
     if not isinstance(ownership, NoteOwnership):
         return False
-    record = staff.snapshot()
     row = record.by_id(staff.StaffId(ownership.unit))
     return (row is not None
             and (unit == row.id or unit_names.name(unit) == row.name)
-            and ownership.production in (production.slug, *production.recorded_names))
-
-
-def _production_slug_from_link(link: str) -> str:
-    """Return the production slug named by a note's `production_file` link."""
-    if link.startswith('"'):
-        try:
-            decoded = cast(object, json.loads(link))
-        except json.JSONDecodeError:
-            return ""
-        link = decoded if isinstance(decoded, str) else ""
-    name = link.removeprefix("[[").removesuffix("]]").rsplit("/", 1)[-1]
-    slug = name.removesuffix(".md").removesuffix("-production")
-    return slug if slug and slug != name.removesuffix(".md") else ""
+            and ownership.production == production)
 
 
 def _most_recent_owned_note(
-    vault_root: Path, production: ProductionIdentity, unit: str
+    vault_root: Path, production: str, unit: str, record: staff.StaffSnapshot
 ) -> MostRecentOwnedPhaseNote | NoOwnedPhaseNote:
     matches = [
         path
         for path in vault_root.glob("*/*.md")
-        if _owns_note(_note_ownership(path), production, unit)
+        if _owns_note(_note_ownership(path, record), production, unit, record)
     ]
     if not matches:
         return NoOwnedPhaseNote()
@@ -1776,16 +1722,16 @@ def _phase_note_lock(folder: Path) -> Generator[None]:
         os.close(descriptor)
 
 
-def _write_note(target: Path, content: str, production: ProductionIdentity, unit: str) -> None:
+def _write_note(target: Path, content: str, production: str, unit: str, record: staff.StaffSnapshot) -> None:
     temporary: Path | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         with _phase_note_lock(target.parent):
             target_existed = target.exists()
-            if target_existed and not _owns_note(_note_ownership(target), production, unit):
+            if target_existed and not _owns_note(_note_ownership(target, record), production, unit, record):
                 raise Refusal(
                     "phase note target is not owned by "
-                    + f"{production.slug}/{unit}: {target}"
+                    + f"{production}/{unit}: {target}"
                 )
             if target_existed and target.read_text(encoding="utf-8") == content:
                 return
@@ -1819,10 +1765,10 @@ def _write_note(target: Path, content: str, production: ProductionIdentity, unit
 
 
 def _remove_stale_notes(
-    vault_root: Path, target: Path, production: ProductionIdentity, unit: str
+    vault_root: Path, target: Path, production: str, unit: str, record: staff.StaffSnapshot
 ) -> None:
     for candidate in vault_root.glob("*/*.md"):
-        if candidate == target or not _owns_note(_note_ownership(candidate), production, unit):
+        if candidate == target or not _owns_note(_note_ownership(candidate, record), production, unit, record):
             continue
         try:
             candidate.unlink()
@@ -1841,10 +1787,10 @@ def _vault_root() -> Path:
     ).expanduser()
 
 
-def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:
+def _archive_note(candidate: Path, vault_root: Path, name: str) -> Path:
     """Move one generated phase note into the vault's archive and return its new path."""
     # Outside showrunners, the archive stays out of every scan and in the vault's Git history.
-    folder = vault_root.parent / "archive" / candidate.parent.name / slug
+    folder = vault_root.parent / "archive" / candidate.parent.name / name
     try:
         folder.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -1887,96 +1833,48 @@ def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:
 
 def archive(production_doc: Path) -> list[Path]:
     """Move a production's generated phase notes into the vault's archive."""
-    # The retained document names the archive after the timer stops.
-    document = production_doc.expanduser().resolve()
-    slug = _production_slug_from_link(document.name)
-    if not slug:
-        raise Refusal(f"cannot read production doc: {document}: production doc name must end in -production.md")
-    production = Production(document, slug, user_zone())
-    identity = production_identity(production)
+    resolver = session_staff.RowResolver(staff.snapshot())
+    production = read_production(production_doc, resolver=resolver)
     vault_root = _vault_root()
     if not vault_root.parent.exists():
         return []
     archived: list[Path] = []
     for candidate in sorted(vault_root.glob("*/*.md")):
-        ownership = _note_ownership(candidate)
+        ownership = _note_ownership(candidate, resolver.record)
         if (
             not isinstance(ownership, NoteOwnership)
-            or not _owns_note(ownership, identity, ownership.unit)
+            or not _owns_note(ownership, production.name, ownership.unit, resolver.record)
         ):
             continue
-        archived.append(_archive_note(candidate, vault_root, production.slug))
+        archived.append(_archive_note(candidate, vault_root, production.name))
     return archived
 
 
 def prune(production_doc: Path) -> None:
     """Archive generated notes for units no longer live in a production."""
-    production = read_production(production_doc)
-    identity = production_identity(production)
+    resolver = session_staff.RowResolver(staff.snapshot())
+    production = read_production(production_doc, resolver=resolver)
     live_units = {
-        unit_names.unit_id(unit_plan.unit) for unit_plan in _production_unit_plans(production)
+        unit_plan.unit for unit_plan in _production_unit_plans(production, resolver=resolver)
     }
     vault_root = _vault_root()
     for candidate in vault_root.glob("*/*.md"):
-        ownership = _note_ownership(candidate)
+        ownership = _note_ownership(candidate, resolver.record)
         if (
             not isinstance(ownership, NoteOwnership)
-            or not _owns_note(ownership, identity, ownership.unit)
-            or any(row.id == ownership.unit and unit_names.unit_id(row.name) in live_units
-                   for row in staff.snapshot().find(kind="unit"))
+            or not _owns_note(ownership, production.name, ownership.unit, resolver.record)
+            or any(row.id == ownership.unit and row.name in live_units
+                   for row in resolver.record.find(kind="unit"))
         ):
             continue
-        _ = _archive_note(candidate, vault_root, production.slug)
+        _ = _archive_note(candidate, vault_root, production.name)
 
 
-def owned_notes(production: ProductionIdentity | str, unit: str) -> list[Path]:
-    """List a unit's notes; a legacy slug alone checks only that exact production name."""
-    identity = ProductionIdentity(production, ()) if isinstance(production, str) else production
+def owned_notes(production: str, unit: str) -> list[Path]:
+    """List the generated notes for the staff production name and unit."""
+    record = staff.snapshot()
     return [candidate for candidate in sorted(_vault_root().glob("*/*.md"))
-            if _owns_note(_note_ownership(candidate), identity, unit)]
-
-
-def migrate_notes(vault_root: Path) -> tuple[list[Path], list[Path]]:
-    """Replace legacy note fields with the staff id. Report unresolved notes."""
-    changed: list[Path] = []
-    unresolved: list[Path] = []
-    for path in sorted(vault_root.glob("*/*.md")):
-        with _phase_note_lock(path.parent):
-            before = path.read_text(encoding="utf-8")
-            lines = before.splitlines(keepends=True)
-            if not lines or lines[0].strip() != "---":
-                continue
-            end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), 0)
-            fields = dict(line.strip().split(":", 1) for line in lines[1:end] if ":" in line)
-            fields = {key.strip(): value.strip() for key, value in fields.items()}
-            if fields.get("phase_table") != "true":
-                continue
-            record = staff.snapshot()
-            unit = fields.get("unit", "")
-            row = record.by_id(staff.StaffId(unit))
-            if row is None:
-                production = _production_slug_from_link(fields.get("production_file", "")) or fields.get("production", "")
-                owners = [owner for owner in record.find(kind="showrunner")
-                          if production == owner.name or (
-                              isinstance(timer := showrunners.timer_for(owner, record), showrunners.TimerRegistration)
-                              and timer.slug == production)]
-                matches = [member for owner in owners for member in record.find(kind="unit", parent=owner.id)
-                           if member.name == unit_names.name(unit)]
-                row = matches[0] if len(matches) == 1 else None
-            if row is None or row.kind != "unit":
-                unresolved.append(path)
-                continue
-            header = [line for line in lines[1:end]
-                      if line.partition(":")[0].strip() not in {"unit", "showrunner", "production_file", "production"}]
-            newline = "\r\n" if lines[0].endswith("\r\n") else "\n"
-            after = "".join([lines[0], *header, f"unit: {row.id}{newline}", *lines[end:]])
-            if after != before:
-                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-                    _ = handle.write(after)
-                    os.fchmod(handle.fileno(), path.stat().st_mode & 0o7777)
-                os.replace(handle.name, path)
-                changed.append(path)
-    return changed, unresolved
+            if _owns_note(_note_ownership(candidate, record), production, unit, record)]
 
 
 def refresh(session_dir: Path) -> None:
@@ -1990,29 +1888,28 @@ def refresh(session_dir: Path) -> None:
     if not vault_root.parent.exists():
         return
     production = read_production(_production_document(record.plan, reference), resolver=resolver)
-    identity = production_identity(production)
     owner = resolver.record.by_doc(remote.local_machine(), production.doc)
     from scripts.message import sessions
     try:
         showrunner = next((item["name"] for item in sessions.live_sessions()
                            if owner is not None and item["sessionId"] == owner.current_session), "")
     except OSError as error:
-        raise Refusal(f"cannot look up the showrunner of {production.slug}: {error}") from error
+        raise Refusal(f"cannot look up the showrunner of {production.name}: {error}") from error
     if showrunner:
         if showrunner in {".", ".."} or "/" in showrunner or "\0" in showrunner:
             raise Refusal("showrunner name must be one directory name")
         folder = vault_root / showrunner
     else:
-        previous = _most_recent_owned_note(vault_root, identity, reference.unit)
+        previous = _most_recent_owned_note(vault_root, production.name, reference.unit, resolver.record)
         if isinstance(previous, NoOwnedPhaseNote):
-            raise Refusal(f"the showrunner of {production.slug} is not running")
+            raise Refusal(f"the showrunner of {production.name} is not running")
         folder = previous.path.parent
-    name = _phase_note_name(production.slug, reference.unit, resolver=resolver)
+    name = _phase_note_name(production.name, reference.unit, resolver=resolver)
     target = folder / f"{name}.md"
-    if target.exists() and not _owns_note(_note_ownership(target), identity, reference.unit):
+    if target.exists() and not _owns_note(_note_ownership(target, resolver.record), production.name, reference.unit, resolver.record):
         raise Refusal(
             "phase note target is not owned by "
-            + f"{production.slug}/{reference.unit}: {target}"
+            + f"{production.name}/{reference.unit}: {target}"
         )
     _write_note(
         target,
@@ -2022,10 +1919,11 @@ def refresh(session_dir: Path) -> None:
                  if row.name == unit_names.name(reference.unit)),
             record,
         ),
-        identity,
+        production.name,
         reference.unit,
+        resolver.record,
     )
-    _remove_stale_notes(vault_root, target, identity, reference.unit)
+    _remove_stale_notes(vault_root, target, production.name, reference.unit, resolver.record)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -2049,8 +1947,6 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = prune_parser.add_argument("--production-doc", type=Path, required=True)
     archive_parser = commands.add_parser("archive")
     _ = archive_parser.add_argument("--production-doc", type=Path, required=True)
-    migration = commands.add_parser("migrate-notes")
-    _ = migration.add_argument("--vault-root", type=Path, required=True)
     return parser
 
 
@@ -2066,14 +1962,6 @@ def main() -> int:
     production_doc = production_value if isinstance(production_value, Path) else None
     zone_name = zone_value if isinstance(zone_value, str) else ""
     try:
-        if command == "migrate-notes":
-            vault = cast(Path, args.vault_root)
-            changed, unresolved = migrate_notes(vault.expanduser().resolve())
-            for path in changed:
-                print(f"migrated: {path}")
-            for path in unresolved:
-                print(f"unresolved: {path}", file=sys.stderr)
-            return 1 if unresolved else 0
         if command == "refresh":
             refresh(session_dir.expanduser().resolve())
             return 0

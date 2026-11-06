@@ -11,7 +11,7 @@ for line in "${(@f)$(<$doc)}"; do
     case $doc_status in
       running)
         # One copy of LOG per update tick. A failed copy never changes the check's answer.
-        "${0:A:h:h}/lib/py" "${0:A:h}/log_backup.py" "$doc" >/dev/null || true
+        "${0:A:h:h}/lib/py" "${0:A:h}/log_backup.py" "$1" >/dev/null || true
         exit 0 ;;
       wrapped) exit 2 ;;
       *) exit 1 ;;

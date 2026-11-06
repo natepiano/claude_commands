@@ -41,15 +41,18 @@ class ReviewPauseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notifier = self.root / "notifier"
-        self.instance = notifier / "showrunner-demo"
-        self.instance.mkdir(parents=True)
         doc = self.root / "demo-production.md"
         _ = doc.write_text(
             "> **Status: PRODUCTION — running.** demo\n"
             + f"- **User zone:** {ZONE} — demo\n"
         )
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        owner = fixture_member("showrunner", name="demo", runtime_id=SESSION,
+                               doc=staff.LiveDoc("natedev", doc))
+        self.instance = notifier / f"showrunner-{owner.id}"
+        self.instance.mkdir(parents=True)
         _ = (self.instance / "conf").write_text(
-            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh {doc}\n"
+            f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n"
         )
         _ = (self.instance / "state").write_text("ENABLED=1\nNEXT_DUE=1\n")
         self.enabled = self.instance / "enabled"
@@ -59,12 +62,13 @@ class ReviewPauseTests(unittest.TestCase):
         stub = self.root / "notifier.py"
         _ = stub.write_text(
             "#!/usr/bin/env python3\n"
-            + "import os, pathlib, sys\n"
+            + "import json, os, pathlib, sys\n"
             + "root = pathlib.Path(os.environ['NOTIFIER_STATE_DIR'])\n"
             + "action, name = sys.argv[1:]\n"
             + "enabled = root / name / 'enabled'\n"
             + "state = root / name / 'state'\n"
-            + "record = pathlib.Path(os.environ['SHOWRUNNER_STATE_DIR']) / 'review-paused' / (name.removeprefix('showrunner-') + '.json')\n"
+            + "owner = json.loads(os.environ['TEST_REVIEW_PAUSE_NAMES'])[name]\n"
+            + "record = pathlib.Path(os.environ['SHOWRUNNER_STATE_DIR']) / 'review-paused' / (owner + '.json')\n"
             + "if action == 'status':\n"
             + "    print(f'{name} → session:current every 30 min, ' + ('enabled' if enabled.exists() else 'stopped'))\n"
             + "    print('next_due=1 (1970-01-01 00:00 UTC)')\n"
@@ -90,11 +94,10 @@ class ReviewPauseTests(unittest.TestCase):
             **os.environ, "HOME": str(self.root), "CLAUDE_CODE_SESSION_ID": SESSION,
             "NOTIFIER_STATE_DIR": str(notifier), "SHOWRUNNER_STATE_DIR": str(state),
             "SHOWRUNNER_NOTIFIER": str(stub),
+            "TEST_REVIEW_PAUSE_NAMES": json.dumps({self.instance.name: "demo"}),
         }
 
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        _ = fixture_member("showrunner", name="demo", runtime_id=SESSION,
-                           doc=staff.LiveDoc("natedev", doc))
+        self.environment["STAFF_FILE"] = os.environ["STAFF_FILE"]
 
     def run_script(self, *args: str, session: str = SESSION) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True,
@@ -181,18 +184,20 @@ class ReviewPauseTests(unittest.TestCase):
         self.assertTrue(self.enabled.exists())
 
     def test_later_production_failure_keeps_earlier_pause_and_retries_both(self) -> None:
-        other = self.instance.with_name("showrunner-zeta")
-        other.mkdir()
         doc = self.root / "zeta-production.md"
         _ = doc.write_text((self.root / "demo-production.md").read_text())
-        _ = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc("natedev", doc))
+        other = self.instance.with_name(f"showrunner-{owner.id}")
+        other.mkdir()
+        self.environment["TEST_REVIEW_PAUSE_NAMES"] = json.dumps({self.instance.name: "demo", other.name: "zeta"})
         _ = (other / "conf").write_text(
-            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
         _ = (other / "state").write_text("ENABLED=1\nNEXT_DUE=1\n")
         (other / "enabled").touch()
         other_record = self.record.with_name("zeta.json")
         self.environment["FAIL_STOP_AFTER_FOR"] = other.name
-        failed = self.run_script("pause")
+        self.assertEqual(self.run_script("pause").returncode, 0)
+        failed = self.run_script("pause", session=owner.current_session)
         self.assertEqual(failed.returncode, 1)
         self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done"})
         self.assertEqual(json.loads(other_record.read_text()),
@@ -200,10 +205,12 @@ class ReviewPauseTests(unittest.TestCase):
         self.assertFalse(self.enabled.exists())
         self.assertFalse((other / "enabled").exists())
         _ = self.environment.pop("FAIL_STOP_AFTER_FOR")
-        retried = self.run_script("pause")
+        self.assertEqual(self.run_script("pause").returncode, 0)
+        retried = self.run_script("pause", session=owner.current_session)
         self.assertEqual(retried.returncode, 0, retried.stderr)
         self.assertEqual(json.loads(other_record.read_text()), {"dailies": "done"})
         self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
+        self.assertEqual(self.run_script("resume", "dailies", session=owner.current_session).returncode, 0)
         self.assertTrue(self.enabled.exists())
         self.assertTrue((other / "enabled").exists())
         self.assertFalse(self.record.exists())

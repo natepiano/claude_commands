@@ -1,6 +1,5 @@
 # spacetime
 
-> **Production: natedev** — unit `spacetime-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 

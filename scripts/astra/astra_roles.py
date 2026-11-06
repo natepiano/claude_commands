@@ -10,18 +10,21 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_start
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
+from scripts.herdr import worker_panes
 from scripts.usage import agents_log
 
 AstraRole = Literal["designer", "reviewer"]
-RoleState = Literal["busy", "idle"]
+RoleState = Literal["busy", "idle", "unknown"]
 
 
 class RoleRecord(TypedDict):
@@ -32,6 +35,7 @@ class RoleRecord(TypedDict):
     session_dir: str | None
     worker: str | None
     pid: int | None
+    pid_start: NotRequired[str]
     design_id: NotRequired[str]
     role_id: NotRequired[str]
 
@@ -44,11 +48,20 @@ class MeshWorker:
     worker: str
 
 
-@dataclass(frozen=True)
+class CaptureProcessStart(Enum):
+    CURRENT = "current"
+
+
+@dataclass(frozen=True, init=False)
 class ExecProcess:
-    """A hold that lasts while this local exec process runs."""
+    """A hold belongs to the original process, including its start identity."""
 
     pid: int
+    start: process_start.ProcessStart
+
+    def __init__(self, pid: int, start: process_start.ProcessStart | CaptureProcessStart = CaptureProcessStart.CURRENT) -> None:
+        object.__setattr__(self, "pid", pid)
+        object.__setattr__(self, "start", process_start.process_start(pid) if isinstance(start, CaptureProcessStart) else start)
 
 
 @dataclass(frozen=True)
@@ -143,17 +156,15 @@ def hold(role: AstraRole, staff_id: str = "", *,
                         session_dir=str(session_dir) if session_dir is not None else None, worker=worker, pid=pid)
     if design_id:
         record.update(design_id=design_id, role_id=role_id)
+    if pid is not None:
+        start = process_start.process_start(pid)
+        if not isinstance(start, process_start.Started):
+            raise ValueError("exec process start is unavailable; no hold was saved")
+        record["pid_start"] = start.start
     path = _record_path(member.id)
     held = _parse_record(record, path, membership)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            json.dump(record, output)
-            output.flush()
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    write_text_atomic(path, json.dumps(record))
     return held
 
 
@@ -182,6 +193,8 @@ def _record_text(record: dict[str, object], key: str) -> str:
 def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership: staff.StaffSnapshot) -> HeldRole:
     fields = cast(dict[str, object], record)
     expected = {"staff_id", "held_at", "session_dir", "worker", "pid"}
+    if "pid_start" in fields:
+        expected.add("pid_start")
     if "design_id" in fields:
         expected.update(("design_id", "role_id"))
     if set(fields) != expected:
@@ -192,7 +205,7 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership
         raise ValueError("Astra hold has no worker staff row")
     backend = membership.backends.get(member.id)
     parent = membership.by_id(member.parent.id)
-    if not isinstance(backend, staff.CodexBackend) or parent is None:
+    if not isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend)) or parent is None:
         raise ValueError("Astra hold backend or parent is unavailable")
     role: AstraRole
     task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
@@ -203,7 +216,8 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership
         role = "reviewer" if task.role == "review" else "designer"
     else:
         raise ValueError("worker does not hold an Astra role")
-    thread_id, codex_home, manager = member.current_session, str(backend.codex_home), parent.current_session
+    thread_id, manager = member.current_session, parent.current_session
+    codex_home = str(backend.codex_home) if isinstance(backend, staff.CodexBackend) else ""
     held_at = _record_text(fields, "held_at")
     if path.stem != member.id:
         raise ValueError("staff id differs from file name")
@@ -222,7 +236,9 @@ def _role_lifetime(fields: dict[str, object], role: AstraRole) -> MeshWorker | E
     elif isinstance(session_dir, str) and session_dir.strip() and isinstance(worker, str) and worker.strip() and pid is None:
         lifetime = MeshWorker(session_dir, worker)
     elif session_dir is None and worker is None and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
-        lifetime = ExecProcess(pid)
+        saved_start = fields.get("pid_start")
+        lifetime = ExecProcess(pid, process_start.Started(saved_start) if isinstance(saved_start, str) and saved_start
+                               else process_start.Unreadable("legacy hold has no process start; release it explicitly"))
     else:
         raise ValueError("record needs a mesh worker or an exec pid")
     return lifetime
@@ -248,6 +264,7 @@ def live_roles(membership: staff.StaffSnapshot | None = None) -> list[LiveRole]:
     """Return readable live holds with current state; remove holds known to have ended."""
     membership = membership if membership is not None else staff.local_snapshot()
     roles: list[LiveRole] = []
+    observations: dict[staff.StaffId, list[worker_panes.WorkerPane]] = {}
     try:
         paths = sorted(state_root().glob("*.json"))
     except OSError as error:
@@ -267,10 +284,17 @@ def live_roles(membership: staff.StaffSnapshot | None = None) -> list[LiveRole]:
                     continue
                 if isinstance(instance.lifecycle, design_roles.RoleNotOpened) or instance.lifecycle.staff_id != record["staff_id"]:
                     raise ValueError("durable instance differs from hold")
-                entry = _mesh_worker(design_roles.mesh_directory(lifetime.design_id), instance.name,
-                                     membership=membership)
-                state = _worker_state(entry)
-                record["manager"] = design_roles.worker_parent(design, instance.role, membership).current_session
+                parent = design_roles.worker_parent(design, instance.role, membership)
+                if parent.id not in observations:
+                    observations[parent.id] = worker_panes.observe(parent.id, membership)
+                observed = next(item for item in observations[parent.id] if item.row.id == instance.lifecycle.staff_id)
+                if isinstance(observed, worker_panes.OpenWorker):
+                    state = "idle" if observed.status.value in ("idle", "done") else "busy"
+                elif isinstance(observed, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
+                    state = "idle"
+                else:
+                    state = "unknown"
+                record["manager"] = parent.current_session
             elif isinstance(lifetime, MeshWorker):
                 session_dir = Path(lifetime.session_dir)
                 if not session_dir.exists():
@@ -295,13 +319,19 @@ def live_roles(membership: staff.StaffSnapshot | None = None) -> list[LiveRole]:
                     continue
                 state = _worker_state(entry)
             else:
-                if not _pid_running(lifetime.pid):
+                observed = process_start.process_start(lifetime.pid)
+                if (isinstance(observed, (process_start.Gone, process_start.Zombie))
+                        or isinstance(observed, process_start.Started) and isinstance(lifetime.start, process_start.Started)
+                        and observed.start != lifetime.start.start):
                     path.unlink(missing_ok=True)
                     continue
+                if not isinstance(observed, process_start.Started) or not isinstance(lifetime.start, process_start.Started):
+                    raise ValueError("exec process lifetime is unknown; hold retained")
                 state = "busy"
-            roles.append(LiveRole(staff_id=record["staff_id"], role=record["role"], thread_id=record["thread_id"],
+            live = LiveRole(staff_id=record["staff_id"], role=record["role"], thread_id=record["thread_id"],
                                   codex_home=record["codex_home"], manager=record["manager"],
-                                  held_at=record["held_at"], lifetime=lifetime, state=state))
+                                  held_at=record["held_at"], lifetime=lifetime, state=state)
+            roles.append(live)
         except (OSError, UnicodeError, ValueError) as error:
             message = f"astra_roles: cannot read {path}: {error}"
             print(message.replace("\n", " ").replace("\r", " "), file=sys.stderr)

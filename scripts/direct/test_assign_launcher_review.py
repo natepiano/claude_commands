@@ -9,10 +9,17 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import cast, final
+from collections.abc import Callable
+from typing import cast, final, override
+from unittest.mock import patch
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct import workers
-from scripts.production import session_staff
+from scripts.astra import astra_roles
+from scripts.astra.design_role_test_support import HeldRolePaneCase
+from scripts.direct import assign, workers
+from scripts.production import session_staff, staff, worker
+from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker
 from scripts.direct.assign_launcher_test_support import ROOT, read_object
 from scripts.direct import assign_launcher_test_support as launcher_fixture
 
@@ -20,6 +27,111 @@ setUpModule = mesh_fixture.setUpModule
 
 @final
 class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
+    def test_account_move_reports_a_missing_dispatch_through_the_shared_reader(self) -> None:
+        member = fixture_worker("recovering", staff.StaffId(os.environ["CODEX_THREAD_ID"]),
+                                runtime_id=fixture_runtime_id("recovery-without-dispatch"))
+        self.write_pool_roster({member.name: {"staff_id": member.id, "status": "failed"}})
+        result = self.launch("review", "--operation", "resume-account-move", "--to", member.name)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("resume refused: worker has no recorded dispatch", result.stderr)
+        self.assertEqual(self.turn_starts, 0)
+
+    def managed_astra_review(self) -> subprocess.CompletedProcess[str]:
+        Path(os.environ["NOTIFIER_SESSIONS_DIR"]).mkdir(parents=True, exist_ok=True)
+        with patch.dict(os.environ, {"PROCESS_TABLE_PS": "true"}):
+            return self.launch("review", "--operation", "astra-review", "--new-worker", "astra-reviewer",
+                               "--model", "gpt-6-astra", "--effort", "xhigh",
+                               "--summary", str(self.session_dir / "astra-review.txt"),
+                               "--log", str(self.session_dir / "astra-turn.log"))
+
+    def test_a_managed_astra_review_publishes_and_holds_one_read_only_reviewer(self) -> None:
+        original = self.server.respond
+        held: list[astra_roles.LiveRole] = []
+        published: list[staff.StaffRow] = []
+        before = self.events()
+
+        @self.hang_guard.callback
+        def observe_review(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = original(request)
+            if request.get("method") == "turn/start":
+                held.extend(astra_roles.live_roles())
+                published.extend(row for row in staff.snapshot().find(kind="worker") if row.name == "astra-reviewer")
+                if frames is not None:
+                    params = cast(dict[str, object], request["params"])
+                    frames.insert(-1, {"jsonrpc": "2.0", "method": "item/completed", "params": {
+                        "threadId": params["threadId"], "turnId": "turn-1",
+                        "item": {"id": "review", "type": "agentMessage", "text": "The document passes."},
+                    }})
+            return frames
+
+        self.server.respond = observe_review
+        with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles")}):
+            result = self.managed_astra_review()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(astra_roles.live_roles(), [])
+        member, = published
+        role, = held
+        self.assertEqual((role["role"], role["staff_id"], role["thread_id"]),
+                         ("reviewer", member.id, member.current_session))
+        self.assertEqual(member.parent, staff.ReportsTo(staff.StaffId(os.environ["CODEX_THREAD_ID"])))
+        self.assertEqual(self.events(), before)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.turn_starts, 1)
+        self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"], "read-only")
+        self.assertEqual(cast(dict[str, object], self.methods("turn/start")[0]["params"])["sandboxPolicy"],
+                         {"type": "readOnly", "networkAccess": False})
+        self.assertEqual(self.assignment_records()["astra-reviewer"]["status"], "ended")
+        self.assertEqual((self.session_dir / "astra-review.txt").read_text().strip(), "The document passes.")
+
+    def test_a_failed_managed_astra_turn_ends_its_worker_and_releases_its_role(self) -> None:
+        self.outcomes = ["failed"]
+        with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(self.session_dir / "astra-roles")}):
+            result = self.managed_astra_review()
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(astra_roles.live_roles(), [])
+        self.assertEqual(self.assignment_records()["astra-reviewer"]["status"], "ended")
+        self.assertEqual(self.turn_starts, 1)
+
+    def test_a_managed_astra_role_failure_ends_the_published_worker_before_any_turn(self) -> None:
+        blocked = self.session_dir / "blocked-role-store"
+        _ = blocked.write_text("The role store is unavailable.\n")
+        with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(blocked)}):
+            result = self.managed_astra_review()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("reviewer role unavailable", result.stderr)
+        self.assertEqual(self.turn_starts, 0)
+        self.assertEqual(self.assignment_records()["astra-reviewer"]["status"], "ended")
+
+    def test_a_claude_review_for_a_named_worker_omits_the_follow_option(self) -> None:
+        args = assign.Arguments(role="review", to="project-review", lens="contract", pass_number=2)
+        environment = os.environ.copy()
+        with patch("scripts.direct.assign.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as launched:
+            code = assign.execute_claude(args, self.session_dir, "7", self.project, self.prompt, environment)
+        self.assertEqual(code, 0)
+        launched.assert_called_once_with(
+            ["bash", str(assign.SCRIPTS / "review.sh"), "--phase", "7", str(self.session_dir),
+             str(self.project), str(self.prompt), "review", "review", "review", "2", "contract", ""],
+            env=environment, check=False)
+
+    def test_a_follow_claim_publishes_only_its_launcher_and_worker(self) -> None:
+        self.review_launcher("--new-worker", "project-review", "1")
+        name = next(iter(self.assignment_records()))
+        original = self.server.respond
+        claims: list[dict[str, object]] = []
+
+        @self.hang_guard.callback
+        def read_claim(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                claims.extend(read_object(path) for path in self.session_dir.glob("impl_claim_*.json"))
+            return original(request)
+
+        self.server.respond = read_claim
+        self.review_launcher("--to", name, "2")
+        claim, = claims
+        self.assertEqual(set(claim), {"pid", "worker"})
+        self.assertEqual(claim["worker"], name)
+        self.assertIsInstance(claim["pid"], int)
+
     def watch(self, path: Path) -> codex_mesh.LinuxFileChanges | codex_mesh.KqueueFileChanges:
         if sys.platform.startswith("linux"):
             return codex_mesh.LinuxFileChanges({path})
@@ -266,3 +378,97 @@ class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
         self.assertEqual(turn["model"], "gpt-other-sol")
         self.assertEqual(self.turn_starts, 2)
         self.assertEqual(read_object(identity_path), identity)
+
+
+@final
+class PaneAstraReviewTests(HeldRolePaneCase):
+    """Run the assignment entry point with real worker and transcript paths."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
+        session = self.panes.command_case.fixture.parent.current_session
+        write_text_atomic(Path.home() / ".codex/sessions" / f"{session}.jsonl",
+                          json.dumps({"type": "turn_context", "payload": {"model": "fixture", "effort": "high"}}) + "\n")
+        self.panes.command_case.agent.final = "Verdict: clear."
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run_worker_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) > 1 and Path(command[1]).resolve() == ROOT / "scripts/production/worker.py":
+                result = invoke_cli(worker, lambda: worker.main(command[2:]), command[2:],
+                                    cast(dict[str, str], options["env"]), ROOT)
+                if not options.get("capture_output"):
+                    print(result.stdout + result.stderr, end="")
+                return result
+            return run_process(command, **options)
+
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run_worker_command))
+        _ = self.enterContext(patch.object(assign, "require_live_director"))
+
+    def run_review(self) -> subprocess.CompletedProcess[str]:
+        run = self.panes.root / "astra-run"
+        run.mkdir(exist_ok=True)
+        write_text_atomic(run / "worker_transport", "herdr\n")
+        return invoke_cli(assign, assign.main, ["--role", "review", "--operation", "astra-review",
+            "--new-worker", "astra-reviewer", "--session-dir", str(run), "--cwd", str(self.panes.root),
+            "--prompt", str(self.panes.command_case.prompt), "--summary", str(run / "review.md")],
+            os.environ.copy(), ROOT)
+
+    def assert_review_lifetime(self, failed: bool) -> None:
+        records: list[dict[str, object]] = []
+        rows: list[staff.StaffRow] = []
+        self.panes.command_case.agent.without_done = failed
+
+        def observe() -> None:
+            rows.extend(staff.find(kind="worker"))
+            records.extend(cast(dict[str, object], json.loads(path.read_text()))
+                           for path in (self.panes.root / "holds").glob("*.json"))
+
+        self.panes.command_case.agent.during_prompt = observe
+        if failed:
+            def exit_after_reply(pane: str) -> None:
+                _ = self.panes.world.foreground.pop(pane)
+            self.panes.command_case.agent.after_complete = exit_after_reply
+        holder_state = (self.panes.command_case.run_dir / "progress_history_state.json").read_bytes()
+        result = self.run_review()
+        self.assertEqual(result.returncode, worker.ExitCode.NO_DONE if failed else 0, result.stdout + result.stderr)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(records), 1)
+        row = rows[0]
+        self.assertEqual((row.name, row.parent), (
+            "astra-reviewer", staff.ReportsTo(self.panes.command_case.fixture.parent.id)))
+        self.assertEqual({key: value for key, value in records[0].items() if key not in ("held_at", "pid_start")}, {
+            "staff_id": row.id, "pid": os.getpid(), "session_dir": None, "worker": None})
+        self.assertEqual(len(self.panes.world.launches), 1)
+        self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
+        self.assertFalse(list((self.panes.root / "holds").glob("*.json")))
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertEqual(len(self.panes.world.closed), 1)
+        self.assertEqual((self.panes.command_case.run_dir / "progress_history_state.json").read_bytes(), holder_state)
+        if not failed:
+            reply = (self.panes.root / "astra-run/review.md").read_text().splitlines()
+            self.assertEqual(reply[0], "Verdict: clear.")
+            self.assertTrue(reply[-1].startswith("DONE "))
+            state = read_object(self.panes.root / "astra-run/progress_history_state.json")
+            self.assertEqual(assign.object_map(assign.object_map(state["pass"])[row.name])["status"], "completed")
+        else:
+            self.assertIn("pending input is retained", result.stdout + result.stderr)
+
+    def test_pane_reviewer_writes_the_reply_and_ends_its_row_and_hold(self) -> None:
+        self.assert_review_lifetime(False)
+
+    def test_failed_pane_review_ends_its_row_and_hold(self) -> None:
+        self.assert_review_lifetime(True)
+
+    def test_failed_pane_end_returns_one_and_keeps_the_hold(self) -> None:
+        def lose_process_evidence(pane: str) -> None:
+            self.panes.world.unknown[pane] = "reviewer process is unreadable"
+        self.panes.command_case.agent.after_complete = lose_process_evidence
+        result = self.run_review()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        row, = staff.snapshot().find(kind="worker")
+        record = read_object(self.panes.root / "holds" / (str(row.id) + ".json"))
+        self.assertEqual(record["staff_id"], row.id)
+        self.assertEqual(self.panes.world.closed, [])
+        self.assertEqual(len(self.panes.command_case.agent.submitted), 1)

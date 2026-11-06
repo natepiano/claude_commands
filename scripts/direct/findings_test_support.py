@@ -277,7 +277,7 @@ class FindingsLedgerFixture(unittest.TestCase):
 
     def route_finding(self, finding_id: str, *, reason: str = "spec-gap") -> str:
         return self.run_command(
-            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving-unit",
+            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving",
             "--work-order", "docs/follow-up.md — Phase 6 — Specify retry ownership",
             "--due", "Phase 6 checkpoint", "--evidence", "The Work Order has no owner rule",
         )

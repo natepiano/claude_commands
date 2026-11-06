@@ -829,7 +829,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
             "finding_id", "reason", "owner", "work_order", "due", "evidence", "repair_round",
             "round", "fix_attempts", "astra_approach",
         )}, {
-            "finding_id": "F002", "reason": "spec-gap", "owner": "receiving-unit",
+            "finding_id": "F002", "reason": "spec-gap", "owner": "receiving",
             "work_order": "docs/follow-up.md — Phase 6 — Specify retry ownership",
             "due": "Phase 6 checkpoint", "evidence": "The Work Order has no owner rule",
             "repair_round": 4, "round": 1, "fix_attempts": 0,
