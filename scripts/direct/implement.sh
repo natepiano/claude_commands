@@ -5,6 +5,7 @@
 # The shared board and heartbeat describe each worker during its pass.
 
 set -euo pipefail
+LAUNCHER_COMMAND=(bash "${BASH_SOURCE[0]}" "$@")
 "${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
@@ -233,6 +234,7 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}" \
+    --launcher-command "$("$PY" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${LAUNCHER_COMMAND[@]}")" \
     ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
     echo "ERROR: unable to record the ${PASS_KIND} pass start." >&2
     echo "error" > "${STATUS_FILE}"

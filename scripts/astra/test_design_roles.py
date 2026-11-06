@@ -4,11 +4,12 @@ from __future__ import annotations
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, fixture_unit_location, fixture_session,
-    showrunner_relationship, unit_membership,
+    fixture_worker, showrunner_relationship, unit_membership,
 )
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.test_models_registry import write_registry
+from scripts.direct.test_implement_launcher import configure_pane_account
 
 import argparse
 import ast
@@ -36,6 +37,7 @@ from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import codex_mesh, worker_lifecycle  # noqa: E402
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.astra.design_role_test_support import write_empty_binding_record, write_mesh_server_record
 from scripts.astra.design_roles import launch_thread as launch_native_role
 from scripts.astra.design_roles import release_servers as release_design_servers  # noqa: E402
@@ -145,6 +147,29 @@ class DurableRolesTests(unittest.TestCase):
         self.run_a = self.phase("run-a", "instance-a")
         self.run_b = self.phase("run-b", "instance-b")
 
+    def test_herdr_role_start_keeps_its_creation_claim_when_pane_evidence_is_unknown(self) -> None:
+        _ = (self.run_a / "worker_transport").write_text("herdr\n")
+        notes = self.root / "notes"
+        configure_pane_account(Path.home(), notes)
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        _ = fixture_worker("impl", parent.id)
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr", "AGENT_NOTES_DIR": str(notes)}):
+            with self.assertRaises(design_roles.RoleRefused) as refused:
+                _ = self.open_designer()
+        self.assertIn("/nonexistent/herdr", str(refused.exception))
+        self.assertEqual(self.launches, [])
+        self.assertEqual(self.dispatches, [])
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+        designs = list(design_roles.state_root().glob("*/design.json"))
+        self.assertEqual(len(designs), 1)
+        design = design_roles.read_design(designs[0].parent.name)
+        lifecycle = design.roles[0].lifecycle
+        self.assertIsInstance(lifecycle, design_roles.RoleNotOpened)
+        assert isinstance(lifecycle, design_roles.RoleNotOpened)
+        self.assertEqual(lifecycle.claim, "pane-start")
+
     def test_worker_state_accepts_holder_free_design_and_checks_its_structure(self) -> None:
         design = self.open_designer()
         path = design_roles.design_directory(design.placement.design_id) / "design.json"
@@ -235,6 +260,80 @@ class DurableRolesTests(unittest.TestCase):
         prompt = self.root / "assignment.md"
         _ = prompt.write_text(text)
         return design_roles.resume(design.placement.design_id + "/" + role, prompt)
+
+    def pane_workers(self, design: design_roles.HeldDesign) -> PaneWorld:
+        from scripts.production import worker
+
+        world = PaneWorld()
+        for index, instance in enumerate(design.roles):
+            if isinstance(instance.lifecycle, design_roles.RoleOpen):
+                row = cast(staff.StaffRow, staff.by_id(instance.lifecycle.staff_id))
+                world.add(row, f"w1:p{index}", family="codex")
+        _ = self.enterContext(patch("herdr.Herdr", return_value=world))
+        _ = self.enterContext(patch("herdr.native_process", side_effect=world.native_process))
+        _ = self.enterContext(patch("herdr._startup_processes", side_effect=world.descendants))
+
+        def command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                status = worker.main(arguments)
+            return subprocess.CompletedProcess(arguments, status, output.getvalue(), errors.getvalue())
+
+        _ = self.enterContext(patch.object(design_roles, "_worker_command", side_effect=command))
+        return world
+
+    def test_sibling_mesh_activity_or_claim_blocks_dispatch_and_keeps_the_binding(self) -> None:
+        design = self.open_designer()
+        design = design_roles.open_role("fixture-repo", "design.md", "reviewer", "design",
+                                        binding=self.binding(self.run_a))
+        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
+        entries = cast(dict[str, dict[str, object]], json.loads(roster.read_text()))
+        path = design_roles.design_directory(design.placement.design_id) / "design.json"
+        for transport in ("mesh", "herdr"):
+            _ = (self.run_a / "worker_transport").write_text(transport + "\n")
+            for status, claim in (("running", ""), ("done", "review-in-progress")):
+                with self.subTest(transport=transport, status=status, claim=claim):
+                    entries[self.instance(design, "reviewer").name]["status"] = status
+                    _ = roster.write_text(json.dumps(entries))
+                    fields = cast(dict[str, object], json.loads(path.read_text()))
+                    roles = cast(list[dict[str, object]], fields["roles"])
+                    roles[1]["assignment_claim"] = claim
+                    _ = path.write_text(json.dumps(fields))
+                    before = design_roles.read_design(design.placement.design_id)
+                    with self.assertRaisesRegex(design_roles.RoleRefused, "role is busy"):
+                        _ = self.resume(before, "designer")
+                    self.assertEqual(design_roles.read_design(design.placement.design_id), before)
+                    self.assertEqual(self.dispatches, [])
+
+    def test_busy_sibling_does_not_stop_selected_role_dispatch(self) -> None:
+        design = self.open_designer()
+        design = design_roles.open_role("fixture-repo", "design.md", "reviewer", "design",
+                                        binding=self.binding(self.run_a))
+        world = self.pane_workers(design)
+        world.locations["w1:p1"]["agent_status"] = "working"
+        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
+        _ = roster.write_text("{}")
+        _ = (self.run_a / "worker_transport").write_text("herdr\n")
+        reply = self.resume(design, "designer")
+        self.assertEqual(reply.read_text(), "Saved reply from " + self.launches[0][1])
+        current = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(self.instance(current, "reviewer"), self.instance(design, "reviewer"))
+        self.assertEqual([role for role, _, _ in self.dispatches], ["designer"])
+
+    def test_unknown_sibling_does_not_stop_selected_role_rebind(self) -> None:
+        design = self.open_designer()
+        design = design_roles.open_role("fixture-repo", "design.md", "reviewer", "design",
+                                        binding=self.binding(self.run_a))
+        world = self.pane_workers(design)
+        world.unknown["w1:p1"] = "sibling process evidence is unreadable"
+        roster = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
+        _ = roster.write_text("{}")
+        _ = (self.run_a / "worker_transport").write_text("herdr\n")
+        rebound = design_roles.rebind(design.placement.design_id, expected_generation=1,
+                                      reason="next phase", binding=self.binding(self.run_b))
+        self.assertEqual(design_roles.read_design(design.placement.design_id).binding, self.binding(self.run_b))
+        self.assertEqual(rebound.roles, design.roles)
+        self.assertEqual(world.stops, [])
+        self.assertEqual(world.closed, [])
 
     def test_astra_role_publishes_the_returned_thread_as_its_staff_identity(self) -> None:
         self.check_native_role("demo/design")
