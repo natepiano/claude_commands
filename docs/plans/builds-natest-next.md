@@ -31,7 +31,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Select the next speed target after Phases 24 and 27.** Phase 51 closed with no edit: daily simplify work cut `direct/test_simplify_lens.py` to 15 tests and about 20 s. Phase 54 took `_reuse` and `_identity` of the assign launcher group (floors below). Phase 55 takes `test_assign_launcher.py` after models and herdr reach main. Phase 56 takes `test_verify_ssh_targets_retained.py` and `_retry.py` (2026-11-06).
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
-  - Candidate after Phase 56: `style/test_style_proposals.py`, median 112.7 s wall and 60.8 s CPU (2026-11-06). Confirm owner availability, then measure the current revision before dispatch. Keep the floor rule for modules already improved: `direct/test_verify_mac_only.py` reads 251.2 s against its 212.0 s floor, 18% above and below the 20% rule.
+  - Candidate after Phase 56: `style/test_style_proposals.py`, median 112.7 s wall and 60.8 s CPU (2026-11-06). Confirm owner availability, then measure the current revision before dispatch. Keep the floor rule for modules already improved. Phase 42 moved the `direct/test_verify_mac_only.py` floor to 185.8 s; read its gate median against that floor when Phase 42 is on builds.
   - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), was Phase 31 (floor below). `production/test_fast_track.py`, rank 4 at 216.9 s on 2026-11-05, is Phase 33 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
   - Held: `style/test_style_sync.py`; devtools holds it and `style_sync.py` until its phase is on main, and the showrunner sends the word (2026-11-06).
   - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
@@ -106,6 +106,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: after Phase 24, `eligible` and `reserve` set the floor of `test_verify_ssh_targets_routing.py`: they import `build_hold`, which imports `admission_service` and `memory_admit` at once (`build_hold.py:40-46`). `eligible` runs 24 times (23.4 traced s).
   - Owners (showrunner, 2026-11-05): the lazy `admission_service` import in `build_hold.py` goes to queue-unit with the admission client start, after the `build_hold.py` freeze (measured 9.6 s on this module). A platform column in the `eligible` answer goes to verify-unit as its next item 3.
   - Phase 41 result, 2026-11-05: lazy imports in `build_targets.py` alone gain 1% CPU in `test_verify_mac_only.py`, so they did not land. The gain needs `build_hold`'s chain to leave `eligible` and `reserve`.
+  - Phase 42 result, 2026-11-06: the same method in `mac_idle.py` gains 17.9% CPU in `test_verify_mac_only.py`, because the whole chain leaves four of five commands.
   - Completion condition: natest measures `test_verify_ssh_targets_routing.py` again in same-load pairs when each change is on builds.
   - Revealed by: Phase 24, 2026-11-05.
 
@@ -118,7 +119,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | `production/test_fast_track.py` | 97.9 | production Git, CLI children, blocked-hook deadlines and promotion retries | 33 |
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | Python start-up of `eligible` and `reserve` (`build_hold` -> `admission_service` -> `memory_admit`) | 24 |
 | `style/test_crate_run.py` | Current floor not measured; historical baseline 257.2 | current gate median 88.6 s; Phase 44 measures current copy costs before it states a gain | 40, 44 |
-| `direct/test_verify_mac_only.py` | 212.0 (load 60-75; 156.5 in clean rounds) | `build_targets.py` and `mac_idle.py` process starts; lazy imports in `build_targets.py` alone gain 1% CPU | 39, 41 |
+| `direct/test_verify_mac_only.py` | 185.8 (load 52-70) | `build_targets.py` process starts through the `build_hold` chain; lazy imports in `build_targets.py` alone gain 1% CPU | 39, 41, 42 |
 | `direct/test_verify_lint_cache_versions.py` | 135.9 (clean rounds, no pairs) | `verify.sh lint` route: `step_record.py` 486 starts and 23.1 of 94.0 CPU s | 45 |
 | `direct/test_verify_lint_judgment.py` | 198.6 | production `verify.sh lint` route: 3.1 s per run with no repair, 5.2 s with repair (step-record and admission client Python starts) plus admission start spacing | 31 |
 | `direct/test_assign_launcher_reuse.py` | 57.4 (load 55-70) | one real launcher process for each later dispatch: 2.6-3.2 s, of which 1.80 s is 12 `subprocess.run` calls in the coordinator | 54 |

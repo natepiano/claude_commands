@@ -929,30 +929,21 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 42 — `mac_idle.py` loads only what its command needs  · status: done
 **Depends on:** Phase 41
 
-#### Work Order
+#### As-built
 
-**Goal:** a `verify.sh` run spends less CPU in `mac_idle.py` starts, with the same behavior. Phase 39 measured 82 starts and 25.9 CPU s in `test_verify_mac_only.py`.
-
-**Spec:**
-1. Measure each command of `scripts/buildlog/mac_idle.py`, then make a trial where each command imports only what it uses (`mac_idle.py:25-53`).
-2. Pair the trial before any review. The whole cost is 25.9 of 182.9 CPU s. Land only when the pair median falls by at least 5% CPU; otherwise end at a floor with no repository change (Phase 41 gained 1% with this method).
-3. Behavior does not change. Add no guard, refusal or check (user rule, 2026-11-05).
+- `register`, `remove`, `exclude` and `cleared` import only what they use. The heavy coordination chain loads inside the watch functions, and `watch` still needs it. `unit_labels_for` is a module-level function that loads `unit_labels` and keeps the test patch name.
+- CPU s per start, 15 paired starts of each command: `register` 0.54 to 0.09, `remove` 0.56 to 0.08, `exclude` 0.56 to 0.08, `cleared` 0.56 to 0.08, `watch` 0.56 to 0.54.
+- Same-load pairs of `test_verify_mac_only.py`, 17 tests each: 218.79 s to 185.78 s wall, 183.67 to 150.76 CPU s, 17.9% less.
+- One real `verify.sh test` from each tree, cargo-liner `census-test-support`, routed to the Mac: two `mac_idle.py` starts, 1.004 to 0.152 CPU s; all helpers 4.200 to 3.399 CPU s.
 
 **Files:**
 - `scripts/buildlog/mac_idle.py` — imports for each command
 
-**Workers:** 1 writer on slot `review3` (one script; the file does not split)
-- `review3` — all files above, role impl
+**Binds later work:** `build_targets.py` starts and the `build_hold` chain in `eligible` and `reserve` now set the `test_verify_mac_only.py` floor (Floors in `builds-natest-next.md`).
 
-**Constraints from prior phases:**
-- Phase 41: the same method for `build_targets.py` gained 1% CPU and did not land. Function-local imports pay only when a whole heavy chain leaves the command.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:** A run that the Mac cannot take starts no `mac_idle.py` command. A real measure needs a repository that `linux_only.<name>` in `config/mac_test.conf` knows; a clone of one needs `direnv allow`.
 
-**Acceptance gate:**
-- Measured CPU before and after in the checkpoint notice: `test_verify_mac_only.py` in same-load pairs (`pairs.sh`), and one real `verify.sh` run.
-- Each caller module of `mac_idle.py` green, with the same test names and assertions.
-- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** Plain local imports in place of the `TYPE_CHECKING` branches: they have no measured gain.
 
 ### Phase 43 — `direct/test_verify_token_renew.py` runs in half its time  · status: done
 **Depends on:** none
