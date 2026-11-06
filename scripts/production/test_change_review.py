@@ -410,8 +410,8 @@ class ProducerWriterTests(ProducerFixture):
             self.unit, session_staff.RowResolver(staff.snapshot()))
         assert isinstance(unit, merge_checkpoint.Unit)
         request = merge_checkpoint.MergeRequest(
-            production, unit, "1", merged, (), merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            production, unit, "1", merged, merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with mock.patch.object(change_review, "drift", return_value=[]):
