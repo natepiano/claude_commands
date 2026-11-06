@@ -1607,7 +1607,7 @@ def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> Non
                               capture_output=True, text=True, check=False,
                               timeout=send_budget.user_seconds(review.user_send_seconds()))
         if sent.returncode:
-            raise ValueError(sent.stderr.strip() or sent.stdout.strip() or f"exit {sent.returncode}")
+            raise ValueError(failure_detail(sent))
         print("Nightly result push: " + next(iter(sent.stdout.splitlines()), ""), flush=True)
     except Exception as error:
         print("Nightly result push could not be sent: " + " ".join(str(error).split()), flush=True)

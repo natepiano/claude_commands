@@ -16,15 +16,12 @@ from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 import silence
 import push_texts
-if TYPE_CHECKING:
-    from ..lib.test_hang_guard import TEST_HANG_GUARD_SECS
-else:
-    from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from user_zone import user_zone
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
