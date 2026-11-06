@@ -1337,3 +1337,38 @@ Source: sdlc [fc249e32], [c4e2eefc], [ecddfb26]. review-links.service ran from 1
 - `item49` — the refusal, the deletion and the rule docs. `item51` — their tests.
 
 **State:** none. The phase writes no new lasting record.
+
+### Phase 8h — A change reaches the list only when it is on main and live  · status: todo
+
+Source: the user via builds, natedev and sdlc [c4e2eefc]: "a change cannot be in the change list unless it is ready to check". sdlc [7c534629]: the rule covers every path that adds a row. One code path for `add`, `merge_checkpoint.py:1444` and `merge_gate.py:1475`, no copies. A change that needs a restart or deploy gets its row when that step is done. The design is this unit's.
+
+**Depends on:** 8g
+
+#### Work Order
+
+**Goal:** a row reaches a change list only when its change is on `origin/main` and live, through one code path. Git holds what waits: the `Change-Review:` lines of merged commits. The phase adds no store and no waiting section.
+
+**Spec:**
+1. **One path.** `change_review.py` gets one function, `list_ready`. It reads the merges on the production's merge branch since `LANDED`, as `drift` does. For each merge with visible changes and no row, it adds the rows when the merge is an ancestor of `origin/main`. Rows carry that merge's short hash. A second call adds nothing.
+2. **Callers.** `merge_checkpoint.py` and `merge_gate.py` call `list_ready` once after their promotion step. It replaces `record_publication_changes`' append and its `change-review` receipt, and `merge_gate.record_changes`' append. In `merge_gate.py` the call moves after `promote`. A merge that does not reach main adds no row, and the next call adds it when it does.
+3. **`add`.** `add --merged` keeps 8g's refusal, through the same ancestor function that `list_ready` uses.
+4. **Live steps.** A `Change-Review:` line takes an optional fourth field: `<what> | <how to try> | <what you see> | after <step>`. `list_ready` skips such a line and prints one line naming the merge and the step. Whoever finishes the step runs `change_review.py live --merged <hash> --repo <checkout>`, which adds that merge's held lines. A rerun adds nothing, and a hash not on `origin/main` takes the `add` refusal.
+5. **`drift`.** `list_ready` makes `drift`'s report of a missing row impossible for lines it can add. Remove `drift` and its action if no other purpose remains. Otherwise keep only what remains, and state which.
+6. **Docs.** `commands/unit/checkpoint.md` states the fourth field and when to use it. `commands/change_review.md` and `docs/production_format.md` state the one path and `live`. Correct the as-built docs that state when a row is added.
+
+**Acceptance:**
+- A real-path test on a temporary repository with a bare origin: a merge on the merge branch only adds no row and exits 0; the same merge after it reaches `origin/main` adds its rows once, at the next call.
+- A line with `after restart` adds no row on main, prints its one line, and `live --merged` adds it once.
+- `merge_checkpoint.py` and `merge_gate.py` real-path tests: a failed promotion adds no row; a good one adds them.
+- No path outside `list_ready` and `add` calls `append_rows`.
+
+**Files:**
+- `scripts/production/change_review.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py` — the path and its callers.
+- `scripts/production/test_change_review.py`, `scripts/production/test_merge_checkpoint.py`, `scripts/production/test_merge_checkpoint_promotion.py`, `scripts/production/test_merge_gate.py` — the tests.
+- `commands/unit/checkpoint.md`, `commands/change_review.md`, `docs/production_format.md`, `docs/as-built/showrunner-automation.md` — the docs. Correct any other as-built doc that states when a row is added.
+
+**Workers:** `1 writer + 1 tester`. One concern.
+- `impl` — the source and docs.
+- `test` — the test files.
+
+**State:** none. The phase writes no new lasting record. Rows go in the existing lists.

@@ -171,7 +171,7 @@ class ReviewLauncherFixture(LauncherFixture):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/git_exclude.py", lib / "git_exclude.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
-        for name in ("conf.py", "conf.sh", "session_paths.py"):
+        for name in ("conf.py", "conf.sh", "session_paths.py", "boot_identity.py"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "production/fast_track.py",
                          self.root / "scripts/production/fast_track.py")

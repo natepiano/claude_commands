@@ -1303,6 +1303,8 @@ def _unit_workers(
                 _problem(problems, f"{run.path}: {name}", error)
                 continue
             member = membership.by_id(staff.StaffId(_as_string(record.get("staff_id"))))
+            if member is not None and isinstance(membership.backends.get(member.id), staff.ClaudeBackend):
+                continue
             parent = (membership.by_id(member.parent.id)
                       if member is not None and isinstance(member.parent, staff.ReportsTo) else None)
             if parent is None:

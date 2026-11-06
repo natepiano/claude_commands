@@ -1,13 +1,14 @@
 """The compact queue view and the checks shared with one-step cards."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache, cached_property
-from typing import assert_never
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_evidence
+from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
+    eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, plain, field, wrap
 from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
@@ -142,39 +143,10 @@ def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUna
     return [check_line(checks.room.passes, queue_evidence.room_check_text(checks.room))]
 
 
-def eligible_head_position(waiting: Sequence[gate.WaitingStep]) -> int:
-    """Position of the first row eligible for the head rule; requires an eligible row."""
-    return next(place for place, step in enumerate(waiting, 1)
-                if not isinstance(step.reason, gate.TokenWaitingWaiter))
 
 
-def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
-    match reason:
-        case gate.TokenWaitingWaiter():
-            return "waiting for the cargo token"
-        case gate.EstimateExpired():
-            return "estimate expired"
-        case gate.ReadingUnavailable():
-            return reason.reason
-        case gate.MemoryPressure():
-            return "memory pressure"
-        case gate.PressureUnavailable():
-            return reason.reason
-        case gate.StartSpacingWait():
-            return "start spacing"
-        case gate.NeedsMemory():
-            return "free memory"
-        case gate.BehindHead():
-            place = next((place for place, step in enumerate(waiting, 1)
-                          if step.session_id == reason.head_session_id and step.since == reason.joined_at), 0)
-            return f"behind #{place}" if place else "behind the first step"
-        case gate.ReadyForAdmission():
-            return "starts at the next check"
-        case gate.HeadAdmissionStatus():
-            return (f"#{eligible_head_position(waiting)}'s turn" if isinstance(reason.cause, gate.ReadyForAdmission)
-                    else reason_phrase(reason.cause, waiting))
-        case _:
-            assert_never(reason)
+
+
 
 
 def bar_eighths(gib: float, cap: float) -> int:
@@ -186,11 +158,6 @@ def size_bar(gib: float, cap: float) -> str:
     eighths = bar_eighths(gib, cap)
     whole, fraction = divmod(eighths, 8)
     return "█" * whole + ("▏▎▍▌▋▊▉"[fraction - 1] if fraction else "")
-
-
-def countdown(until: float, now: float) -> str:
-    minutes, seconds = divmod(max(0, int(until - now)), 60)
-    return f"{minutes}:{seconds:02d}"
 
 
 def head_status(model: QueueModel) -> Line:
@@ -224,13 +191,14 @@ def cap_bar(room: gate.MemoryRoom | gate.ReadingUnavailable, width: int, *, colo
     cells = max(1, min(width, (total + gate.GIB - 1) // gate.GIB))
     scale = total / cells
     cap_at = min(cells - 1, max(0, int(room.cap / scale)))
-    kept_end = min(room.cap, room.used + room.kept)
+    used = room.cap_use
+    kept_end = min(room.cap, used + room.kept)
     result: list[Span] = []
     for cell in range(cells):
         point = (cell + 0.5) * scale
         if cell == cap_at:
             result.append(Span("│", "error"))
-        elif point < min(room.used, room.cap):
+        elif point < min(used, room.cap):
             result.append(Span("█", "suggestion"))
         elif point < kept_end:
             result.append(Span("░", "warning"))
@@ -253,15 +221,17 @@ class RunningBuild:
     swap_bytes: int = 0
 
 
+def anonymous_measurement(use: gate.AnonymousRunUse | gate.RunUseUnavailable) -> tuple[int, bool]:
+    """Show the captured amount and whether its reading is available."""
+    return (use.bytes, True) if isinstance(use, gate.AnonymousRunUse) else (0, False)
+
+
 def running_builds(model: QueueModel) -> list[RunningBuild]:
     """Combine captured keep-asides and scope evidence for each run."""
     explanation = model.reading.explanation
     captured = explanation.room
-    holds = {hold.owner: hold for hold in captured.runs} if isinstance(captured, gate.MemoryRoom) else {}
-    active = (entry.step for entry in explanation.running if gate.running_has_reservation(entry.step))
-    owners_by_step = {id(step): gate.reservation_run_owner(reservation, step)
-                      for reservation, step in zip(explanation.reservations, active, strict=True)}
-    rows: dict[tuple[int, str] | int, RunningBuild] = {}
+    holds = {hold.memory.owner: hold for hold in captured.runs} if isinstance(captured, gate.MemoryRoom) else {}
+    rows: dict[str, RunningBuild] = {}
     for index, running in enumerate(model.reading.explanation.running):
         step = running.step
         memory = step.measured
@@ -270,7 +240,7 @@ def running_builds(model: QueueModel) -> list[RunningBuild]:
         if isinstance(memory, gate.UnownedSliceMemory) and (not isinstance(memory.job_state, NotServiceSlice) or not (
                 isinstance(memory.activity, ScopeProcesses) and isinstance(memory.activity.run, LiveBuildRun))):
             continue
-        key = (step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else index
+        key = gate.run_owner(step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else str(index)
         started = step.run.started_at if isinstance(step.run, LiveBuildRun) else step.started_at
         if not started and isinstance(running.admitted_at, float):
             started = running.admitted_at
@@ -280,10 +250,9 @@ def running_builds(model: QueueModel) -> list[RunningBuild]:
                 memory.bytes if isinstance(memory, gate.UnownedSliceMemory) else 0)
         measured = (isinstance(memory, gate.MeasuredMemory) and isinstance(memory.anonymous, gate.AnonymousRunUse)
                     or isinstance(memory, gate.UnownedSliceMemory))
-        hold = holds.get(owners_by_step.get(id(step), ""))
+        hold = holds.get(running.owner)
         if hold is not None and not isinstance(step.run, LiveBuildRun):
-            used = hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else 0
-            measured = isinstance(hold.use, gate.AnonymousRunUse)
+            used, measured = anonymous_measurement(hold.memory.use)
         kept = hold.bytes if hold is not None and not isinstance(step.run, LiveBuildRun) else 0
         if previous is None:
             rows[key] = RunningBuild(step, used, kept, started, measured,
@@ -297,23 +266,20 @@ def running_builds(model: QueueModel) -> list[RunningBuild]:
         for key, row in rows.items():
             if not isinstance(row.step.run, LiveBuildRun):
                 continue
-            hold = holds.get(f"{row.step.run.pid}-{row.step.run.start_time}")
+            hold = holds.get(gate.run_owner(row.step.run.pid, row.step.run.start_time))
             if hold is not None:
-                rows[key] = RunningBuild(row.step,
-                    hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else 0,
-                    hold.bytes, row.started_at, isinstance(hold.use, gate.AnonymousRunUse), row.swap_bytes)
-        owners = {f"{row.step.run.pid}-{row.step.run.start_time}" for row in rows.values()
+                used, measured = anonymous_measurement(hold.memory.use)
+                rows[key] = RunningBuild(row.step, used, hold.bytes, row.started_at, measured, row.swap_bytes)
+        owners = {gate.run_owner(row.step.run.pid, row.step.run.start_time) for row in rows.values()
                   if isinstance(row.step.run, LiveBuildRun)}
-        owners.update(owners_by_step.values())
+        owners.update(entry.owner for entry in explanation.running)
         for hold in captured.runs:
-            pid, separator, start = hold.owner.partition("-")
-            if hold.owner in owners or not separator or not pid.isdecimal():
+            run = hold.memory.run
+            if hold.memory.owner in owners or not isinstance(run, LiveBuildRun):
                 continue
-            run = LiveBuildRun(int(pid), start, 0.0)
-            used = hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else 0
+            used, measured = anonymous_measurement(hold.memory.use)
             step = gate.RunningStep("", "", "between steps", "", 0, gate.MeasuredMemory(used), pid=run.pid, run=run)
-            rows[(run.pid, run.start_time)] = RunningBuild(step, used, hold.bytes, 0.0,
-                                                         isinstance(hold.use, gate.AnonymousRunUse))
+            rows[gate.run_owner(run.pid, run.start_time)] = RunningBuild(step, used, hold.bytes, 0.0, measured)
     return list(rows.values())
 
 
@@ -355,7 +321,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
 
     def names(step: gate.WaitingStep | gate.RunningStep) -> tuple[str, str, bool]:
         identity = step_labels(step, model.labels)
-        show = field(identity.showrunner) or "—"
+        show = field(step.session_name if not step.session_id and step.unit else identity.showrunner) or "—"
         unit = field(identity.unit).removeprefix(show + "-")
         unit = unit or "—"
         return show, unit, bool(bumped_unit and identity.unit == bumped_unit)
@@ -376,8 +342,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     step_width = max(7, min(13, max(
         max((terminal_width(row.step.step) for row in running), default=7),
         max((terminal_width(step.step) for step in waiting), default=7))))
-    pids = [queue_evidence.pid_text(queue_evidence.step_pid(step)) for step in waiting]
-    running_pids = [queue_evidence.pid_text(queue_evidence.step_pid(row.step)) for row in running]
+    pids = [queue_evidence.step_pid_text(step) for step in waiting]
+    running_pids = [queue_evidence.step_pid_text(row.step) for row in running]
     pid_width = max((len(text) for text in [*pids, *running_pids]), default=5)
     # Reserve the text widths before the pid takes cells from the bars.
     fixed = place_width + step_width + minutes_width + 5
@@ -455,7 +421,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
 
     lines.extend(wrap((Span(queue_evidence.room_text(explanation.room), "inactive"),), columns))
     lines.append(heading())
-    for row, pair, text in zip(running, running_names, running_text):
+    for index, (row, pair, text) in enumerate(zip(running, running_names, running_text)):
         used = row.used / gate.GIB
         held_end = used + row.kept / gate.GIB
         bar = running_bar(min(used, bar_width), min(held_end, bar_width), cap)
@@ -463,7 +429,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         append_row((*identity_columns("run", row.step.step, pair, minutes,
                                         "▸" if (you and row.step.session_id == you
                                                 or selector and running_matches_selector(row.step, selector, model.labels)) else " "),
-                      Span(column(queue_evidence.pid_text(queue_evidence.step_pid(row.step)), pid_width), "inactive"),
+                      Span(column(running_pids[index], pid_width), "inactive"),
                       *bar, Span(text)))
     for index, (step, pair, bar, suffix) in enumerate(zip(waiting, waiting_names, bars, waiting_status)):
         row = (*identity_columns(str(index + 1), step.step, pair, str(age(step.since, explanation.now)),
@@ -505,7 +471,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             identity = model.labels.get(activity.session_id)
             owner = field(identity.session if identity else "") or field(activity.session_name) or "unlabelled session"
             elapsed = leftover_age(age(activity.started_at, explanation.now)) if activity.started_at else "—"
-            lines.append((Span(f"   {queue_evidence.pid_text(queue_evidence.step_pid(step))} · {owner} · {field(activity.program)} · {elapsed} · {memory.bytes / gate.GIB:.1f} GiB"
+            lines.append((Span(f"   {queue_evidence.step_pid_text(step)} · {owner} · {field(activity.program)} · {elapsed} · {memory.bytes / gate.GIB:.1f} GiB"
                               + (f"; {memory.swap_bytes / gate.GIB:.1f} GiB swapped" if memory.swap_bytes else "")),))
             for member in activity.members[1:]:
                 lines.append((Span(f"   pid {member.pid} · {field(member.program)} · {owner}"),))

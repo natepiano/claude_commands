@@ -17,20 +17,14 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 
 from scripts.build_hold import build_hold
 from scripts.build_hold.hold_applies import BUILDING_CARGO_VERBS, cargo_verb
 
-if TYPE_CHECKING:
-    from ..direct import step_record
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-    from scripts.direct import step_record
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
-
+from scripts.direct import step_record
 from scripts.buildlog import store
+from scripts.lib.boot_identity import boot_identity
 
 
 @dataclass(frozen=True)
@@ -290,8 +284,8 @@ def record_build(
 ) -> None:
     """Audit and enforcement use the same permanent log and append writer."""
     try:
-        boot = (proc_root / "sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
+        boot = boot_identity(proc_root)
+    except (OSError, ValueError):
         boot = ""
     identity = build.process.identity
     hold_id = hashlib.sha256(json.dumps([holder.key, holder.since.isoformat()]).encode()).hexdigest()

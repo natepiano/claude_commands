@@ -28,7 +28,6 @@ from scripts.notify import reply_asks
 from scripts.notify import push_texts
 from scripts.notify import push_reference
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
 from scripts.lib import nix_env
 
@@ -762,7 +761,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         loaded = nix_env.ensure(Path.cwd(), environment)
         if isinstance(loaded, nix_env.Refused):
             return Unreviewed(loaded.reason, details())
-        environment = loaded.env
+        from scripts.lib.models_registry import agent_environment
+
+        environment = agent_environment(loaded.env)
         result = runner(command, timeout=remaining(), env=environment)
         if result.returncode != 0:
             return Unreviewed(f"reviewer exit {result.returncode}", details())
