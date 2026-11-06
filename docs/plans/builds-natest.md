@@ -1060,35 +1060,22 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 48 — The queue's sentences say `full test`, and one file lists the suite runners  · status: done
 **Depends on:** Phase 36
 
-#### Work Order
+#### As-built
 
-**Goal:** every queue sentence shows the step name that the user reads, and one file holds the suite-runner names. Phase 36 left both, under the landing rule.
-
-**Spec:**
-1. `queue_evidence.running_text` (`queue_evidence.py:299`) and `queue_evidence.release_text` (`queue_evidence.py:224`) print the raw step id, so a card can say `full-test`. Print `names.prose(step)` with a required `names: StepNames` keyword, as `need_text` does. `queue_card.py` passes `model.names`.
-2. `hold_enforcer.py`, `scope_activity.py` and `pre-tool-use-build-hold-guard.py` each define `SUITE_RUNNERS` and `SUITE_MODULES`. Add `scripts/lib/suite_runners.py` with these two sets and one `starts_suite_runner(target)`, standard library only. `scope_activity.py` keeps its own scan of every argument and uses the two sets.
-3. If the admission service imports the new file, add it to `admission_code.ADMISSION_CODE_PATHS`.
-4. `build_hold.py:493` stays on hold until the showrunner sends natedev messaging's main hash. When the hash comes, that line uses `SUITE_RUNNERS` in this phase or in a small follow-up.
-5. Add no guard, refusal or check (user rule, 2026-11-05).
+- The running, release, bump and Cargo token sentences on `/build:queue` print `names.prose(step)`. `queue_evidence.running_text`, `queue_evidence.release_text` and the `head_facts` line builders take a required `names: StepNames` keyword, so every caller shows at type check.
+- `scripts/lib/suite_runners.py` holds `SUITE_RUNNERS`, `SUITE_MODULES` and `starts_suite_runner(target)`, standard library only. `hold_enforcer.py`, `scope_activity.py` and `pre-tool-use-build-hold-guard.py` use it. `scope_activity.py` keeps its own scan of every argument. `admission_code.ADMISSION_CODE_PATHS` lists the file.
 
 **Files:**
-- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/test_admission_protocol.py`, `scripts/lint/test_memory_admit.py` — item 1 (owner: queue unit)
-- `scripts/lib/suite_runners.py` — new file
-- `scripts/build_hold/hold_enforcer.py`, `scripts/build_queue/scope_activity.py`, `scripts/build_queue/admission_code.py`, `scripts/hooks/pre-tool-use-build-hold-guard.py` — item 2
-- `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — item 4, only after the hold ends
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/head_facts.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/queue_fixture.py` — sentences take names
+- `scripts/lib/suite_runners.py` — the one list of suite runners
+- `scripts/build_hold/hold_enforcer.py`, `scripts/build_queue/scope_activity.py`, `scripts/hooks/pre-tool-use-build-hold-guard.py`, `scripts/build_queue/admission_code.py` — use the list
+- `scripts/build_queue/test_queue_evidence.py`, `test_queue_card.py`, `test_head_facts.py`, `test_build_queue.py`, `test_admission_protocol.py`, `scripts/lint/test_memory_admit.py` (owner resources) — tests
 
-**Workers:** 1 writer on slot `impl` (few lines; slot `test` holds Phase 37)
-- `impl` — all files above
+**Binds later work:** `build_hold.py:493` uses `SUITE_RUNNERS` in a small follow-up when natedev messaging's hold ends. On the tip after queue lands, `memory_cap_text` has no article and no step set, and `config/build_steps.conf` has no `names.full-test`.
 
-**Constraints from prior phases:**
-- Phase 36: `StepNames` reads config once per queue model, and renderers read no file.
-- The hook starts on every Bash call, so `scripts/lib/suite_runners.py` imports only the standard library.
+**Gotchas:** The hook starts on every Bash call, so `suite_runners.py` imports only the standard library.
 
-**Acceptance gate:**
-- A test with a running `full-test` step and a running `merge-gate` step: `running_text` and `release_text` print `full test` and `merge gate`, and never the raw step id.
-- `python3 -m unittest discover -s scripts/build_queue -p 'test_*.py'` green, with `scripts/hooks/test_build_hold_guard.py` and the `scripts/build_hold` modules
-- `git grep -n 'SUITE_RUNNERS = '` finds one line
-- the full test green on the phase commit merged with `origin/builds`
+**Ruled out:** Moving the hook's import saves 0.25 ms next to 20 ms of start. The admission client wait notice keeps the raw step, because no user reads it.
 
 ### Phase 49 — Every shell script starts Python through `scripts/lib/py`  · status: todo
 **Depends on:** Phase 36
