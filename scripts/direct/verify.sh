@@ -590,6 +590,12 @@ run_step() {
             rm -f "$step_log"
             return "$status"
         fi
+        if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" && "${LINT_MEND_WAIT:-0}" == 1 ]]; then
+            HOLD_LINT=1
+            : > "$HOLD_WAIT_DIR/lint-held"
+            rm -f "$step_log"
+            return "$status"
+        fi
         if buildlog_step_compiles "$@" && { { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" && "$CMD" != test ]] && step_can_retry; } || step_stopped_by_hold; }; then
             if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 STEP_FORCE_MAC=1
@@ -3354,6 +3360,9 @@ eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/b
 buildlog_wait_for_memory() {
     local status=0 cleanup_status=0 renewal
     local leave_hook="${LINT_QUEUE_LEAVE_HOOK:-${BUILDLOG_MAC_IDLE_HOOK:-}}"
+    if [[ "${LINT_MEND_WAIT:-0}" == 1 ]]; then
+        leave_hook="$(STEP_WRITES_TREE=0 ssh_retry_hook)"
+    fi
     BUILDLOG_MEM_WAIT_S=0
     step_state waiting_hold
     sync_token_state
@@ -3569,6 +3578,223 @@ trap 'verify_interrupted 2' INT
 trap 'verify_interrupted 15' TERM
 trap 'verify_interrupted 1' HUP
 
+run_lint_judgment() {
+    if lint_config_enabled clippy; then
+        [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
+        start_tree_watch
+        # Store diagnostics in the watch directory for cancellation cleanup.
+        # Keep admission and the step record in run().
+        CLIPPY_LOG="$(mktemp "${TREE_WATCH_DIR:-${TMPDIR:-/tmp}}/clippy.XXXXXX")"
+        clippy_status=0
+        # Use the existing tee to record diagnostics.
+        # Keep wait and cancellation messages visible.
+        if invoke_clippy --workspace --all-targets --all-features --keep-going; then
+            :
+        else
+            clippy_status=$?
+        fi
+        clippy_repair=0
+        if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
+        if first_judgment_permits_repair "$clippy_status" "$CLIPPY_LOG"; then
+            clippy_repair=1
+        fi
+        rm -f "$CLIPPY_LOG"
+        unset CLIPPY_LOG
+        finish_tree_watch
+        if (( clippy_repair )); then
+            # Read at use so a changed policy applies to this repair round.
+            clippy_fix_limit="$(_lint_config_raw clippy_fix_pass_limit)"
+            if [[ ! "$clippy_fix_limit" =~ ^[1-9][0-9]{0,3}$ ]]; then
+                [[ -z "$clippy_fix_limit" ]] || echo "verify.sh: invalid clippy_fix_pass_limit=$clippy_fix_limit; using 3." >&2
+                clippy_fix_limit=3
+            fi
+            clippy_tree_before="$(tree_key --tree-content)"
+            for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=clippy_fix_limit; clippy_fix_pass++)); do
+                invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
+                fmt_cargo "${FMT_SCOPE[@]}"
+                clippy_tree_after="$(tree_key --tree-content)"
+                if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
+                    break
+                fi
+                # An empty key cannot prove that the tree stopped changing.
+                if (( clippy_fix_pass == clippy_fix_limit )); then
+                    CLIPPY_FIX_LIMIT_REACHED=1
+                fi
+                clippy_tree_before="$clippy_tree_after"
+            done
+            start_tree_watch
+            clippy_status=0
+            invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
+            finish_tree_watch
+        fi
+        (( clippy_status == 0 )) || exit "$clippy_status"
+        [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
+    else
+        invoke_clippy --workspace --all-targets --all-features
+    fi
+}
+
+run_lint_held_sequence() {
+    # Format locally; the Mac judges the resulting tree without fixes.
+    fmt_cargo --all
+    load_metadata
+    workspace_taplo
+    lint_status=0
+    if lint_config_enabled mend; then
+        STEP_FORCE_MAC=${1:-0} invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}" || lint_status=1
+    fi
+    if lint_config_enabled clippy; then
+        start_tree_watch
+        STEP_FORCE_MAC=${1:-0} invoke_clippy --workspace --all-targets --all-features || lint_status=1
+        finish_tree_watch
+    fi
+    return 0
+}
+
+run_lint_sequence() {
+    if [[ "$HOLD_LINT" == 1 ]]; then
+        run_lint_held_sequence
+        exit "$lint_status"
+    fi
+    if (( CHECK_LINT )); then
+        # Judge all three tools even when an earlier one reports findings.
+        # Report mode never enters the rewrite paths of the package gate.
+        lint_status=0
+        if lint_config_enabled mend; then
+            echo 'style-lint: mend start'
+            if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
+                echo 'style-lint: mend passed'
+            else
+                lint_status=1
+            fi
+        else
+            lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
+        fi
+        if lint_config_enabled fmt; then
+            echo 'style-lint: rustfmt start'
+            if fmt_cargo --all --check; then
+                echo 'style-lint: rustfmt passed'
+            else
+                lint_status=1
+            fi
+        else
+            lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
+        fi
+        load_metadata
+        if ! workspace_taplo --check; then
+            lint_status=1
+        fi
+        if lint_config_enabled clippy; then
+            echo 'style-lint: clippy start'
+            start_tree_watch
+            if invoke_clippy --workspace --all-targets --all-features; then
+                echo 'style-lint: clippy passed'
+            else
+                lint_status=1
+            fi
+            finish_tree_watch
+        else
+            lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
+        fi
+        exit "$lint_status"
+    fi
+    # Cargo stages are gated by lint.conf; the Taplo check always runs.
+    # mend passes --all-targets because it needs the test and example
+    # targets to see every import and visibility site. It covers the
+    # workspace like the other stages, so
+    # --fix can also rewrite a member the phase did not edit, when this
+    # phase's change left an item there unused or over-visible.
+    if lint_config_enabled mend; then
+        [[ "$PKG" != --workspace ]] || echo 'style-lint: mend start'
+        MEND_LOG="$(mktemp)"
+        # run_step() records diagnostics through its tee.
+        # Keep this call in the parent so cleanup can stop the step.
+        local LINT_MEND_WAIT=1
+        while true; do
+            if invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then
+                break
+            else
+                mend_status=$?
+            fi
+            LINT_MEND_WAIT=0
+            if (( mend_status == LINT_LEFT_QUEUE_STATUS )); then
+                run_lint_held_sequence 1
+                if (( lint_status == 0 )); then
+                    rm -f "$MEND_LOG"
+                    exit 0
+                fi
+                HOLD_LINT=0
+                rm -f "$HOLD_WAIT_DIR/lint-held"
+                continue
+            fi
+            if (( mend_status == 137 || mend_status == 125 )); then
+                rm -f "$MEND_LOG"
+                exit "$mend_status"
+            fi
+            if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
+                echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
+            else
+                echo "verify.sh: cargo mend --fix failed; see the output above" >&2
+            fi
+            rm -f "$MEND_LOG"
+            exit 1
+        done
+        LINT_MEND_WAIT=0
+        rm -f "$MEND_LOG"
+        MEND_LOG=""
+        [[ "$PKG" != --workspace ]] || echo 'style-lint: mend passed'
+    else
+        lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
+    fi
+    # fmt compiles nothing, so it stays on the phase's own work: this
+    # package and every member that differs from HEAD once mend has run.
+    # Covering them all is what lets one lint record answer for each
+    # package (tree_key).
+    if [[ "$PKG" == --workspace ]]; then
+        FMT_SCOPE=(--all)
+    else
+        FMT_SCOPE=(-p "$PKG")
+        FMT_MEMBERS="$(read_metadata \
+        | VERIFY_PY_HELPER=CHANGED_MEMBERS_PY "$PY" -c "$CHANGED_MEMBERS_PY")"
+        while IFS= read -r member; do
+            if [[ -n "$member" && "$member" != "$PKG" ]]; then
+                FMT_SCOPE+=(-p "$member")
+            fi
+        done <<< "$FMT_MEMBERS"
+    fi
+    if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
+        echo 'style-lint: rustfmt start'
+    fi
+    fmt_cargo "${FMT_SCOPE[@]}"
+    if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
+        echo 'style-lint: rustfmt passed'
+    fi
+    # Record the tree Taplo reads; clippy fix and fmt update the key below.
+    if [[ -n "${RUN_LOG}" ]]; then
+        set_verdict_keys
+    fi
+    # Cargo's workspace root can differ from the caller's directory.
+    # Run there so Taplo uses the same config and scope as the push gate.
+    load_metadata
+    TAPLO_ARGS=(--check)
+    if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(); fi
+    if workspace_taplo ${TAPLO_ARGS[@]+"${TAPLO_ARGS[@]}"}; then
+        :
+    else
+        taplo_status=$?
+        if (( taplo_status == 101 )); then
+            if [[ "$(uname)" == Darwin ]]; then
+                echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
+                exit 3
+            fi
+            echo "verify.sh: taplo panicked; this is a tooling failure." >&2
+            exit 2
+        fi
+        exit "$taplo_status"
+    fi
+    run_lint_judgment
+}
+
 case "$CMD" in
     check)
         PKG="${1:?verify.sh check <package>}"
@@ -3619,196 +3845,7 @@ case "$CMD" in
             require_member "$PKG"
         fi
         require_taplo
-        if [[ "$HOLD_LINT" == 1 ]]; then
-            # Format locally; the Mac judges the resulting tree without fixes.
-            fmt_cargo --all
-            load_metadata
-            workspace_taplo
-            lint_status=0
-            if lint_config_enabled mend; then
-                invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}" || lint_status=1
-            fi
-            if lint_config_enabled clippy; then
-                start_tree_watch
-                invoke_clippy --workspace --all-targets --all-features || lint_status=1
-                finish_tree_watch
-            fi
-            exit "$lint_status"
-        fi
-        if (( CHECK_LINT )); then
-            # Judge all three tools even when an earlier one reports findings.
-            # Report mode never enters the rewrite paths of the package gate.
-            lint_status=0
-            if lint_config_enabled mend; then
-                echo 'style-lint: mend start'
-                if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
-                    echo 'style-lint: mend passed'
-                else
-                    lint_status=1
-                fi
-            else
-                lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
-            fi
-            if lint_config_enabled fmt; then
-                echo 'style-lint: rustfmt start'
-                if fmt_cargo --all --check; then
-                    echo 'style-lint: rustfmt passed'
-                else
-                    lint_status=1
-                fi
-            else
-                lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
-            fi
-            load_metadata
-            if ! workspace_taplo --check; then
-                lint_status=1
-            fi
-            if lint_config_enabled clippy; then
-                echo 'style-lint: clippy start'
-                start_tree_watch
-                if invoke_clippy --workspace --all-targets --all-features; then
-                    echo 'style-lint: clippy passed'
-                else
-                    lint_status=1
-                fi
-                finish_tree_watch
-            else
-                lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
-            fi
-            exit "$lint_status"
-        fi
-        # Cargo stages are gated by lint.conf; the Taplo check always runs.
-        # mend passes --all-targets because it needs the test and example
-        # targets to see every import and visibility site. It covers the
-        # workspace like the other stages, so
-        # --fix can also rewrite a member the phase did not edit, when this
-        # phase's change left an item there unused or over-visible.
-        if lint_config_enabled mend; then
-            [[ "$PKG" != --workspace ]] || echo 'style-lint: mend start'
-            MEND_LOG="$(mktemp)"
-            # run_step() records diagnostics through its tee.
-            # Keep this call in the parent so cleanup can stop the step.
-            if invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then
-                :
-            else
-                mend_status=$?
-                if (( mend_status == 137 || mend_status == 125 )); then
-                    rm -f "$MEND_LOG"
-                    exit "$mend_status"
-                fi
-                if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
-                    echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
-                else
-                    echo "verify.sh: cargo mend --fix failed; see the output above" >&2
-                fi
-                rm -f "$MEND_LOG"
-                exit 1
-            fi
-            rm -f "$MEND_LOG"
-            MEND_LOG=""
-            [[ "$PKG" != --workspace ]] || echo 'style-lint: mend passed'
-        else
-            lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
-        fi
-        # fmt compiles nothing, so it stays on the phase's own work: this
-        # package and every member that differs from HEAD once mend has run.
-        # Covering them all is what lets one lint record answer for each
-        # package (tree_key).
-        if [[ "$PKG" == --workspace ]]; then
-            FMT_SCOPE=(--all)
-        else
-            FMT_SCOPE=(-p "$PKG")
-            FMT_MEMBERS="$(read_metadata \
-            | VERIFY_PY_HELPER=CHANGED_MEMBERS_PY "$PY" -c "$CHANGED_MEMBERS_PY")"
-            while IFS= read -r member; do
-                if [[ -n "$member" && "$member" != "$PKG" ]]; then
-                    FMT_SCOPE+=(-p "$member")
-                fi
-            done <<< "$FMT_MEMBERS"
-        fi
-        if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
-            echo 'style-lint: rustfmt start'
-        fi
-        fmt_cargo "${FMT_SCOPE[@]}"
-        if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
-            echo 'style-lint: rustfmt passed'
-        fi
-        # Record the tree Taplo reads; clippy fix and fmt update the key below.
-        if [[ -n "${RUN_LOG}" ]]; then
-            set_verdict_keys
-        fi
-        # Cargo's workspace root can differ from the caller's directory.
-        # Run there so Taplo uses the same config and scope as the push gate.
-        load_metadata
-        TAPLO_ARGS=(--check)
-        if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(); fi
-        if workspace_taplo ${TAPLO_ARGS[@]+"${TAPLO_ARGS[@]}"}; then
-            :
-        else
-            taplo_status=$?
-            if (( taplo_status == 101 )); then
-                if [[ "$(uname)" == Darwin ]]; then
-                    echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
-                    exit 3
-                fi
-                echo "verify.sh: taplo panicked; this is a tooling failure." >&2
-                exit 2
-            fi
-            exit "$taplo_status"
-        fi
-        if lint_config_enabled clippy; then
-            [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
-            start_tree_watch
-            # Store diagnostics in the watch directory for cancellation cleanup.
-            # Keep admission and the step record in run().
-            CLIPPY_LOG="$(mktemp "${TREE_WATCH_DIR:-${TMPDIR:-/tmp}}/clippy.XXXXXX")"
-            clippy_status=0
-            # Use the existing tee to record diagnostics.
-            # Keep wait and cancellation messages visible.
-            if invoke_clippy --workspace --all-targets --all-features --keep-going; then
-                :
-            else
-                clippy_status=$?
-            fi
-            clippy_repair=0
-            if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
-            if first_judgment_permits_repair "$clippy_status" "$CLIPPY_LOG"; then
-                clippy_repair=1
-            fi
-            rm -f "$CLIPPY_LOG"
-            unset CLIPPY_LOG
-            finish_tree_watch
-            if (( clippy_repair )); then
-                # Read at use so a changed policy applies to this repair round.
-                clippy_fix_limit="$(_lint_config_raw clippy_fix_pass_limit)"
-                if [[ ! "$clippy_fix_limit" =~ ^[1-9][0-9]{0,3}$ ]]; then
-                    [[ -z "$clippy_fix_limit" ]] || echo "verify.sh: invalid clippy_fix_pass_limit=$clippy_fix_limit; using 3." >&2
-                    clippy_fix_limit=3
-                fi
-                clippy_tree_before="$(tree_key --tree-content)"
-                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=clippy_fix_limit; clippy_fix_pass++)); do
-                    invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
-                    fmt_cargo "${FMT_SCOPE[@]}"
-                    clippy_tree_after="$(tree_key --tree-content)"
-                    if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
-                        break
-                    fi
-                    # An empty key cannot prove that the tree stopped changing.
-                    if (( clippy_fix_pass == clippy_fix_limit )); then
-                        CLIPPY_FIX_LIMIT_REACHED=1
-                    fi
-                    clippy_tree_before="$clippy_tree_after"
-                done
-                start_tree_watch
-                clippy_status=0
-                invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
-                finish_tree_watch
-            fi
-            (( clippy_status == 0 )) || exit "$clippy_status"
-            [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
-        else
-            invoke_clippy --workspace --all-targets --all-features
-        fi
+        run_lint_sequence
         ;;
     doc)
         DOC_FEATURE_FLAGS=()

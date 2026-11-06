@@ -1128,6 +1128,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Workers:** 1 writer: fix16.
 
 **Constraints from prior phases:**
+- Importing `offload.py` loads no build coordination modules. Resources Phase 67 tests this, and moves the `build_hold` import into `holder_session`.
 - Add no guard, refusal or check that this Spec does not ask for.
 - A test project is made in a tempdir at run time. No test commits one.
 - Tests use a temporary state folder. Live state stays out of worker prompts.
@@ -1141,7 +1142,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `test_mac_test.py`, `test_offload.py`, `test_ssh_eligibility.py`, `test_build_targets.py`, `test_targets.py`, `test_verify_ssh_targets.py` and `scripts/aws_target/test_control.py` pass.
 - basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
 
-### Phase 41c — Send a lint that waits for memory to a free Mac  · status: todo
+### Phase 41c — Send a lint that waits for memory to a free Mac  · status: done
 
 **Depends on:** Phase 41b.
 
@@ -1182,9 +1183,46 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - The notice names the Mac-idle minutes this could have saved, measured from the `mac_idle` and `steps` tables, or says why they cannot be measured.
 - basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
 
-### Phase 41d — Move the test argument parser to one function  · status: todo
+### Phase 41f — Keep the offload settings tests off the live Mac lease  · status: todo
 
 **Depends on:** Phase 41c.
+
+#### Work Order
+
+**Source:** builds showrunner, 2026-11-06: `test_probe_that_cannot_start_reports_its_limit_through_run` failed in the sdlc merge gate with "busy" in place of "unreachable", in the batch and alone. "Fix the cause under load, not the timing."
+
+**Cause, measured:** the test takes the real lease at `~/worktrees/gates/.remote-mirrors/<hash>.lease` for the hana Mac mirror. `copies.config_settings` reads `COPIES_CONFIG` or the repository's `config/copies.conf`, and that file sets `root=~/worktrees/gates`. The test environment sets neither. A live hana Mac run that holds the lease makes `leases` empty, so the answer is busy before the probe starts. The test can also make a live hana run answer busy.
+
+**Goal:** no test in `scripts/mac_test` takes a lease in the live gates root. The test gives its own answer while a live run holds the lease.
+
+**Spec:**
+
+1. Point the copies root of `OffloadSettingsTests` at a folder under its temporary root, through `COPIES_CONFIG`. Use the existing fixture in `scripts/copies/copies_test_support.py` when it fits.
+2. Find each other test in `scripts/mac_test` that reaches `copies.remote_lease` with a path outside its temporary root. On a tempdir copy of `scripts` and `config`, make `remote_lease_path` append each path it returns to a file, run the modules, and read the file. Move each test found to the same fixture.
+3. Add one test that reads `copies.remote_lease_path` for the mirror of the flaky test. It asserts that the path lies under the temporary root.
+4. Change no production file. Change no timing and add no retry.
+
+**Files:**
+- `scripts/mac_test/test_offload.py`
+- `scripts/mac_test/offload_test_support.py`
+
+**Workers:** 1 writer: merge16.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- No proof holds the live lease or touches live state.
+- A test project is made in a tempdir at run time. No test commits one.
+- Importing `offload.py` loads no build coordination modules. Resources Phase 67 tests this.
+- This phase lands on `verify-plain`. Send builds the hash.
+
+**Acceptance gate:**
+- On a tempdir copy with `config/copies.conf` set to `root=<temporary pretend live root>`, hold the lease of the hana mirror under that pretend root. The flaky test fails with "busy" when the fixture of step 1 is removed. It passes with the fixture.
+- The path list of step 2 holds no path in the live gates root after the fix.
+- `test_offload.py` and the other `scripts/mac_test` modules that step 2 changes pass. basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+
+### Phase 41d — Move the test argument parser to one function  · status: todo
+
+**Depends on:** Phase 41c, Phase 41f.
 
 #### Work Order
 
