@@ -517,7 +517,7 @@ class QueueViewTests(QueueFixtureTests):
         with AdmissionFixture() as fixture:
             request = fixture.request(step="merge-gate")
             request = replace(request, identity=wire.Identity("gate-owner", "gate-worker", "", str(fixture.root)),
-                profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.FixedCapSizing(6 * gate.GIB)),
+                profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.HistoryPeakSizing(6 * gate.GIB, gate.FirstProgramPeak(6 * gate.GIB), 0.0)),
                 sidecar=str(fixture.scope(request.owner)))
             _ = only_admitted(fixture.server.handle_request(request))
             fixture.clock.advance(7 * 60)

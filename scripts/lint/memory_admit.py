@@ -17,17 +17,17 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
-from dataclasses import MISSING, dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
-from functools import lru_cache
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast
 from itertools import chain
-from types import UnionType, MappingProxyType
+from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
+from scripts.build_queue import progress_profile as progress, snapshot_codec as codec
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
 
@@ -240,6 +240,7 @@ class AdmissionPolicy:
     peak_hold: PeakHold
     safety_bytes: int = 3 * GIB
     ci_memory_margin_bytes: int = field(default=0, kw_only=True)
+    progress_lookahead_percent: float = field(kw_only=True)
 
 
 PROC = Path("/proc")
@@ -345,12 +346,7 @@ class ShapeFallback:
 ShapeNeedBasis = ShapeP90 | ShapeLargest | ShapeFallback
 
 
-@dataclass(frozen=True)
-class ProgramMemoryCap:
-    program: str
-
-
-NeedBasis = LegacyNeedSource | ShapeNeedBasis | ProgramMemoryCap
+NeedBasis = LegacyNeedSource | ShapeNeedBasis
 
 
 @dataclass(frozen=True)
@@ -586,8 +582,6 @@ class ExpectedPeak:
     def __post_init__(self) -> None:
         if self.source == "shape" and not isinstance(self.basis, (ShapeP90, ShapeLargest, ShapeFallback)):
             raise ValueError("a shape estimate needs its shape basis")
-        if self.source == "cap" and not isinstance(self.basis, ProgramMemoryCap):
-            raise ValueError("a cap need requires its program cap basis")
         if isinstance(self.basis, BasisNotRecorded):
             if self.source in ("measured", "buildlog", "pooled", "fallback"):
                 object.__setattr__(self, "basis", self.source)
@@ -700,6 +694,13 @@ class MeasuredMemory:
 
 
 @dataclass(frozen=True)
+class ProgressAdjustedMemory(MeasuredMemory):
+    counter: progress.ProgressCounter | progress.NoCounter = field(kw_only=True)
+    window: progress.WindowPeak | progress.NoMatchingProfile = field(kw_only=True)
+    remaining_need: int = field(kw_only=True)
+
+
+@dataclass(frozen=True)
 class CompilerServiceMemory(MeasuredMemory):
     """Compiler charge, without a build reservation or run-alone veto."""
 
@@ -722,7 +723,7 @@ class GoneMemory:
     pass
 
 
-StepMemory = PromisedMemory | MeasuredMemory | CompilerServiceMemory | UnownedSliceMemory | GoneMemory
+StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | CompilerServiceMemory | UnownedSliceMemory | GoneMemory
 
 
 @dataclass(frozen=True)
@@ -889,7 +890,7 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
                 or any(not isinstance(number := row.get(key), (float, int))
                        or isinstance(number, bool) or not math.isfinite(number) for key in ("set_at",))):
             raise ValueError("invalid priority fields")
-        return cast(QueuePriority, parse_snapshot_value(row, QueuePriority))
+        return cast(QueuePriority, codec.parse_snapshot_value(row, QueuePriority))
     except FileNotFoundError:
         return NO_QUEUE_PRIORITY
     except (OSError, ValueError, TypeError, OverflowError):
@@ -1236,8 +1237,7 @@ class HeadAdmissionStatus:
 
 
 def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> bool:
-    return (not waiter.get("build_history_current", True) or waiter.get("need_source") != "cap"
-            and now - waiter.get("estimated_at", now) >= (policy.timing.fresh_test_seconds
+    return (not waiter.get("build_history_current", True) or now - waiter.get("estimated_at", now) >= (policy.timing.fresh_test_seconds
                  if waiter.get("fresh_test", False) else policy.timing.estimate_refresh_seconds))
 
 
@@ -1594,11 +1594,6 @@ class FirstProgramPeak:
 
 
 @dataclass(frozen=True)
-class FixedCapSizing:
-    cap_bytes: int
-
-
-@dataclass(frozen=True)
 class HistoryPeakSizing:
     first_peak_bytes: int
     estimate: MeasuredProgramPeak | FirstProgramPeak
@@ -1610,7 +1605,7 @@ class ProgramProfile:
     program: str
     repo: str
     worktree: str
-    sizing: FixedCapSizing | HistoryPeakSizing
+    sizing: HistoryPeakSizing
 
     @property
     def step(self) -> str:
@@ -1618,12 +1613,10 @@ class ProgramProfile:
 
     @property
     def estimated_at(self) -> float:
-        return self.sizing.estimated_at if isinstance(self.sizing, HistoryPeakSizing) else 0.0
+        return self.sizing.estimated_at
 
     @property
     def peak(self) -> ExpectedPeak:
-        if isinstance(self.sizing, FixedCapSizing):
-            return ExpectedPeak(self.sizing.cap_bytes, "cap", 0, ProgramMemoryCap(self.program))
         estimate = self.sizing.estimate
         return (ExpectedPeak(estimate.bytes, "measured", estimate.runs)
                 if isinstance(estimate, MeasuredProgramPeak) else ExpectedPeak(estimate.bytes, "fallback", 0))
@@ -1645,6 +1638,8 @@ def anonymous_history_rows(path: Path) -> Iterator[dict[str, object]]:
 def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
                           first_peak_bytes: int) -> MeasuredProgramPeak | FirstProgramPeak:
     """Read one program's peak history, without using cargo estimates."""
+    if program == "merge-gate":
+        return FirstProgramPeak(first_peak_bytes)
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
     for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
@@ -1801,7 +1796,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds), gib("safety_gib"),
-                                       ci_memory_margin_bytes=value("ci_memory_margin_gib", lambda raw: int(float(raw) * GIB))),
+                                       ci_memory_margin_bytes=value("ci_memory_margin_gib", lambda raw: int(float(raw) * GIB)),
+                                       progress_lookahead_percent=number("progress_lookahead_percent")),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 test_phase_margin=test_margin(),
                 dev_size_factor=number("dev_size_factor"),
@@ -2141,8 +2137,6 @@ def _need_record(basis: NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPha
         return {"kind": "no_test_phase_need", "reason": basis.reason}
     if isinstance(basis, (BasisNotRecorded, str)):
         return {"kind": basis if isinstance(basis, str) else "not_recorded"}
-    if isinstance(basis, ProgramMemoryCap):
-        return {"kind": "program_memory_cap", "program": basis.program}
     cap: dict[str, object] = {"kind": "none"}
     if isinstance(basis.cap, CappedAtBudget):
         cap = {"kind": "budget", "uncapped": basis.cap.uncapped}
@@ -2170,23 +2164,14 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         return BasisNotRecorded()
     row = cast(dict[str, object], raw)
     kind = row.get("kind")
-    if kind == "program_memory_cap":
-        program = row.get("program")
-        return ProgramMemoryCap(program) if isinstance(program, str) and program else BasisNotRecorded()
     if kind == "no_test_phase_need" and row.get("reason") in ("no_width", "no_history", "not_recorded"):
         return NoTestPhaseNeed(cast(Literal["no_width", "no_history", "not_recorded"], row["reason"]))
     if kind == "test_phase_need":
         numbers = [row.get(name) for name in ("bytes", "runs", "width", "recorded_width")]
         if (all(type(number) is int and number > 0 for number in numbers)
                 and row.get("form") in ("same_width", "wider_unscaled", "scaled_up")):
-            raw_margin = row.get("margin")
-            if isinstance(raw_margin, bool) or not isinstance(raw_margin, (str, int, float)):
-                return NoTestPhaseNeed("not_recorded")
-            try:
-                margin = float(raw_margin)
-            except (ValueError, OverflowError):
-                return NoTestPhaseNeed("not_recorded")
-            if not math.isfinite(margin) or margin < 1.0:
+            margin = row.get("margin")
+            if type(margin) is not float or not math.isfinite(margin) or margin < 1.0:
                 return NoTestPhaseNeed("not_recorded")
             return TestPhaseNeed(cast(int, numbers[0]), cast(int, numbers[1]),
                                  cast(int, numbers[2]), cast(int, numbers[3]),
@@ -3072,13 +3057,13 @@ class TokenWaitIntent(TypedDict):
 
 def read_token_wait(path: Path) -> TokenWaitIntent:
     value = cast(object, json.loads(path.read_text()))
-    return cast(TokenWaitIntent, parse_snapshot_value(value, TokenWaitIntent))
+    return cast(TokenWaitIntent, codec.parse_snapshot_value(value, TokenWaitIntent))
 
 
 def read_waiter(path: Path) -> Waiter:
     """Validate persisted waiter fields with the same schema used by snapshots."""
     value = cast(object, json.loads(path.read_text()))
-    return stored_waiter(cast(Waiter, parse_snapshot_value(value, Waiter)))
+    return stored_waiter(cast(Waiter, codec.parse_snapshot_value(value, Waiter)))
 
 
 def stored_waiter(row: Waiter) -> Waiter:
@@ -3302,25 +3287,25 @@ def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
                 step = str(row.get("step", step))
                 repo = str(row.get("repo", repo))
                 if kind == "admitted":
-                    admitted = cast(AdmittedEvent, parse_snapshot_value(row, AdmittedEvent))
+                    admitted = cast(AdmittedEvent, codec.parse_snapshot_value(row, AdmittedEvent))
                     reservation = admitted["reservation_id"]
                     intervals[reservation] = ReservationInterval(reservation, admitted["admitted_at"],
                         admitted["need"], admitted["need_source"], admitted["is_head"], StepStillOpen())
                     end = StepStillOpen()
                 elif kind == "ended":
-                    ended = cast(EndedEvent, parse_snapshot_value(row, EndedEvent))
+                    ended = cast(EndedEvent, codec.parse_snapshot_value(row, EndedEvent))
                     reservation = ended["reservation_id"]
                     ending = ReservationEnded(ended["ended_at"], ended["outcome"], ended["end_kind"], ended["peak"])
                     if reservation in intervals:
                         intervals[reservation] = replace(intervals[reservation], end=ending)
                     end = ending if isinstance(ending.end_kind, StepEnd) else StepStillOpen()
                 elif kind == "left":
-                    left = cast(LeftEvent, parse_snapshot_value(row, LeftEvent))
+                    left = cast(LeftEvent, codec.parse_snapshot_value(row, LeftEvent))
                     end = LeftQueue(left["ended_at"], left["reason"])
                 elif kind == "token_gap":
                     gaps.append(QueueTokenGap(
-                        cast(float, parse_snapshot_value(row["token_left_at"], float)),
-                        cast(float, parse_snapshot_value(row["token_back_at"], float))))
+                        cast(float, codec.parse_snapshot_value(row["token_left_at"], float)),
+                        cast(float, codec.parse_snapshot_value(row["token_back_at"], float))))
                     end = StepStillOpen()
             except (KeyError, ValueError, TypeError):
                 continue
@@ -3372,7 +3357,7 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
     estimate_time = now() if callable(now) else now
     fresh = False
     package, filters = test_package(argv), test_filters(argv)
-    if isinstance(profile, ProgramProfile) and isinstance(profile.sizing, HistoryPeakSizing):
+    if isinstance(profile, ProgramProfile):
         sizing = profile.sizing
         if not sizing.estimated_at or estimate_time.timestamp() - sizing.estimated_at >= policy.timing.estimate_refresh_seconds:
             profile = replace(profile, sizing=replace(sizing,
@@ -3595,14 +3580,22 @@ def test_phase_charge(phase: TestPhaseStarted) -> int:
 
 def reservation_need(row: Reservation, reading: StepMemory) -> int:
     """Select the full step need unless captured evidence proves a test phase."""
+    if isinstance(reading, ProgressAdjustedMemory):
+        return reading.remaining_need
     if row["step"] == "nextest" and isinstance(reading, MeasuredMemory) and isinstance(reading.peak_history, TestPhaseStarted):
         return test_phase_charge(reading.peak_history)
     return row["need"]
 
 
-def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
-    """Group active reservations and ephemeral handoffs inside the pure pass."""
-    groups: dict[str, RunMemory] = {}
+@dataclass(frozen=True)
+class AttributedStepUse:
+    use: AnonymousRunUse | RunUseUnavailable
+    owns_source: bool
+
+
+def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, RunningStep, AttributedStepUse], ...]:
+    """Assign each scope and process to one step before any grouping."""
+    attributed: list[tuple[Reservation, RunningStep, AttributedStepUse]] = []
     active = tuple(zip(inputs.reservations, (step for step in inputs.running if running_has_reservation(step)), strict=True))
     scope_holders: dict[Path, tuple[str, int, MeasuredMemory]] = {}
     process_holders: dict[int, tuple[int, str, int]] = {}
@@ -3634,16 +3627,14 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
             scoped_pids.update(source.members)
     unclaimed = set(process_holders) - scoped_pids
     for index, (row, step) in enumerate(active):
-        run = reservation_run(row, step)
-        owner = reservation_owner(row, step)
-        need = reservation_need(row, step.measured)
         use = step.measured.anonymous if isinstance(step.measured, MeasuredMemory) else RunUseUnavailable("scope not measured")
-        previous = groups.get(owner)
+        owns_source = True
         if isinstance(step.measured, MeasuredMemory):
             source = step.measured.anonymous_source
             if isinstance(source, ScopeSource):
                 if scope_holders[source.directory][1] != index:
                     use = AnonymousRunUse(0)
+                    owns_source = False
                 elif isinstance(use, AnonymousRunUse):
                     nested = sum_anonymous_use(scope_holders[child][2].anonymous
                                                for child in children.get(source.directory, ()))
@@ -3652,8 +3643,22 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
             elif isinstance(source, ProcessSource):
                 assigned = tuple(item for item in source.processes
                                  if item.pid in unclaimed and process_holders[item.pid][2] == index)
+                owns_source = bool(assigned)
                 use = sum_anonymous_use(item.use for item in assigned)
                 unclaimed.difference_update(item.pid for item in assigned)
+        attributed.append((row, step, AttributedStepUse(use, owns_source)))
+    return tuple(attributed)
+
+
+def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
+    """Group attributed steps and ephemeral handoffs inside the pure pass."""
+    groups: dict[str, RunMemory] = {}
+    for row, step, attributed in attributed_step_uses(inputs):
+        run = reservation_run(row, step)
+        owner = reservation_owner(row, step)
+        need = reservation_need(row, step.measured)
+        use = attributed.use
+        previous = groups.get(owner)
         if previous is None:
             groups[owner] = RunMemory(owner, need, use, run=run)
         else:
@@ -3667,6 +3672,59 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
         previous = groups.get(owner, RunMemory(owner, 0, AnonymousRunUse(0), run=held.run))
         groups[owner] = replace(previous, held=previous.held + held.bytes)
     return tuple(groups.values())
+
+
+PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "merge-gate", "cargo")
+
+
+def reservation_profile_key(row: Reservation, host: str) -> str:
+    """Use the history identity for each step rather than its run owner."""
+    if row["step"] == "merge-gate":
+        return progress.profile_key((host, row["step"]))
+    width = row["test_threads"].threads if isinstance(row["test_threads"], RequestedTestWidth) else "unknown"
+    return progress.profile_key((host, row.get("repo_identity", row["repo"]), row["step"],
+        row.get("shape", ""), row.get("test_scope", "full"), row.get("package", ""),
+        sorted(history_arguments(row.get("filters"))), width))
+
+
+def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: AttributedStepUse,
+                    counter: progress.ProgressCounter | progress.NoCounter,
+                    profile: progress.ProgressProfile | progress.NoMatchingProfile,
+                    policy: AdmissionPolicy) -> ProgressAdjustedMemory:
+    """Use a profile only with a current attributed anonymous reading."""
+    full_need = reservation_need(row, reading)
+    window = (progress.window_peak(profile, counter, policy.progress_lookahead_percent)
+              if isinstance(attributed.use, AnonymousRunUse) else
+              progress.NoMatchingProfile("anonymous use unavailable"))
+    need = full_need
+    if isinstance(window, progress.WindowPeak):
+        basis = read_need_basis(row.get("queue_waiter", {}).get("need_basis"))
+        need = shape_headroom_bytes(window.bytes, basis.factor) if isinstance(basis, (ShapeP90, ShapeLargest)) else window.bytes
+        if row["step"] == "nextest" and isinstance(reading.peak_history, TestPhaseStarted):
+            phase = reading.peak_history
+            if isinstance(counter, progress.ProgressCounter) and counter.phase == "test:1":
+                need = test_phase_charge(replace(phase, need=replace(phase.need, bytes=window.bytes)))
+            else:
+                window = progress.NoMatchingProfile("test phase reset or unmatched phase")
+                need = full_need
+    return ProgressAdjustedMemory(reading.bytes, anonymous=reading.anonymous,
+        anonymous_source=reading.anonymous_source, promise=reading.promise,
+        swap_bytes=reading.swap_bytes, observed_peak=reading.observed_peak,
+        unknown_peak_promise=reading.unknown_peak_promise, peak_history=reading.peak_history,
+        counter=counter, window=window, remaining_need=need)
+
+
+def progress_text(reading: StepMemory) -> str:
+    """Explain the captured progress decision without reading current files."""
+    if not isinstance(reading, ProgressAdjustedMemory):
+        return ""
+    counter = reading.counter
+    phase = (f"{counter.phase}, {counter.percent:.0f}% done" if isinstance(counter, progress.ProgressCounter)
+             else counter.reason)
+    reason = (f"highest anonymous use in the next {reading.window.lookahead_percent:g}%"
+              if isinstance(reading.window, progress.WindowPeak) else
+              f"full need: {reading.window.reason}")
+    return f"{phase}; need {reading.remaining_need / GIB:.1f} GiB; {reason}"
 
 
 def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | ReadingUnavailable:
@@ -3970,89 +4028,6 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
         inputs.spacing, inputs.priority, room=result.policy.room, policy=policy)
     return QueueRead(view, explanation, ordered)
 
-@lru_cache(maxsize=None)
-def snapshot_fields(schema: type) -> dict[str, object]:
-    return cast(dict[str, object], get_type_hints(schema, include_extras=True))
-
-
-def snapshot_value(value: object) -> object:
-    """The cache's tagged records retain domain variants, including nested memory evidence."""
-    if isinstance(value, Path):
-        return str(value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return {"kind": type(value).__name__, **{field.name: snapshot_value(cast(object, getattr(value, field.name)))
-                                                for field in fields(value)}}
-    if isinstance(value, Mapping):
-        return {key: snapshot_value(item) for key, item in cast(Mapping[str, object], value).items()}
-    if isinstance(value, frozenset):
-        return [snapshot_value(item) for item in sorted(cast(frozenset[str], value))]
-    if isinstance(value, (tuple, list)):
-        return [snapshot_value(item) for item in cast(tuple[object, ...] | list[object], value)]
-    return value
-
-
-def parse_snapshot_value(value: object, schema: object) -> object:
-    """Validate the wire shape against the same domain fields that the writer serializes."""
-    origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
-    if schema is object:
-        return value
-    if origin is NotRequired:
-        return parse_snapshot_value(value, args[0])
-    # A union of Literal aliases still has typing.Union as its origin on 3.13.
-    if origin is UnionType or origin is get_origin(NeedBasis):
-        for variant in args:
-            try:
-                return parse_snapshot_value(value, variant)
-            except (ValueError, TypeError, KeyError):
-                continue
-        raise ValueError("invalid snapshot variant")
-    if origin is Literal:
-        if value not in args:
-            raise ValueError("invalid snapshot literal")
-        return value
-    if schema is type(None):
-        if value is not None:
-            raise ValueError("invalid snapshot null")
-        return None
-    if schema is str or schema is int or schema is float or schema is bool:
-        valid = (type(value) is schema or schema is float and type(value) is int)
-        if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
-            raise ValueError("invalid snapshot scalar")
-        return value
-    if schema is Path:
-        return Path(cast(str, parse_snapshot_value(value, str)))
-    if origin in (list, tuple, frozenset, Sequence):
-        if not isinstance(value, list):
-            raise ValueError("invalid snapshot sequence")
-        items = cast(list[object], value)
-        if origin in (list, frozenset, Sequence) or len(args) == 2 and args[1] is Ellipsis:
-            parsed = [parse_snapshot_value(item, args[0]) for item in items]
-        else:
-            if len(items) != len(args):
-                raise ValueError("invalid snapshot tuple")
-            parsed = [parse_snapshot_value(item, kind) for item, kind in zip(items, args, strict=True)]
-        return parsed if origin in (list, Sequence) else frozenset(parsed) if origin is frozenset else tuple(parsed)
-    if origin in (dict, Mapping):
-        if not isinstance(value, dict):
-            raise ValueError("invalid snapshot mapping")
-        return {parse_snapshot_value(key, args[0]): parse_snapshot_value(item, args[1])
-                for key, item in cast(dict[str, object], value).items()}
-    if not isinstance(schema, type) or not isinstance(value, dict):
-        raise ValueError("invalid snapshot record")
-    record = cast(dict[str, object], value)
-    annotations = snapshot_fields(schema)
-    if is_typeddict(schema):
-        if any(name not in record and get_origin(kind) is not NotRequired for name, kind in annotations.items()):
-            raise ValueError("missing snapshot row field")
-        return {name: parse_snapshot_value(item, annotations[name]) for name, item in record.items()
-                if name in annotations}
-    if not is_dataclass(schema) or record.get("kind") != schema.__name__:
-        raise ValueError("invalid snapshot record tag")
-    if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
-           for member in fields(schema)):
-        raise ValueError("invalid snapshot record fields")
-    return cast(Callable[..., object], schema)(**{name: parse_snapshot_value(record[name], kind)
-                                                for name, kind in annotations.items() if name in record})
 
 
 @dataclass(frozen=True)
@@ -4281,10 +4256,12 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
             "end_kind": TokenReturn() if intent.get("end_kind") == "token_return" else StepEnd(),
             "peak": PeakSampled(intent["peak"]) if intent["peak"] > 0 else NoPositiveSample(),
         }
-        append_queue_time(path.parent, cast(dict[str, object], snapshot_value(event)), ended_at)
+        append_queue_time(path.parent, cast(dict[str, object], codec.snapshot_value(event)), ended_at)
     maximum.unlink(missing_ok=True)
     path.with_suffix(".wave").unlink(missing_ok=True)
     if row["sidecar"]:
+        for suffix in ("json", "log"):
+            progress.progress_path(Path(row["sidecar"]), suffix).unlink(missing_ok=True)
         Path(row["sidecar"]).unlink(missing_ok=True)
     intents.clear(row)
     return result
@@ -4503,10 +4480,10 @@ def sampling_context(row: Reservation) -> dict[str, object]:
     return {"reservation_id": row.get("reservation_id", ""), "need": row["need"],
             "repo_identity": row.get("repo_identity", ""), "package": row.get("package", ""),
             "filters": row.get("filters", []), "test_scope": row.get("test_scope", "full"),
-            "test_threads": snapshot_value(row["test_threads"]),
-            "call_id": snapshot_value(row["call_id"]),
+            "test_threads": codec.snapshot_value(row["test_threads"]),
+            "call_id": codec.snapshot_value(row["call_id"]),
             "test_phase_need": test_phase_need_record(read_test_phase_need(row.get("test_phase_need"))),
-            "test_phase_charge_use": snapshot_value(row.get("test_phase_charge_use", NoTestPhaseChargeUse()))}
+            "test_phase_charge_use": codec.snapshot_value(row.get("test_phase_charge_use", NoTestPhaseChargeUse()))}
 
 
 class QueueServiceReader(Protocol):

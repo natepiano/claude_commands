@@ -70,6 +70,7 @@ from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.lint import memory_admit  # noqa: E402
+from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, defer_cleanup_signals, queue_place, suite_scope_prefix,
@@ -323,10 +324,10 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
                 os.close(descriptor)
 
 
-def merge_gate_memory_gib(key: str) -> float:
+def merge_gate_governor_gib() -> float:
     """Read one memory setting when the gate uses it."""
     try:
-        value = conf.read("build_admission").number(key)
+        value = conf.read("build_admission").number("merge_gate_governor_gib")
     except conf.Unusable as error:
         raise GateRefused(str(error)) from error
     return value
@@ -336,10 +337,8 @@ def merge_gate_memory_gib(key: str) -> float:
 def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
-    need = int(merge_gate_memory_gib("merge_gate_reservation_gib") * memory_admit.GIB)
     try:
         with queue_place("merge-gate", repo,
-                         sizing=memory_admit.FixedCapSizing(need),
                          before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
             yield place
     except QueuePlaceRefused as error:
@@ -918,7 +917,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False) -> GateRun:
-    governor_gib = merge_gate_memory_gib("merge_gate_governor_gib")
+    governor_gib = merge_gate_governor_gib()
     if module_time_limit_s <= 0:
         raise GateRefused("module time limit must be positive")
     if max_running_jobs <= 0:
@@ -1023,6 +1022,15 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             results.append(result)
             executions.append(result)
         requests = {(job.kind, job.suite, job.module): job for job in pending}
+        progress_total = len(pending)
+        progress_done = 0
+        progress_phase = "suites:1"
+        def publish_progress() -> None:
+            if progress_total:
+                progress_profile.publish_counter(reservation.sidecar,
+                    progress_profile.ProgressCounter(progress_phase, progress_done, progress_total))
+
+        publish_progress()
         try:
             while pending or running:
                 now = time.monotonic()
@@ -1097,6 +1105,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         pending.appendleft(requests[(job.kind, job.suite, job.module)])
                         print(f"{job.suite}/{result.module}: stopped during a natedev hold; queued again", flush=True)
                         continue
+                    progress_done += 1
+                    publish_progress()
                     if not job.killed_for:
                         cpu_measures[cpu_key] = result.cpu_seconds
                     if not job.killed_for and job.peak_memory_mib:
@@ -1132,6 +1142,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     else:
                         first_runs = {(result.suite, result.module): result for result in failed}
                         pending.extend(requests[(result.kind, result.suite, result.module)] for result in failed)
+                        if failed:
+                            progress_phase, progress_done, progress_total = "suites:2", 0, len(failed)
+                            publish_progress()
                 if running or pending:
                     time.sleep(0.05)
         finally:

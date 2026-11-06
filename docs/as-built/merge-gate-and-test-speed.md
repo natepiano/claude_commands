@@ -93,9 +93,10 @@ A deleted or renamed Python file, a graph/read error, a change under `scripts/li
 - Before any job starts it refuses (and the merge rolls back) if a `--type-dirs` path is absent from the checkout, the test list is empty, or `/dev/shm` is not writable.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
 - **Shared admission.** After the build hold ends, `gate_reservation` obtains one `merge-gate` reservation through `queue_place`.
-  It reads `merge_gate_reservation_gib` from `config/build_admission.conf` at use; the initial value is 4 GiB.
-  `FixedCapSizing` uses this value only for the queue reservation.
-  The gate uses no history estimate and performs no estimate refresh.
+  It reads `program_first_peak_gib.merge-gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
+  The gate uses the first peak as its full need.
+  A matching anonymous profile uses the progress window after admission.
+  A missing or legacy profile keeps the full need.
   A wait keeps its gate identity and queue place.
   An admission error refuses the gate with its last reason line.
   Each new sampled peak updates the reservation's `.max` and `.wave` files through atomic writes.
@@ -274,7 +275,7 @@ Every `UNIT_*` name above was `PLAN_DELEGATE_*` before the rename, and `UNIT_RUN
 
 | Item | Value |
 |---|---|
-| Queue reservation | `merge_gate_reservation_gib=4`, read at reservation use |
+| Queue reservation | `program_first_peak_gib.merge-gate=4`, with the progress window after admission |
 | Runner governor | `merge_gate_governor_gib=4`, read when the gate starts |
 | Recorded job reservation | Last sampled peak × 1.2 (`MEMORY_PEAK_MARGIN`) |
 | Unrecorded module reservation | Largest recorded module peak × 1.2, or 640 MiB without module records |

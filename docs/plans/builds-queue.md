@@ -288,7 +288,7 @@ only I can bump
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `admission_client.py`, `admission_service.py`, the pass record in `memory_admit.py`; `test` owns their tests.
 
-### Phase 10k — Rust runs and merge gates keep aside memory by percent done  · status: todo
+### Phase 10k — Rust runs and merge gates keep aside memory by percent done  · status: done
 
 **Depends on:** 10z and 10x (same admission files; one change at a time). Runs beside 13, after 12 (builds ruling, 2026-11-05, on the order of 12, 13 and 10k; 12 added by the user ask, 12:5x). 13 lands first and alone edits `admission_test_support.py` until its checkpoint; 10k merges that checkpoint before its caller gate. Run every caller suite (direct `test_verify_*`, buildlog, hooks, merge admission) before the full gate, with `occupy_host` and `allow_next_start` where a fixture needs them.
 

@@ -305,7 +305,17 @@ buildlog_retry_unstarted_step() {
     BUILDLOG_RETRY_STEP=0
 }
 
+without_progress_frames() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        printf '%s\n' "${line##*$'\r'}"
+    done
+}
+
 run_step_attempt() {
+    export CARGO_TERM_PROGRESS_WHEN=always
+    export CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}}
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
@@ -383,14 +393,20 @@ run_step_attempt() {
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
         log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
+        if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+            ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
+        fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
-        buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
+        buildlog_exec "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
     nextest_share_end
     buildlog_finish_memory "$status" "$sampler_pid"
+    if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+        rm -f -- "$BUILDLOG_PEAK.progress.log"
+    fi
     buildlog_retry_unstarted_step "$@" || {
         status=$?
         [[ -z "$log" ]] || rm -f "$log"

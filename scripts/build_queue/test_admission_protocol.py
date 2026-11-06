@@ -1,6 +1,8 @@
 """The wire transports admission's domain records without another representation."""
 from __future__ import annotations
 
+from scripts.build_queue import snapshot_codec as codec
+
 from scripts.lint.memory_test_support import admission_policy_fixture
 
 from dataclasses import replace
@@ -55,7 +57,7 @@ class ProtocolTests(unittest.TestCase):
 
         activity = ScopeProcesses(2, "session", "worker", "/tree", "python3", NOW, False, NoLiveBuildRun())
         current = gate.UnownedSliceMemory(GIB, owner="scope", activity=activity, pid=gate.PidNotRecorded())
-        self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(current), gate.UnownedSliceMemory), current)
+        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(current), gate.UnownedSliceMemory), current)
 
     def test_service_job_state_and_separate_swap_survive_the_view_reply(self) -> None:
         from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
@@ -83,14 +85,14 @@ class ProtocolTests(unittest.TestCase):
 
         view = gate.QueueView((), (), 0, 0, 0, NOW)
         reading = queue_read_fixture(view, policy=admission_policy_fixture())
-        current = cast(dict[str, object], gate.snapshot_value(reading))
+        current = cast(dict[str, object], codec.snapshot_value(reading))
         del current["diagnostics"]
         current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
-        parsed = gate.parse_snapshot_value(current, gate.QueueRead)
+        parsed = codec.parse_snapshot_value(current, gate.QueueRead)
         self.assertEqual(parsed, replace(reading, diagnostics=(gate.ConfigurationDiagnostic("service warning"),)))
         step = gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0),
                                 run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
-        self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(step), gate.RunningStep), step)
+        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), gate.RunningStep), step)
 
     def test_unit_override_round_trips(self) -> None:
         with AdmissionFixture() as fixture:
@@ -137,7 +139,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             run_request = replace(request, run=run)
             self.assertEqual(wire.parse_request(wire.encode_request(run_request)), run_request)
             run_encoded = cast(dict[str, object], json.loads(wire.encode_request(run_request)))
-            self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], gate.snapshot_value(run))
+            self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], codec.snapshot_value(run))
 
     def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
         conditions: tuple[gate.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
@@ -155,7 +157,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.FixedCapSizing(3 * GIB))),
+                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.HistoryPeakSizing(3 * GIB, gate.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
                     gate.HistoryPeakSizing(18 * GIB, gate.FirstProgramPeak(18 * GIB), NOW))),
                 replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
@@ -191,10 +193,10 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
             for reply in replies:
                 with self.subTest(reply=type(reply).__name__):
-                    with mock.patch.object(gate, "snapshot_value", wraps=gate.snapshot_value) as encode:
+                    with mock.patch.object(codec, "snapshot_value", wraps=codec.snapshot_value) as encode:
                         line = wire.encode_reply(reply)
                     self.assertGreater(encode.call_count, 0)
-                    with mock.patch.object(gate, "parse_snapshot_value", wraps=gate.parse_snapshot_value) as parse:
+                    with mock.patch.object(codec, "parse_snapshot_value", wraps=codec.parse_snapshot_value) as parse:
                         self.assertEqual(wire.parse_reply(line), reply)
                     self.assertGreater(parse.call_count, 0)
 

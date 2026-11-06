@@ -17,7 +17,7 @@ import time
 from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import build_folders
+from scripts.lib import build_folders, atomic_file
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
 import uuid
@@ -136,15 +136,6 @@ def probe_scope_prefix() -> list[str]:
     return prefix
 
 
-def atomic_sample(path: Path, value: str) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    try:
-        _ = temporary.write_text(value)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def wait_reasons(result: memory_admit.AdmissionWaitSnapshot) -> tuple[str, ...]:
     return admission_client.wait_reasons(result)
 
@@ -209,7 +200,7 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
     for line in Path("/proc/self/cgroup").read_text().splitlines():
         if line.startswith("0::") and "/builds.slice/" in line:
             scope = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
-            atomic_sample(sidecar, str(scope) + "\n")
+            atomic_file.atomic_sample(sidecar, str(scope) + "\n")
             if memory_admit.process_start_time(holder_pid) != holder_start:
                 raise QueuePlaceRefused("the queue place holder exited during scope publication")
             os.execvp(argv[0], list(argv))
@@ -268,12 +259,12 @@ class QueuePlace:
         with self._samples:
             now = datetime.now(UTC).timestamp()
             if peak_bytes > self.peak_bytes:
-                atomic_sample(self.path.with_suffix(".max"), f"{peak_bytes}\n")
+                atomic_file.atomic_sample(self.path.with_suffix(".max"), f"{peak_bytes}\n")
                 self.peak_bytes = peak_bytes
-                atomic_sample(self.path.with_suffix(".wave"), f"{peak_bytes} {int(now)}\n")
+                atomic_file.atomic_sample(self.path.with_suffix(".wave"), f"{peak_bytes} {int(now)}\n")
                 self.wave_at = now
             elif self.peak_bytes and current_bytes >= self.peak_bytes / 2 and now - self.wave_at >= self.configuration.peak_wave_seconds:
-                atomic_sample(self.path.with_suffix(".wave"), f"{self.peak_bytes} {int(now)}\n")
+                atomic_file.atomic_sample(self.path.with_suffix(".wave"), f"{self.peak_bytes} {int(now)}\n")
                 self.wave_at = now
 
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
@@ -384,7 +375,7 @@ def _stop_holder(number: int, _frame: object) -> None:
 
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
-                sizing: memory_admit.FixedCapSizing | memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
+                sizing: memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
                 before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
     """Use full commands for purpose selection; retain named batch reservations."""
     # A name requests a batch place. A complete command permits purpose selection.

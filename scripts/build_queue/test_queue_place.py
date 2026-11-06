@@ -1,6 +1,8 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
+from scripts.lib import atomic_file
+
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -197,7 +199,7 @@ def private_scope_start() -> None:
     if not any(private_slice in Path(line[3:]).parts for line in actual.splitlines() if line.startswith("0::")):
         raise AssertionError("the program did not enter the private test slice")
     read_text = Path.read_text
-    publish = queue.atomic_sample
+    publish = atomic_file.atomic_sample
 
     def kernel_path(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
         if path == cgroup_path:
@@ -208,7 +210,7 @@ def private_scope_start() -> None:
         publish(path, value.replace("/sys/fs/cgroup/builds.slice/", "/sys/fs/cgroup/", 1))
 
     with mock.patch.object(Path, "read_text", new=kernel_path), \
-         mock.patch.object(queue, "atomic_sample", side_effect=publish_actual_path):
+         mock.patch.object(atomic_file, "atomic_sample", side_effect=publish_actual_path):
         queue.scope_start(Path(sidecar), int(holder), start, argv)
 
 
@@ -944,26 +946,6 @@ class QueuePlaceTests(unittest.TestCase):
                 self.assertEqual(fixture.children, [])
                 self.assertEqual(list(fixture.directory.glob("*.reservation")), [])
 
-    def test_fixed_cap_ignores_history_at_start_and_after_estimate_refresh_seconds(self) -> None:
-        with QueuePlaceFixture() as fixture:
-            fixture.seed([2 * GIB] * 10)
-            with queue.queue_place("rust-analyzer", fixture.root, sizing=gate.FixedCapSizing(12 * GIB)):
-                _, row = fixture.reservation()
-                self.assertEqual((row["need"], row.get("queue_waiter", {}).get("need_source")), (12 * GIB, "cap"))
-                waiter = row.get("queue_waiter", {})
-                self.assertEqual(gate.ExpectedPeak(row["need"], waiter.get("need_source", "fallback"),
-                    waiter.get("need_runs", 0), gate.read_need_basis(waiter.get("need_basis"))),
-                    gate.ExpectedPeak(12 * GIB, "cap", 0, gate.ProgramMemoryCap("rust-analyzer")))
-                fixture.admission.clock.advance(gate.read_memory_config().policy.timing.estimate_refresh_seconds + 1)
-                with mock.patch.object(gate, "program_peak_estimate", side_effect=AssertionError("cap estimated history")):
-                    _ = fixture.admission.run_pass()
-                _, current = fixture.reservation()
-                self.assertEqual(current["need"], 12 * GIB)
-                self.assertIn("queue_waiter", current)
-                waiter = current.get("queue_waiter", {})
-                self.assertEqual(gate.read_need_basis(waiter.get("need_basis")),
-                                 gate.ProgramMemoryCap("rust-analyzer"))
-                self.assertFalse(list(fixture.directory.glob("*.reservation")))
 
     def test_invalid_config_warns_once_and_does_not_corrupt_child_protocol(self) -> None:
         with QueuePlaceFixture() as fixture:

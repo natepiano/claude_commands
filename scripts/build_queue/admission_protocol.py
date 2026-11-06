@@ -1,4 +1,4 @@
-"""Versioned admission envelopes; domain values use memory_admit's one codec."""
+"""Versioned admission envelopes; domain values use the shared snapshot codec."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import TypeVar, cast
 
+from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_code import (
     ADMISSION_CODE_PATHS as ADMISSION_CODE_PATHS,
     admission_code_version as admission_code_version,
@@ -257,19 +258,19 @@ def admission_socket_path() -> Path:
 
 def encode_record(value: object) -> str:
     """State and message payloads have exactly the domain codec's representation."""
-    return json.dumps(gate.snapshot_value(value), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return json.dumps(codec.snapshot_value(value), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def parse_record(text: str, schema: type[T]) -> T:
     value = cast(object, json.loads(text))
-    return cast(T, gate.parse_snapshot_value(value, schema))
+    return cast(T, codec.parse_snapshot_value(value, schema))
 
 
 def _encode(value: object, variants: dict[str, type]) -> str:
     name = next((name for name, schema in variants.items() if type(value) is schema), None)
     if name is None:
         raise ValueError("unknown admission message")
-    data = gate.snapshot_value(value)
+    data = codec.snapshot_value(value)
     return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
 
 
@@ -285,7 +286,7 @@ def _parse(line: str | bytes, variants: dict[str, type]) -> object:
         if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
         data = envelope["data"]
-        return gate.parse_snapshot_value(data, variants[name])
+        return codec.parse_snapshot_value(data, variants[name])
     except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 

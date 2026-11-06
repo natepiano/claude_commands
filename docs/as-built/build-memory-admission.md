@@ -282,12 +282,13 @@ A refresh uses the open admission connection. An unregistered client uses a read
 A pass retries a retained finalization intent even while its owner remains alive.
 It preserves the first `since` and episode across refreshes and reconnects.
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
-A cap-source waiter never expires. A `FixedCapSizing` program holds its cap without a history estimate or refresh.
-The merge gate reads `merge_gate_reservation_gib` at use for its queue reservation; the initial value is 4 GiB.
+A program uses its history estimate and refreshes it under the normal estimate policy.
+The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the look-ahead window.
 It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
 The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
 Memory peaks do not kill jobs or fail the gate.
-Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory cap` in explanations.
+The gate reports its first need as a fallback and explains any matching anonymous progress window.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -996,3 +997,15 @@ The queue view and cards show captured process ids as `pid N` for each process r
 `HeadExplanation` retains that cause for the view and release advice.
 The formatters read the captured cause and room without a second room calculation.
 No adaptive controller, fixed admission limit, order window, CI growth promise, or test-phase estimate worker remains.
+
+### Progress memory profiles
+
+Cargo build, check, clippy, mend, nextest, and merge gates record attributed anonymous use in five-percent phase bins.
+The service applies each step's recorded headroom rule to the highest profile sample within its look-ahead window.
+`progress_lookahead_percent` is read at use; its initial value is 20.
+The window can cross a phase boundary. Each step has its own history key.
+Missing counters, profiles, or anonymous readings retain the full need.
+The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.
+CI keeps its configured margin until registered CI steps supply counters and profiles.
+`lint/invoke.sh` enables Cargo progress in its capture log. It removes redraw frames from worker output.
+Cargo-tile enables progress for its own captures. The cargo wrapper does not enable progress for other pipes.

@@ -41,9 +41,6 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
     if isinstance(source, gate.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
-    if isinstance(basis, gate.ProgramMemoryCap):
-        program = "the merge gate" if basis.program == "merge-gate" else basis.program
-        return f"{program}'s memory cap"
     if isinstance(basis, (gate.ShapeP90, gate.ShapeLargest, gate.ShapeFallback)):
         if isinstance(basis, gate.ShapeP90):
             text = f"same-shape p90 of {basis.runs} runs"
@@ -86,8 +83,6 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
         text = "fallback: fewer than 5 runs"
     elif source.source == "shape":
         text = "same-shape promise: basis not recorded"
-    elif source.source == "cap":
-        text = "memory cap: program not recorded"
     else:
         text = f"{source.source}: basis not recorded"
     text += f", last {source.history_days} days"

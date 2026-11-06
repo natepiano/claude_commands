@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import select
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -20,9 +21,12 @@ from typing import TYPE_CHECKING, Callable, Protocol, cast
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.build_queue import snapshot_codec as codec
 from scripts.lib import conf, inotify
+from scripts.lib.boot_identity import boot_identity
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lint import memory_admit as gate
@@ -40,6 +44,7 @@ from scripts.message import send_budget, send_result
 from scripts.message.session_send import session_send_argv
 
 
+CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
 READING_ALERT_KEY = "build-admission-reading"
 
 
@@ -484,7 +489,8 @@ class StateIntents:
 
 class AdmissionServer:
     def __init__(self, state_dir: Path, clock: Clock, readings: Readings, proc: Proc, *,
-                 fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None) -> None:
+                 fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
+                 capture_root: Path = CARGO_CAPTURE_ROOT) -> None:
         self.state_dir: Path = state_dir
         self.clock: Clock = clock
         self.readings: Readings = readings
@@ -510,6 +516,13 @@ class AdmissionServer:
         self.last_usable_configuration: gate.MemoryConfig | NoPass = NoPass()
         self.caller_versions: dict[str, str] = {}
         self.slots: dict[str, gate.RunSlot] = {}
+        self.progress_history: progress.ProfileHistory = progress.ProfileHistory(state_dir / "progress_profiles")
+        self.progress_captures: progress.CaptureReader = progress.CaptureReader(capture_root)
+        try:
+            self.boot_id: str = boot_identity(proc.path)
+        except (OSError, ValueError):
+            self.boot_id = ""
+        self.host: str = store.host_name()
         self.pass_stale: bool = False
         self.pending_configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration | NoPass = NoPass()
         self.priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
@@ -889,7 +902,42 @@ class AdmissionServer:
                                            evidence.folder, 0, memory, live, live.started_at, pid=run.pid))
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
-        return self._inputs_with_current_slots(inputs)
+        return self._progress_inputs(self._inputs_with_current_slots(inputs), processes, policy)
+
+    def _progress_inputs(self, inputs: gate.QueueInputs, processes: dict[int, gate.ProcessIdentity],
+                         policy: gate.AdmissionPolicy) -> gate.QueueInputs:
+        """Capture counters and profile samples on the service loop thread."""
+        attributed = iter(gate.attributed_step_uses(inputs))
+        running: list[gate.RunningStep] = []
+        cutoff = inputs.now - gate.HISTORY_DAYS * 86400
+        self.progress_history.prune(cutoff)
+        for step in inputs.running:
+            if not gate.running_has_reservation(step):
+                running.append(step)
+                continue
+            row, step, use = next(attributed)
+            if row["step"] not in gate.PROGRESS_STEPS:
+                running.append(step)
+                continue
+            memory = step.measured
+            if not isinstance(memory, gate.MeasuredMemory):
+                running.append(step)
+                continue
+            sidecar = Path(row["sidecar"])
+            counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
+            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
+                counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
+            if isinstance(counter, progress.NoCounter) and row["step"] != "merge-gate" and self.boot_id:
+                pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
+                counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
+            key = gate.reservation_profile_key(row, self.host)
+            profile = self.progress_history.matching(key, cutoff)
+            adjusted = gate.progress_memory(row, memory, use, counter, profile, policy)
+            running.append(replace(step, measured=adjusted))
+            if use.owns_source and isinstance(use.use, gate.AnonymousRunUse) and "reservation_id" in row:
+                self.progress_history.observe(row["reservation_id"], key, counter, use.use.bytes, inputs.now)
+        self.progress_captures.end_pass()
+        return replace(inputs, running=tuple(running))
 
     def run_pass(self) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         return self._run_pass(self._take_configuration())
@@ -1081,14 +1129,14 @@ class AdmissionServer:
                         "is_head": pending.is_head,
                         "wait_seconds": pending.wait_seconds,
                 }
-                gate.append_queue_time(self.state_dir, cast(dict[str, object], gate.snapshot_value(event)), admitted_at)
+                gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(event)), admitted_at)
                 self.fault("after_admitted_append")
             else:
                 left: gate.LeftEvent = {
                     **gate.lifecycle_event(pending.identity, "left", pending.episode + ":" + pending.reason),
                     "reason": pending.reason, "ended_at": pending.ended_at,
                 }
-                gate.append_queue_time(self.state_dir, cast(dict[str, object], gate.snapshot_value(left)), pending.ended_at)
+                gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(left)), pending.ended_at)
                 self.fault("after_left_append")
             self.lifecycle_outbox = self.lifecycle_outbox[1:]
 
@@ -1098,7 +1146,7 @@ class AdmissionServer:
     def _freeze_test_phase_need(self, record: ReservationRecord, config: gate.MemoryConfig) -> ReservationRecord:
         if record.step != "nextest":
             return record
-        need = gate.test_phase_need(reservation_row(record), store.host_name(),
+        need = gate.test_phase_need(reservation_row(record), self.host,
             datetime.fromtimestamp(self.clock.now(), UTC), self.state_dir,
             history_path=self.state_dir / "anon_peaks.jsonl", config=config)
         return replace(record, test_phase_need=need)
@@ -1155,6 +1203,9 @@ class AdmissionServer:
                 return
         ended_at = (gate.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
+        self.progress_history.finish(record.reservation_id, ended_at, ended_at - gate.HISTORY_DAYS * 86400)
+        if record.sidecar:
+            self.progress_captures.remove(Path(record.sidecar))
         path = Path(record.path)
         outcome, status, end_kind = finalization_outcome(ending)
         if isinstance(ending, TokenWaiting):
@@ -1278,7 +1329,7 @@ class AdmissionServer:
             at = self.clock.now()
             priority["transition"] = gate.PendingPriorityTransition(key,
                 "set" if isinstance(request, wire.PrioritySetRequest) else "clear", at,
-                store.read_last_whole_row_end(store.host_file(store.host_name(), at)))
+                store.read_last_whole_row_end(store.host_file(self.host, at)))
             self.priority = priority
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
             self.persist()
@@ -1408,7 +1459,6 @@ class AdmissionServer:
     def _record_caller_version(self, request: wire.Request, connection: Connection) -> None:
         if not request.code_version:
             return
-        import struct
         pid, uid, gid = struct.unpack("3i", connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         del uid, gid
         identity = self.proc.owner_start(pid)

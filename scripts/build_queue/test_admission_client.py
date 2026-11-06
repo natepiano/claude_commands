@@ -168,7 +168,7 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             checkout = str(fixture.root / "other-checkout")
-            profile = gate.ProgramProfile("merge-gate", "repo", checkout, gate.FixedCapSizing(6 * GIB))
+            profile = gate.ProgramProfile("merge-gate", "repo", checkout, gate.HistoryPeakSizing(6 * GIB, gate.FirstProgramPeak(6 * GIB), fixture.clock.now()))
             with mock.patch.object(gate, "git_identity", side_effect=AssertionError("program inferred cargo")), \
                  mock.patch.object(client, "CLOCK", fixture.clock):
                 request = client.step_request([], str(fixture.root), original.owner, original.since,
@@ -176,8 +176,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(request.identity.folder, checkout)
             self.assertEqual(request.profile, profile)
             self.assertEqual(request.identity.step, "merge-gate")
-            self.assertEqual(request.profile.peak, gate.ExpectedPeak(6 * GIB, "cap", 0,
-                                                                   gate.ProgramMemoryCap("merge-gate")))
+            self.assertEqual(request.profile.peak, gate.ExpectedPeak(6 * GIB, "fallback", 0))
 
     def test_failed_grant_file_write_releases_the_reservation_before_refusing(self) -> None:
         from pathlib import Path

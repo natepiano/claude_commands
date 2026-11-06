@@ -13,6 +13,7 @@ import cgroup_capture
 import filesystem
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from boot_identity import boot_identity, parse_boot_id as parse_boot_id
 from cargo_output import CargoOutputRoots, read_cargo_output_roots
 from cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
@@ -100,14 +101,6 @@ def parse_meminfo(text: str) -> MachineMemoryUse:
     return MachineMemoryUse(values["MemTotal"] - values["MemAvailable"], values["SwapTotal"] - values["SwapFree"])
 
 
-def parse_boot_id(text: str) -> str:
-    """Return the kernel boot ID, rejecting an empty value."""
-    boot_id = text.strip()
-    if not boot_id:
-        raise ValueError("empty boot ID")
-    return boot_id
-
-
 def anon_bytes(cgroup: Path) -> int | Unmeasured:
     """Read process memory from a slice, or mark an absent slice unmeasured."""
     reading = cgroup_capture.read_cgroup(cgroup)
@@ -184,7 +177,7 @@ def sample() -> SampleTaken:
 
     at = time.time()
     host = store.host_name()
-    boot_id = parse_boot_id(BOOT_ID.read_text())
+    boot_id = boot_identity(BOOT_ID.parents[3])
     memory = parse_meminfo(MEMINFO.read_text())
     stalls = parse_pressure(PRESSURE.read_text())
     cpu_stalls = read_pressure(CPU_PRESSURE)
