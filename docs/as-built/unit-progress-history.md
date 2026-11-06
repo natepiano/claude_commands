@@ -16,6 +16,15 @@ The live session cache remains in
 `/tmp/claude/unit/<run-id>/progress_history_state.json` (under `/tmp/claude/delegate/` for a run started before the folder rename). Deleting `/tmp`
 does not remove the durable event stream.
 
+## Configuration digest
+
+`_config_digest` hashes the exact model registry text and `direct.conf` bytes once per recorder process.
+It uses the inherited [launch configuration](agent-registry.md#configuration-lifetimes) when present.
+Without that configuration, it reads the registry through `registry_text` without catalog synchronization or publication.
+The same text and direct settings produce the same digest.
+An unreadable or invalid source produces an empty digest.
+Telemetry does not stop the launch.
+
 ## Event model
 
 Schema version 1 records these event types:

@@ -179,6 +179,22 @@ Login renewal uses named success and failure results.
 The watcher rate-limits attempts and records their reason.
 A failed renewal remains visible; it does not convert a stale reading into a fresh reading.
 
+### Worker move results
+
+`accounts.py move workers <target>` stops same-family workers and leaves their restart pending.
+`assign.sh` cannot yet carry both the fixed staff ID and the destination account for this operation.
+The result names the target account: `stopped, resume pending on <account>: <reason>`.
+
+The preview uses the same family decision before it takes a row lock or stops a source.
+A same-family worker prints `<name> (<id>): would stop; restart on <target> stays pending`.
+A cross-family worker prints `<name> (<id>): not moved: cannot restart on <target> through assign.sh`.
+Unavailable family evidence also refuses the restart.
+The real refusal leaves the source running.
+
+Source release preserves each stop reason and gives the next action.
+The [family handoff](long-lived-workers.md#family-handoff-and-retry) defines its named results and server evidence.
+A session move's opening message selects only its [own worker children](shutdown-and-restart.md#worker-resume-results).
+
 ## Recovery and alert ownership
 
 The unit watchdog reads current names, parents, sessions, and folders from staff.

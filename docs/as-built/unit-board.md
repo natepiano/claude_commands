@@ -20,7 +20,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
                          phase_table.build_plan(plan) ◄───────┘  (chain, gates, PhaseHistory)
                                   │                        │
             progress_history.py progress           board_json.py --session <id>
-            (short report / --tables)              writes <slug>.json, prints {files, watch}
+            (short report / --tables)              writes <staff-id>.json, prints {files, watch}
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
                                        mod: /showrunner:accounts ── runs accounts.py status --json --stored
@@ -62,8 +62,17 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 Run `scripts/lib/py scripts/direct/board_json.py --migrate-cache` to migrate the board cache. The command maps each old slug through its recorded timer owner. It preserves cache contents and lists files without a recorded owner. It exits 1 when an owner is missing. A conflicting destination stops the migration without replacing either file. A repeated migration preserves completed files. The command also resumes after an interruption between the destination creation and the source removal.
 
-- Resolve: read one staff snapshot and use it for every board’s unit rows. Join the session to its newest pane launch’s `STAFF_ID`, then follow its staff parents to the first showrunner. Unit and worker sessions see that showrunner’s production and every showrunner production below it, nearest level first. `--production <slug>` selects the same subtree by its mapped staff row and takes precedence if both selectors are supplied. The shared `MemberSources.showrunner_members` mapping joins each showrunner row to its production; `showrunners.registered_showrunners()` supplies the doc and zone. Unmapped productions are left out. A session with no staff row or no showrunner above it gives no files.
-- `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
+- Resolve uses one staff snapshot for the board and its unit rows.
+  The native session ID selects the staff row.
+  Staff parents lead to the nearest showrunner.
+  The board includes that production and its descendant showrunner productions, nearest level first.
+  `--production <slug>` selects the same subtree and takes precedence over `--session`.
+  `MemberSources.showrunner_members` joins rows to registered production documents and zones.
+  Missing staff rows or showrunner ancestors produce no files.
+- `watch` includes `NOTIFIER_STATE_DIR`, `SHOWRUNNER_STATE_DIR`, and each registered showrunner's `SHOWRUNNER_STATE_DIR/<staff id>` folder.
+  `timer_for` selects registered showrunners from the same staff snapshot.
+  The reader returns existing paths only.
+
 - The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/direct/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
 - `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
 - `stage`, in order:
@@ -79,7 +88,12 @@ Run `scripts/lib/py scripts/direct/board_json.py --migrate-cache` to migrate the
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
   - A run on another plan than its production row (tool-based-ui `demo`) shows its real phase.
   - `plan` is the Plan cell, and is empty when that file no longer exists.
-- `workers` come from the run's session dir: `mesh_roster.json` (role, status; `done` shows as `idle`, `ended` stays), `impl_worker_<slot>.json` (slot, family/model) and the slot's newest `board.log` line as `doing`.
+- `workers` combines the run roster, slot metadata, and each slot's newest board activity.
+  `recorded_turn_settings` supplies the accepted model and effort.
+  `done` displays as `idle`; `ended` stays unchanged.
+  The reader displays raw role and family values when the records contain them.
+  Missing values display as empty fields.
+  The [worker design](long-lived-workers.md#roster-fields) defines the current records without copied role or family fields.
   - Slots drop the worktree's mesh prefix.
   - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
   - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.
