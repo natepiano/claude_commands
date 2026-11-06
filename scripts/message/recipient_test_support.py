@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 from scripts.production import staff
@@ -24,5 +23,5 @@ staff.local_snapshot = staff.snapshot
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name='__main__')
 """
-    return [sys.executable, "-c", source, str(Path(__file__).resolve().parents[2]),
+    return ["/bin/bash", str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, str(Path(__file__).resolve().parents[2]),
             json.dumps([row.to_json() for row in rows]), str(script), *arguments]

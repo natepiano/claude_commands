@@ -118,7 +118,7 @@ def require_score_below_500(test: unittest.TestCase) -> None:
 
 class BuildOomScoreAdjReaderTests(unittest.TestCase):
     python_reader: list[str] = [
-        sys.executable, "-c", "from scripts.lib import conf; "
+        str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.lib import conf; "
         + 'print(conf.read("lint").whole("build_oom_score_adj"))',
     ]
 

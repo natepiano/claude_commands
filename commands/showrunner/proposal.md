@@ -62,12 +62,3 @@ Only the user's decline removes a user approval.
 Use `decline-answer <issue> --words '<user words>'` for a style decision's declined answer.
 Use `style_proposals.py complete` after each merge to close completed style decisions.
 Use `reopen <issue>` to reopen a closed decision with its recorded answer.
-
-## Migrate
-
-Run `scripts/production/migrate_proposals.py <issues folder>` on each machine with proposal files.
-Include the archive folder in the migration.
-Use `--limit 1` for the interrupted-run proof.
-Resolve reported references before the live migration continues.
-An unresolved reference preserves the whole issue file.
-A completed rerun changes no bytes and exits 0.

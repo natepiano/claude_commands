@@ -1126,101 +1126,45 @@ def _in_flight_round(state: dict[str, object]) -> dict[str, object] | None:
     return None
 
 
-def _landed(args: argparse.Namespace) -> None:
-    """Promote an in-flight round to review after its worker exited cleanly.
-
-    `implement.sh` calls this, not the unit director, for the same reason the
-    launcher owns its own pass records: the launcher is the only party that
-    watches the worker exit. A unit director can be killed, compacted, or simply
-    distracted between the repair finishing and the ledger hearing about it, and
-    every one of those gaps used to resolve as "fixed".
-
-    A session with no round in flight is the ordinary case for an implementation
-    dispatch, so it succeeds quietly rather than failing the launcher.
-    """
-    session_dir = _session_dir(args)
-    now = _now_epoch()
+def _resolve_round(args: argparse.Namespace) -> None:
+    """Resolve the repair round in flight."""
+    session_dir, now = _session_dir(args), _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
     round_entry = _in_flight_round(state)
+    landed = _arg_string(args, "resolution") == "landed"
     in_flight = _in_flight_ids(state)
     if round_entry is None or not in_flight:
+        if not landed:
+            raise SystemExit("No repair round is in flight, so there is nothing to abandon")
         print("no repair round in flight")
         return
-    for finding_id in in_flight:
-        entry = _finding(state, finding_id)
-        entry["state"] = STATE_PENDING
-        entry["landed_at"] = now
-    round_entry["outcome"] = "landed"
-    round_entry["landed_at"] = now
-    _write_state(session_dir, state)
-    _append_event(
-        session_dir,
-        state,
-        {
-            "event_type": "finding_batch_landed",
-            "timestamp": _iso_time(now),
-            "timestamp_epoch": now,
-            "round": _integer(round_entry.get("round")),
-            "landed": in_flight,
-        },
-    )
-    print(f"round {_integer(round_entry.get('round'))} landed: {', '.join(in_flight)}")
-
-
-def _abandon(args: argparse.Namespace) -> None:
-    """Return an in-flight round's findings to open because its repair died.
-
-    This is what a killed, crashed, or errored repair actually leaves: the
-    findings are open again, unreviewed, and the reason is appended to the event
-    stream. It never edits history, and it never accepts anything.
-
-    Without `--edits-landed` the round is refunded -- the attempt is uncounted
-    and the round stops counting toward the repair budget -- because a worker
-    that died before writing anything consumed no repair. Pass `--edits-landed`
-    when partial edits are in the tree: that work was real, the next reviewer has
-    to read it, and the attempt stands.
-    """
-    session_dir = _session_dir(args)
-    now = _now_epoch()
-    state = _read_state(session_dir, now, _arg_string(args, "phase"))
-    round_entry = _in_flight_round(state)
-    in_flight = _in_flight_ids(state)
-    if round_entry is None or not in_flight:
-        raise SystemExit("No repair round is in flight, so there is nothing to abandon")
     reason = _arg_string(args, "reason").strip()
-    if not reason:
+    if not landed and not reason:
         raise SystemExit("--reason is required: name how the repair ended")
     edits_landed = bool(getattr(args, "edits_landed", False))
     for finding_id in in_flight:
         entry = _finding(state, finding_id)
-        entry["state"] = STATE_OPEN
-        if not edits_landed:
+        entry["state"] = STATE_PENDING if landed else STATE_OPEN
+        if landed:
+            entry["landed_at"] = now
+        elif not edits_landed:
             entry["fix_attempts"] = max(0, _integer(entry.get("fix_attempts")) - 1)
-    round_entry["outcome"] = "abandoned"
-    round_entry["abandoned_at"] = now
-    round_entry["abandoned_reason"] = reason
-    round_entry["edits_landed"] = edits_landed
-    if not edits_landed:
-        round_entry["abandoned"] = True
+    outcome = "landed" if landed else "abandoned"
+    round_entry.update(outcome=outcome, **{f"{outcome}_at": now})
+    details: dict[str, object] = {"landed": in_flight}
+    if not landed:
+        round_entry.update(abandoned_reason=reason, edits_landed=edits_landed)
+        if not edits_landed:
+            round_entry["abandoned"] = True
+        details = {"reopened": in_flight, "reason": reason, "edits_landed": edits_landed}
     _write_state(session_dir, state)
-    _append_event(
-        session_dir,
-        state,
-        {
-            "event_type": "finding_batch_abandoned",
-            "timestamp": _iso_time(now),
-            "timestamp_epoch": now,
-            "round": _integer(round_entry.get("round")),
-            "reopened": in_flight,
-            "reason": reason,
-            "edits_landed": edits_landed,
-        },
-    )
+    _append_event(session_dir, state, {
+        "event_type": f"finding_batch_{outcome}", "timestamp": _iso_time(now), "timestamp_epoch": now,
+        "round": _integer(round_entry.get("round")), **details,
+    })
     refund = "attempt stands" if edits_landed else "attempt refunded"
-    print(
-        f"round {_integer(round_entry.get('round'))} abandoned ({refund}): "
-        + ", ".join(in_flight)
-    )
+    label = "landed" if landed else f"abandoned ({refund})"
+    print(f"round {_integer(round_entry.get('round'))} {label}: {', '.join(in_flight)}")
 
 
 def _record_decision_event(session_dir: Path, state: dict[str, object], entry: dict[str, object]) -> None:
@@ -1411,25 +1355,15 @@ def _build_parser() -> argparse.ArgumentParser:
         _ = command.add_argument("--session-dir", required=True)
         _ = command.add_argument("--phase", default="", help=PHASE_HELP)
 
-    landed = subparsers.add_parser(
-        "landed", help="promote an in-flight round to review after a clean worker exit"
-    )
-    _ = landed.add_argument("--session-dir", required=True)
-    _ = landed.add_argument("--phase", default="", help=PHASE_HELP)
-    landed.set_defaults(handler=_landed)
+    for verb in ("landed", "abandon"):
+        resolution = subparsers.add_parser(verb, help="resolve a repair round after its worker exits")
+        _ = resolution.add_argument("--session-dir", required=True)
+        _ = resolution.add_argument("--phase", default="", help=PHASE_HELP)
+        resolution.set_defaults(handler=_resolve_round, resolution=verb, reason="", edits_landed=False)
+        if verb == "abandon":
+            _ = resolution.add_argument("--reason", required=True)
+            _ = resolution.add_argument("--edits-landed", action="store_true", help="keep the repair attempt")
 
-    abandon = subparsers.add_parser(
-        "abandon", help="return an in-flight round to open because its repair died"
-    )
-    _ = abandon.add_argument("--session-dir", required=True)
-    _ = abandon.add_argument("--phase", default="", help=PHASE_HELP)
-    _ = abandon.add_argument("--reason", required=True)
-    _ = abandon.add_argument(
-        "--edits-landed",
-        action="store_true",
-        help="partial edits are in the tree, so the attempt stands rather than being refunded",
-    )
-    abandon.set_defaults(handler=_abandon)
 
     status = subparsers.add_parser("status", help="print the whole ledger")
     _ = status.add_argument("--session-dir", required=True)

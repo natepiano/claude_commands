@@ -4,10 +4,14 @@ from __future__ import annotations
 import argparse
 import os
 import pwd
+import subprocess
+import tempfile
+import unittest
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import final
+from typing import cast, final, override
+from unittest.mock import patch
 
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
 
@@ -70,6 +74,84 @@ def write_registry(path: Path, overrides: RegistryOverrides = NO_OVERRIDES, *,
     _ = path.write_text(registry_text(overrides, replace_sections=replace_sections, base_text=base_text,
                                     bare_rows=bare_rows), encoding="utf-8")
     return path
+
+
+class LaunchSettingsTests(unittest.TestCase):
+    root: Path = Path()
+    path: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / "models.conf"
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root / "home"),
+            "MODELS_CONFIG_FILE": str(self.path),
+            "MODELS_CONFIG_PUBLISH": "0",
+            "MODELS_CONFIG_TIER_ONLY": "1",
+            "CODEX_PACER_TIER_FILE": str(self.root / "absent-tier"),
+        })))
+
+    def shell_settings(self, section: str, key: str) -> tuple[str, ...]:
+        from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+        result = subprocess.run([
+            "bash", "-c", 'source "$1"; agents_resolve "$2.$3" || exit; ' +
+            'printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "$AGENT_SERVICE_TIER"',
+            "settings-test", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key,
+        ], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return tuple(result.stdout.splitlines())
+
+    def test_launch_settings_match_shell_role_resolution_and_tier_precedence(self) -> None:
+        from scripts.lib import models_registry
+
+        for family in ("codex", "claude"):
+            for section, keys in (("direct", ("impl", "test", "fix", "review")),
+                                  ("design_roles", ("designer", "reviewer"))):
+                for key in keys:
+                    for tier in ("", "fast", "flex", "default", "pace"):
+                        with self.subTest(family=family, section=section, key=key, tier=tier):
+                            _ = write_registry(self.path, {
+                                "assignments": {section: family},
+                                f"{section}.{family}": {key: "gpt-test:medium" if family == "codex" else "sonnet:max"},
+                                f"{section}.options": {"codex_service_tier": "flex",
+                                                         f"codex_service_tier.{key}": tier or None},
+                            })
+                            settings = models_registry.launch_settings(section, key)
+                            self.assertEqual((settings.kind, settings.model, settings.effort, settings.service_tier),
+                                             self.shell_settings(section, key))
+
+    def test_registry_changes_affect_the_next_launch_without_changing_caller_context(self) -> None:
+        from scripts.lib import models_registry
+
+        with patch.dict(os.environ, {"AGENTS_CALLER_FAMILY": "claude", "AGENTS_CALLER_ASSIGNMENT": "caller"}):
+            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+            first = models_registry.launch_settings("direct", "impl")
+            _ = write_registry(self.path, {"assignments": {"direct": "caller"},
+                                          "direct.claude": {"impl": "sonnet:max"}})
+            second = models_registry.launch_settings("direct", "impl")
+            self.assertNotEqual((first.kind, first.model), (second.kind, second.model))
+            self.assertEqual((second.kind, second.model, second.effort, second.service_tier),
+                             self.shell_settings("direct", "impl"))
+            self.assertEqual(os.environ["AGENTS_CALLER_FAMILY"], "claude")
+            self.assertEqual(os.environ["AGENTS_CALLER_ASSIGNMENT"], "caller")
+
+    def test_invalid_launch_rows_fail_before_a_launcher_can_use_them(self) -> None:
+        from scripts.lib import models_registry
+
+        cases: tuple[RegistryOverrides, ...] = (
+            {"direct.codex": {"impl": "missing-agent:high"}},
+            {"direct.codex": {"impl": "gpt-test:invalid-effort"}},
+            {"direct.codex": {"impl": None}},
+            {"assignments": {"direct": "unknown-family"}},
+            {"direct.options": {"codex_service_tier": "unknown-tier"}},
+        )
+        for rows in cases:
+            with self.subTest(rows=rows):
+                _ = write_registry(self.path, rows)
+                with self.assertRaises(ValueError):
+                    _ = models_registry.launch_settings("direct", "impl")
 
 
 @final

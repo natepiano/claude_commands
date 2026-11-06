@@ -45,7 +45,7 @@ On failure, it undoes the merge and prints the failed suites' output.
 
 ### The gate: `scripts/production/merge_gate.py`
 
-**Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production DOC] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
+**Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
@@ -89,7 +89,7 @@ Recursive discovery changes the ledger key once, so the first gate after this ch
 
 A deleted or renamed Python file, a graph/read error, a change under `scripts/lib/`, `conftest.py`, `settings.json`, `merge_gate.py`, `affected_modules.py`, `models_config.sh`, a `config/*.conf` change, or more than 40% affected modules forces all modules. `--full` does too. Selection prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files`, the module names when N ≤ 10, and the number of always-selected tree scanners. Otherwise it prints `full suite: <reason>` and repeats the reason in the final `Gate tests:` summary. An untouched suite prints `skipped (not affected)`. A certified selection of zero modules is green; affected passes record `kind: affected` and never replace the full base.
 
-**Nightly.** `merge_gate.py --nightly --merge-branch B [--production DOC] [--checkout DIR]` fetches `origin/B`.
+**Nightly.** `merge_gate.py --nightly --merge-branch B [--production <showrunner name>] [--checkout DIR]` fetches `origin/B`.
 It uses the production's standing checkout through `copies.standing(owner, repo, commit)`.
 It runs all test modules and basedpyright over `NIGHTLY_TYPE_DIRS`, which names `scripts` and includes hooks.
 The 03:00 timer calls this path.
@@ -106,7 +106,7 @@ A failure of only the type check removes an existing marker and does not require
 Every red nightly tells the production's showrunner through the existing messaging path.
 The type-failure notice includes the first 20 diagnostic lines, the count of omitted lines, and the checker summary.
 Without a calling session, the gate finds the registered production for the merge branch.
-`--production DOC` can name the production explicitly.
+`--production <showrunner name>` can name the production explicitly.
 A failed delivery prints its cause. A test failure keeps its marker after a failed delivery.
 
 **Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False) -> GateRun`):
@@ -270,6 +270,14 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 **`scripts/direct/wait_for_test_state.py`**
 - `wait_until(ready, directory, timeout=TEST_HANG_GUARD_SECS, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
 - `wait_for_file(path)` is a wrapper, also callable from the command line.
+
+**Python import root.** `scripts/lib/py` resolves its own repository root with shell operations.
+For stdin, `-c`, and `-m`, it puts that root first in `PYTHONPATH` and passes `-P` first.
+It preserves inherited Python paths after that root.
+Options such as `-B` and `-u` can precede the program mode.
+File scripts keep their existing import path behavior.
+The shim resolves relative paths and parent segments without another process or a directory change.
+`test_py_shim.py` tests local package collisions, old modules, cached interpreters, module mode, and file scripts.
 
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `implement.sh` run.
 

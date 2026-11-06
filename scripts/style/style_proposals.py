@@ -34,7 +34,7 @@ from approved_renames import (ApprovedRename, BindingRename, BindingScope, NoApp
 from add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
 from declarations import declaration_line
 from issues import Issue, frontmatter, open_issues, plain
-from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production import session_staff, staff, unit_config, unit_lookup
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
                             UnansweredDecision, staff_reference, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import file_text, git, unit_file_holders
@@ -117,10 +117,6 @@ def repository_name(repo: Path) -> str:
     if result.returncode:
         raise style_ledger.LedgerError(result.stderr.strip())
     return Path(result.stdout.strip()).parent.name
-
-
-def style_slug(repo: Path) -> str:
-    return repository_name(repo) + "-style"
 
 
 def workspace_directories(ledger: style_ledger.Ledger) -> tuple[str, ...]:
@@ -302,7 +298,7 @@ def family_units(doc: Path) -> dict[rules.Family, staff.StaffId]:
         raise style_ledger.LedgerError(str(error)) from error
     units: dict[rules.Family, staff.StaffId] = {}
     for row in rows:
-        unit = unit_names.unit_id(row.name)
+        unit = row.name
         family = rules.style_family(unit)
         if isinstance(family, rules.NotStyleUnit) or isinstance(row.worktree, staff.RemovedWorktree):
             continue
@@ -366,9 +362,8 @@ class DecisionWriter:
         unit = units.get(definition.approval.family)
         if unit is None:
             raise style_ledger.LedgerError(f"rule {key.rule} is always approved, but no {definition.approval.family} unit builds it")
-        slug = style_slug(self.ledger.repo)
         return {"unit": unit, "approved_by": f"rule {key.rule}",
-                "approved_in": staff_reference(slug, "showrunner").id}
+                "approved_in": staff_reference(self.standing.name, "showrunner").id}
 
     def approve_by_rule(self, decision: Issue) -> None:
         """Approve an open decision still waiting for the user when its rule, whatever the blob, is always approved."""
@@ -392,7 +387,7 @@ class DecisionWriter:
             body = Path(scratch) / "body.md"
             _ = body.write_text(self.text(key, findings))
             proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
-                             "--proposed-by", style_slug(self.ledger.repo), "--extra-tags", "style",
+                             "--proposed-by", self.standing.name, "--extra-tags", "style",
                              "--rule", key.rule, "--crate", key.crate, "--rule-blob", key.blob,
                              "--count", str(len(findings)), "--body-file", str(body),
                              "--proposed-ranking", ranking, "--initial-fields", json.dumps({**inherited, **approval}),
@@ -606,12 +601,13 @@ def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
     for cell in cells:
         if cell.family is not None and cell.state in OPEN_CELL_STATES and counts(cell.family, cell.crate):
             work[cell.path].add(cell.family)
+    families: dict[str, rules.Family | None] = {rule.rule_id: rule.family for rule in rules.load_rules(ledger.repo)}
     findings = tuple(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())
-                     if isinstance(finding.state, style_ledger.Filed | style_ledger.Unfiled))
+                     if isinstance(finding.state, style_ledger.Filed | style_ledger.Unfiled)
+                     and families.get(finding.rule.removesuffix("#uncovered")) in scopes)
     if findings:
         if isinstance(reader, DefaultProposalReads):
             reader = GitProposalReader(ledger)
-        families: dict[str, rules.Family | None] = {rule.rule_id: rule.family for rule in rules.load_rules(ledger.repo)}
         tip = ledger.synced_commit()
         directories = reader.crate_directories(tip)
         eligible = tuple(finding for finding in findings
@@ -977,7 +973,7 @@ class LegacyIssue:
 
 def off_rule_issues(ledger: style_ledger.Ledger, proposals: Path) -> tuple[Path, ...]:
     """The open issues that a style unit filed by hand through `/issue`, by name. Migrate never writes them."""
-    proposer = style_slug(ledger.repo)
+    proposer = standing_style_production(ledger.repo).name
     owner = staff_reference(proposer, "showrunner")
     filers = {owner.id, *(row.id for row in staff.snapshot().find(kind="unit", parent=owner.id))}
     named = frozenset(ledger.proposal_paths())

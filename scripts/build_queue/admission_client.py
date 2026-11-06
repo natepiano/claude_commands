@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import errno
+import json
 import math
 import os
 from pathlib import Path
@@ -257,9 +258,9 @@ def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
-          configuration: records.MemoryConfig | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
+          configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
-    acquisition = isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
+    acquisition = isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
@@ -291,14 +292,14 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
 def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
              *, attempt: Callable[[], None], channel: EstimateConnection | None, retry: AcquisitionRetry,
-             configuration: records.MemoryConfig | wire.CleanupTiming
+             configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming
              ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
     first = request
     leave_interval = (configuration.running_pass_seconds if isinstance(configuration, records.MemoryConfig)
                       else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
     # The caller can hold a lease before the service accepts a connection.
-    if isinstance(first, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest)):
+    if isinstance(first, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.BuildHistoryRequest)):
         retry.start_leave_schedule(leave_interval)
     launch = isinstance(first, wire.LaunchRequest)
     failure_limit = _whole_seconds("BUILDLOG_MEM_CHECK_RETRY_S", 60)
@@ -308,10 +309,12 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     restarted = False
     last_valid = CLOCK.monotonic()
     last_silence_notice = last_valid
+    if isinstance(configuration, wire.AcquisitionTiming) and retry.unreachable_deadline == float("inf"):
+        retry.unreachable_deadline = last_valid + configuration.unreachable_limit_seconds
 
     def check_unreachable() -> None:
-        if CLOCK.monotonic() >= retry.unreachable_deadline:
-            assert isinstance(configuration, records.MemoryConfig)
+        if (isinstance(configuration, (records.MemoryConfig, wire.AcquisitionTiming))
+                and CLOCK.monotonic() >= retry.unreachable_deadline):
             duration = _unreachable_duration(configuration.unreachable_limit_seconds)
             reason = f"build queue unreachable for {duration}; step stopped; cargo token given back"
             raise _QueueUnreachable(reason)
@@ -364,11 +367,12 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         raise CheckerFailure(str(error)) from error
                     if CLOCK.monotonic() > retry.deadline:
                         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
-                    retry.unreachable_deadline = float("inf")
+                    retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
+                        if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
                         if generation_query:
                             return reply
-                        return _refused(reply.reason, checker=isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)))
+                        return _refused(reply.reason, checker=isinstance(first, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)))
                     if generation_query:
                         if retry.left_queue():
                             return LeftQueue()
@@ -378,7 +382,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                             continue
                         raise CheckerFailure("invalid build history generation answer")
                     if isinstance(reply, (wire.Admitted, wire.LaunchAdmitted, wire.Ok)):
-                        if (isinstance(first, wire.AdmitRequest) and not isinstance(reply, wire.Admitted)
+                        if (isinstance(first, (wire.AdmitRequest, wire.ServiceEstimateRequest)) and not isinstance(reply, wire.Admitted)
                                 or isinstance(first, wire.LaunchRequest) and not isinstance(reply, wire.LaunchAdmitted)
                                 or isinstance(first, (wire.ReleaseRequest, wire.WidthRequest, wire.AdmitHeadRequest))
                                 and not isinstance(reply, wire.Ok)):
@@ -415,6 +419,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         return LeftQueue()
                     if CLOCK.monotonic() >= retry.deadline:
                         return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+                    if isinstance(cause, records.EstimateExpired) and isinstance(first, wire.ServiceEstimateRequest):
+                        break
                     if isinstance(cause, records.EstimateExpired):
                         if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
                             raise CheckerFailure("estimate cannot be refreshed")
@@ -462,8 +468,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
             if retry.launch_without_wait or CLOCK.monotonic() >= retry.deadline:
                 return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
             restart_error = isinstance(error, TransportUnavailable) or error.errno in (errno.ECONNRESET, errno.EPIPE)
-            if (isinstance(first, (wire.AdmitRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
-                    and isinstance(configuration, records.MemoryConfig)
+            if (isinstance(first, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
+                    and isinstance(configuration, (records.MemoryConfig, wire.AcquisitionTiming))
                     and (restart_error or isinstance(error, (FileNotFoundError, ConnectionRefusedError)))
                     and retry.unreachable_deadline == float("inf")):
                 retry.unreachable_deadline = CLOCK.monotonic() + configuration.unreachable_limit_seconds
@@ -506,12 +512,28 @@ def _mutation(request: wire.ReleaseRequest | wire.WidthRequest | wire.AdmitHeadR
     return cast(wire.Ok | wire.Refused, _call(request, lambda waiting: None, configuration=configuration))
 
 
+def request_id() -> str:
+    """Keep replay identities inside the connecting account's namespace."""
+    return f"uid:{os.getuid()}:{uuid.uuid4().hex}"
+
+
+def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.Wait], None],
+                  timing: wire.AcquisitionTiming = wire.PROTOCOL_ACQUISITION_TIMING
+                  ) -> wire.Admitted | wire.Refused | LeftQueue:
+    if isinstance(on_wait, WaitOutput):
+        on_wait.configuration = timing
+    reply = _call(request, on_wait, configuration=timing)
+    if isinstance(reply, (wire.Admitted, wire.Refused, LeftQueue)):
+        return reply
+    return wire.Refused("invalid service estimate answer")
+
+
 def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
-    return _mutation(wire.ReleaseRequest(uuid.uuid4().hex, reservation, status), configuration)
+    return _mutation(wire.ReleaseRequest(request_id(), reservation, status), configuration)
 
 
 def width(reservation: str, width: int) -> wire.Ok | wire.Refused:
-    return _mutation(wire.WidthRequest(uuid.uuid4().hex, reservation, width))
+    return _mutation(wire.WidthRequest(request_id(), reservation, width))
 
 
 def admit_head(why: str, actor: str) -> wire.Ok | wire.Refused:
@@ -527,7 +549,7 @@ def priority_clear(actor: str) -> wire.Ok | wire.Refused:
 
 
 def token_wait(reservation: str, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
-    return _mutation(wire.TokenWaitRequest(uuid.uuid4().hex, reservation), configuration)
+    return _mutation(wire.TokenWaitRequest(request_id(), reservation), configuration)
 
 
 def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
@@ -551,7 +573,15 @@ class WaitOutput:
     last_reasons: tuple[str, ...] = ()
     last_need: int = 0
     last_position: int = 0
+    last_holder: records.WaitHolder = field(default_factory=records.NoHolder)
     on_event: Callable[[str], None] = field(default=lambda _event: None)
+    configuration: records.MemoryConfig | wire.AcquisitionTiming | ReadConfigurationAtUse = field(
+        default=READ_CONFIGURATION_AT_USE, kw_only=True)
+
+    def reply_seconds(self) -> float:
+        configuration = (records.read_memory_config(report=False)
+            if isinstance(self.configuration, ReadConfigurationAtUse) else self.configuration)
+        return configuration.wait_reply_seconds
 
     def __call__(self, reply: wire.Wait) -> None:
         now = CLOCK.monotonic()
@@ -560,12 +590,19 @@ class WaitOutput:
         changed = (reasons != self.last_reasons or reply.snapshot.peak.bytes != self.last_need
                    or reply.position != self.last_position)
         if first:
-            self.next_notice, self.held = now + records.read_memory_config(report=False).wait_reply_seconds, True
+            self.next_notice, self.held = now + self.reply_seconds(), True
             self.on_event("first")
-        elif now < self.next_notice and not changed:
+        if first or reply.snapshot.holder != self.last_holder:
+            holder = reply.snapshot.holder
+            payload = ({"kind": "session", "session_id": holder.session_id, "session_name": holder.session_name}
+                       if isinstance(holder, records.SessionHolder) else
+                       {"kind": "unit", "unit": holder.unit} if isinstance(holder, records.UnitHolder) else {"kind": "none"})
+            self.on_event("holder " + json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+            self.last_holder = reply.snapshot.holder
+        if not first and now < self.next_notice and not changed:
             return
-        elif now >= self.next_notice:
-            self.next_notice = now + records.read_memory_config(report=False).wait_reply_seconds
+        if now >= self.next_notice:
+            self.next_notice = now + self.reply_seconds()
         self.last_reasons, self.last_need = reasons, reply.snapshot.peak.bytes
         snapshot = reply.snapshot
         decision, peak = snapshot.decision, snapshot.peak

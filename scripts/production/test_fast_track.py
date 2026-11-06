@@ -242,6 +242,8 @@ sys.exit(result.returncode)
 
 @final
 class FastTrackTests(MergeCheckpointFixture):
+    production_name: str = "example"
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.config: Path = Path()
@@ -338,7 +340,7 @@ class FastTrackTests(MergeCheckpointFixture):
             return invoke_cli(fast_track, lambda: fast_track.main(args), args, self.env, self.unit)
 
     def fast_track(self, *paths: str) -> subprocess.CompletedProcess[str]:
-        return self.command("--unit", "alpha-unit", "--production", str(self.doc),
+        return self.command("--unit", "alpha", "--production", self.production_name,
                             "--why", "repair the sample", *(paths or ("scripts/sample/item.py",)))
 
     def change_module(self) -> None:
@@ -427,7 +429,7 @@ class FastTrackTests(MergeCheckpointFixture):
         case._testMethodName = "renamed"
         with patch.object(FastTrackTests, "renamed", MarkedCase.renamed, create=True):
             with patch(f"{__name__}.invoke_cli", side_effect=AssertionError("process mark was ignored")):
-                result = case.command("--pending", "--unit", "alpha-unit")
+                result = case.command("--pending", "--unit", "alpha")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_fetch_wrapper_skips_python_logic_for_ordinary_git_commands(self) -> None:
@@ -658,8 +660,8 @@ signal.pause()
         os.mkfifo(release)
         environment = {**self.env, "FAST_TRACK_PAUSE_COMMIT": str(ready),
                        "FAST_TRACK_COMMIT_RELEASE": str(release)}
-        with subprocess.Popen([sys.executable, str(COMMAND), "--unit", "beta-unit",
-                               "--production", str(self.doc), "--why", "repair the sample",
+        with subprocess.Popen([sys.executable, str(COMMAND), "--unit", "beta",
+                               "--production", self.production_name, "--why", "repair the sample",
                                "scripts/sample/item.py"], cwd=self.unit, env=environment,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as beta:
             try:
@@ -688,7 +690,7 @@ signal.pause()
         self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
         self.assertIn("already on main", retry.stdout)
         row, = self.records()
-        self.assertEqual((row["unit"], row["commit"]), ("alpha-unit", tip))
+        self.assertEqual((row["unit"], row["commit"]), ("alpha", tip))
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
 
     def test_pending_finds_a_pushed_fix_without_a_fast_track_rerun(self) -> None:
@@ -701,14 +703,14 @@ signal.pause()
         # Review discovery must not need a safe restore or a successful promotion.
         self.write(self.unit, "scripts/sample/item.py", "later local edit\n")
         _ = (self.state / "mac-rc").write_text("1\n")
-        pending = self.command("--pending", "--unit", "alpha-unit")
+        pending = self.command("--pending", "--unit", "alpha")
         self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
         self.assertIn(tip, pending.stdout)
         self.assertIn('VALUE = "after"', pending.stdout)
         row, = self.records()
         self.assertEqual((row["commit"], row["review"]), (tip, "pending"))
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), "later local edit\n")
-        again = self.command("--pending", "--unit", "alpha-unit")
+        again = self.command("--pending", "--unit", "alpha")
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(self.records(), [row])
 
@@ -762,6 +764,11 @@ signal.pause()
             _ = valid_doc.write_text(self.doc.read_text())
             self.doc.unlink()
             self.doc = valid_doc
+            self.production_name = "valid-production"
+            from scripts.production import staff
+            from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+            with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+                _ = fixture_member("showrunner", name=self.production_name, doc=staff.LiveDoc("natedev", valid_doc))
         else:
             _ = self.git("restore", "--staged", "--worktree", "scripts/sample/item.py", cwd=self.unit)
             self.write(self.unit, "local.txt", "unrelated local commit\n")
@@ -786,7 +793,7 @@ signal.pause()
         self.assert_unrelated_attempt_does_not_block(missing_production=True)
 
     def close_restore(self, attempt: Path) -> subprocess.CompletedProcess[str]:
-        return self.command("--unit", "alpha-unit", "--close-restore", attempt.stem)
+        return self.command("--unit", "alpha", "--close-restore", attempt.stem)
 
     def test_overlapping_unsafe_restore_names_an_idempotent_close_that_preserves_edits(self) -> None:
         tip, attempt = self.interrupted_module_push()
@@ -923,7 +930,7 @@ signal.pause()
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tip)
         self.assertEqual(len(self.observations("types")), 1)
-        pending = self.command("--pending", "--unit", "alpha-unit")
+        pending = self.command("--pending", "--unit", "alpha")
         self.assertIn(tip, pending.stdout)
         self.assertIn('VALUE = "after"', pending.stdout)
 
@@ -1045,7 +1052,7 @@ signal.pause()
 
     def test_safe_unrelated_attempt_keeps_its_index_worktree_and_restore_record(self) -> None:
         tip, attempt = self.interrupted_module_push()
-        pending = self.command("--pending", "--unit", "alpha-unit")
+        pending = self.command("--pending", "--unit", "alpha")
         self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
         index = self.git("write-tree", cwd=self.unit)
         content = (self.unit / "scripts/sample/item.py").read_bytes()
@@ -1088,7 +1095,7 @@ signal.pause()
         tip = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
         self.assertNotEqual(tip, self.initial)
         self.assertEqual(self.git("show", "-s", "--format=%B", tip, cwd=self.origin),
-                         "fast-track(alpha-unit): repair the sample\n\nFast-Track: alpha-unit")
+                         "fast-track(alpha): repair the sample\n\nFast-Track: alpha")
         self.assertEqual(self.git("show", f"{tip}:scripts/sample/item.py", cwd=self.origin),
                          MODULE.replace('VALUE = "before"', 'VALUE = "after"').strip())
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
@@ -1112,7 +1119,7 @@ signal.pause()
             self.assertTrue((clone / ".git").is_dir(), "the standing checkout must remain")
         row, = self.records()
         self.assertEqual((row["unit"], row["commit"], row["why"], row["review"]),
-                         ("alpha-unit", tip, "repair the sample", "pending"))
+                         ("alpha", tip, "repair the sample", "pending"))
         self.assertRegex(str(row["patch_sha256"]), r"^[0-9a-f]{64}$")
         self.assertTrue(datetime.fromisoformat(str(row["time"]).replace("Z", "+00:00")).isoformat().endswith("+00:00"))
 
@@ -1304,24 +1311,24 @@ signal.pause()
         pushed = self.fast_track()
         self.assertEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
         row, = self.records()
-        pending = self.command("--pending", "--unit", "alpha-unit")
+        pending = self.command("--pending", "--unit", "alpha")
         self.assertEqual(pending.returncode, 0, pending.stderr)
         self.assertIn(str(row["commit"]), pending.stdout)
         self.assertIn('VALUE = "after"', pending.stdout)
         self.assertIn("diff --git", pending.stdout)
         self.assertRegex(pending.stdout, r"(?m)^#+ .+")
-        foreign = {**row, "unit": "beta-unit", "commit": self.initial,
+        foreign = {**row, "unit": "beta", "commit": self.initial,
                    "patch_sha256": hashlib.sha256(b"foreign").hexdigest()}
         later = {**row, "commit": self.initial, "patch_sha256": hashlib.sha256(b"later").hexdigest()}
         with (self.records_dir / "records.jsonl").open("a") as output:
             _ = output.write(json.dumps(foreign) + "\n" + json.dumps(later) + "\n")
-        marked = self.command("--mark-reviewed", "--unit", "alpha-unit", "--pass", "7d/1/contract",
+        marked = self.command("--mark-reviewed", "--unit", "alpha", "--pass", "7d/1/contract",
                               "--commit", str(row["commit"]))
         self.assertEqual(marked.returncode, 0, marked.stdout + marked.stderr)
         rows = self.records()
         self.assertEqual((rows[0]["review"], rows[0]["review_pass"]), ("reviewed", "7d/1/contract"))
         self.assertEqual([entry["review"] for entry in rows[1:]], ["pending", "pending"])
-        pending = self.command("--pending", "--unit", "no-such-unit")
+        pending = self.command("--pending", "--unit", "no-such")
         self.assertEqual((pending.returncode, pending.stdout), (0, ""))
 
 

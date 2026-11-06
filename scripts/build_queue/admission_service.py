@@ -27,9 +27,11 @@ from scripts.lib import conf, inotify
 from scripts.lib.boot_identity import boot_identity
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_records as records
+from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_snapshot
-from scripts.build_queue.admission_records import reason_phrase
+from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 
@@ -40,7 +42,7 @@ else:
 
 from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses
 from scripts.lint.build_shape import build_shape, recorded_build_shape
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
 from scripts.message import send_budget, send_result
 from scripts.message.session_send import session_send_argv
@@ -512,6 +514,29 @@ class StateIntents:
         self.persist()
 
 
+@dataclass(frozen=True)
+class ServiceEstimatedAdmission(wire.AdmitRequest):
+    """Retain service estimation for this connection without changing saved records."""
+
+
+def peer_uid(connection: Connection | NoConnection) -> int:
+    """Read the account before any replay or state lookup."""
+    if isinstance(connection, NoConnection):
+        return os.getuid()
+    credentials = connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    return struct.unpack("3i", credentials)[1]
+
+
+def process_uid(pid: int, proc: Path) -> int | OwnerProcessGone:
+    try:
+        for line in (proc / str(pid) / "status").read_text().splitlines():
+            if line.startswith("Uid:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return OwnerProcessGone()
+
+
 class AdmissionServer:
     def __init__(self, state_dir: Path, clock: Clock, readings: Readings, proc: Proc, *,
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
@@ -799,7 +824,7 @@ class AdmissionServer:
         run = request.run
         key = gate.run_owner(run.pid, run.start_time)
         if key not in self.run_places and self._run_alive(run):
-            self.run_places[key] = wire.RunPlace(run, place.since, request.owner)
+            self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
 
     def _live(self, owner: wire.Owner) -> bool:
         return self.proc.owner_start(owner.pid) == LiveOwnerIdentity(owner.start_time)
@@ -892,6 +917,9 @@ class AdmissionServer:
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
+            if record.episode.startswith("uid:") and isinstance(memory, gate.MeasuredMemory):
+                if isinstance(memory.anonymous, gate.AnonymousRunUse):
+                    self._sample_runner(record, memory.anonymous.bytes, now)
             memories.append((row, memory))
             self._watch_scope(lifetimes[episode], episode)
         for waiting in self.waiters.values():
@@ -930,10 +958,36 @@ class AdmissionServer:
             memory = gate.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
                                              pid=run.pid, activity=replace(evidence, run=live))
             between.append(gate.RunningStep(evidence.session_id, evidence.session_name, "between steps",
-                                           evidence.folder, 0, memory, live, live.started_at, pid=run.pid))
+                                           evidence.folder, 0, memory, live, live.started_at, pid=run.pid, unit=place.unit))
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
         return self._progress_inputs(self._inputs_with_current_slots(inputs), processes, policy)
+
+    def _sample_runner(self, record: ReservationRecord, use: int, now: float) -> None:
+        maximum = Path(record.path).with_suffix(".max")
+        try:
+            peak = int(maximum.read_text())
+        except (OSError, ValueError):
+            peak = 0
+        runner_peak = 0
+        if record.sidecar:
+            try:
+                runner_peak = int(Path(record.sidecar).with_suffix(".max").read_text())
+            except (OSError, ValueError):
+                pass
+        maximum_use = max(peak, use, runner_peak)
+        if maximum_use > peak:
+            atomic_sample(maximum, f"{maximum_use}\n")
+        wave = Path(record.path).with_suffix(".wave")
+        if use > 0 and use >= maximum_use / 2:
+            atomic_sample(wave, f"{maximum_use} {int(now)}\n")
+        elif runner_peak > 0 and runner_peak == maximum_use:
+            try:
+                sampled, at = map(int, Path(record.sidecar).with_suffix(".wave").read_text().split())
+                if sampled == maximum_use:
+                    atomic_sample(wave, f"{sampled} {at}\n")
+            except (OSError, ValueError):
+                pass
 
     def _progress_inputs(self, inputs: gate.QueueInputs, processes: dict[int, gate.ProcessIdentity],
                          policy: gate.AdmissionPolicy) -> gate.QueueInputs:
@@ -1094,7 +1148,7 @@ class AdmissionServer:
                 waiting = self.waiters[episode]
                 reason = decision.reason
                 reply = wire.Wait(reason, position, head, reason_phrase(reason, waiting_steps),
-                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason))
+                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder))
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
@@ -1137,14 +1191,14 @@ class AdmissionServer:
 
     def _wait_snapshot(self, waiting: WaitingAdmission, decision: gate.AdmissionDecision,
                        inputs: gate.QueueInputs, config: gate.MemoryConfig,
-                       reason: gate.WaitReason) -> gate.AdmissionWaitSnapshot:
+                       reason: gate.WaitReason, holder: WaitHolder) -> AdmissionWaitSnapshot:
         head = gate.first_queued_waiter(row for _, row in inputs.ordered)
         head_need = head.waiter["need"] if isinstance(head, gate.QueuedWaiter) else 0
         head_label = head.waiter.get("session_name", "") if isinstance(head, gate.QueuedWaiter) else ""
-        return gate.AdmissionWaitSnapshot(decision, waiting.request.profile.peak, inputs.running,
+        return AdmissionWaitSnapshot(decision, waiting.request.profile.peak, inputs.running,
             inputs.host.available if isinstance(inputs.host, gate.HostMemory) else 0,
             waiting.request.profile.repo, waiting.request.profile.step, config.policy, config.diagnostics,
-            head_need if not isinstance(decision.order_hold, gate.NoOrderHold) else 0, head_label, reason)
+            head_need if not isinstance(decision.order_hold, gate.NoOrderHold) else 0, head_label, reason, holder)
 
     def _drain_lifecycle(self) -> None:
         """Publish saved lifecycle facts after each durable state transition."""
@@ -1240,6 +1294,8 @@ class AdmissionServer:
                 return
         ended_at = (gate.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
+        if record.episode.startswith("uid:"):
+            self._sample_runner(record, 0, ended_at)
         self.progress_history.finish(record.reservation_id, ended_at, ended_at - gate.HISTORY_DAYS * 86400)
         if record.sidecar:
             self.progress_captures.remove(Path(record.sidecar))
@@ -1269,8 +1325,66 @@ class AdmissionServer:
             self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
 
+    def _authorize(self, request: wire.Request, uid: int) -> str:
+        if uid == os.getuid():
+            return ""
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest)):
+            return "queue priority and head admission require the service account"
+        if isinstance(request, (wire.BuildHistoryRequest, wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
+            return ""
+        key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
+               else request.request_id)
+        if not key.startswith(f"uid:{uid}:"):
+            return "request belongs to another account"
+        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
+            if process_uid(request.owner.pid, self.proc.path) != uid or not self._live(request.owner):
+                return "owner belongs to another account or no longer exists"
+            if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity):
+                if process_uid(request.run.pid, self.proc.path) != uid or not self._run_alive(request.run):
+                    return "run belongs to another account or no longer exists"
+            return ""
+        if key in self.ledger:
+            return ""
+        record = next((record for record in self.reservations.values()
+                       if record.reservation_id == request.reservation), None)
+        if record is None or not record.episode.startswith(f"uid:{uid}:"):
+            return "reservation belongs to another account"
+        return ""
+
+    def _runner_reply(self, reply: wire.Reply) -> wire.Reply:
+        if not isinstance(reply, wire.Admitted):
+            return reply
+        config = records.read_memory_config()
+        return wire.RunnerAdmitted(reply.reservation, reply.need, reply.source, reply.max_path,
+            reply.wave_path, reply.sampling_context, reply.cleanup_timing,
+            execution=wire.RunnerExecutionTiming(config.program_sample_seconds,
+                config.program_stop_seconds, config.peak_wave_seconds))
+
+    def _service_estimate(self, request: wire.ServiceEstimateRequest) -> wire.AdmitRequest:
+        config = records.read_memory_config()
+        estimate = step_estimator.step_estimate(list(request.argv), request.cwd, records.INFER_FROM_ARGV,
+            lambda: datetime.fromtimestamp(self.clock.now(), UTC), self.state_dir.parent, config.policy,
+            first_peak_bytes=config.program_first_peaks["cargo"],
+            build_history_generation=lambda: records.BuildHistoryGeneration(self.build_history_generation),
+            location=step_estimator.RepositoryLocation(request.repository, request.worktree))
+        label = config.ci_label.format(runner=request.runner, job=request.job)
+        identity = wire.Identity("", label, estimate.profile.step, request.worktree, request.runner)
+        return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
+            request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
+            isinstance(estimate.cache, records.FreshTest), code_version=request.code_version)
+
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
+        refusal = self._authorize(request, peer_uid(connection))
+        if refusal:
+            return [wire.Refused(refusal)]
+        if isinstance(connection, Connection):
+            self._record_caller_version(request, connection)
+        if isinstance(request, wire.ServiceEstimateRequest):
+            replay = self.ledger.get(request.episode)
+            if replay is not None:
+                return [self._runner_reply(replay.reply)]
+            request = self._service_estimate(request)
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and request.code_version:
             self.caller_versions[gate.run_owner(request.owner.pid, request.owner.start_time)] = request.code_version
         if isinstance(request, wire.BuildHistoryRequest):
@@ -1472,6 +1586,8 @@ class AdmissionServer:
         return [reply]
 
     def _deliver(self, waiting: WaitingAdmission, reply: wire.Reply) -> None:
+        if isinstance(waiting.request, ServiceEstimatedAdmission):
+            reply = self._runner_reply(reply)
         episode = waiting.request.episode
         if episode in self._pending_replies:
             self._pending_replies[episode].append(reply)
@@ -1591,7 +1707,6 @@ class AdmissionServer:
                 cleanup = isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest))
                 if len(line) + 1 > (wire.CLEANUP_REQUEST_MAX_BYTES if cleanup else request_limit):
                     raise ValueError(reason)
-                self._record_caller_version(request, connection)
                 if not isinstance(request, wire.BuildHistoryRequest):
                     if not isinstance(connection.request, NoRequest):
                         raise ValueError("one request for admission per connection")

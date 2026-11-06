@@ -1,7 +1,7 @@
 """Versioned admission envelopes; domain values use the shared snapshot codec."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -55,6 +55,7 @@ class RunPlace:
     run: RunIdentity
     since: float
     first_owner: Owner
+    unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,22 @@ class AdmitRequest(CallerCode):
     fresh_test: bool
     token_back_at: float = 0.0
     run: RunIdentity | NoRun = NO_RUN
+
+
+@dataclass(frozen=True)
+class ServiceEstimateRequest(CallerCode):
+    """Ask the service to estimate a cargo call from its own history."""
+    episode: str
+    owner: Owner
+    argv: tuple[str, ...]
+    cwd: str
+    since: float
+    sidecar: str
+    repository: records.Repository
+    worktree: str
+    runner: str
+    job: str
+    test_width: records.TestWidth = records.NoTestWidth()
 
 
 @dataclass(frozen=True)
@@ -161,7 +178,7 @@ class TokenWaitRequest(CallerCode):
     reservation: str
 
 
-Request = (AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
+Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest)
 
 
@@ -172,6 +189,18 @@ class Wait:
     head: str
     text: str
     snapshot: records.AdmissionWaitSnapshot
+
+
+@dataclass(frozen=True)
+class AcquisitionTiming:
+    """Bound acquisition without reading the client account's configuration."""
+    silence_seconds: float
+    reconnect_seconds: float
+    unreachable_limit_seconds: float
+    wait_reply_seconds: float = 60.0
+
+
+PROTOCOL_ACQUISITION_TIMING = AcquisitionTiming(120.0, 2.0, 300.0)
 
 
 @dataclass(frozen=True)
@@ -196,6 +225,18 @@ class Admitted:
     wave_path: str
     sampling_context: dict[str, object]
     cleanup_timing: CleanupTiming = PROTOCOL_CLEANUP_TIMING
+
+
+@dataclass(frozen=True)
+class RunnerExecutionTiming:
+    program_sample_seconds: float
+    program_stop_seconds: float
+    peak_wave_seconds: float
+
+
+@dataclass(frozen=True)
+class RunnerAdmitted(Admitted):
+    execution: RunnerExecutionTiming = field(kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -235,16 +276,16 @@ class MineReply:
     reading: records.QueueRead
 
 
-Reply = Wait | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
+Reply = Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
 
 _REQUESTS: dict[str, type] = {
-    "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
+    "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest, "admit_head": AdmitHeadRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
 }
 _REPLIES: dict[str, type] = {
-    "wait": Wait, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
+    "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok, "view": ViewReply, "explain": ExplainReply, "mine": MineReply,
 }
 T = TypeVar("T")
@@ -344,7 +385,7 @@ def encode_reply(reply: Reply) -> str:
 def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:
     reply = cast(Reply, _parse(line, _REPLIES))
     if (isinstance(request, LaunchRequest) and isinstance(reply, Admitted)
-            or isinstance(request, AdmitRequest) and isinstance(reply, LaunchAdmitted)):
+            or isinstance(request, (AdmitRequest, ServiceEstimateRequest)) and isinstance(reply, LaunchAdmitted)):
         raise ValueError("admission outcome does not match request")
     return reply
 
