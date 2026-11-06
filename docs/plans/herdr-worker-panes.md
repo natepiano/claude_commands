@@ -549,7 +549,7 @@ Acceptance gate: basedpyright 0/0 on changed files and every caller module; name
 
 #### As-built
 
-models-unit built this phase to the staff-lifecycle spec. Its as-built is the Phase 3n section of `docs/plans/models-rename-track.md`. In short:
+models-unit built this phase to the staff-lifecycle spec. Its as-built is `docs/as-built/long-lived-workers.md`. In short:
 - The staff row is the one record of a worker. Rosters, the worker ledger, run records, inboxes and design-role records store no thread id, cwd, owner or family.
 - `StaffRow.parent` is `ReportsTo(id) | StaffRoot`. `staff.ensure_worker(identity, name, parent)` publishes a worker at the `worker_admission.py` boundary. Adoption is one write of the worker row's `parent`.
 - No row carries a role, no `"backends"` section is stored, the storage schema stays 2, and there is no `adopt_worker`. `StaffSnapshot.backends` finds a backend from `current_session`.

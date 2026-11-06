@@ -282,27 +282,20 @@ def _config_path() -> Path:
     return Path(os.environ.get("CONF_DIR") or "~/.claude/config").expanduser() / "direct.conf"
 
 
-def _models_config_path() -> Path:
-    return models_registry.registry_path()
-
-
 @cache
 def _config_digest() -> str:
-    """Both configuration files hashed together, empty when either cannot be read.
+    """Hash the launch registry and direct settings once per process.
 
-    Cached for the life of the process: one launcher records one pass, and both
-    files answer the same way every call. This is telemetry and must never stop
-    a unit run, so an unreadable file returns empty rather than raising --
-    and empty rather than the hash of the half that could be read, which would
-    name a configuration this process never saw and group unlike passes under it.
+    Return empty text when either source is unavailable. Telemetry must not stop a run.
     """
-    contents: list[bytes] = []
-    for path in (_models_config_path(), _config_path()):
-        try:
-            contents.append(path.read_bytes())
-        except OSError:
-            return ""
-    return hashlib.sha256(b"".join(contents)).hexdigest()[:CONFIG_DIGEST_LENGTH]
+    try:
+        text = (models_registry.launch_configuration(os.environ).text
+                if os.environ.get(models_registry.OPERATION_ENVIRONMENT[0]) else models_registry.registry_text())
+        registry = text.encode("utf-8")
+        contents = registry + _config_path().read_bytes()
+    except (OSError, ValueError, UnicodeError):
+        return ""
+    return hashlib.sha256(contents).hexdigest()[:CONFIG_DIGEST_LENGTH]
 
 
 PASS_OWNER_ENV = "UNIT_PASS_OWNER"

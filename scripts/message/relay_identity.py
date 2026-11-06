@@ -12,6 +12,9 @@ if __package__:
 else:
     from process_identity import process_start
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.boot_identity import boot_identity
+
 RELAY_PREFIX = "relay/"
 
 
@@ -58,8 +61,8 @@ def _process_lifetime(pid: int) -> ProcessLifetime | ProcessLifetimeUnknown:
     if not started:
         return ProcessLifetimeUnknown()
     try:
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip() if sys.platform == "linux" else ""
-    except (OSError, UnicodeError):
+        boot = boot_identity() if sys.platform == "linux" else ""
+    except (OSError, UnicodeError, ValueError):
         return ProcessLifetimeUnknown()
     if sys.platform == "linux" and not boot:
         return ProcessLifetimeUnknown()

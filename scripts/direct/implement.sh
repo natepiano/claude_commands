@@ -99,25 +99,26 @@ FINDINGS_STATE="${SESSION_DIR}/findings_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
 source "${SCRIPT_DIR}/../agents/models_config.sh"
+models_launch_configuration || exit 1
 agents_resolve_claude_launcher "${TASK}" implement.sh || exit $?
 
 # Lock identity checks and claim writes.
 worker_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
-  "${AGENT_MODEL}" "${SCRIPT_DIR}" "${PASS_KIND}" <<'PY'
+  "${AGENT_MODEL}" "${SCRIPT_DIR}" "${PASS_KIND}" "${PROMPT_FILE}" <<'PY'
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-action, root_text, slot, name, model, script_dir, pass_kind = sys.argv[1:]
+action, root_text, slot, name, model, script_dir, pass_kind, prompt_text = sys.argv[1:]
 root = Path(root_text)
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(script_dir).resolve().parents[1]))
 from scripts.production import staff, session_staff, worker_admission
 sys.path.insert(0, str(Path(script_dir)))
-from worker_state import worker_claim_lock, worker_record_path
+from worker_state import worker_claim_lock, worker_record_path, worker_status_path
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
@@ -131,7 +132,7 @@ def read(path):
 
 if action == "admit":
     try:
-        worker_admission.admit(name, root, role=pass_kind)
+        worker_admission.admit(name, root)
     except worker_admission.AdmissionRefused as error:
         print(error, file=sys.stderr)
         raise SystemExit(2)
@@ -139,11 +140,16 @@ if action == "admit":
 
 with worker_claim_lock(root):
     identity_file = worker_record_path(root, name, "fix" if pass_kind == "fix" else slot)
-    member = worker_admission.member(root, name)
+    snapshot = staff.local_snapshot()
+    member = worker_admission.member(root, name, snapshot)
     reference = member.id if member else ""
     worker_id = member.current_session if member else ""
     if action == "switch":
-        raise SystemExit(0 if member and session_staff.worker_family(staff.local_snapshot(), member.id) != "claude" else 1)
+        if not member:
+            raise SystemExit(1)
+        if session_staff.worker_family(snapshot, member.id) != "claude":
+            raise SystemExit(0)
+        raise SystemExit(0 if worker_admission.dispatch_pending(root, name, Path(prompt_text)) else 1)
     elif action == "record":
         if not worker_id:
             raise SystemExit(1)
@@ -155,7 +161,7 @@ with worker_claim_lock(root):
         if not identity and reference:
             identity_file.write_text(json.dumps(expected))
         print(model)
-        status_path = root / f"impl_status_{slot}"
+        status_path = worker_status_path(root, slot)
         claim = read(claim_file)
         pid = claim.get("pid", 0)
         stale_claim = False
