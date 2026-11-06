@@ -87,6 +87,27 @@ Settings entry for the user, one more SessionEnd item:
   dropped as it is read. The Mac hides the environment of a system binary such as `/bin/zsh`,
   never of Claude.
 
+## Codex panes
+
+- A Codex pane launch passes `--no-daemon`. A daemon-attached Codex reports no `agent_session`.
+- A fresh Codex worker gets one short first turn, `WORKER_FIRST_TURN_TEXT`, with the limit
+  `WORKER_FIRST_TURN_SECONDS` (`config/direct.conf`). `worker_panes.start_or_resume` then publishes
+  the staff row from the pane's `agent_session`.
+- A known identity launches with `resume <id>` and gets no first turn.
+- `herdr.pane_native_process` is the one reader of pane membership. For one foreground `codex`:
+  - an open rollout proves the pane;
+  - an `agent_session` equal to the row's `current_session` proves the pane;
+  - a `resume` argument proves the pane when the report is empty (`UnreportedResume`: a resumed
+    Codex reports nothing before its first prompt) or equals the argument;
+  - a report that names another session proves nothing, and so does a pane row that cannot be read.
+- `PANE_AGENT_START_SECONDS` is the one launch deadline, for a worker and for a side pane.
+- `herdr.child_environment` removes `NO_COLOR`. With it, Claude draws no SGR, and `_composer_input`
+  reads the faint placeholder as typed text.
+- The pane's terminal owns `TERM` and `COLORTERM`. `herdr._pane_environment` removes them at a new
+  tab, a split and an existing-pane launch. A Codex tool shell holds `TERM=dumb`. With it, `/etc/zshrc`
+  turns off the line editor, so zsh keeps the raw tty that a stopped Codex leaves, and the Enter
+  from `pane run` never ends a line.
+
 ## Still to come
 
 - Automatic boot restore is not installed on either machine.
