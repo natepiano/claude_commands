@@ -618,6 +618,10 @@ class AgentStatus(StrEnum):
     DEAD = "dead"
     NONE = "none"
 
+    @property
+    def idle(self) -> bool:
+        return self in {AgentStatus.IDLE, AgentStatus.DONE}
+
     @classmethod
     def decode(cls, value: object) -> AgentStatus:
         text = json_text(value, "herdr agent status")
@@ -893,7 +897,6 @@ class AgentWaitResult(TypedDict):
 
 class WorkerReadiness(TypedDict):
     agent_status: AgentStatus
-    interactive_ready: bool
 
 
 class AgentGetResult(TypedDict):
@@ -2048,33 +2051,16 @@ class Herdr:
 
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")
-        status = AgentStatus.decode(agent.get("agent_status"))
-        ready = agent.get("interactive_ready")
-        if not isinstance(ready, bool):
-            print(f"herdr {self.session}:{pane}: readiness is unknown", file=sys.stderr)
-            ready = False
-        return {"agent_status": status, "interactive_ready": ready}
+        return {"agent_status": AgentStatus.decode(agent.get("agent_status"))}
 
-    @staticmethod
-    def _remote_control_turn(row: dict[str, object]) -> bool:
-        """Identify a system turn that confirms Remote Control."""
-        return row.get("type") == "system" and (
-            row.get("subtype") == "bridge_status" or "/remote-control is active" in _turn_text(row))
-
-    def prompt_input_state(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript,
-                           launched_at: datetime, *,
-                           cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
-                           ) -> PromptInputReady | PromptInputNotReady:
+    def prompt_input_state(self, pane: str) -> PromptInputReady | PromptInputNotReady:
         ready, idle = False, False
         try:
-            observation = self.readiness(pane)
-            idle = observation["agent_status"] == AgentStatus.IDLE
-            ready = observation["agent_status"] in {AgentStatus.WORKING, AgentStatus.IDLE} and observation["interactive_ready"]
+            status = self.readiness(pane)["agent_status"]
+            idle = status.idle
+            ready = status == AgentStatus.WORKING or idle
         except (OSError, subprocess.SubprocessError, HerdrFailure):
             pass
-        if not ready and isinstance(transcript, SessionTranscript):
-            reader = cursor if isinstance(cursor, TranscriptCursor) else TranscriptCursor(transcript, launched_at)
-            ready = any(self._remote_control_turn(row) for _, row in reader.read_turns())
         if not ready:
             return PromptInputNotReady("destination session is still loading")
         raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
@@ -2084,16 +2070,11 @@ class Herdr:
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
 
-    def wait_for_prompt_input(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript, launched_at: datetime,
-                              timeout_ms: int, *,
-                              cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
-                              ) -> PromptInputReady | PromptInputTimedOut:
-        if isinstance(cursor, UnspecifiedPromptTranscript) and isinstance(transcript, SessionTranscript):
-            cursor = TranscriptCursor(transcript, launched_at)
+    def wait_for_prompt_input(self, pane: str, timeout_ms: int) -> PromptInputReady | PromptInputTimedOut:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         while time.monotonic() < deadline:
-            state = self.prompt_input_state(pane, transcript, launched_at, cursor=cursor)
+            state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
@@ -2161,9 +2142,11 @@ class Herdr:
             return failure(reason)
 
         try:
-            ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at, timeout_ms, cursor=cursor)
+            ready = self.wait_for_prompt_input(pane, timeout_ms)
             screen = ready.screen
             if isinstance(ready, PromptInputTimedOut):
+                if isinstance(cursor, TranscriptCursor):
+                    _ = cursor.read_turns()
                 if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
                     return deadline_failure()
                 return failure("destination never became ready for input")
@@ -2191,8 +2174,7 @@ class Herdr:
                     if time.monotonic() >= deadline:
                         return deadline_failure()
                     if isinstance(cursor.readability, TranscriptReadable):
-                        ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
-                            max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                        ready = self.wait_for_prompt_input(pane, max(0, int((deadline - time.monotonic()) * 1000)))
                         if isinstance(ready.screen, str):
                             screen = ready.screen
                         if isinstance(ready, PromptInputTimedOut):
@@ -2274,16 +2256,15 @@ class Herdr:
                         continue
                     if composer.text.strip():
                         return failure("destination input contains other text")
-                    # Working can mean queued input, even with an empty box. Only
-                    # an idle recipient after a quiet settle window may be re-typed.
+                    # Working can mean queued input, even with an empty composer.
+                    # Retype only when the recipient is idle after the settle time.
                     observation = self.readiness(pane)
-                    if (observation["agent_status"] != AgentStatus.IDLE
+                    if (not observation["agent_status"].idle
                             or time.monotonic() - last_input < PROMPT_SETTLE_SECONDS):
                         continue
                     if typings == 3:
                         return failure("no user turn after three typings")
-                    ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
-                        max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                    ready = self.wait_for_prompt_input(pane, max(0, int((deadline - time.monotonic()) * 1000)))
                     if isinstance(ready.screen, str):
                         screen = ready.screen
                     if isinstance(ready, PromptInputTimedOut):
@@ -3385,8 +3366,16 @@ def codex_conversations() -> CodexConversations:
             for session in observed:
                 _ = live.setdefault(session.thread_id, ())
     runs: set[Path] = set()
-    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
+    for root in (*unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")), unit_runs.ASTRA_RUN_ROOT):
         runs.update(path.parent for path in root.glob(f"*/{unit_runs.SERVER_FILE}"))
+    server_pids: set[int] = set()
+    for run in runs:
+        try:
+            pid = worker_lifecycle.read_json_object(run / unit_runs.SERVER_FILE).get("pid")
+            if isinstance(pid, int):
+                server_pids.add(pid)
+        except (OSError, ValueError):
+            pass
     for pid, arguments in candidates:
         if not is_codex_process(arguments) or codex_managed_daemon(arguments):
             continue
@@ -3416,7 +3405,7 @@ def codex_conversations() -> CodexConversations:
                 pass
             if environment is not None:
                 if "app-server" in arguments:
-                    if environment.get("UNIT_RUN_DIR"):
+                    if environment.get("UNIT_RUN_DIR") or pid in server_pids:
                         # The run read below resolves a server with no open rollout.
                         continue
                 elif no_rollout and "--no-daemon" not in arguments:

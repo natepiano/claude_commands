@@ -375,7 +375,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         }
         write_process(self.env, 998040, 1, ["zsh"], {"HERDR_SESSION": SHARED, "HERDR_PANE_ID": "w1:p1"})
         responses[f"--session {SHARED} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+            "result": {"agent": {"agent_status": "idle"}}}))
         responses[f"--session {SHARED} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
             code=0, stdout="────────\n❯ \n────────")
         for suffix in ("", " resume"):

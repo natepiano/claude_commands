@@ -172,7 +172,19 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
 def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
     try:
         panes = client.panes()
-        return [(row, pane["pane_id"]) for row in rows for pane in panes if pane["session_id"] == row.current_session]
+        launches = {entry["session_id"]: entry for entry in sorted(pane_record.launches(), key=lambda entry: entry["written_at"])}
+        pane_ids = {pane["pane_id"] for pane in panes}
+        found: list[tuple[staff.StaffRow, str]] = []
+        for row in rows:
+            matches = [pane["pane_id"] for pane in panes if pane["session_id"] == row.current_session]
+            if matches:
+                found.extend((row, pane) for pane in matches)
+                continue
+            entry = max((launches[reference] for reference in (str(row.id), str(row.current_session)) if reference in launches),
+                        key=lambda entry: entry["written_at"], default=None)
+            if entry is not None and entry["pane_id"] in pane_ids:
+                found.append((row, entry["pane_id"]))
+        return found
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
         return []

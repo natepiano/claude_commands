@@ -712,6 +712,39 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(shutdown_record.row_folder(replace(self.rows[2], worktree=staff.PresentWorktree("natedev", self.root / "own")),
                 staff.StaffSnapshot(self.rows)), ("natedev", self.root / "own"))
 
+    def test_codex_dry_run_uses_the_newest_pane_record_and_reports_rows_without_a_tab(self) -> None:
+        self.rows = (replace(self.rows[0], kind="agent", name="morty"), *self.rows[1:])
+        row = self.rows[0]
+        older: pane_record.PaneLaunch = {"kind": "codex", "pane_id": "w1:p2", "session_id": str(row.id),
+            "config_dir": "/account", "cwd": str(self.root), "name": row.name, "model": "",
+            "remote_control": False, "environment": {}, "flags_read": True, "written_at": "1"}
+        for reference in (str(row.id), str(row.current_session)):
+            newest = older.copy()
+            newest.update(session_id=reference, pane_id="w1:p0", written_at="2")
+            with (self.subTest(reference=reference),
+                  patch.object(restart, "live_rows", return_value=list(self.rows)),
+                  patch.object(herdr.Herdr, "panes", return_value=[{**pane, "session_id": None} for pane in self.panes()]),
+                  patch.object(herdr, "saved_layout", return_value={"at": 1, "workspaces": []}),
+                  patch.object(pane_record, "launches", return_value=[newest, older]) as launches,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(restart.restart(stop_all=True, dry_run=True), 0)
+            launches.assert_called_once_with()
+            self.assertEqual(output.getvalue().splitlines(), [
+                f"{row.name}: {row.id}, agent, workspace live, tab 1 ({row.name})",
+                *[f"{other.name}: {other.id}, {other.kind}, no tab" for other in self.rows[1:]]])
+
+    def test_row_panes_keeps_session_matches_and_ignores_an_absent_recorded_pane(self) -> None:
+        row = self.rows[0]
+        entry: pane_record.PaneLaunch = {"kind": "codex", "pane_id": "w1:p9", "session_id": str(row.id),
+            "config_dir": "/account", "cwd": str(self.root), "name": row.name, "model": "",
+            "remote_control": False, "environment": {}, "flags_read": True, "written_at": "2"}
+        older = entry.copy()
+        older.update(pane_id="w1:p1", written_at="1")
+        with patch.object(pane_record, "launches", return_value=[entry, older]):
+            self.assertEqual(restart.row_panes([row], herdr.Herdr("agents")), [(row, "w1:p0")])
+            with patch.object(herdr.Herdr, "panes", return_value=[{**pane, "session_id": None} for pane in self.panes()]):
+                self.assertEqual(restart.row_panes([row], herdr.Herdr("agents")), [])
+
     def test_restart_lock_refusal_leaves_the_record_unchanged(self) -> None:
         reference = str(self.rows[0].id)
         for stop_all in (False, True):

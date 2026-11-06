@@ -163,11 +163,13 @@ prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and i
 session name now. `<slug>` is this doc's file name without `-production.md`; a former
 slug from the Formerly line also works.
 
-To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
-between phases. Never edit the staff row or `.unit.toml` by hand. The rename stops the unit,
-moves its branch, worktree and state, and commits `chore(<slug>): rename unit <old> to <new>` on
-the merge branch. Merge history follows that commit, so the unit's past merges still count under
-the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
+To rename a unit or showrunner, run `/showrunner:rename plan|apply <old> <new>`.
+Use a staff id, `slug/name`, or a unique name.
+A bare name first selects the calling showrunner or its units.
+The command searches all productions only when that scope has no match.
+A unit rename changes matching folder and branch suffixes and resumes its live sessions.
+The command keeps staff ids and creates no commit.
+Use `unit_move.py move-folder --unit <staff id> --to <path>` to move only the folder.
 
 To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner session. It refuses
 while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns

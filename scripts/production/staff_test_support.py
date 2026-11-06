@@ -402,7 +402,7 @@ def source_environment(source: Path) -> dict[str, str]:
         ("HERDR_PANE_RECORD_DIR", "panes"), ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("XDG_CONFIG_HOME", "config"),
         ("UNIT_WORKERS_STATE", "unit-workers"), ("ROSTER_RUN_ROOT", "runs"),
-        ("ASTRA_ROLES_STATE", "astra-roles"),
+        ("ASTRA_ROLES_STATE", "astra-roles"), ("ASTRA_REVIEW_DIR", "astra-runs"),
         ("DESIGN_ROLES_STATE", "design-roles"), ("DESIGN_OWNERSHIP_STATE", "design-ownership"),
     )}
 
@@ -453,9 +453,11 @@ def observe_operation_lock() -> None:
 @contextmanager
 def isolated_source_readers() -> Generator[None]:
     """Redirect import-bound source paths and prevent live session discovery."""
+    from scripts.lib import unit_runs
     from scripts.message import process_table
 
     with ExitStack() as contexts:
+        _ = contexts.enter_context(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", Path(os.environ["ASTRA_REVIEW_DIR"])))
         # Process-evidence cases install their own private snapshot inside this boundary.
         _ = contexts.enter_context(mock.patch.object(process_table, "snapshot", return_value={}))
         for module_name, attributes in (

@@ -653,7 +653,7 @@ class SourceCheckTests(unittest.TestCase):
             "docs/as-built/usage-ledger.md",
             "docs/as-built/build-memory-admission.md",
             "docs/production_format.md",
-            "scripts/production/rename_unit.py",
+            "scripts/production/rename.py",
             "scripts/direct/implement.sh",
             "scripts/usage/collect.py",
         )
