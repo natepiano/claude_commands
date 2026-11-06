@@ -15,7 +15,8 @@ Codex review prompts also include section 3's command block.
    Use opening wording for a replacement conversation.
 2. Boundaries: prohibit commits, branches, and unrelated edits.
    State both file sets under <TeamFilePartition/>. Block changes to a peer's files.
-   Require the summary as the last act at the full `${PHASE_DIR}/impl_summary_<slot>.txt` path.
+   For an existing `mesh` pin, require the summary as the last act at the full `${PHASE_DIR}/impl_summary_<slot>.txt` path.
+   For `herdr`, require the summary in the final reply, because the launcher saves that reply as the summary.
    Include files, reasons, deviations, doubts, unverified checks, and edits outside the file set.
    Implementation, fix and test prompts carry verbatim:
    "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer worker owns the phase style review."
@@ -23,6 +24,8 @@ Codex review prompts also include section 3's command block.
    <ReviewPromptContract/>'s style assignment instead.
 3. Narration: require this command when the activity changes, with the concrete path and assigned slot:
    `bash ~/.claude/scripts/direct/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
+   For a read-only pane reviewer, require short output lines instead of board posts.
+   Assign its required suites to the director or a writer.
    Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
    Include this command block verbatim after section 2 in every Codex prompt:
 
@@ -53,7 +56,9 @@ Codex review prompts also include section 3's command block.
    ```
 
    Claude workers use `run_in_background: true` and end the turn until the result arrives.
-   Before a role change, require `bash ~/.claude/scripts/direct/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`.
+   Before a role change, require this command from writers and existing mesh-pinned reviewers:
+   `bash ~/.claude/scripts/direct/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`.
+   The director records a pane reviewer's role change.
    Use the concrete path and the prompt's slot. Check that different prompts name different slots.
 4. `## Team`: copy the Workers assignment and file ownership, including one owner for each hub file.
    Copy the <CoordinationBoard/> commands. State that `verify.sh` may pause for a peer.
@@ -290,18 +295,20 @@ not exist is not worth inventing; a partition that is wrong costs the phase.
 </TeamFilePartition>
 
 <RoleReassignment>
-Roles move; slots do not. Any open worker may take any role, mid-phase included,
-because every worker in a unit works in the same area. Before dispatch, post a
-board `handoff` naming the slot, the role it leaves, and the role it takes; the
-new prompt has that worker run `board.sh role` before its first tool call.
+Roles move; slots do not.
+Any open worker may take any role during a phase.
+Before dispatch, record the role change with `board.sh role <session_dir> <slot> <role> "<why>"`.
+For a read-only pane reviewer, the director records the change.
+Otherwise require the worker to run `board.sh role` as its first tool call.
 
 A busy turn does not reserve its worker's next role. Reassign it when that turn
 ends; when the new work must run concurrently and every open worker is busy, open
 an extra worker named for its work (`review`, `fix2`) and keep it for reuse. Never
 abandon unwritten tests: assign them to an open worker or open one.
 
-**Standing down means ending the turn, not waiting.** A slot with nothing left
-posts `done` with what it completed and finishes its turn; it never runs an idle
-poll loop. Keep its native conversation for the director's next assignment under <LongLivedWorkers/>.
-Use <PhaseCleanup/> for removal.
+A writer with no remaining task posts `done` and ends its turn.
+Apply <ReviewPromptContract/> to a reviewer's completion.
+Never poll while idle.
+Keep the native conversation for the director's next assignment under <LongLivedWorkers/>.
+Use <PhaseCleanup/> for permanent removal.
 </RoleReassignment>

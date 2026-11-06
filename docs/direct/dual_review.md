@@ -78,20 +78,21 @@ command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error.
 Re-read the tree; trust nothing from memory about its state.
 ```
 
-In a run's own-worker review, the opening also gives the concrete
-`board.sh role ... review` command for the worker's first tool call. The reviewer
-narrates each change of activity as a short output line so the wrapper
-heartbeat remains live, and never polls, sleeps or narrates a wait. It receives no
-heartbeat path and never receives `${IMPL_SUMMARY}`. The reviewer runs read-only.
+For `herdr`, the reviewer posts no board lines and runs no suites.
+The director or a writer handles required board posts and suites.
+For an existing `mesh` pin, give the concrete `board.sh role ... review` command as the reviewer's first tool call.
+The reviewer reports each activity change as a short output line.
+It never polls, sleeps, or reports a wait.
+Give it no heartbeat path or `${IMPL_SUMMARY}`.
+The reviewer runs read-only.
 
-Do not repeat the implementer's listed verification. Apart from the assigned
-<StyleReview/>, a reviewer may run one specific omitted check only when a
-plausible regression lies outside the listed gate, and must name that command;
-a Codex reviewer runs it
-with `verify.sh` per the `## Builds and tests` section of
-<WritePromptContract/> item 3, which every Codex review prompt carries verbatim. Broad reviews apply
-<TypeDesignContract/>; closure reviews apply <ClosureReview/>, including any
-style assignment still owed under this contract.
+Do not repeat the implementer's listed verification.
+For `herdr`, name an omitted check for the director or a writer when a plausible regression requires it.
+For an existing `mesh` pin, a reviewer may run one omitted check for a plausible regression outside the listed gate.
+It names the command and uses `verify.sh` under <WritePromptContract/> item 3.
+Every Codex review prompt carries that item's `## Builds and tests` section verbatim.
+Broad reviews apply <TypeDesignContract/>.
+Closure reviews apply <ClosureReview/>, including any owed style assignment.
 
 Every review prompt carries the Three Gods sentence and the Type Design
 Contract under <WritePromptContract/>. Its standing-instructions line names
@@ -288,6 +289,9 @@ final diff only.
      --prompt "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md"
    ```
 
+   For `herdr`, name `--to review2` for a second lens that runs at the same time.
+   The worker command refuses automatic selection when all suitable workers are busy.
+   Give each additional concurrent lens a distinct available review name with `--to`.
    A closure review omits `--lens` and uses `review_prompt_${REVIEW_PASS}.md`.
    Keep each dispatch handle and apply <LongLivedWorkers/> for selection and reuse.
    Read the summary path each dispatch returns.

@@ -128,7 +128,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 5. **The launcher's whole wait is one background `herdr agent prompt <id> "<line>" --wait`, with no `--timeout` and no `--until`.** herdr then waits for its default settled set, `idle`, `done` or `blocked`, after it sees the turn start (herdr skill, "For normal agent work, `--wait` is enough"). `blocked` wakes the launcher, so a worker at an approval dialog never stalls the director. The director runs the launcher in the background, as today, and the task notification is the wake-up.
 6. **A dispatch refuses a busy worker; a message queues.** A dispatch is a new pass that a launcher waits on, so it needs an `idle` or `done` worker, under the worker's dispatch lock. A message (`send.py`, a detached-run result, review Stage 2) is typed at once, also during a turn: Codex and Claude queue typed input. A blocked or closed worker's message goes to its director. `pending.json` drops.
 7. **A prompt goes in by file path, not as pasted text.** The launcher types one line: `Read <prompt path> and do the work it gives. End your final reply with the line DONE <dispatch id>.`
-8. **No launcher compaction, and no "Continue where you stopped." retry.** Interactive Codex and Claude compact by themselves.
+8. **No launcher compaction, and no "Continue where you stopped." retry.** Interactive Codex and Claude compact by themselves. A Codex pane worker takes `-c model_auto_compact_token_limit=<UNIT_COMPACT_ABOVE_TOKENS>` at launch, because Codex otherwise waits for its 475,000-token window (showrunner ruling, 2026-11-06).
 9. **Codex stays a worker kind.** herdr starts `--kind codex` and `--kind claude` agents. The default worker kind per role stays where it is set today.
 10. **`herdr.py` stays the one herdr client.** `Herdr.panes()` remains the shared pane parser.
     `Herdr._row_panes` owns the native-session join and returns `RowPaneScan(found, unknown)`.
@@ -2587,7 +2587,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 - No rerun test: displays only read (Invariants → Rerun-safe tools).
 - Full gate green.
 
-### Phase 14 — Instructions describe panes  · status: todo
+### Phase 14 — Instructions describe panes  · status: done
 
 **Depends on:** Phase 10, Phase 11, Phase 12, Phase 13 behavior. Draft beside Phase 11 from its fixed contract; check final text and code together in the shared 11/14 gate.
 
@@ -2610,16 +2610,20 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 10. Phase 14d pilot text. A second review lens at the same time names `--to review2`, because the worker command refuses when all workers are busy. After an incomplete pass, the director reruns the saved launcher command before another role's dispatch, and `findings.py landed` runs when that launcher does not run it. A read-only pane reviewer posts no board line and runs no suite, so the director or a writer runs them. A quiet wait that returns exit 3 has the same recovery.
 11. `worker.py end` prints the configuration refusal and exits 7 when the stop budget is unusable. Tell the director to correct the named configuration and run `end` again; the row stays.
 12. Use `targeted_test` in new text once the builds rename is on the merge branch.
+13. A Codex pane worker compacts at the configured limit. `worker_panes._policy_arguments` adds `-c model_auto_compact_token_limit=<n>` for Codex, and `<n>` is `UNIT_COMPACT_ABOVE_TOKENS` from `config/direct.conf`, the key the mesh uses, with no copy. A side pane takes the same option through `launch_arguments`. A Claude launch does not change. An unusable value returns `StartRefused(INVALID_ROLE_CONFIGURATION)`. Showrunner ruling, 2026-11-06: the option goes in this phase, so no pane worker runs after the switch without it, and the usage watch limit stays. Measured 2026-11-06: pane worker `review` reached 287,102 tokens with no compaction, on a 475,000-token window.
+14. A resumed Codex pane worker works in its pane's folder. `worker_panes.launch_arguments` adds `--cd <folder>` on a Codex resume. Without it, `codex resume` takes the thread's recorded folder, which a unit rename or a clone removal leaves absent, and the dispatch ends exit 3 with no prompt delivered (pilot, 2026-11-06).
 
 **Files:**
 
 - `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/unit_move.py`, `scripts/production/test_rename.py`, `scripts/production/test_unit_move.py` — inspect accepted rename behavior; this text phase leaves source and tests unchanged.
 - `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md`, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`, `docs/direct/phase_end.md`, `docs/direct/run_phase_review.md`, `commands/unit/report.md`, `commands/showrunner/produce.md`, `commands/showrunner/accounts.md`, `commands/showrunner/rename_unit.md`, `commands/showrunner/retire_unit.md`, `commands/showrunner/transfer_unit.md`, `commands/message.md`, `commands/codex_winddown.md`, `commands/shutdown.md`, `commands/ask_a_friend.md`, `commands/astra_review.md`, `commands/shot_report.md`, `docs/quota_alerts.md`, `docs/production_format.md`, `docs/accounts.md` — Reference → Instruction edits.
 - `commands/unit/worker.md` — Spec item 11.
+- `scripts/herdr/worker_panes.py`, `scripts/herdr/side_pane.py`, `scripts/herdr/test_worker_panes.py`, `scripts/herdr/test_side_pane.py`, `docs/as-built/long-lived-workers.md` — Spec items 13 and 14.
 
 **Workers:** `2 writers` — split by file group.
 - `impl` — `commands/unit/direct.md` and `docs/direct/*`.
 - `test` (opens as impl) — the other commands and docs.
+- `impl4` — Spec items 13 and 14.
 
 **State:** none.
 
@@ -2632,7 +2636,7 @@ Keep guarded compatibility instructions until Phase 18 removes them.
 Compare rename text with the accepted command output, anomaly lines, restart advice, and finished-rerun behavior.
 Run the shared Phase 11/14 text-and-code gate.
 Regenerate changed command mirrors through `scripts/claude_to_codex/sync.py`.
-No Python or new rerun test is required for this text phase.
+Only Spec items 13 and 14 need Python: a test shows the option and the configured value in a Codex launch and a resume, no option in a Claude launch, and a refusal for an unusable value; a test shows `--cd <folder>` on a Codex resume, and none on a Claude resume. Require basedpyright 0/0 on its files and the full gate. No other Python or new rerun test is required for this phase.
 
 ### Phase 14a — A fresh Codex pane worker publishes from its session report  · status: done
 
@@ -2782,7 +2786,7 @@ No Python or new rerun test is required for this text phase.
 
 **Goal:** herdr-unit's own next run works on panes, then the default becomes `herdr` and units switch at their run boundaries, Mac units after a Mac probe of Phases 6-7.
 
-**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
+**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. At the switch, the director ends each open pane worker of the pilot. Those workers predate the compaction option, and a same-role dispatch keeps a running process so that a rerun can recover an active pass (showrunner ruling, 2026-11-06: no pane worker runs after the switch without the option). Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
 
 **Files:**
 - `config/direct.conf` — `WORKER_TRANSPORT=herdr`.
@@ -2795,7 +2799,7 @@ No Python or new rerun test is required for this text phase.
 - Phase 14a (herdr-unit, 2026-11-06): the pilot's director is Claude, so the pilot does not exercise a Codex parent. The Phase 14a tests and its live proof from a worker's environment cover TERM and COLORTERM at the pane boundary. A failed fresh start prints `publication failed: ...` and keeps the pane; the same launcher command publishes once from that pane.
 - Phase 3h review (2026-11-01): the pilot and default switch gate only the pane track, not the rename track.
 
-**Acceptance gate:** Require shutdown `b76d3b028` on sdlc and its worker-stop integration before the default switch.
+**Acceptance gate:** A pane worker opened after the switch shows `model_auto_compact_token_limit` in its process arguments. Require shutdown `b76d3b028` on sdlc and its worker-stop integration before the default switch.
 After Phase 12 reaches main, the director runs the installed Stop-hook friend proof for both families.
 Require the pilot run's phases to finish on panes.
 Require a live proof on the installed Phase 14d tree: a live detached result, a delayed pane status, a review Stage 2, a quiet wait that returns `NO_DONE`, and recovery through the saved launcher command.
@@ -2877,7 +2881,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
 - `scripts/production/worker.py`, `scripts/production/test_worker.py` — move their imports of deleted or renamed modules. Keep the Stage 2, detached-result, quiet-wait and closure tests after the helpers move.
 - `scripts/direct/assign.py` — delete the pinned dispatch, follow-claim, wait, Stage 2 branches, and `WORKER_TRANSPORT` switch. Delete the mesh Astra prime, follow and end branch of `execute_astra_review` and its mesh-only tests; retain `ASTRA_REVIEW` and `execute_astra_review_herdr`. `implement.sh` and `review.sh` belong to devtools 3t.
 - `scripts/lib/unit_runs.py`, `scripts/lib/test_unit_runs.py`, `scripts/usage/test_collect_mac.py` — `worker_transport` and the run pin go.
-- `config/models.conf`, `config/direct.conf` — `[direct.options] codex_mesh`, `UNIT_CODEX_MESH`, `UNIT_COMPACT_ABOVE_TOKENS`, `WORKER_TRANSPORT` go. models-unit owns `config/models.conf`: send it the `[direct.options]` change.
+- `config/models.conf`, `config/direct.conf` — `[direct.options] codex_mesh`, `UNIT_CODEX_MESH`, `WORKER_TRANSPORT` go. `UNIT_COMPACT_ABOVE_TOKENS` stays, because the pane launch reads it. models-unit owns `config/models.conf`: send it the `[direct.options]` change.
 - `scripts/shutdown/inventory.py`, `scripts/shutdown/stop_resume.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/session_types.py` — delete retained mesh-pinned `CodexServer`, `codex_seats`, `PausedSeat`, mesh pause, and their callers. Since models 3s the same function also resumes Claude children; keep that branch, or its replacement.
 - `scripts/accounts/accounts.py` — delete retained mesh-pinned server handling and server display lines.
 - `scripts/lib/resume_message.py`, `scripts/lib/test_resume_message.py` — Phase 10 adds the tests; remove the `PausedSeat` branch and obsolete mesh command tests after the drain.

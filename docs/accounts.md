@@ -450,7 +450,7 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role worker
 
 A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
-Pane workers move under their dispatch locks.
+Pane workers move under their worker locks.
 A live worker stops at the shell on the same terminal before its conversation resumes on the target account.
 A stopped pane keeps its terminal; a closed pane resumes the same conversation in a new worker pane.
 An active or refused pass receives one resume message; an idle worker receives no text.

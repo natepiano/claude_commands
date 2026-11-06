@@ -162,14 +162,21 @@ Only exit 0 completes a pass.
 Exit 2 means refused.
 Exit 3 means no DONE reply. Exit 4 means blocked. Exit 5 means stalled.
 Exit 6 means busy. Exit 7 means retained. Exit 8 means uncertain.
-Inspect the named pane before another dispatch after an incomplete result.
+After an incomplete pass, inspect the named pane and rerun the saved launcher command before another role's dispatch.
+Apply the same recovery when a quiet wait returns exit 3 (`NO_DONE`).
+After all repair workers complete successfully, run `findings.py landed` if the launcher does not run it.
+Use `--session-dir "${SESSION_DIR}" --phase "<phase id>"`.
+Read-only pane reviewers post no board lines and run no suites.
+The director or a writer handles required board posts and suites.
+A Codex pane worker compacts itself at `UNIT_COMPACT_ABOVE_TOKENS` through a launch option, and the launcher makes no compaction call.
 Do not use mesh claims, mesh roster entries, or phase dispatch locks for this transport.
 
 Shutdown leaves proved stopped workers at the shell and retains their rows and conversations.
 Restore resumes the same conversations through `worker.py restore`.
 Restore reads the role and active pass from the recorder, then reuses the saved launcher command.
 It reads the transcript before input and never submits the same dispatch twice.
-Account moves keep the same pane, terminal, and conversation on the destination account.
+Account moves keep the same conversation on the destination account.
+A stopped worker keeps its pane and terminal; a closed worker resumes in a new pane.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
 A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
@@ -327,7 +334,8 @@ Applies to every implementation, test, fix, and review launcher.
    line, never its handle. A task message resumes the workflow.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
-6. A new-worker or follow-up launcher killed at its time limit leaves its Codex
+6. For `herdr`, recover an incomplete pass under <LongLivedWorkers/> before another role's dispatch.
+   For an existing `mesh` pin, a launcher killed at its time limit leaves its Codex
    worker running with no one watching. Arm a Monitor on
    `${SESSION_DIR}/board.log` until that worker
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
@@ -657,17 +665,14 @@ beside the repair being dispatched — then continue. Never stop, ask permission
 re-open a decision the user has already made about this run, or edit
 `~/.claude/config/direct.conf` mid-run to change what gets said.
 
-**Dispatching a repair fixes nothing.** `dispatch` leaves its batch
-`repair_in_flight`, and `gate` and `verdict` both refuse a finding still in
-flight, so a repair that never finished cannot reach a reviewer pre-labelled as
-fixed and be confirmed on that label alone. `assign.sh` resolves that state
-itself: `landed` when its worker exits cleanly, `abandon --edits-landed` when
-the worker errors. The unit director owns it only when the launcher is gone — the
-user stopped it, the process was killed, the session was interrupted. Then run
-`abandon --reason "<how it ended>"` before any other workflow step, and say in
-one line what died and that the findings are open again. Pass `--edits-landed`
-only when repair edits are actually in the tree; without it the attempt is
-refunded, because a repair that never ran must not spend the budget that decides
+`dispatch` leaves its batch `repair_in_flight`.
+`gate` and `verdict` refuse a finding that remains in flight.
+For `herdr`, apply the completion and recovery rules in <LongLivedWorkers/>.
+For an existing `mesh` pin, `assign.sh` runs `landed` after a clean exit or `abandon --edits-landed` after an error.
+When that mesh launcher is gone, run `abandon --reason "<how it ended>"` before the next workflow step.
+Report the interruption and the reopened findings in one line.
+Pass `--edits-landed` only when repair edits exist in the tree.
+Without that flag, the ledger refunds the attempt, which preserves the budget that decides
 when this phase stops.
 </FindingsLedger>
 
@@ -1307,10 +1312,10 @@ UNIT_RESOLVES_ROUND=1 bash ~/.claude/scripts/direct/assign.sh --role fix \
   --fix-cause "<failed gate or defect>" --pass "${FIX_ROUND}" &
 ```
 
-**`UNIT_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
-only the launcher watches the worker exit, so only it can say a repair landed.
-Each further worker runs the same call with `UNIT_RESOLVES_ROUND=0`, its
-own prompt and its slot; the round is done only once every worker has exited.
+For an existing `mesh` pin, `UNIT_RESOLVES_ROUND=1` makes the launcher resolve the round.
+For `herdr`, apply the completion and recovery rules in <LongLivedWorkers/>.
+Each further worker uses `UNIT_RESOLVES_ROUND=0`, its own prompt, and its slot.
+The round ends only after every worker completes.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` and clear
 `${EARLY_REVIEW_SLOT}` at dispatch, and close the
@@ -1355,7 +1360,9 @@ A successful dispatch continues as above. An error applies <WorkerLaunchFailure/
 If the error remains, apply <RetainPhaseReservation/> and report the fix log.
 Record the error, clear the session marker, and stop.
 The launcher records either outcome in the ledger.
-If a dispatch ends without a terminal status, resolve its round with `findings.py abandon` under <FindingsLedger/>.
+For an existing `mesh` pin, if a dispatch ends without a terminal status, resolve its round with `findings.py abandon` under <FindingsLedger/>.
+For `herdr`, apply the recovery in <LongLivedWorkers/> first, because the pane worker can still finish the round.
+Run `abandon` only when that recovery cannot finish it.
 Then apply <RetainPhaseReservation/> before review, another dispatch, or a report about the round.
 </FixDispatch>
 
