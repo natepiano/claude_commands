@@ -154,6 +154,24 @@ class AssignmentFormsTests(AssignLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(read_object(trace)['to'], 'existing')
 
+    def test_managed_astra_review_requires_a_name_a_review_role_and_a_run(self) -> None:
+        required = ["--role", "review", "--operation", "astra-review", "--new-worker", "astra-reviewer",
+                    "--session-dir", str(self.session_dir), "--prompt", str(self.prompt)]
+        for option, reason in (("--new-worker", "astra-review requires --new-worker"),
+                               ("--role", "astra-review requires --role review"),
+                               ("--session-dir", "recovery and astra-review require --session-dir")):
+            with self.subTest(option=option):
+                arguments = required.copy()
+                index = arguments.index(option)
+                if option == "--role":
+                    arguments[index + 1] = "implement"
+                else:
+                    del arguments[index:index + 2]
+                result = self.run_launcher(["bash", str(ASSIGN), *arguments])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(self.methods("thread/start"), [])
+
     def test_removed_transport_routes_refuse(self) -> None:
         for route in ('--mesh', '--legacy'):
             with self.subTest(route=route):

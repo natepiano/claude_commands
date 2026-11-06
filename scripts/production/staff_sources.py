@@ -253,7 +253,6 @@ class _WorkerSources:
                 except ValueError as error:
                     if not herdr.is_codex_process(process.arguments.split()):
                         continue
-                    self.codex_scan_incomplete = True
                     _problem(f"Codex process scan: pid {process.pid}", error)
                     continue
                 if not herdr.is_codex_process(arguments) or codex_thread_host(arguments):
@@ -269,7 +268,6 @@ class _WorkerSources:
                 elif reason := codex_non_staff_reason(record, sources, environment):
                     _problem(f"Codex process {process.pid}", reason)
                 else:
-                    self.codex_scan_incomplete = True
                     _problem(f"Codex process {process.pid}", "native thread identity is unavailable")
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.codex_scan_incomplete = True
@@ -586,6 +584,8 @@ def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tupl
 def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId) -> None:
     """Refuse removal while worker or peer evidence still names the native id."""
     evidence = observe_workers(record, session_staff.member_sources(), current_only=True)
+    for diagnostic in evidence.diagnostics:
+        print(diagnostic, file=sys.stderr)
     member = record.by_id(identity)
     current_session = member.current_session if member is not None else identity
     if identity in evidence.identities or any(

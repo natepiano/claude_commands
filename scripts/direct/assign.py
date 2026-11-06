@@ -773,9 +773,57 @@ def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAll
     return call(command, env, check=False).returncode
 
 
+def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
+                              env: dict[str, str]) -> int:
+    """Hold one pane reviewer until the worker command confirms its end."""
+    for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
+                      ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
+                       "--phase-title", "Astra review"]):
+        recorded = subprocess.run([PYTHON, PROGRESS, *arguments], env=env, text=True,
+                                  stderr=subprocess.STDOUT, check=False)
+        if recorded.returncode:
+            return recorded.returncode
+    command = [PYTHON, str(SCRIPTS / "../production/worker.py")]
+    added = call([*command, "add", "astra-reviewer", "--name", args.new_worker, "--json"],
+                 env, capture=True, check=False)
+    print(added.stdout + added.stderr, end="", flush=True)
+    if added.returncode:
+        return added.returncode
+    held, result = "", 1
+    try:
+        member = cast(dict[str, str], json.loads(added.stdout))
+        role = astra_roles.hold("reviewer", member["id"], pid=os.getpid())
+        held = role["staff_id"] if role is not None else ""
+        result = subprocess.run([*command, "assign", "astra-reviewer", str(prompt), "--name", args.new_worker,
+                       "--session-dir", str(run), "--slot", args.new_worker, "--phase", "astra-review",
+                       "--kind", "astra", "--reply", args.summary, "--launcher-command",
+                       json.dumps(["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])],
+                      env=env, text=True, stderr=subprocess.STDOUT, check=False).returncode
+        if result == 0:
+            env.update(UNIT_PASS_OWNER="launcher", UNIT_TEAM_ROLE=args.new_worker)
+            result = subprocess.run([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run),
+                           "--status", "completed"], env=env, text=True,
+                           stderr=subprocess.STDOUT, check=False).returncode
+        else:
+            print(f"assign.sh: reviewer dispatch exited {result}; pending input is retained", flush=True)
+    except (OSError, ValueError) as error:
+        print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
+        result = 1
+    finally:
+        ended = subprocess.run([*command, "end", args.new_worker, "--session-dir", str(run)],
+                               env=env, text=True, stderr=subprocess.STDOUT, check=False).returncode
+        if ended:
+            result = 1
+        elif held:
+            astra_roles.release(held)
+    return result
+
+
 def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> int:
     """Publish, hold, review, and close one managed Astra worker."""
     run = Path(args.session_dir).expanduser().resolve()
+    if unit_runs.worker_transport(run) == "herdr":
+        return execute_astra_review_herdr(args, run, cwd, prompt, env)
     context = ["--session-dir", str(run)]
     settings = ["--model", args.model, "--effort", args.effort, "--cwd", str(cwd)]
     opened, held, result = False, "", 1

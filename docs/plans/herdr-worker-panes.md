@@ -2737,9 +2737,64 @@ No Python or new rerun test is required for this text phase.
 
 **Ruled out:** a TERM filter in `child_environment`, because it also reaches `prepared.unset_environment` and a resume would unset TERM in the pane; a daemon-attached Codex worker.
 
+### Phase 14b — An Astra review reaches a pane through assign.sh  · status: done
+
+**Depends on:** Phase 12, Phase 14a, the devtools 8d stack on sdlc
+
+#### Work Order
+
+**Goal:** `assign.sh --operation astra-review` is the one start path for a managed Astra review (sdlc ruling a0767e9c), and a run with the herdr transport places the reviewer in a pane.
+
+**Spec:**
+
+1. `astra_review.py` keeps the devtools `_managed_review`: one `assign.sh --role review --operation astra-review` call. The worker add path of Phase 12 leaves this file.
+2. `assign.py` keeps the devtools `ASTRA_REVIEW` operation and `execute_astra_review`. Its mesh body does not change.
+3. `execute_astra_review` reads `unit_runs.worker_transport(run)`. For `herdr` it records start-run and start-phase `astra-review`, runs `worker.py add astra-reviewer`, holds the role with `astra_roles.hold("reviewer", id, pid=os.getpid())`, runs `worker.py assign` with the prompt and the summary path as the reply, records finish-pass, runs `worker.py end` and releases the hold.
+4. A failed end returns 1 and keeps the hold while `assign.sh` runs. The hold is an exec hold, so it ends with that process. The staff row stays, and it is the record of the reviewer. A failed end in the mesh body keeps its hold.
+5. The saved launcher command is the `assign.sh` command.
+6. Phase 12's removal of held designs, `PRIME`, `FOLLOW` and `RESIDENT` from `assign.py` stays.
+
+**Files:**
+- `scripts/direct/assign.py`, `scripts/direct/test_assign_gate.py`, `scripts/direct/test_assign_launcher.py`, `scripts/direct/test_assign_launcher_review.py` — the operation, the transport branch and its tests.
+- `scripts/astra/astra_review.py`, `scripts/astra/test_astra_review.py` — the one call and its tests.
+- `docs/as-built/agent-registry.md` — the start path.
+
+**Workers:** `1 writer` — the change lands in one function and its tests, so the files do not split.
+
+**State:** none. The worker row and the hold end with the review.
+
+**Constraints from prior phases:** `WORKER_TRANSPORT` stays mesh until Phase 15, so no real caller reaches the branch before the pilot. A fresh Codex takes one first turn (Phase 14a). Add no guard or refusal that this Work Order does not name.
+
+**Acceptance gate:** A real-path test runs `assign.py` for a run pinned to herdr against the `PaneWorld` fixture: the reviewer takes a pane, the reply reaches the summary path, and the row and the hold end. A second test: a failed end returns 1 and keeps the hold. The mesh tests of the operation stay green. The Phase 15 pilot runs one real Astra review in a pane. Require basedpyright 0/0 on changed files and every caller module.
+
+### Phase 14c — An unrelated Codex process does not stop a retire  · status: done
+
+**Depends on:** Phase 12a
+
+#### Work Order
+
+**Goal:** a Codex process that the scan cannot identify does not stop `staff.retire` (sdlc c2c81fdb). The scan reports it as an anomaly. Each Astra review then ends its row.
+
+**Spec:**
+
+1. In `_WorkerSources`, a Codex process with no native thread identity, or with arguments that do not parse, no longer sets `codex_scan_incomplete`. The `_problem` line stays.
+2. A failed read of the whole process table keeps `codex_scan_incomplete`.
+3. Add no new check.
+
+**Files:**
+- `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py` — the scan and its tests.
+
+**Workers:** `1 writer` — one small change and its tests.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 12a keeps a process that exits during the scan out of the scan. Do not touch a live row or process.
+
+**Acceptance gate:** A test runs `staff.retire` for a stopped row with an unidentified Codex process in the table: the row goes, and the anomaly line prints. `test_staff_sources`, `test_staff`, `test_remove_workers`, `test_worker` and `test_astra_roles` pass. Require basedpyright 0/0 on changed files.
+
 ### Phase 15 — Pilot and default switch  · status: todo
 
-**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a
+**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b
 
 #### Work Order
 
@@ -2756,7 +2811,7 @@ No Python or new rerun test is required for this text phase.
 
 **State:** `config/direct.conf`.
 
-**Constraints from prior phases:** Phases 3, 4 and 6-14.
+**Constraints from prior phases:** Phases 3, 4 and 6-14. The pilot runs one real Astra review in a pane through `assign.sh --operation astra-review` (Phase 14b).
 - Phase 14a (herdr-unit, 2026-11-06): the pilot's director is Claude, so the pilot does not exercise a Codex parent. The Phase 14a tests and its live proof from a worker's environment cover TERM and COLORTERM at the pane boundary. A failed fresh start prints `publication failed: ...` and keeps the pane; the same launcher command publishes once from that pane.
 - Phase 3h review (2026-11-01): the pilot and default switch gate only the pane track, not the rename track.
 
@@ -2816,6 +2871,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
     4. Remove the copies: one `worker_panes` rule for idle, busy or unknown (`astra_roles.py:270`); one `worker_panes` finder of a labelled pane in one tab (`side_pane.py:91`); one `PaneWorld` setup for the side pane tests (`SidePaneTests.setUp`, `test_side_pane.py:36`); one helper for the family tests of held roles (`test_design_roles.py:194`, `:212`); fixture recorder commands through `invoke_recorder` (`design_role_test_support.py:62`).
     5. After the composer repair, reconsider one input path for a friend (`Herdr.prompt` and `Herdr.prompt_terminal`).
     6. Pass a held pane row to `native_session` and `native_pane_process`, so one launch reads the pane once.
+    7. One start path for held design roles and friends (sdlc, 2026-11-06). Phase 14b makes `assign.sh` the one start path for an Astra review. Held design roles still start through `worker add` in `design_roles.py`, and friends through `side_pane.py`. Move both behind the pane transport of `assign.sh`.
 
 **Files:**
 

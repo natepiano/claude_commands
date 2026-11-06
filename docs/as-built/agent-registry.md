@@ -172,7 +172,13 @@ These roles keep their staff row and current session in a pane.
 Held roles receive messages through `send.py`.
 An ad hoc Astra review outside the staff hierarchy uses the one-turn `codex exec` path in `astra_review.py`.
 `side_pane.py` serves ask-a-friend consultations without a staff row.
-`assign.py` retains `dispatch`, `adopt`, and `resume-account-move`.
+A managed Astra review starts through `assign.sh --role review --operation astra-review`.
+`assign.py` reads the run's transport pin.
+The mesh transport primes, holds, follows, and ends the reviewer through `codex_mesh.py`.
+The herdr transport adds, assigns, and ends the reviewer through `worker.py`.
+The mesh transport keeps the hold until the end of the worker succeeds.
+The pane transport keeps the hold while `assign.sh` runs; after a failed end, the staff row is the record of the reviewer.
+`assign.py` also retains `dispatch`, `adopt`, and `resume-account-move`.
 The two recovery operations remain until Phase 18.
 
 `serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached

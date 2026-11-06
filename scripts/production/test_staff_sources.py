@@ -218,7 +218,7 @@ class StaffSourcesTests(StaffTestCase):
         members = cast(list[dict[str, object]], document["members"])
         found = next(member for member in members if member["id"] == owner.id)
         self.assertEqual(found["identity"], {"codex": owner.current_session})
-        self.assertFalse(document["complete"])
+        self.assertTrue(document["complete"])
         self.assertEqual(errors.getvalue().splitlines(), [
             "staff sources: Codex process scan: pid 42401: No closing quotation"])
 
@@ -236,9 +236,7 @@ class StaffSourcesTests(StaffTestCase):
         sources = MemberSources({}, (launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(record, sources)
-            evidence = staff_sources.observe_workers(record, sources, unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(record, sources)
         expected = "staff sources: Codex process 42401: native thread identity is unavailable"
         self.assertEqual(evidence.diagnostics, (expected,))
         self.assertNotIn("Claude", "\n".join(evidence.diagnostics))
@@ -287,7 +285,7 @@ class StaffSourcesTests(StaffTestCase):
                 "staff sources: Codex process 42401: pane holds no staff member; not staff",))
 
 
-    def test_missing_codex_thread_in_a_pane_with_staff_unit_labels_keeps_the_scan_incomplete(self) -> None:
+    def test_missing_codex_thread_in_a_pane_with_staff_unit_labels_reports_a_diagnostic(self) -> None:
         from scripts.message import process_table
 
         _ = self.fill_production("label-pane-demo", "models")
@@ -298,12 +296,27 @@ class StaffSourcesTests(StaffTestCase):
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
-            evidence = staff_sources.observe_workers(
-                staff.snapshot(), MemberSources({}, (launch,)), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
         self.assertEqual(evidence.diagnostics, (
             "staff sources: Codex process 42401: native thread identity is unavailable",))
+
+
+    def test_retire_stopped_worker_reports_an_unidentified_codex_process(self) -> None:
+        from scripts.message import process_table
+
+        owner, unit, worker = self.tree()
+        self.pane("test:unidentified", session_id=unit.current_session, environment={})
+        table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:unidentified"}),
+              redirect_stderr(io.StringIO()) as errors):
+            removed = staff.retire(worker.id)
+        self.assertEqual(removed, worker)
+        self.assertIsNone(staff.by_id(worker.id))
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.by_id(owner.id), owner)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "staff sources: Codex process 42401: native thread identity is unavailable"])
 
 
     def test_unparsable_claude_settings_do_not_make_the_codex_scan_incomplete(self) -> None:
@@ -338,17 +351,14 @@ class StaffSourcesTests(StaffTestCase):
             "staff sources: Codex process 42401: not in a herdr pane; not staff",))
 
 
-    def test_unparsable_node_codex_arguments_keep_the_scan_incomplete(self) -> None:
+    def test_unparsable_node_codex_arguments_report_a_diagnostic(self) -> None:
         from scripts.message import process_table
 
         table = {42401: process_table.Process(
             42401, 1, "node", 'node /modules/@openai/codex/bin/codex.js --config "unfinished')}
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment") as environment):
-            with self.assertRaises(staff.StaffUnreadable):
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
-            evidence = staff_sources.observe_workers(
-                staff.StaffSnapshot(()), MemberSources({}, ()), unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
         environment.assert_not_called()
         self.assertEqual(evidence.diagnostics,
                          ("staff sources: Codex process scan: pid 42401: No closing quotation",))
