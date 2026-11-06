@@ -4,7 +4,7 @@
 Usage: astra_review.py [--run-directory <dir> --phase <id>] <document> [focus...]
 
 The review uses the workers account with read-only access and xhigh reasoning.
-A managed review publishes its worker before the app-server starts the turn.
+A managed review publishes its worker before it submits the prompt.
 The final message is saved under /tmp/claude/astra/ and printed.
 A failed review exits 1. A missing document or refused admission exits 2.
 """
@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.production import staff
+from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
@@ -108,10 +109,11 @@ def _managed_review(review: Path, log: Path) -> int:
 
 
 def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
-    """Use worker admission when the caller has a staff identity."""
+    """Use worker admission for a unit or showrunner caller."""
     manager = staff.runtime_id()
-    if manager:
-        _ = (log.parent / "prompt.md").write_text(prompt, encoding="utf-8")
+    caller = staff.snapshot().by_current_session(manager) if manager else None
+    if caller is not None and caller.kind in ("unit", "showrunner"):
+        write_text_atomic(log.parent / "prompt.md", prompt)
         return _managed_review(review, log)
     with log.open("w", encoding="utf-8") as output:
         process = subprocess.run(codex_arguments(label, review, Path.cwd()), input=prompt,
@@ -132,8 +134,7 @@ def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.Ph
             return 1
     folder = design_roles.design_directory(design.placement.design_id)
     request = folder / f"review-request-{os.getpid()}-{time.time_ns()}.txt"
-    with request.open("x", encoding="utf-8") as output:
-        _ = output.write(f"Review {design.document}.\nFocus: {focus}\n")
+    write_text_atomic(request, f"Review {design.document}.\nFocus: {focus}\n")
     try:
         reply = design_roles.resume(design.placement.design_id + "/reviewer", request)
         if not reply.is_file():
@@ -192,7 +193,7 @@ def main(arguments: list[str]) -> int:
     assignment = astra_work.AstraWork("astra-reviewer", str(folder), str(document),
                                      datetime.now(timezone.utc).isoformat(), str(review), work)
     prompt = astra_work.header_line(assignment) + "\n" + review_prompt(document, focus)
-    _ = (folder / "prompt.md").write_text(prompt, encoding="utf-8")
+    write_text_atomic(folder / "prompt.md", prompt)
     log = folder / "codex.log"
     returncode = run_review(label, review, prompt, log)
     written = review.read_text(encoding="utf-8").strip() if review.is_file() else ""
