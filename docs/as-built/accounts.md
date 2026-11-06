@@ -131,6 +131,9 @@ The [launch environment](nix-shell-launch.md) describes shared Nix setup and acc
 ## Moves, refusals, and workers
 
 Account moves use the shared stop and resume API.
+Each session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
+Each attempt has its own move ID and cause.
+A session already on the target writes nothing.
 The [shutdown design](shutdown-and-restart.md) owns process identity, pane reuse, prompt delivery, and recovery details.
 All selected stops finish before the batch resumes any session.
 Each session resumes its own conversation on the target account.
