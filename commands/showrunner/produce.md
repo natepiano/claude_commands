@@ -1002,7 +1002,7 @@ Use `cargo-berth sequence` for merge order.
       to add, and why the check refused it, in a few words. Put it in
       `needed:` and send it as a <Notify/> `blocked` alert. An auto-mode refusal
       goes as `send.py --to user --need blocked --clears-when "<check>" --text-id auto_mode.refused` with its
-      `--value`s (`send.py --help`); free text about it is held. A session that waits
+      `--value`s (read the send rule in `send.py --help`); free text about it is held. A session that waits
       for the user to type a go goes as `send.py --to user --need blocked --clears-when "<check>" --text-id
       session.needs_go` with its `--value`s; free text about it is held. `<check>` is a
       command that exits 0 once the unit no longer waits; with none, drop `--need blocked`.

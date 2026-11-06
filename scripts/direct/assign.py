@@ -799,13 +799,14 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                        "--kind", "astra", "--reply", args.summary, "--launcher-command",
                        json.dumps(["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])],
                       env=env, text=True, stderr=subprocess.STDOUT, check=False).returncode
-        if result == 0:
-            env.update(UNIT_PASS_OWNER="launcher", UNIT_TEAM_ROLE=args.new_worker)
-            result = subprocess.run([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run),
-                           "--status", "completed"], env=env, text=True,
-                           stderr=subprocess.STDOUT, check=False).returncode
-        else:
+        env.update(UNIT_PASS_OWNER="launcher", UNIT_TEAM_ROLE=args.new_worker)
+        finished = subprocess.run([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run),
+                       "--status", "error" if result else "completed"], env=env, text=True,
+                       stderr=subprocess.STDOUT, check=False).returncode
+        if result:
             print(f"assign.sh: reviewer dispatch exited {result}; pending input is retained", flush=True)
+        else:
+            result = finished
     except (OSError, ValueError) as error:
         print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
         result = 1

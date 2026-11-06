@@ -258,7 +258,7 @@ The closed list:
 - **blocked** — a hard stop this command defines: a structural check that blocks
   checkpoint, a refused tool call, a launch failure that survived
   <WorkerLaunchFailure/>'s retry. With no showrunner, alert the user to an auto-mode
-  refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (`send.py --help`),
+  refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (read the send rule in `send.py --help`),
   and to a wait for the user to type a go with `send.py --to user --text-id session.needs_go`.
   An update to an earlier user push on the same subject reuses that push's `--key`,
   so silence keeps only the newest. A `--need blocked` push with a live earlier one
