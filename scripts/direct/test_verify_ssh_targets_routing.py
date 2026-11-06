@@ -169,8 +169,8 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         _ = settings.write_text(settings.read_text() + "version_pin_file=nixos hosts/aws-build.nix\n")
         for mode, reason, detail in (
             ("disk", "disk", "not running on the aws (disk)"),
-            ("version-mismatch", "aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
-             + "move the box pins in nixos hosts/aws-build.nix", "rustc box=rustc other"),
+            ("version-mismatch", "aws version mismatch: nextest box=nextest other natedev=nextest fixture; "
+             + "move the box pins in nixos hosts/aws-build.nix", "nextest box=nextest other"),
             ("runtime-version-mismatch", "aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
              + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/aws-build.nix",
              "nextest box=nextest other"),
@@ -186,6 +186,30 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
                 self.assertEqual(self.local_runs(), [])
                 self.assertEqual(self.admission.history(), [])
                 self.assertEqual(self.attempts()[-1]["reason"], reason)
+
+    def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
+        from scripts.mac_test import offload
+
+        self.configure("natedev,aws")
+        state = self.target_state("aws")
+        _ = (state / "box-tools.json").write_text(json.dumps({"versions": {"rustc": "rustc other"}}))
+        reason = ("aws version mismatch: rustc box=rustc other natedev=rustc fixture; "
+                  "move the box pins in nixos hosts/aws-build.nix")
+        with mock.patch.object(offload, "state_directory", return_value=state):
+            path = offload.linux_version_decline_path("aws", self.root.name)
+            self.assertFalse(path.exists())
+            result = self.verify("test", "sample", "--target", "aws")
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("target aws refused: " + reason, result.stderr)
+            self.assertIn("rustc box=rustc other natedev=rustc fixture", result.stdout + result.stderr)
+            recorded_at = float(path.read_text())
+            self.assertTrue(offload.linux_version_declined_recently("aws", self.root.name, 60, recorded_at + 1))
+            self.assertFalse(offload.linux_version_declined_recently("aws", "other-repository", 60, recorded_at + 1))
+        self.assertEqual(self.attempts()[-1]["reason"], reason)
+        self.assertNotIn("probe", self.ssh_events()[-1]["actions"])
+        self.assertNotIn("run", self.ssh_events()[-1]["actions"])
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.admission.history(), [])
 
     def test_pinned_wait_keeps_its_live_record_until_aws_becomes_available(self) -> None:
         self.assert_pinned_wait_keeps_its_live_record("test")
