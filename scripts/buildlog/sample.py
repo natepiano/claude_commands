@@ -13,6 +13,7 @@ import cgroup_capture
 import filesystem
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from boot_identity import parse_boot_id as parse_boot_id
 from cargo_output import CargoOutputRoots, read_cargo_output_roots
 from cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
@@ -98,14 +99,6 @@ def parse_meminfo(text: str) -> MachineMemoryUse:
     if len(values) != 4:
         raise ValueError("meminfo lacks memory or swap totals")
     return MachineMemoryUse(values["MemTotal"] - values["MemAvailable"], values["SwapTotal"] - values["SwapFree"])
-
-
-def parse_boot_id(text: str) -> str:
-    """Return the kernel boot ID, rejecting an empty value."""
-    boot_id = text.strip()
-    if not boot_id:
-        raise ValueError("empty boot ID")
-    return boot_id
 
 
 def anon_bytes(cgroup: Path) -> int | Unmeasured:

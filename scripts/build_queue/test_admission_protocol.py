@@ -1,11 +1,16 @@
 """The wire transports admission's domain records without another representation."""
 from __future__ import annotations
 
+from scripts.build_queue import snapshot_codec as codec
+
 from scripts.lint.memory_test_support import admission_policy_fixture
 
+from contextlib import redirect_stderr
 from dataclasses import replace
+import io
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import unittest
@@ -14,41 +19,63 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import admission_protocol as wire, queue_evidence
-from scripts.build_queue import admission_code
+from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
+from scripts.build_queue import admission_code, admission_records as records
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NOW
+from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
 
 
 class ProtocolTests(unittest.TestCase):
 
-    def test_old_unavailable_cap_reply_keeps_the_room_without_an_empty_run_list(self) -> None:
-        from scripts.build_queue.queue_fixture import QueueFixture
+    def test_service_estimate_request_carries_identity_without_a_client_estimate(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.service_request()
+            encoded = wire.encode_request(request)
+            decoded = wire.parse_request(encoded)
+            self.assertEqual(decoded, request)
+            envelope = cast(dict[str, object], json.loads(encoded))
+            fields = cast(dict[str, object], envelope["data"])
+            self.assertNotIn("profile", fields)
+            self.assertNotIn("history", fields)
+            self.assertEqual(wire.parse_reply(wire.encode_reply(admitted_reply()), request), admitted_reply())
+            grant = admitted_reply()
+            runner = wire.RunnerAdmitted(grant.reservation, grant.need, grant.source,
+                grant.max_path, grant.wave_path, grant.sampling_context, grant.cleanup_timing,
+                execution=wire.RunnerExecutionTiming(0.1, 0.2, 1.0))
+            self.assertEqual(wire.parse_reply(wire.encode_reply(runner), request), runner)
+            with self.assertRaises(ValueError):
+                _ = wire.parse_reply(wire.encode_reply(wire.LaunchAdmitted(GIB, "wrong outcome")), request)
 
-        with QueueFixture() as fixture:
-            reading = gate.queue_read_from(fixture.inputs(policy=admission_policy_fixture()),
-                                          gate.AdmissionLimits(3 * GIB), admission_policy_fixture())
-            original_room = reading.explanation.room
-            assert isinstance(original_room, gate.MemoryRoom)
-            envelope = cast(dict[str, object], json.loads(wire.encode_reply(wire.ViewReply(reading))))
-            data = cast(dict[str, object], envelope["data"])
-            recorded = cast(dict[str, object], data["reading"])
-            explanation = cast(dict[str, object], recorded["explanation"])
-            room = cast(dict[str, object], explanation["room"])
-            room["cap"] = {"kind": "CapUnavailable", "reason": "anonymous use unavailable"}
 
-            reply = wire.parse_reply(json.dumps(envelope))
-            assert isinstance(reply, wire.ViewReply)
-            decoded_room = reply.reading.explanation.room
-            assert isinstance(decoded_room, gate.MemoryRoom)
-            self.assertIsInstance(decoded_room.cap, gate.CapUnavailable)
-            self.assertEqual((decoded_room.available, decoded_room.room, decoded_room.kept),
-                             (original_room.available, original_room.room, original_room.kept))
-            shown = queue_evidence.room_text(decoded_room)
-            self.assertTrue(shown.startswith(f"Cap unavailable; free {queue_evidence.gib(original_room.available)}"), shown)
-            self.assertNotIn("anonymous use", shown)
-            self.assertNotIn("unavailable for", shown)
+    def test_wait_holder_identity_survives_the_wire_for_each_holder_kind(self) -> None:
+        for holder in (records.SessionHolder("session-id", "worker"), records.UnitHolder("compiler"), records.NoHolder()):
+            with self.subTest(holder=holder):
+                reply = wait_reply(records.NeedsMemory())
+                reply = replace(reply, snapshot=replace(reply.snapshot, holder=holder))
+                parsed = wire.parse_reply(wire.encode_reply(reply))
+                self.assertEqual(parsed, reply)
+                assert isinstance(parsed, wire.Wait)
+                self.assertEqual(parsed.snapshot.holder, holder)
 
+    def test_an_unknown_snapshot_field_keeps_the_reply_and_the_client_wait(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            reply = wait_reply(records.NeedsMemory())
+            encoded = cast(dict[str, object], json.loads(wire.encode_reply(reply)))
+            data = cast(dict[str, object], encoded["data"])
+            snapshot = cast(dict[str, object], data["snapshot"])
+            snapshot["future_wait_evidence"] = {"kind": "UnknownFutureEvidence", "value": 17}
+            line = json.dumps(encoded) + "\n"
+            self.assertEqual(wire.parse_reply(line), reply)
+            granted = admitted_reply()
+            transport = ScriptedTransport(fixture.clock, Exchange((line + wire.encode_reply(granted)).encode()))
+            waits: list[wire.Wait] = []
+            with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(
+                    socket, "socket", side_effect=transport.socket), redirect_stderr(io.StringIO()):
+                result = client.admit(request, waits.append, lambda: request)
+            self.assertEqual(waits, [reply])
+            self.assertEqual(result, granted)
+            self.assertEqual(len(transport.requests), 1)
 
     def test_room_cap_and_unavailable_pressure_survive_the_service_reply(self) -> None:
         from scripts.build_queue.queue_fixture import QueueFixture
@@ -62,8 +89,7 @@ class ProtocolTests(unittest.TestCase):
             inputs = replace(inputs, running=(running,), reservations=(reservation,),
                 host=gate.HostMemory(10 * GIB, 60 * GIB),
                 pressure=gate.PressureUnavailable("PSI unreadable"))
-            reading = gate.queue_read_from(inputs, gate.AdmissionLimits(3 * GIB),
-                                           admission_policy_fixture())
+            reading = gate.queue_read_from(inputs, admission_policy_fixture())
             reply = wire.ViewReply(reading)
             parsed = wire.parse_reply(wire.encode_reply(reply))
             self.assertEqual(parsed, reply)
@@ -78,16 +104,12 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(parsed.reading.explanation.host.pressure,
                              gate.PressureUnavailable("PSI unreadable"))
 
-    def test_unowned_scope_activity_round_trips_and_old_records_remain_readable(self) -> None:
+    def test_unowned_scope_activity_round_trips(self) -> None:
         from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun
 
         activity = ScopeProcesses(2, "session", "worker", "/tree", "python3", NOW, False, NoLiveBuildRun())
         current = gate.UnownedSliceMemory(GIB, owner="scope", activity=activity, pid=gate.PidNotRecorded())
-        self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(current), gate.UnownedSliceMemory), current)
-        old = cast(dict[str, object], gate.snapshot_value(current))
-        del old["activity"]
-        self.assertEqual(gate.parse_snapshot_value(old, gate.UnownedSliceMemory),
-                         gate.UnownedSliceMemory(GIB, owner="scope", pid=gate.PidNotRecorded()))
+        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(current), gate.UnownedSliceMemory), current)
 
     def test_service_job_state_and_separate_swap_survive_the_view_reply(self) -> None:
         from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
@@ -115,21 +137,16 @@ class ProtocolTests(unittest.TestCase):
 
         view = gate.QueueView((), (), 0, 0, 0, NOW)
         reading = queue_read_fixture(view, policy=admission_policy_fixture())
-        current = cast(dict[str, object], gate.snapshot_value(reading))
+        current = cast(dict[str, object], codec.snapshot_value(reading))
         del current["diagnostics"]
         current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
-        parsed = gate.parse_snapshot_value(current, gate.QueueRead)
+        parsed = codec.parse_snapshot_value(current, gate.QueueRead)
         self.assertEqual(parsed, replace(reading, diagnostics=(gate.ConfigurationDiagnostic("service warning"),)))
         step = gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0),
                                 run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
-        self.assertEqual(gate.parse_snapshot_value(gate.snapshot_value(step), gate.RunningStep), step)
-        old = cast(dict[str, object], gate.snapshot_value(step))
-        for name in ("unit", "run", "started_at"):
-            del old[name]
-        self.assertEqual(gate.parse_snapshot_value(old, gate.RunningStep),
-                         gate.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, gate.MeasuredMemory(0), pid=123))
+        self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), gate.RunningStep), step)
 
-    def test_unit_override_round_trips_and_main_encoder_omits_it(self) -> None:
+    def test_unit_override_round_trips(self) -> None:
         with AdmissionFixture() as fixture:
             original = fixture.request()
             original_launch = fixture.launch()
@@ -138,14 +155,7 @@ class ProtocolTests(unittest.TestCase):
                     current = replace(request, identity=replace(request.identity, unit="queue-unit"))
                     self.assertEqual(wire.parse_request(wire.encode_request(current)), current)
                     self.assertEqual(wire.parse_record(wire.encode_record(current), type(current)), current)
-                    compatible = wire.encode_request(current, main_service=True)
-                    self.assertEqual(json.loads(compatible), json.loads(wire.encode_request(request, main_service=True)))
-                    envelope = cast(dict[str, object], json.loads(compatible))
-                    data = cast(dict[str, object], envelope["data"])
-                    self.assertNotIn("unit", cast(dict[str, object], data["identity"]))
-                    restored = wire.parse_request(compatible)
-                    assert isinstance(restored, (wire.AdmitRequest, wire.LaunchRequest))
-                    self.assertEqual(restored.identity, request.identity)
+
     def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
         with AdmissionFixture() as fixture:
             source = Path(__file__).resolve().parents[1]
@@ -172,49 +182,16 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(result.stdout.splitlines(), [before, before])
             self.assertNotEqual(wire.admission_code_version(scripts), before)
 
-    def test_main_service_running_steps_keep_their_identity_and_memory(self) -> None:
-        raw = (Path(__file__).with_name("fixtures") / "live_main_view.json").read_bytes()
-        reply = wire.parse_reply(raw, wire.ViewRequest())
-        assert isinstance(reply, wire.ViewReply)
-        running = reply.reading.view.running
-        recorded = cast(dict[str, object], json.loads(raw))
-        data = cast(dict[str, object], recorded["data"])
-        reading = cast(dict[str, object], data["reading"])
-        view = cast(dict[str, object], reading["view"])
-        source = cast(list[dict[str, object]], view["running"])
-        self.assertEqual(len(running), len(source))
-        self.assertTrue(running)
-        for step, original in zip(running, source, strict=True):
-            self.assertEqual((step.session_id, step.session_name, step.step, step.folder, step.promise),
-                             tuple(original[key] for key in ("session_id", "session_name", "step", "folder", "promise")))
-            measured = cast(dict[str, object], original["measured"])
-            self.assertEqual(cast(dict[str, object], gate.snapshot_value(step.measured))["bytes"], measured["bytes"])
 
-    def test_main_service_unowned_memory_keeps_its_charge_and_scope(self) -> None:
-        raw = (Path(__file__).with_name("fixtures") / "live_main_explain.json").read_bytes()
-        reply = wire.parse_reply(raw, wire.ExplainRequest())
-        assert isinstance(reply, wire.ExplainReply)
-        unowned = [row for row in reply.explanation.running if isinstance(row.step.measured, gate.UnownedSliceMemory)]
-        self.assertTrue(unowned)
-        for row in unowned:
-            memory = row.step.measured
-            assert isinstance(memory, gate.UnownedSliceMemory)
-            self.assertEqual(row.measured, memory.bytes)
-            self.assertGreaterEqual(row.charged, memory.bytes)
-            self.assertTrue(memory.cgroup.endswith(memory.owner))
-
-    def test_no_run_admission_uses_main_fields_but_run_identity_remains_explicit(self) -> None:
+    def test_admission_round_trips_with_no_run_and_an_explicit_run_identity(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
-            encoded = cast(dict[str, object], json.loads(wire.encode_request(request)))
-            data = cast(dict[str, object], encoded["data"])
-            self.assertNotIn("run", data)
             self.assertEqual(wire.parse_request(wire.encode_request(request)), request)
             run = wire.RunIdentity(123, "456")
             run_request = replace(request, run=run)
             self.assertEqual(wire.parse_request(wire.encode_request(run_request)), run_request)
             run_encoded = cast(dict[str, object], json.loads(wire.encode_request(run_request)))
-            self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], gate.snapshot_value(run))
+            self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], codec.snapshot_value(run))
 
     def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
         conditions: tuple[gate.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
@@ -227,34 +204,12 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                     decision=replace(reply.snapshot.decision, pressure=pressure)))
                 self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
 
-    def test_main_service_requests_omit_only_new_fields_and_preserve_every_main_field(self) -> None:
-        # Main's encoder produced these records before the admission cut-over.
-        lines = (Path(__file__).with_name("fixtures") / "main_request_records.jsonl").read_text().splitlines()
-        for line in lines:
-            with self.subTest(request=cast(dict[str, object], json.loads(line))["type"]):
-                original = wire.parse_request(line)
-                current = replace(original, code_version="current-caller-version")
-                self.assertEqual(wire.parse_request(wire.encode_request(current)), current)
-                compatible = wire.encode_request(current, main_service=True)
-                self.assertEqual(json.loads(compatible), json.loads(line))
-                self.assertEqual(wire.parse_request(compatible), original)
-
-    def test_main_service_configuration_diagnostic_keeps_the_recorded_text(self) -> None:
-        raw = cast(dict[str, object], json.loads(
-            (Path(__file__).with_name("fixtures") / "main_pressure_wait.json").read_text()))
-        data = cast(dict[str, object], raw["data"])
-        snapshot = cast(dict[str, object], data["snapshot"])
-        message = "main service recorded a configuration warning"
-        snapshot["fallbacks"] = [{"kind": "ConfigFallback", "diagnostic": message}]
-        reply = wire.parse_reply(json.dumps(raw))
-        assert isinstance(reply, wire.Wait)
-        self.assertEqual(reply.snapshot.diagnostics, (gate.ConfigurationDiagnostic(message),))
 
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.FixedCapSizing(3 * GIB))),
+                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.HistoryPeakSizing(3 * GIB, gate.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
                     gate.HistoryPeakSizing(18 * GIB, gate.FirstProgramPeak(18 * GIB), NOW))),
                 replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
@@ -280,10 +235,9 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             fixture.free(0)
             _ = fixture.server.handle_request(fixture.request())
-            inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
+            inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
-            assert isinstance(limits, gate.AdmissionLimits)
-            reading = gate.queue_read_from(inputs, limits, policy=admission_policy_fixture())
+            reading = gate.queue_read_from(inputs, policy=admission_policy_fixture())
             replies: tuple[wire.Reply, ...] = (
                 wait_reply(gate.EstimateExpired(NOW - admission_policy_fixture().timing.estimate_refresh_seconds), 1, "head", "estimate expired"),
                 admitted_reply("stem", GIB, "future-source", "stem.max", "stem.wave"),
@@ -291,10 +245,10 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
             for reply in replies:
                 with self.subTest(reply=type(reply).__name__):
-                    with mock.patch.object(gate, "snapshot_value", wraps=gate.snapshot_value) as encode:
+                    with mock.patch.object(codec, "snapshot_value", wraps=codec.snapshot_value) as encode:
                         line = wire.encode_reply(reply)
                     self.assertGreater(encode.call_count, 0)
-                    with mock.patch.object(gate, "parse_snapshot_value", wraps=gate.parse_snapshot_value) as parse:
+                    with mock.patch.object(codec, "parse_snapshot_value", wraps=codec.parse_snapshot_value) as parse:
                         self.assertEqual(wire.parse_reply(line), reply)
                     self.assertGreater(parse.call_count, 0)
 
@@ -337,11 +291,10 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             fixture.free(0)
             _ = fixture.server.handle_request(fixture.request(age=admission_policy_fixture().timing.estimate_refresh_seconds))
-            inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
+            inputs = fixture.server.last_inputs
             assert isinstance(inputs, gate.QueueInputs)
-            assert isinstance(limits, gate.AdmissionLimits)
-            inputs = replace(inputs, recovery=gate.NextStartAt(NOW + 30))
-            local = gate.queue_read_from(inputs, limits, policy=admission_policy_fixture()).explanation
+            inputs = replace(inputs, spacing=gate.NextStartAt(NOW + 30))
+            local = gate.queue_read_from(inputs, policy=admission_policy_fixture()).explanation
             parsed = wire.parse_reply(wire.encode_reply(wire.ExplainReply(local)))
             assert isinstance(parsed, wire.ExplainReply)
             self.assertEqual(parsed.explanation, local)
