@@ -2748,7 +2748,7 @@ Only Spec items 13 and 14 need Python: a test shows the option and the configure
 
 **Ruled out:** `UNCERTAIN` for a quiet ended worker, because the recovery is the same saved command.
 
-### Phase 14f — Pane workers take every address, and a closed descriptor refuses no delivery  · status: todo
+### Phase 14f — Pane workers take every address, and a closed descriptor refuses no delivery  · status: done
 
 **Depends on:** Phase 9, Phase 14d.
 
@@ -2764,7 +2764,7 @@ Only Spec items 13 and 14 need Python: a test shows the option and the configure
 4. `progress_history.last_dispatch` includes a `refused` pass. A worker whose newest pass is refused keeps that pass's role and id. Phase 11 keeps a refused pass open for recovery; the 14d reader lost its role.
 
 **Files:**
-- `scripts/message/send.py`, `scripts/message/test_send.py` — Spec items 1 and 2.
+- `scripts/message/send.py`, `scripts/message/test_send.py`, `scripts/herdr/worker_panes.py` — Spec items 1 and 2.
 - `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — Spec item 3.
 - `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — Spec item 4.
 
