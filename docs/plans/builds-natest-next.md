@@ -28,7 +28,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
   - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
   - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
-- [ ] **Select the next speed target after Phases 24 and 27.** Phase 51 takes `direct/test_simplify_lens.py` (Phase 36 architect review, 179.022 s wall, 134.969 CPU s).
+- [ ] **Select the next speed target after Phases 24 and 27.** Phase 51 takes `direct/test_simplify_lens.py` (Phase 36 architect review, 179.022 s wall, 134.969 CPU s). Phases 54 and 55 take the assign launcher group: `_reuse` and `_identity` now, `test_assign_launcher.py` after models and herdr reach main (showrunner, 2026-11-06).
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
   - Candidate: `direct/test_verify_mac_only.py`, rank 1 at 358.7 s (CPU 339.3 s, 17 tests) in `top --repo ~/.claude` on 2026-11-05 08:15 EST. Free since verify's Mac retry hang fix landed on builds at 0380fb6ea (showrunner, 2026-11-05). Merge builds first and take a new baseline.

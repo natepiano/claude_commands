@@ -1021,7 +1021,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - No repository change. One traced run at 54e560258, load 80-93: 97 tests, 319.0 s wall, 79.5 CPU s; `bulk_run.py` and `git_process.py` make 10,582 Git calls in 69.7 s.
 - Most of those calls read mutable state or write. Those stay: `status`, `diff`, `ls-files`, `symbolic-ref`, branch `rev-parse`, and all writes.
 - Reads that a cache could cut, as upper bounds: `rev-parse` on object ids 9.4 s, `hash-object` 5.0 s, `ls-tree` 4.6 s, `cat-file --batch` 2.8 s, `check-ref-format` 2.0 s, `require_base` 1.3 s. The sum is 25.2 s (7.9%), and each distinct input still needs its first read, so the real gain is under the 5% bar. A cache for that gain is more code than the gods accept.
-- The largest removable lead is outside this phase: `bulk_run.py:1048`, `test_tree`, delegates 1,652 Git calls (24.1 s) to `copies.standing`. Phase 44 owns it.
+- The largest removable lead is outside this phase: `bulk_run.py:1043`, `test_tree`, delegates 1,652 Git calls (24.1 s) to `copies.standing`. Phase 44 owns it.
 - Root and common-directory reads (5.6 s upper bound) come from `style_ledger.py`, outside this phase.
 
 ### Phase 47 — test runs spend less time forcing writes to disk  · status: done
@@ -1135,50 +1135,23 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 52 — One shared reader for Git blobs, trees and status  · status: done
 **Depends on:** Phase 37
 
-#### Work Order
+#### As-built
 
-**Goal:** one parser for each Git batch format. The transports stay where they are: a one-shot `cat-file --batch` and the persistent process of `rules.py` both use the same reply parser. The Phase 37 simplify review found the copies, and the Phase 37 architect review found the persistent reader.
-
-**Spec:**
-1. In `scripts/style/git_process.py`, standard library only, add these:
-   - `read_batch_blob(replies: BinaryIO)`: read one `cat-file --batch` reply from a binary stream. It returns a named type for each outcome: blob with its bytes and object id, missing, malformed or truncated. No bare `None`.
-   - `TreeEntry`, moved from `style_ledger.py:1766`.
-   - `parse_tree_listing(listing: str) -> dict[str, TreeEntry]`, the `ls-tree -rz` parser, and `tree_entries`, moved from `style_ledger.py:1862`.
-   - `blob_contents`, moved from `style_ledger.py:1893`.
-   - `parse_status_z(output: str) -> set[str]`, the `status --porcelain -z` parser, which adds both names of a rename or a copy.
-2. `style_ledger.py` imports `TreeEntry`, `tree_entries` and `blob_contents`, so `ledger_api.tree_entries` and `ledger_api.blob_contents` still resolve. `crate_run.py`, `style_plan.py` and the `mock.patch.object` sites in `test_crate_run.py:1827`, `test_style_ledger.py:529` and `test_style_ledger_sites.py:290` do not change.
-3. Each caller keeps its own transport and its own failure policy, and uses the shared parser:
-   - `style_ledger.blob_contents`: object id requests, output through a temporary file. The reply's object id must equal the request; otherwise `GitReadFailed`.
-   - `phase_process.read_git_documents` (`scripts/direct/phase_process.py:1028`): `sha:path` requests, `--no-optional-locks`, the 8 s timeout, `errors="replace"`. A missing or malformed reply leaves that document absent, and the function does not raise for it.
-   - `inventory._read_frozen_files` (`scripts/feature_log/inventory.py:286`): NUL requests with `-z`, `GIT_OPTIONAL_LOCKS=0`, strict UTF-8. Missing, malformed, truncated and trailing data each raise `InventoryError` with today's text.
-   - `rules.ValidatedRuleHistory.identity` (`scripts/style/rules.py:202`): keep the persistent process, its lock, its cache and its `atexit` close. Only the reply parse changes. A bad reply still gives the empty identity.
-   - `affected_modules.blob_texts`: keep the function as a thin adapter, because `test_affected_modules.py:341` patches it and asserts it is not called on a warm cache. Strict UTF-8. A failed read, a missing reply or a malformed reply raises `GraphError`.
-   - `affected_modules.revision_files`: `git_output` then `parse_tree_listing`, so a failed read stays `GraphError`.
-   - `affected_modules.dirty_paths`: `git_output` then `parse_status_z`. `merge_gate.clean_test_tree` expects `GraphError` from a failed read.
-   - `bulk_run.py:794`: `ledger_api.tree_entries` and the `REGULAR_FILE_MODES` filter in place of its own `ls-tree -rz` parse.
-   - `unit_files.changed_files` (`scripts/style/unit_files.py:145`): its own `git` read, then `parse_status_z`, and it keeps its return type.
-4. Add tests to `scripts/style/test_git_process.py` for each `read_batch_blob` outcome and for `parse_status_z` on a rename, a copy and an untracked file. Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after.
-5. Leave these as they are, because their parsers differ: `direct/review_tree.py` (`--no-renames`, `path`-limited `ls-tree`), `buildlog/treekey.py`, `direct/tree_watch.py`, `hana_shot/hana_shot.py`, `style/style_plan.py:404` (it reads each status code).
-6. Add no guard, refusal or check (user rule, 2026-11-05).
+- `scripts/style/git_process.py`, standard library only, holds `read_batch_blob(replies)`, which returns `GitBlob`, `MissingBlob`, `MalformedBlobReply` or `TruncatedBlobReply`. It also holds `TreeEntry`, `parse_tree_listing`, `blob_contents` and `parse_status_z`. A blob length that Python cannot read returns `MalformedBlobReply`.
+- `tree_entries` stays in `style_ledger.py` and calls `parse_tree_listing`, because `test_the_split_blob_cache_reads_each_tree_once_and_keeps_versions_distinct` patches `style_ledger._git`. `style_ledger.py` imports `TreeEntry` and `blob_contents`, so `ledger_api` names still resolve.
+- Each caller keeps its transport and its failure policy: `rules.py` (persistent process), `affected_modules.py`, `phase_process.py` and `feature_log/inventory.py` use `read_batch_blob`. `bulk_run.plan_constants` uses `ledger_api.tree_entries`. `unit_files.changed_files` and `affected_modules.dirty_paths` use `parse_status_z`.
+- The full test on the phase commit is green: 715 modules, 6818 CPU s, memory peak 4.556 GiB. A trial merge with `origin/sdlc` 40e200dd0 is green.
 
 **Files:**
-- `scripts/style/git_process.py`, `scripts/style/style_ledger.py`, `scripts/style/bulk_run.py`, `scripts/style/unit_files.py`, `scripts/style/rules.py`, `scripts/style/test_git_process.py` — owner: style
-- `scripts/production/affected_modules.py`
-- `scripts/direct/phase_process.py`
-- `scripts/feature_log/inventory.py`
+- `scripts/style/git_process.py`, `scripts/style/test_git_process.py` — the parsers and their tests
+- `scripts/style/style_ledger.py`, `scripts/style/bulk_run.py`, `scripts/style/unit_files.py`, `scripts/style/rules.py` — style callers
+- `scripts/production/affected_modules.py`, `scripts/direct/phase_process.py`, `scripts/feature_log/inventory.py` — other callers
 
-**Workers:** 1 writer on slot `impl` (one move, used by every file)
-- `impl` — all files above
+**Binds later work:** A new reader of a `cat-file --batch` reply, an `ls-tree -rz` listing or a `status --porcelain -z` output uses these parsers. Phase 44 finds `copies.standing` at `bulk_run.py:1043`.
 
-**Constraints from prior phases:**
-- Phase 37: `affected_modules.blob_texts` raises `GraphError` on a failed read, and the selection turns that into a full run.
-- Phase 37: `revision_files`, `blob_texts` and `dirty_paths` have no importer outside `affected_modules.py`, `merge_gate.py` and `test_affected_modules.py`. The warm-cache assertions at `test_affected_modules.py:341` stay as they are.
-- `git_process.py` imports only the standard library. `TreeEntry` moves with its reader for this reason.
+**Gotchas:** `phase_process.py` and `inventory.py` start as plain scripts, so each adds the repository root to `sys.path` before its import.
 
-**Acceptance gate:**
-- `read_batch_blob` is the only code outside a test that parses a `cat-file --batch` reply header: a read of the call sites in Spec 3 shows this, and `git grep -n 'cat-file.*--batch'` lists the transports `style/git_process.py`, `style/rules.py`, `direct/phase_process.py` and `feature_log/inventory.py`.
-- Green in the gate form: `style/test_git_process.py`, `style/test_style_ledger.py`, `style/test_style_ledger_sites.py`, `style/test_crate_run.py`, `style/test_rules.py`, `production/test_affected_modules.py`, `production/test_full_test.py`, `direct/test_phase_process.py`, `feature_log/test_inventory.py`.
-- The full test green on the phase commit merged with `origin/builds`.
+**Ruled out:** `direct/review_tree.py`, `buildlog/treekey.py`, `direct/tree_watch.py` and `hana_shot/hana_shot.py` keep their own reads. `style/style_plan.py:404` reads each status code, so it is no copy of the parser.
 
 ### Phase 53 — `board.sh` starts no process to find its folder  · status: done
 **Depends on:** Phase 49
@@ -1195,3 +1168,67 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/direct/verify_lint_scope_test_support.py` (owner verify) — the fixture tool list
 - `scripts/direct/test_board_start.py` — one test per start form, each posts one board line
 
+### Phase 54 — The assign launcher reuse and identity tests run in half their time  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_assign_launcher_reuse.py` (82 s wall, 68 CPU s) and `scripts/direct/test_assign_launcher_identity.py` (70 s wall, 57 CPU s) each run in half their time, or a measured floor shows why they cannot, with every checked behavior kept. They are the top live modules that no phase holds and no unit edits now.
+
+**Spec:** Follow the Speed method.
+1. Each test runs the launcher 1 to 3 times. `DEFAULT_ASSIGNMENT_EXECUTION` in `assign_launcher_test_support.py` is `LauncherScript(ASSIGN)`, a separate process, with the comment "Worker admission requires the actual assignment process." Profile before any edit. Name what one launcher process costs: `bash assign.sh`, interpreter start, imports, each child process, the recorder, compaction waits. Name what `setUp` costs.
+2. Cut in the Speed method's order. Test first whether each test needs a separate process, and name the admission check that requires one. A test that only needs the state of a first dispatch can share that state. Keep one process test per boundary.
+3. A cut in a production file goes to the director first, with the measured gain. Do not edit `assign.py` or `test_assign_launcher.py`: two sdlc units change them now.
+4. A change to `assign_launcher_test_support.py` keeps every importer green: `direct/test_assign_launcher*.py`, `direct/test_assign_claude_door.py`, `direct/test_assign_gate.py`, `agents/test_agent_bg.py`, `agents/test_agent_exec.py`, `lib/test_nix_env_launches.py`. Keep away from the `set-unit` line: sdlc changes that line.
+5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/direct/test_assign_launcher_reuse.py` — the first module
+- `scripts/direct/test_assign_launcher_identity.py` — the second module
+- `scripts/direct/assign_launcher_test_support.py` — the shared fixture
+
+**Workers:** 1 writer on slot `impl4` (the files share one fixture and do not split)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 5: the group has four files on one support file. `test_unreadable_staff_starts_no_worker` runs a separate process because the recorder writes its refusal to process stderr.
+- Phase 6: one real launcher run per test takes 3-6 s, and a parse-only call cannot replace the recorder checks.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher_reuse.py'` and the same line for `test_assign_launcher_identity.py` green, with the same test names and assertions
+- every importer of the support file green, if the phase changes it
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 55 — `direct/test_assign_launcher.py` runs in half its time  · status: todo
+**Depends on:** Phase 54
+**Blocked by:** models a0b90e899 and herdr 14a on main; the showrunner sends the word. Do not merge the sdlc branch.
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_assign_launcher.py` (85 s wall, 69 CPU s at 21 tests) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Take a new baseline after the merge. Recent trees ran 21, 39 and 42 tests in this module, so name the test count at dispatch.
+2. Apply what Phase 54 found about a launcher process. Keep one process test per boundary.
+3. A cut in a production file goes to the director first, with the measured gain.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/direct/test_assign_launcher.py` — the module
+
+**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher.py'` green, with the same test names and assertions
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
