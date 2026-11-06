@@ -1259,30 +1259,14 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 58 — The hana_shot launch test reads no live build log  · status: done
 **Depends on:** Phase 57
 
-#### Work Order
+#### As-built
 
-**Goal:** `test_launch_and_cleanup_keep_real_buildlog_unchanged` passes while other builds write the shared build log, and it still fails when a launch writes outside its own log folder.
-
-**Spec:**
-1. The test compares the size and time of `~/.local/state/buildlog/<host>/*` before and after a launch. Any other build that writes the log in that window fails it: twice in a full gate, and 1 of 4 single runs.
-2. In this test, set `HOME` to a folder under `self.scratch`. `store.root()` with no `BUILDLOG_DIR` then names a default root inside that folder.
-3. After the launch and the cleanup, assert that this default root does not exist. Keep the assertions on the exit code, the state file, the scratch folder and the rows in `BUILDLOG_DIR`.
-4. The test reads no file under the real home. Rename the test for what it pins.
-5. Prove the test: with `store.root` changed by hand to ignore `BUILDLOG_DIR`, the test fails. Revert that change.
-6. Add no guard, refusal or check (user rule, 2026-11-05).
+- `test_launch_and_cleanup_leave_the_default_buildlog_absent` runs with `HOME` under the test's scratch folder, so it reads no real log and another build cannot fail it. It asserts that the isolated log root is inside the scratch folder and that the default log root stays absent after launch and cleanup. The other assertions on exit code, state file, scratch folder and isolated log rows stand.
+- The module has 115 tests and takes 52 s. A `store.root` that ignores `BUILDLOG_DIR` fails the test at its `assertFalse(default_root.exists())` line.
 
 **Files:**
-- `scripts/hana_shot/test_hana_shot.py` — the one test
+- `scripts/hana_shot/test_hana_shot.py` — the launch and cleanup test
 
-**Workers:** 1 writer on slot `impl` (one test in one file)
-- `impl` — the file above, role impl
+**Gotchas:** The test reads the default root with `BUILDLOG_DIR` removed, under the patched `HOME`.
 
-**Constraints from prior phases:**
-- Phase 20: the module stops its fixture servers at once.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/hana_shot -p 'test_hana_shot.py'` green
-- the test run four times on the busy machine, all green; no run writes to the real log
-- the hand change in Spec 5 makes the test fail
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** A proof that appends to the real shared log: it puts false rows in a log other tools read.
