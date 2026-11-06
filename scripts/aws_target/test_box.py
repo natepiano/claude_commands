@@ -17,11 +17,13 @@ from urllib.error import HTTPError, URLError
 
 from scripts.aws_target import admin_secrets, box, deploy
 from scripts.aws_target.ledger import mapping
+from scripts.aws_target.aws_target import AwsUnavailable
 from scripts.build_targets import target_config
 from scripts.mac_test import mac_test, offload
 from scripts.lib import conf
 
 SYSTEM = '/nix/store/' + 'a' * 32 + '-nixos-system-aws-build'
+IMAGE_TAGS = [{'Key': box.IMAGE_OWNER_TAG, 'Value': 'true'}]
 
 FAKE = r'''import json, os, pathlib, shlex, sys
 root = pathlib.Path(os.environ['BOX_FIXTURE'])
@@ -33,6 +35,10 @@ with (root / 'commands').open('a') as log:
     log.write(json.dumps([name, *args]) + '\n')
 def save(): path.write_text(json.dumps(s))
 def output(value): print(json.dumps(value))
+def filtered(rows):
+    filters = json.loads(args[args.index('--filters') + 1])
+    return [row for row in rows if all(any(tag['Key'] == f['Name'][4:] and tag['Value'] in f['Values']
+            for tag in row.get('Tags', [])) for f in filters)]
 def versions(command, remote=False):
     if 'rustc' in command: print(s.get('local_rustc', 'rustc fixture') if not remote else 'rustc fixture')
     elif 'nextest' in command: print('cargo-nextest fixture\n  release fixture  ' if not s.get('mismatch') or not remote else 'cargo-nextest wrong')
@@ -47,12 +53,52 @@ if name == 'aws':
         output({'Reservations': [{'Instances': [{'InstanceId': 'i-box', 'State': {'Name': s.get('ec2', 'running')}, 'LaunchTime': '2026-11-04T00:00:00Z'}]}]})
     elif op == 'stop-instances':
         s['ec2'] = 'stopped'; s['forced_stop'] = True; save(); output({})
+    elif op == 'create-image':
+        if s.get('image_failure'):
+            print('fixture image failure', file=sys.stderr); sys.exit(1)
+        s['image_reads'] = 0; s['image_created'] = True; save(); output({'ImageId': 'ami-cache'})
+    elif op == 'describe-images':
+        if s.get('image_missing'):
+            print('InvalidAMIID.NotFound', file=sys.stderr); sys.exit(1)
+        current = {'ImageId': 'ami-cache', 'State': s.get('image_state', 'available'),
+                   'Tags': [{'Key': 'aws-build-image', 'Value': 'true'}],
+                   'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {'SnapshotId': 'snap-cache'}}]}
+        if s.get('image_state') == 'failed': current['StateReason'] = {'Message': 'snapshot failed'}
+        if '--image-ids' in args:
+            s['image_reads'] = s.get('image_reads', 0) + 1; save()
+            if s.get('snapshot_delayed') and s['image_reads'] == 1: current['BlockDeviceMappings'] = []
+            if s.get('image_state') == 'pending' and s['image_reads'] > 1: current['State'] = 'available'
+            output({'Images': [current]})
+        else:
+            output({'Images': filtered([current, *s.get('old_images', [])])})
+    elif op == 'describe-snapshots':
+        output({'Snapshots': filtered([{'SnapshotId': 'snap-cache', 'Tags': [
+            {'Key': 'aws-build-image', 'Value': 'true'}]}, *s.get('old_snapshots', [])])})
+    elif op == 'deregister-image':
+        if s.pop('deregister_failure', False):
+            save(); print('fixture deregister failure', file=sys.stderr); sys.exit(1)
+        image = args[args.index('--image-id') + 1]
+        s['old_images'] = [row for row in s.get('old_images', []) if row['ImageId'] != image]
+        save(); output({})
+    elif op == 'delete-snapshot':
+        if s.pop('snapshot_failure', False):
+            save(); print('fixture snapshot failure', file=sys.stderr); sys.exit(1)
+        snapshot = args[args.index('--snapshot-id') + 1]
+        s['old_snapshots'] = [row for row in s.get('old_snapshots', []) if row['SnapshotId'] != snapshot]
+        save(); output({})
     elif op == 'describe-instance-information':
         output({'InstanceInformationList': [{'InstanceId': 'i-box', 'PingStatus': 'Online'}] if s['online'] else []})
     elif op == 'send-command':
         s['ssm_command'] = json.loads(args[args.index('--parameters') + 1])['commands'][0]
         save(); output({'Command': {'CommandId': 'command-box'}})
     elif op == 'get-command-invocation':
+        if 'keep=/home/.aws-build-image-keep' in s.get('ssm_command', ''):
+            if 'mkdir -p -m 0700' in s['ssm_command']: s['keep'] = True
+            else:
+                if s.pop('restore_failure', False):
+                    save(); output({'Status': 'Failed', 'StandardErrorContent': 'fixture restore failure'}); sys.exit(0)
+                s['keep'] = False
+            save(); output({'Status': 'Success', 'StandardOutputContent': 'done'}); sys.exit(0)
         output({'Status': 'Success', 'StandardOutputContent': json.dumps({
             'running': s['joined'], 'ssh': s['joined'], 'tags': ['tag:build-aws'] if s['joined'] else [],
             'addresses': ['100.64.0.3'], 'id': 'node-box'})})
@@ -103,7 +149,10 @@ elif name == 'ssh':
     if 'ssh_stderr' in s:
         print(s['ssh_stderr'], file=sys.stderr); sys.exit(255)
     command = args[-1]
-    if 'aws-build-setup-stop --on-active' in command:
+    if command == 'test -e /var/lib/aws-build/bootstrap-complete':
+        s['bootstrap_reads'] = s.get('bootstrap_reads', 0) + 1; save()
+        sys.exit(0 if s['bootstrap_reads'] > s.get('bootstrap_delay', 0) else 1)
+    elif 'aws-build-setup-stop --on-active' in command:
         s['hold'] = True; s['active'] = False; save()
     elif 'systemd-run --unit=aws-build-switch' in command:
         assert s.get('hold') and s.get('copies')
@@ -317,8 +366,225 @@ class BoxTests(unittest.TestCase):
             later = self.commands()[commands:]
             self.assertFalse(any('systemd-run' in c[-1] or c[0] == 'nix' and 'copy' in c for c in later))
             results = box.json_record((self.directory / 'up.json').read_text())
-            self.assertEqual(len(results), 11)
+            self.assertEqual(len(results), 12)
             self.assertTrue(all(mapping(result)['status'] == 'present' for result in results.values()))
+
+    def image_record(self, **values: object) -> None:
+        _ = (self.directory / 'image.json').write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM, **values}))
+
+    def test_image_creation_scrubs_restores_and_excludes_the_data_volume(self) -> None:
+        self.change(joined=True, keep=True, snapshot_delayed=True)
+        _ = (self.directory / 'image-scrub.json').write_text('{}')
+        self.assertFalse(self.subject.image_present())
+        self.subject.image()
+        commands = self.commands()
+        scrub = next(i for i, c in enumerate(commands) if 'mkdir -p -m 0700' in ' '.join(c))
+        create = next(i for i, c in enumerate(commands) if 'create-image' in c)
+        restores = [i for i, c in enumerate(commands) if 'rmdir --' in ' '.join(c)]
+        self.assertLess(restores[0], scrub)
+        self.assertLess(scrub, create)
+        snapshot = next(i for i, c in enumerate(commands) if 'describe-images' in c)
+        self.assertLess(create, snapshot)
+        self.assertLess(snapshot, restores[-1])
+        self.assertEqual(sum('describe-images' in c for c in commands[create:restores[-1]]), 2)
+        args = commands[create]
+        self.assertIn('--no-reboot', args)
+        self.assertEqual(json.loads(args[args.index('--block-device-mappings') + 1]),
+                         [{'DeviceName': '/dev/sdf', 'NoDevice': ''}])
+        tags = cast(object, json.loads(args[args.index('--tag-specifications') + 1]))
+        self.assertEqual(tags, [{'ResourceType': kind, 'Tags': [{'Key': conf.read(self.settings).text('cost_explorer_tag_key'),
+            'Value': conf.read(self.settings).text('cost_explorer_tag_value')}, *IMAGE_TAGS]} for kind in ('image', 'snapshot')])
+        scrub_command = cast(list[str], box.json_record(commands[scrub][commands[scrub].index('--parameters') + 1])['commands'])[0]
+        self.assertIn('for item in /var/lib/tailscale /var/lib/aws-build/data-volume-id /var/lib/aws-build/bootstrap-complete;', scrub_command)
+        self.assertNotIn('systemctl', scrub_command)
+        self.assertNotIn('stop', scrub_command.replace('bootstrap', ''))
+        steps = ['rm -rf -- "$keep/$name.partial"', 'cp -a -- "$item" "$keep/$name.partial"',
+                 'mv -- "$keep/$name.partial" "$keep/$name"', 'rm -rf -- "$item"']
+        positions = [scrub_command.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
+        restore_command = cast(list[str], box.json_record(commands[restores[-1]][
+            commands[restores[-1]].index('--parameters') + 1])['commands'])[0]
+        self.assertLess(restore_command.index('rm -rf -- "$keep"/*.partial'), restore_command.index('for item'))
+        self.assertFalse(self.live()['keep'])
+        self.assertFalse((self.directory / 'image-scrub.json').exists())
+        self.assertEqual(box.json_record((self.directory / 'image.json').read_text()),
+                         {'image_id': 'ami-cache', 'system': SYSTEM})
+
+    def test_image_create_failure_restores_items_and_keeps_the_first_error(self) -> None:
+        self.change(joined=True, image_failure=True)
+        restore_items = self.subject._restore_image_items  # pyright: ignore[reportPrivateUsage]
+        with mock.patch.object(self.subject, '_restore_image_items', wraps=restore_items) as restore, \
+             self.assertRaisesRegex(AwsUnavailable, 'fixture image failure'):
+            self.subject.image()
+        self.assertEqual(restore.call_count, 1)
+        self.assertFalse(self.live()['keep'])
+        self.assertFalse((self.directory / 'image-scrub.json').exists())
+        with mock.patch.object(self.subject, '_restore_image_items', side_effect=box.BoxRefused('restore failed')), \
+             self.assertRaisesRegex(AwsUnavailable, 'fixture image failure'):
+            self.subject.image()
+        self.assertTrue((self.directory / 'image-scrub.json').exists())
+
+    def test_image_restore_marker_resumes_available_image_before_cleanup_without_tailscale(self) -> None:
+        self.image_record()
+        marker = self.directory / 'image-scrub.json'
+        _ = marker.write_text('{}')
+        self.change(keep=True)
+        self.assertFalse(self.subject.image_present())
+        self.assertFalse((self.root / 'commands').exists())
+        with mock.patch.object(self.subject, 'join_present', side_effect=AssertionError('Tailscale join')):
+            self.subject.image()
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.live()['keep'])
+        self.assertEqual(self.starts, 1)
+        commands = self.commands()
+        self.assertIn('describe-instance-information', commands[0])
+        restore = next(i for i, c in enumerate(commands) if 'rmdir --' in ' '.join(c))
+        cleanup = next(i for i, c in enumerate(commands) if '--filters' in c and 'describe-images' in c)
+        self.assertLess(restore, cleanup)
+        self.assertFalse(any('create-image' in c or c[0] in ('ssh', 'tailscale') for c in commands))
+
+    def test_image_restore_failure_keeps_marker_until_restore_succeeds(self) -> None:
+        self.image_record()
+        marker = self.directory / 'image-scrub.json'
+        _ = marker.write_text('{}')
+        self.change(keep=True, restore_failure=True)
+        with self.assertRaisesRegex(box.BoxRefused, 'SSM command command-box: Failed'):
+            self.subject.image()
+        self.assertTrue(marker.exists())
+        self.assertTrue(self.live()['keep'])
+        self.assertFalse(any('describe-images' in c for c in self.commands()))
+        self.subject.image()
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.live()['keep'])
+        self.assertFalse(any('create-image' in c for c in self.commands()))
+
+    def test_image_marker_exists_before_scrub_and_survives_final_restore_failure(self) -> None:
+        self.change(joined=True)
+        marker = self.directory / 'image-scrub.json'
+        ssm = self.subject._ssm  # pyright: ignore[reportPrivateUsage]
+        def execute(command: str) -> str:
+            if 'mkdir -p -m 0700' in command:
+                self.assertTrue(marker.exists())
+            return ssm(command)
+        with mock.patch.object(self.subject, '_ssm', side_effect=execute), \
+             mock.patch.object(self.subject, '_restore_image_items', side_effect=box.BoxRefused('restore failed')), \
+             self.assertRaisesRegex(box.BoxRefused, 'restore failed'):
+            self.subject.image()
+        self.assertTrue(marker.exists())
+        self.assertTrue((self.directory / 'image.json').exists())
+        self.assertFalse(self.subject.image_present())
+        self.subject.image()
+        self.assertFalse(marker.exists())
+        self.assertEqual(sum('create-image' in c for c in self.commands()), 1)
+
+    def test_image_present_uses_only_ec2_for_the_same_system(self) -> None:
+        self.image_record()
+        self.assertTrue(self.subject.image_present())
+        self.assertTrue(all(c[0] in ('git', 'nix', 'aws') for c in self.commands()))
+        self.image_record(system='/nix/store/other')
+        before = len(self.commands())
+        self.assertFalse(self.subject.image_present())
+        self.assertEqual(len(self.commands()), before)
+        self.image_record()
+        self.change(image_missing=True)
+        self.assertFalse(self.subject.image_present())
+
+    def test_pending_image_resumes_without_start_or_scrub(self) -> None:
+        self.image_record()
+        self.change(image_state='pending')
+        self.subject.image()
+        self.assertEqual(self.starts, 0)
+        self.assertFalse(any('create-image' in c or 'send-command' in c for c in self.commands()))
+
+    def test_image_removes_only_other_images_and_their_snapshots(self) -> None:
+        self.change(joined=True, old_images=[{'ImageId': 'ami-old', 'Tags': IMAGE_TAGS, 'BlockDeviceMappings': [
+            {'Ebs': {'SnapshotId': 'snap-old'}}]}], old_snapshots=[{'SnapshotId': 'snap-old', 'Tags': IMAGE_TAGS},
+            {'SnapshotId': 'snap-unowned', 'Description': 'Created by CreateImage fixture', 'Tags': [
+                {'Key': conf.read(self.settings).text('cost_explorer_tag_key'),
+                 'Value': conf.read(self.settings).text('cost_explorer_tag_value')}]}])
+        self.subject.image()
+        commands = self.commands()
+        self.assertEqual([c[c.index('--image-id') + 1] for c in commands if 'deregister-image' in c], ['ami-old'])
+        self.assertEqual([c[c.index('--snapshot-id') + 1] for c in commands if 'delete-snapshot' in c], ['snap-old'])
+        filters = next(c for c in commands if '--filters' in c and 'describe-images' in c)
+        self.assertEqual(json.loads(filters[filters.index('--filters') + 1]),
+                         [{'Name': 'tag:' + box.IMAGE_OWNER_TAG, 'Values': ['true']}])
+        snapshots = next(c for c in commands if 'describe-snapshots' in c)
+        self.assertEqual(snapshots[snapshots.index('--owner-ids') + 1], 'self')
+        self.assertEqual(json.loads(snapshots[snapshots.index('--filters') + 1]), [
+            {'Name': 'tag:' + box.IMAGE_OWNER_TAG, 'Values': ['true']}])
+        self.assertEqual([mapping(row)['SnapshotId'] for row in cast(list[object], self.live()['old_snapshots'])], ['snap-unowned'])
+        self.assertTrue(self.subject.image_present())
+
+    def test_image_present_requires_no_old_images_or_orphan_snapshots(self) -> None:
+        self.image_record()
+        self.change(old_images=[{'ImageId': 'ami-old', 'Tags': IMAGE_TAGS}])
+        self.assertFalse(self.subject.image_present())
+        self.change(old_images=[], old_snapshots=[{'SnapshotId': 'snap-orphan', 'Tags': IMAGE_TAGS}])
+        self.assertFalse(self.subject.image_present())
+        self.change(old_snapshots=[])
+        self.assertTrue(self.subject.image_present())
+        self.assertEqual(self.starts, 0)
+        self.assertFalse(any(c[0] in ('ssh', 'tailscale') or 'send-command' in c for c in self.commands()))
+
+    def test_image_cleanup_resumes_after_deregister_failure_without_box_changes(self) -> None:
+        self.assert_image_cleanup_resumes('deregister_failure', 'fixture deregister failure', True)
+
+    def test_image_cleanup_resumes_after_snapshot_failure_without_box_changes(self) -> None:
+        self.assert_image_cleanup_resumes('snapshot_failure', 'fixture snapshot failure', False)
+
+    def assert_image_cleanup_resumes(self, failure: str, reason: str, image_remains: bool) -> None:
+        self.change(joined=True, old_images=[{'ImageId': 'ami-old', 'Tags': IMAGE_TAGS, 'BlockDeviceMappings': [
+            {'Ebs': {'SnapshotId': 'snap-old'}}]}], old_snapshots=[{'SnapshotId': 'snap-old', 'Tags': IMAGE_TAGS}], **{failure: True})
+        with self.assertRaisesRegex(AwsUnavailable, reason):
+            self.subject.image()
+        self.assertEqual(bool(self.live()['old_images']), image_remains)
+        self.assertEqual(self.live()['old_snapshots'], [{'SnapshotId': 'snap-old', 'Tags': IMAGE_TAGS}])
+        self.assertFalse(self.subject.image_present())
+        before = len(self.commands())
+        starts = self.starts
+        with mock.patch.object(self.subject, 'start', side_effect=AssertionError('box start')), \
+             mock.patch.object(self.subject, 'join_present', side_effect=AssertionError('box join')), \
+             mock.patch.object(self.subject, '_ssm', side_effect=AssertionError('box SSM')):
+            self.subject.image()
+        commands = self.commands()[before:]
+        self.assertEqual(self.starts, starts)
+        self.assertTrue(all(c[0] == 'aws' for c in commands))
+        self.assertFalse(any('create-image' in c or 'send-command' in c for c in commands))
+        self.assertEqual([c[c.index('--image-id') + 1] for c in commands if 'deregister-image' in c],
+                         ['ami-old'] if image_remains else [])
+        self.assertEqual([c[c.index('--snapshot-id') + 1] for c in commands if 'delete-snapshot' in c], ['snap-old'])
+        self.assertEqual(self.live()['old_images'], [])
+        self.assertEqual(self.live()['old_snapshots'], [])
+        self.assertTrue(self.subject.image_present())
+        self.assertEqual(sum('create-image' in c for c in self.commands()), 1)
+
+    def test_failed_image_reports_its_state_reason(self) -> None:
+        self.image_record()
+        # The first read resumes the pending image; the next read reports failure.
+        with mock.patch.object(box, 'saved_image', side_effect=[{'State': 'pending'},
+                {'State': 'failed', 'StateReason': {'Message': 'snapshot failed'}}]), \
+             self.assertRaisesRegex(box.BoxRefused, 'snapshot failed'):
+            self.subject.image()
+
+    def test_configure_waits_for_bootstrap_before_changes(self) -> None:
+        self.change(joined=True, bootstrap_delay=2)
+        self.subject.configure()
+        ssh = [c for c in self.commands() if c[0] == 'ssh']
+        reads = [i for i, c in enumerate(ssh) if c[-1] == 'test -e /var/lib/aws-build/bootstrap-complete']
+        self.assertEqual(len(reads), 3)
+        first_change = next(i for i, c in enumerate(ssh) if 'systemd-run' in c[-1])
+        self.assertLess(reads[-1], first_change)
+
+    def test_idle_stop_image_proof_covers_a_new_instance_with_the_same_system(self) -> None:
+        self.image_record(idle_stop_system=SYSTEM)
+        with mock.patch.object(self.subject, '_instance', return_value='i-new'):
+            self.assertTrue(self.subject.idle_stop_present())
+        self.image_record(idle_stop_system='/nix/store/old')
+        self.assertFalse(self.subject.idle_stop_present())
+        self.change(joined=True, self_stop=True, stop_after=4)
+        self.subject.idle_stop()
+        self.assertEqual(box.json_record((self.directory / 'image.json').read_text())['idle_stop_system'], SYSTEM)
 
     def test_policy_devices_match_machine_names_instead_of_hostnames(self) -> None:
         status: dict[str, object] = {
@@ -471,7 +737,8 @@ class BoxTests(unittest.TestCase):
         configure_commands = self.commands()[before:]
         ssh_commands = [command for command in configure_commands if command[0] == 'ssh']
         self.assertTrue(ssh_commands)
-        read_commands = {'readlink -f /run/current-system', 'systemctl is-active aws-build-remote.service'}
+        read_commands = {'readlink -f /run/current-system', 'systemctl is-active aws-build-remote.service',
+                         'test -e /var/lib/aws-build/bootstrap-complete'}
         self.assertTrue(read_commands.issubset({command[-1] for command in ssh_commands}))
         for command in ssh_commands:
             user = 'natepiano' if command[-1] in read_commands else 'root'

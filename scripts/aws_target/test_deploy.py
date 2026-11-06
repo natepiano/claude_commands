@@ -193,6 +193,14 @@ elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set
     if params['EnableCompute'] == 'false' and (root / 'slow-foundation').exists():
         (root / 'clock').write_text(str(clock + 301))
     reply({})
+elif operation == 'create-image':
+    reply({'ImageId': 'ami-cache'})
+elif operation in ('deregister-image', 'delete-snapshot'):
+    reply({})
+elif operation == 'describe-snapshots':
+    reply({'Snapshots': [{'SnapshotId': 'snap-cache'}]})
+elif operation == 'describe-images' and '--owners' in args and args[args.index('--owners') + 1] == 'self':
+    reply({'Images': [{'ImageId': 'ami-cache', 'State': 'available', 'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {'SnapshotId': 'snap-cache'}}]}]})
 elif operation == 'describe-images':
     reply({'Images': [{'ImageId': 'ami-fixture', 'OwnerId': '123456789012', 'Architecture': 'x86_64',
                        'State': 'available', 'Name': 'nixos-26.05-x86_64', 'RootDeviceName': '/dev/xvda'}]})
@@ -972,6 +980,41 @@ sys.exit(7)
             _ = subject.prepare()
         self.assertEqual(len(self.commands('create-change-set')), before)
 
+    def test_parameters_choose_only_an_available_saved_image(self) -> None:
+        subject = self.deployment()
+        self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-fixture')
+        _ = (self.state / 'image.json').write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM}))
+        self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-cache')
+        with mock.patch.object(box, 'saved_image', return_value={}):
+            self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-fixture')
+        with mock.patch.object(aws_target.AwsCli, 'call', side_effect=aws_target.AwsUnavailable('InvalidAMIID.NotFound')):
+            self.assertEqual(box.saved_image(subject._api(aws_config.read_deployment_settings(self.settings, self.state)), self.state), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_image_stage_runs_between_checks_and_idle_stop(self) -> None:
+        stages = [stage.name for stage in self.deployment()._box_stages()]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(stages[stages.index('checks'):stages.index('idle-stop') + 1], ['checks', 'image', 'idle-stop'])
+
+    def test_update_preserves_ami_only_with_a_live_instance(self) -> None:
+        subject = self.update_fixture()
+        prepared = subject.prepare()
+        for live in ({'InstanceId': 'i-fixture'}, {}):
+            with mock.patch.object(subject, '_stack', return_value=live):
+                subject._update_stack(aws_config.read_deployment_settings(self.settings, self.state), prepared.parameters, compute=False)  # pyright: ignore[reportPrivateUsage]
+            args = cast(list[str], self.commands('create-change-set')[-1]['args'])
+            values = ledger.rows({'values': cast(object, json.loads(args[args.index('--parameters') + 1]))}, 'values')
+            ami = next(row for row in values if row['ParameterKey'] == 'AmiId')
+            self.assertEqual(ami, {'ParameterKey': 'AmiId', **({'UsePreviousValue': True} if live else {'ParameterValue': 'ami-fixture'})})
+
+    def test_down_keeps_and_reports_the_saved_image(self) -> None:
+        _ = self.removal_fixture()
+        path = self.state / 'image.json'
+        _ = path.write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM, 'idle_stop_system': SYSTEM}))
+        before = path.read_bytes()
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertIn('down: image kept: ami-cache; next up starts from it', output)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_new_stack_gets_current_bootstrap(self) -> None:
         subject = self.deployment()
         prepared = subject.prepare()
@@ -1276,6 +1319,10 @@ else: raise AssertionError(args)
         devices['devices'] = [*existing, {'id': 'new-device', 'nodeId': 'node-box',
                                          'hostname': name, 'tags': ['tag:build-aws']}]
 
+    def start_box_after_tick(self, start: Callable[[], object]) -> object:
+        self.set_clock(self.now + 1)
+        return start()
+
     def down_output(self) -> tuple[bool, str]:
         output = StringIO()
         with redirect_stdout(output):
@@ -1302,7 +1349,7 @@ else: raise AssertionError(args)
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
                   admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
                                   session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
@@ -1390,6 +1437,7 @@ else: raise AssertionError(args)
         with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
             self.assertTrue(self.deployment().down())
         self.assertIn('/home build cache is lost', output.getvalue())
+        self.assertIn('admin.gpg, and the box image', output.getvalue())
         self.assertIn('--approve-destroy', output.getvalue())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
@@ -1406,6 +1454,7 @@ else: raise AssertionError(args)
         success, output = self.down_output()
         self.assertTrue(success, output)
         self.assertIn('data volume; the /home build cache is lost', output)
+        self.assertNotIn('down: image kept:', output)
         self.assertIn('retained Budget', output)
         self.assertEqual([row['hostname'] for row in ledger.rows(devices, 'devices')], ['other'])
         self.assertEqual(admin_secrets.read_profiles(self.credentials).sections(), ['unrelated'])
@@ -1488,7 +1537,7 @@ else: raise AssertionError(args)
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
                   admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
                                   session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \
@@ -1497,7 +1546,7 @@ else: raise AssertionError(args)
         self.assertTrue(success, output)
         results = remote.read_record(self.state / 'up.json')
         self.assertEqual(list(results), sorted(('price', 'bootstrap', 'stacks', 'scaler-key', 'tailscale-policy', 'box-join',
-                                              'box-configuration', 'checks', 'idle-stop', 'activation', 'routing-proof')))
+                                              'box-configuration', 'checks', 'image', 'idle-stop', 'activation', 'routing-proof')))
         self.assertTrue(all(ledger.mapping(row)['status'] == 'done' for name, row in results.items() if name != 'price'), output)
         later = [cast(list[str], row['args']) for row in self.commands()[before:]]
         self.assertEqual(sum('EnableCompute=false' in args for args in later), 1)
@@ -1643,7 +1692,7 @@ else: raise AssertionError(args)
         def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
                   admin: admin_secrets.AdminSecretSession) -> box.BoxSetup:
             monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, start, execute=execute, admin=admin, tailnet=box.tailnet_request,
+            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=box.tailnet_request,
                                   monotonic=monotonic, pause=monotonic.advance)
         with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
              mock.patch.object(box, 'BoxSetup', side_effect=setup), \

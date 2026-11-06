@@ -100,7 +100,8 @@ An interruption marker reports the instance generation.
 
 ### Deployment: `deploy.py`, `docs/plans/builds-aws/`
 
-- `deploy.py up --approve-resources` runs price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, checks, idle stop, activation, and routing proof.
+- `deploy.py up --approve-resources` runs twelve stages.
+  They run in this order: price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, checks, image, idle stop, activation, and routing proof.
   Each stage checks live state and records its last result and times in `up.json`.
   A retry continues from incomplete stages. The price stage always refreshes the public price.
   The stacks stage preserves the guard, ledger, and retained-volume checks.
@@ -147,6 +148,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 3. `box-configuration` reads the clean `main` checkout named by `nixos_configuration_directory`.
    It compares `/run/current-system` with the `aws-build` output.
    It builds the output locally and copies the closure with destination substitutes.
+   It waits for `/var/lib/aws-build/bootstrap-complete` before changing the box.
    It copies the closure and runs the box configuration commands as `root` without `sudo`.
    It holds the controller lock and stops the remote idle service during the copy.
    A bounded poweroff timer protects a failed reconnect.
@@ -161,6 +163,39 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
    `box-tools.json` records the instance ID and normalized tool versions.
    Each build still checks the tools inside its own repository shell.
 
+5. `image` saves an image of the configured system before the idle stop proof.
+   It checks the saved system path and the image state before creating an image.
+
+### Box image cache
+
+`image.json` records the image ID, system path, and completed idle stop system proof.
+The image holds the root filesystem and the Nix store.
+The helper excludes the `/dev/sdf` data volume from the image.
+It moves the Tailscale identity and both bootstrap markers to `/home` while the root snapshot starts.
+It restores these items after EC2 reports the root snapshot ID, including after a failed request.
+`image-scrub.json` records the need to restore these items before the scrub starts.
+A rerun restores the items through SSM before it resumes image creation or cleanup.
+The helper deletes the marker only after a successful restore.
+The helper copies each item to a `.partial` path before it renames the complete copy and removes the original.
+The restore removes partial copies before it restores complete copies.
+The moved files leave no live path in the image, but their deleted blocks can stay in the snapshot.
+The image is private and encrypted, and is never shared.
+`down` deletes the Tailscale node, which ends that key.
+The helper holds the controller lock during this operation and stops no service.
+A changed desired system refreshes the image.
+The helper tags both the image and its snapshots with `aws-build-image=true` beside the cost tag.
+The helper waits for the image to become available and removes other images with that ownership tag.
+It lists snapshots with that ownership tag separately and deletes each snapshot outside the current image mappings.
+The stage stays incomplete while either list holds an item to delete.
+A rerun without a restore marker resumes a pending or available image and repeats cleanup without changing the box.
+Only one image remains.
+A 32 GiB root snapshot costs at most $1.60 per month at $0.05 per GB-month.
+`down` keeps the image and its system proof.
+The next `up` selects the available image for a new instance.
+The unchanged bootstrap prepares the new data volume and installs the remote scripts.
+Every stage still runs in the same order.
+A completed idle stop proof also covers a new instance with the same desired system.
+
 `admin_secret_file` names `~/.config/aws-build/admin.gpg` outside the repository, with mode `0600`.
 The encrypted JSON holds `aws_access_key_id`, `aws_secret_access_key`, `tailscale_client_id`, and `tailscale_client_secret`.
 `deploy.py secrets` uses symmetric AES256 encryption and hidden terminal input.
@@ -172,7 +207,7 @@ Enter retains a stored value during replacement.
 `price`, `apply`, `setup-start`, and `up` decrypt at the first administrator request.
 `prepare` decrypts only when it must reconcile existing AWS resources.
 `bootstrap` needs no administrator credentials.
-`up` shares one decryption across all eleven stages.
+`up` shares one decryption across all twelve stages.
 The price stage refresh and the live checks require credentials even when every stage reports `present`.
 The policy check uses the same decrypted OAuth client for its token request.
 AWS subprocesses receive the administrator key through their environment without an administrator profile argument.
@@ -251,7 +286,8 @@ The controller activation and routing proof remain separate plan stages.
    The stage requires a new successful pinned buildlog step with `target=aws` and `host=aws-build`.
 
 Both proofs record the current instance ID and completion time in `up.json`.
-A replacement instance invalidates both proofs.
+A replacement instance invalidates the routing proof.
+The idle stop proof remains valid when `image.json` records the same desired system.
 A later run skips completed proofs without another idle wait or test.
 A stopped instance retains its completed setup evidence for the same instance ID.
 The price stage still refreshes the public price.
@@ -353,7 +389,7 @@ Before CREATE, the helper checks identity-<deployment_id> for a previous reserva
 It verifies the saved DeploymentId and the StackId account before it saves the StackId.
 It resumes the change-set waiter without a second CREATE request.
 
-Existing stack updates preserve the previous Bootstrap when an InstanceId exists. Bootstrap applies only at first boot.
+Existing stack updates preserve the previous Bootstrap and AmiId when an InstanceId exists. These values apply only when the stack creates an instance.
 The box-configuration stage changes a live box.
 
 The helper inspects an UPDATE change set before execution. It refuses protected resource removals and replacements, including conditional replacements.

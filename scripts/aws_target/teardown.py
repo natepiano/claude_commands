@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import subprocess
 import time
-from typing import final
+from typing import cast, final
 
 from scripts.aws_target import admin_secrets, box, ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock
@@ -27,7 +27,7 @@ down would delete all scaler access keys and remove only the scaler credential p
 down would remove compute resources, then the foundation stack and retained Budget.
 down would delete the data volume. The /home build cache is lost.
 down would remove deployment.json, up.json, setup proofs, and the prepared bundle.
-down keeps the spend ledger, charge history, disabled routing.json, and admin.gpg.
+down keeps the spend ledger, charge history, disabled routing.json, admin.gpg, and the box image.
 Run deploy.py down --approve-destroy to remove the target.'''
 
 
@@ -377,6 +377,12 @@ class TargetRemoval:
         (self.directory / 'deployment.json').unlink(missing_ok=True)
         return changed
 
+    def _kept_image(self) -> None:
+        path = self.directory / 'image.json'
+        if path.exists():
+            print('down: image kept: ' + ledger.text(ledger.mapping(cast(object, json.loads(path.read_text()))), 'image_id')
+                  + '; next up starts from it')
+
     def run(self) -> bool:
         stages = (('routing-off', self.routing), ('tailscale-device', self.devices), ('scaler-keys', self.scaler),
                   ('compute', self.compute), ('foundation', self.foundation), ('retained-resources', self.retained),
@@ -386,6 +392,7 @@ class TargetRemoval:
                 if self.verify():
                     for name, action in stages:
                         print(f'{name}: present')
+                    self._kept_image()
                     return True
             except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                 print('identity: refused: ' + self.admin.redact(str(error)))
@@ -405,4 +412,5 @@ class TargetRemoval:
                 except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                     print(f'{name}: refused: ' + self.admin.redact(str(error)))
                     return False
+        self._kept_image()
         return True

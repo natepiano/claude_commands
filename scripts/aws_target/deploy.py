@@ -183,6 +183,9 @@ class Deployment:
         deployment_id = self._deployment_id()
         saved = deployment_record(self.directory)
         parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification, deployment_id)
+        image = box.saved_image(self._api(settings), self.directory)
+        if image.get('State') == 'available':
+            parameters['AmiId'] = ledger.text(image, 'ImageId')
         parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
         return parameters
 
@@ -532,7 +535,7 @@ class Deployment:
         stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
         live = self._stack(settings)
         values: list[dict[str, object]] = [
-            {'ParameterKey': key, 'UsePreviousValue': True} if key == 'Bootstrap' and live.get('InstanceId')
+            {'ParameterKey': key, 'UsePreviousValue': True} if key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
             else {'ParameterKey': key, 'ParameterValue': value}
             for key, value in {**parameters, 'EnableCompute': str(compute).lower()}.items()
         ]
@@ -904,6 +907,7 @@ class Deployment:
             UpStage('box-join', setup.join_present, setup.join),
             UpStage('box-configuration', setup.configuration_present, setup.configure),
             UpStage('checks', setup.checks_present, setup.checks),
+            UpStage('image', setup.image_present, setup.image),
             UpStage('idle-stop', setup.idle_stop_present, setup.idle_stop),
             UpStage('activation', setup.activation_present, setup.activate),
             UpStage('routing-proof', setup.routing_proof_present, setup.routing_proof),

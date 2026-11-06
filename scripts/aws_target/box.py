@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 
 from scripts.aws_target import admin_secrets, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
-from scripts.aws_target.config import deployment_outputs, deployment_record, read_deployment_settings
+from scripts.aws_target.config import deployment_outputs, deployment_record, read_deployment_settings, read_settings
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf
@@ -28,8 +28,26 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import linux_runner, offload, mac_test
 
 
+IMAGE_OWNER_TAG = 'aws-build-image'
+
+
 class BoxRefused(ValueError):
     """A live box check does not permit the next stage."""
+
+
+def saved_image(api: AwsCli, directory: Path) -> dict[str, object]:
+    """Read the saved image from EC2 without accepting a deleted image."""
+    path = directory / 'image.json'
+    if not path.exists():
+        return {}
+    record = json_record(path.read_text())
+    try:
+        reply = api.call('describe-images', '--image-ids', ledger.text(record, 'image_id'), '--owners', 'self')
+    except AwsUnavailable as error:
+        if 'NotFound' in str(error):
+            return {}
+        raise
+    return next(iter(ledger.rows(reply, 'Images')), dict[str, object]())
 
 
 def policy_source() -> dict[str, object]:
@@ -435,6 +453,13 @@ class BoxSetup:
             raise BoxRefused('the NixOS source changed during the build')
         _ = self.start()
         self._wait(self.join_present, 'box configuration requires the joined instance')
+        def bootstrapped() -> bool:
+            try:
+                _ = self._ssh('test -e /var/lib/aws-build/bootstrap-complete')
+                return True
+            except (BoxRefused, OSError, subprocess.SubprocessError):
+                return False
+        self._wait_setup(bootstrapped, 'the box bootstrap did not finish')
         values = conf.read(self.settings)
         timeout = values.whole('box_setup_timeout_s') + values.whole('box_check_attempts') * values.number('box_check_delay_s')
         idle_record = Path('/home/natepiano') / conf.read(self.settings).text('remote_state_directory') / 'idle.json'
@@ -540,12 +565,126 @@ class BoxSetup:
             'instance_id': self._instance(), 'versions': expected}) + '\n')
 
 
+    def _wait_setup(self, check: Callable[[], bool], reason: str) -> None:
+        values = conf.read(self.settings)
+        deadline = self.monotonic() + values.whole('box_setup_timeout_s')
+        while True:
+            if check():
+                return
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise BoxRefused(reason)
+            _ = self.pause(min(values.number('box_check_delay_s'), remaining))
+
+    def image_present(self) -> bool:
+        if (self.directory / 'image-scrub.json').exists():
+            return False
+        path = self.directory / 'image.json'
+        if not path.exists() or json_record(path.read_text()).get('system') != self.desired_system:
+            return False
+        current = saved_image(self._api(), self.directory)
+        return current.get('State') == 'available' and not any(self._image_leftovers(current))
+
+    def _image_leftovers(self, current: dict[str, object]) -> tuple[list[str], list[str]]:
+        api = self._api()
+        filters = json.dumps([{'Name': 'tag:' + IMAGE_OWNER_TAG, 'Values': ['true']}])
+        images = api.call('describe-images', '--owners', 'self', '--filters', filters)
+        snapshots = api.call('describe-snapshots', '--owner-ids', 'self', '--filters', filters)
+        kept = {ledger.mapping(row.get('Ebs')).get('SnapshotId')
+                for row in ledger.rows(current, 'BlockDeviceMappings')}
+        return ([ledger.text(image, 'ImageId') for image in ledger.rows(images, 'Images')
+                 if image.get('ImageId') != current.get('ImageId')],
+                [ledger.text(snapshot, 'SnapshotId') for snapshot in ledger.rows(snapshots, 'Snapshots')
+                 if snapshot.get('SnapshotId') not in kept])
+
+    def _cleanup_images(self, current: dict[str, object]) -> None:
+        images, snapshots = self._image_leftovers(current)
+        api = self._api()
+        for image in images:
+            _ = api.call('deregister-image', '--image-id', image)
+        for snapshot in snapshots:
+            _ = api.call('delete-snapshot', '--snapshot-id', snapshot)
+
+    def _restore_image_items(self) -> None:
+        _ = self._ssm('set -eu; keep=/home/.aws-build-image-keep; ' +
+                      'if test -d "$keep"; then rm -rf -- "$keep"/*.partial; ' +
+                      'for item in /var/lib/tailscale /var/lib/aws-build/data-volume-id /var/lib/aws-build/bootstrap-complete; do ' +
+                      'name=${item##*/}; if test -e "$keep/$name"; then ' +
+                      'rm -rf -- "$item"; mv -- "$keep/$name" "$item"; fi; done; rmdir -- "$keep"; fi; ' +
+                      'sync; printf restored')
+
+    def image(self) -> None:
+        marker = self.directory / 'image-scrub.json'
+        if marker.exists():
+            _ = self.start()
+            self._wait(self.ssm_online, 'image restore requires SSM')
+            with control_lock(self.directory):
+                self._restore_image_items()
+                marker.unlink()
+        path = self.directory / 'image.json'
+        record = json_record(path.read_text()) if path.exists() else {}
+        api = self._api()
+        current = saved_image(api, self.directory) if record.get('system') == self.desired_system else {}
+        if current.get('State') not in ('pending', 'available'):
+            _ = self.start()
+            self._wait(self.join_present, 'image creation requires the joined instance')
+            with control_lock(self.directory):
+                write_text_atomic(marker, json.dumps({'system': self.desired_system}) + '\n')
+                failed = False
+                try:
+                    _ = self._ssm('set -eu; keep=/home/.aws-build-image-keep; mkdir -p -m 0700 -- "$keep"; ' +
+                                  'for item in /var/lib/tailscale /var/lib/aws-build/data-volume-id /var/lib/aws-build/bootstrap-complete; do ' +
+                                  'if test -e "$item"; then name=${item##*/}; rm -rf -- "$keep/$name.partial"; ' +
+                                  'cp -a -- "$item" "$keep/$name.partial"; mv -- "$keep/$name.partial" "$keep/$name"; ' +
+                                  'rm -rf -- "$item"; fi; done; sync; printf prepared')
+                    spending = read_settings(self.settings)
+                    tags = [{'Key': spending.cost_explorer_tag_key, 'Value': spending.cost_explorer_tag_value},
+                            {'Key': IMAGE_OWNER_TAG, 'Value': 'true'}]
+                    reply = api.call('create-image', '--instance-id', self._instance(), '--no-reboot',
+                                     '--name', 'aws-build-image-' + Path(self.desired_system).name[:12] + '-' + str(int(time.time())),
+                                     '--block-device-mappings', json.dumps([{'DeviceName': '/dev/sdf', 'NoDevice': ''}]),
+                                     '--tag-specifications', json.dumps([
+                                         {'ResourceType': kind, 'Tags': tags} for kind in ('image', 'snapshot')]))
+                    record = {'image_id': ledger.text(reply, 'ImageId'), 'system': self.desired_system,
+                              **({'idle_stop_system': self.desired_system}
+                                 if record.get('idle_stop_system') == self.desired_system else {})}
+                    write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
+                    def snapshotted() -> bool:
+                        image = saved_image(api, self.directory)
+                        self._image_failed(image)
+                        root = conf.read(self.settings).text('root_device_name')
+                        return any(row.get('DeviceName') == root and ledger.mapping(row.get('Ebs')).get('SnapshotId')
+                                   for row in ledger.rows(image, 'BlockDeviceMappings'))
+                    self._wait_setup(snapshotted, 'the image root snapshot did not appear')
+                except BaseException:
+                    failed = True
+                    raise
+                finally:
+                    try:
+                        self._restore_image_items()
+                        marker.unlink()
+                    except BaseException:
+                        if not failed:
+                            raise
+        def available() -> bool:
+            image = saved_image(api, self.directory)
+            self._image_failed(image)
+            return image.get('State') == 'available'
+        self._wait_setup(available, 'the image did not become available')
+        self._cleanup_images(saved_image(api, self.directory))
+
+    @staticmethod
+    def _image_failed(image: dict[str, object]) -> None:
+        if image.get('State') == 'failed':
+            raise BoxRefused('image failed: ' + str(ledger.mapping(image.get('StateReason')).get('Message', 'failed')))
+
+
     def _stage_record(self, stage: str) -> dict[str, object]:
         path = self.directory / 'up.json'
         return ledger.mapping(json_record(path.read_text()).get(stage, {})) if path.exists() else {}
 
     def _invalidate_from(self, stage: str) -> None:
-        stages = ('box-configuration', 'checks', 'idle-stop', 'activation', 'routing-proof')
+        stages = ('box-configuration', 'checks', 'image', 'idle-stop', 'activation', 'routing-proof')
         path = self.directory / 'up.json'
         record = json_record(path.read_text()) if path.exists() else {}
         invalid = stages[stages.index(stage):]
@@ -581,7 +720,9 @@ class BoxSetup:
         return ledger.mapping(record.get(stage, {})).get('status') in ('done', 'present')
 
     def idle_stop_present(self) -> bool:
-        return self._proof_present('idle-stop')
+        path = self.directory / 'image.json'
+        return (self._proof_present('idle-stop') or path.exists()
+                and json_record(path.read_text()).get('idle_stop_system') == self.desired_system)
 
     def idle_stop(self) -> None:
         if self.idle_stop_present():
@@ -616,6 +757,11 @@ class BoxSetup:
                     state = self._instance_state()
                     if state == 'stopped':
                         self._save_proof('idle-stop')
+                        path = self.directory / 'image.json'
+                        if path.exists():
+                            record = json_record(path.read_text())
+                            record['idle_stop_system'] = self.desired_system
+                            write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
                         return
                     remaining = deadline - self.monotonic()
                     if remaining <= 0:
