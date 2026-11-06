@@ -2,7 +2,12 @@
 
 ## What it is
 
-The usage ledger is one SQLite store, on natedev, of every model request made on both machines, Claude and Codex alike. Each row records the request's token counts by class, its model and effort, and the role the agent held when it ran: showrunner, unit director, worker (`impl`, `test`, `fix`, `worker`), reviewer by lens, subagent or interactive session. The same store holds what the work produced: runs, phases, review passes, findings, checkpoints, compactions, account readings and account role changes. Metrics are named SQL queries over that store, so token efficiency can be followed over time across every role and every model. The vendors' own reporting does not answer these questions, but the logs on disk do. Before the ledger, each question needed its own scratch script that read raw logs again and knew only one model's weights. The role an agent held was lost once its run ended: the unit director's marker is deleted at run end, a Codex worker's role sits in a per-run `mesh_roster.json` that changes with every dispatch, and `/tmp` does not last. The token counts last (Claude transcripts under `~/.claude/projects`, Codex rollouts under `~/.codex/sessions`); the link from a request to its role did not.
+The usage ledger stores requests from both machines and both model families in one SQLite database on natedev.
+Each request records token classes, model, effort, and the role held at that time.
+The same store records runs, phases, reviews, findings, checkpoints, compactions, readings, and account-role changes.
+Named SQL queries compare usage across roles, models, and outcomes.
+The assignment log preserves role history independently of temporary run folders.
+The [worker design](long-lived-workers.md#roster-fields) defines the staff references in current run records.
 
 ## How it works
 
@@ -15,7 +20,7 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 - `append(agent_id, role, lens, at, approximate=False)` writes under an exclusive `fcntl.flock` and starts a new line after a truncated tail.
 - `register_default(agent_id, role, at) -> bool` reads the log and appends under the same lock, only when no line already names the agent. A line names it when its id equals `agent_id`, or when its id is 8 hex characters and a prefix of `agent_id`. Concurrent deliveries write one line.
 - `assignments(path) -> RoleLog(assignments, problems)` reads the file as bytes and decodes each line inside its own handler. A malformed or undecodable line is a counted `problems` entry; the reader never raises.
-- `role_at(log, agent_id, at) -> Assignment | Unassigned` returns the latest assignment at or before `at`. For a full id it merges the history recorded under `agent_id[:8]` when that prefix is a recorded 8-hex id, so a worker reads `interactive` until `agent_bg.sh`'s `worker` line, then `worker`.
+- `role_at(log, agent_id, at) -> Assignment | Unassigned` returns the latest assignment at or before `at`. For a full id it merges the history recorded under `agent_id[:8]` when that prefix is a recorded 8-hex id, so an old worker line under the prefix still counts. A worker reads `interactive` until `agent_bg.sh` records its dispatch role under the full id.
 - CLI: `append`, `register --id --role`, `backfill [--archive] [--live]`, `show [--id]`. A write failure prints one `agents_log: <reason>` stderr line and exits 0.
 
 **Writers.**
@@ -24,14 +29,20 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 | --- | --- |
 | `scripts/direct/prepare_session.sh` | `director`, under `CLAUDE_CODE_SESSION_ID` |
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
-| `scripts/agents/agent_bg.sh` | `worker`, under the 8-hex id |
+| `scripts/agents/agent_bg.sh` | the `AGENT_BG_ROLE` dispatch role, under the full destination id, before delivery. A call with no role, such as a resident consultation, records nothing, so that session stays `interactive` |
 | `scripts/agents/codex_mesh.py` | the worker's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
 | `scripts/direct/review.sh` | Passes `--lens` to `codex_mesh.py`; records each fresh simplify session as `review` with lens `simplify`. |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
 
 The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives only in `agents.jsonl`, never in `mesh_roster.json`.
 
-`backfill` reads each run directory's `mesh_roster.json` (`role`, and `previous_role` as an earlier line) and `workers` ledger (`worker`), stamped with the file's mtime and `approximate: true`. It skips any id that already has an exact line and never repeats an (id, role, lens) line. A review lens comes only from the newest `review_agent_[<N>_]<lens>.log` that names the worker.
+`backfill` reads surviving run rosters through one staff snapshot.
+It resolves each entry's current session and worker name through staff.
+A worker name that belongs to `ROLES` supplies an approximate assignment at the roster file's modification time.
+A review assignment can take its lens from a matching review log.
+Active markers also recover director assignments.
+The importer skips ids with exact assignments and never repeats an `(id, role, lens)` tuple.
+It prints unreadable evidence and continues.
 
 ### Collector: `scripts/usage/collect.py`
 
@@ -94,7 +105,7 @@ Every stored time is UTC ISO-8601 text ending `+00:00`.
 - `phase_started`, `phase_finished` → `phases`, key (`machine`, `phase_instance_id`).
 - `pass_started`, `pass_finished` → `passes`, key (`machine`, `pass_instance_id`); `kind` is `pass_kind`.
 - `finding_opened`, `finding_verdict` → `findings`, key (`machine`, `phase_instance_id`, `finding_id`); `state` is `open` until a verdict, then its `resulting_state`.
-- `finding_batch_dispatched`, `_landed`, `_abandoned` → `repair_rounds`, key (`machine`, `phase_instance_id`, `round`).
+- `finding_batch_dispatched`, `_landed`, and `_abandoned` enter the `repair_rounds` audit table. Its key is (`machine`, `phase_instance_id`, `round`). These rows preserve dispatch records. Repair counts require started fix passes. Relaunches of one ledger batch add no round. Refunded batches add no round unless they later land.
 
 In `runs`, `phases` and `passes`, `state` is `open` until the finish event and `finished_at` is NULL only while `open`. `source_event` is the creating event's `event_id`, from which a finding's title and detail can be found in the history file.
 
@@ -215,9 +226,15 @@ The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usag
 
 ### Worker roster guards in `scripts/agents/codex_mesh.py`
 
-The roster carries each worker's role and the context size that decides when a launcher compacts it. Its writes are guarded so that a command still at work for a worker's earlier thread, or a compaction that ends late, cannot replace a newer record. None of this enters the usage store.
+The roster stores the context size that controls launcher compaction.
+Staff resolves the current thread; the assignment log supplies the role.
+The [worker design](long-lived-workers.md#roster-fields) defines the stored fields and ownership rules.
+Conditional writes prevent an earlier thread or compaction from replacing a newer record.
+These writes do not enter the usage store.
 
-- `_update_roster_if_expected(session_dir, name, record, expected) -> bool` compares and writes inside one `fcntl.flock` section. `ExpectedRoster = RosterOnThread(thread_id) | RosterAbsent() | RosterEndedOnThread(thread_id) | RosterUnchanged(thread_id, revision)`. `_write_roster_record` holds the storing rules for it and for `_update_roster`.
+- `_update_roster_if_expected(session_dir, name, record, expected) -> bool` compares and writes inside one `fcntl.flock` section.
+  `ExpectedRoster` names the expected thread, active launcher, refusing launcher, absence, ended thread, unchanged revision, or replaced backend.
+  `_write_roster_record` applies the same storage rules to conditional and administrative writes.
 - Every entry carries `revision` (`RosterRevision`), raised by one on each write inside the lock. An entry without one reads as `RosterRevision(0)`. A writer that changes an entry in place calls `_advance_roster_revision(entry)`.
 - `command_compact` reads the revision at its start and writes the new size under `RosterUnchanged`, so a turn that wrote in between keeps its record.
 - `context_tokens` is an integer or `"not_measured_since_compaction"` (`RecordedContextSize = KnownContextSize | NotMeasuredSinceCompaction | ContextSizeUnavailable`). A compaction turn that reports 0 stores the state and prints `compacted <name>: <before> tokens, size not measured until its next turn`. `implement.sh` and `review.sh` ignore a non-integer size, so such a worker gets its follow-up with no second compaction. `compact` of such a worker exits 2 with `size not measured since its last compaction; compact refused`.
@@ -273,7 +290,7 @@ The roster carries each worker's role and the context size that decides when a l
 - **Token counts** outside 0..`MAX_SQLITE_INTEGER` (2**63-1) are never measurements: locally the line is skipped and its cursor advances; on the wire one ends the pass as a failed read.
 - **Listing** uses `os.scandir`, because Python 3.13 `Path.glob` hides listing errors. A nested folder that cannot be listed makes the source `partial`.
 - **Codex key collisions**: the key holds the file's last path component only, so a moved file keeps its keys, and two files of one thread with the same name would share them. Codex names files `rollout-<date-time>-<id>.jsonl`.
-- **Hook order**: for a worker the hook writes `interactive` under the full uuid before `agent_bg.sh` writes `worker` under the prefix; the prefix merge in `role_at` handles that. `register_default` reads the whole log at every session start. Sessions started before the hook reached a machine's `~/.claude` have no line and are `unassigned`.
+- **Hook order**: for a worker the hook writes `interactive` under the full uuid before `agent_bg.sh` writes the dispatch role under the same id; the latest line wins in `role_at`. `register_default` reads the whole log at every session start. Sessions started before the hook reached a machine's `~/.claude` have no line and are `unassigned`.
 - **Backfill limits**: the worker archive keeps no `mesh_roster.json` or `workers` ledger, so archived runs backfill nothing; older review logs do not name the worker, so their lens stays unrecorded; a review outside a run (`agent_exec.sh`) records nothing.
 - **Role coverage is thin for old history.** At first import most Codex requests were `unassigned` (460,601 of about 496,500); Claude about half (191,755 of about 400,000).
 - **Checkpoints** are read on natedev only, so a commit made on the Mac counts once natedev's repository has it. A candidate repository path that no longer exists (a removed worktree; 4 of 18 at first read) is skipped. 6 of 637 real phase ids contain spaces.
@@ -306,7 +323,8 @@ The roster carries each worker's role and the context size that decides when a l
 - **The watch's thresholds.** At the measured median of 2.1M weighted tokens per folder per 2 hours and about 19K per request, 1M is about 50 requests; below it a handful of polls sets the share. At 10% the waste at the minimum is at least 100K weighted tokens, more than the showrunner turn an alert costs. Codex compacts workers at 200,000 tokens, so five requests in a row above 250,000 mean compaction is not happening. Six hours between alerts keeps one problem to one message per working session.
 
 - **SQLite, one store on natedev.** Metrics are joins of requests against roles and outcomes, and SQLite ships with Python. The store and the timer are on natedev because the Mac sleeps with its lid closed; a Mac that does not answer is caught up on the next hourly pass.
-- **Roles recorded at assignment.** The sources that knew a role (active markers, `mesh_roster.json`, `/tmp`) are deleted or overwritten when a run ends; inferring later loses it. Storing only id, role, lens and time follows the user's rule of 2026-10-08: store only what a script cannot look up.
+- **Roles recorded at assignment.** The log preserves role changes after a run folder disappears.
+  Current run records do not store role history.
 - **A lens recorded, never inferred from a worker name.** Any worker runs any lens, so the name says nothing.
 - **Every Claude session and subagent records itself by hook.** Worker tooling covers only its own agents; the hook makes interactive sessions and subagents rows of their own, so a subagent's usage counts once, under the subagent.
 - **Claude requests deduplicated by (message id, request id), keeping the largest of each class.** Counting a message once per file or per agent double-counted 0.19% of all tokens; keeping the first copy of a repeated message lost 5.8% of output.

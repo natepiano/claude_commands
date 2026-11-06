@@ -17,7 +17,7 @@ OLD_NAMES = re.compile(
         r"agents[_]registry",
         r"agent[_]admin[.]sh\b",
         r"commands/agent[.]md\b",
-        r"(?<![\w./-])/ag[e]nt(?![\w./-])",
+        r"(?<![\w./-])/ag[e]nt(?![\w/-]|[.][\w/-])",
     ))
 )
 HISTORY_RESULT = "docs/as-built/director-model-study-results.json"
@@ -29,6 +29,15 @@ RETIRED_FILTER_HISTORY = frozenset({
 
 
 class ModelNameTests(unittest.TestCase):
+    def test_retired_command_matches_sentence_punctuation_but_not_other_paths(self) -> None:
+        command = "/ag" + "ent"
+        for text, rejected in ((f"Use {command}.", True), (f"Use {command}, then continue.", True),
+                               (f"({command})", True), (command, True),
+                               (f"{command}_exec", False), (f"{command}.md", False),
+                               (f"scripts{command}/tool", False), ("/default_models.", False)):
+            with self.subTest(text=text):
+                self.assertEqual(OLD_NAMES.search(text) is not None, rejected)
+
     def test_current_files_use_the_model_names(self) -> None:
         files = subprocess.check_output(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],

@@ -20,7 +20,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
                          phase_table.build_plan(plan) ◄───────┘  (chain, gates, PhaseHistory)
                                   │                        │
             progress_history.py progress           board_json.py --session <id>
-            (short report / --tables)              writes <staff id>.json, prints {files, watch}
+            (short report / --tables)              writes <staff-id>.json, prints {files, watch}
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
                                        mod: /showrunner:accounts ── runs accounts.py status --json --stored
@@ -66,7 +66,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `BoardUnit`: `key` (the staff name), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket (the current phase is then the open `phase_table.build_run` row whose phase or leading title word is that id, so a ticket that a unit rename moved still shows under its old prefix), else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
 - `stage`, in order:
   - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;
-  - a `finding_batch_dispatched` not yet landed in the open phase instance, as `Repair round <dispatched batches>`;
+  - An unlanded `finding_batch_dispatched` in the open phase appears as `Repair round <dispatched batches>`. This label shows dispatch records for audit. Repair counts require started fix passes. Relaunches of one ledger batch add no round. Refunded batches add no round unless they later land.
   - the open activity label (`display_cells.open_step`);
   - `Phase <id> running` while a phase is open (`Ticket <id> running` on a standing plan);
   - otherwise `Run done`, `Waiting on G<k>` or `Standing by`.
@@ -77,7 +77,12 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
   - A run on another plan than its production row (hana `demo`) shows its real phase.
   - `plan` is the Plan cell, and is empty when that file no longer exists.
-- `workers` come from the run's session dir: `mesh_roster.json` (role, status; `done` shows as `idle`, `ended` stays), `impl_worker_<slot>.json` (slot, family/model) and the slot's newest `board.log` line as `doing`.
+- `workers` combines the run roster, slot metadata, and each slot's newest board activity.
+  `recorded_turn_settings` supplies the accepted model and effort.
+  `done` displays as `idle`; `ended` stays unchanged.
+  The reader displays raw role and family values when the records contain them.
+  Missing values display as empty fields.
+  The [worker design](long-lived-workers.md#roster-fields) defines the current records without copied role or family fields.
   - Slots drop the worktree's mesh prefix.
   - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
   - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.

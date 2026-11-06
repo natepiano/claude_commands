@@ -18,6 +18,8 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.agents import codex_mesh
 from scripts.direct import progress_history
+from scripts.lib import models_registry
+from scripts.lib.test_models_registry import registry_text
 from scripts.message import sessions
 from scripts.production import session_staff, staff, unit_move
 from scripts.production.add_unit_test_support import AddUnitTestCase
@@ -707,13 +709,16 @@ class UnitFolderMoveTests(FolderRenameFixture):
             output = "gpt-fixture\nhigh\n" if "mesh-turn" in command else "codex gpt-fixture high default\n"
             return subprocess.CompletedProcess(command, 0, output, "")
 
-        with (mock.patch.object(subprocess, "run", side_effect=model),
+        inherited = models_registry.LaunchModelConfiguration(self.root / "models.conf", registry_text(), ())
+        configuration = models_registry.launch_configuration(inherited.environment(os.environ))
+        with (mock.patch.dict(os.environ, configuration.environment(os.environ)),
+              mock.patch.object(subprocess, "run", side_effect=model),
               mock.patch.object(codex_mesh, "workers_home", return_value=self.root / "home/.codex2"),
               mock.patch.object(codex_mesh, "ensure_server", return_value=(12345, False)) as server,
               mock.patch.object(codex_mesh, "Client", return_value=client),
               mock.patch.object(codex_mesh, "_bind_serving_server"),
               mock.patch.object(codex_mesh, "_serving_request", side_effect=request)):
-            opened = codex_mesh.open_unit_worker(str(run), "impl1", "impl")
+            opened = codex_mesh.open_unit_worker(str(run), "impl1", "impl", configuration=configuration)
             self.assertEqual(session_staff.worker_session(opened, staff.local_snapshot()), native)
             self.assertEqual(server.call_args.kwargs["cwd"], str(self.destination))
             self.assertEqual(requests[0][1]["cwd"], str(self.destination))
