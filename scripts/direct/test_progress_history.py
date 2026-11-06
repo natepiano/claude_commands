@@ -3465,7 +3465,7 @@ with patch.object(fcntl, "flock", admission):
             if event.get("event_type") == event_type
         ]
 
-    def test_last_dispatch_retains_the_finished_pass_when_the_same_slot_starts_again(self) -> None:
+    def test_last_dispatch_selects_the_new_open_pass_when_the_same_slot_starts_again(self) -> None:
         run = self.start_run("dispatch-history", 20_000, unit_owned=True)
         parent = staff.local_snapshot().unit_by_worktree("natedev", self.working_dir)
         assert parent is not None
@@ -3479,11 +3479,12 @@ with patch.object(fcntl, "flock", admission):
         _ = staff.rename(worker.id, "renamed-worker")
         self.start_slot_pass(run, "impl", "test", 20_040, "gpt-called", 0,
                              "--worker-id", worker.id, worker_name="renamed-worker")
+        latest = self.pass_events("dispatch-history", "pass_started")[-1]
         with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(self.root)}):
             dispatch = progress_history.last_dispatch(worker.id)
         self.assertEqual(dispatch, progress_history.RecordedDispatch(
-            "impl", "3", progress_history.DispatchDetailNotRecorded.UNRECORDED,
-            str(run / "phases/3/files"), str(opened["pass_instance_id"]), "completed"))
+            "test", "3", progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            str(run / "phases/3/files"), str(latest["pass_instance_id"]), "active"))
 
     def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
         _ = write_registry(self.models_config_file, {"direct.codex": {"impl": "gpt-called:xhigh"}})
@@ -8388,7 +8389,7 @@ class LastDispatchTests(StaffTestCase):
         _ = staff.rename(worker.id, "renamed-worker")
         self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
 
-    def test_last_dispatch_finds_the_newest_finished_pass_in_another_parent_run(self) -> None:
+    def test_last_dispatch_finds_the_newest_open_pass_in_another_parent_run(self) -> None:
         run, worker = self.dispatch_fixture({"first": {
             "instance_id": "first", "worker_name": "dispatch-worker", "kind": "impl", "started_at": 1}})
         owner = cast(dict[str, object], json.loads((run / unit_runs.STATE_FILE).read_text()))["main_agent"]
@@ -8400,7 +8401,7 @@ class LastDispatchTests(StaffTestCase):
                      "started_at": 5, "status": "active"}}})
         missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
         self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
-            "review", missing, "contract", missing, "second", "error"))
+            "fix", missing, missing, missing, "open", "active"))
 
     def test_last_dispatch_filters_another_parent_before_directory_and_history_reads(self) -> None:
         run, worker = self.dispatch_fixture({"finished": {
@@ -8412,6 +8413,8 @@ class LastDispatchTests(StaffTestCase):
         self.write_json(run.with_name("other-run") / unit_runs.STATE_FILE, {
             "owner_staff_id": parent.id, "main_agent": {"session_id": parent.current_session},
             "status": "active", "history_file": str(history)})
+        self.write_json(run.with_name("unavailable-owner") / unit_runs.STATE_FILE, {
+            "owner_staff_id": fixture_runtime_id("unavailable-dispatch-owner"), "history_file": str(history)})
         calls = self.root / "git-calls"
         _ = calls.write_text("")
         binaries = self.root / "dispatch-bin"
