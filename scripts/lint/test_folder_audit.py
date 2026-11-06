@@ -68,6 +68,9 @@ class FolderAuditTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(short_socket_directory()))
+        home = self.root / "home"
+        home.mkdir()
+        self.enterContext(unittest.mock.patch.dict(os.environ, {"HOME": str(home)}))
         self.rust = self.root / "rust"
         self.temp = self.root / "tmp"
         self.rust.mkdir()

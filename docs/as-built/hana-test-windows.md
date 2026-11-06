@@ -12,6 +12,8 @@ starts from Terminal.
 Test clones on either machine use `copies.py clone <source> --task gate:<id>`
 (or a real `phase:<unit>/<id>` or `--until <when>`). The command records the
 task before Git starts and prints the checkout inside its scratch folder.
+If any Claude account trusts the source, the clone inherits trust in every existing account configuration.
+Removal clears the clone's trust before it deletes the folder.
 `scratch.py end --task gate:<id>` removes the clone. A failed clone remains
 owned by its task, so the same end command removes a partial copy.
 `mac_run.sh` uses one gate task per run. On exit, `hana-instances stop-checkout <path>`

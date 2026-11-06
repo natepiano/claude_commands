@@ -24,6 +24,8 @@ The command acquires the publication lock once for each home.
 Reading, preparation, publication, sync, and cleanup run under that lock.
 The command rebuilds a changed file before publication.
 It never opens a session.
+`copies.py clone` trusts the clone in every existing Claude configuration when any account trusts its source.
+Clone removal clears only that clone's trust bit before it deletes the folder.
 
 ## Every account in one table
 

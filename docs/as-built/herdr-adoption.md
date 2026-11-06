@@ -118,7 +118,6 @@ A Claude session started in a folder the account has not trusted stops at the tr
 - Callers. Each refuses with `<unit | child slug | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`, or `<prefix>: <UnreadableTrustFile text>`:
   - `add_unit.preflight(request, selected)` exits 2 before any stub, table row or worktree is written. A worktree that does not exist yet is checked by its main checkout's key, and its trust command runs in the main checkout.
   - `add_showrunner.checked`, and through it `promote_showrunner.py`. `ADD_SHOWRUNNER_CLAUDE_JSON` sets the account file in tests.
-  - `herdr_sessions.py start` and `resume`. An untrusted folder prints one paste line, the trust command `&&` the same invocation rebuilt by `_launch_rerun` (with `--cwd` resolved, claude arguments kept after `--`, and paths with spaces quoted), and exits 1. Nothing writes `hasTrustDialogAccepted`.
   - `restart._herdr_launch`, on the trust file in the launch environment's `CLAUDE_CONFIG_DIR`, before any server starts.
   - The nightly review launches through `add_unit.py --permanent` on the units account, so `preflight` covers it.
 - Launchers use the configured group account. Each check reads `<CLAUDE_CONFIG_DIR>/.claude.json` in that numbered folder. `~/.claude.json` stays the seed and MCP baseline.
@@ -368,7 +367,7 @@ Run these suites on the Mac with a scratch home. Run the command from the root o
 
 - **One herdr session, one tab per Claude session (user, 2026-10-26).** One attach shows every session, with one workspace per production. `attach <tab>` and `attach-remote` focus the named tab first, so an attach still opens the session the user names. A tab has its session's name, so `list` and attach lines need no lookup table. A stop closes one tab and changes nothing else in the session.
 - **Codex workers stay headless.** App-server threads ask for no trust and already report through the worker ledger. Only Claude sessions, which the user watches, need a terminal.
-- **Trust is checked, never answered.** Answering grants trust the user never gave. Sending a prompt into a trust screen waits forever. A refusal with one paste line costs the user one prompt, once per repository.
+- **Trust is checked, never answered.** Answering grants trust the user never gave. Sending a prompt into a trust screen waits forever. A refusal with one paste line costs the user one prompt, once per repository. `copies.py clone` is the one exception that writes trust (user, 2026-11-05): a clone of a trusted source inherits it through the shared account writer, and removal clears it.
 - **Unique tab names.** A tab name is a session name, so two sessions must never share one. A taken `--name` refuses, and a generated name moves to the next suffix. Every launcher adopts the one shared server, so only the tab name must be unique.
 - **Socket ownership as identity.** Argv and `HERDR_SESSION` both mislead (attach-started servers, inherited variables). The process holding the listening socket cannot.
 - **Resume from our own ids.** Shutdown records and pane launch entries already hold session ids, accounts and cwds. herdr's Claude integration would add hooks to every session to learn the same thing.

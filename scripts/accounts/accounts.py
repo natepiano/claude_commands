@@ -892,6 +892,27 @@ def with_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) ->
     return {**source, "projects": projects}
 
 
+def without_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+    """Remove only the trust bit and project entries that become empty."""
+    raw_projects = source.get("projects", {})
+    if not isinstance(raw_projects, dict):
+        raise ValueError("projects must be an object")
+    projects = dict(cast(dict[str, object], raw_projects))
+    for folder in folders:
+        raw_project = projects.get(folder, {})
+        if not isinstance(raw_project, dict):
+            raise ValueError("configured trust project must be an object")
+        project = dict(cast(dict[str, object], raw_project))
+        if "hasTrustDialogAccepted" not in project:
+            continue
+        del project["hasTrustDialogAccepted"]
+        if project:
+            projects[folder] = project
+        else:
+            del projects[folder]
+    return source if projects == raw_projects else {**source, "projects": projects}
+
+
 @contextmanager
 def _account_home_lock(home: Path) -> Generator[None]:
     """Serialize account-file publication with setup's directory flock."""
@@ -929,12 +950,18 @@ def claude_config_lock(path: Path) -> Generator[None]:
 
 
 def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bool:
+    return _change_claude_config(home, path, lambda source: with_trusted_folders(source, configuration.folders))
+
+
+def _change_claude_config(
+    home: Path, path: Path, change: Callable[[dict[str, object]], dict[str, object]],
+) -> bool:
     with _account_home_lock(home), claude_config_lock(path):
         while True:
             before_mode = stat.S_IMODE(path.stat().st_mode)
             before = path.read_bytes()
             original = read_json_object(io.StringIO(before.decode("utf-8")))
-            updated = with_trusted_folders(original, configuration.folders)
+            updated = change(original)
             if updated == original:
                 return False
             published = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
@@ -948,13 +975,44 @@ def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bo
                 # Preserve changes from writers that do not use the lock.
 
 
+def _claude_trust_homes() -> list[tuple[NamedAccount, Path]]:
+    homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
+    return [(home, accounts_home() / ".claude.json" if home.dir == main_config_dir()
+             else home.dir / ".claude.json") for home in homes]
+
+
+def any_claude_home_trusts(folder: Path) -> bool:
+    """Use the shared Claude trust check without reading account credentials."""
+    from scripts.herdr import herdr
+
+    for _, path in _claude_trust_homes():
+        try:
+            if isinstance(herdr.claude_trust(folder, path), herdr.Trusted):
+                return True
+        except (OSError, ValueError) as error:
+            print(f"accounts: anomaly: {path}: {type(error).__name__}", file=sys.stderr)
+    return False
+
+
+def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
+    """Set or clear one folder's trust in each existing Claude configuration."""
+    folders = (str(folder.resolve()),)
+    change = with_trusted_folders if trusted else without_trusted_folders
+    for home, path in _claude_trust_homes():
+        try:
+            _ = path.stat()
+            _ = _change_claude_config(home.dir, path, lambda source: change(source, folders))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            print(f"accounts: anomaly: {path}: {type(error).__name__}", file=sys.stderr)
+
+
 def trust_accounts() -> int:
     """Apply configured trust to each home independently without inspecting identity."""
     configuration = trust_configuration()
-    homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
     failures = False
-    for home in homes:
-        path = accounts_home() / ".claude.json" if home.dir == main_config_dir() else home.dir / ".claude.json"
+    for home, path in _claude_trust_homes():
         try:
             changed = _trust_file(home.dir, path, configuration)
             state = "updated" if changed else "unchanged"

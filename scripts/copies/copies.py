@@ -429,6 +429,15 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
             checkout.mkdir()
             initialize_git(checkout, source.resolve())
             _ = git(checkout, "reset", "--hard", "--quiet")
+            from scripts.accounts import accounts
+
+            if accounts.any_claude_home_trusts(source):
+                folder = str(checkout.resolve())
+                _ = scratch.update_record(path, lambda record: {
+                    **(record.fields if isinstance(record, copy_record.Registered) else {}),
+                    "claude_trust_folder": folder,
+                }, scratch_settings=scratch_settings)
+                accounts.set_claude_folder_trust(checkout, trusted=True)
     except (OSError, CopyError) as error:
         raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
     return checkout
