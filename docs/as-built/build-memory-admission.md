@@ -488,10 +488,21 @@ The scoped wrapper requires a published sidecar and a live holder before program
 ### Startup, cut-over, and rollback
 
 The system socket starts the system service as the user. The service runs outside `builds.slice` with `OOMScoreAdjust=-900`.
-It clears the outage claim and sends `READY=1` after listener setup.
+It sends `READY=1` after listener setup.
+The main loop clears the outage claim once after `silence_seconds` of continuous operation.
+It uses the last usable configuration and retries a failed clear on a later loop.
+A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
 A restored head override receives reconnect grace only after the listener is ready.
-`down-alert` waits two minutes, claims `build-admission`, and sends one outage push. A later start clears that claim.
+`down-alert` waits `silence_seconds` and claims `build-admission`.
+It sends the outage message to the `builds` session first.
+The message names the journal command and the restart command.
+If the result is not `sent`, it sends an `alert.blocked` phone push.
+The phone action is `sudo systemctl restart build-admission.socket build-admission.service` on natedev.
+The push clears when `admission_client.py view`, through `scripts/lib/py`, succeeds.
+The sender releases the claim only when both sends return `failed`, `refused`, or `retry`.
+Every other outcome preserves the delivered claim.
+The sender prints each send outcome header to the journal.
 
 The builds showrunner owns cut-over. Workers do not change live units or admission state.
 
