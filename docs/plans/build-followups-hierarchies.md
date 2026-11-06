@@ -585,59 +585,34 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 22 — Displays read workers through observe  · status: done
 
-**Depends on:** panes Phases 7, 8 and 9 (herdr 7+8+9 on sdlc), and the `scripts/message/roster.py` fix, which is on sdlc as builds-queue 6f36f4740: `_unit_workers` sets `role_log = _role_log()` before its run loop, and `_worker_assignment` takes `role_log`. This is Phase 13 of `docs/plans/herdr-worker-panes.md`, given to this unit by sdlc on 2026-11-05. It shares one gate with panes Phases 10 and 12, over the exact final batch.
+#### As-built
 
-#### Work Order
-
-**Goal:** each display shows a pane worker through `worker_panes.observe`, the one join of worker rows and herdr panes. A mesh-pinned run displays as it does today.
-
-**Design facts (read by the unit director at herdr 10b59f7f9 and sdlc 3b42139d0):**
-- Each `observe(parent, record)` makes one full pane read: `client.panes()`, `scan_row_panes` and `client.agents()`. A display with about 30 parents must not make 30 reads.
-- `observe` sees only this machine's panes. A worker of the other machine's parent would read as `ClosedWorker`, which is wrong.
-- Every run today is mesh-pinned, and a mesh worker has no pane. `observe` on its row gives `ClosedWorker`, which is wrong.
-- `unit_runs.worker_transport(run)` writes the pin file when it is absent. A display must write nothing.
-- `measure.py` and `worker_owners.py` are deleted (Phase 19), so they leave this phase. The `worker_owners.py` retained branches in the panes plan no longer exist.
-
-**Spec:**
-
-1. **Which parents use panes.** Add `unit_runs.parent_transport(session_id: str) -> Literal["mesh", "herdr"]`. It reads the pin of the session's first held run. With no held run or no pin it reads the configured `WORKER_TRANSPORT`. It writes nothing. Add `session_staff.pane_parents(record) -> list[staff.StaffRow]`: the rows with worker children, whose location is on this machine and whose `parent_transport` is `herdr`.
-2. **One read for many parents.** Add `worker_panes.observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]`. It makes one pane read and gives each parent its states. Split the read out of `_evidence`; `observe` keeps its signature and its behavior. With no parents it makes no herdr call. Import `worker_panes` inside the function that needs it, after `pane_parents` is not empty, so a run with no pane parent pays no import. One exception: the roster's freestanding pane list reads agent status through `worker_panes.agent_inventory`, so that no display calls `herdr agent list` outside `worker_panes`. This import costs 12 ms after the roster's own imports.
-3. **The five states.** Each converted display shows:
-   - `OpenWorker` with its pane and status.
-   - `StoppedWorker` as stopped, and `ClosedWorker` as closed.
-   - `ProcessUnknownWorker` with its known pane and reason as unknown, never as stopped or absent.
-   - `UncertainWorker` as incomplete with its reason, never as closed.
-4. **Displays to convert.**
-   - `scripts/message/roster.py`: add one entry for each worker of `pane_parents`. An `OpenWorker` is `Messageable("worker:<unit>/<short name>")` (the Phase 9 address). Other states are `CannotReceiveMessages(<state and reason>)`. Add each observed native id to `worker_threads`, so that its process does not appear a second time. The mesh loop stays for mesh-pinned runs.
-   - `scripts/production/staff_sources.py` `live`: a worker of `pane_parents` gets one new member field, `pane_state`: `open`, `stopped`, `closed`, `unknown` or `incomplete`. The schema number stays 3. `unknown` and `incomplete` set `complete` to false and add a problem with the reason. Other members do not change. Check the handler that reads this output and report if an added field breaks it.
-   - `scripts/direct/board_json.py` `workers`: a herdr-pinned run lists its workers from `observe_parents`. The mesh branch stays for mesh-pinned runs.
-   - `scripts/production/codex_winddown.py`: count each `OpenWorker` with a working status as a running agent, and name unknown and uncertain workers. A pane Codex is a plain `codex` process, which `is_codex_agent` does not count today.
-   - `scripts/lint/tmp_sweep.py`: a herdr-pinned run folder is in use while a worker of that run is `OpenWorker`, `ProcessUnknownWorker` or `UncertainWorker`. The mesh roster guards stay for mesh-pinned runs.
-5. **One snapshot per run.** Each display takes one `staff.snapshot()` per run and passes it to every `member`, `pane_parents` and `observe_parents` call.
-6. **Problems are shown, never an empty list.** When `snapshot()` raises `StaffUnreadable`, the display shows the reason as a problem line and no empty worker list: `roster.py` through `_problem`, `live` as a problem with the cause and on stderr, and each other display on stderr. A member that gives `NoSuchMember` gets its own problem line, which names the member.
-7. **No change, after a check.** `scripts/message/process_table.py`, `scripts/usage/waste_watch.py` and `scripts/shot_report/transcripts.py` read mesh text only for mesh-pinned runs, for a comment, or for history. Confirm this in the summary and change nothing. If one of them does read live pane workers, convert it under item 3.
-8. **Retained until panes Phase 18.** The mesh roster and server branches in `roster.py`, the mesh branch in `board_json.py`, the mesh start and follow recognition in `process_table.is_codex_agent`, and the mesh roster guards in `tmp_sweep.run_folder_guards`, `worker_use` and `cleanup_end_reason`. Keep no other mesh display path.
-9. Add no other check, guard or refusal. A check that a worker thinks is needed goes to the unit director, who asks the user.
+- `worker_panes.observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]` makes one pane read for many parents and no read for no parents. `PaneRead`, `PaneReadUnavailable`, `_read_panes` and `_parent_evidence` hold that read. `agent_inventory(client)` reads agent status for worker and freestanding displays. `_stop_row` imports `scripts.shutdown.restart` at use, which removes a type-graph import cycle.
+- `session_staff.pane_parents(record)` selects the parents whose held run reads herdr. `unit_runs.parent_transport(session_id, *, scanned, record)` decides this from the first held run's pin, else configuration, and writes nothing.
+- `unit_runs.run_pin(run) -> Literal["mesh", "herdr"] | NoRunPin` is the one reader of a run's pin. An invalid pin raises `ValueError`. `RunStaffAtUse.LOCAL` names a staff read at the point of use.
+- `held_by_session` includes a folder with `progress_history_state.json` or `mesh_roster.json`, because `worker_admission.parent` resolves a run through either file.
+- The roster, `board_json`, `staff_sources.live`, `codex_winddown` and `tmp_sweep` show pane workers in the five states. `ProcessUnknownWorker` never shows as stopped or absent, and `UncertainWorker` never shows as closed. A mesh-pinned run displays as before. No display writes a pin.
+- `staff_sources.live` adds a `pane_state` field to each pane member and a top-level `problems` list. `board_json.pane_worker_rows`, `ReadPaneRows` and `PaneRowsUnreadable` hold the board's read; `tmp_sweep.PaneRunUse`, `PaneRunsUnreadable`, `ReadPaneRuns`, `read_pane_runs`, `pane_run_use` and `run_pane_owner` hold the sweep's read.
+- A display that cannot read a pin, a member or an owner names the cause on a problem line and keeps its other workers. A run makes one staff snapshot: `unit_labels.stopped_run_place(run, record)` and `unit_runs.director(run, record=)` take the display's record.
+- The roster's freestanding pane list reads agent status through `worker_panes.agent_inventory`. This costs 12 ms after the roster's own imports. It matches a worker by `process.marks`, and reads no process environment.
 
 **Files:**
-- `scripts/lib/unit_runs.py`, `scripts/lib/test_unit_runs.py`, `scripts/production/session_staff.py`, `scripts/production/test_session_staff.py`, `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — items 1 and 2.
-- `scripts/message/roster.py`, `scripts/message/test_roster.py`, `scripts/message/unit_labels.py`, `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py` — first writer.
-- `scripts/direct/board_json.py`, `scripts/direct/test_board_json.py`, `scripts/production/codex_winddown.py`, `scripts/production/test_codex_winddown.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py` — second writer, after items 1 and 2 are written.
+- `scripts/herdr/worker_panes.py` — the one pane read and the agent status read.
+- `scripts/lib/unit_runs.py` — the run pin reader, the parent transport and the held-run scan.
+- `scripts/production/session_staff.py` — the parent selection.
+- `scripts/production/staff_sources.py`, `scripts/production/codex_winddown.py` — pane state in staff and winddown reports.
+- `scripts/message/roster.py`, `scripts/message/unit_labels.py` — the roster's pane and mesh rows.
+- `scripts/direct/board_json.py` — the board's pane rows.
+- `scripts/lint/tmp_sweep.py` — the sweep's pane run owners and use.
 
-**Workers:** 2 writers. The first writes items 1 and 2 before the second starts.
+**Binds later work:** the Cleanup phase of the herdr worker panes plan deletes the retained mesh code, 396 lines: `roster._worker_ledger`, `_worker_slot`, `mesh_shown_name`, `mesh_title`, `_run_place`, `_between_turns_reason`, `_run_server_homes`, `_worker_account`, `_worker_status`, `_process_cwds`, `_ledger_workers`, `_review_workers` and the `_unit_workers` mesh run loop; the `board_json.workers` mesh branch; the roster branches of `tmp_sweep.run_folder_guards`, `worker_use` and `cleanup_end_reason`; `process_table.is_codex_agent`; `unit_runs.run_pin`, `NoRunPin` and `parent_transport`; `unit_labels.mesh_records`.
 
-**Acceptance gate:**
-- Each converted display has a test of all five states. `ProcessUnknownWorker` is never shown as stopped or absent, and `UncertainWorker` never as closed.
-- A mesh-pinned run displays as it did: its existing tests pass with no change to their assertions.
-- A worker of the other machine's parent is not shown as closed.
-- A test counts the pane reads: `observe_parents` makes one read for many parents, and none for no parents.
-- No display writes a pin file.
-- Problem tests for each display: an unreachable owner (the fake `ssh` fails), a malformed record and a missing member each give a line that names the cause, and no empty worker list. A run makes one `snapshot()` call.
-- No display module calls `herdr agent list` outside `worker_panes`.
-- The checkpoint message records added and deleted source lines, each retained branch with its line count and its owner (panes Phase 18), and the time of one `observe_parents` read. The source count is a decrease when the retained lines count as deleted.
-- basedpyright reports 0/0/0 on changed files and every caller module. The shared full gate is green.
+**Gotchas:**
+- A pane with unknown evidence makes every closed worker `UncertainWorker`. Morty's two bare `codex` panes are unknown today.
+- `unit_runs.director` prints one anomaly line on stderr for a run folder with no staff owner, so the roster prints one such line for each old folder until the tmp sweep removes it.
+- One `observe_parents` read takes 1.438 s over 45 parents and 528 workers. `pane_parents` takes 0.513 s.
 
-**Known effect:** a pane with unknown evidence makes every closed worker `UncertainWorker` ("absence is unproved"). Morty's two bare `codex` panes are unknown today (pids 198033 and 294399), so every closed pane worker shows incomplete until those panes have a thread id.
+**Ruled out:** a state-file-only filter in `held_by_session`, which drops the pin of a run with only a mesh roster.
 
 ### Phase 23 — An unknown process does not refuse a staff write about another row  · status: done
 
