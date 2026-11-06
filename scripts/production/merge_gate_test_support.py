@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
+from scripts.lib import build_folders
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.production import merge_gate
@@ -281,7 +282,7 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        directory = tempfile.TemporaryDirectory(dir="/dev/shm", prefix="merge-gate-test-")
+        directory = tempfile.TemporaryDirectory(dir=build_folders.tmpfs_temporary_parent(), prefix="merge-gate-test-")
         cls.addClassCleanup(directory.cleanup)
         cls.fixture_root = Path(directory.name) / "case"
         cls.fixture_snapshot = Path(directory.name) / "snapshot"
@@ -523,7 +524,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
                  ignored_signals: bool = False, callers_production: bool = False,
-                 own_process: bool = False) -> subprocess.CompletedProcess[str]:
+                 own_process: bool = False, preamble: str = "") -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
              "--checkpoint", checkpoint or self.checkpoint,
@@ -537,7 +538,7 @@ class MergeGateFixture(unittest.TestCase):
         # The gate measures itself and descendants; cap assertions need their own gate process.
         if own_process or ignored_signals:
             return subprocess.run(
-                [*self.gate_command(ignored_signals=ignored_signals), *arguments], cwd=self.root,
+                [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
                 env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         from scripts.production import showrunners
@@ -553,14 +554,15 @@ class MergeGateFixture(unittest.TestCase):
             return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
                               self.environment, self.root)
 
-    def gate_command(self, *, ignored_signals: bool = False) -> list[str]:
+    def gate_command(self, *, ignored_signals: bool = False, preamble: str = "") -> list[str]:
         source = "import sys, signal; "
         if ignored_signals:
             source += ("[signal.signal(sig, signal.SIG_IGN) for sig in "
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
         source += (f"sys.path.insert(0, {str(SCRIPT.parents[2])!r}); "
-                   "from scripts.production import merge_gate; "
-                   "raise SystemExit(merge_gate.main(sys.argv[1:]))")
+                   + "from scripts.production import merge_gate; \n"
+                   + preamble + "\n"
+                   + "raise SystemExit(merge_gate.main(sys.argv[1:]))")
         return [sys.executable, "-c", source]
 
     def run_promote_only(self) -> subprocess.CompletedProcess[str]:
