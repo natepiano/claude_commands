@@ -2591,52 +2591,22 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Depends on:** Phase 10, Phase 11, Phase 12, Phase 13 behavior. Draft beside Phase 11 from its fixed contract; check final text and code together in the shared 11/14 gate.
 
-#### Work Order
+#### As-built
 
-**Goal:** every instruction file describes panes, and mesh text stays only inside a mesh-pinned branch.
-
-**Spec:**
-
-1. Update the listed instructions to the behavior from Phases 10–14b. For a fresh unpublished worker, retry the original launcher command: no saved pass exists yet, and the rerun publishes once from the retained pane.
-2. Keep mesh instructions only in a branch selected by an existing run's mesh pin.
-3. Preserve the existing rename command results, anomaly lines, and restart advice.
-4. Describe completed reruns as one `unchanged` line with exit 0 and no restart notice.
-5. Preserve pending-rename completion, staged document bytes, working bytes, and source-index removal behavior.
-6. Preserve folder and branch `swap_stem` targets and one anomaly line for each unmatched end.
-7. Add no display layer, rename implementation, or duplicate rename test.
-   Describe detached results and review Stage 2: a rerun after a stop can type one result twice, and Stage 2 reports through its status and summary.
-8. Use the existing timeout output test in `test_unit_move.py` as behavior evidence.
-9. Keep the existing Hana coverage for empty-owner window titles unchanged.
-10. Phase 14d pilot text. A second review lens at the same time names `--to review2`, because the worker command refuses when all workers are busy. After an incomplete pass, the director reruns the saved launcher command before another role's dispatch, and `findings.py landed` runs when that launcher does not run it. A read-only pane reviewer posts no board line and runs no suite, so the director or a writer runs them. A quiet wait that returns exit 3 has the same recovery.
-11. `worker.py end` prints the configuration refusal and exits 7 when the stop budget is unusable. Tell the director to correct the named configuration and run `end` again; the row stays.
-12. Use `targeted_test` in new text once the builds rename is on the merge branch.
-13. A Codex pane worker compacts at the configured limit. `worker_panes._policy_arguments` adds `-c model_auto_compact_token_limit=<n>` for Codex, and `<n>` is `UNIT_COMPACT_ABOVE_TOKENS` from `config/direct.conf`, the key the mesh uses, with no copy. A side pane takes the same option through `launch_arguments`. A Claude launch does not change. An unusable value returns `StartRefused(INVALID_ROLE_CONFIGURATION)`. Showrunner ruling, 2026-11-06: the option goes in this phase, so no pane worker runs after the switch without it, and the usage watch limit stays. Measured 2026-11-06: pane worker `review` reached 287,102 tokens with no compaction, on a 475,000-token window.
-14. A resumed Codex pane worker works in its pane's folder. `worker_panes.launch_arguments` adds `--cd <folder>` on a Codex resume. Without it, `codex resume` takes the thread's recorded folder, which a unit rename or a clone removal leaves absent, and the dispatch ends exit 3 with no prompt delivered (pilot, 2026-11-06).
+- The listed commands and docs describe panes. Each live mesh instruction requires an existing mesh-pinned run, and that guarded text stays until the mesh goes.
+- The text describes a retry of the original launcher command for a fresh unpublished worker, detached results, review Stage 2, one `unchanged` line for a completed rerun, a second review lens through `--to review2`, a director-run `findings.py landed`, and the `worker.py end` configuration refusal with exit 7.
+- `worker_panes.launch_policy` reads `UNIT_COMPACT_ABOVE_TOKENS` from `config/direct.conf`. `_policy_arguments` adds `-c model_auto_compact_token_limit=<n>` for Codex. `LaunchPolicy.compact_above_tokens` is `int | ClaudeCompaction`, and a Claude launch does not change. An unusable value returns `StartRefused(INVALID_ROLE_CONFIGURATION)`. `side_pane._policy` reads the same key and converts `conf.Unusable` to `SidePaneRefused`.
+- `worker_panes.launch_arguments(policy, identity, directory)` adds `--cd <directory>` on a Codex resume, after `--no-daemon`.
 
 **Files:**
+- `scripts/herdr/worker_panes.py`, `scripts/herdr/side_pane.py`, `scripts/herdr/test_worker_panes.py`, `scripts/herdr/test_side_pane.py`, `docs/as-built/long-lived-workers.md` — the compaction option and the resume folder.
+- `commands/unit/direct.md`, `commands/unit/worker.md`, `commands/unit/report.md`, `docs/direct/`, `commands/showrunner/`, `commands/message.md`, `commands/codex_winddown.md`, `commands/shutdown.md`, `commands/ask_a_friend.md`, `commands/astra_review.md`, `commands/shot_report.md`, `docs/quota_alerts.md`, `docs/production_format.md`, `docs/accounts.md` — pane text.
 
-- `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/unit_move.py`, `scripts/production/test_rename.py`, `scripts/production/test_unit_move.py` — inspect accepted rename behavior; this text phase leaves source and tests unchanged.
-- `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md`, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`, `docs/direct/phase_end.md`, `docs/direct/run_phase_review.md`, `commands/unit/report.md`, `commands/showrunner/produce.md`, `commands/showrunner/accounts.md`, `commands/showrunner/rename_unit.md`, `commands/showrunner/retire_unit.md`, `commands/showrunner/transfer_unit.md`, `commands/message.md`, `commands/codex_winddown.md`, `commands/shutdown.md`, `commands/ask_a_friend.md`, `commands/astra_review.md`, `commands/shot_report.md`, `docs/quota_alerts.md`, `docs/production_format.md`, `docs/accounts.md` — Reference → Instruction edits.
-- `commands/unit/worker.md` — Spec item 11.
-- `scripts/herdr/worker_panes.py`, `scripts/herdr/side_pane.py`, `scripts/herdr/test_worker_panes.py`, `scripts/herdr/test_side_pane.py`, `docs/as-built/long-lived-workers.md` — Spec items 13 and 14.
+**Binds later work:** `UNIT_COMPACT_ABOVE_TOKENS` stays when the mesh goes, because the pane launch reads it. The command mirror regenerates through `scripts/claude_to_codex/sync.py` once this text is on main. New text uses the name `targeted_test` once the builds rename is on the merge branch.
 
-**Workers:** `2 writers` — split by file group.
-- `impl` — `commands/unit/direct.md` and `docs/direct/*`.
-- `test` (opens as impl) — the other commands and docs.
-- `impl4` — Spec items 13 and 14.
+**Gotchas:** A resumed Codex takes its recorded thread folder unless `--cd` is given. A same-role dispatch keeps a running process, so a worker from before the option keeps running without it.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 14d shipped the mesh list, check and restore text in `commands/unit/worker.md`; do not write it again. Phase 8 landed the transport-aware text in `commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerRuns/>`, `<WorkerLaunchFailure/>`, `<FixDispatch/>`, `<PhaseCleanup/>`), branched once on the run's pin. Phase 9 `send.py worker:<unit>/<short name>` and `mesh_runs.py` pane delivery; Phase 10 shutdown and restore of split tabs; Phase 11 account moves of pane workers; Phase 12 converted friend commands to `side_pane.py open|send|close`; held Astra roles use `worker.py`. Managed Astra reviews start through `assign.sh --role review --operation astra-review`, and `/astra_review` prints the saved report. A failed end keeps the row, and `worker.py list` shows it; the exec hold is implementation-only and ends with `assign.sh`. Ad hoc Astra reviews retain `codex exec` until Phase 18; preserve the friend recovery instructions; Phase 13 displays read workers through `observe`. Phase 4f accepted limit (F008): an interrupted multi-pane rebuild can lose the split ratio and leave panes in the source workspace; the anomaly line names the tab and the panes. The instructions tell the user to inspect those panes; a retry does not rebuild the split.
-- Phase 3h review (2026-11-01): keep the 4b header, Hub files and Gates deletions; do not generate them again.
-
-**Acceptance gate:** Search the listed instructions for unguarded mesh commands and paths.
-Every live mesh instruction must require an existing mesh-pinned run.
-Keep guarded compatibility instructions until Phase 18 removes them.
-Compare rename text with the accepted command output, anomaly lines, restart advice, and finished-rerun behavior.
-Run the shared Phase 11/14 text-and-code gate.
-Regenerate changed command mirrors through `scripts/claude_to_codex/sync.py`.
-Only Spec items 13 and 14 need Python: a test shows the option and the configured value in a Codex launch and a resume, no option in a Claude launch, and a refusal for an unusable value; a test shows `--cd <folder>` on a Codex resume, and none on a Claude resume. Require basedpyright 0/0 on its files and the full gate. No other Python or new rerun test is required for this phase.
+**Ruled out:** A restart of a same-role worker that lacks the option, because a rerun recovers an active pass through that process.
 
 ### Phase 14a — A fresh Codex pane worker publishes from its session report  · status: done
 
