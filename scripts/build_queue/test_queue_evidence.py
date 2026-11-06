@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import admission_records as records
+
 from scripts.lint.memory_test_support import admission_policy_fixture
 
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -680,7 +682,7 @@ class QueueEvidenceTests(unittest.TestCase):
                 _ = admission.server.run_pass()
             with admission.serving(), \
                  mock.patch.object(gate, "queue_read", side_effect=client.view), \
-                 mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+                 mock.patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                  mock.patch("sys.argv", ["build_queue.py", "--columns", "400", "1"]), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(build_queue.main(), 0)

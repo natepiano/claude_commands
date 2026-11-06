@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue import admission_records as records, snapshot_codec as codec, step_estimator
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture
 
@@ -1448,7 +1448,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         meminfo = self.root / 'meminfo'
         _ = meminfo.write_text('MemAvailable: 67108864 kB\n')
         arguments = ['cargo', 'nextest', 'run', '-E', 'package(hana) & test(native_rate)']
-        with patch.dict(os.environ, {'BUILDLOG_TEST_BUILD_KEY': 'current-key', 'BUILDLOG_TREE': 'source-only-key', 'BUILDLOG_TEST_TARGET_DIR': str(configured), 'BUILDLOG_TEST_BUILD_DIR': str(configured), 'CARGO_TARGET_DIR': str(self.worktree / 'target')}), patch.object(gate, 'git_identity', return_value=(HANA, 'checkout')), patch.object(store, 'host_name', return_value=self.host), patch.object(buildlog_record, 'git_directory', return_value=str(self.worktree)), patch.object(buildlog_record, 'git_facts', return_value={'worktree': str(self.worktree)}), patch.object(gate, 'process_start_time', return_value=None):
+        with patch.dict(os.environ, {'BUILDLOG_TEST_BUILD_KEY': 'current-key', 'BUILDLOG_TREE': 'source-only-key', 'BUILDLOG_TEST_TARGET_DIR': str(configured), 'BUILDLOG_TEST_BUILD_DIR': str(configured), 'CARGO_TARGET_DIR': str(self.worktree / 'target')}), patch.object(step_estimator, 'git_identity', return_value=(HANA, 'checkout')), patch.object(store, 'host_name', return_value=self.host), patch.object(buildlog_record, 'git_directory', return_value=str(self.worktree)), patch.object(buildlog_record, 'git_facts', return_value={'worktree': str(self.worktree)}), patch.object(gate, 'process_start_time', return_value=None):
             fresh = gate.step_estimate(arguments, str(self.worktree), gate.INFER_FROM_ARGV, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
             self.assertEqual(fresh.profile.peak.bytes, 2 * GIB)
             _ = (self.state / 'target-deletes.json').write_text(json.dumps({str(configured): (NOW - timedelta(seconds=30)).timestamp()}))
@@ -1680,7 +1680,7 @@ class LedgerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(gate, "process_start_time", side_effect=caller_start))
         _ = self.enterContext(patch.object(gate, "process_table", return_value={self.pid: gate.ProcessIdentity(1, "start")}))
         _ = self.enterContext(patch.object(gate, "tree_memory", return_value=gate.MeasuredMemory(8 * GIB)))
-        _ = self.enterContext(patch.object(gate, "git_identity", return_value=(HANA, "test-worktree")))
+        _ = self.enterContext(patch.object(step_estimator, "git_identity", return_value=(HANA, "test-worktree")))
         _ = self.enterContext(patch.object(store, "host_name", return_value="test-host"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "log")})))
 
@@ -2432,7 +2432,7 @@ class BuildPromiseFixture(MemoryQueueFixture):
         self.enterContext(patch.dict(os.environ, {
             **fake_memory_readings(self.root),
         }))
-        _ = self.enterContext(patch.object(gate, "git_identity", return_value=(HANA, "hana-clone")))
+        _ = self.enterContext(patch.object(step_estimator, "git_identity", return_value=(HANA, "hana-clone")))
         _ = self.enterContext(patch.object(store, "host_name", return_value="test-host"))
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         config = gate.read_memory_config(report=False)
@@ -3048,8 +3048,9 @@ class BuildFinalizerTests(BuildPromiseFixture):
                             self.assertNotIn(waiting.request.episode, fixture.server.reservations)
                             raise RefreshChecked()
                 with patch.object(client, "CLOCK", fixture.clock), \
+                     patch.object(records, "process_start_time", side_effect=self.processes.get), \
                      patch.object(client.WaitOutput, "__call__", side_effect=observe), \
-                     patch.object(gate, "anonymous_history_rows", side_effect=count_history_scans), \
+                     patch.object(step_estimator, "anonymous_history_rows", side_effect=count_history_scans), \
                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
                      test_hang_guard.LauncherHangGuard(self.id()).protect(), fixture.serving():
                     with self.assertRaises(RefreshChecked):
@@ -3219,7 +3220,7 @@ class ProgramProfileTests(MemoryQueueFixture):
         profile = gate.ProgramProfile("merge-gate", "installed/.claude", "checkout",
             gate.HistoryPeakSizing(4 * GIB, gate.MeasuredProgramPeak(GIB, 1),
                 NOW_EPOCH - admission_policy_fixture().timing.estimate_refresh_seconds))
-        with patch.object(gate, "git_identity", side_effect=AssertionError("the program inferred a cargo identity")):
+        with patch.object(step_estimator, "git_identity", side_effect=AssertionError("the program inferred a cargo identity")):
             result = gate.step_estimate(["merge-gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
         self.assertEqual(result.profile.peak, gate.ExpectedPeak(4 * GIB, "fallback", 0))
         assert isinstance(result.profile, gate.ProgramProfile)
@@ -3235,8 +3236,8 @@ class ProgramProfileTests(MemoryQueueFixture):
             self.assertEqual((program, cap, now, root), ("merge-gate", 4 * GIB, NOW, self.root))
             self.assertTrue(host)
             return gate.MeasuredProgramPeak(6 * GIB, 2)
-        with patch.object(gate, "program_peak_estimate", side_effect=estimate) as refreshed, \
-             patch.object(gate, "git_identity", side_effect=AssertionError("the program inferred a cargo identity")), \
+        with patch.object(step_estimator, "program_peak_estimate", side_effect=estimate) as refreshed, \
+             patch.object(step_estimator, "git_identity", side_effect=AssertionError("the program inferred a cargo identity")), \
              patch.object(fcntl, "flock", side_effect=AssertionError("the estimate acquired an admission lock")):
             result = gate.step_estimate(["merge-gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
         refreshed.assert_called_once()
@@ -5564,7 +5565,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
 
     def test_warning_boundary_reports_each_fallback_once_and_checker_stays_silent(self) -> None:
         self.write_config(estimate_refresh_seconds="abc", slot_gap_seconds=None)
-        with patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), contextlib.redirect_stderr(io.StringIO()) as errors:
+        with patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), contextlib.redirect_stderr(io.StringIO()) as errors:
             first = gate.read_memory_config(report=False)
             second = gate.read_memory_config(report=False)
             gate.warn_configuration_diagnostics(first.diagnostics)
@@ -5595,7 +5596,7 @@ class ServiceAdmissionRuleTests(unittest.TestCase):
         profile = gate.ProgramProfile("rust-analyzer", "repo", "tree",
             gate.HistoryPeakSizing(18 * GIB, gate.FirstProgramPeak(18 * GIB), NOW_EPOCH))
         with tempfile.TemporaryDirectory() as folder, \
-             patch.object(gate, "program_peak_estimate", return_value=gate.MeasuredProgramPeak(7 * GIB, 9)) as estimate:
+             patch.object(step_estimator, "program_peak_estimate", return_value=gate.MeasuredProgramPeak(7 * GIB, 9)) as estimate:
             young = gate.step_estimate([], "tree", profile,
                 NOW + timedelta(seconds=policy.timing.estimate_refresh_seconds - 1), Path(folder), policy, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
             estimate.assert_not_called()
@@ -5620,9 +5621,9 @@ class ServiceAdmissionRuleTests(unittest.TestCase):
     def test_fresh_nextest_estimate_carries_its_cache_policy_to_expiry(self) -> None:
         for fresh in (False, True):
             with self.subTest(fresh=fresh), tempfile.TemporaryDirectory() as folder, \
-                 patch.object(gate, "git_identity", return_value=(HANA, "tree")), \
-                 patch.object(gate, "is_fresh_test", return_value=fresh), \
-                 patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(2 * GIB, "measured", 5)):
+                 patch.object(step_estimator, "git_identity", return_value=(HANA, "tree")), \
+                 patch.object(step_estimator, "is_fresh_test", return_value=fresh), \
+                 patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(2 * GIB, "measured", 5)):
                 result = gate.step_estimate(["cargo", "nextest", "run"], "tree",
                     gate.InferFromArgv(), NOW, Path(folder), admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
                 self.assertIsInstance(result.cache, gate.FreshTest if fresh else gate.ReusableEstimate)

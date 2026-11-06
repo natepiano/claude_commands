@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 else:
     import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
-from scripts.build_queue import queue_evidence
+from scripts.build_queue import admission_records as records, queue_evidence, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, reply_bytes,
@@ -175,7 +175,7 @@ class ClientTests(unittest.TestCase):
             original = fixture.request()
             checkout = str(fixture.root / "other-checkout")
             profile = gate.ProgramProfile("merge-gate", "repo", checkout, gate.HistoryPeakSizing(6 * GIB, gate.FirstProgramPeak(6 * GIB), fixture.clock.now()))
-            with mock.patch.object(gate, "git_identity", side_effect=AssertionError("program inferred cargo")), \
+            with mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("program inferred cargo")), \
                  mock.patch.object(client, "CLOCK", fixture.clock):
                 request = client.step_request([], str(fixture.root), original.owner, original.since,
                                               "", original.episode, profile)
@@ -196,7 +196,7 @@ class ClientTests(unittest.TestCase):
                 released.append(reservation)
                 return release(reservation, status, configuration)
             with mock.patch.object(client, "step_request", return_value=original), \
-                 mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                 mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  mock.patch.object(client, "write_shell_grant", side_effect=OSError("grant disk failed")), \
                  mock.patch.object(client, "release", side_effect=observe_release), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()) as output:
@@ -215,8 +215,8 @@ class ClientTests(unittest.TestCase):
             transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED)), Exchange(reply_bytes(GRANTED)))
             estimates = [gate.StepEstimate(original.profile, gate.FreshTest()),
                          gate.StepEstimate(updated, gate.ReusableEstimate())]
-            with mock.patch.object(gate, "step_estimate", side_effect=estimates) as estimate, \
-                 mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+            with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
+                 mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
                 status = client.main(["admit", "--pid", str(original.owner.pid), "--since", str(original.since),
                                       "--", "cargo", "nextest", "run"])
@@ -245,8 +245,8 @@ class ClientTests(unittest.TestCase):
                 def history_peak(*_args: object, **_kwargs: object) -> gate.ExpectedPeak:
                     self.assertIsInstance(transport.requests[-1], wire.BuildHistoryRequest)
                     return gate.ExpectedPeak(12 * GIB, "fallback", 0)
-                with mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
-                        mock.patch.object(gate, "expected_peak", side_effect=history_peak) as history:
+                with mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+                        mock.patch.object(step_estimator, "expected_peak", side_effect=history_peak) as history:
                     with mock.patch.object(conf, "read", wraps=conf.read) as reader:
                         request = client.step_request(["cargo", "build"], str(fixture.root), owner.owner,
                             owner.since, "", owner.episode, profile)
@@ -265,7 +265,7 @@ class ClientTests(unittest.TestCase):
             request = fixture.request(step="build")
             with mock.patch.object(client, "CLOCK", fixture.clock), \
                     mock.patch.object(client, "build_history_generation", side_effect=AssertionError("cached estimate queried a newer generation")), \
-                    mock.patch.object(gate, "expected_peak", side_effect=AssertionError("cached estimate read history")):
+                    mock.patch.object(step_estimator, "expected_peak", side_effect=AssertionError("cached estimate read history")):
                 retained = client.step_request(list(request.argv), request.cwd, request.owner,
                     request.since, request.sidecar, request.episode, request.profile)
             self.assertEqual(retained.profile, request.profile)
@@ -285,8 +285,8 @@ class ClientTests(unittest.TestCase):
             def refresh() -> wire.AdmitRequest:
                 return client.step_request(list(request.argv), request.cwd, request.owner,
                     request.since, request.sidecar, request.episode)
-            with mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
-                    mock.patch.object(gate, "expected_peak", side_effect=history_peak) as history:
+            with mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+                    mock.patch.object(step_estimator, "expected_peak", side_effect=history_peak) as history:
                 self.assertEqual(client.admit(request, lambda _wait: None, refresh), granted)
             self.assertEqual(history.call_count, 1)
             self.assertEqual(len(transport.attempts), 2)
@@ -319,9 +319,9 @@ class ClientTests(unittest.TestCase):
 
                 with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-leave"}), \
                         mock.patch.object(client, "_leave_queue", side_effect=leave), \
-                        mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
-                        mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
-                        mock.patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                        mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
+                        mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+                        mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
                         redirect_stderr(io.StringIO()) as errors, mock.patch("sys.stdout", io.StringIO()) as output:
                     status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "build"])
                 self.assertEqual(status, 75, errors.getvalue())
@@ -347,9 +347,9 @@ class ClientTests(unittest.TestCase):
                         Exchange(reply_bytes(wire.BuildHistoryReply(0))),
                         Exchange(reply_bytes(EXPIRED), generation_failure),
                         *(Exchange(connect_error=FileNotFoundError()) for _ in range(3)))
-                    with mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
-                            mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
-                            mock.patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                    with mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
+                            mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+                            mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
                             redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
                         status = client.main([command, "--pid", str(original.owner.pid), "--", "cargo", "build"])
                     self.assertEqual(status, 2)
@@ -375,9 +375,9 @@ class ClientTests(unittest.TestCase):
                         else Exchange(TimeoutError()) for _ in range(12))
                     transport = self.use_transport(fixture, *exchanges)
                     with mock.patch.dict(os.environ, {"BUILDLOG_MEM_WAIT_LIMIT_S": "6", "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": ""}), \
-                            mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
-                            mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
-                            mock.patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                            mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
+                            mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+                            mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
                             redirect_stderr(io.StringIO()) as errors, mock.patch("sys.stdout", io.StringIO()) as output:
                         status = client.main(["launch", "--pid", str(original.owner.pid), "--", "cargo", "build"])
                     self.assertEqual(status, 2)
@@ -499,7 +499,7 @@ class ClientTests(unittest.TestCase):
                 split = len(encoded) // 2
                 transport = self.use_transport(fixture,
                     Exchange(encoded[:split], TimeoutError(), encoded[split:]))
-                with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("cleanup read config")), \
+                with mock.patch.object(records, "read_memory_config", side_effect=AssertionError("cleanup read config")), \
                         redirect_stderr(io.StringIO()) as errors:
                     result = client.release("stem", 137, acquired) if kind == "release" else client.token_wait("stem", acquired)
                 self.assertEqual(result, wire.Ok())
@@ -533,7 +533,7 @@ class ClientTests(unittest.TestCase):
             write_memory_config(config, **{"program_first_peak_gib.cargo": "invalid"})
             original = fixture.request()
             repository = gate.RepositoryIdentity("github.com/team/project", "project")
-            with mock.patch.object(gate, "git_identity", return_value=(repository, "tree")), \
+            with mock.patch.object(step_estimator, "git_identity", return_value=(repository, "tree")), \
                     mock.patch.object(conf, "read", wraps=conf.read) as reader, \
                     redirect_stderr(io.StringIO()) as errors:
                 request = client.step_request(["cargo", "clippy"], str(fixture.root), original.owner,
@@ -586,8 +586,8 @@ class ClientTests(unittest.TestCase):
                 waits: list[wire.Wait] = []
                 with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-decline"}), \
                         mock.patch.object(client, "_leave_queue", side_effect=decline), \
-                        mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), original.cwd)), \
-                        mock.patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)) as history, \
+                        mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), original.cwd)), \
+                        mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)) as history, \
                         redirect_stderr(io.StringIO()) as errors:
                     request = refresh() if stage == "initial" else original
                     result = client.admit(request, waits.append, refresh)
@@ -631,8 +631,8 @@ class ClientTests(unittest.TestCase):
 
                 with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-decline"}), \
                         mock.patch.object(client, "_leave_queue", side_effect=decline), \
-                        mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), request.cwd)), \
-                        mock.patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                        mock.patch.object(step_estimator, "git_identity", return_value=(gate.UnknownRepository(), request.cwd)), \
+                        mock.patch.object(step_estimator, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
                         redirect_stderr(io.StringIO()) as errors:
                     result = client.admit(request, waits.append, refresh)
                 self.assertEqual(result, GRANTED)
@@ -759,7 +759,7 @@ class ClientTests(unittest.TestCase):
                     fixture.configure(reconnect_seconds=4, outage_notice_seconds=6)
             fixture.clock.on_sleep = reconfigure
             with redirect_stderr(io.StringIO()) as output, \
-                    mock.patch.object(gate, "read_memory_config", wraps=gate.read_memory_config) as reader:
+                    mock.patch.object(records, "read_memory_config", wraps=records.read_memory_config) as reader:
                 self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
             reader.assert_called_once_with(report=False)
             self.assertEqual(transport.attempts, [0, 3, 6, 9])
@@ -813,7 +813,7 @@ class ClientTests(unittest.TestCase):
                 Exchange(connect_error=FileNotFoundError()), Exchange(reply_bytes(GRANTED)),
                 Exchange(connect_error=FileNotFoundError()), Exchange(reply_bytes(GRANTED)))
             with redirect_stderr(io.StringIO()), \
-                    mock.patch.object(gate, "read_memory_config", wraps=gate.read_memory_config) as reader:
+                    mock.patch.object(records, "read_memory_config", wraps=records.read_memory_config) as reader:
                 self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
                 fixture.configure(reconnect_seconds=7, outage_notice_seconds=11)
                 self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
@@ -827,7 +827,7 @@ class ClientTests(unittest.TestCase):
             commit_config_fixture(config)
             write_memory_config(config, estimate_refresh_seconds="invalid")
             request = fixture.request()
-            with fixture.serving(), mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+            with fixture.serving(), mock.patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                     mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as errors:
                 first = client.admit(request, lambda _wait: None, lambda: request)
                 second = client.admit(request, lambda _wait: None, lambda: request)
@@ -1093,8 +1093,8 @@ class ClientTests(unittest.TestCase):
                 return gate.StepEstimate(original.profile, gate.ReusableEstimate())
 
             with mock.patch.dict(os.environ, {"BUILDLOG_RUN": f"{run.pid}:{run.start_time}"}), \
-                 mock.patch.object(gate, "step_estimate", side_effect=estimate), \
-                 mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                 mock.patch.object(step_estimator, "step_estimate", side_effect=estimate), \
+                 mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()) as output:
                 status = client.main(["admit", "--pid", str(original.owner.pid),
                                       "--since", str(original.since), "--wait-events", "--", "cargo", "nextest"])
@@ -1119,9 +1119,9 @@ class ClientTests(unittest.TestCase):
                 else:
                     environment["BUILDLOG_RUN"] = value
                 with mock.patch.dict(os.environ, environment, clear=True), \
-                     mock.patch.object(gate, "step_estimate", return_value=gate.StepEstimate(
+                     mock.patch.object(step_estimator, "step_estimate", return_value=gate.StepEstimate(
                          original.profile, gate.ReusableEstimate())), \
-                     mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                     mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                      redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
                     status = client.main(["admit", "--pid", str(original.owner.pid),
                                           "--since", str(original.since), "--", "cargo", "nextest"])
@@ -1139,9 +1139,9 @@ class ClientTests(unittest.TestCase):
             transport = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)))
             with mock.patch.object(sys, "platform", "darwin"), \
                  mock.patch.dict(os.environ, {"BUILDLOG_RUN": f"{run.pid}:{run.start_time}"}), \
-                 mock.patch.object(gate, "step_estimate", return_value=gate.StepEstimate(
+                 mock.patch.object(step_estimator, "step_estimate", return_value=gate.StepEstimate(
                      original.profile, gate.ReusableEstimate())), \
-                 mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                 mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
                 status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
             self.assertEqual(status, 0)

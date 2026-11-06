@@ -15,7 +15,6 @@ import struct
 import subprocess
 import sys
 import threading
-import time
 from typing import TYPE_CHECKING, Callable, Protocol, cast
 
 if __package__ in (None, ""):
@@ -28,7 +27,8 @@ from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_snapshot
-from scripts.build_queue.queue_view import reason_phrase
+from scripts.build_queue.admission_records import reason_phrase
+from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 
 if TYPE_CHECKING:
@@ -111,15 +111,6 @@ class Clock(Protocol):
     def monotonic(self) -> float: ...
 
 
-class SystemClock:
-    def now(self) -> float:
-        return time.time()
-
-    def monotonic(self) -> float:
-        return time.monotonic()
-
-    def sleep(self, seconds: float) -> None:
-        time.sleep(seconds)
 
 
 class Readings(Protocol):

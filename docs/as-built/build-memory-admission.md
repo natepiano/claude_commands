@@ -64,7 +64,7 @@ Stable session folders retain their short paths and mode `0700`.
 The session hook defines the session temporary root.
 The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
 The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
-`memory_admit.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
+`step_estimator.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
 `tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
 
 ### Machine side (`/etc/nixos`, natedev only)
@@ -114,7 +114,8 @@ After a restart, the service restores live run places and removes ended run plac
 
 `scripts/build_queue/admission_service.py` is the only live admitter. Its epoll loop owns the queue and reservations.
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
-`memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
+`step_estimator.py` owns the estimates. `admission_records.py` owns the shared records, configuration, and wait phrases.
+`memory_admit.py` owns the readers, pure admission rules, projection, and finalizer.
 
 [Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.
 The first two minutes use the same calculation. A run never counts its use twice.
@@ -268,7 +269,8 @@ The comparative replay does not run. The capacity rule is not adopted.
 
 ### Estimates and keep-asides
 
-The client calls `step_estimate` before admission and after `EstimateExpired`.
+The client imports `step_estimator` inside `step_request`. It calls `step_estimate` before admission and after `EstimateExpired`.
+`system_clock.py` owns the shared `SystemClock`. Cleanup commands load no service or queue view.
 Before each new build estimate, it reads `build_history` from the service, then reads history.
 `StepProfile.build_history_generation` keeps that generation through reconnects and delayed replies.
 The service grants a build only when its estimate generation equals `ServiceState.build_history_generation`.

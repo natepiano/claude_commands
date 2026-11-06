@@ -17,7 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
-from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue import snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
 from scripts.lint import memory_admit as gate
 
@@ -57,7 +57,7 @@ def wait_client_main() -> int:
             cast(gate.NeedSource, "future-source") if action == "unknown" else "measured", 5)
         return gate.StepEstimate(gate.StepProfile("fixture", "nextest", "tree", peak,
             estimated_at=clock.now()), gate.ReusableEstimate())
-    with mock.patch.object(client, "CLOCK", clock), mock.patch.object(gate, "step_estimate", side_effect=estimate):
+    with mock.patch.object(client, "CLOCK", clock), mock.patch.object(step_estimator, "step_estimate", side_effect=estimate):
         with mock.patch.object(sys, "argv", ["admission_client.py", *sys.argv[2:]]):
             return client.main()
 

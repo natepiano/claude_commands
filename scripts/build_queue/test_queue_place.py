@@ -27,6 +27,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.build_queue import admission_records as records, step_estimator
 from scripts.lint import memory_admit as gate
 
 if TYPE_CHECKING:
@@ -511,7 +512,7 @@ class QueuePlaceTests(unittest.TestCase):
                 process = place.popen(argv, stdout=subprocess.DEVNULL)
                 self.assertEqual(process.wait(timeout=2), 0)
             self.assertEqual(fixture.history(), history)
-            with mock.patch.object(gate, "program_peak_estimate", side_effect=AssertionError("editor sized from history")):
+            with mock.patch.object(step_estimator, "program_peak_estimate", side_effect=AssertionError("editor sized from history")):
                 with queue.queue_place([str(executable)], fixture.root) as place:
                     self.assertEqual(place.purpose, queue.ProgramPurpose.EDITOR_SERVER)
                     self.assertFalse(fixture.admission.server.reservations)
@@ -914,7 +915,7 @@ class QueuePlaceTests(unittest.TestCase):
         with QueuePlaceFixture() as fixture:
             write_memory_config(fixture.config, **{"program_first_peak_gib.rust-analyzer": "abc"})
             diagnostics = io.StringIO()
-            with mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+            with mock.patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                  mock.patch.object(client, "admit", wraps=client.admit) as checked, redirect_stderr(diagnostics):
                 for _ in range(2):
                     with self.assertRaises(queue.QueuePlaceRefused) as refused:

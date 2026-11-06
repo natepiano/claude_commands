@@ -20,7 +20,7 @@ from unittest import mock
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
-from scripts.build_queue import progress_profile as progress
+from scripts.build_queue import progress_profile as progress, step_estimator
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply, snapshot_with_head_cause
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture
@@ -245,7 +245,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             return result
         with mock.patch.object(client, "admit", side_effect=acquire), \
              mock.patch.object(client, "CLOCK", fixture.clock), \
-             mock.patch.object(memory_admit, "git_identity", side_effect=AssertionError("gate inferred cargo")):
+             mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("gate inferred cargo")):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(profiles), 3)

@@ -52,7 +52,7 @@ from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import admission_code, queue_snapshot, queue_view, queue_card, queue_evidence, head_facts
-from scripts.build_queue import progress_profile as progress
+from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from scripts.build_queue.queue_lines import plain
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
@@ -2843,7 +2843,7 @@ class CutoverServiceTests(unittest.TestCase):
             fixture.free(18 * GIB)
             with test_hang_guard.LauncherHangGuard(self.id()).protect(), fixture.serving(), \
                     mock.patch.object(client, "CLOCK", fixture.clock), \
-                    mock.patch.object(gate, "git_identity", return_value=(repository, str(fixture.root))):
+                    mock.patch.object(step_estimator, "git_identity", return_value=(repository, str(fixture.root))):
                 refreshed = client.step_request(list(argv), str(fixture.root), waiter.owner,
                     waiter.since, waiter.sidecar, waiter.episode)
             self.assertEqual((refreshed.owner, refreshed.episode, refreshed.since),
@@ -2975,7 +2975,7 @@ class CutoverServiceTests(unittest.TestCase):
             before = dict(fixture.server.waiters[stale.episode].row)
             with test_hang_guard.LauncherHangGuard(self.id()).protect(), fixture.serving(), \
                     mock.patch.object(client, "CLOCK", fixture.clock), \
-                    mock.patch.object(gate, "git_identity", return_value=(stale.profile.repository, str(fixture.root))):
+                    mock.patch.object(step_estimator, "git_identity", return_value=(stale.profile.repository, str(fixture.root))):
                 refreshed = client.step_request(list(stale.argv), stale.cwd, stale.owner,
                     stale.since, stale.sidecar, stale.episode)
             self.assertEqual((refreshed.owner, refreshed.episode, refreshed.since),
@@ -3464,8 +3464,8 @@ class CutoverServiceTests(unittest.TestCase):
             peak = gate.ExpectedPeak(2 * GIB, "measured", 5)
             policy = gate.read_memory_config().policy
             from datetime import UTC, datetime
-            with mock.patch.object(gate, "git_identity", return_value=(repository, "clone")) as identity, \
-                 mock.patch.object(gate, "expected_peak", return_value=peak) as history:
+            with mock.patch.object(step_estimator, "git_identity", return_value=(repository, "clone")) as identity, \
+                 mock.patch.object(step_estimator, "expected_peak", return_value=peak) as history:
                 first = gate.step_estimate(argv, str(fixture.root), gate.InferFromArgv(),
                     datetime.fromtimestamp(fixture.clock.now(), UTC), fixture.state_dir.parent, policy, first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
                 second = gate.step_estimate(argv, str(fixture.root), first.profile,
@@ -4229,7 +4229,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
             commit_config_fixture(config)
             write_memory_config(config, estimate_refresh_seconds="invalid")
             request = fixture.request()
-            with mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
+            with mock.patch.object(records, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                     mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
                 granted = only_admitted(fixture.server.handle_request(request))
                 _ = fixture.server.run_pass()

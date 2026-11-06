@@ -12,7 +12,7 @@ from scripts.build_queue.admission_code import (
     ADMISSION_CODE_PATHS as ADMISSION_CODE_PATHS,
     admission_code_version as admission_code_version,
 )
-from scripts.lint import memory_admit as gate
+from scripts.build_queue import admission_records as records
 
 VERSION = 1
 
@@ -66,7 +66,7 @@ class Identity:
     unit: str = ""
 
 
-Profile = gate.StepProfile | gate.ProgramProfile
+Profile = records.StepProfile | records.ProgramProfile
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -83,8 +83,8 @@ class AdmitRequest(CallerCode):
     since: float
     sidecar: str
     identity: Identity
-    call: gate.Call
-    test_width: gate.TestWidth
+    call: records.Call
+    test_width: records.TestWidth
     profile: Profile
     fresh_test: bool
     token_back_at: float = 0.0
@@ -167,11 +167,11 @@ Request = (AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRe
 
 @dataclass(frozen=True)
 class Wait:
-    reason: gate.WaitReason
+    reason: records.WaitReason
     position: int
     head: str
     text: str
-    snapshot: gate.AdmissionWaitSnapshot
+    snapshot: records.AdmissionWaitSnapshot
 
 
 @dataclass(frozen=True)
@@ -221,18 +221,18 @@ class BuildHistoryReply:
 
 @dataclass(frozen=True)
 class ViewReply:
-    reading: gate.QueueRead
+    reading: records.QueueRead
 
 
 @dataclass(frozen=True)
 class ExplainReply:
-    explanation: gate.QueueExplanation
-    diagnostics: tuple[gate.ConfigurationDiagnostic, ...] = ()
+    explanation: records.QueueExplanation
+    diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
 class MineReply:
-    reading: gate.QueueRead
+    reading: records.QueueRead
 
 
 Reply = Wait | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
