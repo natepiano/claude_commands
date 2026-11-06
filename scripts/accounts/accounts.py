@@ -1717,15 +1717,6 @@ def prepare_claude_launch(label: str, *, resume: bool) -> PreparedAccount:
     return prepared
 
 
-def claude_account_with_room(now: datetime) -> NamedAccount:
-    """Select and prepare a Claude account with quota."""
-    selected = pick("claude", now)
-    if isinstance(selected, NoAccountWithRoom):
-        raise AccountsError(no_room_line("claude", selected))
-    _ = prepare_claude_launch(selected.label, resume=False)
-    return NamedAccount(selected.label, selected.dir)
-
-
 def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
                              target: str = "", config_dir: str = "", source_fallback: bool = False) -> ClaudeLaunchAccount:
     """Use the group account, except for a moved unit restored on its source."""

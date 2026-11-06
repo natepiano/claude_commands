@@ -88,6 +88,7 @@ class SimplifyDispatchTests(NixFixture):
                        runtime_id=self.env["CODEX_THREAD_ID"],
                        worktree=staff.PresentWorktree("natedev", self.work))
         self.claude_quota("claude1", 100)
+        self.env["CLAUDE_CONFIG_DIR"] = str(self.home / ".claude1")
         _ = shutil.copytree(self.git_seed / ".git", self.work / ".git")
         standing = self.root / "review/simplify.md"
         standing.parent.mkdir()
@@ -348,11 +349,10 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         self.assertEqual(len(self.claude_calls()), 3)
 
     def test_no_account_failure_runs_again_without_starting_claude(self) -> None:
-        reset = datetime.now(timezone.utc) + timedelta(days=2)
-        self.claude_quota("claude1", 0, reset=reset)
+        self.env["CLAUDE_CONFIG_DIR"] = str(self.home / "missing")
         result = self.launch()
-        self.assertIn("no claude account has room; the earliest reset is", result.stderr)
-        self.assertIn(f"{reset:%a %Y-%m-%d %H:%M} UTC", result.stderr)
+        self.assertIn("caller has no numbered Claude account", result.stderr)
+        self.assertIn("Claude returned an empty simplify report", result.stderr)
 
         _ = self.launch()
 
@@ -392,9 +392,9 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
 
         result = self.launch()
 
-        self.assertIn("Claude account claude1", result.stderr)
-        self.assertIn("Claude account claude1", self.phase_file("review_agent_1_simplify.log").read_text())
-        self.assertEqual(self.claude_calls()[0]["config_dir"], str(self.home / ".claude1"))
+        self.assertNotIn("Claude account claude1", result.stderr)
+        self.assertNotIn("Claude account claude1", self.phase_file("review_agent_1_simplify.log").read_text())
+        self.assertEqual(self.claude_calls()[0]["config_dir"], str(self.home / ".claude2"))
         self.assertEqual(self.status(), "reviewed")
 
     def test_busy_lens_reports_error_without_starting_claude(self) -> None:
