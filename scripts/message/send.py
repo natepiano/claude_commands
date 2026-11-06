@@ -4,7 +4,7 @@
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
 
-  send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
+  send.py --to NAME|uds:<path>|session:<id>|worker:<unit>/<worker>|codex:<thread>
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
@@ -19,6 +19,9 @@ every message follows are /message (~/.claude/commands/message.md).
                           also stop the emergency push sent with KEY (see below)
   send.py clear-check     retire each live emergency push whose --clears-when check passes
 
+Pane workers use worker:<unit>/<worker>.
+Workers in mesh-pinned runs use worker:<run id>/<worker>.
+
 Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. Every path without confirmed delivery falls back to a
 headless `claude -p` relay whose one job is a SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
@@ -29,7 +32,8 @@ SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
 Staff `worker:` paths deliver through observed panes or their holders.
 Mesh `worker:` addresses keep their existing queues.
-`codex:` addresses queue through the shared Codex daemon.
+Staff worker addresses use the run's pinned transport.
+Other `codex:` addresses queue through the shared Codex daemon.
 One staff snapshot selects each staff recipient.
 Unit names use the staff names. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
@@ -1983,27 +1987,31 @@ def resolve_recipient(
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
+    import roster
+
     membership = staff.snapshot() if membership is None else membership
     problems = observed.diagnostics
 
     def lookup() -> DeliveryRoute:
         nonlocal problems
-        if to.startswith("uds:"):
-            return socket_recipient(to, sessions.live_sessions() if records is None else records, {}, membership=membership)
-        member = resolve_staff_recipient(to, membership, observed=observed.entries)
+        socket_records = (sessions.live_sessions() if records is None else records) if to.startswith("uds:") else []
+        member = resolve_staff_recipient(to, membership, observed=observed.entries, records=socket_records)
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
-        if (not isinstance(scope, NamedMachine) and to.startswith("worker:")
+        if (not isinstance(scope, NamedMachine)
                 and isinstance(member, staff.StaffRow) and member.kind == "worker"):
             from scripts.herdr import worker_panes
 
             holder = membership.parent_of(member)
-            if holder is not None:
-                run = worker_panes.worker_run(holder)
+            if holder is not None and (isinstance(holder.worktree, staff.WorktreeUnfilled)
+                                       or holder.worktree.machine == roster.remote.local_machine()):
+                run = worker_panes.worker_run(holder, record=membership)
                 if unit_runs.worker_transport(run) == "herdr":
                     return PaneWorkerRecipient(member)
-                if not _sender_label_matches(to, observed.entries):
+                if to.startswith("worker:") and not _sender_label_matches(to, observed.entries):
                     return CodexWorkerRecipient(to, member.name, str(run))
+        if to.startswith("uds:"):
+            return socket_recipient(to, socket_records, {}, membership=membership)
         if isinstance(member, staff.StaffRow):
             for anomaly in observed.row_anomalies:
                 if anomaly.row.id == member.id:
@@ -2645,8 +2653,9 @@ def parse(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(prog="send.py",
                                      description=(
                                          "Send one message to a roster name, uds:<path>, "
-                                         "session:<id>, worker:<run id>/<worker name>, "
-                                         "codex:<thread id>, or user."
+                                         "session:<id>, codex:<thread id>, or user. "
+                                         "Use worker:<unit>/<worker> for a pane worker. "
+                                         "Use worker:<run id>/<worker name> for a run pinned to mesh."
                                      ),
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]\n\n"
@@ -2657,7 +2666,9 @@ def parse(argv: list[str]) -> Options:
         required=True,
         help=(
             "a roster name, uds:<path>, session:<id>, "
-            "worker:<run id>/<worker name>, codex:<thread id>, or user"
+            "codex:<thread id>, or user. "
+            "Use worker:<unit>/<worker> for a pane worker. "
+            "Use worker:<run id>/<worker name> for a run pinned to mesh."
         ),
     )
     _ = parser.add_argument("--text-id", default="", help="registered script push")

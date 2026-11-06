@@ -178,7 +178,7 @@ class ReviewLauncherFixture(LauncherFixture):
         config = self.root / "config"
         config.mkdir(exist_ok=True)
         _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
-        for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
+        for name in ("review.sh", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")
         # Test the wrapper after admission in this private fixture.

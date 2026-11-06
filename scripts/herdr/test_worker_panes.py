@@ -6,6 +6,7 @@ import json
 import fcntl
 import math
 import os
+import sys
 import time
 import subprocess
 from copy import deepcopy
@@ -26,6 +27,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.herdr import worker_panes
+from scripts.direct import progress_history
 
 import herdr
 import pane_launch
@@ -304,6 +306,7 @@ class WorkerPaneTests(StaffTestCase):
         config = self.root / "conf"
         config.mkdir()
         write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
+                          + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
                           + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
                           + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
                           + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
@@ -392,14 +395,101 @@ class WorkerPaneTests(StaffTestCase):
 
     def completed_dispatch(self, row: staff.StaffRow, role: staff.WorkerRole) -> None:
         self.dispatch(row, role, completed=True)
+        self.reply_to_dispatch(row, "dispatch-" + row.name)
+
+    def reply_to_dispatch(self, row: staff.StaffRow, dispatch_id: str) -> None:
         backend = staff.backend(row)
         assert isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
         source = worker_admission.transcript_source(row, backend)
-        message = "The task is complete.\nDONE dispatch-" + row.name
+        message = "The task is complete.\nDONE " + dispatch_id
         entry = ({"type": "event_msg", "payload": {"type": "agent_message", "message": message}}
                  if isinstance(backend, staff.CodexBackend) else
                  {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": message}]}})
         write_text_atomic(source, json.dumps(entry) + "\n")
+
+    def record_command(self, *arguments: str, at: int) -> None:
+        with (patch.dict(os.environ, {"UNIT_PASS_OWNER": "launcher", "UNIT_TEAM_ROLE": "impl",
+                  "UNIT_NOW_EPOCH": str(at), "CODEX_THREAD_ID": self.parent.current_session,
+                  "UNIT_HISTORY_DIR": str(self.root / "history"), "UNIT_SYNC_WRITES": "0"}),
+              patch.object(sys, "argv", ["progress_history.py", *arguments, "--session-dir", str(self.root / "run")]),
+              redirect_stdout(io.StringIO())):
+            progress_history.main()
+
+    def recorded_dispatch(self, row: staff.StaffRow, status: Literal["completed", "error"], *, at: int) -> str:
+        run = self.root / "run"
+        state = run / "progress_history_state.json"
+        if not state.exists():
+            run.mkdir(exist_ok=True)
+            write_text_atomic(run / "worker_transport", "herdr\n")
+            write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
+                "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
+                          "status": "active"}, "pass": {}, "events": [],
+                "history_file": str(run / "history.jsonl"),
+                "main_agent": {"session_id": self.parent.current_session, "family": "claude",
+                               "model": "fixture", "effort": "high"}}))
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Preserve the source behavior.\n")
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": str(at), "CODEX_THREAD_ID": self.parent.current_session}):
+            dispatch = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
+        self.record_command("finish-pass", "--status", status, at=at + 1)
+        self.reply_to_dispatch(row, dispatch)
+        return dispatch
+
+    def test_a_worker_can_close_after_its_completed_pass_crosses_a_phase_boundary(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        dispatch = self.recorded_dispatch(opened.row, "completed", at=10)
+        self.reply_to_dispatch(opened.row, worker_panes.stage_two_completion_id(dispatch))
+        self.record_command("finish-phase", "--status", "completed", at=12)
+        self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=13)
+        self.assertEqual(worker_panes.worker_pass(opened.row, self.root / "run"), {})
+        closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        self.assertIsInstance(closed, worker_panes.Closed)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertEqual(self.world.closed, [(opened.pane, opened.terminal)])
+        self.assertEqual(set(self.world.locations), {"w1:p0"})
+
+    def test_a_newer_error_pass_keeps_a_worker_with_an_older_completed_pass(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        completed = self.recorded_dispatch(opened.row, "completed", at=10)
+        failed = self.recorded_dispatch(opened.row, "error", at=20)
+        self.assertNotEqual(failed, completed)
+        self.reply_to_dispatch(opened.row, completed)
+        self.record_command("finish-phase", "--status", "completed", at=22)
+        self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=23)
+        self.assertEqual(worker_panes.worker_pass(opened.row, self.root / "run"), {})
+        closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        self.assertEqual(closed, worker_panes.Kept("launcher has not recorded a completed pass"))
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_a_completed_pass_in_an_explicit_run_outside_the_run_roots_allows_closure(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1")
+        self.completed_dispatch(row, "impl")
+        directory = self.root / "private" / "explicit-run"
+        directory.parent.mkdir()
+        directory = (self.root / "run").rename(directory)
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.OpenWorker)
+        result = worker_panes.can_close(observed, run=worker_panes.DispatchRun(directory))
+        self.assertIsInstance(result, worker_panes.CloseAllowed)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_a_showrunner_workers_completed_pass_allows_closure(self) -> None:
+        self.parent_id = fixture_member("showrunner", name="close-owner").id
+        self.world.add(self.parent, "w1:p0")
+        row = self.worker("showrunner-worker")
+        self.world.add(row, "w1:p1")
+        self.completed_dispatch(row, "impl")
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.OpenWorker)
+        self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
 
     def prompts(self) -> list[tuple[str, ...]]:
         return [command for command in self.world.commands if command[:2] == ("agent", "prompt")]
@@ -636,6 +726,101 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.locations, locations)
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.world.stops, [])
+
+    def test_codex_launch_and_resume_use_the_configured_compaction_limit(self) -> None:
+        first = self.start("reviewer", "review")
+        self.assertIsInstance(first, worker_panes.OpenWorker)
+        assert isinstance(first, worker_panes.OpenWorker)
+        arguments = self.world.requests[-1][1]
+        self.assertIn(["-c", "model_auto_compact_token_limit=43000"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
+                                                             "UNIT_COMPACT_ABOVE_TOKENS=67000"))
+        del self.world.foreground[first.pane]
+        resumed = self.start("reviewer", "review")
+        self.assertIsInstance(resumed, worker_panes.OpenWorker)
+        assert isinstance(resumed, worker_panes.OpenWorker)
+        self.assertEqual((resumed.row, resumed.pane, resumed.terminal), (first.row, first.pane, first.terminal))
+        arguments = self.world.requests[-1][1]
+        self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
+        self.assertIn(["-c", "model_auto_compact_token_limit=67000"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertEqual(len(self.world.launches), 2)
+
+    def test_resume_uses_the_pane_folder_only_for_codex(self) -> None:
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
+                first = self.start("folder-" + family)
+                self.assertIsInstance(first, worker_panes.OpenWorker)
+                assert isinstance(first, worker_panes.OpenWorker)
+                self.assertNotIn("--cd", self.world.requests[-1][1])
+                del self.world.foreground[first.pane]
+                resumed = self.start(first.row.name)
+                self.assertIsInstance(resumed, worker_panes.OpenWorker)
+                assert isinstance(resumed, worker_panes.OpenWorker)
+                self.assertEqual((resumed.row, resumed.pane, resumed.terminal), (first.row, first.pane, first.terminal))
+                arguments = self.world.requests[-1][1]
+                if family == "codex":
+                    self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
+                    self.assertEqual(arguments[arguments.index("--cd") + 1], str(self.root))
+                else:
+                    self.assertEqual(arguments[:2], ["--resume", str(first.row.current_session)])
+                    self.assertNotIn("--cd", arguments)
+
+    def test_claude_launch_ignores_the_codex_compaction_limit(self) -> None:
+        _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+        config = self.root / "conf/direct.conf"
+        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
+                                                             "UNIT_COMPACT_ABOVE_TOKENS=invalid"))
+        self.assertIsInstance(self.start(), worker_panes.OpenWorker)
+        family, arguments, _ = self.world.requests[-1]
+        self.assertEqual(family, "claude")
+        self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
+
+    def test_unusable_codex_compaction_limit_refuses_before_launch(self) -> None:
+        config = self.root / "conf/direct.conf"
+        original = config.read_text()
+        before = self.staff_state()
+        for value in ("", "invalid", "0", "-1", "1.5"):
+            with self.subTest(value=value):
+                write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
+                                                           "UNIT_COMPACT_ABOVE_TOKENS=" + value))
+                result = self.start()
+                self.assertIsInstance(result, worker_panes.StartRefused)
+                assert isinstance(result, worker_panes.StartRefused)
+                self.assertEqual(result.reason, worker_panes.StartRefusal.INVALID_ROLE_CONFIGURATION)
+                self.assertIn("UNIT_COMPACT_ABOVE_TOKENS", result.detail)
+                self.assertEqual(self.world.launches, [])
+                self.assertEqual(self.staff_state(), before)
+
+    def test_same_role_keeps_a_worker_without_the_compaction_option(self) -> None:
+        result = self.start()
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.dispatch(result.row, "impl")
+        pid, family, arguments = self.world.foreground[result.pane]
+        index = arguments.index("model_auto_compact_token_limit=43000")
+        self.world.foreground[result.pane] = pid, family, arguments[:index - 1] + arguments[index + 1:]
+        self.assertEqual(self.start(), result)
+        self.assertEqual((len(self.world.launches), self.world.stops), (1, []))
+
+    def test_role_change_resumes_a_worker_without_the_compaction_option(self) -> None:
+        result = self.start()
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.completed_dispatch(result.row, "impl")
+        pid, family, arguments = self.world.foreground[result.pane]
+        index = arguments.index("model_auto_compact_token_limit=43000")
+        self.world.foreground[result.pane] = pid, family, arguments[:index - 1] + arguments[index + 1:]
+        changed = self.start(role="test")
+        self.assertIsInstance(changed, worker_panes.OpenWorker)
+        assert isinstance(changed, worker_panes.OpenWorker)
+        self.assertEqual((changed.row, changed.pane, changed.terminal), (result.row, result.pane, result.terminal))
+        arguments = self.world.requests[-1][1]
+        self.assertIn(["-c", "model_auto_compact_token_limit=43000"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertEqual(self.world.stops, [str(result.row.current_session)])
+        self.assertEqual(len(self.world.launches), 2)
 
     def test_fresh_codex_publishes_the_first_turn_report_and_sends_no_second_turn(self) -> None:
         first = self.start("reviewer", "review")
@@ -1016,9 +1201,11 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.parent.id)), 1)
 
     def test_unusable_configuration_opens_no_split(self) -> None:
+        config = self.root / "conf/direct.conf"
+        original = config.read_text()
         for value in ("0.01", "0.99", "invalid"):
             with self.subTest(value=value):
-                write_text_atomic(self.root / "conf/direct.conf", f"# range: 0.1..0.9\nWORKER_SPLIT_RATIO={value}\n")
+                write_text_atomic(config, original.replace("WORKER_SPLIT_RATIO=0.667", "WORKER_SPLIT_RATIO=" + value))
                 result = self.start()
                 self.assertIsInstance(result, worker_panes.StartRefused)
                 assert isinstance(result, worker_panes.StartRefused)
