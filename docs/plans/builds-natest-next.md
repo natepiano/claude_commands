@@ -35,6 +35,11 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), was Phase 31 (floor below). `production/test_fast_track.py`, rank 4 at 216.9 s on 2026-11-05, is Phase 33 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
   - Held: `style/test_style_sync.py`; sdlc-devtools has open edits.
   - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
+- [ ] **The next test to speed up is chosen by the CPU it saves each day, not by its time in one run.** The showrunner placed it here on 2026-11-06; if the two orders differ, the showrunner takes the rule question to the user.
+  - Target: the Introduction of this file and "Select the next speed target"; proposed text: "Choose eligible modules by expected daily CPU saving: observed daily executions × estimated removable CPU per execution. Include merge executions, selected unit executions, and retries; exclude reused results."
+  - Why needed: 5 unit runs ran `direct/test_simplify_lens.py` twice (258 CPU s) and `direct/test_verify_mac_only.py` once (194 CPU s). The sample is small.
+  - Completion condition: after a day on builds, report both orders with the count of red merges that a unit full test missed, against the 104-run estimate of 15 (Phase 37).
+  - Revealed by: Phase 37 architect review, 2026-11-06.
 - [ ] **Architecture proposal: the type-check job**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
   - Why needed: report-unit names `types/basedpyright` among the three highest-CPU gate jobs (2-4 min). One basedpyright job checks every listed folder in each gate.

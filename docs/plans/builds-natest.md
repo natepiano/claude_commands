@@ -849,45 +849,25 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 37 — A unit's full test runs under 40% of the test modules  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a unit's full test selects the modules its change touches directly, and natedev spends less CPU on gates. The user asked for this through the queue unit, 2026-11-05.
-
-**Spec:** a missed module now costs one red merge, not a red branch, because Phase 36 makes the merge gate run all modules. Replay of 104 unit runs (estimates, run folder, `phases/37/replay/report.md`): today's selection has a mean of 6285 CPU s per run, a clean-run median of 650 modules and 4 runs at most 40%. This selection has a mean of about 3600 CPU s, a clean-run median of about 146 modules, 44 runs at most 40%, 25 module misses and 8 red merges. The next-narrower variant has 157 misses and 19 red merges, and it leads only while a red merge costs under about 8000 CPU s; a red merge also stalls the chain. Showrunner, 2026-11-05: replay first, this set, Phase 36 stands.
-1. `select_affected` selects a test module when any of these holds:
-   - the module itself changed;
-   - its source imports a changed Python file directly, one import step, with no further search;
-   - its source names a changed repository-relative path as a complete token, with a leading `./` allowed;
-   - it sits in the folder of a changed non-test Python file.
-2. A changed non-Python file reaches a test only through the "names it" rule.
-3. A deleted or renamed Python file uses the import facts at the base for the same one step. Its surviving direct importers are selected.
-4. The changed set is the diff from the base to `HEAD` plus the dirty paths of the tree. A dirty tree no longer means a full run.
-5. Delete the full-run triggers: `tree not clean`, renamed Python file, deleted Python file, `full_suite_trigger`, the 40% limit, the orphan-folder rule and the tree-scanning always-selected set. Delete the filename-mention edges, the transitive search and the code they leave unused. Bump `EXTRACTOR_VERSION` if source facts change.
-6. A full run comes only from `--full`, `no certified base` or a graph error. The nightly-red marker no longer widens a full test; it stays for the merge and the nightly run.
-7. Do not target `scripts/agents/test_codex_mesh.py`: the user removes it within 48 hours.
-8. Add no guard, refusal or check (user rule, 2026-11-05). The nightly full run stays.
-9. Land after Phase 36: until the merge gate runs all modules, this selection must not reach a merge. The worker first changes `affected_modules.py` and its tests. After the Phase 36 checkpoint, a second step changes `merge_gate.py` and `full_test.py` for the removed `tree_scanners` field and the nightly-red marker.
-10. If selections fall as the replay says, send the showrunner a pass cache proposal with a new estimate. It saved 13% of CPU at the old closures.
+- `select_affected` in `scripts/production/affected_modules.py` selects a test module by four rules: the test module changed; the test directly imports a changed Python file; the test names a changed path as a complete token; the test shares a folder with a changed non-test Python source.
+- A full run comes only from `--full`, no certified base or a graph error. The nightly-red marker widens only a merge gate. A dirty tree, a rename or a deletion does not mean a full run.
+- A unit run prints `affected: N of M modules (base <commit>, <user-zone time>), K changed files` once.
+- Measured CPU per unit run: before, 124 runs, mean 6512.54 s, median 6710.86 s; after, 5 runs, mean 2238.07 s, median 2155.40 s. Replay of 104 records at the final code: median 120 modules, 58 runs at or under 40%, mean 2660 to 2716 CPU s, 102 module misses, 15 estimated red merges.
+- `CACHE_FORMAT_VERSION` is 2 and `EXTRACTOR_VERSION` is 4. The public names are `extract_facts`, `SourceFacts(imports, tokens)`, `module_dependencies`, `graph_for_files`, `dependency_graph`, `select_affected`, `dirty_paths`, `blob_texts`, `revision_files`, `CertifiedBase`, `NoCertifiedBase`, `AffectedSelection`, `FullSuite` and `GraphError`.
 
 **Files:**
-- `scripts/production/affected_modules.py` — the selection
-- `scripts/production/test_affected_modules.py` — tests
-- `scripts/production/merge_gate.py`, `scripts/production/full_test.py` — after the Phase 36 checkpoint: the removed field and the nightly-red marker
+- `scripts/production/affected_modules.py` — selection
+- `scripts/production/merge_gate.py`, `scripts/production/gate_modules.py`, `scripts/production/merge_gate_test_support.py` — the unit run and the merge run
+- `scripts/production/test_affected_modules.py`, `scripts/production/test_full_test.py`, `scripts/production/test_merge_gate_ledger.py` — tests
+- `docs/as-built/merge-gate-and-test-speed.md` — selection rules
 
-**Workers:** 1 writer on slot `impl` (one selection function and its tests)
-- `impl` — all files above
+**Binds later work:** After one day on builds, count the red merges that a unit full test missed. Report that count against the 104-run estimate of 15 (8 for the wider selection), with both target orders: time, and CPU saved each day. A missed module turns red at the merge, because the merge gate runs all modules.
 
-**Constraints from prior phases:**
-- Phase 36: `full_test.py` selects and `merge_gate.py` runs all modules. Its checkpoint comes first.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:** A `git merge` selection on a wide change stays wide: one measured run selected 490 of 716 modules.
 
-**Acceptance gate:**
-- Replay of the same 104 unit runs on the final code gives the K row of the report, within its ranges: full runs, median modules, misses, red merges. Quote before and after in the checkpoint notice, and mark them as estimates.
-- Measured CPU per unit run, before and after, in the checkpoint notice. Before: the mean CPU of the unit runs in the merge-gate records of the 24 hours to the Phase 37 start. After: the final `full_test.py` on 5 recent unit commits, in clones, with the sample size stated. These numbers go to the user.
-- Each of the four selection rules has a test with a real scratch repository. A deleted Python file selects its surviving direct importers, and a dirty path selects as a changed path.
-- A clean tree with no reach selects no module and passes.
-- `test_affected_modules.py`, `test_full_test.py` and each `test_merge_gate*.py` green in the gate form, and the full test green on the phase commit merged with `origin/builds`.
-- After landing, the checkpoint's Change-Review line: the user reads `full test` runs on the queue page and sees fewer modules.
+**Ruled out:** A pass cache on import closures: upper limit 23.7% CPU, median 69 CPU s per run. The wider selection with filename mentions and a transitive search costs 3572 to 3628 CPU s per run and saves 7 red merges per 104 runs.
 
 ### Phase 38 — Three scripts start Python through `scripts/lib/py`  · status: done
 **Depends on:** none
@@ -1157,16 +1137,32 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 #### Work Order
 
-**Goal:** one reader for each Git batch format. The Phase 37 simplify review found the copies.
+**Goal:** one parser for each Git batch format. The transports stay where they are: a one-shot `cat-file --batch` and the persistent process of `rules.py` both use the same reply parser. The Phase 37 simplify review found the copies, and the Phase 37 architect review found the persistent reader.
 
 **Spec:**
-1. Move `style_ledger.blob_contents` (`style_ledger.py:1893`) and `style_ledger.tree_entries` (`style_ledger.py:1862`) into `scripts/style/git_process.py`, standard library only.
-2. Remove the copies: `affected_modules.blob_texts`, `affected_modules.revision_files`, `phase_process.py:1046`, `feature_log/inventory.py:285`, `bulk_run.py:794`. Check that each copy has the same behavior before you replace it.
-3. `scripts/style/unit_files.py:145-154` uses one `status --porcelain -z` parser with `affected_modules.dirty_paths`. Choose the home with the fewest imports.
-4. Add no guard, refusal or check (user rule, 2026-11-05).
+1. In `scripts/style/git_process.py`, standard library only, add these:
+   - `read_batch_blob(replies: BinaryIO)`: read one `cat-file --batch` reply from a binary stream. It returns a named type for each outcome: blob with its bytes and object id, missing, malformed or truncated. No bare `None`.
+   - `TreeEntry`, moved from `style_ledger.py:1766`.
+   - `parse_tree_listing(listing: str) -> dict[str, TreeEntry]`, the `ls-tree -rz` parser, and `tree_entries`, moved from `style_ledger.py:1862`.
+   - `blob_contents`, moved from `style_ledger.py:1893`.
+   - `parse_status_z(output: str) -> set[str]`, the `status --porcelain -z` parser, which adds both names of a rename or a copy.
+2. `style_ledger.py` imports `TreeEntry`, `tree_entries` and `blob_contents`, so `ledger_api.tree_entries` and `ledger_api.blob_contents` still resolve. `crate_run.py`, `style_plan.py` and the `mock.patch.object` sites in `test_crate_run.py:1827`, `test_style_ledger.py:529` and `test_style_ledger_sites.py:290` do not change.
+3. Each caller keeps its own transport and its own failure policy, and uses the shared parser:
+   - `style_ledger.blob_contents`: object id requests, output through a temporary file. The reply's object id must equal the request; otherwise `GitReadFailed`.
+   - `phase_process.read_git_documents` (`scripts/direct/phase_process.py:1028`): `sha:path` requests, `--no-optional-locks`, the 8 s timeout, `errors="replace"`. A missing or malformed reply leaves that document absent, and the function does not raise for it.
+   - `inventory._read_frozen_files` (`scripts/feature_log/inventory.py:286`): NUL requests with `-z`, `GIT_OPTIONAL_LOCKS=0`, strict UTF-8. Missing, malformed, truncated and trailing data each raise `InventoryError` with today's text.
+   - `rules.ValidatedRuleHistory.identity` (`scripts/style/rules.py:202`): keep the persistent process, its lock, its cache and its `atexit` close. Only the reply parse changes. A bad reply still gives the empty identity.
+   - `affected_modules.blob_texts`: keep the function as a thin adapter, because `test_affected_modules.py:341` patches it and asserts it is not called on a warm cache. Strict UTF-8. A failed read, a missing reply or a malformed reply raises `GraphError`.
+   - `affected_modules.revision_files`: `git_output` then `parse_tree_listing`, so a failed read stays `GraphError`.
+   - `affected_modules.dirty_paths`: `git_output` then `parse_status_z`. `merge_gate.clean_test_tree` expects `GraphError` from a failed read.
+   - `bulk_run.py:794`: `ledger_api.tree_entries` and the `REGULAR_FILE_MODES` filter in place of its own `ls-tree -rz` parse.
+   - `unit_files.changed_files` (`scripts/style/unit_files.py:145`): its own `git` read, then `parse_status_z`, and it keeps its return type.
+4. Add tests to `scripts/style/test_git_process.py` for each `read_batch_blob` outcome and for `parse_status_z` on a rename, a copy and an untracked file. Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after.
+5. Leave these as they are, because their parsers differ: `direct/review_tree.py` (`--no-renames`, `path`-limited `ls-tree`), `buildlog/treekey.py`, `direct/tree_watch.py`, `hana_shot/hana_shot.py`, `style/style_plan.py:404` (it reads each status code).
+6. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
-- `scripts/style/git_process.py`, `scripts/style/style_ledger.py`, `scripts/style/bulk_run.py`, `scripts/style/unit_files.py` — owner: style
+- `scripts/style/git_process.py`, `scripts/style/style_ledger.py`, `scripts/style/bulk_run.py`, `scripts/style/unit_files.py`, `scripts/style/rules.py`, `scripts/style/test_git_process.py` — owner: style
 - `scripts/production/affected_modules.py`
 - `scripts/direct/phase_process.py`
 - `scripts/feature_log/inventory.py`
@@ -1176,10 +1172,12 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Constraints from prior phases:**
 - Phase 37: `affected_modules.blob_texts` raises `GraphError` on a failed read, and the selection turns that into a full run.
+- Phase 37: `revision_files`, `blob_texts` and `dirty_paths` have no importer outside `affected_modules.py`, `merge_gate.py` and `test_affected_modules.py`. The warm-cache assertions at `test_affected_modules.py:341` stay as they are.
+- `git_process.py` imports only the standard library. `TreeEntry` moves with its reader for this reason.
 
 **Acceptance gate:**
-- `git grep -n 'cat-file.*--batch'` finds one framing reader outside a test.
-- Each caller module of the changed files green in the gate form.
+- `read_batch_blob` is the only code outside a test that parses a `cat-file --batch` reply header: a read of the call sites in Spec 3 shows this, and `git grep -n 'cat-file.*--batch'` lists the transports `style/git_process.py`, `style/rules.py`, `direct/phase_process.py` and `feature_log/inventory.py`.
+- Green in the gate form: `style/test_git_process.py`, `style/test_style_ledger.py`, `style/test_style_ledger_sites.py`, `style/test_crate_run.py`, `style/test_rules.py`, `production/test_affected_modules.py`, `production/test_full_test.py`, `direct/test_phase_process.py`, `feature_log/test_inventory.py`.
 - The full test green on the phase commit merged with `origin/builds`.
 
 ### Phase 53 — `board.sh` starts no process to find its folder  · status: todo
