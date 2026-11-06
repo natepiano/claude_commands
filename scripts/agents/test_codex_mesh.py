@@ -13340,8 +13340,10 @@ sys.argv = [script, *arguments]
 runpy.run_path(script, run_name='__main__')
 ''')
         shim.chmod(0o755)
+        end_environment = os.environ.copy()
+        del end_environment["CODEX_THREAD_ID"]
         ended = subprocess.run(["bash", str(Path(codex_mesh.__file__).parents[1] / "direct" / "end_session.sh")],
-            capture_output=True, text=True, check=False, timeout=LauncherHangGuard('assert_run_end_keeps_directed_workers').remaining(), env=os.environ.copy())
+            capture_output=True, text=True, check=False, timeout=LauncherHangGuard('assert_run_end_keeps_directed_workers').remaining(), env=end_environment)
         self.assertEqual(ended.returncode, 0, ended.stdout + ended.stderr)
         self.assertFalse(marker.exists())
         for name, expected in roster.items():
