@@ -285,6 +285,39 @@ only I can bump
 
 **Ruled out:** a new import test; the `build_hold.py` import, under the builds file freeze.
 
+### Phase 20b — A clippy fix step leaves the machine-wide build tokens to other builds  · status: done
+
+**Depends on:** nothing. Source: builds showrunner, 2026-11-06 10:22 EST, on the user's words "how to share cpu slots between compiles and gates".
+
+#### Work Order
+
+**Goal:** A `cargo clippy --fix` step runs in its own small pool of jobs. It stops taking tokens from `/dev/steve` that it does not use.
+
+**Spec:**
+
+1. **Key.** `clippy_fix_jobs=8` in `config/lint.conf` `[clippy]`, with a comment that says who reads it and the valid range. `scripts/lint/lint_config.sh` reads it with builtins only, as `lint_config_build_oom_score_adj` does: missing uses 8; invalid prints one warning and uses 8.
+2. **Call.** `invoke_clippy_fix` in `scripts/lint/invoke.sh` runs cargo with `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` removed and with `--jobs <clippy_fix_jobs>`, on natedev and on the Mac alike. A plain `invoke_clippy` stays in the pool. The memory queue step, the lint gating and the build log record do not change: the recorded argv still holds `--fix`.
+3. **Comment.** The pool comment near `scripts/lint/invoke.sh:53` names this one exception and why.
+4. **Proof by test.** A fake cargo on PATH behind the real `invoke_clippy_fix` and `invoke_clippy` records argv and environment. The fix call has no pool variables and has `--jobs` from the config. The plain call keeps the pool. A changed config value changes `--jobs`. An invalid value warns and uses 8.
+5. **Proof on hana.** One real `invoke_clippy_fix` on a scratch hana clone with warm build output, before (the installed copy) and after (this tree), with the argv of the live step. Report the wall time of each. The real cargo process has no pool variable in its environment.
+
+**Files:**
+- `config/lint.conf`
+- `scripts/lint/lint_config.sh`
+- `scripts/lint/invoke.sh`
+- `scripts/lint/test_invoke_scope.py`
+- `scripts/direct/test_verify_lint_output.py` (approved fix argv assertion)
+- `scripts/direct/test_verify_lint_judgment.py` (approved fix argv assertion)
+- `docs/as-built/phase-checks.md`
+
+**Workers:** `1 writer + 1 tester`
+- `impl2` — `config/lint.conf`, `scripts/lint/lint_config.sh`, `scripts/lint/invoke.sh`, `docs/as-built/phase-checks.md`.
+- `test2` — `scripts/lint/test_invoke_scope.py` and the hana proof.
+
+**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, and the wall time and token answer in the notice.
+
+**Change-Review:** a hana clippy fix step no longer holds the build tokens.
+
 ### Phase 21 — Each moved admission name has one import path  · status: todo
 
 **Depends on:** 10o, and resources 0dfe65382 on the builds branch, because that branch conflicts in `memory_admit.py`. Source: builds showrunner, 2026-11-06 02:2x EST (design call).

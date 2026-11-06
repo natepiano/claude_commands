@@ -22,6 +22,11 @@ Clippy judges first.
 A passing judgment skips repairs.
 A failed judgment starts up to three `cargo clippy --fix` and fmt passes, followed by a final judgment.
 Every clippy run in this path uses `--keep-going`.
+`invoke_clippy_fix` removes `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` from cargo's environment on Linux and macOS.
+It sets `--jobs` from `clippy_fix_jobs` in `config/lint.conf`.
+The valid range is 1..9999. Missing or invalid values use 8; invalid values print one warning.
+Plain `invoke_clippy` keeps the shared build pool.
+Fix steps keep memory admission, lint gating and build log records, including the `--fix` argument.
 The director runs workspace rustdoc through `verify.sh doc` after staging, immediately before the checkpoint commit.
 The checkpoint requires its pass record for the exact tree.
 [Lint-step fix](build-followups-mul-add.md#lint-step-fix) defines the pass rules.

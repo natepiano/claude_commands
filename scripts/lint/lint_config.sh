@@ -16,8 +16,8 @@
 #   lint_config.sh export             LINT_OP_<NAME>=on|off lines
 #   lint_config.sh enabled <op>       exit 0 if on, 1 if off (no output)
 #
-# A missing config file means every check is on. Numeric settings (sweep sizes
-# and build_oom_score_adj) are values, not check names or on/off switches.
+# A missing config file enables every check.
+# Numeric settings set limits and adjustments, not check states.
 
 LINT_CONFIG_FILE="${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"
 
@@ -113,6 +113,21 @@ lint_config_build_oom_score_adj() {
         printf 'warning: %s: build_oom_score_adj=%s is invalid (expected integer -1000..1000) — using 500\n' \
             "$LINT_CONFIG_FILE" "$_lint_adj" >&2
         printf -v "$1" '%s' 500
+    fi
+}
+
+# Resolve the fix job limit with builtins only.
+lint_config_clippy_fix_jobs() {
+    local _lint_jobs _lint_presence
+    _lint_config_raw_into clippy_fix_jobs _lint_jobs _lint_presence
+    if [[ "$_lint_presence" == absent ]]; then
+        printf -v "$1" '%s' 8
+    elif [[ "$_lint_jobs" =~ ^[1-9][0-9]{0,3}$ ]]; then
+        printf -v "$1" '%s' "$_lint_jobs"
+    else
+        printf 'warning: %s: clippy_fix_jobs=%s is invalid (expected integer 1..9999) — using 8\n' \
+            "$LINT_CONFIG_FILE" "$_lint_jobs" >&2
+        printf -v "$1" '%s' 8
     fi
 }
 

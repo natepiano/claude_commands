@@ -48,11 +48,15 @@ if declare -F lint_config_build_oom_score_adj >/dev/null; then
 else
     BUILD_OOM_SCORE_ADJ=500
 fi
+if declare -F lint_config_clippy_fix_jobs >/dev/null; then
+    lint_config_clippy_fix_jobs CLIPPY_FIX_JOBS
+else
+    CLIPPY_FIX_JOBS=8
+fi
 
-# natedev's machine-wide pool of build slots (/etc/nixos
-# modules/linux/jobserver.nix). The session environment names it, but a shell
-# started before the pool existed does not, so join it here too. The Mac has no
-# /dev/steve and skips this.
+# Builds use natedev's machine-wide pool (/etc/nixos/modules/linux/jobserver.nix).
+# Join the pool when the session does not name it. The Mac has no /dev/steve.
+# Clippy fixes use private jobs because they leave shared tokens unused.
 if [[ -z "${CARGO_MAKEFLAGS:-}" && -c /dev/steve && -r /dev/steve && -w /dev/steve ]]; then
     export CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"
 fi
@@ -700,7 +704,7 @@ invoke_clippy() {
         return 0
     fi
     local -a cargo_args=() clippy_args=()
-    local seen_sep=0 arg
+    local seen_sep=0 fixing=0 arg
     for arg in "$@"; do
         if [[ "$arg" == "--" && $seen_sep -eq 0 ]]; then
             seen_sep=1
@@ -708,12 +712,19 @@ invoke_clippy() {
         fi
         if [[ $seen_sep -eq 0 ]]; then
             cargo_args+=("$arg")
+            [[ "$arg" != --fix ]] || fixing=1
         else
             clippy_args+=("$arg")
         fi
     done
-    run cargo clippy ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
-        ${clippy_args[@]+"${clippy_args[@]}"}
+    if [[ $fixing -eq 1 ]]; then
+        run env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS \
+            cargo clippy --jobs "$CLIPPY_FIX_JOBS" ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
+            ${clippy_args[@]+"${clippy_args[@]}"}
+    else
+        run cargo clippy ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
+            ${clippy_args[@]+"${clippy_args[@]}"}
+    fi
 }
 
 # Use the same scope, lint arguments, gating, and run wrapper as judgment.
