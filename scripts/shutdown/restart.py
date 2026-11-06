@@ -1,6 +1,9 @@
 """Stop live staff rows, then resume their current sessions in their saved tabs."""
 from __future__ import annotations
 
+# Function imports defer the lifecycle dependency until both modules exist.
+# pyright: reportImportCycles=false
+
 import math
 import os
 import subprocess
@@ -9,8 +12,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, cast
-from importlib import import_module
+from typing import Literal
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
@@ -22,40 +24,10 @@ import sessions
 from scripts.production import staff, session_staff
 from scripts.lib import conf, nix_env, operation_deadline, unit_runs
 from scripts.shutdown import shutdown_record, pane_record
-from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed
+from scripts.shutdown.stop_results import Stopped, NotRunning, StopFailed
 from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.whoami.account import named_account_environment
-
-
-class WorkerRow(Protocol):
-    row: staff.StaffRow
-
-
-class WorkerShell(WorkerRow, Protocol):
-    pane: str
-    terminal: str
-
-
-class WorkerPanes(Protocol):
-    StoppedWorker: type[WorkerShell]
-    ClosedWorker: type[WorkerRow]
-    def observe(self, parent: staff.StaffId, record: staff.StaffSnapshot) -> list[WorkerRow]: ...
-    def worker_run(self, parent: staff.StaffRow) -> Path: ...
-
-
-class WorkerRestore(Protocol):
-    def restore(self, parent: staff.StaffId) -> int: ...
-
-
-class MemberLifecycle(Protocol):
-    def stop(self, session: str, *, deadline: float) -> StopResult: ...
-    def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
-    def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
-
-
-worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
-stop_resume = cast(MemberLifecycle, cast(object, import_module("scripts.shutdown.stop_resume")))
 
 
 @dataclass(frozen=True)
@@ -82,6 +54,8 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf) -> bool:
+    from scripts.shutdown import stop_resume
+
     with operation_deadline.within(deadline):
         try:
             panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
@@ -101,17 +75,21 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
             return False
         result = stop_resume.stop(str(row.current_session), deadline=deadline)
         if isinstance(result, (Stopped, NotRunning)):
-            record = staff.initial_snapshot()
-            parent = record.parent_of(row)
-            if row.kind == "worker" and parent is not None and _pane_workers(parent):
-                state = next((state for state in worker_panes.observe(parent.id, record) if state.row.id == row.id), None)
-                if isinstance(state, worker_panes.StoppedWorker):
-                    return bool(panes and panes[0]["pane_id"] == state.pane
-                                and panes[0].get("terminal_id") == state.terminal)
-                return False
             return True
         _anomaly(row, result.reason if isinstance(result, StopFailed) else "session not found")
         return False
+
+
+def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+    projected = entry.copy()
+    projected["session_id"] = identity
+    projected["name"] = name
+    arguments = pane_record.resume_arguments(projected)
+    kind = pane_launch.agent_kind(entry)
+    if kind == "codex":
+        home = entry["environment"].get("CODEX_HOME", entry["config_dir"])
+        return kind, {"CODEX_HOME": home}, arguments
+    return kind, named_account_environment(Path(entry["config_dir"])), arguments
 
 
 def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
@@ -121,15 +99,7 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
         print(f"{identity}: launch record anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
         entry = None
     if entry is not None:
-        projected = entry.copy()
-        projected["session_id"] = identity
-        projected["name"] = name
-        arguments = pane_record.resume_arguments(projected)
-        kind = pane_launch.agent_kind(entry)
-        if kind == "codex":
-            home = entry["environment"].get("CODEX_HOME", entry["config_dir"])
-            return kind, {"CODEX_HOME": home}, arguments
-        return kind, named_account_environment(Path(entry["config_dir"])), arguments
+        return _saved_launch(entry, identity, name)
     for directory in sessions.config_dirs():
         if any((directory / "projects").glob(f"*/{identity}.jsonl")):
             return "claude", named_account_environment(directory), ["--resume", identity, "--name", name]
@@ -142,25 +112,29 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
     raise OSError(f"no transcript for {identity}")
 
 
-def _pane_workers(row: staff.StaffRow) -> bool:
+def pane_workers(row: staff.StaffRow) -> bool:
+    from scripts.herdr import worker_panes
+
     return unit_runs.worker_transport(worker_panes.worker_run(row)) != "mesh"
 
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
-    worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
+    from scripts.production import worker
     if row.kind in ("unit", "showrunner") and any(
             child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
-            ) and _pane_workers(row) and worker.restore(row.id) != 0:
+            ) and pane_workers(row) and worker.restore(row.id) != 0:
         raise OSError("worker restore is incomplete")
 
 
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
               present: bool = False, target_account: str = "", deadline: float = math.inf,
               resolver: session_staff.RowResolver | None = None) -> str:
+    from scripts.shutdown import stop_resume
+
     with operation_deadline.within(deadline):
         if row.kind == "worker":
             parent = record.parent_of(row)
-            if parent is not None and _pane_workers(parent):
+            if parent is not None and pane_workers(parent):
                 return start_row(parent, record, client, present=present, target_account=target_account,
                                  deadline=deadline, resolver=resolver)
         live = herdr.read_conversation(str(row.current_session))
@@ -177,10 +151,12 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         from scripts.shutdown.launch_names import LaunchNames
 
         names = LaunchNames(record)
-        original = pane_record.launch_for_session(str(row.current_session)) or pane_record.launch_for_session(str(row.id))
+        publication = pane_record.publication_for_session(str(row.current_session), record=record)
+        original = publication.entry if publication is not None else None
         projected = names.resume(original) if original is not None else None
-        kind, environment, arguments = session_launch(str(row.current_session), row.name)
-        if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
+        kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name)
+            if original is not None else session_launch(str(row.current_session), row.name))
+        if kind == "claude" and not target_account and original is None and row.kind in ("unit", "showrunner"):
             from scripts.accounts import accounts
 
             target_account = accounts.role_account(row.kind).label
@@ -203,8 +179,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
             if len(panes) > 1:
                 _anomaly(row, "duplicate panes retained")
-            elif panes and not panes[0].get("terminal_id"):
-                _anomaly(row, "pane has no terminal id; pane retained")
             elif panes and (original is None or original["cwd"] == str(folder)):
                 target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
         except (OSError, ValueError, herdr.HerdrFailure) as error:
@@ -219,8 +193,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             herdr.conversation_note(current)
         settings = conf.read("shutdown")
         start_seconds = settings.number("START_SECONDS")
-        if start_seconds <= 0:
-            raise conf.Unusable(f"{settings.source}: START_SECONDS must be positive")
         operation_deadline.check()
         result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
             trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
@@ -228,11 +200,18 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
                               live.reason if isinstance(live, herdr.UnknownConversation) else ""))
         if isinstance(result.outcome, herdr.PromptNotSubmitted):
+            if isinstance(target, herdr.ExistingPane) and not target.terminal:
+                return result.pane
             raise OSError(result.outcome.reason)
         if original is not None and projected is not None and result.pane != original["pane_id"]:
-            path = pane_record.record_path(client.session)
-            pane_launch.finish_restore(path, original, pane_launch.resume_attempt(path, result.pane),
-                                       names.resume_proof(original, projected), close=client.close_tab_confirmed)
+            fresh = next((pane for pane in client.tab_sessions() if pane.pane_id == original["pane_id"]), None)
+            if fresh is not None and ((fresh.session_id and fresh.session_id != row.current_session)
+                    or not isinstance(client.pane_activity(fresh.pane_id), herdr.PaneAtShell)):
+                print(f"{fresh.pane_id}: pane close anomaly: pane holds other work; kept open", file=sys.stderr)
+            else:
+                path = pane_record.record_path(client.session)
+                pane_launch.finish_restore(path, original, pane_launch.resume_attempt(path, result.pane),
+                                           names.resume_proof(original, projected), close=client.close_tab_confirmed)
         try:
             client.remember_row_tab(str(row.id), result.pane)
             if present:
@@ -304,6 +283,8 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
 
 def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
               resolver: session_staff.RowResolver | None = None) -> list[staff.StaffRow]:
+    from scripts.herdr import worker_panes
+
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     # The registry supplies candidate names; the reader proves each conversation.
     try:
@@ -319,9 +300,9 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     for identity in sorted(candidates.keys() - owned):
         if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
             print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
-    workers: dict[staff.StaffId, WorkerRow] = {}
+    workers: dict[staff.StaffId, worker_panes.WorkerPane] = {}
     for holder in record.rows:
-        if holder.kind in ("unit", "showrunner") and any(child.parent == staff.ReportsTo(holder.id) for child in record.rows) and _pane_workers(holder):
+        if holder.kind in ("unit", "showrunner") and any(child.parent == staff.ReportsTo(holder.id) for child in record.rows) and pane_workers(holder):
             workers.update((state.row.id, state) for state in worker_panes.observe(holder.id, record))
     selected = live_members((row for row in record.rows if row.id not in workers), record,
                             resolver=resolver, codex=codex)
@@ -341,6 +322,8 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
 
 
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = ()) -> int:
+    from scripts.shutdown import stop_resume
+
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -351,24 +334,24 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     selected: list[staff.StaffRow] = []
     if stop_all:
         selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver)
-    else:
-        pending_ids = list(only) if only else shutdown_record.read()
-        if dry_run and not only:
-            path = shutdown_record.record_path()
-            saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
-            print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
-            for row in live_rows(record, client, resolver=resolver):
-                if str(row.id) not in pending_ids:
-                    print(f"{row.name}: live, not in the restart record")
-        for reference in pending_ids:
-            row = record.by_member_reference(reference) if only else record.by_id(staff.StaffId(reference))
-            if only and row is None:
-                matches = [item for item in record.rows if item.name == reference]
-                row = matches[0] if len(matches) == 1 else None
-            if row is None:
-                print(f"{reference}: unknown or ambiguous staff row" if only else
-                      f"{' '.join(reference.split())}: restart anomaly: in the restart record, no fixed staff id", file=sys.stderr)
-                continue
+    pending_ids = list(only) if only and not stop_all else shutdown_record.read()
+    if dry_run and not only and not stop_all:
+        path = shutdown_record.record_path()
+        saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
+        print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
+        for row in live_rows(record, client, resolver=resolver):
+            if str(row.id) not in pending_ids:
+                print(f"{row.name}: live, not in the restart record")
+    for reference in pending_ids:
+        row = record.by_member_reference(reference) if only and not stop_all else record.by_id(staff.StaffId(reference))
+        if only and not stop_all and row is None:
+            matches = [item for item in record.rows if item.name == reference]
+            row = matches[0] if len(matches) == 1 else None
+        if row is None:
+            print(f"{reference}: unknown or ambiguous staff row" if only and not stop_all else
+                  f"{' '.join(reference.split())}: restart anomaly: in the restart record, no fixed staff id", file=sys.stderr)
+            continue
+        if row not in selected:
             selected.append(row)
     if dry_run:
         positions = {tab.get("row_id"): f"workspace {space['name']}, tab {index} ({tab['name']})"
@@ -389,16 +372,12 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     holders: dict[staff.StaffId, staff.StaffRow] = {}
     for row in selected:
         parent = record.parent_of(row) if row.kind == "worker" else None
-        holder = parent if parent is not None and _pane_workers(parent) else row
+        holder = parent if parent is not None and pane_workers(parent) else row
         holders[holder.id] = holder
     if stop_all:
         for holder in tuple(holders.values()):
             try:
-                settings = conf.read("shutdown")
-                durations = [settings.number(key) for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS")]
-                if any(value <= 0 for value in durations):
-                    raise conf.Unusable(f"{settings.source}: stop durations must be positive")
-                deadline = time.monotonic() + sum(durations)
+                deadline = stop_resume.stop_deadline()
                 with staff.row_operation(str(holder.id)), operation_deadline.within(deadline):
                     shutdown_record.update(started=[], pending=[str(row.id) for row in selected
                         if row.id == holder.id or row.parent == staff.ReportsTo(holder.id)])

@@ -38,21 +38,20 @@ The settings.json entry, one more SessionStart item:
   conversation id from `<config>/sessions/<pid>.json`. It needs no
   `report-agent-session`: a restore takes the id from the entry and checks herdr's
   `agent_session` only when the pane has one.
-- `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` (the shared session by
-  default) first waits for the server (`herdr.start_server`, which adopts it). For each pane with
-  an entry, it resumes the conversation unless a reason below holds, and prints the reason:
-  - herdr's `agent_session` names another conversation;
-  - the entry is `ended` (closed by hand);
-  - the conversation already runs (`sessions.live_sessions` or `running_sessions`);
-  - `flags_read` is false (entries written before the field are read as true off the Mac);
-  - the account has no transcript of the conversation;
-  - the pane runs a program.
-- A resume opens a tab with `herdr.open_tab` in the pane's workspace, with the pane's label and
-  cwd, and the entry's marks plus `named_account_environment(config_dir)`. It then runs
-  `start_agent` with `--resume <id>`, `-n`, `--remote-control`, `--model` from the entry, and
-  `--settings '{"disableAgentView": true}'`, with no opening prompt. Then it closes the restored
-  tab by its pane id: ordering the tabs keeps pane ids. A failed start closes the new tab and
-  keeps the restored one. Any failure makes the exit status 1.
+- `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
+  It resumes staff rows through `restart.start_row`.
+  It resumes saved panes without staff rows through `herdr.launch_agent`.
+  A pane without a saved entry or a staff row stays open.
+- Restore keeps live conversations. Unknown conversation evidence prints one anomaly line and permits a guarded launch.
+  Saved entries remain eligible after an intentional stop or when `flags_read` is false.
+  The shared launch path checks the selected terminal before it sends keys.
+- Restore reuses a retained shell when its terminal and folder match.
+  A replacement uses the saved account and the current staff identity, name, and folder.
+  A saved pane without a staff row uses its saved identity, account, and folder.
+  Both routes send no opening prompt.
+- A replacement closes its source only after resume publication proves the new conversation.
+  A source pane that gains another conversation or program stays open and prints an anomaly.
+  A failed start preserves the pane. A failed restore returns exit status 1.
 - Herdr keeps the restored layout. Unless its config sets `[session] resume_agents_on_restore = false`,
   herdr also resumes each pane itself on the server's account, and without the pane's `--env`.
 - `shutdown.py restart --all` stops and starts the local live Claude staff rows.
@@ -71,8 +70,8 @@ The settings.json entry, one more SessionStart item:
   Herdr can replay saved pane commands when its configuration allows agent restore.
   Claude commands wrapped by `lib/relaunch.py` recover the matching conversation's
   session labels and resume note. This is separate from `agents restart`.
-- `pane_restore.py` remains an explicit command for eligible saved panes. Run it
-  when needed; no service invokes it automatically.
+- `pane_restore.py` is an explicit command for staff rows and saved panes without staff rows.
+  No service invokes it automatically.
 
 Settings entry for the user, one more SessionEnd item:
 

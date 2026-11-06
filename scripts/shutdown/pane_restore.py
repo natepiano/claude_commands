@@ -20,10 +20,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
+import pane_launch
+from scripts.lib import conf
+from scripts.shutdown.codex_trust import trust_arguments
+from scripts.whoami.account import named_account_environment
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import staff  # noqa: E402
 
 SERVER_TIMEOUT_MS = 60_000
+
+
+def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
+                  original: pane_record.PaneLaunch, entry: pane_record.PaneLaunch, *, reported_unknown: str) -> None:
+    if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
+        raise herdr.HerdrFailure("the pane runs a program")
+    kind = pane_launch.agent_kind(entry)
+    account = ({"CODEX_HOME": entry["config_dir"]} if kind == "codex"
+               else named_account_environment(Path(entry["config_dir"])))
+    title = entry["name"] or pane.label
+    launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], {**entry["environment"], **account},
+        kind, trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), herdr.NoOpeningPrompt(),
+        int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=title, reported_unknown=reported_unknown)
+    if isinstance(launched, herdr.nix_env.Refused):
+        raise herdr.HerdrFailure(launched.reason)
+    path = pane_record.record_path(session)
+    attempt = pane_launch.resume_attempt(path, launched.pane)
+    fresh = next((item for item in client.tab_sessions() if item.pane_id == pane.pane_id), None)
+    if fresh is not None and ((fresh.session_id and fresh.session_id != entry["session_id"])
+                              or not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell)):
+        print(f"{pane.pane_id}: pane close anomaly: pane holds other work; kept open", file=sys.stderr)
+        return
+    pane_launch.finish_restore(path, original, attempt,
+        pane_launch.VerifiedResume(entry, frozenset({entry["session_id"]})), close=client.close_tab_confirmed)
 
 
 def restore(session: str, *, dry_run: bool) -> int:
@@ -40,24 +68,29 @@ def restore(session: str, *, dry_run: bool) -> int:
         print(f"pane_restore: retained launch repair failed: {error}", file=sys.stderr)
         failures += 1
     selected: dict[staff.StaffId, staff.StaffRow] = {}
+    saved_panes: list[herdr.TabSession] = []
     entries = pane_record.read(session)
+    live: set[str] = set()
     for pane in client.tab_sessions():
         saved = entries.get(pane.pane_id)
         reference = saved["session_id"] if saved is not None else pane.session_id or ""
         row = record.by_member_reference(reference)
         if row is None:
-            print(f"{pane.pane_id} {pane.label}: left as it is: unknown staff identity {reference}")
+            if saved is None:
+                print(f"{pane.pane_id} {pane.label}: left as it is: no launch entry")
+                continue
+            saved_panes.append(pane)
             continue
+        if saved is not None and saved["session_id"] != row.id and not dry_run:
+            pane_record.write(session, {**saved, "session_id": row.id})
         parent = record.parent_of(row) if row.kind == "worker" else None
-        holder = parent if parent is not None else row
+        holder = parent if parent is not None and restart.pane_workers(parent) else row
         selected[holder.id] = holder
         if dry_run:
             entry = names.resume(saved) if saved is not None else None
             account = entry["config_dir"] if entry is not None else "retained account"
             print(f"{pane.pane_id} {row.name}: resume {row.current_session} on {account}")
-    if dry_run:
-        return 1 if failures else 0
-    for holder in selected.values():
+    for holder in (() if dry_run else selected.values()):
         try:
             with staff.row_operation(str(holder.id)):
                 current = staff.initial_snapshot()
@@ -68,6 +101,37 @@ def restore(session: str, *, dry_run: bool) -> int:
         except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
             failures += 1
             print(f"{holder.name}: not resumed: {error}", file=sys.stderr)
+    for pane in saved_panes:
+        saved = entries[pane.pane_id]
+        try:
+            entry = names.resume(saved)
+            entry["environment"] = names.environment(entry)
+            label = entry["name"] or pane.label
+            observed = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))
+            if isinstance(observed, herdr.UnknownConversation):
+                herdr.conversation_note(observed)
+            if isinstance(observed, herdr.LiveConversation) or entry["session_id"] in live:
+                print(f"{pane.pane_id} {label}: left as it is: it already runs")
+                continue
+            if dry_run:
+                print(f"{pane.pane_id} {label}: resume {entry['session_id']} on {entry['config_dir']}")
+                continue
+            with staff.row_operation(entry["session_id"]):
+                current = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))
+                if isinstance(current, herdr.LiveConversation):
+                    print(f"{pane.pane_id} {label}: left as it is: it already runs")
+                    continue
+                if isinstance(current, herdr.UnknownConversation) and not isinstance(observed, herdr.UnknownConversation):
+                    herdr.conversation_note(current)
+                with herdr.restore_staff(record, labels=names.labels):
+                    _resume_saved(session, client, pane, saved, entry,
+                        reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
+                            observed.reason if isinstance(observed, herdr.UnknownConversation) else ""))
+            live.add(entry["session_id"])
+            print(f"{pane.pane_id} {label}: resumed {entry['session_id']}")
+        except (herdr.HerdrFailure, OSError, ValueError, staff.StaffRefused) as error:
+            failures += 1
+            print(f"{pane.pane_id} {pane.label}: not resumed: {error}", file=sys.stderr)
     return 1 if failures else 0
 
 

@@ -484,11 +484,9 @@ class RestartTests(ShutdownTestCase):
         row = self.rows[0]
         pane: herdr.PaneIdentity = {"pane_id": "w1:p0", "workspace_id": "w1", "session_id": row.current_session,
                                      "terminal_id": "kept-terminal"}
-        for fault in ("missing-terminal", "duplicate-panes", "unreadable-panes"):
+        for fault in ("duplicate-panes", "unreadable-panes"):
             with self.subTest(fault=fault):
                 selected = {**pane}
-                if fault == "missing-terminal":
-                    _ = selected.pop("terminal_id")
                 with (patch.object(herdr.Herdr, "panes", return_value=[selected, selected] if fault == "duplicate-panes" else [selected],
                           side_effect=herdr.HerdrFailure("pane list unavailable") if fault == "unreadable-panes" else None),
                       patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
@@ -633,6 +631,7 @@ class RestartTests(ShutdownTestCase):
                       patch.object(stop_resume, "stop", STOP_SESSION),
                       patch.object(sessions, "process_liveness", side_effect=process),
                       patch.object(stop_resume, "_signal_process", side_effect=signal_process),
+                      patch.object(time, "monotonic", side_effect=now),
                       patch.object(stop_resume, "monotonic", side_effect=now),
                       patch.object(stop_resume, "Event", return_value=ClockEvent()),
                       patch.object(pane_record, "seed", return_value=0),
@@ -707,7 +706,7 @@ class RestartTests(ShutdownTestCase):
         for identity, label, unavailable in ((str(self.rows[0].current_session), "live", False), (None, "live", False),
                                            (str(self.rows[0].current_session), None, False), (None, "live", True)):
             with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)),
-                  patch.object(restart, "_pane_workers", return_value=False),
+                  patch.object(restart, "pane_workers", return_value=False),
                   patch.object(herdr.Herdr, "panes", return_value=[{**self.panes()[0], "session_id": identity}],
                                side_effect=herdr.HerdrFailure("socket unavailable") if unavailable else None),
                   patch.object(herdr, "saved_layout", return_value=layout),
@@ -781,6 +780,8 @@ class RestartTests(ShutdownTestCase):
                     start.assert_not_called()
                     expected = self.rows if stop_all else self.rows[:1]
                     self.assertEqual(errors.getvalue().splitlines(),
+                        (["another-pending-row: restart anomaly: in the restart record, no fixed staff id"]
+                         if stop_all and saved else []) +
                         [f"{row.name}: restart anomaly: row is locked" for row in expected])
 
     def test_restart_record_delta_keeps_another_runs_failed_row(self) -> None:
@@ -977,6 +978,16 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(remember.call_count, 3)
         self.assertEqual(errors.getvalue(), "restart: layout anomaly: layout unavailable\n")
 
+    def test_restart_all_resumes_a_pending_holder_after_an_interruption(self) -> None:
+        pending = str(self.rows[0].id)
+        shutdown_record.save([pending, "missing-row"])
+        self.running.clear()
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(restart.restart(stop_all=True), 0)
+        self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
+        self.assertEqual(shutdown_record.read(), ["missing-row"])
+        self.assertIn("missing-row: restart anomaly: in the restart record, no fixed staff id", errors.getvalue())
+
     def test_restart_all_starts_each_row_in_its_saved_tab(self) -> None:
         with (patch.object(herdr.Herdr, "save_layout") as save,
               patch.object(herdr.Herdr, "remember_row_tab") as remember):
@@ -1158,14 +1169,12 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(self.launches, [])
         self.assertEqual(shutdown_record.read(), [])
 
+        child = children[0]
+        self.running.add(str(child.current_session))
         from scripts.herdr import worker_panes
 
-        child = children[0]
-        for state, success in ((worker_panes.StoppedWorker(child, "w1:p1", "terminal-1"), True),
-                               (worker_panes.StoppedWorker(child, "w1:p1", "changed-terminal"), False),
-                               (worker_panes.ClosedWorker(child), False)):
-            self.running.add(str(child.current_session))
-            with (self.subTest(state=state), patch.object(staff, "initial_snapshot", return_value=record),
-                  patch.object(unit_runs, "worker_transport", return_value="herdr"),
-                  patch.object(worker_panes, "observe", return_value=[state])):
-                self.assertEqual(restart.stop_row(child, herdr.Herdr("fixture")), success)
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(unit_runs, "worker_transport", return_value="herdr"),
+              patch.object(worker_panes, "observe") as observe):
+            self.assertTrue(restart.stop_row(child, herdr.Herdr("fixture")))
+        observe.assert_not_called()

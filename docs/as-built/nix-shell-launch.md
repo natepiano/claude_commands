@@ -77,7 +77,7 @@ resolver before calling `exec`.
 | `production/add_showrunner.py` | Child showrunners use `launch_agent`. |
 | `shutdown/restart.py` | Record-driven restarts prepare the saved cwd and account environment before `restore_server`, then use `launch_prepared_agent`. Refusal retains the record. |
 | `shutdown/stop_resume.py` | Shared resume runs the account exec command in the session's pane. The exec path prepares the launch shell. |
-| `shutdown/pane_restore.py` | Saved Claude panes use `launch_agent` before replacing their old tab. |
+| `shutdown/pane_restore.py` | Staff rows use `restart.start_row`. Saved panes without staff rows use `launch_agent`. Both routes preserve live conversations and retained accounts. |
 | `herdr/herdr_sessions.py` | Standalone starts and resumes use `launch_agent`. |
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
