@@ -1119,43 +1119,25 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 50 — One shared wait watches writes, and one file binds inotify  · status: done
 **Depends on:** Phase 43
 
-#### Work Order
+#### As-built
 
-**Goal:** a test wakes on a line that a live writer adds to an open log, through one shared wait with no raw masks. The Phase 43 simplify review found the copies.
-
-**Spec:**
-1. `scripts/lib/inotify.py` gains `IN_MODIFY`.
-2. `LocalReleaseEvents` and `local_release_waiter` take a `mask` parameter. The default stays `0x00000FC8`, written with the named constants, so production callers keep the same events.
-3. `wait_until` takes a keyword `watch_writes: bool = False`.
-4. `VerifyTokenWaitFixture.wait_for_output` becomes one `wait_until(..., watch_writes=True)` call, then the `assertIn`. A timeout raises `TimeoutError`, not `AssertionError`.
-5. Remove the raw-mask patches in `verify_hold_wait_test_support.py` and `verify_mac_offload_test_support.py`.
-6. `LocalReleaseEvents` calls `inotify.open_watch`, `inotify.add_watch` and `inotify.events`. `arm()` still skips a path that is not a directory.
-7. `scripts/agents/codex_mesh.py` keeps its own copy: it goes within 48 hours (user, 2026-11-05).
-8. Add no guard, refusal or check (user rule, 2026-11-05).
+- `scripts/lib/inotify.py` is the one binding outside `codex_mesh.py`. It holds `IN_MODIFY` and `read_events(descriptor)`, which does one read; `events` loops on it.
+- `LocalReleaseEvents` and `local_release_waiter` take `mask`. The default `RELEASE_CHANGES` equals `0xFC8`, written with named constants. `LocalReleaseEvents.wait` uses `read_events` and returns when something changed or the deadline passes.
+- `wait_until(..., watch_writes=False)` is the one wait that can watch writes. `VerifyTokenWaitFixture.wait_for_output` is one `wait_until(..., watch_writes=True)` call, then the `assertIn`. The raw-mask patches are gone.
+- `verify_hold_wait_test_support.py` catches only `FileNotFoundError` around `add_watch`.
+- Tests: `test_fixture_releases_a_call_when_a_scanned_directory_disappears`, `ReleaseDeadlineTests.test_wait_returns_by_its_deadline_when_irrelevant_events_never_stop`, and the live-writer test.
+- Same-load pairs show no speed change, as expected.
 
 **Files:**
-- `scripts/lib/inotify.py`
-- `scripts/direct/local_release_wait.py`
-- `scripts/direct/wait_for_test_state.py`
-- `scripts/direct/verify_token_wait_test_support.py`
-- `scripts/direct/verify_hold_wait_test_support.py`
-- `scripts/direct/verify_mac_offload_test_support.py`
-- `scripts/direct/test_verify_hold_events.py` — the open-writer test
+- `scripts/lib/inotify.py`, `scripts/direct/local_release_wait.py` (owner verify), `scripts/direct/wait_for_test_state.py` — the binding and the wait
+- `scripts/direct/verify_token_wait_test_support.py`, `verify_hold_wait_test_support.py`, `verify_mac_offload_test_support.py` — fixtures
+- `scripts/direct/test_verify_hold_events.py` (owner verify), `scripts/direct/test_review_launcher.py` — tests
 
-**Workers:** 1 writer on slot `impl4` (one wait, used by every file; slots `impl`, `impl3` and `test` hold other phases)
-- `impl4` — all files above
+**Binds later work:** `test_verify_mac_signal_boundaries.py` `test_signal_before_runner_start_removes_result_without_local_work` cleared on one rerun and 32 stress runs. It belongs to verify if it returns.
 
-**Constraints from prior phases:**
-- Phase 43: the shared mask has no `IN_MODIFY`, so a file that a live writer keeps open sends no event until its last close.
-- Turned on for every caller, a write watch wakes on each write in a busy directory, and predicates can read half-written files. Keep it off by default.
-- Architect review after Phase 36: keep the production mask equal to `0xFC8`. `inotify.DIRECTORY_CHANGES` also holds `IN_ATTRIB`, so it is not that mask. Keep the recursive subscriptions and the unrestricted event reads of the two fixtures when their patches go.
+**Gotchas:** `add_watch` raises `FileNotFoundError` for a directory that goes away. The deadline test allows `deadline + 5` s, so load gives no false red.
 
-**Acceptance gate:**
-- A test: a live writer adds a line to a file it keeps open, and `wait_until(..., watch_writes=True)` returns before the file closes.
-- `git grep -n '0x00000FC'` finds one definition at most, outside `codex_mesh.py`.
-- Each caller module of the changed files green in the gate form; `merge_gate.py` waits have the same events.
-- Same-load pairs for `direct/test_verify_hold_*` and `direct/test_verify_mac_only.py`, before and after, in the notice.
-- The full test green on the phase commit merged with `origin/builds`.
+**Ruled out:** A write watch on by default wakes on each write in a busy directory, and predicates can read half-written files. `codex_mesh.py` keeps its own copy, because it goes.
 
 ### Phase 51 — `direct/test_simplify_lens.py` runs in less time  · status: todo
 **Depends on:** none
