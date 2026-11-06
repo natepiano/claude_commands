@@ -18,6 +18,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `docs/associate-producer/operations.md` | read | staff.json (shell) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
+| `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/agent_bg.sh` | read | runtime_id |
@@ -169,7 +170,7 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/waste_watch.py` | read | snapshot |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
 
-153 accessors: 30 write, 122 read, 1 owner.
+155 accessors: 30 write, 124 read, 1 owner.
 
 ## Approved copies
 

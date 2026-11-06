@@ -840,6 +840,25 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.staff_state(), before)
         self.assertEqual((self.world.closed, self.world.stops), ([], []))
 
+    def test_refused_pass_keeps_a_stopped_worker_and_prevents_a_role_change(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1", live=False)
+        self.dispatch(row, "impl")
+        path = self.root / "run/progress_history_state.json"
+        _ = path.write_text(path.read_text().replace('"active"', '"refused"'))
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.StoppedWorker)
+        result = worker_panes.can_close(observed)
+        self.assertIsInstance(result, worker_panes.Kept)
+        self.assertIsInstance(worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Kept)
+        self.assertEqual(self.world.closed, [])
+        self.world.add(row, "w1:p1")
+        changed = self.start(row.name, role="review")
+        self.assertIsInstance(changed, worker_panes.StartRefused)
+        assert isinstance(changed, worker_panes.StartRefused)
+        self.assertEqual(changed.reason, worker_panes.StartRefusal.BUSY_ROLE_CHANGE)
+        self.assertEqual(self.world.launches, [])
+
     def test_close_rerun_after_agent_stop_closes_only_that_terminal_once(self) -> None:
         row = self.worker()
         sibling = self.worker("sibling")
