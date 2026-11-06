@@ -149,7 +149,7 @@ class UnitConfig:
     formatting: RepositoryTaploConfig | DefaultTaploConfig = field(default_factory=DefaultTaploConfig, compare=False)
 
     def __post_init__(self) -> None:
-        # A responsibility is a short duty name.
+        # A responsibility is a short name or a repository path.
         # Responsibilities are a set; sorted order matches taplo's reorder_arrays in a repository config.
         object.__setattr__(self, "responsibilities", tuple(sorted(self.responsibilities)))
         for name in self.responsibilities:

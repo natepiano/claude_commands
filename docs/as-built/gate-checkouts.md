@@ -33,7 +33,8 @@ or `cargo-liner`. Linked worktrees use the main repository's name, so a unit
 worktree of `.claude` uses `.claude/verify-unit-gate`. The root under
 `~/worktrees` belongs to the existing trusted direnv root.
 
-Owners match `[a-z0-9][a-z0-9_-]*`, including production names and recorded unit names.
+Owners are unit or production names, such as `verify` or `builds`.
+Owners match `[a-z0-9][a-z0-9_-]*`.
 Use no phase, run, or session ids.
 The caller supplies the owner from its existing context.
 The helper does not consult a roster.
@@ -92,7 +93,7 @@ Each tree has one `.gate.json` record:
 
 ```json
 {
-  "owner": "verify-unit",
+  "owner": "verify",
   "repo": ".claude",
   "source": "/home/natepiano/worktrees/claude-build-followups-verify",
   "commit": "1111111111111111111111111111111111111111",
@@ -113,7 +114,7 @@ order:
 
 ```sh
 python3 ~/.claude/scripts/copies/copies.py run \
-  --owner verify-unit --repo ~/worktrees/claude-build-followups-verify \
+  --owner verify --repo ~/worktrees/claude-build-followups-verify \
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
@@ -139,7 +140,7 @@ names the affected files, and releases the tree. The next use resets it clean.
 ```sh
 python3 ~/.claude/scripts/copies/copies.py list
 python3 ~/.claude/scripts/copies/copies.py remove \
-  --owner verify-unit --repo ~/worktrees/claude-build-followups-verify
+  --owner verify --repo ~/worktrees/claude-build-followups-verify
 ```
 
 `list` prints one row per tree: path, owner, repo, commit, busy or idle, last

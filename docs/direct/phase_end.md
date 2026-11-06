@@ -35,6 +35,13 @@ Run these steps in order for each completed loop or verbose phase:
    Include every `held_for_decision` item as `Held simplify: <id> — <files> — <proposed change>; ledger <path>`.
    Outside a production, report
    `Checkpoint <short hash> — phase N: <title>.`.
+   Start the daily simplify run as a background shell after the code ready notice:
+
+   ```sh
+   bash ~/.claude/scripts/direct/assign.sh --role simplify --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}"
+   ```
+
+   The next phase does not wait for this run.
 3. **Plan review.** Run <RunPhaseReview/> before the next phase's Work Order is
    used. A defect found in the committed phase becomes a follow-up phase
    inserted next under `/plan:to_phased_plan` → <PhaseNumbering/> and runs next.

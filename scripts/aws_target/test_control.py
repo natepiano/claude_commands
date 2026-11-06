@@ -330,7 +330,7 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
     assert linux_runner.probe_shell(mirror, values, "hana") == 0
     assert linux_runner.run(mirror, values, "hana", "check", (), "call", "tree") == 0
 """
-        result = subprocess.run([sys.executable, "-I", "-c", script,
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-I", "-c", script,
             str(Path(__file__).resolve().parents[2]), str(self.root)],
             cwd=self.root, capture_output=True, text=True, timeout=10, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

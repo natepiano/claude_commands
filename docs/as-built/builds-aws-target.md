@@ -12,7 +12,7 @@ The user approved these spending and capacity values on 2026-11-03, all in `conf
 4. `start_min_waiting=2`, `start_after_wait_s=120` and `idle_stop_minutes=15`: the box starts when 2 steps wait 120 s, and stops after 15 idle minutes.
 5. `slots=2`, `slots.hana=4`, `slots.cargo-liner=4` and `build_budget_gib=32`: the slots per repository and the build space.
 
-The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws-unit wrote that private file on natedev (mode 0600) from the address the user gave.
+The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws wrote that private file on natedev (mode 0600) from the address the user gave.
 The user approved `deployment_price_file=~/.config/aws-build/deployment-price` on 2026-11-03. `deploy.py price` writes the Spot price and its read time there (mode 0600), outside the repository.
 
 The target is live. The user approved go-live on 2026-11-03. The stacks exist in `us-east-2`, and the box is instance `i-0216cf933a26bd1ea`. `offload=on`, and `targets=mac,natedev,aws` lists AWS after natedev. [The runbook](../plans/builds-aws-runbook.md) gives the steps. The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
@@ -133,7 +133,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
    It resolves the natedev and Mac addresses from local Tailscale status.
    The network rule permits only these addresses on port 22.
-   The SSH rule permits `autogroup:member` as `natepiano`; the network rule still limits access to these devices.
+   The SSH rule permits `autogroup:member` as `natepiano` and `root`; the network rule still limits access to these devices.
    It changes only `tag:build-aws` owners and destination rules.
    It prints each proposed change and uses the policy ETag to prevent concurrent overwrites.
    It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
@@ -147,6 +147,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 3. `box-configuration` reads the clean `main` checkout named by `nixos_configuration_directory`.
    It compares `/run/current-system` with the `aws-build` output.
    It builds the output locally and copies the closure with destination substitutes.
+   It copies the closure and runs the box configuration commands as `root` without `sudo`.
    It holds the controller lock and stops the remote idle service during the copy.
    A bounded poweroff timer protects a failed reconnect.
    A transient systemd unit runs the switch independently of SSH.

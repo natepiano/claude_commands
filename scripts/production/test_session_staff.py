@@ -4,15 +4,51 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
+import json
+import os
 from unittest import mock
 
+from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import session_staff as labels, staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
 import herdr
 from pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_pane_parents_selects_only_local_pane_workers_from_the_record(self) -> None:
+        config, runs = self.root / "config", self.root / "runs"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        runner = fixture_member("showrunner", name="pane-show", doc=staff.LiveDoc("natedev", self.root / "show.md"))
+        selected = fixture_member("unit", name="pane", parent=runner.id,
+                                  worktree=staff.PresentWorktree("natedev", self.root / "pane"))
+        mesh = fixture_member("unit", name="mesh", parent=runner.id,
+                              worktree=staff.PresentWorktree("natedev", self.root / "mesh"))
+        other = fixture_member("unit", name="other-machine", parent=runner.id,
+                               worktree=staff.PresentWorktree("mac", self.root / "other"))
+        _ = fixture_member("unit", name="no-workers", parent=runner.id,
+                           worktree=staff.PresentWorktree("natedev", self.root / "empty"))
+        for parent in (runner, selected, mesh, other):
+            _ = fixture_worker("impl", parent.id)
+            if parent == runner:
+                continue
+            run = runs / parent.name
+            run.mkdir(parents=True)
+            write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: parent.id}))
+            write_text_atomic(run / "worker_transport", "mesh\n" if parent == mesh else "herdr\n")
+        _ = fixture_worker("test", selected.id)
+        record = staff.snapshot()
+        before = self.staff_state()
+        with (mock.patch.object(unit_runs, "RUN_ROOT", runs),
+              mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"),
+              mock.patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(runs)}),
+              mock.patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as scans):
+            self.assertEqual({row.id for row in labels.pane_parents(record)}, {runner.id, selected.id})
+            self.assertEqual(scans.call_count, 1)
+        self.assertEqual(self.staff_state(), before)
+
     def test_unknown_process_identity_preserves_healthy_unit_status(self) -> None:
         import unit_lookup
 
@@ -30,7 +66,7 @@ class StatusDiscoveryTests(StaffTestCase):
                 with mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]), redirect_stderr(errors):
                     observed = tuple(unit_lookup._herdr_labeled({}, unit_lookup.UnreadAt({}, unit_lookup.RecordsRead()), processes))  # pyright: ignore[reportPrivateUsage]
                     grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(),
-                                                            sources=labels.MemberSources({}, (launch,)))
+                                                            sources=labels.MemberSources((launch,)))
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
                 self.assertIn("anomaly:", errors.getvalue())
                 states = grouped.status_units("show")
@@ -50,6 +86,6 @@ class StatusDiscoveryTests(StaffTestCase):
                 errors = StringIO()
                 with redirect_stderr(errors):
                     grouped = labels.group_labeled_sessions([*children, agent], record=staff.snapshot(),
-                                                            sources=labels.MemberSources({}, ()))
+                                                            sources=labels.MemberSources(()))
                 self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(grouped.units, {"show": {row.name: replace(agent, unit=row.name)}})

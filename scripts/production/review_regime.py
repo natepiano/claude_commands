@@ -6,7 +6,6 @@ Usage:
                        --started <ISO> --merged <ISO> --holds <K> --merge-defects <D>
                        [--ux-findings <N>] [--code-findings <N>] [--review-minutes <M>]
                        [--ux-check-minutes <U>] [--ux-repair-minutes <R>]
-                       [--simplify-findings <N>] [--simplify-minutes <S>]
                        [--excluded <reason>] [--note <text>]
   review_regime.py report [--since <ISO date>]
   review_regime.py watch
@@ -77,8 +76,6 @@ class Row:
     ux_repair_minutes: float | None
     note: str | None
     excluded: str | None
-    simplify_findings: int | None
-    simplify_minutes: float | None
 
     def hours(self) -> float:
         return (datetime.fromisoformat(self.merged) - datetime.fromisoformat(self.started)).total_seconds() / 3600
@@ -100,7 +97,6 @@ def read_rows() -> list[Row]:
         minutes = record.get("review_minutes")
         check_minutes = record.get("ux_check_minutes")
         repair_minutes = record.get("ux_repair_minutes")
-        simplify_minutes = record.get("simplify_minutes")
         note = record.get("note")
         excluded = record.get("excluded")
         plan = record.get("plan")
@@ -121,8 +117,6 @@ def read_rows() -> list[Row]:
                 ux_repair_minutes=float(repair_minutes) if isinstance(repair_minutes, int | float) else None,
                 note=note if isinstance(note, str) else None,
                 excluded=excluded if isinstance(excluded, str) else None,
-                simplify_findings=optional_int(record, "simplify_findings"),
-                simplify_minutes=float(simplify_minutes) if isinstance(simplify_minutes, int | float) else None,
             )
         )
     return rows
@@ -155,8 +149,6 @@ def add(arguments: argparse.Namespace) -> None:
         ux_repair_minutes=cast(float | None, arguments.ux_repair_minutes),
         note=cast(str | None, arguments.note),
         excluded=excluded,
-        simplify_findings=cast(int | None, arguments.simplify_findings),
-        simplify_minutes=cast(float | None, arguments.simplify_minutes),
     )
     if row.hours() < 0:
         raise SystemExit("review_regime: --merged is before --started")
@@ -168,9 +160,6 @@ def add(arguments: argparse.Namespace) -> None:
             return
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     record = cast(dict[str, object], asdict(row))
-    for key in ("simplify_findings", "simplify_minutes"):
-        if record[key] is None:
-            del record[key]
     with LEDGER.open("a") as ledger:
         _ = ledger.write(json.dumps(record) + "\n")
     print(f"added {row.unit} phase {row.phase} ({row.regime}): {row.holds} holds, {row.merge_defects} merge defects, {row.hours():.1f} h" + (f"; excluded: {row.excluded}" if row.excluded else ""))
@@ -210,12 +199,6 @@ def report(since: str | None) -> None:
     )
     line("UX reviewer findings per phase (mean)", lambda group: mean_of([float(row.ux_findings) for row in group if row.ux_findings is not None]))
     line("code findings per phase (mean)", lambda group: mean_of([float(row.code_findings) for row in group if row.code_findings is not None]))
-    if any(row.simplify_findings is not None for row in rows):
-        line("simplify findings per phase (mean)", lambda group: mean_of([
-            float(row.simplify_findings) for row in group if row.simplify_findings is not None]))
-    if any(row.simplify_minutes is not None for row in rows):
-        line("simplify minutes per phase (mean)", lambda group: mean_of([
-            row.simplify_minutes for row in group if row.simplify_minutes is not None]))
     print("\n".join(lines))
 
 
@@ -270,8 +253,6 @@ def main() -> int:
     _ = adding.add_argument("--review-minutes", type=float)
     _ = adding.add_argument("--ux-check-minutes", type=float)
     _ = adding.add_argument("--ux-repair-minutes", type=float)
-    _ = adding.add_argument("--simplify-findings", type=int)
-    _ = adding.add_argument("--simplify-minutes", type=float)
     _ = adding.add_argument("--excluded", help=f"why the comparison cannot use this phase; --ux-check-minutes 0 records {NO_VISIBLE_CHANGE!r}")
     _ = adding.add_argument("--note")
     reporting = commands.add_parser("report")

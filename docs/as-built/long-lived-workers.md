@@ -10,7 +10,7 @@ read-only and persist across phases and plans. The fresh Claude helper in
 A unit keeps its worker threads across phases and plans. `assign.sh` selects
 an idle worker by role, resumes it, and claims it for the dispatch.
 Codex code review uses the unit's read-only `review` workers.
-The [simplify lens](simplify-lens.md) uses a fresh Claude review.
+The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Writers keep their writing roles.
 Each follow compacts when the recorded context exceeds the configured limit.
 Phase cleanup ends turns and keeps threads. Unit pause, move and end use the
@@ -36,7 +36,7 @@ reviewer can take the work.
 
 One renderer makes every worker's thread title and message prefix:
 `workers.shown_name`. A unit run gives `<production> · <unit> · <job>[ <n>]`,
-with the unit's `-unit` suffix removed. The job label comes from
+with the unit's staff name. The job label comes from
 `config/names.toml`: `implementer`, `tester`, `repair_worker` or
 `code_reviewer` for the `impl`, `test`, `fix` and `review` roles, and `worker`
 for any other role. The second holder of a role gets the number 2, and so on.
@@ -208,7 +208,8 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 `~/.local/state/unit-workers/<production>/<unit>.json` (`UNIT_WORKERS_STATE`
 selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
-Plan headers accept both Production forms and resolve former production names.
+The unit staff row selects its parent showrunner.
+The parent row's `name` and `doc.path` give the production name and document.
 Later reads use the saved identity, so moving a worktree does not change owners.
 `rename_unit.py` changes the unit row and repairs its session and display names.
 An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
@@ -270,7 +271,7 @@ See `unit-rename.md`.
 
 - Codex workers open once per run and end only at `end_session.sh`. A held design role is not a run worker: run end unbinds it and never ends its thread. Phase cleanup never ends a Codex thread. A new worker opens only when no open worker can take the work.
 - Claude workers keep their per-phase lifecycle; this design covers Codex workers only.
-- Only the unit director starts a finished worker's next turn through `implement.sh --to <worker>` or `review.sh --to <worker>`. A peer message sent with `send` is held for that turn, which receives it before its dispatch prompt, so the prompt is the last text the worker reads.
+- Only the unit director starts a finished Codex worker's next turn through `assign.sh --role <role> --to <worker>`. The turn receives held peer messages before its dispatch prompt. Claude workers keep `implement.sh`.
 - Compaction, the worker claim and the identity check run under one launcher lock (`impl_worker_claim.lock`); each mesh operation also holds its worker lifecycle lock. A live compaction turn (exit 3) or changed roster (exit 4) blocks the follow-up. Other compaction failures post one board line and allow the follow-up.
 - A worker's identity file is anchored to the implementation model, whichever launcher opened the worker.
 - A assigned review claims its worker before writing any artifact, and fails if the working tree changed in any of HEAD, status, tracked diff or untracked content.
@@ -302,7 +303,7 @@ See `unit-rename.md`.
 - **Open once.** Before this design, each phase opened new `impl` and `test` threads and every review was a new thread, so every task paid a worker's startup cost. A worker that stays open pays that cost once per run.
 - **Compact between tasks.** Startup turned out to be a small share of usage. Over 1,437 natedev threads, usage before the first edit was 19% of uncached input, 4% of cached input and 10% of output: about 6% of weighted usage. Most usage is cached context that long threads read again on every call. A long-lived worker saves its startup but carries its context, so frequent compaction is what keeps the saving.
 - **Codex workers only.** The cost being addressed is Codex worker startup. Claude workers are the fallback family and keep their existing lifecycle.
-- **Read-only unit reviewers.** Codex code review uses the unit's own role and read-only sandbox. Writers keep their roles. The fresh Claude design check and [simplify lens](simplify-lens.md) use separate launches.
+- **Read-only unit reviewers.** Codex code review uses the unit's own role and read-only sandbox. Writers keep their roles. The fresh Claude design check and [daily simplify run](simplify-lens.md) use separate launches.
 - **Verdict per checkpointed phase.** The amount of work changes from day to day, so usage per day would not compare the two windows. Account switches are too rare for a verdict: the baseline had 2 in about five days, too few to show a change within a week. They are reported alongside the verdict.
 - **Hyphens refused in `--slot`.** `--to` derives the slot from the worker name, so refusing hyphens is simpler than resolving a hyphenated slot from its recorded identity.
 - **Second-overflow error kept.** It stops a worker that fills its context again and again without doing work, so press-on cannot loop forever.
@@ -333,7 +334,7 @@ Phase-bound `open` and `adopt` use the resolved design checkout when `--checkout
 
 Role IDs are `<design_id>/designer` and `<design_id>/reviewer`. Instance names are `<production>-<area>-astra-designer` / `-astra-reviewer`; an adopted role keeps its old mesh name.
 
-**Types.** Frozen dataclasses, tagged by `kind` at the JSON boundary (`../type_design.md`): `UnitHolder(production_slug, unit_name)` | `ShowrunnerHolder(production_slug)`; `DesignUnbound` | `DesignBoundToPhase(run_directory, phase, repository, output_paths)`; `PhaseBoundDesigner(binding_generation, launch_sandbox)` | `ReadOnlyReviewer` (`ThreadAccessPolicy`); `RoleNotOpened(claim)` | `RoleOpen(thread_id)` | `RolePausedForMove(thread_id)` | `RoleNeedsRecovery(thread_id, reason)` | `RoleEnded(thread_id)`; `DesignPlacement(design_id, host, generation)`; `RoleInstance`, `HeldDesign`, `PendingMessage`, `HolderReach(session_id)` | `HolderUnavailable(reason)`. Refusals raise `RoleRefused(ValueError)`.
+**Types.** Frozen dataclasses, tagged by `kind` at the JSON boundary (`../type_design.md`): `DesignUnbound` | `DesignBoundToPhase(run_directory, phase, repository, output_paths)`; `PhaseBoundDesigner(binding_generation, launch_sandbox)` | `ReadOnlyReviewer` (`ThreadAccessPolicy`); `RoleNotOpened(claim)` | `RoleOpen(thread_id)` | `RolePausedForMove(thread_id)` | `RoleNeedsRecovery(thread_id, reason)` | `RoleEnded(thread_id)`; `DesignPlacement(design_id, host, generation)`; `RoleInstance`, `HeldDesign`, `PendingMessage`, `HolderReach(session_id)` | `HolderUnavailable(reason)`. Refusals raise `RoleRefused(ValueError)`.
 
 **CLI** (exit 2 and one `roles:` stderr line on any refusal):
 
@@ -342,9 +343,9 @@ Role IDs are `<design_id>/designer` and `<design_id>/reviewer`. Instance names a
 | `open --repository <id> --document --role --production [--unit] --area [--run-directory --phase --checkout --output-path …]` | `open_role` | Reserve placement, create the slot, start one thread. `--repository` is the registered repository ID; the checkout comes from the authority. |
 | `adopt … --source-mesh --name --thread-id --adoption-id` | `adopt` | Move an existing idle thread into the store. |
 | `resume <instance> --prompt-file` | `resume` | Build a headed prompt, claim and dispatch one turn, print the reply path. |
-| `recover <instance>` | `recover` | Prove the recorded thread idle and clear an uncertain claim. |
+| `recover <instance>` | `recover` | Prove the recorded thread idle and clear an uncertain claim. With no worker evidence, it refuses and names `end`, and it never starts a second thread. |
 | `rebind <design> --expected-generation --reason [--unbind / --run-directory --phase --output-path / --production --unit / --checkout --document]` | `rebind` | Change holder, binding, checkout or document while idle; advances the generation. |
-| `end <instance>` | `end` | End one role. When no role of the design stays open, it also stops the design mesh server and writes `end-server-release.json`; a failed stop leaves the role `RoleNeedsRecovery`. |
+| `end <instance>` | `end` | End one role. The role's own `outcome_unknown` creation claim does not count as busy, and a missing worker counts as ended for that claim. When no role of the design stays open, it also stops the design mesh server and writes `end-server-release.json`; a failed stop leaves the role `RoleNeedsRecovery`. |
 | `unbind-run <run>` | `unbind_run` | Unbind every design bound to that run. |
 | `list [--json]` | `list_roles` | Default: one plain line per role with instance ID, role, lifecycle state, holder, holder session or unavailable reason, thread ID when present, and document; `no held roles` when empty, then one line per problem. `--json`: the full local roles and problems dict, with `transition.json`, move marker and failed status mapped to recovery/paused states; no network calls. |
 | `register --repository --host --checkout` | `register_repository` | Register a repository with the authority. |

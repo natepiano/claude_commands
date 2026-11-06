@@ -278,7 +278,7 @@ class FolderRenameTests(FolderRenameFixture):
         displays.pane = displays.tab = self.owner.name
         labels = displays.pane, displays.tab, displays.workspace
         before = file_versions(self.root)
-        arguments = ["apply", "folder-production", "port-unit", "port"]
+        arguments = ["apply", "folder-production", "port", "port"]
         with (FolderSessionFixture(self.owner, live=False).installed(), displays.installed(),
               mock.patch.object(unit_move, "move_folder", wraps=unit_move.move_folder) as move):
             result = invoke_cli(rename_unit, lambda: rename_unit.main(arguments), arguments,

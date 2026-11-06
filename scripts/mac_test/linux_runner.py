@@ -31,24 +31,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
     from ..copies import copies
     from ..lib import build_folders
+    from ..lib.boot_identity import boot_identity as boot_identity
     from ..lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from ..aws_target import ledger
     from ..build_targets.target_config import SshTarget, is_aws_target
 else:
     from scripts.copies import copies
     from scripts.lib import build_folders
+    from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from scripts.build_targets.target_config import SshTarget, is_aws_target
 
 
+
 PROC_ROOT = Path('/proc')
-
-
-def boot_identity(proc_root: Path = PROC_ROOT) -> str:
-    identity = (proc_root / 'sys/kernel/random/boot_id').read_text().strip()
-    if not identity:
-        raise ValueError('boot identity is missing')
-    return identity
 
 
 class SlotBoot(Enum):

@@ -128,3 +128,12 @@ def create_text_atomic(path: Path, text: str) -> bool:
             return False
         sync_folder(path.parent)
         return True
+
+
+def atomic_sample(path: Path, value: str) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        _ = temporary.write_text(value)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
