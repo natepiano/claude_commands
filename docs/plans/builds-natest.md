@@ -1116,11 +1116,10 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 ### Phase 46 — style test runs do less Git work outside `copies.py`  · status: todo
 **Depends on:** none
-**Blocked by:** the style owner's work in `style/bulk_run.py` and `style/git_process.py`; the showrunner says when.
 
 #### Work Order
 
-**Goal:** `style/test_crate_run.py` spends less time in Git calls made by `style/bulk_run.py` and `style/git_process.py`, with the same behavior. Phase 40 measured 10,444 Git calls and 60.9 s of a 325 s profiled run. Estimate: about 30 s. The showrunner assigned this on 2026-11-05.
+**Goal:** `style/test_crate_run.py` spends less time in Git calls made by `style/bulk_run.py` and `style/git_process.py`, with the same behavior. Phase 40 measured 10,444 Git calls and 60.9 s of a 325 s profiled run. Estimate: about 30 s. The showrunner assigned this on 2026-11-05; sdlc says no style work is in flight in these two files. The notice gives measured time before and after.
 
 **Spec:**
 1. Measure before any edit: count Git calls per command form, per caller line, in a real `style/test_crate_run.py` run. Estimate the removable cost per form.
