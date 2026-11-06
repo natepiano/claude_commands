@@ -311,11 +311,18 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 - `wait_until(ready, directory, timeout=TEST_HANG_GUARD_SECS, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
 - `wait_for_file(path)` is a wrapper, also callable from the command line.
 
-**Python import root.** `scripts/lib/py` resolves its own repository root with shell operations.
+**Python import root.** The gate starts each test run through the checked tree's `scripts/lib/py`.
+The gate removes the caller's `PYTHONPATH` from each child environment.
+The shim sets the checked tree's root in `PYTHONPATH`.
+Tests and their Python children can import packages from that tree.
+The gate refuses a tree without the shim.
+`MERGE_GATE_PYTHON` still selects the test interpreter.
+
+The shim resolves its repository root with shell operations.
 For stdin, `-c`, and `-m`, it puts that root first in `PYTHONPATH` and passes `-P` first.
-It preserves inherited Python paths after that root.
+Outside the gate, it preserves inherited Python paths after that root.
 Options such as `-B` and `-u` can precede the program mode.
-File scripts keep their existing import path behavior.
+File scripts keep their folder first in the import path.
 The shim resolves relative paths and parent segments without another process or a directory change.
 `test_py_shim.py` tests local package collisions, old modules, cached interpreters, module mode, and file scripts.
 

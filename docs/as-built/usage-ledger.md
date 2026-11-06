@@ -105,7 +105,7 @@ Every stored time is UTC ISO-8601 text ending `+00:00`.
 - `phase_started`, `phase_finished` → `phases`, key (`machine`, `phase_instance_id`).
 - `pass_started`, `pass_finished` → `passes`, key (`machine`, `pass_instance_id`); `kind` is `pass_kind`.
 - `finding_opened`, `finding_verdict` → `findings`, key (`machine`, `phase_instance_id`, `finding_id`); `state` is `open` until a verdict, then its `resulting_state`.
-- `finding_batch_dispatched`, `_landed`, `_abandoned` → `repair_rounds`, key (`machine`, `phase_instance_id`, `round`).
+- `finding_batch_dispatched`, `_landed`, and `_abandoned` enter the `repair_rounds` audit table. Its key is (`machine`, `phase_instance_id`, `round`). These rows preserve dispatch records. Repair counts require started fix passes. Relaunches of one ledger batch add no round. Refunded batches add no round unless they later land.
 
 In `runs`, `phases` and `passes`, `state` is `open` until the finish event and `finished_at` is NULL only while `open`. `source_event` is the creating event's `event_id`, from which a finding's title and detail can be found in the history file.
 

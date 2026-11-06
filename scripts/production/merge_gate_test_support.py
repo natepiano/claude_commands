@@ -135,8 +135,9 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
         if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
-            self.assertEqual(os.environ.get("PYTHONPATH"),
-                             os.environ["MERGE_GATE_TEST_REPO"] + os.pathsep + os.environ["MERGE_GATE_TEST_PYTHONPATH"])
+            self.assertEqual(os.environ.get("PYTHONPATH"), str(Path.cwd()))
+            self.assertNotIn(os.environ["MERGE_GATE_TEST_PYTHONPATH"], sys.path)
+            self.assertNotIn(os.environ["MERGE_GATE_TEST_REPO"], sys.path)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
         death = state / ("signal-" + suite)
@@ -472,6 +473,9 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
         self.write(self.checkout / "scripts/test_times/module_run.py",
                    (SCRIPT.parents[1] / "test_times/module_run.py").read_text())
+        shim = self.checkout / "scripts/lib/py"
+        shim.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copy2(SCRIPT.parents[1] / "lib/py", shim)
         for suite in self.suites:
             self.write(self.checkout / "scripts" / suite / "test_first.py", SUITE_MODULE)
         if "lib" in self.suites:
