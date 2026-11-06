@@ -31,10 +31,12 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   - `scripts/<folder>/test_*.py` — the test modules that the speed phases change (natest-unit changes shared test files through cargo-berth's flow; production doc, Units → natest-unit)
 - **Key files:**
   - `scripts/production/merge_gate.py` — line numbers on builds 772ef96a9: `MODULE_HISTORY_RUNS = 5` (103); `SUITE_BOOTSTRAP` (108, execs its argv); `GateJobResult` (159, has `cpu_seconds`); `gate_state_dir()` (510); `start_gate_job` (638); `test_module_environment` (655, gives each module a private `TMPDIR`, `BUILDLOG_DIR` and tool tripwires); `finish_gate_job` (678, finishes every job, the type job included); `PassedTreeLedger` (736, `CleanTestTree.tree` and `.commit`); `discover_test_modules` (864); `run_suites` (878): the module argv at 1003 is `[*scope_prefix, python, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name]`, the type job argv is at 1000-1001, the rerun-alone pass keeps first results in `first_runs`, and the `finally` block (1074-1088) saves `module_seconds.json`, `module_cpu_seconds.json`, `module_peak_mib.json`, `types_peak_mib.json` and `module_history.json`; the summary lines (1093-1127) print each folder suite's time from `suite_started` and `suite_finished` Since Phase 2 (8bc0d5c88): each module job runs `RUNNER` (`scripts/test_times/module_run.py`), not `unittest discover`; `discover_test_modules` (877); `record_gate_run` writes the run record.
-  - `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate*.py` — the gate's fixture and tests
+  - `scripts/production/full_test.py` — a unit's run: it selects modules through `scripts/production/affected_modules.py`. `merge_gate.SuiteMode` names the two modes; `run_suites(..., mode=SuiteMode.MERGE_GATE)` runs all modules (Phase 36). The line numbers above are history: find the current lines with `git grep`.
+  - `scripts/lib/build_steps.py`, `config/build_steps.conf` — `StepNames.shown` and `StepNames.prose`: the step names that the user reads (Phase 36)
+  - `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate*.py`, `scripts/production/test_full_test.py` — the gate's fixture and tests
   - `scripts/buildlog/store.py` — `root()` (honors `BUILDLOG_DIR`), `host_name()`, `utc_iso(epoch)`, `host_file(host, epoch)`, `append_line(path, record)`: the JSON-lines store, one file per host per month
   - `scripts/buildlog/record.py` — `RECORD_VERSION`, `new_id(host, epoch)` (513), `ssh_attempt` (1055): the pattern for a one-line record writer
-  - `scripts/buildlog/index.py` — `SCHEMA_VERSION = 29` (42); column lists such as `TEST_COLUMNS` (141) and `CALL_COLUMNS`; `TABLES` (452, with the gate tables); `create_schema` (574, adds a `<table>_src` index for each table); `insert`, `pick`; `add_step` (763, the pattern for a nested list that becomes child rows); `ADDERS` (950, `gate_run` maps to `add_gate_run`); `forget` (954, loops `TABLES`); `update()` (1012); `read_only()` (1051)
+  - `scripts/buildlog/index.py` — `SCHEMA_VERSION = 34`, with `step`, `dirty_paths` and `dirty_path_count` (was 42); column lists such as `TEST_COLUMNS` (141) and `CALL_COLUMNS`; `TABLES` (452, with the gate tables); `create_schema` (574, adds a `<table>_src` index for each table); `insert`, `pick`; `add_step` (763, the pattern for a nested list that becomes child rows); `ADDERS` (950, `gate_run` maps to `add_gate_run`); `forget` (954, loops `TABLES`); `update()` (1012); `read_only()` (1051)
   - `scripts/test_times/gate_record.py` — the `gate_run` record types (`ModuleTimes`, `ModuleRun`, `SuiteRun`, `GateRun`, `NoModuleTimes`), `TYPE_CHECK_JOB` (38), `read_module_times` (131), `kept_tests` (153), `slow_test_s` (162), `write_gate_run` (166) Since Phase 2: `Execution` (106), `module_runs` (185), `report_not_written` (213), `write_gate_run` (219).
   - `scripts/buildlog/cli.py` — runs `index.update()` before each report (140)
   - `scripts/lib/conf.py` — `read(file).number(key)`; a config file puts a `# range: 0..` or `# whole: 1..` line directly above each `KEY=value` (see `config/mesh_runs.conf`)
@@ -74,7 +76,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
      - Call code in-process in place of a subprocess when the test does not check the process boundary; keep one process test for each boundary.
      - Split a module whose tests are independent into two or more files, so the gate runs them at the same time. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time. Every file of the group is in acceptance. Time the group with one `module_run.py` process per file, all started at once (as `pairs.sh` does), from the first start to the last end. The gate runs at most half the CPU count of modules at once (`DEFAULT_MAX_RUNNING_JOBS` in `merge_gate.py`); a group with more files than that gains less in the gate.
   4. A change to a shared support file (for example `scripts/lint/memory_test_support.py`) is allowed only when every module that imports it stays green; name those importers in the final gate run.
-  5. After the edit, measure the gain in same-load pairs: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. A floor names its cost breakdown and the one operation that limits it. A proposal names its owner, its revisit condition, and whether its gain is measured or estimated. The pair tool prints the before and after medians as a table when it ends. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
+  5. After the edit, measure the gain in same-load pairs: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. Each side sets `TMPDIR` to its own folder under `/dev/shm` and removes it after the round, because the gate runs there and pays no `fsync` cost (Phase 47). A number on the normal disk is a separate result. The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. A floor names its cost breakdown and the one operation that limits it. A proposal names its owner, its revisit condition, and whether its gain is measured or estimated. The pair tool prints the before and after medians as a table when it ends. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
 
 ## Phases
 
@@ -673,7 +675,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/production -p 'test_merge_gate_ledger.py'` green, with the same test names and assertions
-- all 12 `scripts/production/test_merge_gate*.py` modules green, with the same test names and assertions; each module's before and after time in same-load pairs
+- all 12 `scripts/production/test_merge_gate*.py` modules and `scripts/production/test_full_test.py` green, with the same test names and assertions; each module's before and after time in same-load pairs
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
@@ -974,7 +976,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the full test green on the phase commit merged with `origin/builds`.
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
 
-### Phase 43 — `direct/test_verify_token_renew.py` runs in half its time  · status: todo
+### Phase 43 — `direct/test_verify_token_renew.py` runs in half its time  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -989,7 +991,6 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Files:**
 - `scripts/direct/test_verify_token_renew.py` — the module
-- `scripts/direct/verify_token_wait_test_support.py` — `wait_for_output` accepts either Popen text mode
 
 **Workers:** 1 writer on slot `impl` (one module; the file does not split; slot `test` holds the Phase 36 repair)
 - `impl` — all files above, role impl
@@ -1027,6 +1028,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Constraints from prior phases:**
 - Phase 40 measured the cost; the module itself is at a floor.
+- Verify Phase 35 replaces the `None` source and merge policies of `copies.standing` with named types. Build on those types.
 - Recovery from missing borrowed objects stays (`copies.py:349`, `test_copies.py:980`). If the refresh error path changes, replace `PostUseError.caller_error: BaseException | None` (`copies.py:110`) with named caller outcomes.
 
 **Acceptance gate:**
@@ -1078,10 +1080,10 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 #### Work Order
 
-**Goal:** every queue sentence shows the shown step name, and one file holds the suite-runner names. Phase 36 left both, under the landing rule.
+**Goal:** every queue sentence shows the step name that the user reads, and one file holds the suite-runner names. Phase 36 left both, under the landing rule.
 
 **Spec:**
-1. `queue_evidence.running_text` (`queue_evidence.py:299`) and `queue_evidence.release_text` (`queue_evidence.py:224`) print the raw step id, so a card can say `full-test`. Print `names.shown(step)` with a required `names: StepNames` keyword, as `need_text` does. `queue_card.py` passes `model.names`.
+1. `queue_evidence.running_text` (`queue_evidence.py:299`) and `queue_evidence.release_text` (`queue_evidence.py:224`) print the raw step id, so a card can say `full-test`. Print `names.prose(step)` with a required `names: StepNames` keyword, as `need_text` does. `queue_card.py` passes `model.names`.
 2. `hold_enforcer.py`, `scope_activity.py` and `pre-tool-use-build-hold-guard.py` each define `SUITE_RUNNERS` and `SUITE_MODULES`. Add `scripts/lib/suite_runners.py` with these two sets and one `starts_suite_runner(target)`, standard library only. `scope_activity.py` keeps its own scan of every argument and uses the two sets.
 3. If the admission service imports the new file, add it to `admission_code.ADMISSION_CODE_PATHS`.
 4. `build_hold.py:493` stays on hold until the showrunner sends natedev messaging's main hash. When the hash comes, that line uses `SUITE_RUNNERS` in this phase or in a small follow-up.
@@ -1091,16 +1093,17 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_admission_protocol.py` — item 1 (owner: queue unit)
 - `scripts/lib/suite_runners.py` — new file
 - `scripts/build_hold/hold_enforcer.py`, `scripts/build_queue/scope_activity.py`, `scripts/build_queue/admission_code.py`, `scripts/hooks/pre-tool-use-build-hold-guard.py` — item 2
+- `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — item 4, only after the hold ends
 
-**Workers:** 1 writer on slot `test` (few lines, and one file set holds the step name work)
-- `test` — all files above
+**Workers:** 1 writer on slot `impl` (few lines; slot `test` holds Phase 37)
+- `impl` — all files above
 
 **Constraints from prior phases:**
 - Phase 36: `StepNames` reads config once per queue model, and renderers read no file.
 - The hook starts on every Bash call, so `scripts/lib/suite_runners.py` imports only the standard library.
 
 **Acceptance gate:**
-- A test with a running `full-test` step: `running_text` and `release_text` print `full test` and never `full-test`.
+- A test with a running `full-test` step and a running `merge-gate` step: `running_text` and `release_text` print `full test` and `merge gate`, and never the raw step id.
 - `python3 -m unittest discover -s scripts/build_queue -p 'test_*.py'` green, with `scripts/hooks/test_build_hold_guard.py` and the `scripts/build_hold` modules
 - `git grep -n 'SUITE_RUNNERS = '` finds one line
 - the full test green on the phase commit merged with `origin/builds`
@@ -1113,7 +1116,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Goal:** no shell script starts a bare `python3`, so a Mac with Apple's Python 3.9 first on PATH starts the right interpreter. The showrunner chose this sweep, 2026-11-05 (Phase 38 finding F006).
 
 **Spec:**
-1. The 17 starts: `berth_fix/capture.sh:44`; `berth_fix/launch.sh:44,69,82,101,116`; `bevy_migration_plan/bevy_migration_count_pattern.sh:48`; `direct/board.sh:173,230,287`; `lint/memory_gate.sh:21,124,148`; `production/mac_run.sh:74,96`; `statusline/statusline.sh:66,76`. Find the current line numbers with `git grep`.
+1. The 17 starts: `berth_fix/capture.sh:44`; `berth_fix/launch.sh:44,69,82,101,116`; `bevy_migration_plan/bevy_migration_count_pattern.sh:48`; `direct/board.sh:173,230,287`; `lint/memory_gate.sh:21,124,148`; `production/mac_run.sh:74,96`; `statusline/statusline.sh:66,76`. Find the current line numbers with `git grep`. Also: `agents/test_agent_exec.sh` (7 starts), `agents/test_launcher_tasks.sh:28`, `lib/test_models_registry.sh:7`. `direct/verify.sh:259` and `rust_style/load-rust-style.sh:8` default `CLAUDE_PYTHON` to `python3`: change the default only if the readers can start it. Before the first edit, run the survey `git grep -nE '\bpython3\b' -- '*.sh'` again.
 2. Keep each start's arguments, stdin and exit status. Use the Phase 38 form, so a filename-only start and a symlink start still resolve the launcher.
 3. `statusline.sh` and `board.sh` start often. Measure the time of one start before and after, and put both numbers in the notice.
 4. Workers run `board.sh` in a sandbox, so run one `board.sh post` in a sandboxed worker before the checkpoint.
@@ -1127,6 +1130,8 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/lint/memory_gate.sh` — tell the queue unit before the edit; it owns line 160
 - `scripts/production/mac_run.sh`
 - `scripts/statusline/statusline.sh`
+- `scripts/agents/test_agent_exec.sh`, `scripts/agents/test_launcher_tasks.sh`, `scripts/lib/test_models_registry.sh` — shell tests with starts
+- `scripts/direct/verify.sh`, `scripts/rust_style/load-rust-style.sh` — the `CLAUDE_PYTHON` default; tell the verify unit before the `verify.sh` edit
 - `scripts/mac_test/test_offload.py` — with any other test module that copies these scripts into a fixture
 
 **Workers:** 1 writer on slot `impl3` (one rule across small files)
@@ -1166,17 +1171,80 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/direct/verify_token_wait_test_support.py`
 - `scripts/direct/verify_hold_wait_test_support.py`
 - `scripts/direct/verify_mac_offload_test_support.py`
+- `scripts/direct/test_verify_hold_events.py` — the open-writer test
 
-**Workers:** 1 writer on slot `impl` (one wait, used by every file)
-- `impl` — all files above
+**Workers:** 1 writer on slot `test` (one wait, used by every file; slot `impl` holds Phase 48)
+- `test` — all files above
 
 **Constraints from prior phases:**
 - Phase 43: the shared mask has no `IN_MODIFY`, so a file that a live writer keeps open sends no event until its last close.
 - Turned on for every caller, a write watch wakes on each write in a busy directory, and predicates can read half-written files. Keep it off by default.
+- Architect review after Phase 36: keep the production mask equal to `0xFC8`. `inotify.DIRECTORY_CHANGES` also holds `IN_ATTRIB`, so it is not that mask. Keep the recursive subscriptions and the unrestricted event reads of the two fixtures when their patches go.
 
 **Acceptance gate:**
 - A test: a live writer adds a line to a file it keeps open, and `wait_until(..., watch_writes=True)` returns before the file closes.
 - `git grep -n '0x00000FC'` finds one definition at most, outside `codex_mesh.py`.
 - Each caller module of the changed files green in the gate form; `merge_gate.py` waits have the same events.
 - Same-load pairs for `direct/test_verify_hold_*` and `direct/test_verify_mac_only.py`, before and after, in the notice.
+- The full test green on the phase commit merged with `origin/builds`.
+
+### Phase 51 — `direct/test_simplify_lens.py` runs in less time  · status: todo
+**Depends on:** none
+**Blocked by:** devtools 7u on main, about 23:30 EST; the showrunner sends the word. Build on main after it lands. 7s rebases on this phase.
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_simplify_lens.py` (179 s wall, 135 CPU s; its Phase 6 floor is 118 s) falls under its floor again, or a new measured floor shows why it cannot, with every checked behavior kept. The Phase 36 architect review picked it: it is the top module over its floor that no phase holds, outside the routes that other units own.
+
+**Spec:** Follow the Speed method.
+1. The module had 17 tests at Phase 6, and it has 30 now. Profile before any edit. Name what the added tests cost and what each review-launcher run costs.
+2. `test_report_validation_trims_whitespace_and_requires_pass_or_a_numbered_item` runs the review launcher 8 times, and each run checks the report result, the saved status and the record's `status` and `raised` fields. Keep each check and each process boundary that a check needs.
+3. Cut in the Speed method's order. A cut in a production file or a support file goes to the director first, with the measured gain.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/direct/test_simplify_lens.py` — the module (recent owner: sdlc-devtools); tell the showrunner at start
+
+**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 6: one real review-launcher run per test takes 3-6 s, and a parse-only call cannot replace the recorder checks.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/direct -p 'test_simplify_lens.py'` green, with the same test names and assertions
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 52 — One shared reader for Git blobs, trees and status  · status: todo
+**Depends on:** Phase 37
+
+#### Work Order
+
+**Goal:** one reader for each Git batch format. The Phase 37 simplify review found the copies.
+
+**Spec:**
+1. Move `style_ledger.blob_contents` (`style_ledger.py:1893`) and `style_ledger.tree_entries` (`style_ledger.py:1862`) into `scripts/style/git_process.py`, standard library only.
+2. Remove the copies: `affected_modules.blob_texts`, `affected_modules.revision_files`, `phase_process.py:1046`, `feature_log/inventory.py:285`, `bulk_run.py:794`. Check that each copy has the same behavior before you replace it.
+3. `scripts/style/unit_files.py:145-154` uses one `status --porcelain -z` parser with `affected_modules.dirty_paths`. Choose the home with the fewest imports.
+4. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/style/git_process.py`, `scripts/style/style_ledger.py`, `scripts/style/bulk_run.py`, `scripts/style/unit_files.py` — owner: style
+- `scripts/production/affected_modules.py`
+- `scripts/direct/phase_process.py`
+- `scripts/feature_log/inventory.py`
+
+**Workers:** 1 writer on slot `impl` (one move, used by every file)
+- `impl` — all files above
+
+**Constraints from prior phases:**
+- Phase 37: `affected_modules.blob_texts` raises `GraphError` on a failed read, and the selection turns that into a full run.
+
+**Acceptance gate:**
+- `git grep -n 'cat-file.*--batch'` finds one framing reader outside a test.
+- Each caller module of the changed files green in the gate form.
 - The full test green on the phase commit merged with `origin/builds`.

@@ -28,12 +28,11 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
   - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
   - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
-- [ ] **Select the next speed target after Phases 24 and 27.**
+- [ ] **Select the next speed target after Phases 24 and 27.** Phase 51 takes `direct/test_simplify_lens.py` (Phase 36 architect review, 179.022 s wall, 134.969 CPU s).
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
   - Candidate: `direct/test_verify_mac_only.py`, rank 1 at 358.7 s (CPU 339.3 s, 17 tests) in `top --repo ~/.claude` on 2026-11-05 08:15 EST. Free since verify's Mac retry hang fix landed on builds at 0380fb6ea (showrunner, 2026-11-05). Merge builds first and take a new baseline.
   - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), was Phase 31 (floor below). `production/test_fast_track.py`, rank 4 at 216.9 s on 2026-11-05, is Phase 33 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
-  - Candidate: `direct/test_verify_lint_cache_versions.py`, rank 8, median 135.1 s wall and 89.3 s CPU. Start with a profile inside the test module. The verify unit owns it; confirm the holder with the showrunner before an edit.
   - Held: `style/test_style_sync.py`; sdlc-devtools has open edits.
   - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
 - [ ] **Architecture proposal: the type-check job**
@@ -51,7 +50,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: the test starts one Python process for each of the 33 `test_*.py` modules in `scripts/buildlog`: 24.5 s of the 34.8 s suite run at load 70 (11:24 EST, 2026-11-03). It is the slowest test in the index suite, and each new module adds one more process.
   - Completed by Phase 28: eight workers run one process for each discovered module, and each module keeps both checks in its own subTest. Paired module medians: 26.0 s -> 5.8 s.
   - Revealed by: Phase 3
-- [ ] **The simplify-lens report validation test starts fewer processes and keeps its recorder checks.**
+- [x] **The simplify-lens report validation test starts fewer processes and keeps its recorder checks.** Phase 51 owns this.
   - Target: `scripts/direct/test_simplify_lens.py` — `test_report_validation_trims_whitespace_and_requires_pass_or_a_numbered_item` (25 s, 8 review-launcher runs)
   - Why needed: Phase 6 left this test as the module's largest cost. Each of the 8 runs checks the report result, the saved status and the review record's `status` and `raised` fields, so a parse-only call cannot replace them.
   - Completion condition: every existing check stays; the needed process boundaries stay; same-load pairs show the gain.
@@ -81,7 +80,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Measure `test_verify_lint_judgment.py` again when its owners' changes land.**
   - Target: `direct/test_verify_lint_judgment.py` (198.6 s after Phase 31)
   - Owners (showrunner, 2026-11-05): queue-unit fixes the admission start spacing in `scripts/build_queue/admission_test_support.py` (first after 10x) and takes the lighter admission client start (`scripts/lint/memory_gate.sh:17-22`), with the `build_hold.py` import proposal. verify-unit takes step-record state reuse (`verify.sh:356-358`, `verify.sh:1925-1934`), next after its Phase 35, then a callable repair decision (`verify.sh:3711-3714`).
-  - Phase 45 also measures the step-record reuse on `direct/test_verify_lint_cache_versions.py`: 486 starts, 23.1 of 94.0 CPU s. Pair both modules when it lands.
+  - Phase 45 recorded 486 step-record starts and 23.1 of 94.0 CPU s in `direct/test_verify_lint_cache_versions.py`. Natest pairs both lint modules after verify-unit lands the step-record reuse.
   - Completion condition: same-load pairs on builds after each change lands; the Floors row moves to the new median.
   - Revealed by: Phase 31, 2026-11-05.
 - [x] **Document the gate's discover form without PYTHONPATH.** Phase 34 corrected the Mac instructions. Every code runner already uses discover. The report unit owns the `docs/plans/builds-report.md:76` command. No package or import rewrite remains.
