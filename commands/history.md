@@ -55,7 +55,7 @@ unconverted.
   keys are rejected
 - `phases` — review and fix rounds per phase, grouped by `(run, phase)`; columns
   `run  phase  reviews  fixes  impl  fix  total`
-- `rounds` — repair rounds and causes per phase instance; median and shares cover phases with a recorded review start; lists unreviewed phases separately in the summary; `--top N` (default 25), `--plan <substring>`, `--status`, `--until` (same forms as `--since`); marks mixed phase records
+- `rounds` reports repair rounds and causes per phase instance. A round requires a started fix pass. Relaunches of one ledger batch count as one round. A refunded batch adds no round unless it later lands. A dispatch alone adds no round. Median and shares cover phases with a recorded review start. The summary lists unreviewed phases separately. Options include `--top N` (default 25), `--plan <substring>`, `--status`, and `--until` (same forms as `--since`). The report marks mixed phase records.
 - `routed [--open] [--since <time>] [--format text|json]` — routed findings, owners, Work Orders, due checkpoints, age and closure; read-only (the user, 2026-10-28)
 - `runs` — one row per run
 - `tests` — verification and smoke history
