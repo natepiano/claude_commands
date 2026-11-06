@@ -101,11 +101,13 @@ import pathlib
 import sys
 
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
+(root / 'delivered_to.txt').write_text(sys.argv[sys.argv.index('--to') + 1])
 transcript = pathlib.Path(os.environ['STUB_TRANSCRIPT'])
 from scripts.production import staff, session_staff
 rows = staff.local_snapshot()
 worker = rows.by_current_session(transcript.name.removesuffix('.jsonl'))
-(root / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(rows, worker.id)))
+if worker is not None:
+    (root / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(rows, worker.id)))
 (root / 'delivered_message.txt').write_text(pathlib.Path(sys.argv[sys.argv.index('--file') + 1]).read_text())
 behavior = os.environ.get('STUB_SEND_BEHAVIOR', 'complete')
 if behavior == 'queued':

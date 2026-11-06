@@ -12,10 +12,28 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.direct import assign, workers
-from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_slot
+from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_slot, worker_status_path
 
 
 class WorkerStateTests(unittest.TestCase):
+    def test_temporary_status_copies_do_not_replace_the_current_phase_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            phase = run / "phases" / "build"
+            copied = run / "tmp" / "fixture" / "phases" / "build"
+            phase.mkdir(parents=True)
+            copied.mkdir(parents=True)
+            original = phase / "impl_status_impl"
+            _ = original.write_text("implementing\n")
+            _ = (run / "impl_status_impl").write_text("implemented\n")
+            temporary = copied / "impl_status_impl"
+            _ = temporary.write_text("implemented\n")
+            os.utime(run / "impl_status_impl", (1, 1))
+            os.utime(original, (2, 2))
+            os.utime(temporary, (3, 3))
+            self.assertEqual(worker_status_path(run, "impl").read_text(), "implementing\n")
+            self.assertEqual(worker_status_path(run, "impl"), original)
+
     def test_an_existing_repair_identity_keeps_its_file_and_a_new_impl_gets_a_distinct_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)

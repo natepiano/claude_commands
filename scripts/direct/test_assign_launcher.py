@@ -11,17 +11,20 @@ from pathlib import Path
 from typing import TextIO, TypedDict, cast, final, override
 from unittest.mock import patch
 
-from scripts.agents import test_codex_mesh as mesh_fixture
+from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
+from scripts.direct import assign, progress_history
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
-from scripts.direct import assign
 from scripts.direct.findings_test_support import invoke_findings
-import herdr
-
+from scripts.lint import style_review
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
 from scripts.production.cli_fixture import invoke_cli
-from scripts.direct import progress_history
-from scripts.lib.atomic_file import write_text_atomic
-from scripts.lint import style_review
+from scripts.production.staff_test_support import fixture_worker, transcript_fixture
+from scripts.usage import agents_log
+from datetime import datetime, timezone
+
+import herdr
 
 
 def setUpModule() -> None:
@@ -204,6 +207,163 @@ class PaneReviewLauncherTests(unittest.TestCase):
 
 @final
 class AssignLauncherTests(AssignLauncherFixture):
+    def test_claude_worker_returns_through_start_and_then_follows_its_codex_thread(self) -> None:
+        self.commit_project()
+        Path(os.environ["NOTIFIER_SESSIONS_DIR"]).mkdir(parents=True, exist_ok=True)
+        owner = staff.native_id(os.environ["CODEX_THREAD_ID"])
+        row = fixture_worker("switch1", owner, backend=staff.ClaudeBackend())
+        source, evidence = transcript_fixture(row, staff.ClaudeBackend())
+        agents_log.append(row.current_session, "interactive", None, datetime.now(timezone.utc))
+        roster = self.session_dir / codex_mesh.ROSTER_FILE
+        _ = roster.write_text(json.dumps({row.name: {"staff_id": row.id, "status": "done"}}))
+        commands = self.session_dir.parent / "mesh-commands.jsonl"
+        releases = self.session_dir.parent / "source-releases.jsonl"
+        directory = self.session_dir.parent / "instrument-mesh"
+        directory.mkdir()
+        code = "\n".join((
+            "import json, os, sys",
+            "from pathlib import Path",
+            "def enter(frame, event, argument):",
+            "    if event != 'call' or frame.f_code.co_name != 'main' or not frame.f_code.co_filename.endswith('/agents/codex_mesh.py'): return",
+            "    sys.setprofile(None)",
+            "    mesh = sys.modules['__main__']",
+            f"    with Path({str(commands)!r}).open('a') as output: output.write(json.dumps(sys.argv[1:]) + chr(10))",
+            "    def start_server(session_dir, workers_home, *extra):",
+            f"        Path(session_dir, mesh.SERVER_FILE).write_text(json.dumps({{'pid': os.getpid(), 'port': {self.server.port}, 'codex_home': str(workers_home), 'auto_compact_tokens': mesh.AUTO_COMPACT_TOKENS, 'dev_shell_worktree': {str(self.project)!r}}}))",
+            f"        return {self.server.port}",
+            "    mesh._start_server = start_server",
+            "    mesh._start_watcher = lambda *args: mesh.ExistingServerWatcher()",
+            "    def observe_release(frame, event, result):",
+            "        if event == 'return' and frame.f_code.co_name == 'release_source' and frame.f_code.co_filename.endswith('/shutdown/stop_resume.py'):",
+            "            row = frame.f_locals['row']",
+            f"            with Path({str(releases)!r}).open('a') as output: output.write(json.dumps({{'session': row.current_session, 'result': type(result).__name__}}) + chr(10))",
+            "    sys.setprofile(observe_release)",
+            "sys.setprofile(enter)",
+        ))
+        _ = (directory / "sitecustomize.py").write_text(code)
+        with patch.dict(os.environ, {"PYTHONPATH": str(directory) + os.pathsep + str(ASSIGN.parents[2])}):
+            for live_server, named in ((False, True), (True, True), (True, False)):
+                with self.subTest(live_server=live_server, named=named):
+                    if not live_server:
+                        (self.session_dir / codex_mesh.SERVER_FILE).unlink(missing_ok=True)
+                    else:
+                        mesh_fixture.write_server_record(self.session_dir, self.server.port, self.home / ".codex",
+                                                         str(self.project))
+                    if not named:
+                        agents_log.append(row.current_session, "impl", None, datetime.now(timezone.utc))
+                    commands.unlink(missing_ok=True)
+                    self.server.requests.clear()
+                    image = self.session_dir.parent / "attached.png"
+                    image.touch()
+                    result = self.launch("implement", "--image", str(image), *(("--to", row.name) if named else ()))
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    called = [cast(list[str], json.loads(line))[0] for line in commands.read_text().splitlines()]
+                    self.assertIn("start", called)
+                    self.assertNotIn("can-follow", called)
+                    self.assertNotIn("follow", called)
+                    current = staff.by_id(row.id)
+                    assert current is not None
+                    self.assertNotEqual(current.current_session, row.current_session)
+                    self.assertEqual(current.to_json() | {"current_session": row.current_session}, row.to_json())
+                    self.assertEqual(len(self.methods("turn/start")), 1)
+                    extract = worker_admission.handoff_path(self.session_dir, row)
+                    self.assertIn(evidence[0][0], extract.read_text())
+                    opening = self.turn_inputs[-1]
+                    self.assertLess(opening.index(str(extract)), opening.index(self.prompt.read_text()))
+                    self.assertIn(str(source), opening)
+                    self.assertIn(str(image.resolve()), opening)
+                    stopped = [cast(dict[str, object], json.loads(line)) for line in releases.read_text().splitlines()]
+                    self.assertEqual(stopped[-1], {"session": row.current_session, "result": "SourceReleased"})
+                    commands.unlink()
+                    self.server.requests.clear()
+                    follow = self.launch("implement", "--to", row.name)
+                    self.assertEqual(follow.returncode, 0, follow.stdout + follow.stderr)
+                    called = [cast(list[str], json.loads(line))[0] for line in commands.read_text().splitlines()]
+                    self.assertIn("can-follow", called)
+                    self.assertIn("follow", called)
+                    self.assertNotIn("start", called)
+                    self.assertEqual(staff.by_id(row.id), current)
+                    self.assertEqual(len(self.methods("turn/start")), 1)
+                    _ = staff.update_current_session(current.current_session, staff.native_id(row.current_session))
+                    _ = roster.write_text(json.dumps({row.name: {"staff_id": row.id, "status": "done"}}))
+
+    def test_codex_retry_starts_with_the_saved_handoff_and_accepted_or_unrelated_work_follows(self) -> None:
+        self.commit_project()
+        _ = self.successful("implement", "--new-worker", "retry1")
+        row = worker_admission.member(self.session_dir, "retry1", staff.local_snapshot())
+        assert row is not None
+        roster = self.session_dir / codex_mesh.ROSTER_FILE
+        original = read_object(roster)
+        _ = self.prompt.write_text("Continue the interrupted switch.\n")
+        request = worker_admission.assignment_id(self.prompt)
+        extract = worker_admission.handoff_path(self.session_dir, row)
+        _ = extract.write_text(f"{worker_admission.HANDOFF_SOURCE_PREFIX}{self.session_dir / 'source.jsonl'}\nKeep the source work.\n")
+        commands = self.session_dir.parent / "retry-commands.jsonl"
+        directory = self.session_dir.parent / "retry-observer"
+        directory.mkdir()
+        _ = (directory / "sitecustomize.py").write_text("\n".join((
+            "import json, sys",
+            "from pathlib import Path",
+            "def observe(frame, event, argument):",
+            "    if event == 'call' and frame.f_code.co_name == 'main' and frame.f_code.co_filename.endswith('/agents/codex_mesh.py'):",
+            f"        with Path({str(commands)!r}).open('a') as output: output.write(json.dumps(sys.argv[1:]) + chr(10))",
+            "        sys.setprofile(None)",
+            "sys.setprofile(observe)",
+        )))
+        cases = (("prepared", request, True), ("sending", request, True), ("", request, True),
+                 ("accepted", request, False), ("sending", "another-prompt", False))
+        with patch.dict(os.environ, {"PYTHONPATH": str(directory) + os.pathsep + str(ASSIGN.parents[2])}):
+            for state, identity, pending in cases:
+                with self.subTest(state=state, identity=identity):
+                    entry = cast(dict[str, object], original[row.name]).copy()
+                    entry.update(assignment_id=identity, dispatch_state=state)
+                    _ = roster.write_text(json.dumps({row.name: entry}))
+                    commands.unlink(missing_ok=True)
+                    self.server.requests.clear()
+                    result = self.launch("implement", "--to", row.name)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    called = [cast(list[str], json.loads(line))[0] for line in commands.read_text().splitlines()]
+                    self.assertIn("start" if pending else "follow", called)
+                    self.assertNotIn("can-follow" if pending else "start", called)
+                    if pending:
+                        self.assertNotIn("follow", called)
+                        opening = self.turn_inputs[-1]
+                        self.assertLess(opening.index(str(extract)), opening.index(self.prompt.read_text()))
+                    self.assertEqual(self.methods("thread/start"), [])
+                    self.assertEqual(staff.by_id(row.id), row)
+
+    def test_assignment_shares_one_generation_through_allocation_and_refreshes_the_next_launch(self) -> None:
+        probe = RegistryReadProbe(self.session_dir.parent, self.registry)
+        _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-kept-sol:high"},
+                                           "codex.agents": {"gpt-kept-sol": "high", "gpt-other-sol": "high,max"},
+                                           "direct.options": {"codex_service_tier": "fast"}})
+        original = self.server.respond
+        edited = False
+
+        @self.hang_guard.callback
+        def change_after_creation(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal edited
+            if request.get("method") == "thread/start" and not edited:
+                edited = True
+                _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-other-sol:max"},
+                                                   "codex.agents": {"gpt-other-sol": "high,max"},
+                                                   "direct.options": {"codex_service_tier": "flex"}})
+            return original(request)
+
+        self.server.respond = change_after_creation
+        with patch.dict(os.environ, probe.environment(os.environ)):
+            for expected in (("gpt-kept-sol", "high", "fast"), ("gpt-other-sol", "max", "flex")):
+                with self.subTest(expected=expected):
+                    probe.clear()
+                    self.server.requests.clear()
+                    _ = self.successful(execution=LauncherScript(ASSIGN))
+                    turns = self.methods("turn/start")
+                    self.assertEqual(len(turns), 1)
+                    params = cast(dict[str, object], turns[0]["params"])
+                    self.assertEqual((params.get("model"), params.get("effort"), params.get("serviceTier")), expected)
+                    self.assertEqual(len(probe.reads()), 1, probe.reads())
+        self.assertTrue(edited)
+
     def test_herdr_assignment_retains_unknown_workers_without_a_mesh_backend(self) -> None:
         _ = (self.session_dir / "worker_transport").write_text("herdr\n")
         before = Path(os.environ["STAFF_FILE"]).read_bytes()

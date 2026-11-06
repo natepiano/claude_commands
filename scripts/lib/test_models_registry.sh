@@ -7,6 +7,19 @@ write_test_registry() {
     MODELS_CONFIG_PUBLISH=0 python3 "$TEST_MODELS_REGISTRY_DIR/test_models_registry.py" "$@"
 }
 
+registry_read_probe() {
+    eval "$(python3 - "$TEST_MODELS_REGISTRY_DIR/../.." "$1" "$2" <<'PYTHON'
+import os, shlex, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts.lib.test_models_registry import RegistryReadProbe
+environment = RegistryReadProbe(Path(sys.argv[2]), Path(sys.argv[3])).environment(os.environ)
+for name in ("TEST_REGISTRY_PATH", "TEST_REGISTRY_READS", "PYTHONPATH"):
+    print(f"export {name}={shlex.quote(environment[name])}")
+PYTHON
+    )"
+}
+
 # Compare complete registry records without depending on comment or section order.
 registry_records() {
     awk '

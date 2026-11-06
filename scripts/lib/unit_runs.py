@@ -234,22 +234,27 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
         return ""
 
 
-def held_by_session(root_override: str | Path | None = None, *,
-                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
-    """Read each folder's director once, in root order and then name order."""
-    found: dict[str, list[str]] = {}
-    seen: set[Path] = set()
+def run_folders(root_override: str | Path | None = None) -> list[Path]:
+    """List unique run folders in root and name order, without marker folders."""
+    folders: dict[Path, Path] = {}
     for root in run_roots(root_override):
         try:
-            folders = sorted(root.iterdir())
+            candidates = sorted(root.iterdir())
         except OSError:
             continue
-        for folder in folders:
-            resolved = folder.resolve()
-            if (folder.is_dir() and resolved not in seen
-                    and any((folder / name).is_file() for name in (STATE_FILE, "mesh_roster.json"))):
-                seen.add(resolved)
-                found.setdefault(director(folder, record=record), []).append(str(folder))
+        for folder in candidates:
+            if folder != root / "active" and folder.is_dir():
+                _ = folders.setdefault(folder.resolve(), folder)
+    return list(folders.values())
+
+
+def held_by_session(root_override: str | Path | None = None, *,
+                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
+    """Read each run's director once, in root and name order."""
+    found: dict[str, list[str]] = {}
+    for folder in run_folders(root_override):
+        if any((folder / name).is_file() for name in (STATE_FILE, "mesh_roster.json")):
+            found.setdefault(director(folder, record=record), []).append(str(folder))
     return found
 
 
