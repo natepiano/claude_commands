@@ -655,7 +655,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 4. A change to `merge_gate_test_support.py` keeps every `test_merge_gate*.py` module green; name each one in the final run.
 5. The two files belong to the sdlc production. sdlc devtools-unit holds them on an unmerged branch while it repairs a `merge_gate.py` guard (showrunner, 2026-11-05). sdlc gave natest the `run_gate` clock fix. The code step starts only after the builds showrunner sends the go with the main hash of devtools' repaired combined merge (due about 07:10 EST). That merge changes `merge_gate_test_support.py`: merge the hash first and build on it. The profile in step 1 is done.
 6. Profile result (2026-11-05, baseline median 118.2 s wall, 11.1 CPU s, 17 tests): 110.0 s is 22 admission start waits of about 5 s each. After each admission, `scripts/lint/memory_admit.py:3716` publishes `NextStartAt(now + recovery_start_seconds)` (`build_admission.conf`: 5 s). The private server keeps that deadline between the gates of one test, and `admission_test_support.py:357-365` moves its fake clock with real time. So each later gate in a test waits 5 real seconds. Seed builds (0.3 s), type environment builds (0.9 s) and scheduler polls (3.7 s, `merge_gate.py:1144`) are small.
-7. Code step (showrunner, 2026-11-05): the fixture does not advance the admission clock by hand. A manual `allow_next_start()` advance in each module is a workaround. queue-unit fixes the start spacing at its cause in the shared admission fixture (`scripts/build_queue/admission_test_support.py`), as its first item after 10x. The code step starts when that fix is on builds and the go in step 5 has come. Merge builds, then measure the module again in same-load pairs. If the module is at half time, record the result. If not, profile the rest and cut it in the Speed method's order. Keep hold, pressure, queued-head and timing behavior. Leave the mocked nightly calls. Keep every test name, assertion, gate order, module job and type job in all 12 `test_merge_gate*.py` modules. Do not set the spacing to zero or mock the admission result. Add no guard, refusal or check that this Work Order does not name. Projected ledger result after the queue fix: 8-12 s.
+7. Code step (showrunner, 2026-11-05): the fixture does not advance the admission clock by hand. A manual `allow_next_start()` advance in each module is a workaround. Queue Phase 13 fixed the start spacing at its cause: `advance_idle_spacing` in `scripts/build_queue/admission_test_support.py:369`, which `caller_admission` turns on by default. The code step starts when the go in step 5 has come. Merge builds, then measure the 18-test module in same-load pairs before any edit: runs on 2026-11-06 split into 14-17 s and 120-130 s, and the rolling median still reads about 125 s. If the module is at half time, record the result and close the phase with no edit. If not, profile the rest and cut it in the Speed method's order. Keep hold, pressure, queued-head and timing behavior. Leave the mocked nightly calls. Keep every test name, assertion, gate order, module job and type job in all 12 `test_merge_gate*.py` modules. Do not set the spacing to zero or mock the admission result. Add no guard, refusal or check that this Work Order does not name. Projected ledger result after the queue fix: 8-12 s.
 8. Later proposal, not this phase: `merge_gate.py` could wake on child exit in place of 0.05 s polls (at most 3.7 s here; owner sdlc devtools-unit).
 
 **Files:**
@@ -952,7 +952,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - Measured CPU before and after in the checkpoint notice: `test_verify_mac_only.py` in same-load pairs (`pairs.sh`), and one real `verify.sh` run.
 - Each caller module of `mac_idle.py` green, with the same test names and assertions.
-- the targeted test green on the phase commit merged with `origin/builds`.
+- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
 
 ### Phase 43 — `direct/test_verify_token_renew.py` runs in half its time  · status: done
@@ -995,7 +995,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - caller suites for `copies.py` green, `style/test_bulk_run.py` included (`bulk_run.test_tree` calls `copies.standing`)
 - measured before and after for `style/test_crate_run.py` and one `copies.py run`, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
+- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 45 — `direct/test_verify_lint_cache_versions.py` runs in half its time  · status: done
@@ -1193,7 +1193,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher.py'` green, with the same test names and assertions
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
+- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 56 — The SSH retained and retry tests run in half their time  · status: todo
@@ -1227,44 +1227,34 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets_retained.py'` and the same line for `test_verify_ssh_targets_retry.py` green, with the same test names and assertions
 - every importer of the support file green, if the phase changes it
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
+- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 57 — The merge tip holds the queue stack, and the unit's narrow run is called targeted test  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** One tip holds Phases 34 and 36-54 merged with `origin/builds`, with every conflict resolved. Every name and text that means the unit's narrow run says targeted test, in one change with all callers.
+- The branch holds builds 2cd281ee3 and this unit's Phases 34 and 36-54.
+- The unit's narrow run is `scripts/production/targeted_test.py`, with tests in `test_targeted_test.py`. `merge_gate.SuiteMode.TARGETED_TEST` is `"targeted-test"`.
+- Config keys: `names.targeted-test=targeted test` (`build_steps.conf`), `prefixes.targeted-test=targeted-test-` (`build_folders.conf`), `peak_hold_seconds.targeted-test=180` and `program_first_peak_gib.targeted-test=4` (`build_admission.conf`).
+- `scripts/lib/suite_runners.py` holds `SUITE_RUNNERS = frozenset({"merge_gate.py", "targeted_test.py"})`. `admission_code.py`, `admission_service.py`, `buildlog/index.py` and `hooks/pre-tool-use-build-hold-guard.sh` use the new step. `StepNames.memory_cap_text` is gone, because the queue stack removed its only caller.
+- `scripts/direct/board.sh:289` starts its Python block through `"$BOARD_DIR/../lib/py"`. `docs/plans/builds-queue.md` Phase 10v items 6 and 7 stand as builds wrote them.
+- `test_change_review.py` pins `unit_producer` on the exact staff name across productions, and `UnknownProducer` for duplicate and absent names.
+- Merge gate on the merged tree: one red module, `production/test_change_review.py`, later repaired. Its 112 tests pass on the tip merged with a8e9b1c42. Gate tests took 6220.74 s at load 55-135, with a peak of 2.006 GiB.
 
-**Spec:**
-1. Merge `origin/builds` in a private clone of this branch. Resolve each conflict so both sides' behavior stays. Read this plan's As-built for the phase on one side and the owner plan for the other side.
-2. Rename, from the user's words "Okay let's use targeted tests and not full tests". `full_test.py` becomes `targeted_test.py`. `test_full_test.py` becomes `test_targeted_test.py`. The step id `full-test` becomes `targeted-test`.
-3. Config keys, approved by the user: `names.targeted-test` is `targeted test`, `prefixes.targeted-test` is `targeted-test-`, and `peak_hold_seconds.targeted-test` is `180`.
-4. Change all text that means the unit's narrow run, in code, config, commands, docs and tests. "Merge gate" stays, with its meaning. A worker must leave no reader of the old names in main code.
-   These sites keep their words because they mean another thing: `verify.sh final`'s workspace tests in `commands/unit/direct.md`, `<full test worker name>` in `docs/direct/launch_implementation.md`, a cargo test request with a package in `queue_evidence.py`, `step_estimator.py` and `builds-resources.md`, a rerun of all modules in `merge_gate.py` and `test_merge_gate_suites_types.py`, and the full test id in `module_run.py`.
-   In `docs/plans/`, change Delegation Context lines and `todo` phases. A `done` phase and a quoted word are history and stay.
-5. Stored records and build folders with the old id or prefix get a one-off program at deploy, if any exist. The director checks live state at the merge and reports.
-6. `build_steps.memory_cap_text` has no caller on the merged tree: the queue stack removed the fixed caps. Delete it.
-7. Add no guard, refusal or check (user rule, 2026-11-05).
+**Files:**
+- `scripts/production/targeted_test.py`, `scripts/production/test_targeted_test.py` — the unit's narrow run and its tests
+- `scripts/lib/suite_runners.py` — the runners the guards recognize
+- `config/build_steps.conf`, `config/build_folders.conf`, `config/build_admission.conf` — the step's name, folder prefix and limits
+- `scripts/production/test_change_review.py` — exact-name producer tests
+- `scripts/direct/board.sh` — the board's Python start
 
-**Files:** Every file the merge conflicts in, and every file that holds the old name on the merged tree. The list is in `phases/57/files` of the run.
+**Binds later work:** Until the script is on main, a targeted run uses the tree's script with `CONF_DIR='{tree}/config'`, or the merge gate. Stored `full-test` rows in `anon_peaks.jsonl` and `queue_times.jsonl` stay as history. `build_hold.py:493` keeps the old word until the send freeze ends.
 
-**Workers:** 2 writers for the conflicts, split by file group. Then 1 writer for the rename, because all sites change together.
-- `impl` — conflicts in `docs/` and `scripts/` outside the build queue, then the rename
-- `impl3` — conflicts in `scripts/build_queue/`, `scripts/build_hold/` and `scripts/lint/`
+**Gotchas:** Before the tip lands, a plain targeted run refuses with `REFUSED: no first peak for targeted-test`. Before the tip is on builds, the selection covers about 564 of 716 modules, because the base is the merge base with builds. `publication_changes` can print "Producer stays empty" and keep `UnknownProducer` (`change_review.py:975-982`).
 
-**Constraints from prior phases:**
-- Phase 36: the unit's run selects modules, and the merge gate runs all modules. The rename changes neither behavior.
-- Phase 48: `names.` holds a step's table word, and `prose.` holds a step's sentence word. Other steps keep their current keys.
-
-**Acceptance gate:**
-- no conflict marker on the merged tree
-- `git grep -n -E 'full[-_ ]test|FULL_TEST|[Ff]ull [Tt]est'` finds only the sites Spec 4 keeps and history in `docs/plans/`
-- the targeted test reaches admission on the tip with `CONF_DIR` set to the tip's config, because the installed config has `program_first_peak_gib.targeted-test` only after the tip lands
-- the rename's run-time cost: names only, none measured; the first real run's time goes in the notice after landing
-- `merge_gate.py --tests-only` green on the tip
-- `basedpyright` on the changed Python files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** A test for a different relative production path: `read_production` and `production_doc` take `row.doc.path` from the staff row, so no caller can pass that path.
 
 ### Phase 58 — The hana_shot launch test reads no live build log  · status: todo
 **Depends on:** Phase 57
@@ -1293,6 +1283,6 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/hana_shot -p 'test_hana_shot.py'` green
-- the test run four times beside a process that appends to the real log, all green
+- the test run four times on the busy machine, all green; no run writes to the real log
 - the hand change in Spec 5 makes the test fail
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`

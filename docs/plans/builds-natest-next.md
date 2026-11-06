@@ -31,7 +31,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Select the next speed target after Phases 24 and 27.** Phase 51 closed with no edit: daily simplify work cut `direct/test_simplify_lens.py` to 15 tests and about 20 s. Phase 54 took `_reuse` and `_identity` of the assign launcher group (floors below). Phase 55 takes `test_assign_launcher.py` after models and herdr reach main. Phase 56 takes `test_verify_ssh_targets_retained.py` and `_retry.py` (2026-11-06).
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
-  - Candidate after Phase 56: `herdr/test_herdr.py`, median 68.3 s wall and 38.3 s CPU, latest 65.9 s (2026-11-06). Confirm owner availability after herdr lands, then measure the current revision. `direct/test_verify_mac_only.py` is at its floor (211.8 s against 212.0 s).
+  - Candidate after Phase 56: `style/test_style_proposals.py`, median 112.7 s wall and 60.8 s CPU (2026-11-06). Confirm owner availability, then measure the current revision before dispatch. Keep the floor rule for modules already improved: `direct/test_verify_mac_only.py` reads 251.2 s against its 212.0 s floor, 18% above and below the 20% rule.
   - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), was Phase 31 (floor below). `production/test_fast_track.py`, rank 4 at 216.9 s on 2026-11-05, is Phase 33 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
   - Held: `style/test_style_sync.py`; devtools holds it and `style_sync.py` until its phase is on main, and the showrunner sends the word (2026-11-06).
   - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
@@ -90,7 +90,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Revealed by: Phase 7; showrunner ruling 2026-11-04 (next, not current).
 - [ ] **Measure `test_verify_lint_judgment.py` again when its owners' changes land.**
   - Target: `direct/test_verify_lint_judgment.py` (198.6 s after Phase 31)
-  - Owners (showrunner, 2026-11-05): queue-unit fixes the admission start spacing in `scripts/build_queue/admission_test_support.py` (first after 10x) and takes the lighter admission client start (`scripts/lint/memory_gate.sh:17-22`), with the `build_hold.py` import proposal. verify-unit takes step-record state reuse (`verify.sh:356-358`, `verify.sh:1925-1934`), next after its Phase 35, then a callable repair decision (`verify.sh:3711-3714`).
+  - Queue Phase 13 completed the admission start-spacing fix. Measure both lint modules on the merged code. Owners (showrunner, 2026-11-05): queue-unit keeps the lighter admission client start (`scripts/lint/memory_gate.sh:17-22`) and the `build_hold.py` import work. verify-unit keeps step-record state reuse (`verify.sh:356-358`, `verify.sh:1925-1934`), then a callable repair decision (`verify.sh:3711-3714`).
   - Phase 45 recorded 486 step-record starts and 23.1 of 94.0 CPU s in `direct/test_verify_lint_cache_versions.py`. Natest pairs both lint modules after verify-unit lands the step-record reuse.
   - Completion condition: same-load pairs on builds after each change lands; the Floors row moves to the new median.
   - Revealed by: Phase 31, 2026-11-05.
