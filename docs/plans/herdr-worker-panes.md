@@ -2740,15 +2740,52 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Ruled out:** A retry of every changed listing, because a new descriptor must refuse.
 
+### Phase 14g — A worker from an earlier phase can be ended  · status: done
+
+**Depends on:** none. It lands before the switch, because the switch ends each open pane worker (user, 2026-11-06: "you have numerous open panes").
+
+#### As-built
+
+- `worker_panes.can_close` reads the resolved run's pass through `worker_pass`. With no pass there, it reads `progress_history.last_dispatch(row.id)`, the one reader across the parent's runs. So `worker.py end` ends an idle pane worker whose last pass finished in an earlier phase.
+- Either read must give status `completed`, and its `instance_id` is the dispatch id. The idle checks, the agent status, the transcript's complete records and the last `DONE <id>` or `DONE <id>-2` line stay as they were. A newer pass with any other status keeps the worker open.
+- A stopped worker passes on the idle checks alone.
+
+**Files:**
+- `scripts/herdr/worker_panes.py` — `can_close`.
+- `scripts/herdr/test_worker_panes.py` — a pass across a phase boundary, a newer error pass, an explicit run outside the run roots, and a showrunner's worker.
+
+**Gotchas:** `last_dispatch` scans only the run roots and `UNIT_RUN_DIR`, and `unit_runs.run_owner` accepts only a unit. So a pass from an earlier phase of a private run or of a showrunner's run stays `Kept`.
+
+**Ruled out:** `last_dispatch` as the only read, because it refuses an explicit private run and a showrunner's worker.
+
+### Phase 14h — A friend launches with the worker policy  · status: done
+
+**Depends on:** Phase 14g, because both phases change `scripts/herdr/worker_panes.py`.
+
+#### As-built
+
+- `worker_panes.worker_policy(settings)` returns the `LaunchPolicy` of a worker that writes files, for the supplied model settings. `launch_policy(role)` and `worker_policy` share `_launch_policy(settings, sandbox)`, which holds the permission and the compaction read.
+- `side_pane._policy` calls `worker_policy` with the `ask_a_friend.consultation` settings. `side_pane.py` names no sandbox and no permission mode. It still turns `conf.Unusable` into `SidePaneRefused`.
+- `commands/ask_a_friend.md` states that the friend has worker permissions, and that step 2's instruction to change files only after an explicit request holds it back.
+- `docs/as-built/agent-registry.md` states the friend's policy.
+
+**Files:**
+- `scripts/herdr/worker_panes.py` — `worker_policy`, `_launch_policy`.
+- `scripts/herdr/side_pane.py` — `_policy`.
+- `scripts/herdr/test_side_pane.py` — both families' permissions.
+- `commands/ask_a_friend.md`, `docs/as-built/agent-registry.md` — the statement of the policy.
+
+**Gotchas:** Plan mode allows an allowed Bash command, so a plan-mode friend can reply with `send.py`. Whether it stops at a prompt depends on the model's path. A reply with no prompt does not prove the policy.
+
 ### Phase 15 — Pilot and default switch  · status: todo
 
-**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14d, Phase 14e, Phase 14f. The switch waits for Phase 14d on main, because an Astra review from a mesh-pinned caller stays on the mesh (user and sdlc, 2026-11-06).
+**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14d, Phase 14e, Phase 14f, Phase 14g, Phase 14h. The switch waits for Phase 14d on main, because an Astra review from a mesh-pinned caller stays on the mesh (user and sdlc, 2026-11-06).
 
 #### Work Order
 
 **Goal:** herdr-unit's own next run works on panes, then the default becomes `herdr` and units switch at their run boundaries, Mac units after a Mac probe of Phases 6-7.
 
-**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. At the switch, end each open pane worker that predates the compaction option, under any holder. Read `worker.py list` for each holder. The director ends its own workers, and asks each other holder's owner to end that holder's workers. End a worker only when its pass is complete, because a same-role dispatch keeps a running process so that a rerun can recover an active pass (showrunner ruling, 2026-11-06: no pane worker runs after the switch without the option). Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
+**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. At the switch, end each open pane worker that predates the compaction option, under any holder. Read `worker.py list` for each holder. The director ends its own workers, and asks each other holder's owner to end that holder's workers. End a worker only when its pass is complete, because a same-role dispatch keeps a running process so that a rerun can recover an active pass (showrunner ruling, 2026-11-06: no pane worker runs after the switch without the option). A worker whose failed pass never reached its thread has no work to recover: its rollout holds no new user message. Type `/quit` in its pane, then run `worker.py end`, which accepts a stopped worker (done for `impl2`, 2026-11-06). Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
 
 **Files:**
 - `config/direct.conf` — `WORKER_TRANSPORT=herdr`.
@@ -2765,7 +2802,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 A pane worker opened after the switch shows `model_auto_compact_token_limit` in its process arguments. `worker.py list` for each holder shows no open pane worker from before the option.
 Resume a pane worker whose recorded folder differs from the current worktree. Require the same conversation, and the current worktree as its working folder.
 Require shutdown `b76d3b028` on sdlc and its worker-stop integration before the default switch.
-After Phase 12 reaches main, the director runs the installed Stop-hook friend proof for both families.
+After Phase 12 reaches main, the director runs the installed Stop-hook friend proof for both families. The proof runs on installed Phase 14g and Phase 14h code. A reply with no prompt does not prove the policy, because a plan-mode friend can also reply. So the proof also reads each family's permission arguments.
 Require the pilot run's phases to finish on panes.
 Require a live proof on the installed Phase 14d tree: a live detached result, a delayed pane status, a review Stage 2, a quiet wait that returns `NO_DONE`, and recovery through the saved launcher command.
 Require the pilot's Astra review to take a pane, print and save its reply, and retire its row while an unrelated Codex process is live. Keep `PaneAstraReviewTests` green for the failed end.
@@ -2815,7 +2852,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
 12. Test interrupted state retirement and a finished rerun that prints `unchanged` and changes nothing.
 13. Leave launcher consolidation to devtools 3t.
 14. **Phase 12 follow-ups.** Each item comes from the Phase 12 review.
-    1. An ad hoc Astra review outside the staff hierarchy moves to a side pane, after the reply wait and close exist (user, 2026-11-03: reviewers and designers run in herdr panes). Delete the one-turn `codex exec` branch of `astra_review.py` in the same change. Preserve the Astra reviewer settings, workers account, completed report file, printed report, and exit codes. The code writer owns the policy and report handling; the test writer owns the consumer tests.
+    1. An ad hoc Astra review outside the staff hierarchy moves to a side pane, after the reply wait and close exist (user, 2026-11-03: reviewers and designers run in herdr panes). Delete the one-turn `codex exec` branch of `astra_review.py` in the same change. Preserve the Astra reviewer settings, workers account, completed report file, printed report, and exit codes. `side_pane._policy` now always gives the friend's worker permissions (Phase 14h), and an Astra reviewer stays read-only. So the shared launch takes its policy as an explicit argument. A test proves that a friend keeps worker permissions and an Astra reviewer keeps read-only permissions. The code writer owns the policy and report handling; the test writer owns the consumer tests.
     2. Delete the old held-role paths: `MeshWorker` and its branches (`astra_roles.py:40`), the design mesh roster reads and edits (`design_roles._edit_roster` and `_roster`, `design_roles.py:507`, `:515`), `HeldRole.codex_home` (`astra_roles.py:67`), and the held and resident paths of `codex_mesh.py` (:2736). Old hold files and old designs change once, through a one-off program at deploy. Keep `ExecProcess(pid, start)` and `HeldDesignRole`: both stay current hold lifetimes.
     3. A held role is created with its final name (`design_roles.open_role`, `design_roles.py:642`). `astra_roles.live_roles` (`astra_roles.py:242`) scans the session once. An unbound role records `start-run` and `start-phase` once (`design_roles.py:591`).
     4. Remove the copies: one `worker_panes` rule for idle, busy or unknown (`astra_roles.py:270`); one `worker_panes` finder of a labelled pane in one tab (`side_pane.py:91`); one `PaneWorld` setup for the side pane tests (`SidePaneTests.setUp`, `test_side_pane.py:36`); one helper for the family tests of held roles (`test_design_roles.py:194`, `:212`); fixture recorder commands through `invoke_recorder` (`design_role_test_support.py:62`).

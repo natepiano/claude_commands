@@ -90,7 +90,7 @@ release_mac_claim() {
       elif ! on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" >/dev/null; then
         print -u2 "mac_run: remote clone registry cleanup failed"
         cleanup_failed=1
-      elif ! python3 $copies_script unregister-remote --host $host --path $clone; then
+      elif ! "$lib/py" $copies_script unregister-remote --host $host --path $clone; then
         print -u2 "mac_run: local clone registry cleanup failed"
         cleanup_failed=1
       fi
@@ -139,10 +139,10 @@ clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clon
 [[ $clone == /* && $clone != *$'\n'* ]] || { print -u2 'mac_run: scratch clone returned no absolute checkout'; exit 4 }
 clone_arg=${(q)clone}
 registry_args=(--repository hana --owner $copy_owner --host $host --path $clone --session $copy_session)
-mirror_lease=$(python3 $copies_script register-remote "${registry_args[@]}" --shell-lease) || exit 4
+mirror_lease=$("$lib/py" $copies_script register-remote "${registry_args[@]}" --shell-lease) || exit 4
 exec 8>"$mirror_lease"
 flock 8
-python3 $copies_script register-remote "${registry_args[@]}" || exit 4
+"$lib/py" $copies_script register-remote "${registry_args[@]}" || exit 4
 base=$(ssh $host "git -C $clone_arg rev-parse HEAD")
 if git -C $repo merge-base --is-ancestor $sha $base 2>/dev/null; then
   ssh $host "git -C $clone_arg checkout -q --detach $sha"

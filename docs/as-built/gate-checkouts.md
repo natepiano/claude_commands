@@ -198,8 +198,8 @@ The source index and unchanged file modification times remain unchanged.
 `scripts/copies/copy_guard.py` owns the creation rule; `config/copies.conf` owns
 the allow list. The
 PreToolUse Bash dispatcher refuses direct repository cloning, worktree
-creation, and recursive repository copying, and points to `copies.py run` with
-an example. The repository scan applies the same allow list to script code.
+creation, and recursive repository copying. Its refusal gives a `copies.py run` example and the `make_worktree.sh <path> <branch>` command for a lasting phase tree.
+Run that command from the source repository. The repository scan applies the same allow list to script code.
 
 The guard distinguishes no forbidden operation, a specific detected repository-tree operation, and an unresolved relevant operation. One invocation decoder handles shell commands, tool argv and Python subprocess vectors. It distinguishes command text, stdin programs, script/module operands and informational invocations using interpreter-specific option semantics: CPython options and operands, Bash/Zsh invocation options, and portable POSIX sh meanings. Script stdin and informational invocation input are data, while executable outer expansions are inspected before exemptions. Ordered descriptor duplication through <& and >&, moves, closure and replacement determine selected stdin; an unknown selected input refuses with a specific unresolved reason. Nested parsing distinguishes program, array word-list, parameter and arithmetic context. Literal data stays data while executable substitutions are inspected recursively. Runtime unresolved relevant programs refuse; static abstract analysis may defer unknown interpreter input to concrete call sites. Known gaps remain interprocedural analysis, generated programs such as bash -c "$(printf ...)", aliases and sourced files. Supported syntax is bounded by the documented tested forms rather than a claim to implement every shell dialect.
 

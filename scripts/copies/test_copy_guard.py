@@ -263,6 +263,12 @@ class CopyGuardTests(unittest.TestCase):
         self.assertEqual(copy_guard.refusal(command, self.repo), "")
         self.assertIn("copies.py run", copy_guard.refusal(
             shlex.join(["git", "worktree", "add", str(checkout), "-b", "original-work"]), self.repo))
+        refusal = copy_guard.hook_refusal(json.dumps({
+            "tool_name": "Bash", "cwd": str(self.repo),
+            "tool_input": {"command": shlex.join(["git", "worktree", "add", str(checkout), "-b", "original-work"])},
+        }))
+        self.assertIn("copies.py run", refusal)
+        self.assertIn("make_worktree.sh <path> <branch>", refusal)
         result = subprocess.run(["bash", str(helper), str(checkout), "original-work"],
                                 cwd=self.repo, text=True, capture_output=True, timeout=10, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)

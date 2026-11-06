@@ -33,7 +33,8 @@ TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated dispos
 REFUSAL = (
     "Repository trees must be made by copies.py run. "
     + "Example: ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --owner verify "
-    + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover"
+    + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover. "
+    + "A lasting phase tree: bash ~/.claude/scripts/worktree/make_worktree.sh <path> <branch>, from the source repository."
 )
 GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"})
 COPY_VALUE_OPTIONS = frozenset({"-t", "--target-directory", "-e", "--rsh", "--exclude", "--include",
