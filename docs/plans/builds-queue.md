@@ -327,36 +327,26 @@ only I can bump
 
 ### Phase 19 — The merge gate runs no type check, and the daily run does  · status: done
 
-**Asked by:** the user, 2026-11-05: "i think this basedpyright should come out out - we need a way to ensure that these are run but in the merge gate it is killing us", then "as far as i'm concerned we could also limit how often these happen - i.e., only running them once a day or something - basedpyright is not as urgent to keep up to date as getting all of our tests going faster".
+#### As-built
 
-**Depends on:** 10k (it changes the gate's memory sizing in the same file).
-
-**Measured 2026-11-05:** 214 gate runs that day. Each full type check takes a median of 164 s and peaks at 4.07 GiB; it is 3.4% of a gate's CPU. The rest of a gate stays under 1 GiB in about 90% of samples. 35 of 301 recorded type checks failed, so the check finds real errors and must still run.
-
-#### Work Order
-
-**Goal:** A gate never holds 4 GiB for a type check, and the full type check runs once a day.
-
-**Spec:**
-1. **Out of the gate.** `merge_gate.py` with `--tests-only` or the merge path runs no type job. `--type-dirs` defaults to no folders. An explicit `--type-dirs scripts` still runs the check by hand.
-2. **Daily.** `merge_gate.py --nightly` (the 03:00 timer) runs the full check over `scripts` from a named constant. No new command and no new timer.
-3. **A red check.** A nightly run with only a type failure tells the showrunner, with the failing files, and writes no `full-required` marker. A type error does not force full test runs.
-4. **Memory need.** The gate's memory need comes from the test modules alone, also straight after this lands. Check the recorded gate windows and history that size the need. If old records that held a type check keep the need high, post blocked with the record and the measured effect.
-5. **Unit checks stay.** Workers keep the type check on their changed files and caller modules.
-6. **Docs.** Update the docstring of `merge_gate.py`, `docs/as-built/merge-gate-and-test-speed.md` and any `commands/` or `docs/direct/` text that says a gate type-checks.
+- `merge_gate.py` with `--tests-only` or on the merge path runs no type job: `--type-dirs` defaults to no folders. An explicit `--type-dirs scripts` still runs the check. `gate_reservation(repo, temporary, hold, *, type_dirs=())` sizes from the folders.
+- `merge_gate.py --nightly`, from the 03:00 `claude-nightly.timer`, sets `NIGHTLY_TYPE_DIRS = ("scripts",)` and runs the full check. It splits `type_failures` from `failed`.
+- A nightly type failure tells the showrunner, with the failing files and the first `NIGHTLY_TYPE_DIAGNOSTIC_LINES` (20) lines, and writes no `full-required` marker. A red nightly with no failed job says the full suite is required.
+- `memory_admit.merge_gate_shape(argv)` returns `MERGE_GATE_TYPES` when `--type-dirs` is in the argv, else `MERGE_GATE_TESTS`. `admission_service.py` stores the shape, and `reservation_profile_key` keys on it, so a nightly profile does not raise a test-only gate's need.
+- Workers keep their type check on changed files and caller modules.
 
 **Files:**
-- `scripts/production/merge_gate.py` — items 1-4.
-- `scripts/production/test_merge_gate_suites_types.py`, `scripts/production/test_merge_gate.py` — the tests.
-- `docs/as-built/merge-gate-and-test-speed.md` — the doc.
+- `scripts/production/merge_gate.py` — the type folder rule, the nightly split, `tell_nightly_red`
+- `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate_suites_types.py`
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — the gate shape
+- `scripts/build_queue/admission_service.py` — stores the shape
+- `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/build-memory-admission.md`
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `merge_gate.py` and the docs; `test` owns the test files.
+**Binds later work:** a rename of the `merge-gate` step carries the shape in the profile key.
 
-**State:** none.
+**Gotchas:** a type error can reach main, and the next 03:00 run reports it. Before this change, 142 full passing gates had wall median 1500 s, CPU median 6642 s and peak median 4649 MiB; one type job had wall median 164 s, CPU median 227 s and peak median 4067 MiB.
 
-**Acceptance gate:** A real `--tests-only` gate on a scratch copy starts no `basedpyright`. A nightly test with a fake `MERGE_GATE_BASEDPYRIGHT` runs the check, and a type failure there tells a fake showrunner and writes no marker.
-
-**Notice:** Name `scripts/production/merge_gate.py` as also-touches (owner sdlc devtools-unit). Give the measured gate CPU and wall time before and after (builds, 2026-11-05).
+**Ruled out:** a separate `type_gate.py`, a promotion hook or a new timer; a client that sends the gate shape.
 
 ### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: todo
 
