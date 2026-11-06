@@ -1,13 +1,12 @@
 """Seed real Git workspaces for the final gate and its read-only pass query."""
 from __future__ import annotations
 
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 import json
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import ClassVar, override
 
@@ -74,9 +73,7 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         _ = self.git("add", ".")
         _ = self.git("commit", "--quiet", "-m", "initial")
         # Exercise the real interpreter shim's cache, avoiding repeated version probes.
-        cache = fixture / "cache/claude"
-        cache.mkdir(parents=True, exist_ok=True)
-        _ = (cache / cache_file_name()).write_text(sys.executable + "\n")
+        seed_interpreter_cache(fixture / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def git(self, *args: str) -> str:
