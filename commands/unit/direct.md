@@ -167,8 +167,8 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 </LongLivedWorkers>
 
 <CoreContract>
-- Never modify unrelated files. The unit director may make a worktree, and its
-  branch, for its own workers. The unit's staff row keeps its one home worktree;
+- Never modify unrelated files. The unit director may make a worktree, and its branch, for its own workers, with `scripts/worktree/make_worktree.sh`.
+  The unit's staff row keeps its one home worktree;
   where a worker works stays in its run record, not in staff. The director
   removes each worktree it made when that work ends. In the home worktree, the
   only branch the run may create is the remote branch <PushCheckpoint/> pushes;

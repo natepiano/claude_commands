@@ -1063,7 +1063,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Ruled out:**
 - A direct call of the retry deadline check: it does not pass through `route_test`.
 
-### Phase 41b — Run verify.sh check on a workspace with no library, and name the lasting tree path in the refusal  · status: todo
+### Phase 41b — Run verify.sh check on a workspace with no library, and name the lasting tree path in the refusal  · status: done
 
 **Depends on:** none.
 
