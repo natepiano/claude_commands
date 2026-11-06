@@ -1757,7 +1757,7 @@ class Herdr:
             return False
         return True
 
-    def close_retained_pane(self, pane: str, *, terminal: str = "") -> None:
+    def close_retained_pane(self, pane: str, *, terminal: str = "") -> bool:
         """Retire an outside caller's record only after confirmed terminal closure."""
         path = pane_launch.record_directory() / f"{self.session}.json"
         try:
@@ -1774,12 +1774,13 @@ class Herdr:
             terminal = observed
         target = original["session_id"] if original is not None else ""
         if not self.close_tab_confirmed(pane, target=target, terminal=terminal):
-            return
+            return False
         if original is not None:
             try:
                 pane_launch.retire_launch(path, original["pane_id"], original)
             except (OSError, ValueError) as error:
                 print(f"herdr {self.session}:{pane}: legacy record retained: {error}", file=sys.stderr)
+        return True
 
     def focus_tab_of(self, pane: str) -> None:
         """Show the tab holding `pane`, and its workspace, in the session's attached clients."""
@@ -2046,6 +2047,25 @@ class Herdr:
         info = json_object(payload.get("process_info"), "native pane process info")
         return _native_pane_process(info, kind)
 
+    def pane_agent_process(self, pane: str, terminal: str) -> AgentProcessIdentity:
+        """Read the foreground agent identity, then confirm its terminal."""
+        info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
+                           "pane process info")
+        processes: list[AgentProcessIdentity] = []
+        reader = _startup_process_reader(PROGRAM_TIMEOUT_SECONDS)
+        for value in json_items(info.get("foreground_processes"), "foreground processes"):
+            process = json_object(value, "foreground process")
+            arguments = _foreground_arguments(process)
+            if any(_is_agent_process(arguments, kind) for kind in ("claude", "codex")):
+                pid = cast(int, process["pid"])
+                processes.append(reader.identity(pid))
+        if len(processes) != 1:
+            raise HerdrFailure(f"{pane}: expected one foreground agent process")
+        row = _pane_row(self, pane)
+        if isinstance(row, NoPane) or row.get("terminal_id") != terminal:
+            raise HerdrFailure(f"{pane}: terminal changed before process selection", "wrong_target")
+        return processes[0]
+
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")
         status = AgentStatus.decode(agent.get("agent_status"))
@@ -2305,6 +2325,13 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=text,
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        self._prompt(pane, text)
+
+    def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
+        """Send input to the selected pane terminal."""
+        row = _pane_row(self, pane)
+        if isinstance(row, NoPane) or row.get("terminal_id") != terminal:
+            raise HerdrFailure(f"{pane}: terminal changed before prompt")
         self._prompt(pane, text)
 
     def _prompt(self, pane: str, text: str) -> None:
@@ -3012,7 +3039,7 @@ def close_agent(session: str, pane: str) -> None:
     client = Herdr(session)
     path = pane_launch.record_directory() / f"{session}.json"
     if pane in pane_launch.read_valid_entries(path):
-        client.close_retained_pane(pane)
+        _ = client.close_retained_pane(pane)
         return
     rows = client.listed("pane")
     selected = next((row for row in rows if row.get("pane_id") == pane), None)
@@ -4746,7 +4773,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
         if isinstance(destination, NewTab):
             close_agent(name, pane)
         elif isinstance(destination, SplitPane):
-            client.close_retained_pane(pane)
+            _ = client.close_retained_pane(pane)
         raise
     except (HerdrFailure, OSError, subprocess.SubprocessError) as error:
         if isinstance(error, HerdrFailure) and error.code == "wrong_target":

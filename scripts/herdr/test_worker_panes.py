@@ -702,12 +702,18 @@ class WorkerPaneTests(StaffTestCase):
     def test_unusable_configuration_opens_no_split(self) -> None:
         for value in ("0.01", "0.99", "invalid"):
             with self.subTest(value=value):
-                write_text_atomic(self.root / "conf/direct.conf", f"WORKER_SPLIT_RATIO={value}\n")
+                write_text_atomic(self.root / "conf/direct.conf", f"# range: 0.1..0.9\nWORKER_SPLIT_RATIO={value}\n")
                 result = self.start()
                 self.assertIsInstance(result, worker_panes.StartRefused)
                 assert isinstance(result, worker_panes.StartRefused)
                 self.assertEqual(result.reason, worker_panes.StartRefusal.INVALID_ROLE_CONFIGURATION)
                 self.assertEqual(self.world.launches, [])
+
+    def test_split_uses_the_range_from_configuration(self) -> None:
+        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.05..0.95\nWORKER_SPLIT_RATIO=0.95\n")
+        result = self.start()
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.95, "impl2")])
 
     def test_invalid_live_ratio_uses_the_committed_ratio_and_prints_a_warning(self) -> None:
         for arguments in (("init", "-q"), ("add", "conf/direct.conf"),

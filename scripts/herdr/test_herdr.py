@@ -134,6 +134,41 @@ def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, objec
 
 
 class NativePaneSessionTests(StaffTestCase):
+    def test_pane_agent_process_reads_only_the_foreground_agent_without_native_identity(self) -> None:
+        from scripts.herdr.test_worker_panes import PaneWorld
+
+        world = PaneWorld()
+        world.locations["w1:p1"] = {"pane_id": "w1:p1", "terminal_id": "friend-terminal",
+                                    "workspace_id": "w1", "tab_id": "w1:t1"}
+        world.activate(fixture_runtime_id("friend-process"), "w1:p1", "codex")
+        pid = world.foreground["w1:p1"][0]
+        process = self.root / "proc" / str(pid)
+        process.mkdir(parents=True)
+        write_text_atomic(process / "stat", f"{pid} (fixture) S " + "0 " * 18 + "1\n")
+        with patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")}), patch.object(
+                herdr, "_PLATFORM", "linux"), patch.object(
+                world, "native_pane_process", side_effect=AssertionError("no native identity")):
+            self.assertEqual(world.pane_agent_process("w1:p1", "friend-terminal"), herdr.AgentProcessIdentity(pid, 1))
+        self.assertEqual(world.process_reads, ["w1:p1"])
+        del world.foreground["w1:p1"]
+        with self.assertRaisesRegex(herdr.HerdrFailure, "expected one foreground agent"):
+            _ = world.pane_agent_process("w1:p1", "friend-terminal")
+
+    def test_prompt_terminal_sends_only_to_the_selected_terminal(self) -> None:
+        from scripts.herdr.test_worker_panes import PaneWorld
+
+        world = PaneWorld()
+        world.locations["w1:p1"] = {"pane_id": "w1:p1", "terminal_id": "friend-terminal",
+                                    "workspace_id": "w1", "tab_id": "w1:t1"}
+        with patch.object(world, "native_session", side_effect=AssertionError("no native identity")):
+            world.prompt_terminal("w1:p1", "friend-terminal", "Explain the result.")
+            world.locations["w1:p1"]["terminal_id"] = "replacement-terminal"
+            with self.assertRaisesRegex(herdr.HerdrFailure, "terminal changed"):
+                world.prompt_terminal("w1:p1", "friend-terminal", "Do not deliver this text.")
+        self.assertEqual(len(world.commands), 1)
+        self.assertEqual(world.commands[0][:3], ("agent", "prompt", "w1:p1"))
+        self.assertIn("Explain the result.", world.commands[0][3])
+
     def test_codex_native_process_refuses_an_unheld_thread_from_environment(self) -> None:
         identity = fixture_runtime_id("unheld-thread")
         proc = self.root / "unheld-proc"
@@ -1751,8 +1786,8 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                   patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()) as activity,
                   patch.object(client, "_close_pane", side_effect=close) as closed,
                   patch.object(pane_launch, "retire_launch", wraps=pane_launch.retire_launch) as retired):
-                client.close_retained_pane("w1:p1", terminal="term-one")
-                client.close_retained_pane("w1:p1", terminal="term-one")
+                _ = client.close_retained_pane("w1:p1", terminal="term-one")
+                _ = client.close_retained_pane("w1:p1", terminal="term-one")
             closed.assert_called_once_with("w1:p1")
             activity.assert_called_once_with("w1:p1")
             retired.assert_called_once_with(path, "w1:p1", entry)
@@ -1768,9 +1803,9 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                       redirect_stderr(io.StringIO()) as errors):
                     if terminal:
                         with self.assertRaisesRegex(herdr.HerdrFailure, "terminal identity changed"):
-                            client.close_retained_pane("w1:p1")
+                            _ = client.close_retained_pane("w1:p1")
                     else:
-                        client.close_retained_pane("w1:p1")
+                        _ = client.close_retained_pane("w1:p1")
                         self.assertEqual(errors.getvalue().splitlines(), [
                             "herdr conversation: terminal is unknown; target retained"])
                 closed.assert_not_called()
@@ -1784,7 +1819,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             with (patch.object(client, "panes", side_effect=[self.rows(), [moved, self.rows()[1]]]),
                   patch.object(client, "_close_pane"),
                   redirect_stderr(errors)):
-                self.assertIsNone(client.close_retained_pane("w1:p1"))
+                self.assertFalse(client.close_retained_pane("w1:p1"))
             self.assertEqual(errors.getvalue(), "herdr fixture:w1:p1: closure is pending; record retained\n")
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
 
@@ -1794,7 +1829,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             with (patch.object(client, "pane_activity", return_value=herdr.PaneRunning(("editor",))),
                   patch.object(client, "_close_pane") as closed,
                   self.assertRaisesRegex(herdr.HerdrFailure, "pane runs other work: editor")):
-                client.close_retained_pane("w1:p1")
+                _ = client.close_retained_pane("w1:p1")
             closed.assert_not_called()
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
 
@@ -1805,7 +1840,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             with (patch.object(client, "panes", return_value=self.rows()),
                   patch.object(client, "_close_pane") as closed,
                   redirect_stderr(errors)):
-                self.assertIsNone(client.close_retained_pane("w1:p1"))
+                self.assertFalse(client.close_retained_pane("w1:p1"))
             closed.assert_called_once_with("w1:p1")
             self.assertEqual(errors.getvalue(), "herdr fixture:w1:p1: closure is pending; record retained\n")
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
@@ -1817,7 +1852,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
         with self.retained() as (client, path, entry):
             with (patch.object(client, "panes", return_value=self.rows()),
                   patch.object(client, "run", return_value="{}") as sent):
-                client.close_retained_pane("w1:p1", terminal="term-one")
+                _ = client.close_retained_pane("w1:p1", terminal="term-one")
             commands = [cast(tuple[str, ...], event.args) for event in sent.call_args_list]
             self.assertIn(("pane", "close", "w1:p1"), commands)
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)
@@ -1838,7 +1873,7 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                 return "{}"
             with (patch.object(client, "panes", side_effect=rows),
                   patch.object(client, "run", side_effect=transport) as sent):
-                client.close_retained_pane("w1:p1", terminal="term-one")
+                _ = client.close_retained_pane("w1:p1", terminal="term-one")
             commands = [cast(tuple[str, ...], event.args) for event in sent.call_args_list]
             self.assertIn(("pane", "close", "w1:p1"), commands)
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"], entry)

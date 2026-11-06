@@ -4,7 +4,7 @@
 Usage: astra_review.py [--run-directory <dir> --phase <id>] <document> [focus...]
 
 The review uses the workers account with read-only access and xhigh reasoning.
-A managed review publishes its worker before the app-server starts the turn.
+A managed review publishes its worker before it submits the prompt.
 The final message is saved under /tmp/claude/astra/ and printed.
 A failed review exits 1. A missing document or refused admission exits 2.
 """
@@ -12,6 +12,7 @@ A failed review exits 1. A missing document or refused admission exits 2.
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.production import staff
+from scripts.lib.atomic_file import write_text_atomic
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
@@ -97,9 +99,11 @@ def tail(text: str) -> str:
 
 
 def _managed_review(review: Path, log: Path) -> int:
-    """Publish an idle worker before dispatch through the shared app-server path."""
+    """Use the worker command for a managed one-turn review."""
     from contextlib import redirect_stderr, redirect_stdout
-    from scripts.agents import codex_mesh
+    import io
+    from scripts.production import worker
+    from typing import cast
 
     run = log.parent
     name = f"astra-reviewer{os.getpid()}"
@@ -108,29 +112,33 @@ def _managed_review(review: Path, log: Path) -> int:
     result = 1
     with log.open("w", encoding="utf-8") as output, redirect_stdout(output), redirect_stderr(output):
         try:
-            result = codex_mesh.main([
-                "prime", "--session-dir", str(run), "--name", name,
-                "--role", "astra-reviewer", "--instructions-file", str(run / "prompt.md"),
-                "--model", MODEL, "--effort", REASONING,
-                "--sandbox", "read-only",
-            ])
+            for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(Path.cwd())],
+                              ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
+                               "--phase-title", "Astra review"]):
+                recorded = subprocess.run([sys.executable, str(SCRIPTS / "direct/progress_history.py"), *arguments],
+                                           stdout=output, stderr=output, text=True, check=False)
+                if recorded.returncode:
+                    return recorded.returncode
+            with redirect_stdout(io.StringIO()) as published:
+                result = worker.main(["add", "astra-reviewer", "--name", name, "--json"])
             if result:
                 return result
             opened = True
-            role = astra_roles.hold("reviewer", session_dir=run, worker=name)
+            member = cast(dict[str, str], json.loads(published.getvalue()))
+            role = astra_roles.hold("reviewer", member["id"], pid=os.getpid())
             held = role["staff_id"] if role is not None else ""
-            result = codex_mesh.main([
-                "follow", "--session-dir", str(run), "--to", name, "--role", "review",
-                "--message-file", str(run / "prompt.md"), "--summary-file", str(review),
-                "--log-file", str(run / "turn.log"), "--model", MODEL, "--effort", REASONING,
-                "--cwd", str(Path.cwd()), "--read-only",
-            ])
-        except (OSError, ValueError) as error:
+            design_roles.assign_and_finish(["assign", "astra-reviewer", str(run / "prompt.md"),
+                "--name", name, "--session-dir", str(run), "--slot", name, "--phase", "astra-review",
+                "--kind", "astra", "--reply", str(review),
+                "--launcher-command", json.dumps([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])],
+                run=run, name=name)
+            result = 0
+        except (OSError, ValueError, design_roles.RoleRefused) as error:
             print(f"astra_review: reviewer role unavailable: {error}", file=sys.stderr)
             result = 1
         finally:
             if opened:
-                ended = codex_mesh.main(["end", "--session-dir", str(run), "--to", name])
+                ended = worker.main(["end", name, "--session-dir", str(run)])
                 if ended:
                     result = 1
                 elif held:
@@ -139,10 +147,11 @@ def _managed_review(review: Path, log: Path) -> int:
 
 
 def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
-    """Use worker admission when the caller has a staff identity."""
+    """Use worker admission for a unit or showrunner caller."""
     manager = staff.runtime_id()
-    if manager:
-        _ = (log.parent / "prompt.md").write_text(prompt, encoding="utf-8")
+    caller = staff.snapshot().by_current_session(manager) if manager else None
+    if caller is not None and caller.kind in ("unit", "showrunner"):
+        write_text_atomic(log.parent / "prompt.md", prompt)
         return _managed_review(review, log)
     with log.open("w", encoding="utf-8") as output:
         process = subprocess.run(codex_arguments(label, review, Path.cwd()), input=prompt,
@@ -163,8 +172,7 @@ def held_review(design: design_roles.HeldDesign, focus: str, work: astra_work.Ph
             return 1
     folder = design_roles.design_directory(design.placement.design_id)
     request = folder / f"review-request-{os.getpid()}-{time.time_ns()}.txt"
-    with request.open("x", encoding="utf-8") as output:
-        _ = output.write(f"Review {design.document}.\nFocus: {focus}\n")
+    write_text_atomic(request, f"Review {design.document}.\nFocus: {focus}\n")
     try:
         reply = design_roles.resume(design.placement.design_id + "/reviewer", request)
         if not reply.is_file():
@@ -223,7 +231,7 @@ def main(arguments: list[str]) -> int:
     assignment = astra_work.AstraWork("astra-reviewer", str(folder), str(document),
                                      datetime.now(timezone.utc).isoformat(), str(review), work)
     prompt = astra_work.header_line(assignment) + "\n" + review_prompt(document, focus)
-    _ = (folder / "prompt.md").write_text(prompt, encoding="utf-8")
+    write_text_atomic(folder / "prompt.md", prompt)
     log = folder / "codex.log"
     returncode = run_review(label, review, prompt, log)
     written = review.read_text(encoding="utf-8").strip() if review.is_file() else ""

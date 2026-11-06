@@ -1251,7 +1251,7 @@ Make no unproved write and create no second row.
 
 **Binds later work:** structural faults (a missing terminal, an unreadable pane list, a duplicate pane) are anomalies, not refusals; each destructive action goes through `check_target`. Folder moves and resumes with no launch record restart through `restart.start_row`.
 
-**Ruled out:** a pane found by herdr's `agent_session` value; it can be stale.
+**Ruled out:** a pane found by herdr's `agent_session` value alone; a stale value with a shell in the foreground proves nothing. Phase 14a: with `codex` as the one foreground process, the value proves the pane.
 
 ### Phase 4b — `production_tree.py` deleted  · status: done
 
@@ -1471,7 +1471,7 @@ Test unchanged reruns and refusal when the recorded old value differs.
 #### As-built
 
 - `Herdr.move_row_tabs(row_id, *, record=...) -> bool` in `herdr.py` moves the unit row and the rows whose `parent` is the unit into the workspace named by the parent row's `name`. It returns `False` only when every row is already in place.
-- Membership is native identity only: `Herdr._row_panes` takes a pane when its native process runs the row's `current_session`. A label, a title, a pane mark or herdr's `agent_session` never makes a pane a member.
+- Membership is native evidence: `Herdr._row_panes` takes a pane when its native process runs the row's `current_session`, or when its one foreground process is `codex` and its `agent_session` equals `current_session` (Phase 14a). A label, a title or a pane mark never makes a pane a member.
 - A tab moves as one unit. `_move_row_tab` replays the `layout.export` tree in the new workspace, keeps terminals and focus, and orders tabs with `tab.move`. A zoomed tab is refused with one line. Public pane ids can change; terminals stay.
 - A stopped row, also a director whose shell pane stays after exit, gets a saved binding in the new workspace and does not move. Restart opens it there.
 - Unknown pane evidence prints one anomaly line and skips that row.
@@ -1735,7 +1735,7 @@ The Darwin process snapshot runs only when an agent process is present.
 #### As-built
 
 `Herdr.record_layout` uses `Herdr._row_panes(record, panes) -> (found, known)` once to bind each proved row to its pane's tab.
-An `agent_session` mark binds nothing without a proved native process.
+An `agent_session` mark binds nothing without a proved native process, or, for Codex, `codex` as the one foreground process (Phase 14a).
 Unknown evidence binds nothing, retains saved placement, and skips the retired-row filter for that save.
 Each save makes one `pane process-info` call per listed pane.
 
@@ -2041,7 +2041,7 @@ def launch_settings(section: str, key: str) -> LaunchSettings
 - Split configuration uses the shared reader and committed-value recovery; unusable effective values refuse before any split.
 - `CODEX_THREAD_ID` alone cannot prove the current conversation after `/new`; process generations compare only by equality.
 
-- Native process evidence alone proves ownership; `agent_session`, labels, titles, and inherited environment values do not prove ownership.
+- Native process evidence proves ownership. So does `agent_session` with `codex` as the one foreground process (Phase 14a). Labels, titles, and inherited environment values do not prove ownership.
 - Labels recover stopped panes only; unknown evidence never proves absence or permits a replacement split.
 - Destructive operations require the observed pane id and `current_session` target; display names truncate at 32 characters.
 - Missing terminals, duplicate identities, and ownership conflicts retain panes; proved unrelated operations remain usable.
@@ -2511,13 +2511,13 @@ Test named output, continued known work, and protection of sibling panes.
 **Resume-message contract:** consume Phase 10's `NoAccountMove | AccountMove(source, destination)` read-only.
 Keep complete move messages unchanged; test account-move recovery before publication and after replacement.
 
-### Phase 12 — Astra and ask-a-friend in panes  · status: todo
+### Phase 12 — Astra and ask-a-friend in panes  · status: done
 
 **Depends on:** Phase 1, Phase 3n, Phase 6, Phase 7, Phase 8, Phase 9. Shared gate with Phases 10/12/13 over the exact final batch.
 
 #### Work Order
 
-**Goal:** Astra roles and ask-a-friend run in panes: an Astra role held by a unit director or a showrunner is a worker under that holder, and an Astra role or friend for a caller outside the staff hierarchy is a pane beside the caller that is not staff.
+**Goal:** Astra roles and ask-a-friend run in panes: an Astra role held by a unit director or a showrunner is a worker under that holder, and a friend is a pane beside the caller that is not staff. An ad hoc Astra review outside the staff hierarchy keeps its one-turn `codex exec` path in this phase and moves to a pane in Phase 18 (sdlc, 2026-11-05).
 
 **Spec:**
 
@@ -2529,7 +2529,7 @@ Keep complete move messages unchanged; test account-move recovery before publica
    Keep that row's id, name, current session, and discovered backend; never create a second row for reuse.
    Phase 7 selects `[design_roles.<kind>]` settings and the sandbox for that role.
    `design_roles.py` keeps its existing fences and removes its held-role mesh calls.
-   Only an ad hoc Astra caller outside the staff hierarchy uses `side_pane.py`.
+   Follow-up: an ad hoc Astra review outside the staff hierarchy moves to a pane after the reply wait and close exist (Phase 18, Spec item 14). Until then it uses the existing one-turn `codex exec` branch of `astra_review.py` (sdlc, 2026-11-05).
    Do not call `start_or_resume` directly from `design_roles.py`.
 2. **Ask-a-friend** remains outside worker admission, as Phase 1 specifies.
    It opens a pane beside the caller through `scripts/herdr/side_pane.py` (new; `open <label>` and `close <label>`), which calls `launch_prepared_agent` with a `SplitPane` and the `consultation` key of `[ask_a_friend.<caller family>]` (`[assignments] ask_a_friend=caller`: the caller's family from its staff row, or from its runtime id for a caller outside the staff hierarchy), writes no staff row, and closes its pane at `end`. It finds its pane by its label in the caller's tab with one `Herdr.panes()` read, by the same evidence rules as Phase 7 (a non-empty `terminal_id`, one pane with the label, a fresh `pane_activity`). A rerun of an open stopped after the split reuses the labelled pane at its shell through `ExistingPane(pane, terminal)`: no pane closes and no second split opens. Structural faults refuse with the reason; unknown process evidence prints the named anomaly and continues. `close` ends the agent, then closes the pane only after a second read finds the same terminal and a fresh `pane_activity` reads `PaneAtShell`. A rerun of `end` finds no pane and reports done.
@@ -2550,20 +2550,21 @@ Keep complete move messages unchanged; test account-move recovery before publica
 **Files:**
 
 - `scripts/astra/design_roles.py`, `scripts/astra/test_design_roles.py` — Astra roles; delete replaced held-role mesh launch, follow, and end paths.
-- `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py` — new: the one pane beside a caller outside the staff hierarchy, for ask-a-friend and for such a caller's Astra role.
+- `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py` — new: the one pane beside a caller, for ask-a-friend.
 - `scripts/ask_a_friend/launch_friend.sh` — delete after converting all callers to `side_pane.py`, including `scripts/agents/test_launcher_tasks.sh`, `docs/as-built/agent-registry.md` and the `LAUNCHERS` entry in `scripts/direct/assign_gate.py`.
 - `scripts/ask_a_friend/test_end_friend.py` — preserve the shared `worker_fill` command tests until Phase 18 retires that tool.
   Retain consultation stop and rerun behavior in the side-pane tests before deleting script-specific tests.
 - `commands/ask_a_friend.md` — convert friend command calls; regenerate its Codex mirror through `scripts/claude_to_codex/sync.py`.
 - `scripts/direct/progress_history.py`, `scripts/direct/recorder_state.py` — read only: the last dispatch role and existing pass state.
-- `scripts/production/staff.py`, `scripts/production/session_staff.py`, `scripts/production/worker.py`, `scripts/herdr/herdr.py` — consume existing APIs.
-  This phase leaves these source files unchanged.
+- `scripts/production/staff.py`, `scripts/production/session_staff.py` — consume existing APIs. This phase leaves these source files unchanged.
+- `scripts/production/worker.py`, `scripts/production/test_worker.py` — `end --session-dir` reads the pass from the dispatch run, and `assign` and `end` take `--parent`, so a held role keeps its one parent under any caller.
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — the one-terminal agent process reader and `prompt_terminal` for `side_pane.py`.
 - `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — `launch_policy`, `launch_arguments` and `launch_environment` become public names of the existing private helpers, so that `side_pane.py` uses one launch path.
 - `scripts/direct/assign.py`, `scripts/direct/test_assign_gate.py`, `scripts/direct/test_assign_launcher.py`, `scripts/direct/test_assign_claude_door.py`, `scripts/direct/test_one_launch_path.py` — delete the `PRIME`, `FOLLOW` and `RESIDENT` operations with their held-role and friend callers. `ADOPT` and `RESUME_ACCOUNT_MOVE` stay for Phase 18.
 - `scripts/astra/astra_roles.py`, `scripts/astra/test_astra_roles.py`, `scripts/astra/astra_review.py`, `scripts/astra/test_astra_review.py` — the held-role reader accepts both families and reads the shared worker observation; `astra_review.py` stops the `prime` call.
 
 **Workers:** `3 writers` — one worker per item.
-- `impl` — `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py`, `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py`; hub: `scripts/herdr/side_pane.py` (`design_roles.py` calls it for a caller outside the staff hierarchy).
+- `impl` — `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py`, `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py`.
 - `test` (opens as impl) — `scripts/astra/design_roles.py`, `scripts/astra/test_design_roles.py`, `scripts/astra/design_role_test_support.py`, `scripts/astra/astra_roles.py`, `scripts/astra/test_astra_roles.py`, `scripts/astra/astra_review.py`, `scripts/astra/test_astra_review.py`.
 - `test2` (opens as impl) — `commands/ask_a_friend.md`, `scripts/ask_a_friend/launch_friend.sh`, `scripts/ask_a_friend/test_end_friend.py`, `scripts/agents/test_launcher_tasks.sh`, `docs/as-built/agent-registry.md`, `scripts/direct/assign_gate.py`, `scripts/direct/assign.py` and its tests. The director runs the Codex mirror sync.
 
@@ -2621,9 +2622,9 @@ Keep every behavior assertion in the retained tests.
 Keep shared `worker_fill` command tests until Phase 18 removes that tool.
 
 - basedpyright 0/0 on changed files and every caller module.
-- Tests for each changed module; `designer1` and `reviewer1` under a unit read their `[design_roles.<kind>]` keys and sandboxes from their selected roles; a showrunner's Astra role starts under the showrunner, keeps its one row, id and backend identity, and makes no second row; an Astra role or ask-a-friend asked for by an ad hoc session outside the staff hierarchy opens a side pane and makes no staff row; ask-a-friend from a showrunner opens a side pane and makes no staff row; a friend's opening question, a follow-up and its reply reach the caller, for a Claude caller and a Codex caller; `close` ends the friend and its pane.
+- Tests for each changed module; `designer1` and `reviewer1` under a unit read their `[design_roles.<kind>]` keys and sandboxes from their selected roles; a showrunner's Astra role starts under the showrunner, keeps its one row, id and backend identity, and makes no second row; ask-a-friend asked for by an ad hoc session outside the staff hierarchy opens a side pane and makes no staff row; an unheld Astra review asked for by such a session runs its one-turn `codex exec` path; ask-a-friend from a showrunner opens a side pane and makes no staff row; a friend's opening question, a follow-up and its reply reach the caller, for a Claude caller and a Codex caller; `close` ends the friend and its pane.
 - Real proofs (Invariants → Lifecycle reruns keep the pane), in a probe tab of `agents`: a rerun of a finished open keeps the same tab, pane id and `terminal_id` and exits 0; one open stopped after its split finishes on rerun in that same pane.
-- Rerun tests (Invariants → Rerun-safe tools), each compared with one clean run: `test_astra_open_rerun_after_split` (the labelled pane is reused; one pane, same terminal); `test_friend_open_rerun_after_split` (the labelled pane is reused; one pane, same terminal); `test_friend_end_rerun_after_close` (no pane, reports done); each open and close run twice gives one pane and then none.
+- Rerun tests (Invariants → Rerun-safe tools), each compared with one clean run: `test_friend_open_rerun_after_split` (the labelled pane is reused; one pane, same terminal); `test_friend_end_rerun_after_close` (no pane, reports done); each open and close run twice gives one pane and then none.
 - Full gate green.
 
 **Pane close contract:** use Phase 6's confirmed pane close and `pane_launch.retire_launch`.
@@ -2764,9 +2765,44 @@ Compare rename text with the accepted command output, anomaly lines, restart adv
 Run the shared Phase 11/14 text-and-code gate.
 No Python or new rerun test is required for this text phase.
 
+### Phase 14a — A fresh Codex pane worker publishes from its session report  · status: todo
+
+**Depends on:** Phase 7, Phase 8, Phase 12
+
+#### Work Order
+
+**Goal:** A fresh real Codex worker in a pane publishes its staff row, and each later read finds that pane.
+
+**Spec:** Measured on Codex 0.166: a Codex window has no open rollout that `Herdr.native_session` can read, so `worker_panes.start_or_resume` cannot name a fresh Codex worker. With `--no-daemon`, the SessionStart hook runs about 0.7 s after the first prompt, and the pane's `agent_session` then equals the thread. Before the first turn, nothing names the thread. sdlc ruled on 2026-11-05 [926be85b].
+
+1. Probe before code, on a real Codex in `zz-proof-*` tabs, with and without `--no-daemon`, idle after one turn. Record `agent_session`, whether the hook ran and the pane environment that the hook saw. This proves or disproves the shared daemon as the cause.
+2. Measure the memory of one worker with `--no-daemon`, and of a daemon-attached window beside the daemon's own memory. Put the number in the phase report and the checkpoint notice.
+3. A Codex pane launch passes `--no-daemon`, in `worker_panes.launch_arguments`. Item 3 falls away if the probe disproves the cause, and the probe result then goes to sdlc before code.
+4. A fresh Codex worker starts with one short first turn. `start_or_resume` waits for the pane's `agent_session`, then publishes the row with that value. The first-turn text and the wait deadline live in `config/direct.conf`. A known identity keeps its `resume` argument and needs no first turn.
+5. A pane whose one foreground process is `codex` and whose `agent_session` equals the row's `current_session` is that row's pane. This holds at every reader of pane membership, through one `herdr.py` reader. The `resume` argument and the open rollout still prove a pane as they do today.
+6. Change the old rule to this one in this plan, at Phase 4r `**Ruled out:**`, Phase 4e `Membership is native identity only`, Phase 5b `An agent_session mark binds nothing` and Phase 7 `Native process evidence alone proves ownership`, and in each as-built doc that states it.
+7. A launch does not forward `NO_COLOR`, in `herdr.child_environment`. Measured 2026-11-05: a Claude session with `NO_COLOR=1` draws no SGR, so `_typed_text` keeps the faint placeholder and `_composer_input` reads it as typed text. A Codex tool shell holds `NO_COLOR=1`, and `launch_prepared_agent` forwards it. Without it the same session draws faint SGR and the composer reads empty. This reaches `add_unit`, `add_showrunner`, `promote_showrunner` and `stop_resume` when a Codex caller runs them.
+
+**Files:**
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`, `scripts/herdr/fake_herdr.py` — the one reader.
+- `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — the launch argument, the first turn and the publish.
+- `config/direct.conf` — the first-turn text and the wait deadline.
+- `docs/plans/herdr-worker-panes.md`, `docs/as-built/herdr-restore.md` — the rule.
+
+**Workers:** `1 measurer` for items 1 and 2, then `1 writer` for items 3-6.
+
+**State:** None. The staff row keeps its current fields.
+
+**Constraints from prior phases:** Phase 7 and Phase 8: one worker lifecycle reader. Phase 12: the opening prompt must reach a fresh pane. Phase 13 (hierarchies-unit) edits `worker_panes.py`.
+
+**Acceptance gate:** Real proof in a `zz-proof-*` tab with a private `STAFF_FILE`: a fresh Codex worker reaches `OpenWorker`, its row's `current_session` equals the rollout's thread, a rerun keeps the same pane and `terminal_id`, and a stale `agent_session` with a shell in the foreground proves nothing.
+Record the measured memory per worker in the checkpoint notice.
+Test that `child_environment` leaves out `NO_COLOR`. Real proof: a Claude pane launched with `NO_COLOR=1` in the caller's environment reads an empty composer.
+Full gate.
+
 ### Phase 15 — Pilot and default switch  · status: todo
 
-**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14
+**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a
 
 #### Work Order
 
@@ -2833,6 +2869,12 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
 11. Remove `worker_transport` and the run pin from `unit_runs.py`. `unit_runs.py` keeps standard-library imports at the top for the Mac usage bootstrap; `test_collect_mac.py` is its consumer test.
 12. Test interrupted state retirement and a finished rerun that prints `unchanged` and changes nothing.
 13. Leave launcher consolidation to devtools 3t.
+14. **Phase 12 follow-ups.** Each item comes from the Phase 12 review.
+    1. An ad hoc Astra review outside the staff hierarchy moves to a side pane, after the reply wait and close exist (user, 2026-11-03: reviewers and designers run in herdr panes). Delete the one-turn `codex exec` branch of `astra_review.py` in the same change.
+    2. Delete the old held-role paths: `MeshWorker` and its branches (`astra_roles.py:40`), the design mesh roster reads and edits (`design_roles.py:37`), `HeldRole.codex_home` (`astra_roles.py:67`), and the held and resident paths of `codex_mesh.py` (:2736). Old hold files and old designs change once, through a one-off program at deploy.
+    3. A held role is created with its final name (`design_roles.py:655`). `live_roles` scans the session once (`astra_roles.py:270`). An unbound role records `start-run` and `start-phase` once (`design_roles.py:591`).
+    4. Remove the copies: one `worker_panes` rule for idle, busy or unknown (`astra_roles.py:270`); one `worker_panes` finder of a labelled pane in one tab (`side_pane.py:91`); one `PaneWorld` setup for the side pane tests (`test_side_pane.py:46`); one helper for the family tests of held roles (`test_design_roles.py:148`); fixture recorder commands through `invoke_recorder` (`design_role_test_support.py:62`).
+    5. After the composer repair, reconsider one input path for a friend (`herdr.py:2325`).
 
 **Files:**
 
@@ -2840,6 +2882,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
   Remove their command callers and collector imports.
   `agent_bg.sh` calls `worker_fill.py coordinate-claude`: replace that call with the worker command first. Remove the `assign_gate.PYTHON_HOPS` entry and update the Claude tests with the deletion.
 - `scripts/ask_a_friend/test_end_friend.py` — retire only the remaining `worker_fill` command tests with that tool; preserve shared consumer tests.
+- `scripts/astra/astra_review.py`, `scripts/astra/test_astra_review.py`, `scripts/astra/astra_roles.py`, `scripts/astra/test_astra_roles.py`, `scripts/astra/design_roles.py`, `scripts/astra/test_design_roles.py`, `scripts/astra/design_role_test_support.py`, `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py` — Spec item 14.
 - `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py` — delete the mesh allocation, launch, follow-claim, and server paths retained for pinned runs.
 - `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — own the sandbox constants after mesh deletion.
   Remove any remaining mesh-pinned phase-lock checks; retain the fixed-id worker lock.

@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,10 +17,12 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, session_staff
+from scripts.herdr import worker_panes
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.usage import agents_log
 
 AstraRole = Literal["designer", "reviewer"]
-RoleState = Literal["busy", "idle"]
+RoleState = Literal["busy", "idle", "unknown"]
 
 
 class RoleRecord(TypedDict):
@@ -146,14 +147,7 @@ def hold(role: AstraRole, staff_id: str = "", *,
     path = _record_path(member.id)
     held = _parse_record(record, path, membership)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            json.dump(record, output)
-            output.flush()
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    write_text_atomic(path, json.dumps(record))
     return held
 
 
@@ -192,7 +186,7 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership
         raise ValueError("Astra hold has no worker staff row")
     backend = membership.backends.get(member.id)
     parent = membership.by_id(member.parent.id)
-    if not isinstance(backend, staff.CodexBackend) or parent is None:
+    if not isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend)) or parent is None:
         raise ValueError("Astra hold backend or parent is unavailable")
     role: AstraRole
     task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
@@ -203,7 +197,8 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership
         role = "reviewer" if task.role == "review" else "designer"
     else:
         raise ValueError("worker does not hold an Astra role")
-    thread_id, codex_home, manager = member.current_session, str(backend.codex_home), parent.current_session
+    thread_id, manager = member.current_session, parent.current_session
+    codex_home = str(backend.codex_home) if isinstance(backend, staff.CodexBackend) else ""
     held_at = _record_text(fields, "held_at")
     if path.stem != member.id:
         raise ValueError("staff id differs from file name")
@@ -248,6 +243,7 @@ def live_roles(membership: staff.StaffSnapshot | None = None) -> list[LiveRole]:
     """Return readable live holds with current state; remove holds known to have ended."""
     membership = membership if membership is not None else staff.local_snapshot()
     roles: list[LiveRole] = []
+    observations: dict[staff.StaffId, list[worker_panes.WorkerPane]] = {}
     try:
         paths = sorted(state_root().glob("*.json"))
     except OSError as error:
@@ -267,10 +263,17 @@ def live_roles(membership: staff.StaffSnapshot | None = None) -> list[LiveRole]:
                     continue
                 if isinstance(instance.lifecycle, design_roles.RoleNotOpened) or instance.lifecycle.staff_id != record["staff_id"]:
                     raise ValueError("durable instance differs from hold")
-                entry = _mesh_worker(design_roles.mesh_directory(lifetime.design_id), instance.name,
-                                     membership=membership)
-                state = _worker_state(entry)
-                record["manager"] = design_roles.worker_parent(design, instance.role, membership).current_session
+                parent = design_roles.worker_parent(design, instance.role, membership)
+                if parent.id not in observations:
+                    observations[parent.id] = worker_panes.observe(parent.id, membership)
+                observed = next(item for item in observations[parent.id] if item.row.id == instance.lifecycle.staff_id)
+                if isinstance(observed, worker_panes.OpenWorker):
+                    state = "idle" if observed.status.value in ("idle", "done") else "busy"
+                elif isinstance(observed, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
+                    state = "idle"
+                else:
+                    state = "unknown"
+                record["manager"] = parent.current_session
             elif isinstance(lifetime, MeshWorker):
                 session_dir = Path(lifetime.session_dir)
                 if not session_dir.exists():
@@ -299,9 +302,10 @@ def live_roles(membership: staff.StaffSnapshot | None = None) -> list[LiveRole]:
                     path.unlink(missing_ok=True)
                     continue
                 state = "busy"
-            roles.append(LiveRole(staff_id=record["staff_id"], role=record["role"], thread_id=record["thread_id"],
+            live = LiveRole(staff_id=record["staff_id"], role=record["role"], thread_id=record["thread_id"],
                                   codex_home=record["codex_home"], manager=record["manager"],
-                                  held_at=record["held_at"], lifetime=lifetime, state=state))
+                                  held_at=record["held_at"], lifetime=lifetime, state=state)
+            roles.append(live)
         except (OSError, UnicodeError, ValueError) as error:
             message = f"astra_roles: cannot read {path}: {error}"
             print(message.replace("\n", " ").replace("\r", " "), file=sys.stderr)

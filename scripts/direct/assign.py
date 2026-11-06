@@ -21,7 +21,6 @@ from types import FrameType
 from typing import NoReturn, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.astra import design_roles
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
@@ -48,40 +47,11 @@ We believe in three gods, Simple, Fast and Beautiful, with correctness as the fl
 
 class AssignmentOperation(StrEnum):
     DISPATCH = "dispatch"
-    PRIME = "prime"
-    FOLLOW = "follow"
-    RESIDENT = "resident"
     ADOPT = "adopt"
     RESUME_ACCOUNT_MOVE = "resume-account-move"
 
 
 RECOVERY_OPERATIONS = (AssignmentOperation.ADOPT, AssignmentOperation.RESUME_ACCOUNT_MOVE)
-
-
-@dataclass(frozen=True)
-class NoHeldAssignment:
-    """The assignment uses the normal worker policy."""
-
-
-@dataclass(frozen=True)
-class ReservedHeldCreation:
-    """The holder reserved this token before thread creation."""
-    token: str
-
-
-@dataclass(frozen=True)
-class ExistingHeldThread:
-    """The holder retains this recorded thread identity."""
-    thread_id: str
-
-
-@dataclass(frozen=True)
-class HeldAssignment:
-    """The design store supplies the identity, claim, and access policy."""
-    design: design_roles.HeldDesign
-    member: design_roles.RoleInstance
-    claim: ReservedHeldCreation | ExistingHeldThread
-    access: design_roles.ThreadAccessPolicy
 
 
 @final
@@ -106,11 +76,6 @@ class Arguments(argparse.Namespace):
     pass_number: int = 1
     image: list[str] = []
     operation: AssignmentOperation = AssignmentOperation.DISPATCH
-    held_design: str = ""
-    held_role: str = ""
-    family: str = ""
-    log: str = ""
-    id_file: str = ""
     from_session_dir: str = ""
 
 
@@ -157,10 +122,8 @@ def parse_arguments() -> Arguments:
     _ = choice.add_argument("--to", default="")
     _ = choice.add_argument("--new-worker", default="")
     for option in ("model", "effort", "summary", "fix-cause", "paths", "phase", "early-ready", "session-dir",
-                   "style-since", "style-until", "held-design", "log", "id-file", "from-session-dir"):
+                   "style-since", "style-until", "from-session-dir"):
         _ = parser.add_argument("--" + option, default="")
-    _ = parser.add_argument("--held-role", choices=("designer", "reviewer"), default="")
-    _ = parser.add_argument("--family", choices=("codex", "claude"), default="")
     _ = parser.add_argument("--prompt", default="")
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
     _ = parser.add_argument("--lens", choices=LENSES, default="")
@@ -172,20 +135,8 @@ def parse_arguments() -> Arguments:
         parser.error(f"{args.role} is not available until Phase 6")
     if not args.prompt and args.operation not in RECOVERY_OPERATIONS:
         parser.error("--prompt is required")
-    if bool(args.held_design) != bool(args.held_role):
-        parser.error("--held-design and --held-role are required together")
-    if args.operation in (AssignmentOperation.PRIME, AssignmentOperation.FOLLOW) and not args.held_design:
-        parser.error("prime and follow require a held design")
-    if args.held_design and args.operation not in (AssignmentOperation.PRIME, AssignmentOperation.FOLLOW):
-        parser.error("held designs require prime or follow")
-    if args.operation in (AssignmentOperation.PRIME, AssignmentOperation.RESIDENT) and not args.new_worker:
-        parser.error("prime and resident require --new-worker")
-    if args.operation in (*RECOVERY_OPERATIONS, AssignmentOperation.FOLLOW) and not args.to:
-        parser.error("follow and recovery require --to")
-    if args.operation == AssignmentOperation.RESIDENT and args.role != "review":
-        parser.error("resident requires --role review")
-    if args.operation != AssignmentOperation.RESIDENT and (args.family or args.id_file):
-        parser.error("--family and --id-file require resident")
+    if args.operation in RECOVERY_OPERATIONS and not args.to:
+        parser.error("recovery requires --to")
     if args.operation == AssignmentOperation.ADOPT and not args.from_session_dir:
         parser.error("adopt requires --from-session-dir")
     if args.from_session_dir and args.operation != AssignmentOperation.ADOPT:
@@ -233,48 +184,6 @@ def authorized_paths(args: Arguments, cwd: Path) -> list[str]:
     if not paths:
         refuse("--paths must contain at least one path")
     return paths
-
-
-def held_assignment(args: Arguments) -> NoHeldAssignment | HeldAssignment:
-    if not args.held_design:
-        return NoHeldAssignment()
-    try:
-        design = design_roles.read_design(args.held_design)
-    except (OSError, ValueError) as error:
-        refuse(str(error))
-    if design.placement.host != design_roles.local_host():
-        refuse("the held design belongs to another host")
-    member = next((member for member in design.roles if member.role == args.held_role), None)
-    if member is None or member.name != (args.to or args.new_worker):
-        refuse("the held design does not reserve this worker")
-    if not isinstance(member.lifecycle, design_roles.RoleNotOpened):
-        try:
-            record = staff.snapshot()
-            owner = design_roles.worker_parent(design, member.role, record)
-            caller = worker_admission.parent(record, staff_id=staff.runtime_id())
-        except (OSError, ValueError) as error:
-            refuse(str(error))
-        if owner.id != caller.id:
-            refuse("only the current design worker parent may assign a held worker")
-    if args.role != ("implement" if member.role == "designer" else "review"):
-        refuse("--role differs from the held role")
-    if (Path(args.cwd).resolve() != Path(design.repository).resolve()
-            or Path(args.session_dir).resolve() != design_roles.mesh_directory(args.held_design).resolve()):
-        refuse("the held design requires its recorded worktree and mesh")
-    if args.paths:
-        refuse("the held design supplies its access policy; --paths is refused")
-    claim: ReservedHeldCreation | ExistingHeldThread
-    if args.operation == AssignmentOperation.PRIME:
-        if not isinstance(member.lifecycle, design_roles.RoleNotOpened) or not member.lifecycle.claim:
-            refuse("held thread creation requires its reserved creation claim")
-        claim = ReservedHeldCreation(member.lifecycle.claim)
-    else:
-        if isinstance(member.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
-            refuse("the held design has no active thread")
-        claim = ExistingHeldThread(member.lifecycle.thread_id)
-        if session_staff.worker_session(read_roster(Path(args.session_dir), member.name)) != claim.thread_id:
-            refuse("the held thread differs from the mesh identity")
-    return HeldAssignment(design, member, claim, design_roles.access_policy(design, member.role))
 
 
 def recover_arguments(args: Arguments) -> None:
@@ -339,8 +248,7 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
 
 
 def resolve_model(args: Arguments, role: str, env: dict[str, str]) -> tuple[str, str, str, str]:
-    task = (f"design_roles.{args.held_role}" if args.held_design else
-            "ask_a_friend.consultation" if args.operation == AssignmentOperation.RESIDENT else f"direct.{role}")
+    task = f"direct.{role}"
     result = call(["bash", "-c", '''source "$1"; agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_MODEL}"
@@ -877,59 +785,16 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
     return result
 
 
-def admit_assignment(worker: str, run: Path, role: str,
-                     held: NoHeldAssignment | HeldAssignment) -> worker_admission.WorkerStartAllowed:
-    """Apply the same admission rule to every assignment operation."""
-    if isinstance(held, HeldAssignment):
-        lifecycle = held.member.lifecycle
-        return worker_admission.admit(
-            worker, run, role=held.member.role,
-            reference=str(lifecycle.staff_id) if isinstance(lifecycle, design_roles.HeldWorker) else "")
-    return worker_admission.admit(worker, run, role=role)
-
-
 def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAllowed,
-                      held: NoHeldAssignment | HeldAssignment, cwd: Path, prompt: Path,
-                      family: str, model: str, effort: str, tier: str, env: dict[str, str]) -> int:
-    """Translate a checked assignment into its backend operation."""
+                      env: dict[str, str]) -> int:
+    """Translate an admitted assignment into its recovery operation."""
     run, worker = admitted.run, admitted.name
-    summary = str(Path(args.summary).resolve()) if args.summary else str(run / f"{worker}.reply.txt")
-    log = str(Path(args.log).resolve()) if args.log else str(run / f"{worker}.log")
-    if family == "claude":
-        if args.operation != AssignmentOperation.RESIDENT:
-            refuse("this operation requires a Codex worker")
-        env.update(AGENT_BG_ROLE="review", AGENT_BG_DETACH="1", AGENT_BG_EFFORT=effort)
-        return call(["bash", str(SCRIPTS / "../agents/agent_bg.sh"), "--run", str(run), worker, str(cwd), str(prompt), summary, log,
-                     str(Path(args.id_file).resolve()) if args.id_file else str(run / "friend_id"), model],
-                    env, check=False).returncode
     command = [PYTHON, MESH]
     context = ["--session-dir", str(run)]
-    settings = ["--model", model, "--effort", effort, "--service-tier", tier]
-    role = "impl" if args.role == "implement" else args.role
-    if args.operation == AssignmentOperation.PRIME:
-        if not isinstance(held, HeldAssignment) or not isinstance(held.claim, ReservedHeldCreation):
-            refuse("prime requires the holder's reserved creation claim")
-        sandbox = "read-only" if isinstance(held.access, design_roles.ReadOnlyReviewer) else held.access.launch_sandbox
-        command += ["prime", *context, "--name", worker, "--cwd", str(cwd), "--instructions-file", str(prompt),
-                    *settings, "--sandbox", sandbox, "--held-design", held.design.placement.design_id,
-                    "--held-role", held.member.role]
-    elif args.operation == AssignmentOperation.FOLLOW:
-        if not isinstance(held, HeldAssignment) or not isinstance(held.claim, ExistingHeldThread):
-            refuse("follow requires the holder's existing thread identity")
-        command += ["follow", *context, "--to", worker, "--role", role, "--cwd", str(cwd),
-                    "--message-file", str(prompt), "--summary-file", summary, "--log-file", log, *settings]
-        if isinstance(held.access, design_roles.ReadOnlyReviewer):
-            command += ["--read-only"]
-    elif args.operation == AssignmentOperation.RESIDENT:
-        command += ["start", "--resident", *context, "--name", worker, "--role", role,
-                    "--cwd", str(cwd), "--prompt-file", str(prompt), "--summary-file", summary,
-                    "--log-file", log, "--task", "ask_a_friend.consultation", *settings]
-    elif args.operation == AssignmentOperation.ADOPT:
+    if args.operation == AssignmentOperation.ADOPT:
         command += ["adopt", *context, "--name", worker, "--from", str(Path(args.from_session_dir).resolve())]
-    elif args.operation == AssignmentOperation.RESUME_ACCOUNT_MOVE:
-        command += ["resume-account-move", *context, "--to", worker]
     else:
-        refuse("the dispatch operation requires the normal worker coordinator")
+        command += ["resume-account-move", *context, "--to", worker]
     return call(command, env, check=False).returncode
 
 
@@ -937,11 +802,10 @@ def main() -> int:
     require_live_director()
     args = parse_arguments()
     recover_arguments(args)
-    held = held_assignment(args)
     cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
     if not cwd.is_dir() or not prompt.is_file():
         refuse("--cwd must be a directory and --prompt must be a readable file")
-    paths = [] if isinstance(held, HeldAssignment) or args.operation in RECOVERY_OPERATIONS else authorized_paths(args, cwd)
+    paths = [] if args.operation in RECOVERY_OPERATIONS else authorized_paths(args, cwd)
     env = dict(os.environ)
     run, phase = prepare_run(args, cwd, prompt, env)
     transport = unit_runs.worker_transport(run)
@@ -959,10 +823,6 @@ def main() -> int:
         return execute_herdr(args, run, phase, prompt, role, paths, env)
     family, model, effort, tier = (("codex", "", "", "") if args.operation in RECOVERY_OPERATIONS
                                    else resolve_model(args, role, env))
-    if args.family and args.family != family:
-        refuse("the resident family differs from the caller's configured family")
-    if isinstance(held, HeldAssignment) and family != "codex":
-        refuse("held designs require Codex")
     worker = args.to
     reservation: dict[str, object] = {}
     if args.operation != AssignmentOperation.DISPATCH or family == "claude":
@@ -981,7 +841,7 @@ def main() -> int:
         worker = resolved.stdout.strip()
         reservation = workers.allocation_for_follow(run, worker)
     try:
-        admitted = admit_assignment(worker, run, role, held)
+        admitted = worker_admission.admit(worker, run, role=role)
     except ValueError as error:
         workers.release_allocation(run, worker, reservation)
         print(str(error), file=sys.stderr)
@@ -989,7 +849,7 @@ def main() -> int:
     env["UNIT_TEAM_ROLE"] = worker
     env["UNIT_PASS_OWNER"] = "launcher"
     if args.operation != AssignmentOperation.DISPATCH:
-        return execute_operation(args, admitted, held, cwd, prompt, family, model, effort, tier, env)
+        return execute_operation(args, admitted, env)
     if family == "claude":
         return execute_claude(args, run, phase, cwd, prompt, env)
     dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation)

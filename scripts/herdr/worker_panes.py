@@ -34,6 +34,15 @@ WorkerRole = staff.WorkerRole
 
 
 @dataclass(frozen=True)
+class DispatchRun:
+    directory: Path
+
+
+class HolderRun(Enum):
+    CURRENT = "holder's run"
+
+
+@dataclass(frozen=True)
 class OpenWorker:
     row: staff.StaffRow
     pane: str
@@ -368,18 +377,19 @@ def stage_two_completion_id(dispatch_id: str) -> str:
 
 
 def can_close(worker: OpenWorker | StoppedWorker, *,
+              run: DispatchRun | HolderRun = HolderRun.CURRENT,
               lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
         return Kept("worker parent is unavailable")
-    run = worker_run(parent)
-    idle = _idle_checks(worker.row, run, lock)
+    directory = run.directory if isinstance(run, DispatchRun) else worker_run(parent)
+    idle = _idle_checks(worker.row, directory, lock)
     if isinstance(idle, Kept) or isinstance(worker, StoppedWorker):
         return idle
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         return Kept(f"agent state is {worker.status.value}")
-    passed = _worker_pass(worker.row, run)
+    passed = _worker_pass(worker.row, directory)
     if passed.get("status") != "completed":
         return Kept("launcher has not recorded a completed pass")
     try:
@@ -402,7 +412,7 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
     return CloseAllowed()
 
 
-def _registry_row(role: WorkerRole) -> LaunchPolicy:
+def launch_policy(role: WorkerRole) -> LaunchPolicy:
     from scripts.agents.codex_mesh import READ_ONLY_SANDBOX, WORKER_SANDBOX
     from scripts.astra import design_roles
     section, key = ("design_roles", role.removeprefix("astra-")) if role.startswith("astra-") else ("direct", role)
@@ -414,7 +424,7 @@ def _registry_row(role: WorkerRole) -> LaunchPolicy:
     return LaunchPolicy(settings, sandbox, permission)
 
 
-def _arguments(policy: LaunchPolicy, identity: str) -> list[str]:
+def launch_arguments(policy: LaunchPolicy, identity: str) -> list[str]:
     settings = policy.settings
     if settings.kind == "codex":
         arguments = ["resume", identity] if identity else []
@@ -430,7 +440,7 @@ def _arguments(policy: LaunchPolicy, identity: str) -> list[str]:
     return arguments
 
 
-def _account_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | DestinationWorkerAccount,
+def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | DestinationWorkerAccount,
                          resume: bool) -> dict[str, str] | StartRefused:
     from scripts.accounts import accounts
     from scripts.whoami import account as account_reader, agent_accounts
@@ -463,7 +473,7 @@ def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, 
         candidates = [args for args in arguments if any(Path(arg).name in ("codex", "claude") for arg in args)]
         if len(candidates) != 1:
             return _uncertain(worker.row, "running launch policy is unproved")
-        expected = _arguments(policy, "")
+        expected = launch_arguments(policy, "")
         actual = candidates[0]
         required = ("--model", "--sandbox", "--ask-for-approval") if policy.settings.kind == "codex" else ("--model", "--permission-mode")
         if any(flag not in actual for flag in required):
@@ -497,8 +507,6 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     if evidence.scan.unknown:
         return _uncertain(parent, "pane evidence is incomplete; new split retained")
     ratio = conf.read("direct").number("WORKER_SPLIT_RATIO")
-    if not 0.1 <= ratio <= 0.9:
-        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, "WORKER_SPLIT_RATIO is outside 0.1..0.9")
     workers = {item.pane for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
                and any(_text(pane, "pane_id") == item.pane and _text(pane, "tab_id") == tab for pane in evidence.panes)}
     if not workers:
@@ -534,7 +542,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     try:
-        policy = _registry_row(role)
+        policy = launch_policy(role)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     try:
@@ -602,7 +610,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         closable = can_close(current, lock=lock)
         if isinstance(closable, Kept):
             return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, closable.blocker)
-    environment = _account_environment(policy, account, row is not None)
+    environment = launch_environment(policy, account, row is not None)
     if isinstance(environment, StartRefused):
         return environment
     environment["UNIT_TEAM_ROLE"] = name.value
@@ -638,7 +646,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
     try:
         launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
-            _arguments(policy, str(row.current_session) if row else ""), herdr.NoOpeningPrompt(),
+            launch_arguments(policy, str(row.current_session) if row else ""), herdr.NoOpeningPrompt(),
             int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000), agent=name.value)
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
@@ -669,6 +677,7 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
 
 
 def close(parent: StaffId, name: WorkerName, *,
+          run: DispatchRun | HolderRun = HolderRun.CURRENT,
           lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> Closed | Kept | UncertainWorker:
     record = staff.snapshot()
     row = worker_admission.find_worker(record, parent, name.value)
@@ -694,8 +703,9 @@ def close(parent: StaffId, name: WorkerName, *,
                 _layout(parent, evidence)
                 return Closed()
             owner = record.parent_of(row)
-            closable = (_idle_checks(row, worker_run(owner), held) if isinstance(observed, ProcessUnknownWorker) and owner is not None
-                        else can_close(observed, lock=held) if isinstance(observed, (OpenWorker, StoppedWorker))
+            closable = (_idle_checks(row, run.directory if isinstance(run, DispatchRun) else worker_run(owner), held)
+                        if isinstance(observed, ProcessUnknownWorker) and owner is not None
+                        else can_close(observed, run=run, lock=held) if isinstance(observed, (OpenWorker, StoppedWorker))
                         else Kept("worker parent is unavailable"))
             if isinstance(closable, Kept):
                 return closable
