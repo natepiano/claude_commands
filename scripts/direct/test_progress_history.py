@@ -3583,11 +3583,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(started[0].get("team_slot"), "impl")
 
     def test_a_pass_with_no_worker_records_an_empty_team_slot(self) -> None:
-        """Empty is unknown, not a worker name.
-
-        Passes predating the field, and any recorder outside implement.sh, have
-        to stay separable from a launcher that really is the `impl` member.
-        """
+        """Keep unknown workers separate from the impl worker."""
         session_dir = self.start_run("no-slot", 24_000)
         self.start_phase_and_pass(session_dir, 24_010)
         started = self.pass_events("no-slot", "pass_started")
@@ -3934,7 +3930,7 @@ with patch.object(fcntl, "flock", admission):
         self.start_phase(session, 41_010)
         prompt = self.root / "repair-prompt.txt"
         _ = prompt.write_text("Phase 3 — Retry handling\nRepair the failed gate.\n")
-        command = ["bash", "implement.sh", "--role", "fix", str(prompt)]
+        command = ["bash", "assign.sh", "--role", "fix", "--prompt", str(prompt)]
         with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
                                      "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
             with self.assertRaisesRegex(SystemExit, "Fix launch has no ledger round"):
@@ -4177,9 +4173,8 @@ with patch.object(fcntl, "flock", admission):
         session_dir = self.start_run("stagger", 46_000)
         self.start_phase(session_dir, 46_010)
         self.start_slot_pass(session_dir, "impl", "impl", 46_020)
-        # What implement.sh writes: each launcher registers with its opening role
-        # stamped, and they land a few seconds apart because they start in
-        # sequence. That stagger is a roll-call, not the team changing shape.
+        # Each launcher records its opening role.
+        # The launchers start in sequence, so their register times differ.
         for offset, slot, role in ((0, "impl", "impl"), (3, "test", "test")):
             self.run_board(session_dir, "post", slot, "register", f"role={role}; up", at=46_020 + offset)
         self.start_slot_pass(session_dir, "test", "test", 46_023)
@@ -4892,9 +4887,8 @@ with patch.object(fcntl, "flock", admission):
         self.run_board(
             session_dir, "post", "test", "status", "hana_catalyst tests 240 passed", at=started_at + 200
         )
-        # What implement.sh posts on exit: after the worker's last line, and marked
-        # as the launcher's. Without the mark every finished worker read `fix
-        # finished` and the narration the reader wanted sat one line up, unseen.
+        # Assign marks its exit message as a launcher message.
+        # The report must retain the worker's last message.
         self.run_board(
             session_dir,
             "post",

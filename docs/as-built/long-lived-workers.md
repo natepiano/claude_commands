@@ -57,7 +57,7 @@ The [staff design](staff-accessors.md#staff-identity-and-backends) owns row fiel
 Its slot is `NewWorkerSlot` or `ExistingWorkerSlot(row)`.
 `PublishedWorker(row, handoff)` means staff publication succeeded.
 Only publication permits dispatch success.
-`implement.sh` completes admission before it records the implementation pass.
+`assign.py` completes admission before it records the implementation pass.
 A publication failure cleans up the backend that this attempt created and reports its native id.
 
 A new slot takes the parent/name lock before it takes the row lock.
@@ -111,7 +111,8 @@ This anomaly does not refuse admission.
 
 `dispatch_pending(run, name, prompt)` matches the assignment id and any state other than `ASSIGNMENT_ACCEPTED`.
 An unreadable roster prints one anomaly and returns false.
-`assign.py` and `implement.sh` check family before the pending record, so a family change still reaches the switch path.
+`assign.py` checks the family before the pending record.
+A family change still reaches the switch path.
 A retry for the published destination restores the saved extract before its assignment.
 It reuses that destination instead of creating another backend.
 An accepted retry prints `unchanged`.
@@ -120,7 +121,9 @@ An accepted retry prints `unchanged`.
 Its `--assignment-file` names the original prompt, so a retry computes the same assignment id.
 `start` has no image option, so the generated prompt names each attached image path.
 An accepted record or a record for another prompt keeps the normal follow path.
-`implement.sh` and `review.sh` are Claude launchers. `review.sh` has no pending-dispatch check, and its follow path does not restore a saved extract.
+`assign.py` starts Claude implementation, test, and repair workers through `assign_claude.py`.
+`review.sh` has no pending-dispatch check.
+Its follow path does not restore a saved extract.
 
 ### Claude coordinator and friends
 
@@ -240,19 +243,19 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 ### Launchers
 
-**`scripts/direct/implement.sh [--to <worker>] <session_dir> [working_dir] [prompt_file] [task] [role_description] <pass_kind> [pass_activity] [fix_pass] <team_role> [mesh_prefix]`**
+**`bash scripts/direct/assign.sh --role <implement|test|fix> --session-dir <run> --cwd <worktree> --prompt <file> --phase <phase> --paths <file>`**
 
-- Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
-- Family changes and pending deliveries use the [handoff and retry path](#family-handoff-and-retry).
-- With `--to` and a worker of the same family, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Finds the saved identity through its `staff_id`. A new identity uses `impl_worker_<slot>.json`. The compatibility launcher uses `impl_worker_fix.json` for a repair in the `impl` slot. Named `assign.sh` workers use their names as new slots. The saved model does not select the next turn's model. Each turn uses an explicit override or the current role default. A missing identity is created from the roster. A worker recorded under another slot is refused.
-  2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
-  3. If the roster's `context_tokens` is an integer greater than `UNIT_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On exit 4 (the roster changed during compaction) it refuses the follow-up and advises inspection and same-thread `reopen` when idle. On other failures it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
-  4. Claims the worker with `can-follow --role <pass_kind>`.
-- On exit, it releases the claim.
-- After launch it waits for the worker's record (with `--to` on Codex, the turn record) for up to `UNIT_WORKER_WAIT_ATTEMPTS` (30) checks `UNIT_WORKER_POLL_SECS` (1 s) apart, stopping early when the launcher exits. Tests shorten the interval and raise the count.
-- It reads the threshold from `config/direct.conf` (`UNIT_CONFIG` can override the path). A missing, non-numeric or non-positive value exits 2 with an error naming the key.
-- A worker assigned a different role keeps its slot as the 9th argument and changes only the task and pass-kind words.
+`assign.py` resolves the family, model, and effort once.
+For Claude implementation, test, and repair work, it calls `assign_claude.py` in the same process.
+`assign_claude.py` has no command line.
+
+- Without `--to`, assign starts a worker and records its staff identity.
+- With `--to <worker>`, assign continues that worker or completes a family change.
+- The Claude path checks admission before it records the pass.
+- A claim protects a continued worker until the dispatch ends.
+- Each slot keeps its `impl_status_<slot>`, `impl_summary_<slot>.txt`, `impl_agent_<slot>.log`, and `impl_agent_<slot>` files.
+- `UNIT_WORKER_WAIT_ATTEMPTS` and `UNIT_WORKER_POLL_SECS` control the worker record probes.
+- `assign_claude.py` releases the claim and stops the heartbeat watch when the dispatch ends.
 
 **Codex code review dispatch.** Use `assign.sh --role review --session-dir <run>
 --phase <phase> --prompt <file> --cwd <worktree>`. Each Codex broad-review lens has
@@ -366,7 +369,7 @@ See [unit rename](unit-rename.md) for explicit worktree moves.
 | File | Role |
 | --- | --- |
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
-| `scripts/direct/implement.sh` | Claude writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
+| `scripts/direct/assign_claude.py` | Claude writer, tester, and repair dispatch inside assign; identity checks and claims for `--to` |
 | `scripts/direct/assign.py`, `assign.sh` | Unit role allocation, persistent reviewer dispatch, read-only follow and own review records |
 | `scripts/direct/review.sh` | Compatibility flags, explicit recipient follow and own allocation |
 | `scripts/direct/end_session.sh` | Unbinds held design roles, preserves a live director's workers and servers, otherwise pauses recorded runs; no sweep |

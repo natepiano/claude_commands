@@ -462,7 +462,7 @@ class CountTests(unittest.TestCase):
 
     def test_an_agent_belongs_to_its_nearest_named_session(self) -> None:
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "claude", "claude"),
-                 30: Process(30, 20, "bash", "bash implement.sh"), 40: Process(40, 30, "python3", f"{MESH} start"),
+                 30: Process(30, 20, "bash", "bash assign.sh --role implement"), 40: Process(40, 30, "python3", f"{MESH} start"),
                  50: Process(50, 1, "codex", "codex exec")}
         counts = codex_winddown.agent_counts(table, {10: "showrunner", 20: "trunk"})
         self.assertEqual(counts, {"trunk": 1, codex_winddown.NO_SESSION: 1})

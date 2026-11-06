@@ -25,7 +25,7 @@ from scripts.astra import astra_roles
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
-from scripts.direct import phase_reservation, progress_history, simplify_daily, workers
+from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_status_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
@@ -751,8 +751,8 @@ def require_live_director() -> None:
 
 
 def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Path,
-                   env: dict[str, str]) -> int:
-    """Use the Claude launcher under the same assign parent."""
+                   env: dict[str, str], model: str, effort: str) -> int:
+    """Run the Claude pass inside the assign process."""
     options = ["--phase", phase]
     role = "impl" if args.role == "implement" else args.role
     slot = args.to or args.new_worker or role
@@ -761,17 +761,15 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
                             ("--style-until", args.style_until), ("--summary", args.summary)):
             if value:
                 options += [flag, value]
-        command = ["bash", str(SCRIPTS / "review.sh"), *options, str(run), str(cwd), str(prompt),
-                   "review", "review", "review", str(args.pass_number), args.lens, args.early_ready]
+        return subprocess.run(["bash", str(SCRIPTS / "review.sh"), *options, str(run), str(cwd), str(prompt),
+                   "review", "review", "review", str(args.pass_number), args.lens, args.early_ready],
+                   env=env, check=False).returncode
     else:
-        if args.to:
-            options += ["--to", args.to]
-        if args.fix_cause:
-            options += ["--fix-cause", args.fix_cause]
-        command = ["bash", str(SCRIPTS / "implement.sh"), *options, str(run), str(cwd), str(prompt),
-                   role, role, role, role, str(args.pass_number), slot]
-    result = subprocess.run(command, env=env, check=False).returncode
-    if args.summary and args.role != "review":
+        worker = assign_claude.ClaudeFollowUp(args.to) if args.to else assign_claude.NewClaudeWorker()
+        result = assign_claude.run(assign_claude.ClaudeLaunch(run, phase, cwd, prompt, role, slot,
+            args.fix_cause, args.pass_number, model, effort, worker,
+            ("bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]), env))
+    if args.summary:
         artifact = run / "phases" / phase / f"impl_summary_{slot}.txt"
         if artifact.is_file():
             _ = Path(args.summary).write_text(artifact.read_text())
@@ -1027,7 +1025,7 @@ def main() -> int:
                 if args.role == "review" else worker)
         started_before = pass_start_count(run, slot)
         try:
-            code = execute_claude(args, run, phase, cwd, prompt, env)
+            code = execute_claude(args, run, phase, cwd, prompt, env, model, effort)
         finally:
             workers.release_allocation(run, worker, reservation)
         try:

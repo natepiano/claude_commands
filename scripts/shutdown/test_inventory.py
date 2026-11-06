@@ -180,7 +180,8 @@ class InventoryTests(ShutdownTestCase):
         run = self.root / "paused run"
         run.mkdir()
         command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
-        outer = ["bash", "/config/scripts/direct/implement.sh", "outer arguments"]
+        outer = ["bash", "/config/scripts/direct/assign.sh", "--role", "implement",
+                 "--session-dir", str(run), "--cwd", "/checkout with spaces", "--prompt", "/old/prompt.md"]
         self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
         self.herdr_process(811, 812, command, {})
         self.herdr_process(812, 1, outer, {})

@@ -68,7 +68,7 @@ TURN_END = re.compile(rf"^\s*(?:[●⏺]\s+)?(?P<status>(?:— )?(?P<kind>{'|'.j
 # not in the production's zone.
 HOLD_TIME = re.compile(r"\b(?:(?:(?P<year>\d{4})-)?(?P<month>\d{2})-(?P<day>\d{2})[ T])?"
                        + r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
-WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
+WORK = {"zsh", "bash", "sh", "review.sh", "verify.sh"}
 BLOCKED = herdr.AgentStatus.BLOCKED
 PROMPT_TEXT_ID = "stall_watch.permission_prompt"
 # The prompt alert's sender, which its retire names too.

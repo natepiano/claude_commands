@@ -1331,7 +1331,7 @@ A `Change-Review:` line takes an optional fourth field, `after <step>`. `Visible
 
 **Ruled out:** a store or waiting section for held lines; Git holds them in `Change-Review:` lines.
 
-### Phase 8i — A Claude worker starts only through assign  · status: todo
+### Phase 8i — A Claude worker starts only through assign  · status: done
 
 Source: the user approved on C1119, through sdlc [b8646245]: fold `scripts/direct/implement.sh` into assign. `assign.py` runs it as its inner step. Move that code into assign, delete `implement.sh`, its second start path and its refusal, and update each caller, doc and test that names it. The order "It must be impossible to start a worker in more than one way" also applies.
 
@@ -1354,12 +1354,12 @@ Source: the user approved on C1119, through sdlc [b8646245]: fold `scripts/direc
 10. **Out of scope.** `review.sh` keeps its form. `settings.json` is a permission file and this phase does not edit it; the director reports its two stale lines. `docs/plans/` other plans are history and stay.
 
 **Acceptance:**
-- Real-path tests through `bash scripts/direct/assign.sh` with a fixture Claude binary: a new worker and a `--to` follow-up, for implement, test and fix. Each reads the status, summary, log, board lines and recorder events. Existing assertions hold. Approved changes: a direct start of `implement.sh` no longer exists, so its refusal tests go, and the recorded launcher command names assign.
+- Real-path tests through `bash scripts/direct/assign.sh` with a fixture Claude binary: a new worker and a `--to` follow-up, for implement, test and fix. Each reads the status, summary, log, board lines and recorder events. Existing assertions hold. Approved changes: a direct start of `implement.sh` no longer exists, so its refusal tests go, and the recorded launcher command names assign. Three refusal exit codes in those tests now read what `assign.py` already returned on the real path: 2 for a model resolve failure, 3 for an admission refusal.
 - A failed launch still ends through the 8f path: a run with no other worker ends, and the worker row stays.
 - `test_one_launch_path` passes with the new names and finds no second start path.
 - A fix round: `landed` on a clean exit, `abandon --edits-landed` on a failed exit.
 - Live check by the director: one real Claude worker on a small prompt through `assign.sh` with a copy of the models file that sets `direct=claude`. Register and done appear on the board.
-- `git grep -n "implement\.sh"` prints only `docs/plans/`, `settings.json` and any dated record.
+- `git grep -n "implement\.sh"` prints only `docs/plans/`, `settings.json`, any dated record, and the approved phone sample in `scripts/notify/`. That sample keeps its words because a change voids its user approval, and it starts nothing.
 
 **Files:**
 - `scripts/direct/assign.py`, `scripts/direct/assign_claude.py`, `scripts/direct/implement.sh`, `scripts/direct/assign_gate.py`, `scripts/production/stall_watch.py`, `scripts/agents/models_config.sh` — the move.

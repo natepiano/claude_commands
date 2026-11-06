@@ -9,7 +9,9 @@ import shlex
 import subprocess
 import tomllib
 from importlib import import_module
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
@@ -25,6 +27,92 @@ from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import PaneLaunch
 from scripts.production import unit_names
+
+
+@dataclass(frozen=True)
+class ReportProcessIdentity:
+    """A process identity recovered only for the units report."""
+
+    native_id: str
+    is_morty: bool
+
+
+@dataclass
+class AnomalyReport:
+    check: Callable[[int, str], ReportProcessIdentity] | None
+    lines: list[str] = field(default_factory=list)
+    processes: dict[int, ReportProcessIdentity] = field(default_factory=dict)
+    observations: dict[int, list[str]] = field(default_factory=dict)
+    positions: dict[int, int] = field(default_factory=dict)
+
+    def process(self, pid: int, identity: str) -> ReportProcessIdentity:
+        if pid and pid in self.processes:
+            return self.processes[pid]
+        result = self.check(pid, identity) if self.check is not None else ReportProcessIdentity(identity, False)
+        if pid:
+            self.processes[pid] = result
+        return result
+
+    def add(self, message: str, pid: int) -> None:
+        message = " ".join(message.splitlines())
+        if not pid:
+            line = "anomaly: " + message
+            if line not in self.lines:
+                self.lines.append(line)
+            return
+        identity = self.process(pid, "")
+        if identity.is_morty:
+            return
+        observations = self.observations.setdefault(pid, [])
+        if message not in observations:
+            observations.append(message)
+        text = "; ".join(observations)
+        if f"pid {pid}" not in text:
+            text = f"pid {pid}: {text}"
+        if identity.native_id and identity.native_id not in text:
+            text += f"; thread {identity.native_id}"
+        if pid not in self.positions:
+            self.positions[pid] = len(self.lines)
+            self.lines.append("")
+        self.lines[self.positions[pid]] = "anomaly: " + text
+
+
+_anomaly_report: ContextVar[AnomalyReport | None] = ContextVar("unit_anomaly_report", default=None)
+
+
+@contextmanager
+def anomalies(check: Callable[[int, str], ReportProcessIdentity] | None = None) -> Generator[list[str]]:
+    """Collect observations by PID; other callers retain stderr."""
+    report = AnomalyReport(check)
+    token = _anomaly_report.set(report)
+    try:
+        yield report.lines
+    finally:
+        _anomaly_report.reset(token)
+
+
+def report_process(pid: int, identity: str = "") -> ReportProcessIdentity:
+    report = _anomaly_report.get()
+    return report.process(pid, identity) if report is not None else ReportProcessIdentity(identity, False)
+
+
+def collect_anomaly(message: str, *, pid: int = 0) -> bool:
+    report = _anomaly_report.get()
+    if report is None:
+        return False
+    report.add(message, pid)
+    return True
+
+
+def report_anomaly(message: str, *, pid: int = 0) -> None:
+    if not collect_anomaly(message, pid=pid):
+        print("anomaly: " + " ".join(message.splitlines()), file=sys.stderr)
+
+
+def morty_thread(identity: str) -> bool:
+    from scripts.message import send
+
+    return bool(identity) and send.morty_stamp(send.CodexSender(identity))
 
 
 WORKER_FACT_KEYS = ("thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")
@@ -98,7 +186,7 @@ def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) ->
             if marker.is_file():
                 marked.setdefault(Path(marker.read_text().strip()), set()).update(row.id for row in rows if row.parent == staff.ReportsTo(owner.id))
         except (OSError, ValueError) as error:
-            print(f"anomaly: {owner.name}: {error}".replace("\n", " "), file=sys.stderr)
+            report_anomaly(f"{owner.name}: {error}")
     paths = [*marked, *unit_runs.run_folders()]
     if current := unit_runs.environ("RUN_DIR"):
         paths.append(Path(current))
@@ -111,7 +199,7 @@ def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) ->
             records = {staff.StaffId(value): cast(dict[str, object], entry) for entry in entries if isinstance(entry, dict)
                        and isinstance(value := cast(dict[str, object], entry).get("staff_id"), str)}
         except (OSError, ValueError) as error:
-            print(f"anomaly: {run}: {error}".replace("\n", " "), file=sys.stderr)
+            report_anomaly(f"{run}: {error}")
         for identity in records.keys() | marked.get(run, set[staff.StaffId]()):
             evidence = found.setdefault(identity, WorkerRunEvidence([], []))
             evidence.runs.append(run)
@@ -186,7 +274,7 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
         tree = RowResolver(record).unit_worktree(row)
         if isinstance(tree, PresentWorktree):
             return tree.path
-    print(f"anomaly: {reference}: staff worktree is unavailable", file=sys.stderr)
+    report_anomaly(f"{reference}: staff worktree is unavailable")
     return Path.cwd()
 
 
@@ -595,6 +683,13 @@ def place_text(place: Place) -> str:
     return f"herdr:{place.session}:{place.pane}"
 
 
+def process_pid(unit: LabeledSession) -> int:
+    """Return the observed PID, or zero when no process was observed."""
+    if isinstance(unit.process, ObservedProcess):
+        return unit.process.pid
+    return unit.claude.pid if isinstance(unit.claude, LiveClaude) else 0
+
+
 def holder_text(unit: LabeledSession) -> str:
     """Identify the observed process, including uncertain holders."""
     if isinstance(unit.process, ObservedProcess):
@@ -648,7 +743,9 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
     shared_session = herdr.shared_session()
     parents = {row.id: production_name for production_name, rows in membership.items() for row in rows}
     found: dict[str, dict[staff.StaffId, list[LabeledSession]]] = {}
-    observed = tuple(marked)
+    observed = tuple(unit for unit in marked if not report_process(
+        process_pid(unit),
+        unit.identity.id if isinstance(unit.identity, LiveSession) else "").is_morty)
     pane_rows: dict[Place, set[staff.StaffId]] = {}
     for unit in observed:
         row = record.by_current_session(unit.identity.id) if isinstance(unit.identity, LiveSession) else None
@@ -659,7 +756,8 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
         if runtime_row is None:
             reason = (f"{unit.identity.id}: no current staff row" if isinstance(unit.identity, LiveSession)
                       else "process identity is unavailable")
-            print(f"anomaly: {holder_text(unit)}: {reason}", file=sys.stderr)
+            report_anomaly(f"{holder_text(unit)}: {reason}",
+                           pid=process_pid(unit))
             candidates = set(pane_rows.get(unit.place, ()))
             for launch in launches:
                 if unit.place.session == shared_session and launch["pane_id"] == unit.place.pane:
@@ -681,7 +779,8 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
                     or (parent is not None and parent.kind == "showrunner"
                         and isinstance(parent.doc, staff.WrappedDoc))):
                 continue
-            print(f"anomaly: {row.name}: no showrunner staff parent", file=sys.stderr)
+            report_anomaly(f"{row.name}: no showrunner staff parent",
+                           pid=process_pid(unit))
             continue
         found.setdefault(production_name, {}).setdefault(row.id, []).append(unit)
     units: dict[str, dict[str, LabeledSession]] = {}
