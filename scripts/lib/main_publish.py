@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 from typing import cast
 
 from scripts.lib.atomic_file import write_text_atomic
@@ -130,16 +131,21 @@ def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIM
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,
            *, subject_prefix: str, unchanged: str) -> str:
-    """Commit only the named file; restore its previous content when commit fails."""
+    """Commit only the named file; restore it if Git fails without moving HEAD."""
     if not message.startswith(subject_prefix):
         raise Refusal(f"commit subject must start with {subject_prefix!r}")
+    head_before = git(checkout, "rev-parse", "HEAD").stdout.strip()
     committed = git(checkout, "commit", "-q", "--only", "-m", message, "--", str(conf))
+    head_after = git(checkout, "rev-parse", "HEAD").stdout.strip()
     if committed.returncode:
-        if isinstance(before, MissingFile):
-            conf.unlink(missing_ok=True)
+        if head_after != head_before:
+            print(f"anomaly: git commit: {first_line(committed)}; the commit exists", file=sys.stderr)
         else:
-            write_text_atomic(conf, before.text)
-        raise Refusal(f"git commit: {first_line(committed)}; {unchanged}")
+            if isinstance(before, MissingFile):
+                conf.unlink(missing_ok=True)
+            else:
+                write_text_atomic(conf, before.text)
+            raise Refusal(f"git commit: {first_line(committed)}; {unchanged}")
     return git(checkout, "rev-parse", "--short", "HEAD").stdout.strip()
 
 

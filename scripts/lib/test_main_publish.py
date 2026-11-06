@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import redirect_stderr
 from functools import cached_property
+import io
 from pathlib import Path
 import shlex
 import shutil
@@ -130,6 +132,33 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.config.read_text(), before)
         self.assertEqual(repo.head(), head)
         self.assertEqual(repo.remote_tip(), head)
+
+    def test_rerere_failure_after_commit_keeps_the_new_file_and_allows_push(self) -> None:
+        repo = self.repository
+        before = repo.change()
+        changed = repo.config.read_text()
+        head = repo.head()
+        _ = repo.git(repo.checkout, "config", "rerere.enabled", "true")
+        lock = repo.checkout / ".git/MERGE_RR.lock"
+        lock.touch()
+        errors = io.StringIO()
+
+        with redirect_stderr(errors):
+            short_head = main_publish.commit(
+                repo.checkout, repo.config, "tune(example): amount 2 -> 3",
+                main_publish.ExistingFile(before), subject_prefix="tune(", unchanged="unchanged",
+            )
+
+        self.assertNotEqual(repo.head(), head)
+        self.assertEqual(short_head, repo.git(repo.checkout, "rev-parse", "--short", "HEAD"))
+        self.assertEqual(repo.config.read_text(), changed)
+        self.assertEqual(repo.git(repo.checkout, "show", "HEAD:config/example.conf"), changed.strip())
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"anomaly: git commit: fatal: Unable to create '{lock}': File exists.; the commit exists",
+        ])
+        pushed, detail = main_publish.push(repo.checkout)
+        self.assertTrue(pushed, detail)
+        self.assertEqual(repo.remote_tip(), repo.head())
 
     def test_push_publishes_mixed_tune_and_zone_commits_in_either_order(self) -> None:
         repo = self.repository
