@@ -800,6 +800,7 @@ class WaitingStep:
     need: int
     reason: WaitReason
     unit: str = ""
+    project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
 
 
@@ -815,6 +816,7 @@ class RunningStep:
     run: LiveBuildRun | NoLiveBuildRun = NoLiveBuildRun()
     started_at: float = 0.0
     unit: str = ""
+    project: str = ""
 
 
 @dataclass(frozen=True)

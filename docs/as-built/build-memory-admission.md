@@ -115,6 +115,16 @@ After a restart, the service restores live run places and removes ended run plac
 `scripts/build_queue/admission_service.py` is the only live admitter. Its epoll loop owns the queue and reservations.
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `step_estimator.py` owns the estimates. `admission_records.py` owns the shared records, configuration, and wait phrases.
+
+The queue Step column and cards show the project before the step, such as `nateroids nextest`.
+A step without a project name shows only the step.
+An absolute repository path does not supply a project name.
+Matching and history retain the original step name.
+The queue omits a live unowned scope when its run has no reservation and keeps no memory.
+A run with a memory hold shows through that hold.
+The services block and the block for processes from ended builds remain visible.
+The card selector still finds an unowned run by its owner.
+The memory page keeps this memory in Other.
 `memory_admit.py` owns the readers, pure admission rules, projection, and finalizer.
 
 [Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.

@@ -1053,6 +1053,44 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 
 **Change-Review:** none — the queue view shows the same rows; the room rises by the margin while a registered CI job runs.
 
+### Phase 20d — A queue row names the project of its step  · status: todo
+
+**Depends on:** none. Source: the builds showrunner, 2026-11-06, from hana.
+
+#### Work Order
+
+**Goal:** A person who looks for a project in the build queue finds its row. A step of nateroids reads `nateroids nextest`, not `nextest`.
+
+**Spec:**
+
+1. **Cause.** The user searched the queue for "nateroids" and did not find the step. Its row read `migration nextest`: the unit column, then the step. The memory-wait line already prints `nateroids nextest`: `subject = f"{snapshot.repo} {snapshot.step}"` in `scripts/build_queue/admission_client.py`.
+2. **Project name.** One function in `scripts/build_queue/queue_lines.py` gives a step's shown text: `<project> <step>`, or `<step>` when no project is known. `RunningStep` and `WaitingStep` in `admission_records.py` gain a `project` field with an empty default, filled by the service from `repository_name` or else `repo`. An absolute path in `repo`, as a merge gate records it, is no project name, so a gate row stays `merge-gate`.
+3. **Every view.** The Step column in `/build:queue`, its card, and every other place that prints `step.step` to a person use that function. The column width follows the shown text. Matching and history keep `step.step`. The name `targeted test` keeps its display rule.
+4. **Records.** No stored record changes. A `project` missing from an older service's snapshot reads as empty, by the client's rule from phase 10p.
+5. **Proof.** Tests with a tempdir and the service fixture: an admit request with repo `nateroids` gives a running row and a waiting row with `nateroids nextest` through the service reading and the real view; a gate with an absolute path repo stays `merge-gate`; a wide name keeps the columns aligned at 60, 80, 100 and 140 columns. Update the goldens only where a row has a project, and list each changed golden.
+
+6. **Runs outside the queue (user, 2026-11-06: "/build:queue shouldn't show them").** A process group in `builds.slice` with no reservation and no kept memory shows no row in `/build:queue`. Today `queue_view.py` keeps such a row when its processes trace to a live run, and names it `between steps`. A run that keeps memory still shows through its hold. The services block and the "Still running after their build ended" block stay. The memory page does not change: this memory stays in Other. The card selector still finds such a run by owner.
+
+**Files:**
+- `scripts/build_queue/admission_records.py`
+- `scripts/build_queue/admission_service.py`
+- `scripts/build_queue/admission_protocol.py`
+- `scripts/build_queue/queue_evidence.py`
+- `scripts/build_queue/queue_view.py`
+- `scripts/build_queue/queue_card.py` — prints `step.step` at three lines.
+- `scripts/lint/memory_admit.py` — builds `RunningStep` and `WaitingStep` from reservation and waiter records; owner resources-unit.
+- `scripts/build_queue/test_queue_view.py`
+- `scripts/build_queue/test_queue_card.py`
+- `scripts/build_queue/test_admission_service.py`
+- `scripts/build_queue/golden/` — only rows with a project.
+- `docs/as-built/build-memory-admission.md` — the row's Step text.
+
+**Workers:** `1 writer` — `impl3`, code, tests and docs.
+
+**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, adversary and contract reviews.
+
+**Change-Review:** A queue row names its project | On natedev, in any Claude session, type /build:queue while a hana migration or a hana build runs | The Step column reads the project and the step, such as nateroids nextest. The memory page gets the same text after this lands.
+
 ### Phase 10f — The queue names every build folder it makes and deletes it when its work ends  · status: todo
 **Depends on:** none (checkpoint A is on main; checkpoint B changes `scripts/lib/build_folders.py`, the `tmp_sweep` call and `scripts/mac_test/linux_runner.py`, which no other open phase changes).
 **Why.** The user, 2026-11-03, via the builds showrunner: "our build-queue is supposed to handle making sure we name things and delete them when they are completed". The naming map is a design call that the builds showrunner settles. The showrunner approved it on 2026-11-03 (map and rulings: the 10f design in the unit's phase folder), with one change: a remote mirror ends when its copies.py remote lease from verify P35 ends.
