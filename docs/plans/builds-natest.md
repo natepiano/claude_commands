@@ -1183,35 +1183,15 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 53 — `board.sh` starts no process to find its folder  · status: done
 **Depends on:** Phase 49
 
-#### Work Order
+#### As-built
 
-**Goal:** `board.sh read` costs what it cost before Phase 49. Phase 49 added two process starts to every `board.sh` call to find the script's folder.
-
-**Spec:**
-1. In `scripts/direct/board.sh`, replace `BOARD_DIR=$(dirname "$(readlink -f -- "${BASH_SOURCE[0]}")")` with this form:
-   ```bash
-   BOARD_SCRIPT=${BASH_SOURCE[0]}
-   [[ ! -L "$BOARD_SCRIPT" && "$BOARD_SCRIPT" == */* ]] || BOARD_SCRIPT=$(readlink -f -- "$BOARD_SCRIPT")
-   BOARD_DIR=${BOARD_SCRIPT%/*}
-   ```
-2. A filename-only start and a symlink start still call `readlink`. Every other start starts no process to find the folder.
-3. Remove `"readlink"` from the fixture tool list at `scripts/direct/verify_lint_scope_test_support.py:413`. A fixture that starts `board.sh` by a path with a slash does not need it now.
-4. Add a test for each start form: path with a slash in a PATH without `readlink`, filename-only, and symlink. Each form posts one line to the board. Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after.
-5. Add no guard, refusal or ban check.
+- `scripts/direct/board.sh` finds its folder by parameter expansion when it starts from a path with a slash that is no symlink. A filename start or a symlink start still calls `readlink -f`.
+- A `board.sh read` takes 6.01 ms median, from 9.23 ms, in 200 random-order pairs at a load of about 26. The median pair difference is 3.09 ms.
+- A fixture PATH needs `readlink` only for a filename or symlink start, so `isolate_path_without_taplo` does not list it.
+- Each start form returns rc=0 on natedev and on the Mac (Darwin 27.0.0, bash 5.3.9).
 
 **Files:**
-- `scripts/direct/board.sh`
-- `scripts/direct/verify_lint_scope_test_support.py` — owner verify; tell the verify unit before the edit
-- `scripts/direct/test_board_start.py` — new
+- `scripts/direct/board.sh` — the start form
+- `scripts/direct/verify_lint_scope_test_support.py` (owner verify) — the fixture tool list
+- `scripts/direct/test_board_start.py` — one test per start form, each posts one board line
 
-**Workers:** 1 writer on slot `impl3` (one line and its tests)
-- `impl3` — all files above
-
-**Constraints from prior phases:**
-- Phase 49: without `readlink`, the old form gave `BOARD_DIR=.`, and the board request failed and retried for 60 s.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- same-load random-order pairs of `board.sh read`, 200 pairs: the median pair difference shows about 4.7 ms less than the Phase 49 form (measured on a trial: 12.6 ms to 7.9 ms)
-- each start form on natedev and on the Mac gives rc=0
-- the full test green on the phase commit merged with `origin/builds`
