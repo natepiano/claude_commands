@@ -46,7 +46,7 @@ class StylePlanTests(StylePlanFixture):
         super().setUp()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
-        _ = recorded_unit("sample-style", "names-unit", self.unit, self.doc,
+        _ = recorded_unit("sample-style", "names", self.unit, self.doc,
                           plan="docs/style-production/units/names-unit.md")
 
     def test_split_partitions_the_table_left_total_including_ticketed_and_unselected_findings(self) -> None:
@@ -68,7 +68,7 @@ class StylePlanTests(StylePlanFixture):
             with closing(sqlite3.connect(ledger.database)) as connection, connection:
                 _ = connection.execute("UPDATE held_findings SET proposal=? WHERE finding_id=?",
                                        (str(decision), by_path[paths[name]].finding_id))
-        ledger.ticket_add("2", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [paths["ticketed"]],
+        ledger.ticket_add("2", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [paths["ticketed"]],
                           [rule], proposal=str(issue), finding_ids=(by_path[paths["ticketed"]].finding_id,))
         ledger.ticket_assign("2", "demo-style-names")
         for index, excluded in enumerate(("declined", "unanswered", "types", "waived", "unfiled", "built"), 2):
@@ -80,7 +80,7 @@ class StylePlanTests(StylePlanFixture):
                 text = re.sub(r"unit: [^\n]*\n", "", text)
             elif excluded == "types":
                 _ = fixture_member("unit", name="types", parent=recorded_showrunner("sample-style", self.doc).id)
-                text = text.replace(f"unit: {unit_staff_id('names-unit')}", f"unit: {unit_staff_id('types-unit')}")
+                text = text.replace(f"unit: {unit_staff_id('names')}", f"unit: {unit_staff_id('types')}")
             _ = decision.write_text(text)
             finding = ledger.hold(rule, paths["free"], index, excluded, "type", "before", "after",
                                   findings[0].rule_blob, "outside")
@@ -111,14 +111,14 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_proposals.RankExemptions, "allows", side_effect=exempt),
               mock.patch.object(style_plan, "unsynced_changes", return_value={
                   paths["unsynced"]: style_plan.UnsyncedChange(paths["unsynced"], self.tip)})):
-            split = style_plan.classify_split(ledger, "names-unit", self.doc, self.base(),
+            split = style_plan.classify_split(ledger, "names", self.doc, self.base(),
                                               unit_plans.PilotCrates(frozenset({"crates/alpha"})),
                                               style_plan.BusyFiles(self.board(), frozenset({paths["busy"], paths["ticketed"]})),
                                               definitions, style_ledger.GitReadCache(self.repo), measured_at)
         self.assertEqual(split, style_ledger.RecordedSplit(3, 2, 1, 6, measured_at))
         left = split.ready + split.changed + split.structure + split.other
-        output = style_units.table([live_units.LiveUnit("names-unit", None)], {}, doc=self.doc, now=datetime(2026, 10, 28, 12, tzinfo=UTC),
-                                   zone=UTC, ledger_paths={"names-unit": ledger.database})
+        output = style_units.table([live_units.LiveUnit("names", None)], {}, doc=self.doc, now=datetime(2026, 10, 28, 12, tzinfo=UTC),
+                                   zone=UTC, ledger_paths={"names": ledger.database})
         self.assertIn(f"| 1 | 0 | {left} approved of 14 filed |", output)
 
     def test_a_merged_ticket_keeps_its_filed_type_finding_in_other_until_a_person_marks_it_built(self) -> None:
@@ -127,7 +127,7 @@ class StylePlanTests(StylePlanFixture):
         issue = self.approved_decision(rule, self.sources[:1], "type")
         ledger = self.ledger()
         finding, = ledger.proposal_findings(issue)
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [finding.path],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [finding.path],
                           [rule], proposal=str(issue), finding_ids=(finding.finding_id,))
         ledger.ticket_assign("1", "demo-style-names")
         ledger.ticket_checkpoint("1", self.tip)
@@ -141,7 +141,7 @@ class StylePlanTests(StylePlanFixture):
                   self.tip, (style_ledger.DeclarationNotRead(held),))),
               mock.patch.object(style_proposals.RankedWork, "waits", return_value={}),
               mock.patch.object(style_proposals, "ranked_below_unit", return_value=False)):
-            result = style_plan.classify_split(ledger, "names-unit", self.doc, self.base(), unit_plans.AllCrates(),
+            result = style_plan.classify_split(ledger, "names", self.doc, self.base(), unit_plans.AllCrates(),
                                                style_plan.BusyFiles(self.board(), frozenset()), definitions,
                                                style_ledger.GitReadCache(self.repo), measured_at)
         self.assertEqual(result, style_ledger.RecordedSplit(0, 0, 0, 1, measured_at))
@@ -168,11 +168,11 @@ class StylePlanTests(StylePlanFixture):
                   self.tip, tuple(style_ledger.DeclarationNotRead(finding) for finding in findings))),
               mock.patch.object(style_proposals.RankedWork, "waits", return_value={}),
               mock.patch.object(style_proposals, "ranked_below_unit", return_value=False)):
-            result = style_plan.classify_split(ledger, "names-unit", self.doc, self.base(), unit_plans.AllCrates(),
+            result = style_plan.classify_split(ledger, "names", self.doc, self.base(), unit_plans.AllCrates(),
                                                style_plan.BusyFiles(self.board(), frozenset()), definitions,
                                                style_ledger.GitReadCache(self.repo), measured_at)
-            table = style_units.table([live_units.LiveUnit("names-unit", None)], {}, doc=self.doc,
-                                      ledger_paths={"names-unit": ledger.database})
+            table = style_units.table([live_units.LiveUnit("names", None)], {}, doc=self.doc,
+                                      ledger_paths={"names": ledger.database})
         self.assertEqual(result, style_ledger.RecordedSplit(1, 0, 0, 1, measured_at))
         self.assertIn("| 0 | 0 | 2 |", table)
         self.assertEqual(result.ready + result.changed + result.structure + result.other, 2)
@@ -187,7 +187,7 @@ class StylePlanTests(StylePlanFixture):
         # The helper files each finding after hold(); site evidence consumes the current ledger row.
         findings = ledger.proposal_findings(issue)
         definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == type_rule)
-        ledger.ticket_add("2001", ticket_owner_id("types-unit"), "read", "types", "crates/alpha", [self.sources[1]], [type_rule])
+        ledger.ticket_add("2001", ticket_owner_id("types"), "read", "types", "crates/alpha", [self.sources[1]], [type_rule])
         ledger.ticket_assign("2001", "style/main")
         _ = ledger.ticket_base("2001")
         for index, path in enumerate(self.sources[:2]):
@@ -215,9 +215,9 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_proposals.RankExemptions, "allows", return_value=False),
               mock.patch.object(style_proposals, "run_follow", return_value=style_proposals.FollowRun(reading, (), ())),
               mock.patch.object(ledger, "declaration_reading", return_value=reading), redirect_stdout(output)):
-            split = style_plan.classify_split(ledger, "names-unit", self.doc, self.base(), unit_plans.AllCrates(),
+            split = style_plan.classify_split(ledger, "names", self.doc, self.base(), unit_plans.AllCrates(),
                                               style_plan.BusyFiles(self.board(), frozenset()), definitions, cache, measured_at)
-            _ = style_plan._select_phase(ledger, ticket_owner_id("names-unit"), "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
+            _ = style_plan._select_phase(ledger, ticket_owner_id("names"), "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
                                          self.doc, self.plan.read_text(), unit_plans.AllCrates(),
                                          style_plan.BusyFiles(self.board(), frozenset()), frozenset(), definitions, style_plan.MainChanges(self.tip), family="names")
         self.assertEqual(split, style_ledger.RecordedSplit(0, 1, 1, 0, measured_at))
@@ -249,13 +249,13 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_proposals, "renumber", side_effect=AssertionError("split does not renumber")),
               mock.patch.object(style_plan, "write_phase", side_effect=AssertionError("split writes no phase")),
               redirect_stdout(output), redirect_stderr(errors)):
-            code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit)])
+            code = style_plan.main(["split", "--unit", "names", "--repo", str(self.unit)])
         self.assertEqual((code, errors.getvalue()), (0, ""))
-        self.assertRegex(output.getvalue(), r"^names-unit: 1/0/0/0 in \d+\.\d{2} min\n$")
+        self.assertRegex(output.getvalue(), r"^names: 1/0/0/0 in \d+\.\d{2} min\n$")
         with closing(sqlite3.connect(ledger.database)) as connection:
             after = tuple(line for line in connection.iterdump() if not line.startswith('INSERT INTO "refill_results"'))
             row = cast(tuple[str, str, str, int, int, int, int], connection.execute(
-                "SELECT at,outcome,split_at,ready,changed,structure,other FROM refill_results WHERE unit='names-unit'").fetchone())
+                "SELECT at,outcome,split_at,ready,changed,structure,other FROM refill_results WHERE unit='names'").fetchone())
         self.assertEqual(after, before)
         self.assertEqual((row[0], row[1], *row[3:]), ("", "", 1, 0, 0, 0))
         measured_at = datetime.fromisoformat(row[2])
@@ -263,15 +263,15 @@ class StylePlanTests(StylePlanFixture):
         self.assertLessEqual(started, measured_at)
         self.assertLessEqual(measured_at, datetime.now(UTC))
         self.assertEqual((self.plan.read_bytes(), issue.read_bytes()), (before_plan, before_issue))
-        rendered = style_units.table([live_units.LiveUnit("names-unit", None)], {}, doc=self.doc, now=measured_at, zone=UTC,
-                                     ledger_paths={"names-unit": ledger.database})
+        rendered = style_units.table([live_units.LiveUnit("names", None)], {}, doc=self.doc, now=measured_at, zone=UTC,
+                                     ledger_paths={"names": ledger.database})
         self.assertIn("| gone | idle | idle | — | 0 | 0 | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
 
     def test_a_scan_error_or_time_limit_keeps_the_last_split_and_reports_the_cause(self) -> None:
         _ = self.rule("failed-split")
         self.sync()
         ledger = self.ledger()
-        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00"))
+        style_ledger.record_split(self.repo, "names", style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00"))
         before = ledger.database.read_bytes()
 
         def expire(*_args: object, **_kwargs: object) -> None:
@@ -285,9 +285,9 @@ class StylePlanTests(StylePlanFixture):
                       mock.patch.object(style_plan, "classify_split", side_effect=failure),
                       mock.patch.object(style_ledger, "record_split", wraps=style_ledger.record_split) as record,
                       redirect_stdout(output), redirect_stderr(errors)):
-                    code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit), "--timeout-minutes", "1"])
+                    code = style_plan.main(["split", "--unit", "names", "--repo", str(self.unit), "--timeout-minutes", "1"])
                 self.assertEqual((code, output.getvalue()), (1, ""))
-                self.assertTrue(errors.getvalue().startswith("split names-unit: "))
+                self.assertTrue(errors.getvalue().startswith("split names: "))
                 self.assertIn(cause, errors.getvalue())
                 record.assert_not_called()
                 self.assertEqual(ledger.database.read_bytes(), before)
@@ -296,7 +296,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.rule("write-time-limit")
         self.sync()
         ledger = self.ledger()
-        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00"))
+        style_ledger.record_split(self.repo, "names", style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00"))
         with closing(sqlite3.connect(ledger.database)) as connection:
             before = tuple(connection.iterdump())
         output, errors = io.StringIO(), io.StringIO()
@@ -329,11 +329,11 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_ledger, "record_split", side_effect=bounded_write) as record,
               redirect_stdout(output), redirect_stderr(errors)):
             _ = writer.execute("BEGIN IMMEDIATE")
-            code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit),
+            code = style_plan.main(["split", "--unit", "names", "--repo", str(self.unit),
                                     "--timeout-minutes", str(limit_seconds / 60)])
             writer.rollback()
         self.assertEqual((code, output.getvalue()), (1, ""))
-        self.assertRegex(errors.getvalue(), r"^split names-unit: (time limit.*|database is locked)\n$")
+        self.assertRegex(errors.getvalue(), r"^split names: (time limit.*|database is locked)\n$")
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["busy_timeout_seconds"], limit_seconds)
         self.assertEqual(busy_budgets, [(250,)])
@@ -344,7 +344,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.rule("expired-write")
         self.sync()
         ledger = self.ledger()
-        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00"))
+        style_ledger.record_split(self.repo, "names", style_ledger.RecordedSplit(9, 8, 7, 6, "2026-10-27T12:00:00+00:00"))
         before = ledger.database.read_bytes()
         deadline = style_plan.SplitDeadline(time.monotonic() - 1, 1)
         output, errors = io.StringIO(), io.StringIO()
@@ -355,9 +355,9 @@ class StylePlanTests(StylePlanFixture):
                   1, 2, 3, 4, "2026-10-28T12:00:00+00:00")),
               mock.patch.object(style_ledger, "record_split", wraps=style_ledger.record_split) as record,
               redirect_stdout(output), redirect_stderr(errors)):
-            code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit)])
+            code = style_plan.main(["split", "--unit", "names", "--repo", str(self.unit)])
         self.assertEqual((code, output.getvalue(), errors.getvalue()),
-                         (1, "", "split names-unit: time limit of 1 min reached\n"))
+                         (1, "", "split names: time limit of 1 min reached\n"))
         record.assert_not_called()
         self.assertEqual(ledger.database.read_bytes(), before)
 
@@ -373,9 +373,9 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_plan, "classify_split", side_effect=AssertionError("no long scan")),
               mock.patch.object(style_ledger, "record_split", side_effect=AssertionError("no split write")),
               redirect_stdout(output), redirect_stderr(errors)):
-            code = style_plan.main(["split", "--unit", "names-unit", "--repo", str(self.unit)])
+            code = style_plan.main(["split", "--unit", "names", "--repo", str(self.unit)])
         self.assertEqual((code, output.getvalue(), errors.getvalue()),
-                         (1, "", "split names-unit: ledger has no refill_results (schema below 25)\n"))
+                         (1, "", "split names: ledger has no refill_results (schema below 25)\n"))
         self.assertEqual(ledger.database.read_bytes(), before)
 
 
@@ -450,9 +450,9 @@ class RefillRecordingTests(unittest.TestCase):
                 with (mock.patch.object(style_plan, "next_phase", side_effect=next_result),
                       mock.patch.object(style_ledger, "record_refill", side_effect=record) as recorded,
                       redirect_stdout(output)):
-                    self.assertEqual(style_plan.main(["next-phase", "--unit", "names-unit", "--plan", "/tmp/claude/plan.md",
+                    self.assertEqual(style_plan.main(["next-phase", "--unit", "names", "--plan", "/tmp/claude/plan.md",
                                                       "--repo", "/tmp/claude/repo"]), code)
-                recorded.assert_called_once_with(Path("/tmp/claude/repo"), "names-unit", words)
+                recorded.assert_called_once_with(Path("/tmp/claude/repo"), "names", words)
                 self.assertEqual(calls, ["returned", "recorded"])
                 self.assertEqual(output.getvalue(), printed)
 
@@ -462,7 +462,7 @@ class RefillRecordingTests(unittest.TestCase):
                 output = io.StringIO()
                 with (mock.patch.object(style_plan, "next_phase", side_effect=error),
                       mock.patch.object(style_ledger, "record_refill") as recorded, redirect_stderr(output)):
-                    self.assertEqual(style_plan.main(["next-phase", "--unit", "names-unit", "--plan", "/tmp/claude/plan.md",
+                    self.assertEqual(style_plan.main(["next-phase", "--unit", "names", "--plan", "/tmp/claude/plan.md",
                                                       "--repo", "/tmp/claude/repo"]), 2)
                 recorded.assert_not_called()
                 self.assertIn(str(error), output.getvalue())
@@ -480,7 +480,7 @@ class BranchFileLocationTests(StaffTestCase):
         rows = unit_files.unit_worktrees(fixture.doc)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].worktree, fixture.worktree)
-        self.assertEqual(rows[0].unit, "member-unit")
+        self.assertEqual(rows[0].unit, "member")
 
 
 if __name__ == "__main__":

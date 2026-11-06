@@ -34,11 +34,6 @@ to rediscover after a context compaction lives in the doc.
      as-built docs — no new doc; create (or line absent) = distill a new as-built doc. -->
 > **As-built disposition: <amend | create>** — <amend: name the target as-built docs>
 
-<!-- Optional; set by /producer:to_production when the plan is one unit of a production.
-     Preserved verbatim by every command that edits this doc. /unit:direct reads
-     it and applies <ProductionUnit/> from ~/.claude/docs/production_format.md. -->
-> **Production: <name>** — unit `<unit>`; production doc `<path>`
-
 <!-- Optional; a standing plan never closes its run. <NextPhase/> refills it
      through style_plan.py. Git-exclude the plan:
      the ledger is its record; checkpoint and shrink never commit or shrink it. -->

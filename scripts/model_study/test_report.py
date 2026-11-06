@@ -430,7 +430,7 @@ class ReportTests(unittest.TestCase):
         output = message(comparison, phases, extracted, NOW, False, path)
         lines = output.splitlines()
         self.assertEqual(lines[0],
-                         "From model-study-unit: INTERIM director model study — sonnet stays (no measurable difference; evidence thin).")
+                         "From model-study: INTERIM director model study — sonnet stays (no measurable difference; evidence thin).")
         self.assertLessEqual(len(lines), 60)
         self.assertTrue(lines[1].startswith("alpha: median continuation-turn seconds"))
         self.assertTrue(lines[2].startswith("beta: median continuation-turn seconds Opus n/a"))
@@ -449,7 +449,7 @@ class ReportTests(unittest.TestCase):
         lines = output.splitlines()
         self.assertLessEqual(len(lines), 60)
         self.assertEqual(lines[0],
-                         "From model-study-unit: INTERIM director model study — sonnet stays (no measurable difference; evidence thin).")
+                         "From model-study: INTERIM director model study — sonnet stays (no measurable difference; evidence thin).")
         for name in names:
             self.assertTrue(any(line.startswith(f"{name}: median continuation-turn seconds") for line in lines))
         self.assertIn("Verdict:", lines)
@@ -508,7 +508,7 @@ class ReportTests(unittest.TestCase):
             lines = output.getvalue().splitlines()
             self.assertLessEqual(len(lines), 60)
             self.assertEqual(lines[0],
-                             "From model-study-unit: INTERIM director model study — sonnet stays (no measurable difference; evidence thin).")
+                             "From model-study: INTERIM director model study — sonnet stays (no measurable difference; evidence thin).")
             self.assertEqual(lines[-1], str(state_dir / "report.md"))
             self.assertNotIn("# Director model comparison", output.getvalue())
             self.assertNotIn(SECRET, output.getvalue())

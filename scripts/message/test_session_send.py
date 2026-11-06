@@ -134,7 +134,7 @@ class SessionSendTests(unittest.TestCase):
                            "BUILDLOG_DIR": str(root / "buildlog"),
                            "TEST_SENDER_GUARD": str(root / "refused")}
             return subprocess.run(
-                [sys.executable, "-c", GUARD_PROBE, str(sender), mode],
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", GUARD_PROBE, str(sender), mode],
                 cwd=Path(__file__).resolve().parents[2], env=environment,
                 capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
             )

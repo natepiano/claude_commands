@@ -256,6 +256,9 @@ progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
 
+`review-trial` reports code, UX, and simplify counts and review times for one phase instance.
+[Review regime records](review-regime-trial.md) define its sources, output, and checkpoint parser.
+
 Phases can be open together. State holds the most recently started open phase
 under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
 `findings.py` use) and the older open ones under `open_phases`, each carrying
@@ -280,8 +283,7 @@ For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
 phase note from the event stream; `eta` asks for it after its append and before
 its `ETA recorded:` line. A refresh failure adds one stderr line and changes
-neither the command's output nor its exit status. Plans without a
-`> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
+neither the command's output nor its exit status. Runs whose plan has no staff unit skip the subprocess. [Phase tables](phase-tables.md)
 covers the note, the table built from these events and the hook's limits.
 
 `eta` reads its times in the user's zone setting (`scripts/lib/user_zone.py`):

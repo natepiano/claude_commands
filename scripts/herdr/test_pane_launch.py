@@ -31,7 +31,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
         expected = {"CODEX_THREAD_ID": "native", "PATH": "/bin"}
         self.assertEqual(legacy_identity.without_legacy_identity(environment), expected)
         self.assertEqual(environment["STAFF_ID"], "old")
-        labels = session_labels.StaffLabels(staff.StaffSnapshot((), production=False), {}, {})
+        labels = session_labels.StaffLabels(staff.StaffSnapshot((), production=False))
         entry = pane_launch.launch("pane", "native", "/work", {}, ["claude"])
         entry["environment"] = environment
         with (patch.object(legacy_identity, "without_legacy_identity", return_value=expected) as remove,

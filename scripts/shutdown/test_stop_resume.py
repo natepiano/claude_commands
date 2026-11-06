@@ -26,7 +26,7 @@ from scripts.shutdown import restart, stop_resume
 from scripts.shutdown.stop_results import ClaudeStartState
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.shutdown.inventory import PausedSeat
 import herdr
 import pane_record
@@ -211,7 +211,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_names_use_a_fresh_snapshot_under_the_row_lock(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
-        row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                              current_session=identity)
         for reference in (row.name, row.id, identity):
             self.launched.clear()
@@ -226,9 +226,9 @@ class StopResumeTests(unittest.TestCase):
 
     def test_unknown_ambiguous_and_remote_names_refuse(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
-        row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                              current_session=identity)
-        other = staff.StaffRow(staff.StaffId("other-unit"), "unit", "accounts", staff.StaffRoot(),
+        other = staff.StaffRow(staff.StaffId("other"), "unit", "accounts", staff.StaffRoot(),
                                current_session=staff.StaffId("other-session"))
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row, other))):
             for reference, text in (("absent", "unknown name"), ("accounts", "ambiguous name")):
@@ -236,8 +236,8 @@ class StopResumeTests(unittest.TestCase):
                 assert isinstance(result, stop_resume.ResumeFailed)
                 self.assertIn(text, result.reason)
                 if reference == "accounts":
-                    self.assertIn("accounts-unit", result.reason)
-                    self.assertIn("other-unit", result.reason)
+                    self.assertIn("accounts", result.reason)
+                    self.assertIn("other", result.reason)
                 else:
                     self.assertEqual(result.reason, "unknown name")
         remote_row = staff.StaffRow(row.id, row.kind, row.name, row.parent,
@@ -273,7 +273,7 @@ class StopResumeTests(unittest.TestCase):
 
         machine = remote.local_machine()
         rows = (
-            staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", staff.StaffRoot(),
+            staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                 current_session=staff.StaffId("accounts-session"),
                 worktree=staff.PresentWorktree(machine, self.root)),
             staff.StaffRow(staff.StaffId("team-accounts"), "showrunner", "team-accounts", staff.StaffRoot(),
@@ -324,7 +324,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_by_name_of_a_running_session_reports_success_without_a_launch(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
-        row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                              current_session=identity)
         self.client.native_ids["w1:p2"] = identity
         self.live.return_value = sessions.LiveSessionProcess(123)
@@ -506,8 +506,10 @@ class StopResumeTests(unittest.TestCase):
         seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
                           turn_live=True, launcher_command=command)
         rebuilt = shlex.split(stop_resume.resume_worker_command(seat, current))
-        self.assertEqual(rebuilt, [*command[:6], "--to", "review2", run, current,
-                                  str(Path(run) / "review2.resume-prompt.md"), *command[9:]])
+        self.assertEqual(rebuilt, ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"),
+                                  "--to", "review2", "--session-dir", run, "--cwd", current,
+                                  "--prompt", str(Path(run) / "review2.resume-prompt.md"),
+                                  "--lens", "contract", "--phase", "4w", "--role", "review", "--pass", "3"])
         self.assertEqual(seat["launcher_command"], command)
 
     def test_saved_review_resumes_without_retired_allocation_options(self) -> None:
@@ -518,14 +520,106 @@ class StopResumeTests(unittest.TestCase):
                    "--slot", "review", *task]
         seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="019b3a40-4250-7000-8000-000000000104",
                           turn_live=True, launcher_command=command)
-        expected = [*command[:2], "--phase", "3p", "--lens", "contract", "--to", "review2",
-                    run, cwd, str(Path(run) / "review2.resume-prompt.md"), *task[3:]]
+        expected = ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"), "--to", "review2",
+                    "--session-dir", run, "--cwd", cwd, "--prompt", str(Path(run) / "review2.resume-prompt.md"),
+                    "--phase", "3p", "--lens", "contract", "--role", "review", "--pass", "2"]
         rebuilt = stop_resume.resume_worker_command(seat, cwd)
         self.assertEqual(shlex.split(rebuilt), expected)
         self.assertNotIn("--pool", shlex.split(rebuilt))
         self.assertNotIn("--lease", shlex.split(rebuilt))
         seat["launcher_command"] = shlex.split(rebuilt)
         self.assertEqual(stop_resume.resume_worker_command(seat, cwd), rebuilt)
+
+    def test_positional_review_resume_keeps_the_pass_lens_and_delivery_file(self) -> None:
+        run, cwd = str(self.root / "worker run"), str(self.root / "staff folder")
+        ready = str(self.root / "final diff ready")
+        for requested_lens in ("", "contract"):
+            with self.subTest(requested_lens=requested_lens):
+                command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh")]
+                if requested_lens:
+                    command.extend(("--lens", requested_lens))
+                command.extend((run, "/old tree", "old prompt", "review", "check this change", "reviewing",
+                                "3", "adversary", ready))
+                seat = PausedSeat(run_dir=run, seat="review2", role="review", staff_id="worker-id",
+                                  turn_live=True, launcher_command=command)
+                rebuilt = shlex.split(stop_resume.resume_worker_command(seat, cwd))
+                options = dict(zip(rebuilt[2::2], rebuilt[3::2]))
+                self.assertEqual(options["--pass"], "3")
+                self.assertEqual(options["--lens"], requested_lens or "adversary")
+                self.assertEqual(options["--early-ready"], ready)
+                self.assertEqual(options["--cwd"], cwd)
+                self.assertEqual(options["--prompt"], str(Path(run) / "review2.resume-prompt.md"))
+                seat["launcher_command"] = rebuilt
+                self.assertEqual(shlex.split(stop_resume.resume_worker_command(seat, cwd)), rebuilt)
+
+    def test_saved_assignment_resume_keeps_task_options_and_repeated_images(self) -> None:
+        run, cwd = str(self.root / "worker run"), str(self.root / "staff folder")
+        task = ["--role", "review", "--model", "gpt-6.1", "--effort", "high",
+                "--image", "/image one.png", "--image", "/image two.png", "--operation", "follow",
+                "--held-role", "reviewer", "--held-design", "design-id", "--family", "codex",
+                "--phase", "3t", "--lens", "contract", "--pass", "4", "--summary", "/summary file",
+                "--early-ready", "/ready file", "--style-since", "abc", "--style-until", "def",
+                "--diff", "/saved diff", "--log", "/saved log", "--id-file", "/saved id",
+                "--from-session-dir", "/former run", "--fix-cause", "keep this cause", "--paths", "/saved paths"]
+        for launcher in ("assign.sh", "assign.py"):
+            with self.subTest(launcher=launcher):
+                saved = ["bash" if launcher.endswith(".sh") else "python3",
+                         str(stop_resume.SCRIPTS / "direct" / launcher), "--new-worker", "former-worker",
+                         "--session-dir", "/old run", "--cwd", "/old tree", "--prompt", "/old prompt", *task]
+                seat = PausedSeat(run_dir=run, seat="review2", role="impl", staff_id="worker-id",
+                                  turn_live=True, launcher_command=saved)
+                rebuilt = shlex.split(stop_resume.resume_worker_command(seat, cwd))
+                self.assertEqual(rebuilt, ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh"),
+                                          "--to", "review2", "--session-dir", run, "--cwd", cwd,
+                                          "--prompt", str(Path(run) / "review2.resume-prompt.md"), *task])
+                self.assertEqual(seat["launcher_command"], saved)
+                seat["launcher_command"] = rebuilt
+                self.assertEqual(shlex.split(stop_resume.resume_worker_command(seat, cwd)), rebuilt)
+
+    def test_writer_resume_uses_the_phase_folder_and_has_no_run_paths_fallback(self) -> None:
+        run = str(self.root / "worker run")
+        for phase in ("ad hoc", ""):
+            with self.subTest(phase=phase):
+                command = ["bash", str(stop_resume.SCRIPTS / "direct/implement.sh")]
+                if phase:
+                    command.extend(("--phase", phase))
+                command.extend((run, "/old tree", "old prompt", "impl", "the task", "impl", "writing", "0", "impl"))
+                seat = PausedSeat(run_dir=run, seat="writer", role="impl", staff_id="worker-id",
+                                  turn_live=True, launcher_command=command)
+                rebuilt = shlex.split(stop_resume.resume_worker_command(seat, "/current tree"))
+                options = dict(zip(rebuilt[2::2], rebuilt[3::2]))
+                self.assertEqual(options["--role"], "implement")
+                if phase:
+                    self.assertEqual(options["--paths"], str(Path(run) / "phases/adhoc/files"))
+                else:
+                    self.assertNotIn("--paths", options)
+
+    def test_resume_without_a_launcher_uses_the_shared_last_dispatch(self) -> None:
+        from scripts.direct import progress_history
+
+        run = self.root / "worker run"
+        seat = PausedSeat(run_dir=str(run), seat="worker", role="impl",
+                          staff_id="019b3a40-4250-7000-8000-000000000104", turn_live=True, launcher_command=[])
+        for role in ("review", "test"):
+            with self.subTest(role=role):
+                missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+                dispatch = progress_history.RecordedDispatch(
+                    role, "3t", "contract" if role == "review" else missing,
+                    missing if role == "review" else "/saved/paths.txt")
+                with patch.object(progress_history, "last_dispatch", return_value=dispatch) as read:
+                    command = shlex.split(stop_resume.resume_worker_command(seat, "/current/tree"))
+                read.assert_called_once_with(staff.StaffId(seat["staff_id"]))
+                self.assertEqual(command[:2], ["bash", str(stop_resume.SCRIPTS / "direct/assign.sh")])
+                options = dict(zip(command[2::2], command[3::2]))
+                self.assertEqual(options["--role"], role)
+                self.assertEqual(options["--phase"], "3t")
+                self.assertEqual(options["--cwd"], "/current/tree")
+                self.assertEqual(options["--prompt"], str(run / "worker.resume-prompt.md"))
+                if role == "review":
+                    self.assertEqual(options["--lens"], "contract")
+                    self.assertNotIn("--paths", options)
+                else:
+                    self.assertEqual(options["--paths"], "/saved/paths.txt")
 
     def test_recovery_opens_a_fresh_tab_for_a_missing_pane_then_uses_the_shared_resume(self) -> None:
         self.client.rows.clear()
@@ -680,11 +774,11 @@ class StopResumeTests(unittest.TestCase):
         self.assertLessEqual(self.clock.elapsed, 0.1)
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
 
-    def prompt_retirement_fixture(self, *, alerted: bool) -> Path:
+    def prompt_retirement_fixture(self, *, alerted: bool) -> tuple[Path, staff.StaffRow]:
         """Publish cancellation requests for the watcher with an isolated send.py recorder."""
         from scripts.production.staff_test_support import unit_membership
 
-        _ = unit_membership("production", "alpha")
+        row = unit_membership("production", "alpha")
         self.entry["environment"].update({"SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "alpha"})
         pane_record.write("agents", self.entry)
         state = self.root / "stall-watch"
@@ -695,15 +789,14 @@ class StopResumeTests(unittest.TestCase):
                               + f"pathlib.Path({str(log)!r}).write_text(json.dumps(sys.argv[1:]))\n")
         _ = self.enterContext(patch.object(stall_watch, "STATE_DIR", state))
         _ = self.enterContext(patch.object(stall_watch, "SEND", sender))
-        _ = self.enterContext(patch.object(showrunners, "canonical_slug", return_value="production"))
         prompt = stall_watch.PromptWait(session_id="019b3a40-4250-7000-8000-000000000102", created=0,
             key="stall-watch:prompt:production:alpha", since=0, alerted=alerted, tool="permission", retiring=False, told=60)
-        stall_watch.save_prompt(stall_watch.prompt_path("production", "alpha"), prompt)
-        return log
+        stall_watch.save_prompt(stall_watch.watched_staff_unit("production", "alpha", row).prompt_path, prompt)
+        return log, row
 
-    def assert_prompt_cancellation_requested(self, log: Path) -> None:
+    def assert_prompt_cancellation_requested(self, log: Path, row: staff.StaffRow) -> None:
         self.assertFalse(log.exists(), "stop and move must never send")
-        path = stall_watch.prompt_path("production", "alpha")
+        path = stall_watch.watched_staff_unit("production", "alpha", row).prompt_path
         self.assertTrue(path.exists())
         requests = list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json"))
         self.assertTrue(requests)
@@ -722,33 +815,33 @@ class StopResumeTests(unittest.TestCase):
             _ = stall_watch.tick(100)
 
     def test_stop_requests_prompt_cancellation_before_returning_without_sending(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
 
     def test_move_requests_prompt_cancellation_before_resuming_without_sending(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=False)
+        log, row = self.prompt_retirement_fixture(alerted=False)
         def start_after_request(*arguments: str) -> str:
             self.assertIn("exec", self._typed(arguments))
-            self.assert_prompt_cancellation_requested(log)
+            self.assert_prompt_cancellation_requested(log, row)
             return ""
         self.start.side_effect = start_after_request
         self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"),
                          stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude4"))
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
 
     def test_failed_prompt_retirement_stays_requested_until_the_watcher_confirms_it(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         sender = self.root / "retire.py"
         original = sender.read_text()
         _ = sender.write_text(original + "raise SystemExit(3)\n")
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
         errors = io.StringIO()
         with redirect_stderr(errors):
             self.drain_prompt_cancellations()
         self.assertIn("stall-watch: retire:", errors.getvalue())
-        path = stall_watch.prompt_path("production", "alpha")
+        path = stall_watch.watched_staff_unit("production", "alpha", row).prompt_path
         self.assertTrue(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")))
         _ = sender.write_text(original)
         self.drain_prompt_cancellations()
@@ -776,7 +869,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(errors.getvalue().count("prompt cancellation:"), 2)
 
     def test_stop_and_move_never_take_a_held_watcher_lock(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         real_flock = fcntl.flock
         forbidden_attempts: list[tuple[int, int]] = []
         with (stall_watch.STATE_DIR / "lock").open("a+") as lock:
@@ -797,12 +890,12 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
                 self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ClaudeUp)
         self.assertEqual(forbidden_attempts, [], "stop and move must never attempt the watcher lock")
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
 
     def test_a_delayed_cancellation_never_retires_a_resumed_sessions_new_prompt(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
-        path = stall_watch.prompt_path("production", "alpha")
+        path = stall_watch.watched_staff_unit("production", "alpha", row).prompt_path
         stall_watch.save_prompt(path, stall_watch.PromptWait(session_id="019b3a40-4250-7000-8000-000000000102", created=time.time() + 1,
             key="stall-watch:prompt:production:alpha", since=200, alerted=False, tool="new-request", retiring=False))
         self.drain_prompt_cancellations()
@@ -813,7 +906,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual((saved["since"], saved["retiring"]), (200, False))
 
     def test_a_malformed_cancellation_does_not_stop_valid_requests(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
         bad = stall_watch.STATE_DIR / "aaa.prompt.cancel.json"
         _ = bad.write_text("{")
@@ -823,10 +916,10 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn(str(bad), errors.getvalue())
         self.assertTrue(bad.exists())
         self.assertTrue(log.exists())
-        self.assertFalse(stall_watch.prompt_path("production", "alpha").exists())
+        self.assertFalse(stall_watch.watched_staff_unit("production", "alpha", row).prompt_path.exists())
 
     def test_a_mac_stop_publishes_cancellation_without_any_lookup(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         with (patch("platform.system", return_value="Darwin"),
               patch.object(pane_record, "launch_for_session", side_effect=AssertionError("no launch lookup")) as launch,
               patch.object(staff_sources, "unit_parent", side_effect=AssertionError("no remote lookup")) as parent,
@@ -835,17 +928,17 @@ class StopResumeTests(unittest.TestCase):
         launch.assert_not_called()
         parent.assert_not_called()
         socket.assert_not_called()
-        self.assert_prompt_cancellation_requested(log)
+        self.assert_prompt_cancellation_requested(log, row)
 
     def test_launch_deletion_after_stop_cannot_lose_the_old_alerts_cancellation(self) -> None:
-        log = self.prompt_retirement_fixture(alerted=True)
+        log, row = self.prompt_retirement_fixture(alerted=True)
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
         # retire_unit removes launch records after stop and before the next watcher pass.
         pane_record.record_path("agents").unlink()
         self.drain_prompt_cancellations()
         self.assertEqual(json.loads(log.read_text()), ["retire", "--to", "user", "--from", "stall-watch",
                                                       "--key", "stall-watch:prompt:production:alpha"])
-        self.assertFalse(stall_watch.prompt_path("production", "alpha").exists())
+        self.assertFalse(stall_watch.watched_staff_unit("production", "alpha", row).prompt_path.exists())
         self.assertEqual(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")), [])
 
     def test_missing_pane_recovery_does_not_duplicate_a_live_session(self) -> None:
@@ -1278,7 +1371,6 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = fixture_member("agent", name="alpha", runtime_id=self.entry["session_id"])
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
-        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.add_beta()
         for platform in ("linux", "darwin"):
             with self.subTest(platform=platform), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000102"}), patch.object(stop_resume, "_detach", wraps=self.real_detach), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "", "")) as run, patch.object(subprocess, "Popen") as popen:
@@ -1415,7 +1507,7 @@ class StopResumeTests(unittest.TestCase):
                     result = stop_resume.resume("alpha", why="maintenance")
                 self.assertIsInstance(result, stop_resume.ClaudeUp)
                 self.assertEqual(self.client.prompts, [])
-                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1, errors.getvalue())
                 self.assertIn("prompt identity anomaly:", errors.getvalue())
                 self.detach.assert_called()
 
@@ -1488,8 +1580,8 @@ class StopResumeTests(unittest.TestCase):
         owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))))
         for probe in (False, True):
-            for outcome in ("watchdog: alpha-unit restarted on claude3",
-                            "watchdog: alpha-unit: folder no longer exists; restore dropped"):
+            for outcome in ("watchdog: alpha restarted on claude3",
+                            "watchdog: alpha: folder no longer exists; restore dropped"):
                 with self.subTest(probe=probe, outcome=outcome):
                     self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
                     pane_record.write("agents", self.entry)
@@ -1567,9 +1659,9 @@ class StopResumeTests(unittest.TestCase):
     def test_non_unit_early_exit_tells_only_the_requesting_showrunner(self) -> None:
         from scripts.production import showrunners
         import quota_alert
-        # The requester's registry is independent of the resumed session's mark.
-        with (patch.object(staff, "runtime_id", return_value="019b3a40-4250-7000-8000-000000000201"),
-              patch.object(showrunners, "production_of", return_value=self.root / "requester-production.md") as lookup,
+        requester = fixture_member("showrunner", name="requester",
+            runtime_id="019b3a40-4250-7000-8000-000000000201")
+        with (patch.object(staff, "runtime_id", return_value=requester.current_session),
               patch.object(stop_resume, "_detach", wraps=self.real_detach) as detach,
               patch.object(subprocess, "run"), patch.object(subprocess, "Popen"),
               patch.object(showrunners, "tell") as tell,
@@ -1584,7 +1676,6 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(invocation[0], "stay")
             self.assertIn("--requester", arguments)
             self.assertEqual(arguments[arguments.index("--requester") + 1], "requester")
-            lookup.assert_called_once_with("019b3a40-4250-7000-8000-000000000201")
             log = self.root / "stay.log"
             self.process.return_value = sessions.SessionNotLive()
             arguments[arguments.index("--log") + 1] = str(log)

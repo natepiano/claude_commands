@@ -7,10 +7,8 @@ from pathlib import Path
 import shutil
 import shlex
 import sys
-import subprocess
 import tempfile
 from typing import ClassVar, override
-from unittest.mock import patch
 
 from scripts.direct import implement_launcher_test_support as support
 
@@ -90,22 +88,11 @@ class ClaudeLauncherFixture(support.ImplementLauncherFixture):
         self.prompt_file: Path = self.root / "implementation_prompt.md"
         self.implement_script: Path = self.root / "scripts/direct/implement.sh"
         _ = self.staff_parent
+        _ = (self.root / "claude-bin").write_text(self.cli_shim())
 
     @override
     def tearDown(self) -> None:
         shutil.rmtree(self.root)
 
-    @override
-    def claude_worker(self, session_dir: Path) -> Path:
-        with patch.object(support, "STUB_CLAUDE", self.cli_shim()):
-            return super().claude_worker(session_dir)
-
     def cli_shim(self) -> str:
         return CLAUDE_REPLY_SHIM.replace("__PYTHON__", shlex.quote(sys.executable))
-
-    @override
-    def claude_launch(self, session_dir: Path, registry_row: str, *,
-                      inherited_effort: str = "", kind: str = "impl") -> subprocess.CompletedProcess[str]:
-        with patch.object(support, "STUB_CLAUDE", self.cli_shim()):
-            return super().claude_launch(session_dir, registry_row,
-                                         inherited_effort=inherited_effort, kind=kind)

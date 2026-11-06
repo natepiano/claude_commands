@@ -1,6 +1,5 @@
 # models-unit: rename-track phases from herdr-unit's plan
 
-> **Production:** sdlc
 > **Source:** `docs/plans/herdr-worker-panes.md` on `natedev-herdr` (herdr-unit). sdlc moved these three items to models-unit on 2026-11-02 08:2x EST, on the user's ask to make rename land sooner.
 
 ## Delegation Context

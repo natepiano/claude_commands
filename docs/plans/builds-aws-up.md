@@ -1,6 +1,5 @@
 # AWS build target: one command, from nothing to a working target
 
-> **Production:** builds (unit aws-unit). Branch `builds-aws`.
 
 ## Goal
 

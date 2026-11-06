@@ -309,7 +309,9 @@ def longest_first(worktrees: Iterable[UnitWorktree]) -> tuple[UnitWorktree, ...]
 
 def unit_worktrees(production_docs: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[UnitWorktree, ...]:
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
-    return longest_first(row for document in sorted(production_docs.glob("*-production.md"))
+    return longest_first(row for document in (owner.doc.path for owner in resolver.record.find(kind="showrunner")
+                         if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                         and owner.doc.path.parent == production_docs)
                          for row in document_units(document, resolver=resolver))
 
 
