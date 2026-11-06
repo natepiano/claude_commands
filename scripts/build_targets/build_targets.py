@@ -59,8 +59,6 @@ def positive_pid(value: str) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
-    platform = commands.add_parser("platform")
-    _ = platform.add_argument("--target", required=True)
     reserve = commands.add_parser("reserve")
     _ = reserve.add_argument("--repo-root", required=True)
     _ = reserve.add_argument("--package", default="")
@@ -93,18 +91,6 @@ def parser() -> argparse.ArgumentParser:
     _ = interrupt.add_argument("--call-id", required=True)
     _ = interrupt.add_argument("--signal", dest="signal_name", choices=("INT", "TERM"), default="TERM")
     return root
-
-
-def command_platform(target: str) -> int:
-    print(target_config.configured_ssh_target(target).platform)
-    return 0
-
-
-# A platform query needs configuration before any coordination imports.
-if __name__ == "__main__" and sys.argv[1:2] == ["platform"]:
-    override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
-    platform_arguments = parser().parse_args(namespace=CliArguments())
-    raise SystemExit(command_platform(platform_arguments.target))
 
 
 from targets import (
@@ -305,7 +291,8 @@ def print_eligible_target(result: EligibleTarget | ExcludedTarget) -> None:
     disposition = "eligible" if isinstance(result, EligibleTarget) else "excluded"
     reason = "-" if isinstance(result, EligibleTarget) else display_field(result.reason)
     settings = str(target.settings) if isinstance(target, SshTarget) else "-"
-    print(f"{target.name}\t{disposition}\t{reason}\t{settings}")
+    platform = target.platform if isinstance(target, SshTarget) else "-"
+    print(f"{target.name}\t{disposition}\t{reason}\t{settings}\t{platform}")
 
 
 StepKind = Literal["check", "lint", "doc", "test", "build", "example", "final"]
@@ -893,8 +880,6 @@ def command_check_local(caller: str = "") -> int:
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
     args = parser().parse_args(namespace=CliArguments())
-    if args.command == "platform":
-        return command_platform(args.target)
     if args.command == "reserve":
         return command_reserve(args)
     if args.command == "release-wait":

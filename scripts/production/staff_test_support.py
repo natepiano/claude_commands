@@ -444,14 +444,14 @@ def source_environment(source: Path) -> dict[str, str]:
         ("HERDR_PANE_RECORD_DIR", "panes"), ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("XDG_CONFIG_HOME", "config"),
         ("UNIT_WORKERS_STATE", "unit-workers"), ("ROSTER_RUN_ROOT", "runs"),
-        ("ASTRA_ROLES_STATE", "astra-roles"),
+        ("ASTRA_ROLES_STATE", "astra-roles"), ("ASTRA_REVIEW_DIR", "astra-runs"),
         ("DESIGN_ROLES_STATE", "design-roles"), ("DESIGN_OWNERSHIP_STATE", "design-ownership"),
     )}
 
 
 OWNER_CLI = """import os, runpy, sys
 sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
-from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
+from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_readers, observe_operation_lock
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
 from scripts.production import staff_sources
@@ -464,6 +464,9 @@ sys.argv[0] = script
 with isolated_source_readers(), mock.patch.object(
     remote, 'local_machine', return_value='mac' if sys.platform == 'darwin' else 'natedev',
 ):
+    if script == str(STAFF_SCRIPT):
+        from scripts.production import staff
+        raise SystemExit(staff.main())
     runpy.run_path(script, run_name='__main__')
 """
 
@@ -495,9 +498,11 @@ def observe_operation_lock() -> None:
 @contextmanager
 def isolated_source_readers() -> Generator[None]:
     """Redirect import-bound source paths and prevent live session discovery."""
+    from scripts.lib import unit_runs
     from scripts.message import process_table
 
     with ExitStack() as contexts:
+        _ = contexts.enter_context(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", Path(os.environ["ASTRA_REVIEW_DIR"])))
         # Process-evidence cases install their own private snapshot inside this boundary.
         _ = contexts.enter_context(mock.patch.object(process_table, "snapshot", return_value={}))
         for module_name, attributes in (

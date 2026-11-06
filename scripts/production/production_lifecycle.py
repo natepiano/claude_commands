@@ -15,6 +15,9 @@ from typing import NamedTuple, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import session_staff, staff, unit_config
+from scripts.shutdown import stop_resume
+from scripts.lib import unit_runs
+from scripts.herdr import worker_panes
 from scripts.shutdown.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -590,6 +593,11 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = capture_release(production.name, record=record)
     for item in prepared:
         unit = item.unit
+        _ = stop_resume.stop_unit_workers(unit.member.id, record)
+        remaining = worker_panes.observe(unit.member.id, staff.snapshot()) if record.find(kind="worker", parent=unit.member.id) and unit_runs.worker_transport(worker_panes.worker_run(unit.member)) == "herdr" else []
+        if any(isinstance(state, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for state in remaining):
+            held = True
+            continue
         _ = unit_config.park(unit.member.id, unit.worktree, item.retirement)
         if unit.worktree.exists():
             retire_reservations(unit.worktree)

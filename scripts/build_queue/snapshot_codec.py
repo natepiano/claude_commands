@@ -92,4 +92,3 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         raise ValueError("invalid snapshot record fields")
     return cast(Callable[..., object], schema)(**{name: parse_snapshot_value(record[name], kind)
                                                 for name, kind in annotations.items() if name in record})
-

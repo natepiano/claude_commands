@@ -22,6 +22,15 @@ The fixed `id` identifies a member across session changes.
 `CodexBackend.family` is `codex`; its `codex_home` names the serving account.
 `BackendUnavailable` names unavailable backend evidence.
 A live Claude session can supply backend evidence before its transcript exists.
+`StaffRow.paused` is `Paused(since, by, why)` or `Active()`.
+JSON stores `paused: {since, by, why}` only for a paused row.
+`pause(reference, why)` records the time in the user zone and the caller's staff name.
+`resume(reference)` removes the field.
+The commands accept a unit or `--production <showrunner name>`.
+Production pause accepts repeated `--except <unit>` options.
+Both commands are safe to repeat. They stop no process.
+Rename, move, retire and restore retain the pause field.
+
 Staff storage uses schema 2.
 `staff_sources.live` emits observations with schema 3.
 `WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
@@ -41,12 +50,14 @@ Each wait uses the smaller configured limit or remaining operation deadline.
 ## Accessor table
 
 The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, and `retire_pending`.
-They also include `set_doc`, `set_worktree`, and `update_current_session`.
+They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, and `resume`.
 
 | File | Access | `staff` calls |
 |---|---|---|
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
+| `commands/showrunner/units.md` | write | staff.py pause, resume (shell) |
 | `docs/associate-producer/operations.md` | read | staff.json (shell) |
+| `docs/as-built/showrunner-automation.md` | write | staff.py pause, resume (shell) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
@@ -65,6 +76,7 @@ They also include `set_doc`, `set_worktree`, and `update_current_session`.
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
+| `scripts/copies/copies.py` | read | local_snapshot |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/board_json.py` | read | active, snapshot |
@@ -135,10 +147,9 @@ They also include `set_doc`, `set_worktree`, and `update_current_session`.
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
 | `scripts/production/prune_phase_notes.py` | read | snapshot |
-| `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, set_doc, snapshot |
+| `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, row_operation, set_doc, snapshot |
 | `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
-| `scripts/production/rename_unit.py` | write | by_id, cli_result, operation, rename, set_worktree, snapshot |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/production/resume_unit.py` | read | cli_result, initial_snapshot, operation, restore_unit |
 | `scripts/production/retire_unit.py` | write | cli_result, operation, operation_fds, set_worktree, snapshot |
