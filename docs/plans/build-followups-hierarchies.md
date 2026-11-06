@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready; long-running.** Find the agent hierarchy that delivers Hana fastest under the user's constraints: measure today's hierarchy, collect the constraints, propose the best hierarchy with a step-by-step change to it, then build and measure one approved step at a time.
 
-> **Production: sdlc** — unit `hierarchies-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Source
 

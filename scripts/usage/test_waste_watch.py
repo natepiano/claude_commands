@@ -126,7 +126,7 @@ class WasteWatchTests(unittest.TestCase):
             found = REAL_DISCOVERY()
         self.assertIsInstance(found, waste_watch.ShowrunnersFound)
         assert isinstance(found, waste_watch.ShowrunnersFound)
-        self.assertEqual([runner.slug for runner in found.showrunners], ["watch"])
+        self.assertEqual([runner.name for runner in found.showrunners], ["watch"])
         self.assertEqual(errors.getvalue().splitlines(), ["warning: docless: the production document is not recorded"])
 
     def test_partial_discovery_keeps_the_lookup_unknown_instead_of_complete(self) -> None:

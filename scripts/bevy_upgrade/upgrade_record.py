@@ -300,7 +300,7 @@ def start(production: Production, target: str, pins: Pins, now: datetime, *, sta
             _ = path.replace(archive)
         except OSError as error:
             raise RecordFailure(f"{path}: {error}") from error
-    return apply_pins(Record(staff_id=identity, production=str(production.doc),
+    return apply_pins(Record(staff_id=identity, production=production.name,
                              checkout=str(production.checkout), target=target, started=_utc(now),
                              closed=None, bevy=[], pins_read=_utc(now), dependencies={},
                              target_bevy=TargetUnread(status="unread"), target_error="", checked=None,

@@ -35,7 +35,7 @@ class StylePlanTests(StylePlanFixture):
             for _ in expected:
                 code, _, errors = self.run_next()
                 self.assertEqual(code, 0, errors)
-                ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+                ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
                 self.assertEqual(ticket["kind"], "proposal")
                 tickets.append(ticket["files"])
                 ledger.ticket_checkpoint(ticket["id"], self.tip)

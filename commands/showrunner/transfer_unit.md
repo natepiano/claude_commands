@@ -1,16 +1,16 @@
 ---
 description: Transfer a unit between productions.
-argument-hint: "<unit> <to production doc>"
+argument-hint: "<unit> <receiving showrunner name>"
 ---
 
 # Transfer unit
 
 Run from the giving showrunner session, when the receiving showrunner asks for the unit. `<unit>` is
-the unit's id or its stem. `<to production doc>` is the receiving production's doc. The script lives
+the unit's id or its stem. `<receiving showrunner name>` is the receiving showrunner row's `name`. The script lives
 at `~/.claude/scripts/production/transfer_unit.py`:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/transfer_unit.py" <plan|apply|verify> <slug> <unit> <to production doc>
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/transfer_unit.py" <plan|apply|verify> <showrunner name> <unit> <receiving showrunner name>
 ```
 
 1. Run `plan` to check the unit and the receiving showrunner against their staff rows.

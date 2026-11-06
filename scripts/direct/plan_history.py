@@ -49,7 +49,7 @@ PHASE_REFERENCE_PATTERN = re.compile(
     + r"\d+[a-z]?(?!\w|[-:./]\w))*)",
 )
 UNIT_PHASE_PREFIX = re.compile(
-    r"(?<![\w-])(?P<quote>`|'|\"|\*\*)?(?P<unit>[\w-]+-unit)"
+    r"(?:^|[;,&][ \t]*|\b(?i:and)[ \t]+)(?P<quote>`|'|\"|\*\*)?(?P<unit>(?!(?i:and)(?![\w-]))[\w-]+)"
     + r"(?:['’]s)?(?(quote)(?P=quote))(?:['’]s)?[ \t]+$"
 )
 
@@ -141,7 +141,7 @@ def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver |
                 # A unit name qualifies only the phase span that follows it.
                 qualifier = UNIT_PHASE_PREFIX.search(dependency_text[: reference.start()])
                 if qualifier is not None and (
-                    isinstance(member, session_staff.NoSuchMember) or qualifier.group("unit").removesuffix("-unit") != member.row.name
+                    isinstance(member, session_staff.NoSuchMember) or qualifier.group("unit") != member.row.name
                 ):
                     continue
                 phase_ids = reference.group("single") or reference.group("list")

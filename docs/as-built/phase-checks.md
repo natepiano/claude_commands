@@ -49,7 +49,8 @@ files. `<ReviewPromptContract/>` defines phase paths and retries.
 
 **How findings flow**
 
-Broad review includes the [simplify lens](simplify-lens.md).
+Broad review runs `adversary`, `contract`, and armed `rerun` lenses.
+The [daily simplify run](simplify-lens.md) starts after the code ready notice.
 Its held items stay outside repair batches.
 The contract reviewer retains the style assignment.
 

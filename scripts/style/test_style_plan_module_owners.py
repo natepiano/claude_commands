@@ -95,7 +95,7 @@ class StylePlanTests(StylePlanFixture):
         self.commit_to_every_checkout()
         output = self.refill_with_busy(self.sources[1])
         self.assertNotIn("waiting", output)
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/terminal/startup_tests.rs"], [finding]))
 
     def test_decision_refill_builds_a_restructure_whose_busy_file_mounts_another_file_by_path(self) -> None:
@@ -106,7 +106,7 @@ class StylePlanTests(StylePlanFixture):
         self.commit_to_every_checkout()
         output = self.refill_with_busy(self.sources[1])
         self.assertNotIn("waiting", output)
-        ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/terminal/startup_tests.rs"], [finding]))
 
 if __name__ == "__main__":

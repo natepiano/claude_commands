@@ -1714,15 +1714,15 @@ print("SENT: delivered")
         }
         review_root = self.showrunner_root / "review-paused"
         review_root.mkdir(parents=True)
-        review_paths = [review_root / f"{slug}.json" for slug in paths]
+        review_paths = [review_root / f"{name}.json" for name in paths]
         for review_path in review_paths:
             _ = review_path.write_text("{}\n")
-        before = {slug: path.read_bytes() for slug, path in paths.items()}
+        before = {name: path.read_bytes() for name, path in paths.items()}
 
         held = self.run_cli("tick", now=1_000)
         self.assertEqual(held.returncode, 0, held.stderr)
         self.assertEqual(
-            {slug: path.read_bytes() for slug, path in paths.items()}, before
+            {name: path.read_bytes() for name, path in paths.items()}, before
         )
         self.assertEqual(self.calls(self.send_log), [])
         self.assertEqual(

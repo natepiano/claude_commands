@@ -21,9 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
+from scripts.lib import build_folders
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import fake_memory_readings
-from scripts.production import merge_gate
+from scripts.production import merge_gate, staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
@@ -281,7 +283,7 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        directory = tempfile.TemporaryDirectory(dir="/dev/shm", prefix="merge-gate-test-")
+        directory = tempfile.TemporaryDirectory(dir=build_folders.tmpfs_temporary_parent(), prefix="merge-gate-test-")
         cls.addClassCleanup(directory.cleanup)
         cls.fixture_root = Path(directory.name) / "case"
         cls.fixture_snapshot = Path(directory.name) / "snapshot"
@@ -338,7 +340,7 @@ class MergeGateFixture(unittest.TestCase):
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
         self.environment = {
-            **os.environ, "HOME": str(home), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -462,6 +464,8 @@ class MergeGateFixture(unittest.TestCase):
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"
         self.write(self.quiet_production, "# quiet\n")
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc("natedev", self.quiet_production))
         _ = self.git(self.root, "init", "--bare", str(self.origin))
         _ = self.git(self.root, "init", "-b", "main", str(self.checkout))
         _ = self.git(self.checkout, "config", "user.name", "Merge Gate Fixture")
@@ -523,21 +527,21 @@ class MergeGateFixture(unittest.TestCase):
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
                  ignored_signals: bool = False, callers_production: bool = False,
-                 own_process: bool = False) -> subprocess.CompletedProcess[str]:
+                 own_process: bool = False, preamble: str = "") -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
              "--checkpoint", checkpoint or self.checkpoint,
              "--previous-checkpoint", previous or self.base,
-             "--unit", "fixture-unit", "--phase", "phase-2",
+             "--unit", "fixture", "--phase", "phase-2",
              "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
-             *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
+             *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
              *extra]
         # The gate measures itself and descendants; cap assertions need their own gate process.
         if own_process or ignored_signals:
             return subprocess.run(
-                [*self.gate_command(ignored_signals=ignored_signals), *arguments], cwd=self.root,
+                [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
                 env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         from scripts.production import showrunners
@@ -553,14 +557,15 @@ class MergeGateFixture(unittest.TestCase):
             return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
                               self.environment, self.root)
 
-    def gate_command(self, *, ignored_signals: bool = False) -> list[str]:
+    def gate_command(self, *, ignored_signals: bool = False, preamble: str = "") -> list[str]:
         source = "import sys, signal; "
         if ignored_signals:
             source += ("[signal.signal(sig, signal.SIG_IGN) for sig in "
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
         source += (f"sys.path.insert(0, {str(SCRIPT.parents[2])!r}); "
-                   "from scripts.production import merge_gate; "
-                   "raise SystemExit(merge_gate.main(sys.argv[1:]))")
+                   + "from scripts.production import merge_gate; \n"
+                   + preamble + "\n"
+                   + "raise SystemExit(merge_gate.main(sys.argv[1:]))")
         return [sys.executable, "-c", source]
 
     def run_promote_only(self) -> subprocess.CompletedProcess[str]:
@@ -614,7 +619,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def review_list(self) -> tuple[Path, Path]:
         """A change-review list holding C7, and the production doc that names it."""
-        review = self.root / "change-review.md"
+        review = Path(self.environment["HOME"]) / "rust/hanadocs/change-review/change-review - fixture-showrunner.md"
         self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                    + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
         doc = self.root / "production.md"

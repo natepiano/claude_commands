@@ -350,6 +350,14 @@ print('complete', flush=True)
 
 
 class UnitConfigTests(UnitConfigFixture):
+    def test_responsibilities_accept_names_and_paths_and_reject_invalid_values(self) -> None:
+        responsibilities = ("nightly-review", "scripts/production/", "settings.json")
+        value = config.UnitConfig(config.StandbyPlan(), config.NoAppPort(), responsibilities)
+        self.assertEqual(value.responsibilities, tuple(sorted(responsibilities)))
+        for invalid in ("", "all production scripts", "../outside", "/absolute", "scripts/../outside"):
+            with self.subTest(invalid=invalid), self.assertRaises(config.ConfigRefused):
+                _ = replace(value, responsibilities=(invalid,))
+
     def test_remote_configuration_fields_preserve_retirement_and_reject_invalid_values(self) -> None:
         fields: dict[str, object] = {
             "plan": "docs/plans/worker.md", "port": 8123,

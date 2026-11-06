@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import fcntl
 import json
 import os
 import shlex
@@ -24,7 +25,6 @@ from scripts.production import staff, showrunners
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
 from scripts.shutdown import remote
-from scripts.production.showrunners import canonical_slug
 from sessions import SessionRecord
 from place import HerdrPlace
 from pane_launch import PaneLaunch
@@ -157,7 +157,8 @@ def publish_worker_roster(handle: WorkerStateFile, roster: Mapping[str, object])
 
 def read_worker_roster(path: Path) -> dict[str, object]:
     from scripts.agents import worker_lifecycle
-    return worker_lifecycle.read_worker_state(path)
+    with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as handle:
+        return handle.read_object()
 
 
 def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> Path:
@@ -166,7 +167,7 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
         owner = record.parent_of(row) if row.kind == "worker" else row
         if owner is not None and owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
             from scripts.production.production_doc import read_production
-            return read_production(owner.doc.path).checkout
+            return read_production(owner.name, record).checkout
         tree = RowResolver(record).unit_worktree(row)
         if isinstance(tree, PresentWorktree):
             return tree.path
@@ -408,12 +409,12 @@ class RowResolver:
 
 @dataclass(frozen=True)
 class ShowrunnerMember:
-    slug: str
+    name: str
 
 
 @dataclass(frozen=True)
 class UnitMember:
-    slug: str
+    name: str
     unit: str
 
 
@@ -503,16 +504,6 @@ class MemberSources:
     productions: dict[str, showrunners.ShowrunnerSource]
     launches: tuple[PaneLaunch, ...]
 
-    def canonical_slug(self, slug: str) -> str:
-        """Resolve a former slug from loaded documents, then recorded journals."""
-        if slug in self.productions:
-            return slug
-        matches = [name for name, source in self.productions.items()
-                   if slug in showrunners.former_slugs(source.document)]
-        if matches:
-            return matches[0] if len(matches) == 1 else slug
-        return showrunners.rename_history().get(slug, slug)
-
     def member(self, selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
         if isinstance(selector, FolderMember):
             return RowResolver(record).member_by_folder(selector.machine, selector.path)
@@ -520,27 +511,16 @@ class MemberSources:
             if isinstance(selector.staff_id, NoSession):
                 raise staff.StaffUnreadable("observed session has no native runtime identity")
             return unit_match(selector, record, selector.staff_id)
-        source = self.productions.get(selector.slug)
         if isinstance(selector, UnitMember):
-            parent = self.member(ShowrunnerMember(selector.slug), record)
+            parent = self.member(ShowrunnerMember(selector.name), record)
             if isinstance(parent, NoSuchMember):
                 return NoSuchMember(selector)
             return unit_match(selector, record, parent=RequiredParent(parent.row))
-        if source is None:
-            row = record.by_path(selector.slug)
-            return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)
-        owner = record.by_doc(remote.local_machine(), source.timer.doc)
-        if owner is not None:
-            return MemberFound(owner) if owner.kind == "showrunner" else NoSuchMember(selector)
-        return NoSuchMember(selector)
+        row = next((row for row in record.find(kind="showrunner") if row.name == selector.name), None)
+        return MemberFound(row) if row is not None else NoSuchMember(selector)
 
     def showrunner_members(self, record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
-        found: dict[str, staff.StaffRow] = {}
-        for slug in self.productions:
-            selected = self.member(ShowrunnerMember(slug), record)
-            if isinstance(selected, MemberFound):
-                found[slug] = selected.row
-        return found
+        return {row.name: row for row in record.find(kind="showrunner")}
 
 
 def member_sources(*, dependencies: Callable[[Path], None] | None = None,
@@ -558,7 +538,7 @@ def member_sources(*, dependencies: Callable[[Path], None] | None = None,
         raise staff.StaffUnreadable(str(error)) from error
     sources = showrunners.read_sources(unreadable=unreadable,
                                        dependencies=dependencies, record=record)
-    return MemberSources({source.timer.slug: source for source in sources}, tuple(launches.values()))
+    return MemberSources({source.timer.name: source for source in sources}, tuple(launches.values()))
 
 
 class LiveClaude(NamedTuple):
@@ -623,29 +603,16 @@ class LabeledProductions:
     units: dict[str, dict[str, LabeledSession]]
     members: dict[str, tuple[str, ...]] = field(default_factory=dict, compare=False)
 
-    def status_units(self, slug: str) -> dict[str, LabeledSession]:
+    def status_units(self, production_name: str) -> dict[str, LabeledSession]:
         """Return the selected process for each unit in the production."""
-        return dict(self.units.get(slug, {}))
+        return dict(self.units.get(production_name, {}))
 
-
-def lookup_slug(slug: str, *, record: staff.StaffSnapshot | None = None) -> str:
-    if record is None:
-        return canonical_slug(slug)
-    if any(showrunners.owner_slug(row) == slug for row in record.find(kind="showrunner")):
-        return slug
-    return showrunners.rename_history().get(slug, slug)
 
 
 def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> dict[str, tuple[staff.StaffRow, ...]]:
     """All recorded unit children, including those with no pane or local worktree."""
-    active_runners = {row.id for row in staff.active(record, "showrunner")}
-    runners = {slug: row for slug, row in sources.showrunner_members(record).items() if row.id in active_runners}
-    # A timer is not required for an offline production whose short name is its slug.
-    mapped = {row.id for row in runners.values()}
-    runners.update({row.name: row for row in staff.active(record, "showrunner")
-                    if row.id not in mapped and row.name not in runners})
-    return {slug: tuple(unit for unit in staff.active(record, "unit") if unit.parent == staff.ReportsTo(row.id))
-            for slug, row in runners.items()}
+    return {row.name: tuple(unit for unit in staff.active(record, "unit") if unit.parent == staff.ReportsTo(row.id))
+            for row in sources.showrunner_members(record).values() if row in staff.active(record, "showrunner")}
 
 
 def group_labeled_sessions(marked: Iterable[LabeledSession], *,
@@ -657,12 +624,12 @@ def group_labeled_sessions(marked: Iterable[LabeledSession], *,
     return _group_labeled_sessions(marked, record, production_members(record, sources), sources.launches)
 
 
-def retained_session_labels(marked: Iterable[LabeledSession], row: staff.StaffRow, slug: str, *,
+def retained_session_labels(marked: Iterable[LabeledSession], row: staff.StaffRow, production_name: str, *,
                         record: staff.StaffSnapshot, sources: MemberSources) -> LabeledProductions:
     """Keep pane evidence for a retained identity during stop and cleanup checks."""
     membership = production_members(record, sources)
-    if row not in membership.get(slug, ()):
-        membership[slug] = (*membership.get(slug, ()), row)
+    if row not in membership.get(production_name, ()):
+        membership[production_name] = (*membership.get(production_name, ()), row)
     return _group_labeled_sessions(marked, record, membership, sources.launches)
 
 
@@ -671,7 +638,7 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
     import herdr
 
     shared_session = herdr.shared_session()
-    parents = {row.id: slug for slug, rows in membership.items() for row in rows}
+    parents = {row.id: production_name for production_name, rows in membership.items() for row in rows}
     found: dict[str, dict[staff.StaffId, list[LabeledSession]]] = {}
     observed = tuple(marked)
     pane_rows: dict[Place, set[staff.StaffId]] = {}
@@ -699,8 +666,8 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
         if runtime_row.kind != "unit":
             continue
         row = runtime_row
-        slug = parents.get(row.id)
-        if slug is None:
+        production_name = parents.get(row.id)
+        if production_name is None:
             parent = record.parent_of(row)
             if (isinstance(row.worktree, staff.RemovedWorktree)
                     or (parent is not None and parent.kind == "showrunner"
@@ -708,10 +675,10 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
                 continue
             print(f"anomaly: {row.name}: no showrunner staff parent", file=sys.stderr)
             continue
-        found.setdefault(slug, {}).setdefault(row.id, []).append(unit)
+        found.setdefault(production_name, {}).setdefault(row.id, []).append(unit)
     units: dict[str, dict[str, LabeledSession]] = {}
-    for slug, production in found.items():
-        units[slug] = {}
+    for production_name, production in found.items():
+        units[production_name] = {}
         for identity, places in production.items():
             row = record.by_id(identity)
             assert row is not None
@@ -719,9 +686,9 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
             selected = next((unit for unit in places if isinstance(unit.process, ObservedProcess)
                              and (herdr.is_claude_process([unit.process.command])
                                   or herdr.is_codex_process([unit.process.command]))), places[0])
-            units[slug][name] = selected if selected.unit == name else replace(selected, unit=name)
-    return LabeledProductions(units, {slug: tuple(row.name for row in rows)
-                                     for slug, rows in membership.items()})
+            units[production_name][name] = selected if selected.unit == name else replace(selected, unit=name)
+    return LabeledProductions(units, {production_name: tuple(row.name for row in rows)
+                                     for production_name, rows in membership.items()})
 
 
 def session_staff_and_directors(
@@ -771,7 +738,7 @@ class LaunchMembership:
         return cls(record, member_sources(record=record))
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
-        labels = StaffLabels(self.record, self.sources.productions, self.sources.showrunner_members(self.record))
+        labels = StaffLabels(self.record)
         owner = self.record.by_member_reference(launch["session_id"])
         session_id = owner.current_session if owner is not None else launch["session_id"]
         return labels.environment(launch["environment"], session_id)

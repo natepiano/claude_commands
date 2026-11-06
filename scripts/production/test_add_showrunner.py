@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
-from scripts.production.production_doc import Production, read_production
+from scripts.production.production_doc import Production, read_new_production, read_production
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.whoami import usage_store
@@ -57,7 +57,7 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         _ = fixture_member("showrunner", name="demo", runtime_id=fixture_runtime_id("decoy-showrunner"))
         with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", return_value=
               runtime.AgentLaunched("w1:p1", runtime.PromptSubmitted(datetime.now(timezone.utc)))) as launch):
-            _ = add_showrunner.launch(read_production(document), "fixture", "high", current,
+            _ = add_showrunner.launch(read_production("row-name"), "fixture", "high", current,
                                       self.root, accounts.NamedAccount("claude1", self.root))
         arguments = cast(list[str], launch.call_args.kwargs["agent_arguments"])
         self.assertEqual(arguments[arguments.index("-n") + 1], "row-name")
@@ -66,10 +66,12 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
         self.assertNotIn("STAFF_ID", cast(dict[str, str], launch.call_args.args[4]))
 
     def test_fresh_showrunner_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
-        document = self.production("demo")
+        document = self.root / "different-production.md"
+        _ = document.write_text("# New production\n")
         _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
                                 + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
-        child = read_production(document)
+        child = read_new_production(document, "demo")
+        self.assertIsNone(staff.initial_snapshot().by_path("demo"))
         identity = fixture_runtime_id("fresh-Claude-showrunner")
         backend = ClaudeBackendFixture(identity, self.root / "claude-account")
         with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", side_effect=backend.launch)):
@@ -85,6 +87,16 @@ class NativeClaudeShowrunnerTests(StaffTestCase):
 
 
 class AddShowrunnerTests(AddShowrunnerFixture):
+    def test_existing_showrunner_uses_its_staff_document_when_given_another_document(self) -> None:
+        document = self.doc("kid")
+        owner = fixture_member("showrunner", name="kid", doc=staff.LiveDoc("natedev", document))
+        unrelated = self.doc("unrelated")
+        result = self.run_command("kid", "--doc", str(unrelated), "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"would start kid in {self.root / 'kid-checkout'}", result.stdout)
+        self.assertNotIn(str(self.root / "unrelated-checkout"), result.stdout)
+        self.assertEqual(staff.by_id(owner.id), owner)
+
     def test_new_showrunner_and_missing_parent_are_admitted_with_their_live_docs(self) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
@@ -142,7 +154,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             self.assertGreater(showrunner_admit.call_count, 0)
             with (patch.dict(os.environ, self.env),
                   patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
-                unit = add_unit.ensure_staff_unit(read_production(self.doc("kid")), "probe-unit",
+                unit = add_unit.ensure_staff_unit(read_production("kid"), "probe",
                     worktree=staff.PresentWorktree("natedev", self.root / "probe"),
                     runtime_id=fixture_runtime_id("probe-unit-backend"))
             unit_admit.assert_called_once()
@@ -154,15 +166,16 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_existing_staff_parent_survives_a_stale_saved_parent_during_ensure(self) -> None:
         self.timer("kid", "cfc4564d-fed3-5803-9a4c-e3119733bb53")
         parent = fixture_member("showrunner", name="other")
-        child = fixture_member("showrunner", name="kid", parent=parent.id,
-                             doc=staff.LiveDoc("natedev", self.doc("kid")))
+        child = staff.by_path("kid")
+        assert child is not None
+        child = staff.move(child.id, staff.ReportsTo(parent.id))
         path = self.root / "showrunner" / child.id / "parent"
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, "top\n")
         before = self.staff.staff_file.read_bytes(), path.read_bytes()
         with (patch.dict(os.environ, self.env),
               patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
-            ensured = add_showrunner.ensure_staff_showrunner(read_production(self.doc("kid")), "top")
+            ensured = add_showrunner.ensure_staff_showrunner(read_production("kid"), "top")
         self.assertEqual(ensured, child)
         self.assertEqual((self.staff.staff_file.read_bytes(), path.read_bytes()), before)
 
@@ -172,7 +185,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             """The backend was observed before this launcher process ended."""
 
         def interrupted(child: Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
-            self.assertEqual((child.slug, caller), ("kid", "top"))
+            self.assertEqual((child.name, caller), ("kid", "top"))
             self.assertEqual(runtime_id, "cfc4564d-fed3-5803-9a4c-e3119733bb53")
             raise NativeCallbackInterrupted("stopped after saving launch")
 
@@ -238,9 +251,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(starts, 1)
         self.assertNotIn("TARGET=session:cfc4564d-fed3-5803-9a4c-e3119733bb53", self.timer_conf("kid").read_text())
 
-        def register(slug: str) -> bool:
-            self.assertEqual(slug, "kid")
-            _ = self.timer_conf(slug).write_text(self.timer_text(slug, "cfc4564d-fed3-5803-9a4c-e3119733bb53"))
+        def register(production_name: str) -> bool:
+            self.assertEqual(production_name, "kid")
+            _ = self.timer_conf(production_name).write_text(self.timer_text(production_name, "cfc4564d-fed3-5803-9a4c-e3119733bb53"))
             return True
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(12345)),
@@ -398,9 +411,11 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertIn("--resume and --cwd go together", alone.stderr)
 
     def test_showrunner_shared_tab_retries_enter_with_the_selected_session_transcript(self) -> None:
-        child = read_production(self.doc("kid"))
+        child = read_new_production(self.doc("kid"), "kid")
         selected = accounts.NamedAccount("claude3", self.root / "selected")
         native = fixture_runtime_id("shared-tab-resumed-showrunner")
+        row = fixture_member("showrunner", name="kid", doc=staff.LiveDoc("natedev", self.doc("kid")))
+        _ = staff.update_current_session(row.current_session, staff.native_id(native))
         path, record = self.record(native, "kid")
         pid = cast(dict[str, object], json.loads(record))["pid"]
         transcript = selected.dir / "projects/fixture" / f"{native}.jsonl"
@@ -473,7 +488,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         _ = self.doc("kid")
         for outcome in (runtime.PromptNotSubmitted("fixture lost input"), runtime.PromptSubmissionNotRequired()):
             with (self.subTest(outcome=outcome), patch.dict(os.environ, self.env, clear=True),
-                  patch.object(showrunners, "own_slug", return_value="top"),
+                  patch.object(showrunners, "own_name", return_value="top"),
                   patch.object(add_showrunner, "checked"),
                   patch.object(runtime, "shared_session", return_value="agents"),
                   patch.object(runtime, "start_server"), patch.object(runtime, "open_tab", return_value="destination:p1"),
@@ -481,7 +496,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                   patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
                   patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
                   redirect_stderr(io.StringIO()) as error):
-                code = add_showrunner.main(["--production", str(self.doc("kid")), "--model", "opus", "--effort", "high"])
+                code = add_showrunner.main(["--production", "kid", "--doc", str(self.doc("kid")), "--model", "opus", "--effort", "high"])
             self.assertEqual(code, add_showrunner.SESSION_NOT_READY)
             self.assertIn("kid: opening prompt not submitted", error.getvalue())
             appeared.assert_not_called()
@@ -594,7 +609,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_resume_refuses_an_unrelated_tab_of_the_same_name_without_closing_it(self) -> None:
         (self.state / "live-agents").touch()
         self.live("unrelated-conversation")
-        result = self.run_command("kid", "--resume", "ended-conversation", "--cwd", str(self.root),
+        result = self.run_command("kid", "--resume", fixture_runtime_id("ended-conversation"), "--cwd", str(self.root),
                                   "--account", "claude2")
         self.refused(result, "a tab named kid is already open in herdr session agents")
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -646,7 +661,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
 
     def test_resume_uses_the_configured_showrunners_account(self) -> None:
         directory = self.named_account()
-        child = read_production(self.doc("kid"))
+        child = read_new_production(self.doc("kid"), "kid")
         self.resume_record()
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
@@ -655,7 +670,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         role.assert_called_once_with("showrunner")
 
     def test_check_validates_the_destination_without_returning_a_binary(self) -> None:
-        child = read_production(self.doc("kid"))
+        child = read_new_production(self.doc("kid"), "kid")
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(add_showrunner, "running", return_value=False), \
                 patch.object(showrunner_tree, "descendants_of", return_value=[]), \
@@ -697,7 +712,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_showrunner_launch_carries_no_marks_or_caller_account_variables(self) -> None:
         self.env["CLAUDE_CODE_OAUTH_TOKEN"] = "caller-token"
         self.env["SHOWRUNNER_UNIT"] = "parent"
-        self.env["SHOWRUNNER_UNIT_ID"] = "parent-unit"
+        self.env["SHOWRUNNER_UNIT_ID"] = "parent"
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -770,9 +785,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         edge.parent.mkdir(parents=True)
         _ = edge.write_text("top\n", encoding="utf-8")
         top = fixture_member("showrunner", name="top")
-        _ = fixture_member("showrunner", name="kid", parent=top.id,
-                           runtime_id="cfc4564d-fed3-5803-9a4c-e3119733bb53",
-                           doc=staff.LiveDoc("natedev", self.doc("kid")))
+        child = staff.by_path("kid")
+        assert child is not None
+        _ = staff.move(child.id, staff.ReportsTo(top.id))
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53")
         result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -780,7 +795,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(self.sent_to(), [])
 
     def test_a_stored_timer_alone_is_not_a_showrunner_that_appeared(self) -> None:
-        self.timer("kid", "ended-session")
+        self.timer("kid", fixture_runtime_id("ended-session"))
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("kid has no running showrunner after 0 s", result.stdout)
@@ -799,8 +814,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_session_records_that_cannot_be_read_refuse_the_start(self) -> None:
         _ = (self.root / "sessions.py").write_text(
             "import sys\nprint('registry gone', file=sys.stderr)\nraise SystemExit(3)\n", encoding="utf-8")
-        self.timer("kid", "some-session")
-        self.refused(self.run_command("kid"), "cannot tell whether session:some-session is running: registry gone")
+        self.timer("kid", fixture_runtime_id("some-session"))
+        row = staff.by_path("kid")
+        assert row is not None
+        self.refused(self.run_command("kid"), f"cannot tell whether session:{row.current_session} is running: registry gone")
 
     def test_a_registry_unreadable_for_a_moment_during_the_wait_is_tried_again(self) -> None:
         self.flaky_registry(1)
@@ -849,23 +866,23 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertIn(["--session", "agents", "pane", "list"], self.herdr_calls())
 
     def test_each_refusal_names_its_cause_and_starts_nothing(self) -> None:
-        notes = self.root / "notes.md"
-        _ = notes.write_text("# notes\n", encoding="utf-8")
-        not_a_doc = self.invoke(["--production", str(notes), "--model", "opus", "--effort", "high"])
+        not_a_doc = self.invoke(["--production", "unknown", "--model", "opus", "--effort", "high"])
         self.assertEqual(not_a_doc.returncode, 2, not_a_doc.stdout + not_a_doc.stderr)
         self.assertIn("add_showrunner: ", not_a_doc.stderr)
         self.refused(self.run_command("top"), "top is this session's own production")
-        self.timer("running", "running-session")
-        self.live("running-session")
+        self.timer("running", fixture_runtime_id("running-session"))
+        self.live(fixture_runtime_id("running-session"))
         self.refused(self.run_command("running"), "running already has a running showrunner")
         (self.state / "live-agents").touch()
         self.refused(self.run_command("kid"), "a tab named kid is already open in herdr session agents")
 
     def test_a_production_above_the_caller_is_refused(self) -> None:
-        self.timer("middle", "middle-session")
-        self.timer("grand", "grand-session")
+        self.timer("middle", fixture_runtime_id("middle-session"))
+        self.timer("grand", fixture_runtime_id("grand-session"))
         grand = fixture_member("showrunner", name="grand")
-        middle = fixture_member("showrunner", name="middle", parent=grand.id)
+        middle = staff.by_path("middle")
+        assert middle is not None
+        middle = staff.move(middle.id, staff.ReportsTo(grand.id))
         top = next(row for row in staff.find(kind="showrunner") if row.name == "top")
         _ = staff.move(top.id, staff.ReportsTo(middle.id))
         for child, parent in (("top", "middle"), ("middle", "grand")):

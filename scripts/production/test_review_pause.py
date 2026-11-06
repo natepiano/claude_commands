@@ -48,8 +48,11 @@ class ReviewPauseTests(unittest.TestCase):
             "> **Status: PRODUCTION — running.** demo\n"
             + f"- **User zone:** {ZONE} — demo\n"
         )
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        owner = fixture_member("showrunner", name="demo", runtime_id=SESSION,
+                               doc=staff.LiveDoc("natedev", doc))
         _ = (self.instance / "conf").write_text(
-            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh {doc}\n"
+            f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n"
         )
         _ = (self.instance / "state").write_text("ENABLED=1\nNEXT_DUE=1\n")
         self.enabled = self.instance / "enabled"
@@ -92,9 +95,7 @@ class ReviewPauseTests(unittest.TestCase):
             "SHOWRUNNER_NOTIFIER": str(stub),
         }
 
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        _ = fixture_member("showrunner", name="demo", runtime_id=SESSION,
-                           doc=staff.LiveDoc("natedev", doc))
+        self.environment["STAFF_FILE"] = os.environ["STAFF_FILE"]
 
     def run_script(self, *args: str, session: str = SESSION) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True,
@@ -185,14 +186,15 @@ class ReviewPauseTests(unittest.TestCase):
         other.mkdir()
         doc = self.root / "zeta-production.md"
         _ = doc.write_text((self.root / "demo-production.md").read_text())
-        _ = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc("natedev", doc))
+        owner = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc("natedev", doc))
         _ = (other / "conf").write_text(
-            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh {doc}\n")
+            f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
         _ = (other / "state").write_text("ENABLED=1\nNEXT_DUE=1\n")
         (other / "enabled").touch()
         other_record = self.record.with_name("zeta.json")
         self.environment["FAIL_STOP_AFTER_FOR"] = other.name
-        failed = self.run_script("pause")
+        self.assertEqual(self.run_script("pause").returncode, 0)
+        failed = self.run_script("pause", session=owner.current_session)
         self.assertEqual(failed.returncode, 1)
         self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done"})
         self.assertEqual(json.loads(other_record.read_text()),
@@ -200,10 +202,12 @@ class ReviewPauseTests(unittest.TestCase):
         self.assertFalse(self.enabled.exists())
         self.assertFalse((other / "enabled").exists())
         _ = self.environment.pop("FAIL_STOP_AFTER_FOR")
-        retried = self.run_script("pause")
+        self.assertEqual(self.run_script("pause").returncode, 0)
+        retried = self.run_script("pause", session=owner.current_session)
         self.assertEqual(retried.returncode, 0, retried.stderr)
         self.assertEqual(json.loads(other_record.read_text()), {"dailies": "done"})
         self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
+        self.assertEqual(self.run_script("resume", "dailies", session=owner.current_session).returncode, 0)
         self.assertTrue(self.enabled.exists())
         self.assertTrue((other / "enabled").exists())
         self.assertFalse(self.record.exists())

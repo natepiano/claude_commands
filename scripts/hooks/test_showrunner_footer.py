@@ -65,9 +65,11 @@ class QuestionLibraryTests(unittest.TestCase):
                 instance.mkdir(parents=True)
                 _ = (instance / "conf").write_text(
                     f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {document}\n")
+                _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
+                identities = QuestionStaff.for_record(staff.StaffSnapshot(()))
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors):
-                    line, due, paths = counts_row.row(instance)
+                    line, due, paths = counts_row.row(instance, identities=identities)
                 self.assertEqual(line, "For you: 1 efficiency")
                 self.assertEqual(due, "")
                 self.assertIn(document, paths)
