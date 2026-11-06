@@ -20,6 +20,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker, fixture_runtime_id
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import process_start
 from scripts.lib.stop_injection_test_support import stop_in_child
@@ -98,7 +99,12 @@ class AstraRolesTests(StaffTestCase):
             record = cast(dict[str, object], json.loads((self.state / "99340615-2159-5777-b1c8-71572890df55.json").read_text()))
             self.assertEqual({key: record[key] for key in ("design_id", "role_id", "session_dir", "worker", "pid")},
                              {"design_id": design_id, "role_id": "designer", "session_dir": None, "worker": None, "pid": None})
-            live = astra_roles.live_roles()
+            world = PaneWorld()
+            row = staff.by_id(staff.StaffId("99340615-2159-5777-b1c8-71572890df55"))
+            assert row is not None
+            world.add(row, "w1:p1", live=False)
+            with mock.patch("scripts.herdr.herdr.Herdr", return_value=world):
+                live = astra_roles.live_roles()
             self.assertEqual([(entry["thread_id"], entry["manager"], entry["state"]) for entry in live],
                              [("99340615-2159-5777-b1c8-71572890df55", self.parent.current_session, "idle")])
             ended = replace(design, roles=(replace(design.roles[0], lifecycle=design_roles.RoleEnded(staff.StaffId("99340615-2159-5777-b1c8-71572890df55"))), design.roles[1]))

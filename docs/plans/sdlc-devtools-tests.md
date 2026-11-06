@@ -1126,32 +1126,6 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Red
 
 **Depends on:** 3t, 3u, 3v (records stage of the rename track).
 
-#### Work Order
-
-**Goal:** the change review cell, the phase note `unit:`, the board cache and the proposal `unit:` field hold staff ids as their stored ownership and lookup keys, on both machines, and no reader looks them up by a unit or production name. Display and command boundaries keep the current name: `proposal_unit` (`proposal_issue.py:286`) resolves a stored id to the name, and the board shows the staff name as its unit key (`test_board_json.py:833`).
-
-**Spec:**
-1. **Remaining consumers.** For each store, search `grep -rn '<store path or key>' scripts commands ~/.codex/skills/generated-from-claude` and switch each reader that still takes a name to the staff id from the row. Keep `change_routing.owner` current-parent routing (`change_routing.py:157-182`) and reviewed change-review rows byte for byte.
-2. **Unit-board reader.** Already shipped: `mods/unit-board/hooks/data.ts:84` reads the generator's staff-id paths, and `mods/unit-board/tests/register.test.ts:24` covers a production rename. Confirm the deployed plugin and cite it in the notice. Change no source unless the search in item 1 finds a path built from a production name; that change goes to the unit-board owner.
-3. **Shared-folder regression.** One test holds proposal and question records in one proposals folder. It checks proposal ownership and the `/showrunner:questions` table after a rename and after a transfer. Question records keep their contents, timestamps, `production_id` and `asked_by` byte for byte.
-4. **Deployment evidence.** Phase 3t deleted `migrate_proposals.py`; sdlc ran it from `c6e9f5555` on 2026-11-05. Its output on natedev and the Mac, and a live read of each store, are the migration proof for proposals. A live read on 2026-11-06 found open change review rows that still hold names (hana 190, natedev 32), so `change_routing._staff_owner` keeps its `by_id` condition and `migrate_owners` stays. The deploy runs `change_review.py migrate-owners --write` after the 7u programs, and a final read must show staff ids in all open rows on each machine. A follow-up then deletes the `by_id` condition and `migrate_owners`. The phase code runs no migration.
-5. Delete more than you add. Add no guards.
-
-**Files:**
-- `scripts/production/change_review.py`, `scripts/production/change_routing.py`, `scripts/direct/phase_table.py`, `scripts/direct/board_json.py`, `scripts/production/proposal_issue.py`, `commands/change_review.md` — remaining readers; every other reader the search finds joins them.
-- `scripts/production/test_change_review.py`, `scripts/production/test_change_routing.py`, `scripts/direct/test_phase_table.py`, `scripts/direct/test_board_json.py`, `scripts/production/test_proposal_issue.py`, `scripts/production/test_update_registration_questions.py` — their tests and the shared-folder regression.
-- `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/rename_outside.py`, `scripts/production/transfer_unit.py` — read only (herdr-unit 3y).
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — the non-test files.
-- `test` — the tests and the shared-folder regression.
-
-**State:** none in code. Open change review rows convert at deploy (Spec item 4).
-
-**Constraints from prior phases:** keep the Phase 3s resolver. Phase 4p resolves relative question folders through `update_registration.question_folder`. Unreadable ownership is not confirmed absence. Staff rows hold canonical unit names from `unit_names.name`. Add no store registry, identity alias or live-rekey journal. Read-only consumers report the bad row and keep the other rows.
-
-**Acceptance gate:** the search in item 1 finds no reader that takes a name as a stored key, or the notice names each match and its owner. A real `/change_review` shows a moved unit's open row under its new production. The shared-folder regression passes. basedpyright `0 errors, 0 warnings, 0 notes` on changed files and their callers. Each changed module's suite passes. The full gate passes.
-
 **As built:** the change review cell, the phase note `unit:`, the board cache and the proposal `unit:` field hold staff ids, and `change_routing` routes an open row from its staff id. `change_review.py migrate-owners` moved 222 rows on natedev. The Mac run waits on the user's Mac step. After its final read shows staff ids in all open rows, delete the `by_id` condition and `migrate_owners`.
 
 ### Phase 3t — Production tools read the row and `.unit.toml`  · status: done

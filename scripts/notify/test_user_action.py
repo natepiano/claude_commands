@@ -6,7 +6,7 @@ import unittest
 from scripts.notify import push_texts
 from scripts.notify.user_action import ActionRequired, NoActionRequired, action_conflicts
 
-TILE = ActionRequired("On natedev, in the tile pane, approve the prompt or add an allow rule")
+TILE = ActionRequired("On natedev, in the tile pane, type: Go: run the refused command")
 
 
 class ActionConflictTests(unittest.TestCase):

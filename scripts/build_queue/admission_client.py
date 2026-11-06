@@ -23,6 +23,8 @@ if __package__ in (None, ""):
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_service import SystemClock
+from scripts.message import send_budget, send_result
+from scripts.message.session_send import session_send_argv
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit as gate
 
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
 else:
     from scripts.lib import conf
 
+BUILDS_SESSION = "builds"
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
 LOADED_ADMISSION_CODE_VERSION = os.environ.get("BUILDLOG_ADMISSION_CODE_VERSION") or admission_code.admission_code_version()
 
@@ -674,18 +677,51 @@ def down_alert() -> int:
             if CLOCK.monotonic() - started >= configuration.silence_seconds:
                 break
             CLOCK.sleep(configuration.reconnect_seconds)
+    settings = conf.read("lint")
     claimed = outage_alerts.claim("build-admission")
     if not isinstance(claimed, outage_alerts.AlertClaim):
         return 0
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    from scripts.notify import push_texts
-    command = push_texts.user_send_argv(push_texts.render("build_admission.down"))
-    result = subprocess.run(command, check=False)
-    if result.returncode:
-        outage_alerts.release(claimed)
-        return result.returncode
-    outage_alerts.delivered(claimed)
-    return 0
+
+    def send(command: list[str], message: str = "") -> send_result.Outcome:
+        try:
+            result = subprocess.run(command, input=message, text=True, capture_output=True,
+                                    timeout=send_budget.seconds(settings.number("sweep_sender_timeout_seconds")))
+            header = send_result.parse_outcome(result.stdout)
+            if isinstance(header, send_result.OutcomeHeader):
+                print(f"{header.outcome.upper()}: {header.detail}", flush=True)
+            outcome = send_result.send_outcome(result.returncode, result.stdout)
+            if isinstance(outcome, send_result.ConfirmedSendOutcome):
+                return outcome.header.outcome
+            print(f"build admission: outage alert failed: {result.stderr.strip()}", file=sys.stderr)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            print(f"build admission: outage alert failed: {error}", file=sys.stderr)
+        return "failed"
+
+    retained = False
+    try:
+        restart = "sudo systemctl restart build-admission.socket build-admission.service"
+        message = (f"The build queue service has not answered for {configuration.silence_seconds:g} seconds. Builds wait.\n"
+                   "The service restarts by itself. Read journalctl -u build-admission.service.\n"
+                   f"If the user must act, push the phone with this command: {restart}")
+        session_outcome = send(session_send_argv(BUILDS_SESSION, sender="build-admission", lint_settings=settings), message)
+        release_outcomes = ("failed", "refused", "retry")
+        retained = session_outcome not in release_outcomes
+        if session_outcome != "sent":
+            from scripts.notify import push_texts
+            command = push_texts.user_send_argv(push_texts.render("alert.blocked",
+                sender="build-admission", title="Build queue service is down",
+                action=f"On natedev, run: {restart}",
+                body="No session is live to handle it. Builds wait until the service answers."))
+            scripts = Path(__file__).resolve().parents[1]
+            command.extend(["--clears-when", shlex.join([str(scripts / "lib/py"), str(Path(__file__).resolve()), "view"])])
+            phone_outcome = send(command)
+            retained = retained or phone_outcome not in release_outcomes
+        return 0 if retained else 1
+    finally:
+        if retained:
+            outage_alerts.delivered(claimed)
+        else:
+            outage_alerts.release(claimed)
 
 
 def _saved_cleanup_timing() -> wire.CleanupTiming:

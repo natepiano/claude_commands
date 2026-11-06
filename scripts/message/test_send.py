@@ -4161,20 +4161,20 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-style"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
         options = local_options(self.auto_mode_arguments())
-        self.assertEqual(options.summary, "cargo-liner-style: auto mode stopped modules")
+        self.assertEqual(options.summary, "cargo-liner-style: modules commands refused")
         self.assertEqual(options.sender, "cargo-liner-style")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=cargo-liner-style", options.values)
         self.assertIn("rule_line=", options.values)
         self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n"
                       + "implement.sh --to modules-impl\nreview.sh --to modules-test\n\n"
-                      + "Approve: the work goes on now, and auto mode can stop it on these commands again.", options.text or "")
-        self.assertTrue((options.text or "").endswith("Allow rule: the work goes on now, and auto mode lets these commands run from then on."))
+                      + "Go: the session runs these commands now, and auto mode can refuse these commands again.", options.text or "")
+        self.assertTrue((options.text or "").endswith("Allow rule: auto mode lets these commands run from then on."))
         one = local_options(self.auto_mode_arguments(commands=("git push origin build-followups-messaging",),
                                                      waits="The merge waits for it.", rule="Bash(git push:*)"))
         self.assertIn("Auto mode refused a shell command in the modules session. The merge waits for it.\n"
                       + "git push origin build-followups-messaging\n\n"
-                      + "Approve: the work goes on now, and auto mode can stop it on this command again.", one.text or "")
+                      + "Go: the session runs this command now, and auto mode can refuse this command again.", one.text or "")
         self.assertTrue((one.text or "").endswith("lets this command run from then on. The rule: Bash(git push:*)"))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
@@ -4242,7 +4242,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.writer_session()
         exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
         options = local_options(self.auto_mode_arguments(commands=(exact, long)))
-        self.assertIn(f"The P542 build waits for them.\n{exact}\n{long[:89]}…\n\nApprove", options.text or "")
+        self.assertIn(f"The P542 build waits for them.\n{exact}\n{long[:89]}…\n\nGo:", options.text or "")
 
     def test_auto_mode_waits_says_what_waits_and_gives_no_instruction(self) -> None:
         self.writer_session()
@@ -4318,9 +4318,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
         options = local_options(self.auto_mode_arguments(session="types", commands=("save_counts.py --per-unit",),
                                                          waits="The trunk plan waits for it"))
-        self.assertEqual(options.summary, "cargo-liner: auto mode stopped types")
+        self.assertEqual(options.summary, "cargo-liner: types command refused")
         self.assertEqual(options.sender, "cargo-liner")
-        self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, approve the prompt or add an allow rule"))
+        self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, type: Go: run the refused command"))
         self.assertIn("Auto mode refused a shell command in the types session. The trunk plan waits for it.\n"
                       + "save_counts.py --per-unit", options.text or "")
 
@@ -4347,13 +4347,16 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_help_lists_the_auto_mode_template_and_when_to_use_it(self) -> None:
         with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             _ = send.parse(["--help"])
-        self.assertIn("auto_mode.refused: auto mode refused a command and the session waits for the user.", output.getvalue())
+        self.assertIn("auto_mode.refused: auto mode refused a command; the session continues its other work.", output.getvalue())
+        self.assertIn("Send auto_mode.refused only when the refused step holds work and the user has no step for it yet. "
+                      + "If the user already has one, send nothing. "
+                      + "With other work to run, go on with it and leave out --need blocked.", output.getvalue())
         self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
         self.assertIn("quota.paid_credits_queued: an account now spends paid credits and the user queued a workers move;", output.getvalue())
         self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
-        self.assertIn("permission.rca_started: a unit starts to fix why a session stopped for a permission. Sent by"
+        self.assertIn("permission.rca_started: a unit starts to fix the cause of a permission stop or refusal. Sent by"
                       + f" rca.py start; sessions run rca.py, not this: {rca.CALL} start <id> --owner <unit>", output.getvalue())
-        self.assertIn("permission.rca_fixed: the fix merged and the session does not stop for that permission again."
+        self.assertIn("permission.rca_fixed: the fix merged; that permission does not stop or refuse the session again."
                       + f" Sent by rca.py fixed; sessions run rca.py, not this: {rca.CALL} fixed <id>", output.getvalue())
 
     def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:

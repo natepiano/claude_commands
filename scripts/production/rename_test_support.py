@@ -143,6 +143,9 @@ class FolderMoveBackend:
             _ = record.write_text(json.dumps({"type": "session_meta", "payload": {"id": self.fixture.owner.current_session}}) + "\n")
             descriptor.symlink_to(record)
 
+    def pane_row(self, pane: str) -> herdr.PaneIdentity | herdr.NoPane:
+        return next((row for row in self.panes() if row["pane_id"] == pane), herdr.NoPane(pane))
+
     def panes(self) -> list[herdr.PaneIdentity]:
         return [
             {"pane_id": "w1:p1", "terminal_id": "kept-terminal", "workspace_id": "w1",
@@ -254,7 +257,6 @@ class FolderMoveFixture(StaffTestCase):
             "GIT_CONFIG_NOSYSTEM": "1",
         })))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
-        _ = self.enterContext(mock.patch("pane_record.RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.enterContext(mock.patch("progress_history.SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")

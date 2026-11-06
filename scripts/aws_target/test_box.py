@@ -95,6 +95,7 @@ elif name == 'nix':
     if 'eval' in args or 'build' in args: print(s['desired'])
     elif 'copy' in args:
         assert '--substitute-on-destination' in args
+        assert args[args.index('--to') + 1] == 'ssh://root@100.64.0.3'
         if s.get('copy_failure'): sys.exit(1)
         s['copies'] = s.get('copies', 0) + 1; save()
     else: raise AssertionError(args)
@@ -351,7 +352,7 @@ class BoxTests(unittest.TestCase):
         with redirect_stdout(output):
             self.subject.policy()
         self.assertIn('tag:build-aws', output.getvalue())
-        ssh_rules = [{'action': 'accept', 'src': ['autogroup:member'], 'dst': ['tag:build-aws'], 'users': ['natepiano']}]
+        ssh_rules = [{'action': 'accept', 'src': ['autogroup:member'], 'dst': ['tag:build-aws'], 'users': ['natepiano', 'root']}]
         network_rule = {'action': 'accept', 'src': ['100.64.0.1', '100.64.0.2'], 'dst': ['tag:build-aws:22']}
         self.assertEqual(self.tailnet.policy['ssh'], ssh_rules)
         self.assertEqual(cast(list[object], self.tailnet.policy['acls'])[1], network_rule)
@@ -465,8 +466,19 @@ class BoxTests(unittest.TestCase):
     def test_configuration_holds_idle_stop_and_survives_the_switch_disconnect(self) -> None:
         self.change(joined=True, switch_disconnect=True)
         self.assertFalse(self.subject.configuration_present())
+        before = len(self.commands())
         self.subject.configure()
+        configure_commands = self.commands()[before:]
+        ssh_commands = [command for command in configure_commands if command[0] == 'ssh']
+        self.assertTrue(ssh_commands)
+        read_commands = {'readlink -f /run/current-system', 'systemctl is-active aws-build-remote.service'}
+        self.assertTrue(read_commands.issubset({command[-1] for command in ssh_commands}))
+        for command in ssh_commands:
+            user = 'natepiano' if command[-1] in read_commands else 'root'
+            self.assertEqual(command[-2], user + '@100.64.0.3')
+            self.assertNotIn('sudo', command[-1])
         self.assertTrue(self.subject.configuration_present())
+        self.assertEqual(self.commands()[-1][-2], 'natepiano@100.64.0.3')
         commands = self.commands()
         hold = next(i for i, c in enumerate(commands) if 'aws-build-setup-stop --on-active' in c[-1])
         copy = next(i for i, c in enumerate(commands) if c[0] == 'nix' and 'copy' in c)
@@ -474,6 +486,7 @@ class BoxTests(unittest.TestCase):
         self.assertLess(hold, copy)
         self.assertLess(copy, switch)
         self.assertIn('--substitute-on-destination', commands[copy])
+        self.assertEqual(commands[copy][commands[copy].index('--to') + 1], 'ssh://root@100.64.0.3')
         self.assertIn('--collect --no-block', commands[switch][-1])
         self.assertTrue(self.live()['active'])
         self.assertFalse(self.live()['hold'])
@@ -496,7 +509,8 @@ class BoxTests(unittest.TestCase):
         self.assertTrue(self.live()['active'])
         self.assertFalse(self.live()['hold'])
         self.assertTrue(any('rm -f -- /home/natepiano/.local/state/build-target/aws-control/idle.json' in c[-1]
-                            and 'sudo systemctl start' in c[-1] for c in self.commands()))
+                            and 'systemctl start' in c[-1] and 'sudo' not in c[-1]
+                            and c[-2] == 'root@100.64.0.3' for c in self.commands()))
 
     def test_checks_compare_plain_environment_versions_without_another_repository(self) -> None:
         self.change(joined=True)

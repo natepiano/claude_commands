@@ -7,11 +7,16 @@ from dataclasses import replace
 import errno
 import io
 import os
+import shlex
+import subprocess
+import time
 from pathlib import Path
 import sys
 import unittest
 from unittest import mock
 
+from scripts.accounts import outage_alerts
+from scripts.message import send_result
 from scripts.lint import memory_admit as gate
 from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
@@ -715,36 +720,89 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn("check failed", errors.getvalue())
                 self.doCleanups()
 
-    def test_down_alert_sends_once_per_outage_and_start_clears_the_claim(self) -> None:
-        import time
-        import subprocess
+    def test_down_alert_sends_once_until_a_restart_runs_for_the_silence_interval(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.clock.epoch = time.time()
-            commands: list[list[str]] = []
-            def deliver(command: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
-                self.assertFalse(check)
-                commands.append(command)
+            fixture.configure(silence_seconds=10, reconnect_seconds=1)
+            commands: list[tuple[list[str], str]] = []
+
+            def deliver(command: list[str], *, input: str, text: bool, capture_output: bool,
+                        timeout: float) -> subprocess.CompletedProcess[str]:
+                self.assertTrue(text)
+                self.assertTrue(capture_output)
+                self.assertGreater(timeout, 0)
+                commands.append((command, input))
                 with redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(client.down_alert(), 0)
                 self.assertRegex(output.getvalue(), r"^already claimed by [0-9a-f]+\n$")
-                self.assertEqual(len(commands), send.call_count)
-                return subprocess.CompletedProcess(command, 0)
+                self.assertEqual(len(commands), sender.call_count)
+                return subprocess.CompletedProcess(command, 0, "SENT: to builds\n", "")
+
             with mock.patch.object(client, "CLOCK", fixture.clock), \
-                 mock.patch.object(client, "view", side_effect=wire.AdmissionUnavailable("no socket")), \
-                 mock.patch.object(subprocess, "run", side_effect=deliver) as send:
+                    mock.patch.object(client, "view", side_effect=wire.AdmissionUnavailable("no socket")), \
+                    mock.patch.object(subprocess, "run", side_effect=deliver) as sender:
+                with redirect_stdout(io.StringIO()) as sent_output:
+                    self.assertEqual(client.down_alert(), 0)
+                self.assertEqual(sent_output.getvalue(), "SENT: to builds\n")
+                for attempt in range(3):
+                    with self.subTest(restart=attempt), fixture.loop_turn():
+                        fixture.restart()
+                        fixture.clock.advance(9)
+                        fixture.server.run_once()
+                        self.assertIsInstance(outage_alerts.claim("build-admission"), outage_alerts.AlertDelivered)
                 self.assertEqual(client.down_alert(), 0)
-                self.assertEqual(send.call_count, 1)
+                self.assertEqual(sender.call_count, 1)
+                with fixture.loop_turn():
+                    fixture.server.run_once()
                 self.assertEqual(client.down_alert(), 0)
-                self.assertEqual(send.call_count, 1)
-                self.assertEqual(client.down_alert(), 0)
-                self.assertEqual(send.call_count, 1)
-                fixture.restart()
-                self.assertEqual(client.down_alert(), 0)
-                self.assertEqual(send.call_count, 2)
-                from scripts.notify import push_texts
-                text_id = commands[-1][commands[-1].index("--text-id") + 1]
-                self.assertEqual(text_id, "build_admission.down")
-                self.assertIn("build admission service is down; builds wait", push_texts.render(text_id).body)
+                self.assertEqual(sender.call_count, 2)
+            command, message = commands[0]
+            self.assertEqual(command[command.index("--to") + 1], "builds")
+            self.assertEqual(command[command.index("--from") + 1], "build-admission")
+            self.assertEqual(message,
+                "The build queue service has not answered for 10 seconds. Builds wait.\n"
+                + "The service restarts by itself. Read journalctl -u build-admission.service.\n"
+                + "If the user must act, push the phone with this command: "
+                + "sudo systemctl restart build-admission.socket build-admission.service")
+            self.assertEqual(commands[1], commands[0])
+
+    def test_down_alert_retains_sent_or_waiting_messages_and_retries_only_empty_deliveries(self) -> None:
+        cases: tuple[tuple[send_result.Outcome, send_result.Outcome, bool], ...] = (
+            ("queued", "sent", True), ("held", "failed", True), ("pending", "failed", True),
+            ("queued", "failed", True), ("failed", "sent", True), ("failed", "queued", True),
+            ("failed", "held", True), ("failed", "pending", True), ("failed", "skipped", True),
+            ("skipped", "failed", True), ("failed", "failed", False),
+            ("refused", "refused", False), ("retry", "retry", False))
+        for session, phone, retained in cases:
+            with self.subTest(session=session, phone=phone), AdmissionFixture() as fixture:
+                fixture.configure(silence_seconds=2, reconnect_seconds=1)
+                replies = [subprocess.CompletedProcess([], send_result.EXIT[outcome],
+                    f"{outcome.upper()}: stub delivery\n", "") for outcome in (session, phone)]
+                with mock.patch.object(client, "CLOCK", fixture.clock), \
+                        mock.patch.object(client, "view", side_effect=wire.AdmissionUnavailable("no socket")), \
+                        mock.patch.object(subprocess, "run", side_effect=replies * 2) as sender:
+                    self.assertEqual(client.down_alert(), 0 if retained else 1)
+                    self.assertEqual(sender.call_count, 2)
+                    command = cast(list[str], sender.call_args_list[1].args[0])
+                    self.assertEqual(command[command.index("--to") + 1], "user")
+                    self.assertEqual(command[command.index("--text-id") + 1], "alert.blocked")
+                    self.assertEqual(command[command.index("--need") + 1], "blocked")
+                    values = [command[index + 1] for index, part in enumerate(command) if part == "--value"]
+                    self.assertEqual(values, [
+                        "action=On natedev, run: sudo systemctl restart build-admission.socket build-admission.service",
+                        "body=No session is live to handle it. Builds wait until the service answers.",
+                        "sender=build-admission", "title=Build queue service is down"])
+                    scripts = Path(client.__file__).resolve().parents[1]
+                    self.assertEqual(shlex.split(command[command.index("--clears-when") + 1]),
+                        [str(scripts / "lib/py"), str(Path(client.__file__).resolve()), "view"])
+                    self.assertEqual(client.down_alert(), 0 if retained else 1)
+                    self.assertEqual(sender.call_count, 2 if retained else 4)
+
+    def test_outage_clear_command_reports_failure_while_the_private_service_is_down(self) -> None:
+        with AdmissionFixture() as fixture, redirect_stderr(io.StringIO()) as errors:
+            fixture.server.close()
+            self.assertNotEqual(client.main(["view"]), 0)
+            self.assertIn("admission service unavailable:", errors.getvalue())
 
     def test_retry_and_outage_notice_intervals_read_config_during_the_call(self) -> None:
         with AdmissionFixture() as fixture:
