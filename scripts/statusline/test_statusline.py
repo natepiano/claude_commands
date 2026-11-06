@@ -13,12 +13,13 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast, final, override
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
 from scripts.production import session_labels, staff
 from scripts.shutdown import remote
-from scripts.statusline import assignment, rebuild_row
+from scripts.statusline import adhoc_items, assignment, rebuild_row
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
@@ -33,7 +34,7 @@ ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
                  colors: Path | str = "",
-                 counts: str = "", rebuild: str = "", staff_text: str = "", **marks: str) -> list[str]:
+                 counts: str = "", rebuild: str = "", adhoc: str = "", staff_text: str = "", **marks: str) -> list[str]:
     """Run statusline.jq once over every input and return its output lines.
 
     `colors` is a file path or temporary config text; empty text omits the argument.
@@ -42,7 +43,8 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
     label, role = assignment.assignment(record, str(cast(dict[str, object], inputs[0]).get("session_id", "")) if isinstance(inputs[0], dict) else "")
     stdin = "\n".join(json.dumps(each) for each in inputs)
     stored = [] if labels is None else ["--slurpfile", "labels", str(labels)]
-    parent = ["--arg", "assignment", label, "--arg", "role", role, "--arg", "counts", counts, "--arg", "rebuild", rebuild]
+    parent = ["--arg", "assignment", label, "--arg", "role", role, "--arg", "counts", counts,
+              "--arg", "rebuild", rebuild, "--arg", "adhoc", adhoc]
     with tempfile.TemporaryDirectory() as directory:
         configured: list[str] = []
         if colors:
@@ -268,6 +270,52 @@ class ColorTests(unittest.TestCase):
         self.assertEqual(line, "For you: \x1b[91m\x1b[1m2\x1b[22m questions\x1b[0m, "
                          + "\x1b[1m1\x1b[22m change, \x1b[1m1\x1b[22m proposal")
 
+    def test_adhoc_items_come_first_with_pink_text_and_a_bold_number_in_every_role(self) -> None:
+        for identity in (OWNER.id, UNIT.id, "unassigned-session"):
+            for text in ("3 adhoc items", "1 adhoc item"):
+                with self.subTest(session=identity, adhoc=text):
+                    line = status_lines(
+                        {"session_id": identity}, colors=SHIPPED_COLORS, adhoc=text,
+                        counts=f"{identity} For you: 1 question, 2 changes, 130 efficiency",
+                        staff_text=staff_text(OWNER, UNIT),
+                    )[-1]
+                    count, words = text.split(" ", 1)
+                    self.assertEqual(line, f"For you: \x1b[38;5;211m\x1b[1m{count}\x1b[22m {words}\x1b[0m, "
+                                     + "\x1b[91m\x1b[1m1\x1b[22m question\x1b[0m, "
+                                     + "\x1b[96m\x1b[1m2\x1b[22m changes\x1b[0m, "
+                                     + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m")
+
+
+class AdhocItemsTests(unittest.TestCase):
+    def test_command_writes_the_session_count_and_zero_removes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
+            path = Path(directory) / ".local/state/adhoc_review/review-session"
+            self.assertEqual(adhoc_items.row("review-session"), "")
+            for remaining, expected in ((3, "3 adhoc items"), (1, "1 adhoc item"), (0, ""), (0, "")):
+                with self.subTest(remaining=remaining):
+                    result = subprocess.run(
+                        ["python3", str(Path(adhoc_items.__file__)), str(remaining)],
+                        env={"PATH": os.environ["PATH"], "HOME": directory,
+                             "CLAUDE_CODE_SESSION_ID": "review-session"},
+                        capture_output=True, text=True, check=True,
+                    )
+                    self.assertEqual(result.stdout + result.stderr, "")
+                    self.assertEqual(adhoc_items.row("review-session"), expected)
+                    if remaining:
+                        self.assertEqual(path.read_text(encoding="utf-8"), str(remaining))
+                    else:
+                        self.assertFalse(path.exists())
+
+    def test_row_omits_invalid_or_nonpositive_counts_and_an_empty_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
+            path = Path(directory) / ".local/state/adhoc_review/review-session"
+            path.parent.mkdir(parents=True)
+            for contents in ("not a number", "1.5", "1_0", "0", "-1", ""):
+                with self.subTest(contents=contents):
+                    _ = path.write_text(contents, encoding="utf-8")
+                    self.assertEqual(adhoc_items.row("review-session"), "")
+            self.assertEqual(adhoc_items.row(""), "")
+
 
 def limits(five_hour: dict[str, float | None], seven_day: dict[str, float | None]) -> dict[str, object]:
     return {"rate_limits": {"five_hour": five_hour, "seven_day": seven_day}}
@@ -438,6 +486,18 @@ class RoleTests(unittest.TestCase):
             check=True, env=env, cwd=self.home,
         )
         return result.stdout.splitlines()
+
+    def test_review_without_a_production_shows_only_its_own_adhoc_count_in_each_shell(self) -> None:
+        path = self.home / ".local/state/adhoc_review/review-session"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("3", encoding="utf-8")
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                lines = self.command_lines({"session_id": "review-session"}, shell=shell)
+                self.assertEqual(ANSI.sub("", lines[-1]), "For you: 3 adhoc items")
+                for identity in ("other-session", ""):
+                    other = self.command_lines({"session_id": identity}, shell=shell)
+                    self.assertNotIn("For you:", "\n".join(other))
 
     def test_reset_times_take_the_zone_from_the_setting_and_its_label(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())

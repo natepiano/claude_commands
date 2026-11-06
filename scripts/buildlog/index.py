@@ -195,7 +195,7 @@ GATE_RUN_COLUMNS: list[Column] = [
     ("status", "INTEGER", "exit status"),
     ("max_jobs", "INTEGER", "maximum number of concurrent jobs"),
     ("peak_mib", "REAL", "peak memory in MiB"),
-    ("cap_mib", "REAL", "memory cap in MiB"),
+    ("cap_mib", "REAL", "runner memory governor in MiB"),
     ("checkout", "TEXT", "checkout path"),
     ("branch", "TEXT", "branch"),
     ("sha", "TEXT", "commit"),

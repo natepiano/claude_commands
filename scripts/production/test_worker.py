@@ -658,7 +658,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(listing[0]["name"], "impl2")
         self.assertEqual(listing[0]["role"], "review")
         self.assertEqual(listing[0]["state"], "OpenWorker")
-        self.assertEqual(listing[0]["activity"], "idle")
+        self.assertEqual(listing[0]["activity"], "done")
 
     def test_restore_retains_the_same_native_session_and_reruns_unchanged(self) -> None:
         opened = self.opened()
