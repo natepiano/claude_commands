@@ -1,0 +1,68 @@
+"""Read target platforms from eligibility rows without an interpreter."""
+
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+VERIFY = Path(__file__).with_name("verify.sh")
+
+
+class VerifyTargetPlatformTests(unittest.TestCase):
+    def platform(self, table: str, runs_on: str, target: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            bash = shutil.which("bash")
+            assert bash is not None
+            environment = {
+                "HOME": directory, "PATH": directory,
+                "PY": str(Path(directory) / "no-python"),
+                "BUILD_TARGETS_SCRIPT": str(Path(directory) / "no-build-targets.py"),
+                "STEP_TARGET_TABLE": table, "STEP_RUNS_ON": runs_on,
+            }
+            script = shell_functions(VERIFY, "target_platform") + '\ntarget_platform "$1"\n'
+            return subprocess.run(
+                [bash, "--noprofile", "--norc", "-c", script, "platform-test", target],
+                cwd=directory, env=environment, capture_output=True, text=True,
+                timeout=TEST_HANG_GUARD_SECS,
+            )
+
+    def test_macos_row_supplies_the_platform_without_an_interpreter(self) -> None:
+        result = self.platform("linux-box\teligible\t-\t/linux.conf\tlinux\n"
+                               + "mac-box\teligible\t-\t/mac.conf\tmacos", "ssh_allowed", "mac-box")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "macos\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_linux_row_supplies_the_platform_without_an_interpreter(self) -> None:
+        result = self.platform("mac-box\texcluded\tbusy\t/mac.conf\tmacos\n"
+                               + "linux-box\teligible\t-\t/linux.conf\tlinux", "ssh_allowed", "linux-box")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "linux\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_local_row_supplies_no_remote_platform(self) -> None:
+        result = self.platform("natedev\teligible\t-\t-\t-", "ssh_allowed", "natedev")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_missing_mac_row_keeps_the_mac_allowed_fallback(self) -> None:
+        result = self.platform("", "mac_allowed", "mac")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "macos\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_missing_row_has_no_ssh_allowed_fallback(self) -> None:
+        result = self.platform("", "ssh_allowed", "mac")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

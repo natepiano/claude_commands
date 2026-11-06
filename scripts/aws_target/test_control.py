@@ -102,7 +102,7 @@ class ControlTests(ControlFixture):
 
     def test_pinned_poll_updates_keep_the_repository_hold(self) -> None:
         self.pinned_step()
-        row = step_record.read_fields("pinned")
+        row = cast(dict[str, object], json.loads(step_record.record_path("pinned").read_text()))
         step_record.write_fields("pinned", {**row, "updated": "2026-01-15T12:00:01Z"})
         self.check_decline_demand()
 
@@ -144,7 +144,7 @@ class ControlTests(ControlFixture):
         self.pinned_step(kind="build")
         self.assertEqual(self.controller().tick().state, "stopped")
         self.pinned_step()
-        step_record.state("pinned", step_record.StepState.ON_SSH, "aws")
+        _ = step_record.record_path("pinned").with_suffix(".state").write_text("on_ssh aws\n")
         self.assertEqual(self.controller().tick().state, "stopped")
         self.assertEqual(self.aws.count("start-instances"), 0)
 

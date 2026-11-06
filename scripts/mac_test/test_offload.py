@@ -121,7 +121,7 @@ class CompletedRunSyncTests(unittest.TestCase):
     def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
         configured = target_config.SshTarget(target, "linux" if target == "aws" else "macos", root / "target.conf")
         config = offload.OffloadConfig(True, offload.SshConnectionSettings("aws-build", 1, 1), 1, 1, 1, "1", {})
-        request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), target=target)
+        request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target=target, holder_session="fixture-session")
         controller = offload.ProcessController()
         output = io.StringIO()
 
@@ -193,7 +193,7 @@ class LocalVersionPreflightTests(unittest.TestCase):
             target = target_config.SshTarget("aws", "linux", root / "aws.conf")
             config = offload.OffloadConfig(True, offload.SshConnectionSettings("dummy", 1, 1),
                                           1, 1, 1, "1", {"version_pin_file": "box-pins.nix"})
-            request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), target="aws")
+            request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target="aws", holder_session="fixture-session")
             controller = offload.ProcessController()
             versions = {"rustc": "rustc 1.99.0", "nextest": "nextest fixture", "mend": "mend fixture", "git": "commit"}
 
@@ -227,10 +227,10 @@ class LocalVersionPreflightTests(unittest.TestCase):
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
-                        claim.assert_called_once_with(controller, config, request, HANA)
+                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
                         self.assertFalse(offload.linux_version_decline_path("aws", HANA.name).exists())
                 else:
-                    claim.assert_called_once_with(controller, config, request, HANA)
+                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
                     self.assertFalse(offload.linux_version_declined_recently("aws", HANA.name, 60, 100))
             scripts_copy.assert_not_called()
             tree_copy.assert_not_called()
@@ -256,7 +256,7 @@ class OffloadSettingsTests(unittest.TestCase):
 
     def test_mac_command_sends_repository_identity_only_when_nonempty(self) -> None:
         config = offload.read_config(self.settings)
-        request = offload.OffloadRequest(self.root, "hana", "fixture-call", offload.NO_RESULT_FILE, ())
+        request = offload.OffloadRequest(self.root, "hana", "fixture-call", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
         for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
             with self.subTest(key=key):
                 words = shlex.split(offload.remote_test_command(
@@ -494,7 +494,7 @@ class OffloadSettingsTests(unittest.TestCase):
         expected = {"cargo-port": "backoff", "cargo-tile": "backoff", "tui_pane": "backoff", "cargo-berth": "backoff"}
         for package, reason in expected.items():
             with self.subTest(package=package):
-                request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, ())
+                request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
                 with mock.patch.object(offload, "repository_identity",
                                        return_value=offload.KnownRepository("cargo-liner")):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
@@ -991,11 +991,22 @@ class OffloadCommandTests(OffloadCommandFixture):
             for argument in copy["args"]
             if argument.startswith("--exclude-from=")
         )
+        session = (self.environment.get("CLAUDE_CODE_SESSION_ID")
+                   or self.environment.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}")
+        receiver_argument = (
+            "--rsync-path=~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive "
+            + shlex.join(["--path", ".local/state/mac-test/mirror/hana", "--owner", "verify",
+                          "--repository", "hana", "--session", session, "--", "rsync"])
+        )
         self.assertEqual(
             copy["args"],
             [
                 "-rlpc",
                 "--delete",
+                receiver_argument,
+                "--exclude=/.mac-test-mirror",
+                "--exclude=/.copy-record.json",
+                "--exclude=/.copy-session",
                 exclude_argument,
                 "-e",
                 "ssh -o BatchMode=yes -o ConnectTimeout=6 "
@@ -1004,7 +1015,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 "mac:.local/state/mac-test/mirror/hana/",
             ],
         )
-        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/.mac-test-mirror\n/generated/\n")
+        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/generated/\n")
 
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)

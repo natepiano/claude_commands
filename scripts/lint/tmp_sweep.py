@@ -492,6 +492,7 @@ def running_session_ids() -> frozenset[str] | None:
 class ProcessUsesKnown:
     """A completed scan of process paths, including a scan with no matches."""
     paths: list[tuple[str, int, str]]
+    unreadable_cwd_pids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -500,18 +501,23 @@ class ProcessUsesUnavailable:
 
 
 def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
-    """Each path under prefix that a process works in, holds open or maps, with its pid and how;
-    unavailable when proc does not exist. A process that ends mid-scan, or one this user cannot read, is
-    passed over: another user's process does not work in an agent's scratch."""
+    """Read matching process paths and report processes with unreadable working directories.
+
+    Ignore processes that end during the scan.
+    """
     if not os.path.isdir(proc):
         return ProcessUsesUnavailable()
     found: list[tuple[str, int, str]] = []
+    unreadable: list[int] = []
     for entry in listing(proc):
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
         try:
             cwd = os.readlink(os.path.join(entry.path, "cwd"))
+        except PermissionError:
+            unreadable.append(pid)
+            continue
         except OSError:
             continue
         if cwd.startswith(prefix):
@@ -532,7 +538,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown 
                         found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, "maps a file in it"))
         except OSError:
             continue
-    return ProcessUsesKnown(found)
+    return ProcessUsesKnown(found, tuple(unreadable))
 
 
 def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
@@ -543,7 +549,8 @@ def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesU
     except (OSError, subprocess.TimeoutExpired):
         return ProcessUsesUnavailable()
     # lsof exits 1 when it cannot read some process; the lines it printed still hold.
-    return ProcessUsesKnown(parse_lsof(completed.stdout, prefix)) if completed.stdout else ProcessUsesUnavailable()
+    return (ProcessUsesKnown(parse_lsof(completed.stdout, prefix))
+            if completed.returncode in (0, 1) and completed.stdout else ProcessUsesUnavailable())
 
 
 def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:

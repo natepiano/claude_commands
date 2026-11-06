@@ -76,8 +76,8 @@ class RepositoryKeyTests(unittest.TestCase):
 
     def test_attempt_without_commits_or_origin_records_unknown_identity(self) -> None:
         log_root = self.root.parent / "buildlog"
-        request = offload.OffloadRequest(self.root, "project", "empty-repository", offload.NO_RESULT_FILE, (),
-                                        target="aws")
+        request = offload.OffloadRequest(self.root, "project", "empty-repository", offload.NO_RESULT_FILE, (), owner="verify",
+                                        target="aws", holder_session="fixture-session")
         with mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(log_root), "BUILDLOG_MEM_WAIT_SINCE": "", "BUILDLOG_MEM_WAIT_FIRST_FILE": "",
         }):
@@ -440,7 +440,7 @@ class RepositorySlotTests(unittest.TestCase):
             self.assertNotIn("..", path.parts)
         self.assertEqual(offload.remote_mirror(first_id), ".local/state/mac-test/mirror/project")
         config = offload.read_config(self.root / "aws.conf")
-        request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), target="aws", slot=2)
+        request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), owner="verify", target="aws", slot=2, holder_session="fixture-session")
 
         command = offload.remote_test_command(config, request, first_id)
 
@@ -592,7 +592,7 @@ class RepositorySlotTests(unittest.TestCase):
         )
         for words, expected in cases:
             with self.subTest(words=words):
-                request = offload.OffloadRequest(self.root / "hana", "hana", "call", offload.NO_RESULT_FILE, words)
+                request = offload.OffloadRequest(self.root / "hana", "hana", "call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
 
                 command = offload.remote_test_command(offload.read_config(settings), request, identity)
 
