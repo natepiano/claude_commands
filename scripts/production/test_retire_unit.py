@@ -238,9 +238,14 @@ class RetireUnitTests(unittest.TestCase):
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.limits()
+        copies_config = self.root / "copies.conf"
+        template = Path(__file__).resolve().parents[2] / "config/copies.conf"
+        with copies_config.open("w", encoding="utf-8") as output:
+            output.writelines(f"root={self.root / 'gates'}\n" if line.startswith("root=") else line
+                              for line in template.read_text(encoding="utf-8").splitlines(keepends=True))
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
-            "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
+            "COPIES_CONFIG": str(copies_config),
             "SCRATCH_ROOT": str(self.root / "scratch"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
             "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
@@ -394,6 +399,33 @@ class RetireUnitTests(unittest.TestCase):
 
     def stops(self) -> list[list[str]]:
         return self.calls.copy()
+
+    def test_retire_removes_owned_copies_and_keeps_another_owner(self) -> None:
+        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+            pass
+        with copies.standing("other-unit", self.checkout, "HEAD") as kept:
+            pass
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn("alpha retired", output)
+        self.assertFalse(tree.exists())
+        self.assertTrue(kept.is_dir())
+        self.assertIsInstance(self.unit_worktree(), staff.RemovedWorktree)
+
+    def test_retire_reports_a_busy_copy_and_still_retires(self) -> None:
+        with copies.standing("alpha", self.checkout, "HEAD") as tree:
+            code, output = self.retire()
+            self.assertEqual(code, 0, output)
+            anomalies = [line for line in output.splitlines() if line.startswith("anomaly:")]
+            self.assertEqual(len(anomalies), 1, output)
+            self.assertIn(f"{tree}: busy;", anomalies[0])
+            self.assertIn("alpha retired", output)
+            self.assertTrue(tree.is_dir())
+            self.assertIsInstance(self.unit_worktree(), staff.RemovedWorktree)
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn("unchanged", output)
+        self.assertFalse(tree.exists())
 
     def unit_worktree(self) -> staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled:
         row = staff.by_id(self.unit_staff_id)

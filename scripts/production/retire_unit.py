@@ -25,6 +25,8 @@ from scripts.message import sessions
 from scripts.lib import process_group, conf
 from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
+from scripts.copies import copies
+from scripts.lib import scratch
 import berth_board
 import progress_history
 import unit_lookup
@@ -489,11 +491,19 @@ def release_reservations(unit: Unit, *, settings: conf.ConfigRead) -> None:
             print(f"anomaly: {failure(result)}")
 
 
+def remove_copies(unit: Unit) -> None:
+    try:
+        copies.remove_trees(unit.name)
+    except (copies.CopyError, OSError, scratch.ScratchError) as error:
+        print(f"anomaly: {error}")
+
+
 def retire(unit: Unit, *, settings: conf.ConfigRead,
            record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
     row = unit.staff_member
     if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
+        remove_copies(unit)
         print("unchanged")
         return 0
     refused = refusals(unit, settings=settings)
@@ -544,6 +554,7 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
         print("\n".join(f"anomaly: {reason}" for reason in failed))
         return 1
     _ = staff.set_worktree(row.id, staff.RemovedWorktree(local_machine(), unit.worktree), expected=row.worktree)
+    remove_copies(unit)
     print(f"{unit.name} retired")
     return 0
 

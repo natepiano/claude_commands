@@ -673,29 +673,26 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Files:** `scripts/production/worker.py`, `scripts/production/test_worker.py`, `commands/unit/worker.md`.
 
-### Phase 28 — A retired or renamed unit leaves no gate copies  · status: todo
+### Phase 28 — A retired unit leaves no gate copies  · status: done
 
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** sdlc's request of 2026-11-06. The user sees many leftover folders in cargo-port. `copies.remove_trees` runs only in `tidy_wrapped`, so `retire_unit` and `rename_unit` leave the unit's gate copies in `~/worktrees/gates`. Copies are keyed by name, so a rename leaves the old-name folder.
+**Goal:** sdlc's request of 2026-11-06. The user sees many leftover folders in cargo-port. `copies.remove_trees` runs only in `tidy_wrapped`, so `retire_unit` leaves the unit's gate copies in `~/worktrees/gates`. The rename half waits for a gate-only way in `copies.py`: `remove_trees` ends every clean copy of the owner, and a rename does not stop the unit, so a live worker's copy would go.
 
 **Spec:**
 1. `retire_unit.retire`: after the worktree is removed and `staff.set_worktree` is done, call `copies.remove_trees(unit.name)`. Print each `copies.CopyError`, `OSError` or `scratch.ScratchError` as one `anomaly:` line. The retire still exits 0.
-2. `rename_unit.apply`: after the rename and the folder move end, and outside `staff.row_operation`, call `copies.remove_trees(old)`. A removal does not depend on `changed`, so a rerun also removes. Print each of the same errors as one `anomaly:` line. The rename still ends as it does now. The next gate clones again under the new name.
+2. A retire rerun also removes, so a copy that was busy goes on the next retire. The removal is one helper that both paths call.
 3. Do not change `scripts/copies/copies.py` and do not copy its logic. Do not change `tidy_wrapped.py`.
-4. Tests in `scripts/production/test_retire_unit.py` and `scripts/production/test_rename_unit.py`. Each test makes its gate root in a tempdir through `COPIES_CONFIG`:
+4. Tests in `scripts/production/test_retire_unit.py`. Each test makes its gate root in a tempdir through `COPIES_CONFIG`:
    - a retire removes the unit's copies, and another owner's copy stays;
-   - a rename removes the old-name copies, and another owner's copy stays;
-   - a busy copy prints one anomaly line, and the retire or rename ends as normal.
+   - a busy copy prints one anomaly line, the retire ends as normal, and a rerun removes the copy.
 5. Add no check, guard or refusal. Tests never act on a live unit.
 
 **Files:**
 - `scripts/production/retire_unit.py`
-- `scripts/production/rename_unit.py`
 - `scripts/production/test_retire_unit.py`
-- `scripts/production/test_rename_unit.py`
 
 **Workers:** 1 writer, slot impl2.
 
@@ -705,5 +702,5 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Acceptance gate:**
 - basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
-- `scripts/production/test_retire_unit.py`, `scripts/production/test_rename_unit.py` and `scripts/production/test_tidy_wrapped.py` pass.
+- `scripts/production/test_retire_unit.py` and `scripts/production/test_tidy_wrapped.py` pass.
 - The showrunner's merge test on the merged tree is green.
