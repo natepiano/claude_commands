@@ -276,6 +276,24 @@ Design from the sdlc showrunner:
 
 **Acceptance gate:** on the live sdlc production, `unit_phases.py --production docs/plans/sdlc-production.md` prints a table with a Status column; no Morty line; each other unplaced process as an `anomaly:` line under the table; and one message reaches sdlc with those lines. `staff.py pause` then `resume` on a live unit changes its Status cell and back. Named tests pass for: Morty placed, another Codex process unplaced, one send per run, no send with no lines, a send failure leaves the table and exit code unchanged, and each pause and resume form.
 
-### Phase 9r — Two refusals without proof of a live target are deleted  · status: todo
+### Phase 9r — A retire fault leaves no server, and a source release does not refuse  · status: in progress
 
-From the sdlc showrunner, 2026-11-05. A Codex process with no native thread identity (Morty, and an unrelated interactive Codex) must not make `staff.retire` raise. `codex_mesh._release_source_servers` must not refuse with "source server endpoint is unknown" for a recorded pid, because a reused pid can be an unrelated process. User rule 2026-11-02: only proof that the target is live refuses. Add no new check. Separate hash, on branch `sdlc-fix-rounds-retire`.
+From the sdlc showrunner, 2026-11-05. Separate hash, on branch `sdlc-fix-rounds-retire`. Add no new check.
+
+- `codex_mesh end` stops the run's servers before `staff.retire`, so a retire fault can never leave a server running.
+- `_release_source_servers` and `stop_worker_for_switch` lose their refusals. A release prints one `anomaly:` line for an invalid record or a server that fails to answer, and goes on.
+- One case still refuses, by sdlc ruling: a thread loaded on a server that answers with an unknown stop state. A changed source identity prints one anomaly line, signals nothing and goes on.
+- `staff.retire` is out of scope: hierarchies `9772f7357` deletes its refusals.
+- After this hash and `9772f7357` are on main, retire every astra-reviewer row with no live process and report the count.
+
+### Phase 9s — A fix records its repair round in the Codex launch path  · status: done
+
+From the sdlc showrunner, 2026-11-05. Dropped on 2026-11-06: hash `50bfbdcf6` does not merge.
+
+Devtools 3y `finish_repair` in `scripts/direct/assign.py` resolves the round: `landed` on a clean exit, `abandon --edits-landed` on an error. The fix call in `commands/unit/direct.md` sets `UNIT_RESOLVES_ROUND=1`, so a director passes that prefix on each repair round.
+
+### Phase 9t — A commit that exists is not reported as failed  · status: done
+
+From the sdlc showrunner, 2026-11-06, rca 261106-1. Separate hash, on branch `sdlc-fix-rounds-publish`, from sdlc. Add no new check.
+
+`scripts/lib/main_publish.commit` runs `git commit --only`. A stale `.git/MERGE_RR.lock` made git exit nonzero after it wrote the commit, because rerere runs after the commit. `commit` took that as no commit, restored the old file text and said the value was unchanged. HEAD held `SIMPLIFY_LENS=off`, the live file said on, the commit was not pushed, and every main promotion refused. The fix compares HEAD before and after: when HEAD moved, the commit exists, so the new file stays and the push goes on.
