@@ -98,6 +98,7 @@ EARLY_READY_FILE="${9:-}"
 TASK="direct.${SUBTASK}"
 # shellcheck source=/dev/null
 source "${BASH_SOURCE[0]%/*}/../agents/models_config.sh"
+models_launch_configuration || exit 1
 agents_resolve_claude_launcher "${TASK}" review.sh || exit $?
 
 case "${PASS_INDEX}" in

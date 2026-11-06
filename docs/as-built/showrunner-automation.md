@@ -196,7 +196,14 @@ The showrunner still judges, before the call: the other units' overlap notice, n
 - **One user-zone setting (2026-10-12).** `config/user_zone.conf` holds `zone=<IANA name>` (America/New_York), and `scripts/lib/user_zone.py` is the one reader: `user_zone()`, `user_zone_name()` and `zone_label()` for Python, and run as a script it prints the name for shell and skill text (`TZ="$(… user_zone.py)" date '+%H:%M %Z'`). It reads the file at each call, so an edit needs no restart. With no file or no `zone=` line the zone is America/New_York; a name that is not a zone is refused with its source named. `USER_ZONE` in the environment wins over the file, and `USER_ZONE_CONF` points at another file. Scripts import it by adding `scripts/lib` to `sys.path`, or as `scripts.lib.user_zone` where the file already imports `scripts.*`. Labels come from the zone (`%Z`). Gotchas: a test file whose expected text is Pacific pins `USER_ZONE=America/Los_Angeles` in a module-level `setUpModule`, so no saved expected output changed. A time stored without an offset keeps the zone it was recorded in: the model study's roster columns stay Pacific (`RECORDED_ZONE` in `turns.py`), and reading them in the user's zone would move the instant three hours. A production still takes its zone from its doc's `User zone` line. `buildlog report` and `mac-report` show times in the caller's `TZ`, so their skills pass the helper's zone as a `TZ=` prefix. Displays that call `astimezone()` with no zone follow the machine's own zone, not this setting. `scripts/lib/test_user_zone.py` fails when a script outside its `NAMES_A_ZONE` list hands a named zone to `ZoneInfo`, sets `TZ=` to one, or writes a zone label after a time format.
 - **`/zone` (2026-10-21).** `commands/zone.md` runs `scripts/lib/zone.py`. Bare, it prints the zone, its label, its UTC offset and the time now. `set NAME` resolves NAME (`resolve`): an exact IANA name, else the one zone whose city matches (case, accents, `_` and spaces ignored), else the one zone that uses the label now or in six months; more than one match, or none, is refused with exit 2, the matches grouped by UTC offset. Then, on natedev only: the checkout of `user_zone.CONF` must be on main and take `origin/main` as a fast-forward; the `zone=` line is rewritten (comments kept) and committed with `--only` that file, subject `user zone: <zone> (<label>), set with /zone`; `main_publish.commit` compares the named file with HEAD when `git commit` fails. If `git diff --quiet HEAD -- <conf>` exits 0, it keeps the new text and prints `anomaly: git commit: <error>; the commit exists` to stderr. Any other result restores the old text and refuses the change. It returns the short HEAD, so `/zone` and `/tune` continue to push. `main` is pushed only when every commit origin lacks has that subject. The Mac pulls as a promotion does (`ssh mac … git pull --ff-only natedev:<checkout> main`, judged by `rc=`), and `broadcast.py --from zone --all` tells both machines. When the Mac pull fails, the change and its message go to `<XDG_STATE_HOME>/zone/mac.json`, and the broadcast runs `--here`. A bare `zone.py` pulls and sends a queued change; `merge_checkpoint.promote` runs `zone.py drain --pulled` after each Mac pull, which sends only the message. `ZONE_SSH`, `ZONE_BROADCAST` and `ZONE_STATE` replace ssh, broadcast.py and the queue folder in `scripts/lib/test_zone.py`.
   A rerun checks the config against HEAD. It commits an uncommitted zone even when the stored zone already equals the request.
-- **Status line assignment (2026-10-31).** `statusline.sh` hands jq the shared `~/.local/state/staff/staff.json` (`STAFF_FILE` overrides it), accepting schemas 1 and 2. The row supplies the role, current name and parent showrunner's name on every refresh. The join order matches `session_labels.StaffLabels.environment`: explicit `STAFF_ID`, a unique showrunner timer target, cwd equal to exactly one present local staff worktree, then a unique normalized unit or showrunner name. An unknown explicit id never falls through. Duplicate folders, removed worktrees and another machine's worktrees cannot assign a unit; the folder match never includes descendants. Timer targets use the showrunner staff id. The shell reads notifier confs and the local hostname with builtins and passes the confs to the existing jq process; assignment opens no production document and reads no Units table. `test_python_and_jq_share_timer_folder_and_name_precedence` runs both readers on the same fixtures through the shell in sh and zsh. Missing or damaged staff input still renders the other fields with an unassigned role. Notifier counts and quota caches keep their existing refresh paths.
+- **Status line assignment.** `statusline.sh` sends the native session ID and staff data to `scripts/statusline/assignment.py`.
+  `StaffSnapshot.by_current_session` selects the row.
+  The row supplies the current name, kind, and parent name.
+  A showrunner displays `<name> showrunner`; a worker displays `worker`.
+  A unit displays `<name> unit`, with `for <parent>` when the parent exists.
+  Missing or damaged staff data displays `unassigned`.
+  Copied `STAFF_ID`, timer targets, folders, and names do not select a row.
+  Quota and notifier refresh paths keep their own behavior.
 
 - **Fixed zones removed (2026-10-21).** The status line wrote reset times in EDT/EST from rules in `statusline.jq`. `statusline.sh` now exports `TZ` from `USER_ZONE`, else the `zone=` line of `USER_ZONE_CONF` or `config/user_zone.conf` (shell builtins only), and `TZDIR=/etc/zoneinfo` when unset, since NixOS's glibc finds zone files only through it. `user_time` uses `strflocaltime`; in the hour a clock repeats, glibc's mktime can give the other pass's label, so the label comes from the first of the second and two hours either side whose own `%z`, read in the same call, is the offset the clock shows. `send_later.py --at` is read in the user's zone and passed to systemd in UTC. `verify.sh`'s recorded-result line stamps the user's zone with its label. `dailies_input.ETA_ZONES` knows AST and ADT.
 - **No display in the machine's zone (2026-10-12).** The Mac's zone is Pacific and natedev's Eastern, so a bare `astimezone()` printed a different time on each. Every time shown to the user now passes `user_zone()`: the Mac test and build target status lines, history, the lint sweep, the build reports, the account tables, the progress tables and the proposals table. `buildlog`'s `cli.main()` sets the process zone to the setting first (`run_in_user_zone()`), because its SQL takes days with `localtime`; the build report skills pass no `TZ=`. `agent_accounts.user_zone()` falls back to the setting, and `phase_table.py show` defaults to it. `progress_history.py` reads the setting too. A time stored with its offset, compared, or used to find a file by the machine's date stays as it was; `scripts/lib/test_user_zone.py` lists those scripts in `USES_THE_MACHINE_ZONE` and fails when another script calls a bare `astimezone()`. A test that sets `TZ` for its expected times sets `USER_ZONE` to the same zone.
@@ -215,9 +222,31 @@ The showrunner still judges, before the call: the other units' overlap notice, n
 - `notice clear <gate>` drafts `send <waiting unit>: From the showrunner: <gate> clear — <unit> phase <N> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.` (refused until that code merge exists); `notice lift <gate> --log <path>` drafts `… <gate> lifted — your tests pass without <unit> phase <N> (<log>). Continue.` Gates rows read `| <id> | <waiting unit> phase <N> | <unit> phase <N> | … |`.
 - Overrides for tests: `CI_POINTS_VALIDATE_SCRIPT`, `CI_POINTS_REVIEW_REGIME`, `DAILIES_REVIEW_REGIME`.
 
+### Unit configuration formatting
+
+`unit_config.py` owns the unit's `.unit.toml` and its parked configuration.
+`UnitConfig` carries the plan, port, responsibilities, retirement state, and formatting choice.
+Formatting is `RepositoryTaploConfig(text)` or `DefaultTaploConfig`.
+It does not change configuration equality.
+
+The writer reads `.taplo.toml`, then `taplo.toml`, from the repository when present.
+It formats through `taplo fmt --no-auto-config` with an explicit input path and the selected configuration.
+It validates the decoded values before publication.
+It never publishes an unformatted fallback after a formatter failure.
+`Published` and `AlreadyCurrent` distinguish changed bytes from matching bytes.
+Matching values in differently formatted text still produce `Published`.
+
+A parked configuration saves the repository formatting text as `taplo_config`.
+A later write uses the present worktree's formatting when available, then the saved formatting, then the caller's formatting.
+`repair_port` compares the recorded old port under the writer lock before it publishes the settled port.
+A different concurrent port produces a conflict instead of an overwrite.
+
 ### Unit lookup: `unit_lookup.py`
 
-A unit's session name is written in one place, the session itself (user, 2026-10-08). Nothing copies it into the production doc, a registry or the showrunner's saved report state, so a rename in Claude or a relaunch leaves nothing to bring in step. The same holds for a showrunner's name.
+Staff holds each member's current name and native session ID.
+The lookup resolves live process evidence through that native ID.
+The [staff identity contract](staff-accessors.md#staff-identity-and-backends) defines the stored facts.
+Saved progress state uses the fixed staff reference instead of a copied session name.
 
 - **Readers.** `live_units.py <showrunner>` joins the registered doc's live rows with the lookup and prints the unit, its pane, `live|stopped|unknown|gone` and its name now, tab-separated. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `dailies_input.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (dailies ETAs, judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
 
@@ -317,9 +346,13 @@ Copied pane marks do not select rows.
 
 ## Calibration and gotchas
 
-- **`config/models.conf` is shared by both machines.** `/default_models`, `/showrunner:effort` and catalog sync use `scripts/lib/models_registry.py:store_registry`: atomic replacement, fetch and fast-forward before editing, then a registry-only `config(agents): …` commit pushed to origin. A rejected push replays the same rows on the fetched tip, up to three tries. Unrelated staged and unstaged work is preserved. Catalog sync only adds models and efforts; retiring catalog models requires an explicit shared-registry edit; `/default_models` does not delete catalog rows. Temporary registries and `MODELS_CONFIG_PUBLISH=0` never publish. The former clean filter remains retired by `ensure_git_filters.sh`.
+- `config/models.conf` is shared by both machines.
+  The [model registry](agent-registry.md#registry-publication) owns publication, concurrent edits, and catalog additions.
 
-- Sourcing `models_config.sh` may run the Codex catalog refresh when its state is stale; `--check` writes nothing of its own but does not promise zero writes to the registry's state. Tests set `MODELS_CONFIG_FILE`, `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE` and `CODEX_CATALOG_SYNC_STATE_FILE` (newest) to temporary paths.
+- A fresh launch or editor read can synchronize the Codex catalog before its registry snapshot.
+  Sourcing `models_config.sh` only defines functions.
+  The [configuration lifetime](agent-registry.md#configuration-lifetimes) keeps settings consistent across helper processes.
+  Tests use private `MODELS_CONFIG_FILE`, `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE`, and `CODEX_CATALOG_SYNC_STATE_FILE` paths.
 
 - A re-run of `add_unit.py` must name its original mode; the mode comes from the commit subject, then the Plan cell, then the stub.
 

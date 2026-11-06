@@ -6,6 +6,7 @@ from __future__ import annotations
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib import models_registry
 from scripts.lib import unit_runs
 
 import argparse
@@ -27,7 +28,8 @@ from unittest.mock import patch
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.production.staff_test_support import (
-    StaffTestCase, isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id, recorded_showrunner, recorded_unit,
+    StaffTestCase, isolated_staff_file, isolated_source_readers, source_environment,
+    fixture_member, fixture_worker, fixture_runtime_id, recorded_showrunner, recorded_unit,
 )
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 # These regressions check the private verifier's semantic result before wait closure.
@@ -87,6 +89,8 @@ class ProgressHistoryTests(unittest.TestCase):
         # Socket fixtures need a short path even when the run's TMPDIR is long.
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.temporary.name)
+        self.enterContext(patch.dict(os.environ, source_environment(self.root / "sources")))
+        self.enterContext(isolated_source_readers())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         _ = fixture_member("showrunner", name="recorder")
@@ -117,6 +121,35 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_config_digest_reads_without_catalog_sync_and_keeps_the_inherited_launch_text(self) -> None:
+        settings = self.root / "digest-settings"
+        settings.mkdir()
+        _ = (settings / "direct.conf").write_text("fixture=1\n")
+        log = self.root / "unexpected-sync"
+        script = self.root / "scripts/agents/sync_codex_catalog.sh"
+        script.parent.mkdir(parents=True)
+        _ = script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(log)!r}).touch()\n")
+        script.chmod(0o755)
+        digest = cast(Callable[[], str], vars(progress_history)["_config_digest"])
+        clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
+        original = self.models_config_file.read_text()
+        configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
+        for inherited in (False, True):
+            with self.subTest(inherited=inherited), patch.object(models_registry, "launch_configuration", wraps=models_registry.launch_configuration) as launches, patch.object(models_registry, "__file__", str(script.parent.parent / "lib/models_registry.py")), patch.dict(os.environ, {
+                "HOME": str(self.root), "CONF_DIR": str(settings), "MODELS_CONFIG_FILE": str(self.models_config_file),
+                "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
+                "MODELS_LAUNCH_CONFIGURATION": configuration.environment({})["MODELS_LAUNCH_CONFIGURATION"] if inherited else "",
+            }):
+                _ = self.models_config_file.write_text(original + "# later edit\n")
+                clear()
+                try:
+                    text = original if inherited else self.models_config_file.read_text()
+                    self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                    self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
+                    self.assertEqual(launches.call_count, int(inherited), "telemetry entered the fresh launch path")
+                finally:
+                    clear()
 
     def test_review_trial_counts_rerun_findings_as_code(self) -> None:
         self.write_full_config()

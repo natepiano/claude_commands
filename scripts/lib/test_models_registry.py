@@ -7,7 +7,8 @@ import pwd
 import subprocess
 import tempfile
 import unittest
-from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast, final, override
@@ -26,6 +27,62 @@ class ExactRows:
 
 RegistryOverrides = Mapping[str, Mapping[str, str | None] | ExactRows]
 NO_OVERRIDES: RegistryOverrides = {}
+
+
+@final
+class RegistryReadProbe:
+    """Count registry opens in every Python child of a fixture launch."""
+
+    def __init__(self, root: Path, registry: Path) -> None:
+        self.directory = root / "registry-read-probe"
+        self.directory.mkdir(exist_ok=True)
+        self.log = self.directory / "reads"
+        self.registry = registry.resolve()
+        self.local_reads = 0
+        _ = (self.directory / "sitecustomize.py").write_text('''import os, sys
+target = os.environ.get("TEST_REGISTRY_PATH", "")
+log = os.environ.get("TEST_REGISTRY_READS", "")
+def registry_open(event, arguments):
+    if event != "open" or not target or not log:
+        return
+    path, mode, flags = arguments
+    if not isinstance(path, (str, bytes)) or os.fsdecode(path) != target:
+        return
+    if (isinstance(mode, str) and "r" in mode) or (mode is None and flags & os.O_ACCMODE == os.O_RDONLY):
+        descriptor = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(descriptor, (str(os.getpid()) + " " + sys.argv[0] + "\\n").encode())
+        finally:
+            os.close(descriptor)
+sys.addaudithook(registry_open)
+''')
+        self.clear()
+
+    def environment(self, environment: Mapping[str, str]) -> dict[str, str]:
+        return {**environment, "TEST_REGISTRY_PATH": str(self.registry), "TEST_REGISTRY_READS": str(self.log),
+                "PYTHONPATH": str(self.directory) + os.pathsep + environment.get("PYTHONPATH", "")}
+
+    @contextmanager
+    def active(self, environment: Mapping[str, str]) -> Generator[None]:
+        from scripts.lib import models_registry
+
+        self.local_reads = 0
+        with patch.dict(os.environ, self.environment(environment)), \
+                patch.object(models_registry, "registry_text", wraps=models_registry.registry_text) as reads:
+            try:
+                yield
+            finally:
+                self.local_reads = reads.call_count
+
+    def total(self) -> int:
+        return self.local_reads + len(self.reads())
+
+    def reads(self) -> list[str]:
+        return self.log.read_text().splitlines()
+
+    def clear(self) -> None:
+        self.local_reads = 0
+        _ = self.log.write_text("")
 
 
 def registry_text(overrides: RegistryOverrides = NO_OVERRIDES, *,
