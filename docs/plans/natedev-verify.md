@@ -280,7 +280,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 ### Phase 8 — Name the holder of what a wait is on  · status: todo
 
-**Depends on:** queue Phase 10h in `docs/plans/builds-queue.md`, which prints the `holder <json>` event, and queue-unit's work before it on the admission client. sdlc phases-unit Phase 11 (`start-wait --holder-*`, `wait-holder` in `progress_history.py`) is on builds. Hierarchies' wait experiment needs this phase.
+**Depends on:** Phase 41h. Queue Phase 10h in `docs/plans/builds-queue.md`, which prints the `holder <json>` event, and queue-unit's work before it on the admission client. sdlc phases-unit Phase 11 (`start-wait --holder-*`, `wait-holder` in `progress_history.py`) is on builds. Hierarchies' wait experiment needs this phase.
 
 #### Work Order
 
@@ -1180,7 +1180,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Gotchas:**
 - `copies.config_settings` reads `COPIES_CONFIG`, else the repository's `config/copies.conf`. `CONF_DIR` does not reach it, and a `Path.home` patch does not reach `Path.expanduser`. A test that reaches a lease needs `COPIES_CONFIG`.
 
-### Phase 41d — Move the test argument parser to one function  · status: todo
+### Phase 41d — Move the test argument parser to one function  · status: done
 
 **Depends on:** Phase 41c, Phase 41f.
 
@@ -1210,3 +1210,169 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 **Acceptance gate:**
 - `test_verify_mac_only.py`, `test_verify_mac_arguments.py` and `test_verify_argument_parser.py` pass with no change to the first two.
 - basedpyright 0/0/0 on the changed Python files. The merge gate runs all modules.
+
+### Phase 41g — One form for every verify command  · status: todo
+
+**Depends on:** Phase 41d.
+
+#### Work Order
+
+**Source:** the user's "go" on C1149, through builds, 2026-11-06. "One owner switches all callers. No alias for the old forms."
+
+**Goal:** every command of `verify.sh` takes one form, `verify <command> [<package>] [flags]`. No package means the whole workspace. Each caller uses this form in this phase.
+
+**Spec:**
+
+1. One function parses the form, beside `parse_routing_arguments`. It takes at most one positional word, a package name. An empty package means the whole workspace. A second positional word prints the usage and exits 2.
+2. A package keeps the meaning that the command gives it today. Do not narrow a Cargo selection: `check` and `build` keep `--workspace`, and a named package still owns the feature names without a slash. Feature unification across the workspace is why, and a narrower selection costs rebuilds.
+3. Each command under the form:
+   - `check [<package>]`, `build [<package>]`: with no package, feature names pass unchanged.
+   - `test [<package>] [--test <name>]`: with no package, nextest runs the workspace. `--test <name>` replaces the positional integration test.
+   - `lint [<package>] [--check]`: with no package, it does what `lint --workspace` does today. `--workspace` is removed. `--check` works with or without a package.
+   - `doc [<package>]`: the run stays the whole staged workspace, and the pass record does not change. A package owns the feature names, as in `check`.
+   - `example [<package>] [--name <name>]`: `--name` replaces the positional name. With no name, Clippy runs on all examples of the package, or of the workspace when no package is given. With a name and no package, the member that has the example supplies its required features.
+   - `final [<package>] [--saved] [--tree <tree>]`: with a package, the check stays whole-workspace and nextest runs that package, and no pass is saved. `--saved` replaces `final-pass`, with the same answer and exit status. `--tree` is valid only with `--saved`.
+4. Remove `final-pass`, `lint --workspace`, the positional example name and the positional integration test. Add no alias. An old form exits 2 and prints a usage line that names the new form, so a worker with a stale prompt corrects itself in one step (builds, 2026-11-06).
+5. A record with no package names `workspace` as its package. `scripts/buildlog/index.py`, `scripts/buildlog/report.py`, `scripts/buildlog/mac_outcome.py` and `scripts/build_queue/step_estimator.py` read that word. A `test` with no package counts as a gate run in memory admission, and the estimator uses the workspace figure.
+6. Update `verify --help` and `verify help <command>` to the form, under 80 columns.
+7. Switch every caller in the Files list, and each further caller that a search finds. A doc that states a form states the new form, also `<package>` as `[<package>]`. Do not change `docs/plans`. Search `~/rust/nate_style` also, and name each hit outside this repository in the summary. Keep the script path `~/.claude/scripts/direct/verify.sh`: the permission rules name it.
+
+**Files:**
+- `scripts/direct/verify.sh`
+- `scripts/buildlog/index.py`
+- `scripts/buildlog/mac_outcome.py`
+- `scripts/buildlog/report.py`
+- `scripts/build_queue/step_estimator.py`
+- `scripts/direct/final_pass.py`
+- `scripts/hooks/checkpoint_gate.py`
+- `scripts/hooks/post-tool-use-fn-length.py`
+- `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py`
+- `scripts/lint/invoke.sh`
+- `scripts/lint/lint_config.sh`
+- `scripts/style/add_style.py`
+- `scripts/style/bulk_run.py`
+- `scripts/agents/test_codex_mesh.py`
+- `scripts/agents/test_mesh_runs.py`
+- `scripts/berth/tests/test_work_order.py`
+- `scripts/buildlog/test_mac_idle.py`
+- `scripts/buildlog/test_report.py`
+- `scripts/direct/test_mesh_tree_cancel.py`
+- `scripts/direct/test_verify_final_pass_commits.py`
+- `scripts/direct/test_verify_final_pass_compiler.py`
+- `scripts/direct/test_verify_final_pass_edits.py`
+- `scripts/direct/test_verify_final_pass_failure.py`
+- `scripts/direct/test_verify_final_pass.py`
+- `scripts/direct/test_verify_final_pass_records.py`
+- `scripts/direct/test_verify_final_pass_script.py`
+- `scripts/direct/test_verify_final_pass_staged.py`
+- `scripts/direct/test_verify_final_pass_unstaged.py`
+- `scripts/direct/test_verify_final_pass_untracked.py`
+- `scripts/direct/test_verify_token_detach.py`
+- `scripts/direct/test_verify_tree_cancel_history.py`
+- `scripts/direct/test_verify_verbs.py`
+- `scripts/direct/verify_examples_test_support.py`
+- `scripts/direct/verify_final_pass_test_support.py`
+- `scripts/hooks/test_build_hold_guard.py`
+- `scripts/hooks/test_checkpoint_doc_gate.py`
+- `scripts/lib/test_process_group.py`
+- `scripts/production/test_merge_checkpoint_validation.py`
+- `scripts/production/test_unit_phases.py`
+- `scripts/style/style_plan_test_support.py`
+- `scripts/style/test_bulk_run.py`
+- `scripts/style/test_crate_run.py`
+- `scripts/style/test_style_sync.py`
+- `commands/build/hold.md`
+- `commands/build/mac.md`
+- `commands/lint_config.md`
+- `commands/plan/to_phased_plan.md`
+- `commands/producer/to_production.md`
+- `commands/release.md`
+- `commands/unit/checkpoint.md`
+- `commands/unit/direct.md`
+- `config/lint.conf`
+- `config/README.md`
+- `docs/as-built/build-followups-fn-length-hook.md`
+- `docs/as-built/build-followups.md`
+- `docs/as-built/build-followups-mul-add.md`
+- `docs/as-built/buildlog-memory-stalls.md`
+- `docs/as-built/buildlog-tests-per-edit-rust-release.md`
+- `docs/as-built/build-memory-admission.md`
+- `docs/as-built/builds-aws-target.md`
+- `docs/as-built/build-targets.md`
+- `docs/as-built/gate-checkouts.md`
+- `docs/as-built/mac-test-offload.md`
+- `docs/as-built/merge-gate-and-test-speed.md`
+- `docs/as-built/nextest-width-and-lint-scope.md`
+- `docs/as-built/phase-checks.md`
+- `docs/as-built/rustdoc-once-and-final-targets.md`
+- `docs/as-built/showrunner-automation.md`
+- `docs/as-built/style-showrunner.md`
+- `docs/direct/final_gate_commit.md`
+- `docs/direct/phase_checks.md`
+- `docs/direct_plan_format.md`
+- `docs/direct/write_prompt_contract.md`
+- `docs/production_format.md`
+- `docs/style_production.md`
+- `scripts/build_targets/working_set_owners.json`
+
+**Workers:** 2 writers: merge16 holds `scripts/`, fix16 holds every other path.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- natest changes `test_verify*` modules at the same time. Change only the form words in those modules. Tell the director each module you change, so that natest can have the list.
+- Phase 41d: keep `parse_routing_arguments` callable through `shell_functions`.
+- Phases 29, 37 and 41c: this phase changes no route. Each command runs where it runs today.
+
+**Acceptance gate:**
+- A real `verify.sh` call on a tempdir workspace with no package runs `check`, `test` and `lint` over the workspace, and `test_verify_verbs.py` holds each removed form with exit 2.
+- Each removed form exits 2 and prints its new form.
+- `final --saved` gives the same answer and status as `final-pass` gave, in the `test_verify_final_pass*` modules.
+- A search of the repository, outside `docs/plans`, finds none of the removed forms.
+- The modules that the writers change pass, and basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
+
+### Phase 41h — One routing rule, and --target, --mac and --local on every command  · status: todo
+
+**Depends on:** Phase 41g.
+
+#### Work Order
+
+**Source:** the user's "go" on C1149, through builds, 2026-11-06.
+
+**Goal:** one rule says where each step of each command runs. `--target`, `--mac` and `--local` mean the same on every command.
+
+**Spec:**
+
+1. One function holds the rule. A step that writes the tree runs on natedev. `build` runs on natedev unless a flag pins it, because this machine uses the binary. Each other step runs on the first eligible target in `config/build_targets.conf` order. Today's default order is Mac, natedev, AWS.
+2. `check`, `doc`, `example`, the `lint` judgment and `final` now use that order, as `test` does. A `STEP_RUNS_ON` value of `ssh_allowed` and a value of `mac_allowed` become one value. `natedev_only` stays for the two cases in item 1.
+3. `parse_routing_arguments` accepts the flags on every command, with one meaning:
+   - `--target <name>` pins each movable step to that target and waits for it.
+   - `--mac "<reason>"` pins each movable step to the Mac and never uses natedev.
+   - `--local "<reason>"` pins each step to natedev. The existing refusal of a reason that names a reservation applies on every command.
+   - A step that writes the tree stays on natedev under each flag. `lint --mac` repairs on natedev and judges on the Mac.
+4. `offload.py` adds the verbs that `build`, `example` and `final` need. `config/build_targets.conf` lists them in each target's `kinds`. `linux_only` keeps its effect on every kind.
+5. `build` on another target prints `binary: <target>:<path>`.
+6. A saved pass from another target follows the rule that `doc` uses today. Name the rule in the as-built.
+7. Update `verify help <command>`, `docs/as-built/build-targets.md` and `docs/as-built/mac-test-offload.md`.
+8. Before the checkpoint, measure a mid-edit `check` on the Mac against natedev, with the sync time included, and put the numbers in the notice (builds, 2026-11-06). The measure uses one real package after a one-line edit, and names the method.
+
+**Files:**
+- `scripts/direct/verify.sh`
+- `scripts/mac_test/offload.py`
+- `scripts/build_targets/build_targets.py`
+- `config/build_targets.conf`
+- `scripts/direct/test_verify_routing_rule.py`
+- `docs/as-built/build-targets.md`
+- `docs/as-built/mac-test-offload.md`
+
+**Workers:** 1 writer: merge16.
+
+**Constraints from prior phases:**
+- Add no guard, refusal or check that this Spec does not ask for.
+- Phases 29, 37 and 41c: a tree-writing step stays on natedev, and the first-mend leave hook stays.
+- Importing `offload.py` loads no build coordination modules (resources' Phase 67 test).
+- Phase 41e edits `route_test`, `free-now` and `reserve` in its own tree. Merge whichever lands second.
+
+**Acceptance gate:**
+- `test_verify_routing_rule.py` calls the rule function for each command with no flag, `--target`, `--mac` and `--local`, and reads the route of each step.
+- A real `verify.sh` call with a fake SSH runner reaches the target for `check`, `example` and `build`, and repairs on natedev under `lint --mac`.
+- The modules that read routing pass with no change to what they assert, except for the two merged `STEP_RUNS_ON` values. basedpyright is 0/0/0 on the changed Python files. The merge gate runs all modules.
