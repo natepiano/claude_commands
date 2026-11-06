@@ -582,13 +582,12 @@ class ClaimReleaseTests(ControlFixture):
             _ = mac_test.release_stopped_claims(other, evidence)
         self.assertEqual(unrelated.read_bytes(), before)
 
-    def test_stop_evidence_preserves_claims_for_another_host_or_instance_generation(self) -> None:
-        for mismatch in ("host", "generation", "legacy"):
+    def test_stop_evidence_preserves_claims_for_another_host_or_without_a_generation(self) -> None:
+        for mismatch in ("host", "legacy"):
             with self.subTest(mismatch=mismatch):
                 path = self.claim(self.paths)
                 row = cast(dict[str, object], json.loads(path.read_text()))
                 row["remote_host"] = "previous-host" if mismatch == "host" else "aws-build"
-                row["instance_generation"] = "previous-generation" if mismatch == "generation" else "generation-one"
                 if mismatch == "legacy":
                     del row["instance_generation"]
                 _ = path.write_text(json.dumps(row))

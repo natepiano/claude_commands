@@ -256,6 +256,9 @@ progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
 
+`review-trial` reports code, UX, and simplify counts and review times for one phase instance.
+[Review regime records](review-regime-trial.md) define its sources, output, and checkpoint parser.
+
 Phases can be open together. State holds the most recently started open phase
 under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
 `findings.py` use) and the older open ones under `open_phases`, each carrying
