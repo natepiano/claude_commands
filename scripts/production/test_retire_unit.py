@@ -249,6 +249,7 @@ class RetireUnitTests(unittest.TestCase):
                            capture_output=True)
         for setting in (("user.email", "test@example.invalid"), ("user.name", "test"), ("commit.gpgsign", "false")):
             _ = git(self.checkout, "config", *setting)
+        _ = (self.checkout / "Cargo.toml").write_text("[workspace]\n")
         self.worktree = self.root / "alpha-wt"
         self.doc = self.checkout / "alpha-production.md"
         _ = self.doc.write_text(

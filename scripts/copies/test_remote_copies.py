@@ -39,7 +39,7 @@ class RemoteCopiesTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
-                                             {"source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
+                                             {"Cargo.toml": "[workspace]\n", "source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
         self.mirror = self.root / "mirrors/repository"
 
     def remote(self, owner: str = "alpha", path: str = "mirror/repository") -> copies.RemoteMirror:

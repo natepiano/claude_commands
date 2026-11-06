@@ -74,7 +74,7 @@ class StandingTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         seed = ImmutableGitSeed.create(
             self.base, "main", "Gate Tests", "gate-tests@example.invalid",
-            {"tracked.txt": "published\n", "stable.txt": "unchanged\n",
+            {"Cargo.toml": "[workspace]\n", "tracked.txt": "published\n", "stable.txt": "unchanged\n",
              ".gitignore": "target/\nignored.txt\n"},
         )
         self.source = seed.checkout
@@ -119,6 +119,119 @@ class StandingTests(unittest.TestCase):
     def python_run(self, program: str, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, "-c", program, *arguments],
                               capture_output=True, text=True, timeout=10)
+
+    def fresh_base(self) -> str:
+        _ = self.git(self.source, "rm", "Cargo.toml")
+        _ = self.git(self.source, "commit", "-qm", "remove the root build manifest")
+        return self.git(self.source, "rev-parse", "HEAD")
+
+    def test_fresh_gate_holds_the_commit_and_lock_then_removes_its_task_folder(self) -> None:
+        base = self.fresh_base()
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(base)) as tree:
+            folder = tree.parent
+            self.assertTrue(folder.is_relative_to(self.base / "scratch"))
+            self.assertEqual(tree.name, "checkout")
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), base)
+            with scratch.busy_locks(folder, create=False) as idle:
+                self.assertFalse(idle)
+            self.assertFalse(Path(self.settings["root"]).exists())
+            self.assertEqual(list(scratch.registered_copy_paths()), [])
+            # A fresh copy needs no source refresh after the caller finishes.
+            shutil.rmtree(self.source)
+        self.assertFalse(folder.exists())
+        self.assertFalse(Path(self.settings["root"]).exists())
+
+    def test_fresh_gate_removes_its_folder_after_a_caller_exception(self) -> None:
+        base = self.fresh_base()
+        failure = ValueError("the gate failed")
+        folders: list[Path] = []
+        with self.assertRaises(ValueError) as raised:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(base)) as tree:
+                folders.append(tree.parent)
+                raise failure
+        self.assertIs(raised.exception, failure)
+        self.assertFalse(folders[0].exists())
+
+    def test_fresh_gate_removes_its_folder_after_a_merge_conflict(self) -> None:
+        _ = self.fresh_base()
+        _ = self.git(self.source, "switch", "-qc", "incoming")
+        _ = (self.source / "tracked.txt").write_text("incoming conflict\n")
+        _ = self.git(self.source, "commit", "-qam", "incoming conflict")
+        _ = self.git(self.source, "switch", "-q", "main")
+        _ = (self.source / "tracked.txt").write_text("base conflict\n")
+        _ = self.git(self.source, "commit", "-qam", "base conflict")
+        base = self.git(self.source, "rev-parse", "HEAD")
+        with self.assertRaises(copies.PreparationError):
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(base),
+                                 merge=copies.MergeRevision("incoming")):
+                self.fail("A conflicting merge must not enter the caller")
+        self.assertEqual(list((self.base / "scratch").rglob("checkout")), [])
+        self.assertFalse(Path(self.settings["root"]).exists())
+
+    def test_fresh_gates_of_one_owner_overlap_without_reusing_a_tree(self) -> None:
+        base = self.fresh_base()
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(base)) as first:
+            with copies.standing("verify-unit", self.source, copies.CommittedSource(base)) as second:
+                self.assertNotEqual(first, second)
+                self.assertTrue(first.exists())
+                self.assertTrue(second.exists())
+                self.assertTrue(second.is_relative_to(self.base / "scratch"))
+            self.assertFalse(second.exists())
+            self.assertTrue(first.exists())
+        self.assertFalse(first.exists())
+
+    def test_nested_manifest_and_uncommitted_root_manifest_keep_a_fresh_gate(self) -> None:
+        _ = self.fresh_base()
+        nested = self.source / "scripts/proof_crate"
+        nested.mkdir(parents=True)
+        _ = (nested / "Cargo.toml").write_text("[workspace]\n")
+        _ = self.git(self.source, "add", ".")
+        _ = self.git(self.source, "commit", "-qm", "add a nested manifest")
+        base = self.git(self.source, "rev-parse", "HEAD")
+        _ = (self.source / "Cargo.toml").write_text("[workspace]\n")
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(base)) as tree:
+            self.assertTrue(tree.is_relative_to(self.base / "scratch"))
+            self.assertTrue((tree / "scripts/proof_crate/Cargo.toml").exists())
+            self.assertFalse((tree / "Cargo.toml").exists())
+        self.assertFalse(tree.exists())
+
+    def test_committed_root_manifest_reuses_output_despite_working_file_removal(self) -> None:
+        (self.source / "Cargo.toml").unlink()
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as tree:
+            output = tree / "target/compiled"
+            _ = output.write_text("retained output")
+        with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as reused:
+            self.assertEqual(reused, tree)
+            self.assertEqual(output.read_text(), "retained output")
+            self.assertEqual((tree / "Cargo.toml").read_text(), "[workspace]\n")
+
+    def test_fresh_gate_applies_working_changes_before_a_merge(self) -> None:
+        base = self.fresh_base()
+        incoming = self.incoming()
+        _ = (self.source / "untracked.txt").write_text("working content\n")
+        with copies.standing("verify-unit", self.source, copies.WorktreeSource(base, self.source),
+                             merge=copies.MergeRevision("incoming")) as tree:
+            self.assertTrue(tree.is_relative_to(self.base / "scratch"))
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD^2"), incoming)
+            self.assertEqual((tree / "incoming.txt").read_text(), "merged content\n")
+            self.assertEqual((tree / "untracked.txt").read_text(), "working content\n")
+        self.assertFalse(tree.parent.exists())
+
+    def test_fresh_gate_removal_failure_preserves_the_caller_exception(self) -> None:
+        base = self.fresh_base()
+        failure = ValueError("the gate failed")
+        remove = shutil.rmtree
+        folders: list[Path] = []
+        with ExitStack() as patches:
+            with self.assertRaises(copies.PostUseError) as raised:
+                with copies.standing("verify-unit", self.source, copies.CommittedSource(base)) as tree:
+                    folders.append(tree.parent)
+                    _ = patches.enter_context(mock.patch.object(shutil, "rmtree",
+                                                               side_effect=PermissionError("removal failed")))
+                    raise failure
+        self.assertIs(raised.exception.caller_error, failure)
+        self.assertIn(str(folders[0]), str(raised.exception))
+        remove(folders[0])
 
     def test_clone_cli_creates_a_task_owned_checkout_without_a_root_busy_mark(self) -> None:
         result = self.cli("clone", str(self.source), "--task", "gate:camera", "--name", "camera")
@@ -946,7 +1059,7 @@ class StandingTests(unittest.TestCase):
 
     def test_owner_removal_covers_repositories_and_editable_copies(self) -> None:
         other = ImmutableGitSeed.create(self.base / "other", "main", "Gate Tests",
-                                        "gate-tests@example.invalid", {"other.txt": "content"}).checkout
+                                        "gate-tests@example.invalid", {"Cargo.toml": "[workspace]\n", "other.txt": "content"}).checkout
         other = other.rename(other.with_name("other-repository"))
         with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as first:
             pass
@@ -1039,7 +1152,7 @@ class StandingTests(unittest.TestCase):
 
     def test_repository_removal_skips_a_workspace_with_a_deleted_source(self) -> None:
         other = ImmutableGitSeed.create(self.base / "other", "main", "Gate Tests",
-                                        "gate-tests@example.invalid", {"other.txt": "content"}).checkout
+                                        "gate-tests@example.invalid", {"Cargo.toml": "[workspace]\n", "other.txt": "content"}).checkout
         other = other.rename(other.with_name("unrelated-repository"))
         with copies.workspace("verify-unit", other, "HEAD", name="other-worker", branch="worker") as kept:
             pass

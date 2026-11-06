@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run gates in one warm checkout per owner, with a second checkout when busy."""
+"""Run gates in fresh copies or reusable copies with build output."""
 from __future__ import annotations
 
 import argparse
@@ -176,7 +176,7 @@ class PreparationError(CopyError):
 
 
 class PostUseError(CopyError):
-    """The caller finished, but refreshing its standing checkout metadata failed."""
+    """Cleanup or a metadata refresh failed after the caller used a checkout."""
 
     def __init__(self, message: str, *, caller_error: BaseException | None = None) -> None:
         super().__init__(message)
@@ -456,6 +456,36 @@ def available_tree(owner: str, repo: str, pool: CopiesConfiguration) -> Generato
                 waiter = Thread(target=first_tree_released, daemon=True)
                 waiter.start()
         _ = wake.wait(pool.wait_seconds)
+
+
+@contextmanager
+def fresh_tree(owner: str) -> Generator[GateLease]:
+    """Hold a private scratch checkout and delete its folder after use."""
+    path = scratch.new(word=f"{owner}-gate", throwaway=True)
+    try:
+        descriptors: list[int] = []
+        with claim_tree(path, create=False, inherited_fds=descriptors) as state:
+            if state is not ClaimState.ACQUIRED:
+                raise CopyError(f"{path}: task folder is busy")
+            checkout = path / "checkout"
+            checkout.mkdir()
+            yield GateLease(checkout, tuple(descriptors))
+    finally:
+        caller_error = sys.exception()
+        try:
+            shutil.rmtree(path)
+        except OSError as error:
+            raise PostUseError(f"{path}: fresh copy removal failed: {error}",
+                               caller_error=caller_error) from error
+
+
+def keeps_build_cache(source: Path, base: str) -> bool:
+    """Use a standing tree when the selected commit has a root Cargo manifest."""
+    try:
+        _ = git(source, "cat-file", "-e", f"{base}:Cargo.toml")
+    except CopyError:
+        return False
+    return True
 
 
 def initialize(tree: Path, source: Path, owner: str, repo: str, base: str) -> None:
@@ -838,7 +868,7 @@ def end_workspaces(task: str, paths: list[Path]) -> None:
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
              merge: MergePolicy = NO_MERGE) -> Generator[Path]:
-    """Hold a warm gate checkout through preparation and the caller's entire use."""
+    """Hold a gate checkout through preparation and the caller's use."""
     owner = checked_owner(owner)
     try:
         source = Path(repo).expanduser().resolve()
@@ -850,7 +880,9 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
             and commit_at(source, "HEAD") == base and isinstance(policy, CommittedSource) and isinstance(merge, NoMerge)):
         yield source
         return
-    with available_tree(owner, name, load_config()) as lease:
+    keep_cache = keeps_build_cache(source, base)
+    lease_context = available_tree(owner, name, load_config()) if keep_cache else fresh_tree(owner)
+    with lease_context as lease:
         tree = lease.tree
         token = COMMAND_LOCKS.set(lease.descriptors)
         active = ACTIVE_GATES.set((*ACTIVE_GATES.get(), tree))
@@ -859,14 +891,15 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
             try:
                 yield tree
             finally:
-                caller_error = sys.exception()
-                try:
-                    refresh_remotes(tree, source)
-                    mark_target(tree)
-                    write_record(tree, owner, name, source, commit_at(tree, "HEAD"))
-                except (OSError, scratch.ScratchError, CopyError) as error:
-                    raise PostUseError(f"{tree}: post-use refresh failed: {error}",
-                                       caller_error=caller_error) from error
+                if keep_cache:
+                    caller_error = sys.exception()
+                    try:
+                        refresh_remotes(tree, source)
+                        mark_target(tree)
+                        write_record(tree, owner, name, source, commit_at(tree, "HEAD"))
+                    except (OSError, scratch.ScratchError, CopyError) as error:
+                        raise PostUseError(f"{tree}: post-use refresh failed: {error}",
+                                           caller_error=caller_error) from error
         finally:
             ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)

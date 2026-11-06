@@ -88,7 +88,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_wrap_removes_production_and_unit_checkouts_before_state(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
-                                          "cleanup@example.invalid", {"file.txt": "content"}).checkout
+                                          "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         owner = self.owner("done")
         _ = fixture_member("unit", name="alpha", parent=owner.id)
@@ -115,7 +115,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_wrap_keeps_state_until_a_damaged_copy_record_is_repaired(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
-                                          "cleanup@example.invalid", {"file.txt": "content"}).checkout
+                                          "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         state = self.state_files("done")
         with copies.workspace("done", source, "HEAD", name="damaged", branch="worker") as tree:

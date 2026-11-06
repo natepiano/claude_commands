@@ -188,7 +188,7 @@ class ScratchTests(unittest.TestCase):
 
     def test_standing_checkout_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
         seed = ImmutableGitSeed.create(self.base, "main", "Scratch tests", "scratch@example.invalid",
-                                       {"source.txt": "style source\n"})
+                                       {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         started = time.time()
         with mock.patch.dict(os.environ, {"HOME": str(self.base)}):
             with copies.standing("style", seed.checkout, copies.CommittedSource("HEAD")) as checkout:

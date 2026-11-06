@@ -1,8 +1,11 @@
 # Standing gate checkouts
 
 `scripts/copies/copies.py` is the single place that makes gate, review, merge,
-and landing checkouts. A unit reuses one tree and its build output across
-commits. Another caller can use the second tree while the first is busy.
+and landing checkouts.
+`standing` calls `keeps_build_cache(source, base)` to select the copy lifetime.
+The function runs `git cat-file -e <base>:Cargo.toml`.
+A root manifest in the selected commit selects a standing copy.
+Other commits select a fresh copy, including commits with only nested Cargo manifests.
 
 ## Configuration, place, and names
 
@@ -21,19 +24,20 @@ below is required; the implementation has no fallback values.
 
 These values come from configuration.
 `owner.nightly=nightly`, `owner.style=style`, and `owner.verify=verify` supply owners when production context is unavailable.
-Each owner and repository has exactly two checkout slots.
+Each owner and repository with a root Cargo manifest has two standing checkout slots.
 
 The same file holds `allow.<path>=<reason>` entries under `[allow-list]`, with
 paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
-Trees live at `<root>/<repo>/<owner>-gate` and `<owner>-gate-2`.
+Standing trees live at `<root>/<repo>/<owner>-gate` and `<owner>-gate-2`.
 `<repo>` is the repository identity from the last part of its origin URL, without `.git`.
 Local origins, including relative paths and `file://` URLs, lead to the source repository's identity.
 A cycle of local origins is an error.
 A repository without an origin uses its main checkout's folder name.
 Linked worktrees and local clones use the same identity.
-For example, `~/.claude` uses `claude_commands/verify-unit-gate`.
+`~/.claude` has no root Cargo manifest and uses fresh copies.
+Its nested proof crate does not select a standing copy.
 The root under `~/worktrees` belongs to the existing trusted direnv root.
 
 Owners are unit or production names, such as `verify` or `builds`.
@@ -41,6 +45,26 @@ Owners match `[a-z0-9][a-z0-9_-]*`.
 Use no phase, run, or session ids.
 The caller supplies the owner from its existing context.
 The helper does not consult a roster.
+
+## Fresh copies
+
+`fresh_tree(owner)` creates a scratch task folder with the default task and the word `<owner>-gate`.
+It creates a `checkout` folder inside the task folder and yields a `GateLease`.
+The task folder's busy lock protects the copy throughout preparation and caller use.
+Command children inherit the lease descriptors.
+Fresh copies do not use the standing pool or register as editable workspaces.
+Overlapping callers receive separate folders without waiting for another caller.
+
+Preparation fetches the selected commit and applies the requested source and merge policies.
+The context removes the task folder after success, a caller exception, or a preparation failure.
+A failed removal raises `PostUseError` and retains the caller's exception in `caller_error`.
+A killed process leaves the folder for the scratch sweep.
+`fresh_tree` sets the scratch record's `throwaway` mark because code creates the folder and no person edits it.
+The sweep skips the Git work check for a marked folder.
+The busy lock, expiry, and other keep rules still apply.
+An absent mark means false, so other folders keep their Git work protection.
+No command-line option sets the mark.
+Fresh copies skip the metadata and cache refresh after use.
 
 ## Reset and build output
 
@@ -67,7 +91,8 @@ The copy keeps `origin/HEAD` only when the source records that ref.
 Each copy also has a `source` remote with the local source path as its URL.
 Its `refs/remotes/source/*` track the source's local branches.
 The copy sweep uses these refs to detect commits saved in the source.
-Creation, reuse, and the end of use refresh both remotes with local fetches.
+Preparation refreshes both remotes with local fetches.
+Standing copies also refresh both remotes after use.
 A source without an `origin` remote keeps the local source URL and local branch mapping.
 These copies also keep `source`, so all copies use the same refresh rule.
 Legacy adoption resolves each local origin URL from its own repository before comparison.
@@ -86,11 +111,10 @@ use removes that link and restores a local cache without changing its target.
 
 ## Acquisition and cleanup
 
-A use holds `scratch.busy_locks(tree, create=True)` throughout preparation and
-the entire command or Python context. The mark is the existing `.claude-busy`
+A standing use holds `scratch.busy_locks(tree, create=True)` throughout preparation and the entire command or Python context. The mark is the existing `.claude-busy`
 flock. There is no second lock implementation or central registry.
 
-Acquisition tries both trees in order without waiting. If both trees are
+Standing acquisition tries both trees in order without waiting. If both trees are
 busy, it prints one stderr line naming the trees and their recorded holder
 pids, then blocks on the primary tree's flock while rechecking the second at
 `wait_seconds` intervals (one second in the shipped configuration). Primary
@@ -100,7 +124,7 @@ preparation and failed commands release the lock.
 Git runs automatic maintenance synchronously because its children inherit the busy lock.
 This also releases the lock after a failed metadata refresh.
 
-Each tree has one `.gate.json` record:
+Each prepared tree has one `.gate.json` record:
 
 ```json
 {
@@ -146,7 +170,9 @@ stale source tracking ref cannot select an old merge. Other merge refs are fetch
 source repository. Local origin paths resolve relative to the source repository;
 remote URLs keep their original form. Source refs stay unchanged. The merge uses `--no-ff --no-edit`.
 Failed application or a merge conflict exits 3,
-names the affected files, and releases the tree. The next use resets it clean.
+names the affected files, and releases the lease.
+A fresh copy is deleted.
+The next standing use resets its tree.
 
 ```sh
 python3 ~/.claude/scripts/copies/copies.py list
@@ -180,8 +206,9 @@ before it deletes production state. A refusal keeps the state for a retry.
 
 Success exits 0; invalid owners, invalid configuration, and other refused
 operations exit 2. Apply and merge failures exit 3. `run` returns its command's
-status. Repeating a use resets the same checkout and retains its build files;
-only the last-use record and cache-use stamp are refreshed.
+status. Repeating a standing use resets the same checkout and retains its build files.
+The last-use record and cache-use stamp are refreshed.
+A fresh use creates another checkout.
 
 Script callers use the same implementation:
 
@@ -197,6 +224,7 @@ The source policy is `CommittedSource(revision)`, `WorktreeSource(revision, work
 `StagedSource` requires a tree identity.
 The merge policy defaults to `NoMerge()`.
 `standing` yields a `Path` while it holds the lease.
+Callers must finish all checkout access before the context ends.
 `CopyError` represents a refusal.
 `PreparationError` represents an application or merge failure.
 
@@ -221,7 +249,7 @@ The guard distinguishes no forbidden operation, a specific detected repository-t
 
 | Allowed creator | Reason |
 | --- | --- |
-| `scripts/copies/copies.py` | Creates standing checkouts, remote mirrors, and registered test clones. |
+| `scripts/copies/copies.py` | Creates fresh checkouts, standing checkouts, remote mirrors, and registered test clones. |
 | `scripts/production/add_unit.py` | Creates original unit worktrees. |
 | `scripts/production/resume_unit.py` | Restores original unit worktrees. |
 | `scripts/berth_fix/launch.sh` | Creates a standing original fixer worktree, not a build copy. |
@@ -229,8 +257,8 @@ The guard distinguishes no forbidden operation, a specific detected repository-t
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
 
-Comparisons run in sequence in one tree or use the second tree.
-More than two simultaneous builds for one owner and repository wait.
+Standing comparisons run in sequence in one tree or use the second tree.
+More than two standing builds for one owner and repository wait.
 The existing floor sweep handles old copies under `/tmp`.
 
 ## Remote mirrors

@@ -628,14 +628,16 @@ def task_or_default(task: str, now: float, *,
 
 
 def write_record(path: Path, task: str, now: float, *,
+    throwaway: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
     _ = update_record(path, lambda record: fields_for_task(
         {**(record.fields if isinstance(record, copy_record.Registered) else {}),
-         "maker": maker(), "created": now, "renewed": now}, task), scratch_settings=scratch_settings)
+         "maker": maker(), "created": now, "renewed": now, "throwaway": throwaway}, task), scratch_settings=scratch_settings)
 
 
 def new(task: str = "", word: str = "", visible: bool = False, now: float | None = None, *,
+    throwaway: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -645,7 +647,7 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     path = target(task, word, visible, scratch_settings=scratch_settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.mkdir()
-    write_record(path, task, moment, scratch_settings=scratch_settings)
+    write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
     return path
 
 
@@ -741,6 +743,12 @@ def task_of(path: Path, *,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     record = copy_record.read_record(path / copy_record.RECORD)
     return pending_removal(path, scratch_settings=scratch_settings) if isinstance(record, copy_record.NotRegistered) else record
+
+
+def is_throwaway(path: Path) -> bool:
+    """Identify a folder that code creates without edits from a person."""
+    record = task_of(path)
+    return isinstance(record, copy_record.Registered) and record.fields.get("throwaway") is True
 
 
 def pending_copy_paths(base: Path) -> Iterator[Path]:

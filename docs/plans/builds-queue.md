@@ -315,6 +315,47 @@ only I can bump
 
 **Change-Review:** none. The user sees no change; the gate folder name is internal.
 
+### Phase 18b — A repository with no build cache gets a fresh copy for each run  · status: todo
+
+**Depends on:** 18a. Source: builds showrunner, 2026-11-06, from sdlc. The user asked why each unit keeps two standing gate copies of ~/.claude. It goes ahead of 20d, 20b and 10v.
+
+#### Work Order
+
+**Goal:** A gate on a repository with no build cache uses a private copy that is deleted when the run ends. Only a Rust repository keeps standing copies.
+
+**Spec:**
+
+1. **Measured reason.** A `git archive` of ~/.claude (2,003 files, 45 MB) takes 0.17 s. A standing copy helps only a repository with build output to reuse.
+2. **One decision point.** A new function in `scripts/copies/copies.py`, `keeps_build_cache(source, base)`, answers true when commit `base` has `Cargo.toml` at its root. `git cat-file -e <base>:Cargo.toml` reads it. `standing` is the only caller. No repository name list. `scripts/aws_target/proof_crate/Cargo.toml` is nested, so ~/.claude gets a fresh copy.
+3. **Fresh copy.** A new context manager `fresh_tree(owner)` yields a `GateLease`, as `available_tree` does. It makes a scratch folder with `scratch.new`, default task, word `<owner>-gate`, and a `checkout` folder inside it, in the form of `clone`. It holds the folder's busy lock through the run, so the hourly sweep cannot remove a live copy. `standing` selects the lease with `keeps_build_cache` and otherwise keeps its flow: `prepare`, the `ACTIVE_GATES` entry and `COMMAND_LOCKS`.
+4. **Delete at the end.** `fresh_tree` removes the scratch folder when the run ends: at success, at a caller exception and at a preparation failure. A killed process leaves the folder to the scratch sweep. A failed removal raises `PostUseError` with the caller's error, as the post-use refresh does.
+5. **No post-use work on a fresh copy.** `standing` skips `refresh_remotes`, `mark_target` and `write_record` after use on a fresh copy; nothing reads that tree again.
+6. **Callers.** Read each `copies.standing` caller (`scripts/production/fast_track.py`, `waiting.py`, `ci_points.py`, `bump_gate.py`, `merge_gate.py`, `scripts/buildlog/rust_release.py`, `scripts/style/bulk_run.py`, `crate_run.py`, `style_sync.py`) and `copies.py run`. A caller that uses the tree path after its `with` block must move that use inside the block. Report each one in the summary.
+7. **Old trees.** Touch no tree under `~/worktrees/gates/`. Hierarchies Phase 28 deletes the stale gate folders. `remove_trees` keeps its behavior for the standing trees that remain. No stored record changes, so there is no conversion.
+8. **Proof.** Tests in `test_copies.py`, each in a tempdir:
+   - no root `Cargo.toml`: the tree is under the scratch root, holds `base`, and is gone after the block, also after a caller exception and a failed merge;
+   - no folder appears under the pool root;
+   - two overlapping runs of one owner get different trees and neither waits;
+   - a nested `Cargo.toml` alone gives a fresh copy;
+   - a root `Cargo.toml` gives the standing tree, and a second use reuses its `target`;
+   - the answer reads commit `base`, not the source's working files;
+   - `WorktreeSource` and `MergeRevision` work on a fresh copy.
+   Existing standing tests keep their assertions; their source repository gains a root `Cargo.toml` in its fixture. Measure one fresh copy of a tree of ~/.claude's size with `standing` and give the wall time in the summary.
+
+**Files:**
+- `scripts/copies/copies.py`
+- `scripts/copies/test_copies.py`
+- `scripts/copies/test_remote_copies.py`, `scripts/copies/test_review_remote_copies.py`, `scripts/copies/copies_test_support.py` — fixtures only, when a fixture needs a root `Cargo.toml`.
+- `scripts/production/` — a caller or fixture, when item 6 or the gate needs it.
+- `scripts/style/` — a caller or fixture, when item 6 or the gate needs it.
+- `docs/as-built/gate-checkouts.md` — the two cases and the decision point.
+
+**Workers:** `1 writer` — `impl2`, code, tests and docs.
+
+**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, adversary and contract reviews.
+
+**Change-Review:** none. The user sees no change in how a gate runs; the row for the visible result goes with the removal of the stale gate folders, which hierarchies owns.
+
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
 #### As-built

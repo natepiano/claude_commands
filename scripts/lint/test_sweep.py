@@ -2706,7 +2706,7 @@ class FloorTests(SweepCase):
     def test_floor_keeps_a_standing_target_only_while_its_checkout_is_busy(self) -> None:
         base = self.base()
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
-                                       {"source.txt": "style source\n"})
+                                       {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
             with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
@@ -2730,7 +2730,7 @@ class FloorTests(SweepCase):
     def test_floor_finds_and_reclaims_an_idle_retained_standing_target(self) -> None:
         base = self.base()
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
-                                       {"source.txt": "style source\n"})
+                                       {"Cargo.toml": "[workspace]\n", "source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
             with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
@@ -2753,7 +2753,7 @@ class FloorTests(SweepCase):
         _ = config.write_text("\n".join(f"root={pool}" if line.startswith("root=") else line
                                            for line in configured.splitlines()))
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
-                                       {"source.txt": "standing source\n"})
+                                       {"Cargo.toml": "[workspace]\n", "source.txt": "standing source\n"})
         discover = sweep.target_dirs
 
         def configured_targets(roots: Sequence[str], *, lint_settings: conf.ConfigRead,
