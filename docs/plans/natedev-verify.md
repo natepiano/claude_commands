@@ -293,20 +293,20 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Spec:**
 
-1. **Flags.** `phase_wait_start` (`verify.sh:1178`) passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | build target | memory> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none. None records `HolderNotNamed`.
-2. **Memory holder.** `scripts/lint/memory_gate.sh` (near line 179) pipes each line of `admission_client.py --wait-events` to `buildlog_memory_event` (`verify.sh:1220`). Add a `holder <json>` case there. No change goes into `memory_gate.sh` or the admission client.
+1. **Flags.** `phase_wait_start` (`verify.sh:1236`) passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | build target | memory> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none. None records `HolderNotNamed`.
+2. **Memory holder.** `scripts/lint/memory_gate.sh` (near line 178) pipes each line of `scripts/build_queue/admission_client.py --wait-events` to `buildlog_memory_event` (`verify.sh:1278`). Add a `holder <json>` case there. No change goes into `memory_gate.sh` or the admission client.
    - The client prints `holder` after `first`, and again only when the holder changes.
    - `{"kind":"session","session_id":…,"session_name":…}` gives `--holder-resource-kind memory --holder-resource memory --holder-session <session_id>`.
    - `{"kind":"unit","unit":…}` gives `--holder-resource-kind memory --holder-resource memory --holder-unit <unit>`.
    - `{"kind":"none"}` is an explicit absence: `wait-holder` with no flags.
    - An unchanged holder prints no event, so a steady wait starts no process.
 3. **Same shell.** The event loop runs in the pipe's subshell, and each wait id is in `$HOLD_WAIT_DIR/phase-wait.<BASHPID>.<key>`. `first`, `holder`, `done` and `left` for one client run use that one subshell. Keep the holder state in that subshell.
-4. **Token holder.** In `acquire_token` (`verify.sh:2948`, wait starts near 2981 and 3019) the holder is the board token owner, with kind `slot` and resource `cargo`. Read it in Bash on each pass of the wait loop. Call `wait-holder` only when it changes.
-5. **Build hold.** At `verify.sh:2706` and `:3310`, and in the current SSH routes (`route_test`, `route_test_without_renewal` near `:2330`), the holder is the hold's holder, with kind `slot` and the held target as the resource.
+4. **Token holder.** In `acquire_token` (`verify.sh:3008`, wait starts near 3041 and 3079) the holder is the board token owner, with kind `slot` and resource `cargo`. Read it in Bash on each pass of the wait loop. Call `wait-holder` only when it changes.
+5. **Build hold.** At `verify.sh:2766` and `:3370`, and in the SSH route (`route_test` at `:2263`, wait at `:2389`; `:3248` copies that body to `route_test_without_renewal`, and `:3249` wraps it with the token renewal), the holder is the hold's holder, with kind `slot` and the held target as the resource.
 6. **Mac busy.** For the Mac-only wait (`phase_wait_start hold "Mac busy"`), the holder is the session that holds the Mac claim, with kind `slot` and resource `mac`. Name it again on each poll.
 7. **Changes.** A changed holder calls `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags. A holder that goes away calls it with no flags. No watcher process runs beside a wait. A change during one blocking wait call shows at the next pass.
 8. **Recorder failure.** A failed `start-wait` or `wait-holder` prints the existing `NotRecorded` line. It never changes admission or the step's exit. The next `holder` event or pass tries again.
-9. **Queue age.** `mem_wait_s` and the waiting lines count from the first wait start (`$HOLD_WAIT_DIR/memory-wait-first`). Each recorder interval runs from its own `first` line to its `done` or `left` line. A rejoin after a refused Mac claim opens a new interval and keeps the first start. A first check that admits opens no interval and makes no holder call.
+9. **Queue age.** `mem_wait_s` and the waiting lines count from the first queued time in `BUILDLOG_MEM_WAIT_FIRST_FILE`, normally `$HOLD_WAIT_DIR/first-queued-at` (`verify.sh:1955-1959`). Step setup writes that file before routing, so a memory event never creates it. Each recorder interval runs from its own `first` line to its `done` or `left` line. A rejoin after a refused Mac claim opens a new interval and keeps the first queued time. A first check that admits opens no interval and makes no holder call.
 
 **Files:**
 - `scripts/direct/verify.sh` — the `holder` case, the lookups and the `wait-holder` calls.
@@ -318,7 +318,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Constraints from prior phases:**
 - Add no guard, refusal or check that this Spec does not ask for.
-- Read `scripts/lint/memory_gate.sh`, `scripts/lint/admission_client.py` and `scripts/direct/progress_history.py` only; do not change them.
+- Read `scripts/lint/memory_gate.sh`, `scripts/build_queue/admission_client.py` and `scripts/direct/progress_history.py` only; do not change them.
 - Phase 1: an inline helper in `verify.sh` runs as `VERIFY_PY_HELPER=<NAME> "$PY" …`, so a `VERIFY_PY_TRACE` run names its start.
 - Phase 9: a step with no wait starts no new Python. `test_verify_python_starts` keeps its count.
 - Phase 14: a `--mac` wait polls with a Bash `sleep` held in `HOLD_WAITER_PID`, and `hold_interrupted` ends that `sleep`.
@@ -328,7 +328,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 - verify help: a `verify.sh` header edit keeps the `# Usage:` and `# Help <command>:` blocks and the doc gate sentence.
 
 **Acceptance gate:**
-- Through the real event pipe, the recorded wait shows: a holder of each kind; a holder change; an explicit absence; a recorder failure and its retry; a rejoin after a refused Mac claim; and an immediate admission with no interval and no holder call.
+- Through the real event pipe, the recorded wait shows: a holder of each kind; a holder change; an explicit absence; a recorder failure and its retry; a rejoin after a refused Mac claim, with a new interval and the same first queued time; and an immediate admission with no interval and no holder call.
 - The recorded wait names the token owner, the hold's holder and the Mac claim's session, and a change on the next pass.
 - `test_verify_tree_cancel_lint.py`, `test_verify_python_starts`, the verify token, memory-kill and Mac-step suites and `test_verify_lint_local_writes.py` pass.
 - basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
@@ -843,91 +843,36 @@ Checkpoints `f81a7ba55` and `3aea5698d` on `verify-remake-1-24`, landed with the
 
 **Ruled out:** taking the claim lock only in `mirror-remove` and claiming a slot before its lease (both change the lock order that mirror removal safety needs); one lease layer per mirror; one owner spelling written at record time; dropping `OffloadRequest.repository_scope`.
 
-### Phase 35b — Simplify the copies remote mirror code · status: todo
+### Phase 35b — Simplify the copies remote mirror code · status: done
 
-**Depends on:** Phase 35. Queue-unit owns `scripts/copies/` once Phase 35 is on GitHub builds, and it does not take these items. Name each path it owns as `also touches <path> (owner queue-unit)` in the notice.
+#### As-built
 
-#### Work Order
-
-**Goal:** the remote mirror code has one lease path, one record writer and reader, one visible lock order and no unused flags, and a Mac offload run spends less time scanning its mirror.
-
-**Acceptance observation:** the time of one `mirror_has_process` call on the hana mirror on the Mac, and one `mirror_sweep_leases` pass on natedev's real target folder. The `mirror_has_process` time before is 5.2 s. Put each before and after time in the notice.
-
-**Spec:**
-
-**Group A — every result stays the same.** The writer does these first.
-
-1. `mirror_sweep_leases` (`copies.py:1216`, F015): glob `*/.mac-test-mirror` and `*/*/.mac-test-mirror` in place of `rglob`. Find `.*.copy-removing.json` authority files in the same two layouts (`copies.py:1227`), so an interrupted removal stays visible.
-2. One lease path and one lock read (F016): add `remote_lease_path(mirror)` and use it at the three places that build the path. Add one function that reads `/proc/locks` once and returns the existing `HeldMirror` values (`floor_claims.py:78`: host, path, session), not repository names. `serve` calls it. Delete `MirrorRepository`, `RegisteredRemoteMirror`, `RemoteMirrorLeaseRegistry` and the `TYPE_CHECKING` `file_lock` import. `copies.py:1074` reads `remote_record_path(mirror)` and scans no other record.
-3. One `remote_copies_command(action, mirror, *tail)` for `remote_rsync`, `remote_use_command` and `remove_remote_mirror` (F018).
-4. One `mark_mirror(tree, owner, repo, session, **extra)` and one `read_mirror_record(tree)` (F019). Name the mark with `floor_claims.MIRROR_MARK`. `remote_rsync` adds the `--exclude` entries for the metadata names that copies.py owns; remove those names from offload's exclude file. Keep metadata-before-authority deletion, replacement-record precedence and owner transfer only after successful use.
-5. `local_mirror_lease` has one read-and-raise block (F020).
-6. One `mirror_locks(tree, session, create)` context takes the lease, then the claim lock, then the record lock. Split `mirror_action` into `mirror_remove(args)` and `mirror_run(args)`. One helper strips a leading `--` (F021).
-7. Delete the `mirror-probe` action, its early return and the `"probe"` defaults (F022).
-8. Staged source boundary (F017, F023, changed together): `StagedSource.tree` is mandatory. `hold --staged-tree` is optional; with none, `hold` computes `staged_tree(repo)` before it makes the `StagedSource`, then prints the tree and the checkout. `doc_checkout` reads both lines. Delete `run --staged` and `run --staged-tree`, and make `run --commit` required.
-9. `register-remote` (F024): delete `--repo` and its `source_owner` and `repository_name` fallbacks. `--owner` and `--repository` are required. Delete `hold --owner`; `hold` calls `source_owner` directly, because it keeps the standing checkout's owner.
-10. Delete `lease.close()` at `offload.py:2225` (F025).
-11. One owner-suffix helper for `copies.py:269` and `tidy_wrapped.py:96` (F026). It keeps the current spelling: `alpha_unit` gives `alpha_unit-unit`. Do not call `unit_names.unit_id`, which gives `alpha-unit` and raises `BadName`; existing records must stay inside owner removal.
-12. `fallback_owner("verify")` with `owner.verify=verify` in `config/copies.conf`; `OffloadRequest.owner` is required (F027).
-13. `staged_tree` makes its folder through `build_folders.temporary_build_folder`. Replace the dead `prefixes.verify-doc` with `prefixes.copies-index=copies-index-` (F033). Leave `checkpoint_gate.commit_tree` as it is and send its owner one line about the copy.
-14. Tests: one `mirror_use_payload(case, argv)` in `offload_test_support.py`; delete `CommandEvent.transport_args` (F034). New `scripts/copies/copies_test_support.py` holds the environment fixture and `fake_remote_removal(mirrors)` (F035). Read copies.conf through `conf.read` in `test_remote_copies.py`, and keep the duplicate scan test in `test_copy_guard.py` (F036). Delete `test_doc_checkout_uses_the_staged_copy_api` (F037).
-15. Correct `docs/as-built/gate-checkouts.md`: its creator table and its "Mac mirrors move in a later checkpoint" sentence still describe the time before Phase 35. Update the mirror sections of `mac-test-offload.md` for each change above.
-
-**Group B — a stated result changes.** The writer does these after Group A's suites pass. Each one goes in the notice in one line.
-
-16. `mirror_has_process` (`copies.py:1165`, F014): use the `tmp_sweep.lsof_paths` and `tmp_sweep.process_paths` scanners and match the mirror as a path prefix. `mirror_lease_set` scans once for all mirrors. Linux resolves `tree` once before its `/proc` loop. Keep the process-group rule for a process that cannot be read, and keep "an lsof failure means busy".
-17. One slot-capacity reader in `target_config`, used by `mac_test.slot_capacity` and by admission at `offload.py:2218` (F028). A bad value now gives the reader's `ConfigError` in admission too.
-18. One holder-session chain through `build_hold.owning_session()` (F029). The session shown in a busy refusal can change to that chain's answer.
-19. `mac_run.sh` (F038): keep the clone's registration. After a successful clone cleanup, remove both records through copies.py: the natedev record (`mac_run.sh:138`) and the `localhost` record on the Mac (`copies.py:1434`). A failed cleanup keeps both.
-20. `mirror_probe_setup` tests the mark file first and starts Python on the remote host only when the mark is absent (F039). A mirror with its mark skips `mirror_local_path`, because the mark exists only after that check passed.
-
-**Not in this phase.**
-- F030 (`mac_run.sh` shell lease to the `hold` coproc): no change. `flock` waits and `remote_lease` refuses at once, so the change adds a refusal. Close its route with this reason.
-- F032 (`.remote-mirrors` out of the pool): no change. The move splits lease exclusion for a process that holds the old inode, and the dot-name skip costs one line. Close its route with this reason.
-- F031 (`sweep.py` busy-mirror loop and the `busy_mirrors` name): `sweep.py` is under the builds file freeze, so the item is in `docs/plans/natedev-verify-next.md` and its route stays open.
+- **Discovery.** `mirror_sweep_leases` globs `*/.mac-test-mirror` and `*/*/.mac-test-mirror`, and finds `.*.copy-removing.json` authority files in the same two layouts, so an interrupted removal stays visible. It runs on the Mac mirror root `~/.local/state/mac-test/mirror` (`sweep.py:4332`); natedev has no such root. A pass takes under 0.001 s (from 0.95 s).
+- **Process scan.** `scan_mirror_processes(mirrors) -> MirrorProcessScan` uses `tmp_sweep.lsof_paths` and `process_paths`. `mirror_has_process(tree, processes)` matches the mirror path or a descendant, and an unavailable scan means busy. `lsof_paths` accepts output only with status 0 or 1. `ProcessUsesKnown(paths, unreadable_cwd_pids=())` keeps the process-group rule for a process that cannot be read. `mirror_lease_set` takes all candidate leases, scans once, classifies while the leases are held and releases the busy ones. A Mac call on the hana mirror takes 0.22 s (from 5.2 s).
+- **Locks.** `local_mirror_lease(tree, session, *, create=True)` is the lease; `mirror_metadata_locks(tree)` takes the claim lock, then the record lock. `mirror_remove(args)` and `mirror_run(args)` replace `mirror_action`. `receive_metadata(tree, args)` writes received metadata. `file_lock.device_key` and `held_flock_keys` read `/proc/locks`.
+- **Records.** `mark_mirror(tree, owner, repo, session, **extra)` is the one writer. `floor_claims.read_mirror_record(path)` is the one reader, with `mirror_local_path`, `mirror_lock_path`, `removal_authority_path`, `record_lock_path` and `MIRROR_RECORD`, `MIRROR_SESSION`, `MIRROR_METADATA`. `remote_rsync` adds the `--exclude` entries for the metadata names.
+- **Remote registry.** `remote_lease_path(mirror)`, `held_remote_mirrors()` (one `/proc/locks` read, `HeldMirror` values) and `remote_copies_command(action, mirror, *tail)`. `register-remote` requires `--owner` and `--repository`; `unregister-remote --host --path` removes a record. `mac_run.sh` removes the natedev record and the Mac `localhost` record after a successful clone cleanup, and keeps both after a failed one. `mirror_probe_setup` tests the mark first, so a marked mirror starts no remote Python.
+- **Staged source.** `StagedSource.tree` is mandatory. `hold` computes `staged_tree(repo)` and prints the tree and the checkout; `doc_checkout` reads both lines. `run --commit` is required. `staged_tree` copies the source index in a `build_folders.temporary_build_folder` with prefix `copies-index`.
+- **Owner and config.** `copies.unit_owner` is the one suffix helper (`alpha_unit` gives `alpha_unit-unit`), used by `tidy_wrapped.py`. `fallback_owner("verify")` reads `owner.verify=verify`. `OffloadRequest` requires `owner` and `holder_session`; the session comes from `build_hold.owning_session()`. `target_config.slot_capacity(values, repository, *, missing)` is the one reader for `mac_test` and admission; a bad or empty value gives `ConfigError`. `prefixes.verify-doc` is gone from `config/build_folders.conf`, and the `allow.*` rows for `mac_test/offload.py`, `production/mac_run.sh` and `direct/verify.sh` are gone from `config/copies.conf`.
+- **Removed.** `MirrorRepository`, `RegisteredRemoteMirror`, `RemoteMirrorLeaseRegistry`, `ScanMirrorProcesses`, `MirrorLocks`, `finish_updates`, the `mirror-probe` action, `run --staged`, `run --staged-tree`, `hold --staged-tree`, `hold --owner`, `register-remote --repo`, `lease.close()` in `offload.py` and `CommandEvent.transport_args`.
 
 **Files:**
-- `scripts/copies/copies.py`
-- `scripts/copies/copies_test_support.py`
-- `scripts/copies/test_remote_copies.py`
-- `scripts/copies/test_review_remote_copies.py`
-- `scripts/copies/test_copies.py`
-- `scripts/copies/test_copy_guard.py`
-- `scripts/copies/remote_test_support.py`
-- `scripts/build_targets/target_config.py`
-- `scripts/mac_test/offload.py`
-- `scripts/mac_test/floor_claims.py`
-- `scripts/mac_test/mac_test.py`
-- `scripts/mac_test/offload_test_support.py`
-- `scripts/mac_test/test_linux_runner.py`
-- `scripts/mac_test/test_offload.py`
-- `scripts/production/mac_run.sh`
-- `scripts/production/tidy_wrapped.py`
-- `scripts/production/test_mac_run.py`
-- `scripts/production/test_retire_unit.py`
-- `scripts/production/test_tidy_wrapped.py`
-- `scripts/direct/verify.sh`
-- `config/copies.conf`
-- `config/build_folders.conf`
-- `docs/as-built/gate-checkouts.md`
-- `docs/as-built/mac-test-offload.md`
+- `scripts/copies/copies.py` — mirror discovery, scan, leases, locks, records and the remote registry.
+- `scripts/mac_test/floor_claims.py` — mirror record and lock paths, and the record reader.
+- `scripts/mac_test/offload.py` — admission, slot capacity reader use, holder session and `remote_rsync` excludes.
+- `scripts/mac_test/mac_test.py`, `scripts/build_targets/target_config.py` — the one slot-capacity reader.
+- `scripts/lint/tmp_sweep.py` — `lsof` status rule and `unreadable_cwd_pids`.
+- `scripts/lib/file_lock.py` — `device_key`, `held_flock_keys`.
+- `scripts/production/mac_run.sh`, `scripts/production/tidy_wrapped.py` — record removal; owner helper use.
+- `scripts/direct/verify.sh` — reads the `hold` tree and checkout lines.
+- `config/copies.conf`, `config/build_folders.conf` — owner row, `copies-index` prefix.
+- `docs/as-built/gate-checkouts.md`, `docs/as-built/mac-test-offload.md`, `docs/as-built/rustdoc-once-and-final-targets.md` — current mirror and checkout facts.
+- `scripts/copies/copies_test_support.py`, `scripts/mac_test/offload_test_support.py` (`mirror_use_payload(case, argv)`) — test support.
+- `scripts/copies/test_copies.py`, `test_remote_copies.py`, `test_review_remote_copies.py`, `remote_test_support.py`; `scripts/mac_test/test_linux_runner.py`, `test_offload.py`, `test_offload_cleanup.py`, `test_offload_forward.py`, `test_target_slots.py`; `scripts/production/test_mac_run.py`, `test_retire_unit.py`, `test_tidy_wrapped.py` — tests.
 
-**Workers:** 1 integration writer across copies and its callers. A separate test lane starts after the API settles, on the test files above. It writes the new tests from this Work Order alone.
+**Gotchas:** `lsof` exit 1 means no match, and any status above 1 is an unavailable scan. `copies.py` imports `tmp_sweep` inside its two scanner functions, with the top-level import under `TYPE_CHECKING` only.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Work Order does not ask for.
-- Phase 35: the lock order stays. No sweep starts while a process holds an admission or claim lock.
-- `lint/sweep.py` stays under the builds file freeze.
-- Phase 36: `verify.sh` `run()` wraps `run_step` and releases each token it takes when the step ends. Phases 29 and 37: a tree-writing step stays on natedev and records `natedev_only`.
-- verify help: a `verify.sh` header edit keeps the `# Usage:` and `# Help <command>:` blocks and the doc gate sentence.
-
-**Acceptance gate:**
-- `test_review_remote_copies.py` keeps its cancellation, sweep-discovery, replacement, failed-admission, empty-owner and surviving-child cases, with no assertion change.
-- The self-lease, sibling-lease and live-claim tests pass through the new lock read.
-- Staged-only content, unchanged source index, kept mtimes, recovery and pass-record tests pass (`test_verify_doc_checkout.py`, `test_verify_doc_recovery.py`). The gate-owner regression passes.
-- New tests: `alpha_unit` keeps its owner spelling and stays inside owner removal; a successful clone cleanup removes both records and a failed one keeps both; a probe of a marked mirror starts no remote Python; a bad slot value gives `ConfigError` in admission.
-- The `scripts/copies` and `scripts/mac_test` suites, `test_mac_run.py`, `test_retire_unit.py`, `test_tidy_wrapped.py`, `lint/test_sweep.py` and the `test_verify_doc*` suites pass. basedpyright 0/0/0 on the changed Python files and their callers.
-- Merge gate `--tests-only` green on a tree merged with origin/builds.
+**Ruled out:** moving the `mac_run.sh` shell lease to the `hold` coproc (`flock` waits and `remote_lease` refuses at once, so it adds a refusal); moving `.remote-mirrors` out of the pool (it splits lease exclusion for a process that holds the old inode).
 
 ### Phase 36 — A verify call never waits on its own cargo token · status: done
 
