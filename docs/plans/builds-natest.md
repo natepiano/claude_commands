@@ -979,30 +979,12 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 43 — `direct/test_verify_token_renew.py` runs in half its time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_verify_token_renew.py` (rank 8 in `test_times top` at 151 s median, 59.6 CPU s, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:** Follow the Speed method. Ranks 1 and 5 are excluded. Ranks 2, 3, 4, 6, 7 are floors whose CPU has not risen; rank 7 is the Phase 40 floor.
-1. Profile before any edit. Its wall time is 2.5 times its CPU, so name each real wait and what is only host load.
-2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
-3. A cut in a production file or a support file goes to the director first, with the measured gain.
-4. Keep every test name and assertion. Add no guard, refusal or check that this Work Order does not name (user rule, 2026-11-05).
-
-**Files:**
-- `scripts/direct/test_verify_token_renew.py` — the module
-
-**Workers:** 1 writer on slot `impl` (one module; the file does not split; slot `test` holds the Phase 36 repair)
-- `impl` — all files above, role impl
-
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_verify_token_renew.py'` green, with the same test names and assertions
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the full test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+- `scripts/direct/test_verify_token_renew.py` runs in half its time, with every test name and assertion kept. Same-load pair medians: 145.84 s to 73.76 s wall, 57.93 to 53.42 CPU s.
+- The module waits for the first expired second, not for fixed seconds after it. A short `TOKEN_GUARD_ATTEMPTS` and `TOKEN_GUARD_DELAY_MS` config makes `test_busy_board_guard_does_not_stop_memory_wait_renewal` reach status 2 in milliseconds.
+- The remaining CPU is 11 real `invoke_verify` calls. Step-record starts are 225 and 19.96 process s; admission and release commands are 44 and 25.17 process s. The showrunner routed these starts to the verify unit and the queue unit.
+- Phase 50 owns the write watch and the one inotify binding (Phase 43 F005, F006).
 
 ### Phase 44 — `copies.py` does less Git work  · status: todo
 **Depends on:** none
@@ -1090,7 +1072,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 5. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
-- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_admission_protocol.py` — item 1 (owner: queue unit)
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/test_admission_protocol.py`, `scripts/lint/test_memory_admit.py` — item 1 (owner: queue unit)
 - `scripts/lib/suite_runners.py` — new file
 - `scripts/build_hold/hold_enforcer.py`, `scripts/build_queue/scope_activity.py`, `scripts/build_queue/admission_code.py`, `scripts/hooks/pre-tool-use-build-hold-guard.py` — item 2
 - `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — item 4, only after the hold ends
@@ -1173,8 +1155,8 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `scripts/direct/verify_mac_offload_test_support.py`
 - `scripts/direct/test_verify_hold_events.py` — the open-writer test
 
-**Workers:** 1 writer on slot `test` (one wait, used by every file; slot `impl` holds Phase 48)
-- `test` — all files above
+**Workers:** 1 writer on slot `impl4` (one wait, used by every file; slots `impl`, `impl3` and `test` hold other phases)
+- `impl4` — all files above
 
 **Constraints from prior phases:**
 - Phase 43: the shared mask has no `IN_MODIFY`, so a file that a live writer keeps open sends no event until its last close.
