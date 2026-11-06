@@ -547,7 +547,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
         unknown = herdr.UnknownConversation("source (conversation unreadable)")
         target = herdr.NewTab("w1", self.owner.name)
         prepared = herdr.PreparedAgentEnvironment(self.source, {})
-        with (mock.patch.object(herdr, "read_conversation", return_value=unknown),
+        with (mock.patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+                  "codex1", self.home / ".codex1")),
+              mock.patch.object(herdr, "read_conversation", return_value=unknown),
               mock.patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", self.owner.current_session])),
               mock.patch.object(client, "saved_row_tab", return_value=target),
               mock.patch.object(client, "panes", return_value=[]),
@@ -568,7 +570,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
                                           "workspace_id": "w1", "label": self.owner.name}]
         unknown = herdr.UnknownConversation("source (conversation unreadable)")
         before = file_versions(self.records)
-        with (mock.patch.object(herdr, "read_conversation", return_value=unknown),
+        with (mock.patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+                  "codex1", self.home / ".codex1")),
+              mock.patch.object(herdr, "read_conversation", return_value=unknown),
               mock.patch.object(restart, "session_launch", return_value=("codex", {}, ["resume", self.owner.current_session])),
               mock.patch.object(client, "saved_row_tab", return_value=herdr.ExistingPane("w1:p1", "")),
               mock.patch.object(client, "panes", return_value=panes),
