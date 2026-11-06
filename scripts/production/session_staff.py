@@ -542,6 +542,13 @@ class ByName:
 
 
 @dataclass(frozen=True)
+class UnitExclusion:
+    """Match an exclusion within the supplied production members."""
+
+    value: str
+
+
+@dataclass(frozen=True)
 class RequiredParent:
     row: staff.StaffRow
 
@@ -584,7 +591,7 @@ class NoSuchMember:
 
 
 def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
-                reference: StoredReference | LiveSession | ByName = BY_NAME, *,
+                reference: StoredReference | LiveSession | ByName | UnitExclusion = BY_NAME, *,
                 parent: RequiredParent | AnyParent = ANY_PARENT) -> MemberFound | NoSuchMember:
     """One id-first join; production requests also require their current parent."""
     if isinstance(reference, StoredReference):
@@ -593,6 +600,14 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
     elif isinstance(reference, LiveSession):
         row = record.by_current_session(reference.id)
         matches = [row] if row is not None and row.kind == "unit" else []
+    elif isinstance(reference, UnitExclusion):
+        units = record.find(kind="unit")
+        matches = [row for row in units if str(row.id) == reference.value]
+        if not matches:
+            matches = [row for row in units if row.name == reference.value]
+        if not matches:
+            unit_owner = cast(Callable[[str], str], import_module("scripts.copies.copies").unit_owner)
+            matches = [row for row in units if unit_owner(row.name) == reference.value]
     else:
         matches = [row for row in record.find(kind="unit") if row.name == unit_names.name(selector.unit)]
     if isinstance(selector, UnitMember):
@@ -600,6 +615,17 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
     if len(matches) > 1:
         raise staff.StaffUnreadable(f"{selector.unit}: no unique staff entry")
     return MemberFound(matches[0]) if matches else NoSuchMember(selector)
+
+
+def excluded_unit_ids(members: tuple[staff.StaffRow, ...], values: Iterable[str]) -> set[staff.StaffId]:
+    """Resolve exclusions within the supplied production members."""
+    record = staff.StaffSnapshot(members)
+    excluded: set[staff.StaffId] = set()
+    for value in values:
+        match = unit_match(ObservedUnit(value), record, UnitExclusion(value))
+        if isinstance(match, MemberFound):
+            excluded.add(match.row.id)
+    return excluded
 
 
 @dataclass(frozen=True)
