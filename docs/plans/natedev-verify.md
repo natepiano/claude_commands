@@ -912,78 +912,34 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 38 — Publish a step state without starting Python · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Source:** natest, approved by builds 2026-11-05 (next item "Reuse the step-record state"). Design from builds, 2026-11-05: Bash never edits the JSON record. Bash writes a plain state word to one sibling file, and readers join the two.
-
-**Goal:** a `verify.sh` call starts `step_record.py` only for its first record write. Every state publication, tree-writing steps included, and the record removal run in Bash. `step_record.py` stays the only code that knows the record schema.
-
-**Spec:**
-
-1. **State file.** `<call id>.state` sits beside `<call id>.json` in the record directory. It holds one line: a state word, then a space and a target when the state has one (`on_ssh aws`). `step_record.state_path(call_id)` owns the name. Readers glob `*.json`, so they do not see this file.
-2. **Report flag.** `step_record.py write --report` replaces `--clock-offset`. It prints three lines: the wall minus monotonic offset in microseconds, the record path and the state file path.
-3. **Saved values.** `initialize_step_record` (`verify.sh:1952`) reads those three lines. It keeps `VERIFY_MONOTONIC_OFFSET_US`, `STEP_RECORD_PATH`, `STEP_STATE_PATH` and `STEP_RECORD_TEXT`, the bytes of the record read just after the write. The JSON record does not change after this write.
-4. **Publish.** A new `publish_step_state <word> [target]` does these steps, in Bash, with no interpreter:
-   1. Compare the bytes of the record at `STEP_RECORD_PATH` with `STEP_RECORD_TEXT`, with `cmp -s`. A Bash text read drops NUL bytes, so it cannot make this comparison.
-   2. Refuse when the bytes differ or the record is missing. The refusal prints `step record: cannot update step record: <reason>; step refused` to stderr and returns 2. A missing, damaged or rewritten record refuses, the same as the Python read check today. This replaces that check and is not a new one.
-   3. Write the line to `.step-<state file name>-$RANDOM` in the record directory, then `mv` it over `STEP_STATE_PATH`. The step subshell also publishes, so a parent cannot know its temporary name, and the name is not fixed because both can publish during an interrupt.
-5. **Callers.** `step_state` (`verify.sh:412`) calls `publish_step_state`, followed by `|| exit 2`. The `on_ssh` call at `verify.sh:1719` becomes `step_state on_ssh "$selected_target"`. The interrupt path at `verify.sh:3478` calls `publish_step_state waiting_hold || true`. `remove_step_record` (`verify.sh:417`) runs `rm -f --` on `STEP_RECORD_PATH`, `STEP_STATE_PATH` and every temporary file of this call, in that order, and keeps its `|| true`.
-6. **Tree-writing steps.** The word `writes_tree` replaces the two Python writes. While a tree-writing step runs, `step_state <state>` writes `writes_tree <state>`, so the step keeps its real state. `run_step` (`verify.sh:495`) publishes `writes_tree local_noncompiling`, and `run()` (`verify.sh:476`) publishes `local_noncompiling` after the step. `STEP_RECORD_ARGS` goes when it has no other use. Phase 37's binding stays: the step reads as `natedev_only` for its whole lifetime, and the call's decision comes back before the next read-only step. `hold_enforcer.py:228` stops a step only when its state is `on_natedev`, so a tree-writing compile must read `on_natedev`.
-7. **Join.** `step_record.read` is the one join point. All production readers go through it (`mac_idle.py`, `hold_enforcer.py`, `aws_target.py`, `build_targets.py`, `copy_watch.py`). It opens the state file before it reads the JSON and keeps it open through the join, because cleanup removes the JSON first. A reader that finds the JSON and no state file then knows that no publication has happened. After it parses the JSON and before it decodes the row, it joins these values:
-   - No state file: the row stays as it is.
-   - `state` is the word. `selected_target` is the target when given, `mac` for `on_mac`, `natedev` for `on_natedev`, and empty for other words. `updated` is the file's modification time in UTC, read from the open file.
-   - `writes_tree <state>` gives `runs_on` `{"kind": "natedev_only", "reason": "step writes the tree"}`, and joins `<state>` by the rules above.
-   - An unknown word gives `UnreadableRecord`, through the existing path.
-   The joined row goes through `validated_fields` as it does today. The cost is one open and one read per record, with no new import.
-8. **Dead code.** Delete the `state` and `remove` CLI verbs, and `read_fields`, `state_fields`, `state` and `remove`, from `step_record.py`, because no production caller stays. A test fixture that used them writes the state file or calls `write` with a changed record, or unlinks `record_path(call_id)`. `start`, `write` and `stopped` keep their current behavior.
-9. **Durability.** The Bash write has no fsync. The record lives only as long as its call. After a crash, its pid is dead and the readers already ignore it as stale.
-
-**Invariants:** `verify.sh` output, exit codes, cache records and build-log records stay the same for every verb. `python_starts` counts in existing tests only go down. Add no other guard, refusal or check.
-
-**Test changes approved:**
-
-- Delete the `test_step_record_cli.py` tests that only drive the `state` or `remove` verbs. The new real-path tests below hold their behavior. Name each deleted test in the summary.
-- `test_verify_tree_cancel_lint.py:83` has a `python3` stand-in that waits on `step_record.py state`. Change that setup so the test still interrupts at the same point. Its assertions stay.
-- A test that reads a step's state, target, `updated` or run location straight from the JSON file reads it through `step_record.read` instead. The expected values stay. Name each such test in the summary.
-- `test_step_record.py::test_dead_or_reused_process_is_stale_and_excluded`: delete the `steps.state` refusal assertion, because item 8 deletes `state`. `merge16` deletes it. The stale read and `live_records` assertions stay. Real-path test 4 holds the refusal for a record that another pid rewrote.
-- `test_verify_step_routes.py::test_unreadable_record_refuses_before_local_or_mac_compile` keeps every assertion.
-- `test_mac_idle.py::test_tree_writing_lint_wait_is_local_and_next_judgment_counts_again` extracts `publish_step_state` with the other functions, sets the saved values, and keeps the state file with each record snapshot. Its assertions stay.
-- `test_verify_ssh_targets_results.py::test_interruption_preserves_queue_age_and_records_local_state_before_compilation` reads its local step through `step_record.read`. Its expected values stay.
-- `verify_lint_scope_test_support.py::isolate_path_without_taplo` adds `cmp` to its tool list, because publication now runs `cmp`. Its assertions stay.
-
-**Tests.** New file `scripts/direct/test_verify_step_state.py`. Each test runs the real `verify.sh` with its usual fixture and a run-time tempdir:
-
-1. A call with no tree-writing step starts `step_record.py` for `start` and `write` only.
-2. Two tree-writing steps in one call start no more `step_record.py` processes. During each step, `step_record.read` returns `natedev_only`. After each step, it returns the call's own decision.
-3. Each published state reads back through `step_record.read` as a valid record, with `pinned_target`, `eligible_targets`, `mac_targets` and `package` unchanged, and the right `selected_target` for `on_mac`, `on_ssh` and `on_natedev`. Reuse a fixture from `test_verify_step_routes*.py`, and add no copy of a case those files already pin.
-4. A record that is removed, rewritten by another pid, or changed by one added NUL byte makes the next state publication exit 2 with `step refused`, before the step runs.
-5. The removal at call end leaves no record, no state file and no `.step-*` file. This includes a TERM while a publication holds its temporary file.
-
-Direct tests of the join in `scripts/direct/test_step_record.py`: no state file, a word, a word with a target, `writes_tree`, an unknown word, `updated` from the file time, and both files removed after the JSON read.
-
-**Acceptance:**
-
-- Observation: `step_record.py` starts and CPU seconds in `VERIFY_PY_TRACE` rows, with `scripts/test_times/module_run.py`, for `direct/test_verify_token_renew.py` and `direct/test_verify_lint_cache_versions.py`. The director runs the same script on the tree before and after this phase.
-- Comparison: natest's method gave 225 starts and 19.96 process s, and 486 starts and 23.1 CPU s. The trace before and after numbers go in the notice, with one line for the user on the build cost change.
-- Real path: `scripts/direct/test_verify_step_state.py`, and every existing verify test group.
+- `verify.sh` starts `step_record.py` only for `start` and its first `write --report`. Every state publication, tree-writing steps included, and the record removal run in Bash. The JSON record does not change after that write, and `step_record.py` is the only code that knows its schema.
+- `<call id>.state` sits beside `<call id>.json` and holds one line: a state word, and a target when the state has one (`on_ssh aws`), or `writes_tree <state>` during a tree-writing step. `step_record.state_path(call_id)` owns the name.
+- `publish_step_state <word> [target]` compares the record bytes with `STEP_RECORD_TEXT` through `cmp -s`. It refuses with `step record: cannot update step record: record missing or changed; step refused` and exit 2. It then writes `.step-<state file name>-$RANDOM` and moves that file over the state file.
+- `remove_step_record` removes the record, the state file and every `.step-<state file name>-*` file, in that order.
+- `step_record.read` is the one join point. It opens the state file before the JSON read and keeps it open through the join. No file means no publication. `updated` is the file's modification time. `writes_tree <state>` gives `runs_on` `natedev_only` and joins `<state>` by the normal rules. An unknown word gives `UnreadableRecord`.
+- `step_record.py write --report` prints the offset, the record path and the state file path. The `state` and `remove` verbs, `--clock-offset`, `STEP_RECORD_ARGS`, `read_fields` and `state_fields` do not exist.
+- Measured `step_record.py` cost: starts 255 to 26 and CPU 12.88 to 1.25 s on `test_verify_token_renew.py`; starts 486 to 58 and CPU 24.09 to 3.08 s on `test_verify_lint_cache_versions.py`.
 
 **Files:**
-- `scripts/direct/verify.sh` — `publish_step_state`, its callers and the saved values.
-- `scripts/direct/step_record.py` — `state_path`, `--report`, the join in `read`, deleted verbs and functions.
-- `scripts/direct/test_verify_step_state.py` — new real-path tests.
-- `scripts/direct/test_step_record.py`, `scripts/direct/test_step_record_cli.py`, `scripts/direct/test_verify_tree_cancel_lint.py` — the join tests, `--report`, the deleted verbs and the test setup.
-- `scripts/buildlog/test_mac_idle.py`, `scripts/aws_target/test_control.py` — fixtures that called `state` or `remove`.
+- `scripts/direct/verify.sh` — `publish_step_state`, `step_state`, `remove_step_record`, the saved values.
+- `scripts/direct/step_record.py` — `state_path`, `--report`, the join in `read`.
+- `scripts/direct/test_verify_step_state.py` — real-path publication, refusal, read-back and cleanup tests.
+- `scripts/direct/test_step_record.py`, `scripts/direct/test_step_record_cli.py`, `scripts/direct/test_verify_tree_cancel_lint.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/aws_target/test_control.py`, `scripts/direct/test_verify_ssh_targets_results.py`, `scripts/direct/verify_lint_scope_test_support.py` — join tests and fixtures.
 - `docs/as-built/build-memory-admission.md` — how a step state is published and read.
 
-**Workers:** 1 writer + 1 tester
-- `fix16` (test, first): every test file above, and any other test that reads the record JSON directly for these fields.
-- `merge16` (impl, after the tests): `scripts/direct/verify.sh`, `scripts/direct/step_record.py`, `docs/as-built/build-memory-admission.md`.
+**Binds later work:** a test reads a step's state, target, `updated` or run location through `step_record.read`, never from the JSON file. A fixture that hides tools names `cmp` in its tool list.
 
-**State:** the step record under `VERIFY_STEPS_DIR`, same schema, written once; a new `<call id>.state` file beside it, removed with it.
+**Gotchas:**
+- A Bash text read drops NUL bytes, so the record comparison uses `cmp`.
+- `run_once` publishes in the step subshell, so a parent and a child can both publish during an interrupt. The temporary name is therefore not fixed, and cleanup removes it with a glob.
+- `hold_enforcer.py:228` stops a step only when its state is `on_natedev`, so a tree-writing compile keeps its real state through `writes_tree <state>`.
+- The Bash write has no fsync. After a crash the pid is dead and readers ignore the record as stale.
 
-**Verification:** every test module that names `step_record` or `verify.sh`, through `scripts/test_times/module_run.py`; `basedpyright` on each changed Python file; `bash -n scripts/direct/verify.sh` and `shellcheck scripts/direct/verify.sh`; the merge gate before the checkpoint.
+**Ruled out:**
+- Editing the JSON record in Bash: a state file keeps the schema in `step_record.py` alone.
+- A check that a state file left by an old call overrides a new record: each record write gets a new call id.
 
 ### Phase 39 — The first lint judgment's repair decision has one callable home · status: todo
 
