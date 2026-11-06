@@ -23,10 +23,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
-from scripts.herdr import worker_panes
-
-import herdr
-import pane_launch
+from scripts.herdr import herdr, pane_launch, worker_panes
 
 
 @final

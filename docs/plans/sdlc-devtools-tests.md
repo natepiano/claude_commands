@@ -1114,17 +1114,17 @@ Source: the user through sdlc [3e19fcc0]: "yes delete the title-reading code and
 
 **Acceptance gate:** `git grep merge_branch_history` finds nothing, and no code outside tests reads a unit or phase from a merge commit subject; a fixture whose merge subjects carry no unit name gives the same answers; suites of changed folders pass, then the full merge gate; source net negative.
 
-### Phase 8e — Importing staff costs less  · status: todo
+### Phase 8e — Importing staff costs less  · status: done (455aa383e)
 
 Source: sdlc [209c11a3]. Importing `scripts.production.staff` takes 38.9 ms of a 92.6 ms status line refresh. Cut the cost inside `staff.py`. Do not add a second light reader: that is a copy.
 
 **Depends on:** Phase 8a
 
-**Acceptance gate:** the median of five `python3 -P -X importtime` runs shows a lower total for `scripts.production.staff` than before, with the sources of the remainder named; no commands or behavior change; suites of changed folders pass, then the full merge gate.
+**As built:** `staff.py` defers each import that only some paths use into its functions; `_Arguments` stays with the command line. The same-load median fell from 29.4 ms to 18.9 ms. The remainder is `dataclasses` with `inspect` and the module's own code. No command or behavior changed.
 
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
-Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Reduced by the Phase 3t architect review (2026-11-05): the store migrations already shipped (`change_review.py:1118`, `phase_table.py:1939`, `board_json.py:462`), with tests for interruption, reruns and ownership changes, and proposal readers already resolve staff ids. Store 3 (saved tab titles) is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files and removes each store's rewriter there.
+Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Reduced by the Phase 3t architect review (2026-11-05): the store migration code already shipped (`change_review.py:1118`, `phase_table.py:1939`, `board_json.py:462`), with tests for interruption, reruns and ownership changes, and proposal readers already resolve staff ids. Store 3 (saved tab titles) is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files and removes each store's rewriter there.
 
 **Depends on:** 3t, 3u, 3v (records stage of the rename track).
 
@@ -1136,7 +1136,7 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Red
 1. **Remaining consumers.** For each store, search `grep -rn '<store path or key>' scripts commands ~/.codex/skills/generated-from-claude` and switch each reader that still takes a name to the staff id from the row. Keep `change_routing.owner` current-parent routing (`change_routing.py:157-182`) and reviewed change-review rows byte for byte.
 2. **Unit-board reader.** Already shipped: `mods/unit-board/hooks/data.ts:84` reads the generator's staff-id paths, and `mods/unit-board/tests/register.test.ts:24` covers a production rename. Confirm the deployed plugin and cite it in the notice. Change no source unless the search in item 1 finds a path built from a production name; that change goes to the unit-board owner.
 3. **Shared-folder regression.** One test holds proposal and question records in one proposals folder. It checks proposal ownership and the `/showrunner:questions` table after a rename and after a transfer. Question records keep their contents, timestamps, `production_id` and `asked_by` byte for byte.
-4. **Deployment evidence.** Phase 3t deleted `migrate_proposals.py`; sdlc ran it from `c6e9f5555` on 2026-11-05. Its output on natedev and the Mac, and a live read of each store, are the migration proof. This phase runs no migration.
+4. **Deployment evidence.** Phase 3t deleted `migrate_proposals.py`; sdlc ran it from `c6e9f5555` on 2026-11-05. Its output on natedev and the Mac, and a live read of each store, are the migration proof for proposals. A live read on 2026-11-06 found open change review rows that still hold names (hana 190, natedev 32), so `change_routing._staff_owner` keeps its `by_id` condition and `migrate_owners` stays. The deploy runs `change_review.py migrate-owners --write` after the 7u programs, and a final read must show staff ids in all open rows on each machine. A follow-up then deletes the `by_id` condition and `migrate_owners`. The phase code runs no migration.
 5. Delete more than you add. Add no guards.
 
 **Files:**
@@ -1148,7 +1148,7 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Red
 - `impl` — the non-test files.
 - `test` — the tests and the shared-folder regression.
 
-**State:** none; the store migrations already ran.
+**State:** none in code. Open change review rows convert at deploy (Spec item 4).
 
 **Constraints from prior phases:** keep the Phase 3s resolver. Phase 4p resolves relative question folders through `update_registration.question_folder`. Unreadable ownership is not confirmed absence. Staff rows hold canonical unit names from `unit_names.name`. Add no store registry, identity alias or live-rekey journal. Read-only consumers report the bad row and keep the other rows.
 

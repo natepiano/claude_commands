@@ -1331,7 +1331,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    remote_check = "./scripts/lib/py -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
               f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "

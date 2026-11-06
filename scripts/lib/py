@@ -17,31 +17,9 @@ for part in "${shim_parts[@]}"; do
 done
 root="${shim%/*/*/*}"
 
-# Inline programs import from this install before inherited Python paths.
-option_value=0
-for argument in "$@"; do
-    if (( option_value )); then
-        option_value=0
-        continue
-    fi
-    case "$argument" in
-        -|-c*|-m*)
-            export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
-            set -- -P "$@"
-            break ;;
-        -W|-X|--check-hash-based-pycs) option_value=1 ;;
-        --) break ;;
-        -*) ;;
-        *) break ;;
-    esac
-done
-
 NEED_MAJOR=3
 NEED_MINOR=12
 
-shim="${BASH_SOURCE[0]}"
-[[ "$shim" == /* ]] || shim="$PWD/$shim"
-root="${shim%/*/*/*}"
 isolated=0
 if [[ "${1:-}" == --isolated ]]; then
     isolated=1
@@ -53,7 +31,7 @@ for argument in "$@"; do
     if [[ "$skip_argument" == 1 ]]; then skip_argument=0; continue; fi
     if [[ "$options" == 1 ]]; then
         case "$argument" in
-            -c*|-m*|-) break ;;
+            -c*|-m*|-) set -- -P "$@"; break ;;
             -W|-X|--check-hash-based-pycs) skip_argument=1; continue ;;
             --) options=0; continue ;;
             -*) continue ;;

@@ -14,24 +14,18 @@ from typing import override
 from unittest.mock import patch
 
 
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 from scripts.production import live_units
 from scripts.production import showrunners
-import unit_lookup
+from scripts.production import unit_lookup
 from scripts.herdr.herdr import HerdrPlace
-import unit_phases
-import style_units
+from scripts.production import unit_phases
+from scripts.production import style_units
 from scripts.style import style_ledger
-import display_cells
+from scripts.production import display_cells
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id
 
-# Importable once unit_phases has put scripts/direct on the path.
-import phase_table
+from scripts.direct import phase_table
 from scripts.direct import plan_history
 
 

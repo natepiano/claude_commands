@@ -5,7 +5,7 @@ Use it to find each place to change in a staff migration. The spec is `docs/plan
 
 The check in `scripts/production/test_staff_accessors.py` fails when this table omits an accessor. Before a migration, run the check and add each file it names.
 
-Updated from the combined branch on 2026-11-05. The table excludes Python test modules.
+Updated from the combined branch on 2026-11-06. The table excludes Python test modules.
 `staff.py` owns reads and writes.
 On natedev, each Python accessor reads `staff.json` in its own process.
 On the Mac, `staff.py` asks natedev over SSH.
@@ -91,9 +91,9 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
 | `scripts/production/merge_checkpoint_test_support.py` | write | native_id, update_current_session |
 | `scripts/production/merge_gate.py` | read | staff.json path |
-| `scripts/production/merge_gate_test_support.py` | read | LiveDoc |
+| `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
-| `scripts/production/production_doc.py` | read | StaffSnapshot, LiveDoc, WrappedDoc |
+| `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
@@ -166,15 +166,15 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/usage/outcomes.py` | read | snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
-| `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/command_inputs.rs` | read | staff.json (Rust, direct) |
+| `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-153 accessors: 30 write, 122 read, 1 owner.
+153 accessors: 31 write, 121 read, 1 owner.
 
 ## Approved copies
 
 | Copy | Writer | Reader | Approved |
 |---|---|---|---|
-| `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/command_inputs.rs`) | the user, 2026-11-04 |
+| `~/.local/state/staff/staff.json` on the Mac, read-only | `staff.py` on natedev, after each write (atomic rename) | cargo-handler on the Mac (`census/hierarchy.rs`) | the user, 2026-11-04 |
 
 No other copy of the staff facts is allowed without the user's approval. Remake this list before any staff migration.
 
