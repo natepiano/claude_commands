@@ -936,7 +936,6 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 
 ### Phase 44 — `copies.py` does less Git work  · status: todo
 **Depends on:** none
-**Blocked by:** verify P35 on GitHub builds — it moves every copy maker onto `copies.py`; the showrunner says when.
 
 #### Work Order
 
@@ -1136,7 +1135,6 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 
 ### Phase 55 — The assign launcher tests use half their CPU  · status: todo
 **Depends on:** Phase 54
-**Blocked by:** models a0b90e899 and herdr 14a on main; the showrunner sends the word. Do not merge the sdlc branch.
 
 #### Work Order
 
@@ -1293,40 +1291,25 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 ### Phase 61 — Two large verify test files test logic by direct calls  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** the user via the showrunner, 2026-11-06: natest does the test work. Remaining `test_verify*` files go first, largest CPU first, one bumped checkpoint per batch.
+`test_verify_mac_only.py` and `test_verify_lint_cache_versions.py` check their argument, routing, selection and result logic through direct calls of the real functions. They keep the real `verify.sh` runs that prove what no direct call can. Each moved check was proved by a broken step on a tempdir copy.
 
-**Goal:** `test_verify_mac_only.py` and `test_verify_lint_cache_versions.py` use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept. The director split this phase on 2026-11-06, from the measure. The four SSH files move to Phase 66, because their CPU did not fall. `test_verify_lint_judgment.py` and the 38 parser cases move to Phase 67, because they need functions that verify moves.
-
-**Spec:** Follow the Speed method, direct calls first.
-1. Each file gets a behavior map with one row per assertion: the test that checks it after the phase, and whether that test is a direct call or an end-to-end run.
-2. Move argument, routing, selection and result checks onto direct calls of the Bash functions in `verify.sh` and the Python functions they use. Use `scripts/lib/shell_test_support.py` for Bash functions.
-3. A file is finished when each real `verify.sh` run left in it proves something that no direct call can prove.
-4. Put no copy of a fixture in a test file. The SSH writer owns `verify_ssh_targets_test_support.py`. The Mac and lint fixtures are shared with 40 or more files and verify's batch may hold them: send the director a wanted change and its measured gain.
-5. A cut in `verify.sh` or another production file goes to the director with the measured gain. The director sends it to verify.
-6. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+| File | CPU s before, after | Processes before, after | Wall s before, after |
+| --- | --- | --- | --- |
+| `test_verify_mac_only.py` | 180.0, 107.4 | 6,665, 4,820 | 214.3, 127.6 |
+| `test_verify_lint_cache_versions.py` | 87.7, 44.6 | 6,079, 3,379 | 141.0, 72.9 |
 
 **Files:**
-- `scripts/direct/test_verify_mac_only.py` — 186.0 CPU s, 17 tests
-- `scripts/direct/test_verify_lint_cache_versions.py` — 83.6 CPU s, 7 tests
+- `scripts/direct/test_verify_mac_only.py` — `mac_result()` holds the direct call form for result functions
+- `scripts/direct/test_verify_lint_cache_versions.py` — the harness form for lint functions
 
-**Workers:** 2 writers; each family has its own fixture
-- `impl` — `test_verify_mac_only.py`, role impl
-- `test` — `test_verify_lint_cache_versions.py`, opens as impl
+**Binds later work:** a process count does not rank CPU. Add up CPU by command before a move. The four SSH files lost 52% of their processes and no CPU, because they keep real Python target commands and one live admission server per test (Phase 66). The 38 parser cases of `test_verify_mac_only.py` and the 28 real starts of `test_verify_lint_judgment.py` wait for verify's two function moves (Phase 67).
 
-**Constraints from prior phases:**
-- Phase 42: `test_verify_mac_only.py` went from 183.67 to 150.76 CPU s through light imports in `mac_idle.py`; do not repeat that cut.
-- Phase 56: the SSH fixture holds one read-write descriptor for its event wait. Its fixed waits are gone, so CPU there is process starts and imports through `build_hold.py`.
-- Phase 31: lint judgment cost is real lint scripts under `verify.sh`. Its 198.6 s wall floor does not hold it back.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:** a measure run started with `&` has SIGINT ignored, so a SIGINT test goes red there. Measure with `env --default-signal=INT`.
 
-**Acceptance gate:**
-- The behavior map has a row for each assertion of each file, and no row lacks a test. A reviewer reads the old assertions against the map.
-- For each moved check, breaking the function fails the new test, shown on a tempdir copy.
-- CPU s, processes, execs and wall s before and after for each file, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed files and every importer of a changed fixture pass. No full suite: this batch is bumped, so it runs lint and the tests of the changed files only (showrunner, 2026-11-06).
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`.
+**Ruled out:** moving the SSH cases in this phase with no CPU gain. The worktree keeps that first step for Phase 66, which keeps a move only if it cuts CPU or another proof needs it.
+
 
 ### Phase 62 — A test runner ends each process its tests leave  · status: done
 **Depends on:** none
@@ -1356,7 +1339,6 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 
 ### Phase 63 — Three verify test files stop failing at random  · status: todo
 **Depends on:** none
-**Blocked by:** verify's batch checkpoint; verify sends the hash. Two of these files can depend on fixtures that batch changes.
 
 #### Work Order
 
@@ -1365,10 +1347,10 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 **Goal:** each of the three tests has one cause named and removed, or a measured reason that the failure is not in the test.
 
 **Spec:**
-1. Get each failing log from queue-unit. Quote the failing line and the source line before any fix.
-2. `test_verify_token_mac_step.py`, `test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready`: gates 460168a30, 14f4644ef, and once at load 59 on 11-05.
-3. `test_verify_mac_copy_ownership.py`: gate 735747766.
-4. `test_verify_example_edits.py`: gate aa0e60d56.
+1. No failure log exists: the gate prints the failure to its caller's shell, and its record keeps only the failed test name (queue-unit, 2026-11-06). Reproduce each failure at the load of its gate. Quote the failing line and the source line before any fix.
+2. `test_verify_token_mac_step.py`, `test_a_foreign_mac_block_keeps_lint_in_the_memory_wait_until_natedev_is_ready`: gates 460168a30 (record natedev-20261106T162938-718feb) and 14f4644ef (record natedev-20261106T162943-34348c), one minute apart under load, and once at load 59 on 11-05.
+3. `test_verify_mac_copy_ownership.py`, `test_a_stopped_call_leaves_no_step_or_copy_running`: gate 735747766 (record natedev-20261106T133609-c0e02e).
+4. `test_verify_example_edits.py`, `test_edit_during_the_test_run_records_no_pass`: gate aa0e60d56 (record natedev-20261106T154319-4912ce). The first run of that gate, natedev-20261106T140052-6ac435, passed this module.
 5. A flaky file's fixed wait goes first. Move what you can onto direct calls, under the Speed method, because each moved check also leaves the race.
 6. A cut in `verify.sh` or another production file goes to verify. Add no guard, refusal or check (user rule, 2026-11-05).
 
@@ -1401,19 +1383,20 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 
 **Spec:**
 1. `module_run.py` adds `cpu_s` to each test row in its output: the change in own plus reaped-children CPU across the test.
-2. A class or module fixture row, which `result.fixtures` names, carries its own `cpu_s` in the same way. Setup cost stays visible, apart from the tests.
-3. `module_cost.py` gets `--tests N`. It reads the rows of its time run through `TEST_TIMES_OUT`, and prints the N rows with the most CPU after the module table.
+2. `module_run.py:90-98` records a fixture row only when a fixture fails or skips, so a successful `setUpClass` or module fixture has no row. Add timing boundaries for fixtures, with a type that tells a fixture measure from a test measure. Each fixture row carries its own `cpu_s`. Keep `testsRun`, `tests_s` and the existing error outcomes as they are.
+3. `module_cost.py:74` starts `unittest discover`, so its time run writes no `TEST_TIMES_OUT` report and skips the end step of Phase 62. Run both of its runs through `module_run.py`. Each process count then rises by the supervisor, so state one new baseline. `--tests N` reads the rows of the time run, and prints the N rows with the most CPU after the module table.
 4. The build log store and `show.py` do not change. A kept history of per-test CPU is a later proposal, when a reader needs it.
-5. Add no guard, refusal or check (user rule, 2026-11-05).
+5. `coverage_overlap.py:245` reads the three-value tuples from `timed_outcomes()`, and its collector uses `TimedResult`. Keep that API. The new types stay in the runner's output.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
-- `scripts/test_times/module_run.py` — the `cpu_s` field
+- `scripts/test_times/module_run.py` — the `cpu_s` field and the fixture boundaries
 - `scripts/test_times/test_module_run.py` — the case
 - `scripts/test_times/module_cost.py` — `--tests`
 - `scripts/test_times/test_module_cost.py` — the case
 - `commands/test_times.md` — the option
 
-**Workers:** 1 writer on slot `impl3` (one small field and its one reader)
+**Workers:** 1 writer on slot `impl3` (one runner and its one reader)
 - `impl3` — all files above, role impl
 
 **Constraints from prior phases:**
@@ -1423,7 +1406,8 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 **Acceptance gate:**
 - A real tempdir module with one test that starts a CPU-heavy child and one that does not: the first test has more `cpu_s`, and `--tests` lists it first. `test_module_cost.py` names this case.
 - A fixture row with a CPU-heavy `setUpClass` shows that cost in its own row. `test_module_run.py` names this case.
-- Module `wall_s`, `cpu_s` and test status do not change meaning. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
+- `module_cost.py` on a real tempdir module with a detached child: the end step of Phase 62 ends the child, and the module status stays. `test_module_cost.py` names this case.
+- Module `wall_s`, `cpu_s` and test status do not change meaning. `test_coverage_overlap.py` passes. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
 
 ### Phase 65 — The first test time list after a gap appears in under a second  · status: todo
 **Depends on:** Phase 60
@@ -1487,7 +1471,7 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 **Spec:**
 1. The worktree holds this work's first step, uncommitted: 22 cases moved to `route()`, real launcher starts 32 to 7, a behavior map at `phases/61/slots/impl4/behavior_map.md` and a mutation proof. The F001 fix is in the tree: `verify_ssh_targets_test_support.py` uses `${EPOCHREALTIME:-$(date +%s)}`, the form of `verify.sh:1169`.
 2. Measure where the CPU goes, before any other edit. Report CPU by command across the module, from `strace -f` rusage or an equal count, and CPU for each test. Name the share of Python starts by script, Bash, the admission server thread in the test process, and `setUp`.
-3. Suspects: `caller_admission` serves one real admission server for each test, in the test process, with a `running_pass_seconds=0.25` pass. The real target commands import through `build_hold.py`. `refresh_inventory` writes the ledger for two targets in each test.
+3. Suspects: `caller_admission` serves one real admission server for each test, in the test process, with a `running_pass_seconds=0.25` pass. The real target commands import through `build_hold.py`. `refresh_inventory` writes the ledger for two targets in each test. `VerifyMacOffloadFixture.setUp()` starts admission for every test, and that server's loop calls `run_once(0.01)` through each test. The inherited cleanup scans `/proc/*/environ`.
 4. The director picks the cut from step 2 and writes it here. A move stays only if it cuts CPU, or another proof of the same behavior needs it. A move that gains nothing and loses an end-to-end path goes back.
 5. Report why `test_verify_ssh_targets_results.py` went red in both measured runs: `test_linux_loss_keeps_the_attempt_and_queue_age_after_local_success` and `test_interruption_preserves_queue_age_and_records_local_state_before_compilation` after, `test_sigterm_runner_output_preserves_the_sender_interruption_result` and `test_interruption_from_another_generation_remains_an_unconfirmed_loss` before. Those runs had SIGINT ignored. Prove or refute that with a run that has SIGINT at its default.
 6. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
@@ -1499,6 +1483,7 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 - `scripts/direct/test_verify_ssh_targets_retained.py`
 - `scripts/direct/verify_ssh_targets_test_support.py` — the SSH fixture
 - `scripts/build_queue/admission_test_support.py` — only if step 4 names it; owner queue-unit
+- `scripts/direct/verify_mac_offload_test_support.py` — only if step 4 names it; the parent fixture of more than 40 files
 
 **Workers:** 1 writer on slot `impl4` (one fixture and its four files)
 - `impl4` — all files above, role impl
@@ -1506,7 +1491,8 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 **Constraints from prior phases:**
 - Phase 56: the SSH fixture holds one read-write descriptor for its event wait.
 - Phase 61: a process count does not rank CPU. A Python start through `build_hold.py` costs far more than a Bash start.
-- Verify's `verify_mac_offload_test_support.py` is held until builds merges a36296ed2. Do not edit it.
+- Verify's batch a36296ed2 is on builds. `verify_mac_offload_test_support.py` now has `call_mac_functions`, a direct call of the real result and retry functions. Use one change to the parent fixture, and make no copy.
+- Builds changed three of these files, so the edit turn starts from the merged tree.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
@@ -1545,4 +1531,5 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 **Acceptance gate:**
 - The behavior map has a row for each assertion. For each moved check, breaking the function fails the new test, shown on a tempdir copy.
 - CPU s, processes, execs and wall s before and after, from `module_cost.py` and same-load pairs, in the checkpoint notice.
-- The changed files pass. `basedpyright` on them prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
+- The changed files pass. When `VerifyLintJudgmentFixture` or its constants change, these also pass: `test_verify_lint_cache.py`, `test_verify_lint_cache_fix_limit.py`, `test_verify_lint_fix_failures.py`, `test_verify_lint_fix_limit.py`, `test_verify_lint_fixes.py` and `test_verify_token_renew.py`.
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.

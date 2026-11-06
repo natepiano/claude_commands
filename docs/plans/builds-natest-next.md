@@ -8,10 +8,10 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 
 1. Phase 65, now: the first test time list after a gap.
 2. Phase 66, now: the four SSH target files, 204 CPU s, where direct calls did not cut CPU. Measure CPU by command first. Phase 67, after verify's two function moves: lint judgment and the parser cases, 231 CPU s.
-3. Phase 63, after verify's batch hash: three flaky verify files. Phase 64: `module_cost.py` names the tests with the most CPU.
-4. Further `test_verify*` batches, largest CPU first, after verify sends its files. Each batch is one phase with one bumped checkpoint. Verify's cost doc lists the rest; its list has 122 files.
-5. Phase 55: the assign launcher group, 344 CPU s, beside the batches when models reaches builds.
-6. Phase 44: `copies.py` Git work and `style/test_crate_run.py`, 68.5 CPU s, on the showrunner's word.
+3. Phase 63, now: three flaky verify files. Phase 64, now: `module_cost.py` names the tests with the most CPU.
+4. Further `test_verify*` batches follow CPU rank. Measure command, admission-thread, setup and cleanup CPU before direct moves, because the Mac, lint, doc, token, hold and cancellation groups share a fixture that starts admission. Group ownership by shared fixture. Each batch has one phase and one bumped checkpoint. Verify's cost doc lists the rest; its list has 122 files.
+5. Phase 55, now: the assign launcher group, 344 CPU s.
+6. Phase 44, now: `copies.py` Git work and `style/test_crate_run.py`, 68.5 CPU s.
 7. Phase 59: `style/test_style_proposals.py`, 60.8 CPU s.
 8. New phases by rank: `production/test_add_unit.py` 59.8, `production/test_fast_track.py` 55.1, `production/test_staff.py` 53.7, `style/test_add_style.py` 51.0.
 
