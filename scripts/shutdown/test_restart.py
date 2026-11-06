@@ -983,7 +983,8 @@ class RestartTests(ShutdownTestCase):
                 records = [record for record in records if record["sessionId"] != self.rows[0].current_session]
                 orphan = next(record for record in records if record["sessionId"] == "orphan")
                 orphan.update(name="unassigned", cwd="/tmp/orphan")
-                def codex_conversations() -> herdr.CodexConversations:
+                def codex_conversations(*, wanted: str = "") -> herdr.CodexConversations:
+                    _ = wanted
                     identities: dict[str, tuple[int, ...]] = {"orphan": (456,), "codex-orphan": (789,)}
                     if self.rows[0].current_session in self.running:
                         identities[str(self.rows[0].current_session)] = (123,)

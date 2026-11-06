@@ -37,7 +37,7 @@ _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 
 from scripts.whoami import account  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
-from scripts.lib import atomic_file, conf, unit_runs  # noqa: E402
+from scripts.lib import atomic_file, conf, unit_runs, models_registry  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
@@ -1510,7 +1510,7 @@ def _exec_codex_account(label: str, arguments: list[str], *, account_config: con
     environment["CODEX_HOME"] = str(target.home)
     try:
         program = resolve_program("codex", environment=environment)
-        os.execvpe(program, [program, *arguments], environment)
+        os.execvpe(program, [program, *arguments], models_registry.agent_environment(environment))
     except OSError as error:
         raise AccountsError(f"accounts: could not start codex: {error}") from error
 
@@ -1625,9 +1625,9 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
         program = resolve_program("claude", environment=environment)
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(str(SCRIPTS / "lib" / "py"), [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
-                                      "run", "--", program, *arguments], environment)
+                                      "run", "--", program, *arguments], models_registry.agent_environment(environment))
         else:
-            os.execvpe(program, [program, *arguments], environment)
+            os.execvpe(program, [program, *arguments], models_registry.agent_environment(environment))
     except OSError as error:
         raise AccountsError(f"accounts: could not start claude: {error}") from error
 
@@ -2690,7 +2690,7 @@ class SessionBatchMove(Protocol):
     def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
     """Stop and resume each selected local owner through the shared move API."""
 
     account_config = read_account_settings(account_config)
@@ -2702,7 +2702,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
     if isinstance(checked, MoveRefused):
         return tuple(SessionMoveRefused(identity, checked.reason) for identity in ids)
-    live = inventory.listing()
+    live = inventory.listing() if live is None else live
     selected = list(dict.fromkeys(ids))
     refused: dict[str, SessionMoveRefused] = {}
     eligible: list[str] = []
@@ -2988,7 +2988,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         if not matches:
             if dry_run:
                 return MoveDryRun(session, (f"{session}: would resume on {target} if its saved tab is local",))
-            results = move_sessions((session,), target, why=why or "finish account move", account_config=account_config)
+            results = move_sessions((session,), target, why=why or "finish account move", live=live, account_config=account_config)
             stdout, stderr, code = _move_output(results, ())
             outcome = MoveStartFailed if code else MoveStarted
             return outcome(session, target, stdout, stderr, code)
@@ -3005,7 +3005,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         reason = why or f"{session_account_label(owner)} is out of usage"
         if dry_run:
             return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, target), *return_notice))
-        results = move_sessions((owner.session_id,), target, why=reason, account_config=account_config)
+        results = move_sessions((owner.session_id,), target, why=reason, live=live, account_config=account_config)
         stdout, stderr, code = _move_output(results, checked.notices)
         stdout += "".join(line + "\n" for line in return_notice)
         outcome = MoveStartFailed if code else MoveStarted

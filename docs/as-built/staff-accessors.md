@@ -5,12 +5,43 @@ Use it to find each place to change in a staff migration. The spec is `docs/plan
 
 The check in `scripts/production/test_staff_accessors.py` fails when this table omits an accessor. Before a migration, run the check and add each file it names.
 
-Updated from the combined branch on 2026-11-06. The table excludes Python test modules.
+The table excludes Python test modules.
 `staff.py` owns reads and writes.
 On natedev, each Python accessor reads `staff.json` in its own process.
 On the Mac, `staff.py` asks natedev over SSH.
 
-Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, retire_pending, set_doc, set_worktree, update_current_session.
+## Staff identity and backends
+
+`StaffRow` holds `id`, `kind`, `name`, `parent`, `current_session`, `worktree`, and `doc`.
+The fixed `id` identifies a member across session changes.
+`parent` is `ReportsTo(id)` or `StaffRoot`.
+`current_session` holds the native Claude session ID or Codex thread ID.
+
+`StaffSnapshot` derives backend evidence from session records, transcripts, and live processes.
+`ClaudeBackend.family` is `claude`.
+`CodexBackend.family` is `codex`; its `codex_home` names the serving account.
+`BackendUnavailable` names unavailable backend evidence.
+A live Claude session can supply backend evidence before its transcript exists.
+Staff storage uses schema 2.
+`staff_sources.live` emits observations with schema 3.
+`WorkerObservation.identity` is `ClaudeSession`, `CodexThread`, or `BackendUnavailable`.
+
+Run records identify workers through fixed staff references.
+The [worker lifecycle](long-lived-workers.md#roster-fields) defines their stored fields.
+Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) publishes the current runtime.
+
+`set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
+The comparison includes the machine and path when present.
+A row lock protects one member during a worker change.
+`staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
+It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
+Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
+Each wait uses the smaller configured limit or remaining operation deadline.
+
+## Accessor table
+
+The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, and `retire_pending`.
+They also include `set_doc`, `set_worktree`, and `update_current_session`.
 
 | File | Access | `staff` calls |
 |---|---|---|

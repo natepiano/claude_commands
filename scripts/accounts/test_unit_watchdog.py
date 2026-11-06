@@ -405,7 +405,7 @@ class UnitWatchdogTests(unittest.TestCase):
             with (patch.object(stop_resume, "_start_session", side_effect=start),
                   patch.object(herdr.Herdr, "retitle", return_value=False) as retitle,
                   patch.object(staff, "initial_snapshot", return_value=record),
-                  patch.object(stop_resume, "_detach"), patch("scripts.lib.unit_runs.held", return_value=[]),
+                  patch.object(stop_resume, "_detach"),
                   patch.object(herdr, "heal_claude_trust", return_value=herdr.Trusted(
                       Path(cast(str, owner["cwd"])), config / ".claude.json", Path(cast(str, owner["cwd"]))))):
                 result = self.shared_resume("alpha", why="maintenance complete")

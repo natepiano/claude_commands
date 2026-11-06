@@ -2028,6 +2028,17 @@ class PaneBoardTests(StaffTestCase):
         self.assertEqual([(row["slot"], row["state"]) for row in rows], [("reader", "paused")])
         self.assertFalse((run / "worker_transport").exists())
 
+    def test_mesh_worker_rows_keep_full_names_beside_short_slots(self) -> None:
+        write_text_atomic(self.staff_file, '{"schema": 2, "rows": []}')
+        run = self.root / "named-run"
+        run.mkdir()
+        name = "unit-full-review"
+        write_text_atomic(run / "worker_transport", "mesh\n")
+        write_text_atomic(run / "mesh_roster.json", json.dumps({
+            name: {"slot": "review", "status": "running", "task": "direct.review"}}))
+        rows = board_json.workers(run, set())
+        self.assertEqual([(row["name"], row["slot"], row["role"]) for row in rows], [(name, "review", "review")])
+
     def test_unreachable_owner_gives_a_problem_worker(self) -> None:
         run = self.pane_run()[0]
         error = io.StringIO()

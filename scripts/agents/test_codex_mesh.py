@@ -22,9 +22,9 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import SignalPidGuard, install_signal_pid_guard
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
-from scripts.lib import names
+from scripts.lib import models_registry, names
 from scripts.lib.test_names import fixture_names
 
 from scripts.whoami.note_file import note_name
@@ -460,8 +460,8 @@ class FixtureModelDefaults:
     resolver. No second registry parser or model-selection rule lives here.
     """
 
-    def __init__(self, resolve: Callable[[argparse.Namespace], tuple[str, str]]) -> None:
-        self.resolve: Callable[[argparse.Namespace], tuple[str, str]] = resolve
+    def __init__(self, resolve: Callable[[argparse.Namespace, models_registry.LaunchModelConfiguration], tuple[str, str]]) -> None:
+        self.resolve: Callable[[argparse.Namespace, models_registry.LaunchModelConfiguration], tuple[str, str]] = resolve
         self.environment: dict[str, str] = self.resolver_environment()
         self.files: dict[Path, tuple[int, bytes]] = {
             Path(os.environ[key]): (Path(os.environ[key]).stat().st_mtime_ns, Path(os.environ[key]).read_bytes())
@@ -483,12 +483,12 @@ class FixtureModelDefaults:
         return all(path.is_file() and (path.stat().st_mtime_ns, path.read_bytes()) == value
                    for path, value in self.files.items())
 
-    def __call__(self, args: argparse.Namespace) -> tuple[str, str]:
+    def __call__(self, args: argparse.Namespace, configuration: models_registry.LaunchModelConfiguration) -> tuple[str, str]:
         if getattr(args, "model", "") not in ("", "gpt-test") or not self.unchanged():
-            return self.resolve(args)
+            return self.resolve(args, configuration)
         key = tuple(str(getattr(args, name, "")) for name in ("role", "task", "model", "effort"))
         if key not in self.defaults:
-            value = self.resolve(args)
+            value = self.resolve(args, configuration)
             if self.unchanged():
                 self.defaults[key] = value
             return value
@@ -598,11 +598,15 @@ def setUpModule() -> None:
         "MODELS_CONFIG_FILE": str(Path(home.name) / "models.conf"),
         "CODEX_CATALOG_SYNC_STATE_FILE": str(Path(home.name) / "catalog-sync"),
         "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
+        "CODEX_MODELS_CACHE_FILE": str(Path(home.name) / "models_cache.json"),
         "CODEX_PACER_TIER_FILE": str(Path(home.name) / "pacer-tier"),
     }
     for path in tier_files.values():
         _ = Path(path).write_text("", encoding="utf-8")
     _ = write_registry(Path(tier_files["MODELS_CONFIG_FILE"]))
+    for path in tier_files.values():
+        os.utime(path, (1, 1))
+    os.utime(tier_files["CODEX_CATALOG_SYNC_STATE_FILE"], (2, 2))
     for key, value in tier_files.items():
         unittest.addModuleCleanup(set_environment(key, value))
     # The complete shared fixture costs seconds to validate in Bash. Reuse
@@ -611,8 +615,8 @@ def setUpModule() -> None:
     baseline = FixtureModelDefaults(codex_mesh._turn_model_effort)  # pyright: ignore[reportPrivateUsage]
 
     @functools.wraps(codex_mesh._turn_model_effort)  # pyright: ignore[reportPrivateUsage]
-    def baseline_defaults(args: argparse.Namespace) -> tuple[str, str]:
-        return baseline(args)
+    def baseline_defaults(args: argparse.Namespace, configuration: models_registry.LaunchModelConfiguration) -> tuple[str, str]:
+        return baseline(args, configuration)
 
     defaults = patch.object(codex_mesh, "_turn_model_effort", baseline_defaults)
     _ = defaults.start()
@@ -927,26 +931,28 @@ class FixtureModelDefaultsTests(unittest.TestCase):
             with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
                 resolve = MagicMock(return_value=("gpt-test", "high"))
                 defaults = FixtureModelDefaults(resolve)
+                configuration = models_registry.launch_configuration({})
                 args = argparse.Namespace(role="impl", task="", model="gpt-test", effort="high")
-                self.assertEqual(defaults(args), ("gpt-test", "high"))
-                self.assertEqual(defaults(args), ("gpt-test", "high"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
                 self.assertEqual(resolve.call_count, 1)
                 _ = write_registry(registry, {"direct.codex": {"impl": "gpt-test:max"}}, update=True)
                 resolve.return_value = ("gpt-test", "max")
-                self.assertEqual(defaults(args), ("gpt-test", "max"))
-                self.assertEqual(defaults(args), ("gpt-test", "max"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "max"))
+                self.assertEqual(defaults(args, configuration), ("gpt-test", "max"))
                 self.assertEqual(resolve.call_count, 3, "changed registries must resolve on every turn")
 
     def test_custom_registry_and_subprocess_faults_bypass_baseline_reuse(self) -> None:
         resolve = MagicMock(return_value=("gpt-test", "high"))
         defaults = FixtureModelDefaults(resolve)
+        configuration = models_registry.launch_configuration({})
         args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
-        self.assertEqual(defaults(args), ("gpt-test", "high"))
+        self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
         with patch.dict(os.environ, {"MODELS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
-            self.assertEqual(defaults(args), ("gpt-test", "high"))
-            self.assertEqual(defaults(args), ("gpt-test", "high"))
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
         with patch.object(subprocess, "run"):
-            self.assertEqual(defaults(args), ("gpt-test", "high"))
+            self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
         self.assertEqual(resolve.call_count, 4)
 
 
@@ -1729,7 +1735,7 @@ class MeshCommandFixture(unittest.TestCase):
         return [request for request in self.server.requests if request.get("method") == method]
 
     def run_worker(self, args: argparse.Namespace, port: int, *, started_here: bool = False) -> codex_mesh.RunOutcome:
-        allowed = worker_admission.admit(cast(str, args.name), self.session_dir, role=cast(str, args.role))
+        allowed = worker_admission.admit(cast(str, args.name), self.session_dir)
         return codex_mesh._run_worker(args, port, staff_admission=allowed, started_here=started_here)  # pyright: ignore[reportPrivateUsage]
 
     def run_start(self) -> tuple[int, str]:
@@ -2070,13 +2076,15 @@ class StaffAdmissionTests(MeshCommandFixture):
         source, evidence = transcript_fixture(old, staff.ClaudeBackend())
         stopped: list[str] = []
 
-        def stop(reference: str) -> stop_resume.Stopped:
+        def stop(reference: str, kind: str = "") -> stop_resume.Stopped:
+            self.assertEqual(kind, "claude")
             stopped.append(reference)
             self.assertEqual(staff.by_id(old.id), old)
             return stop_resume.Stopped(old.current_session, 987654)
 
         with patch.object(stop_resume, "stop", side_effect=stop):
-            result = codex_mesh.open_unit_worker(str(self.session_dir), old.name, "impl")
+            result = codex_mesh.open_unit_worker(str(self.session_dir), old.name, "impl",
+                configuration=models_registry.launch_configuration(os.environ))
         current = staff.by_id(old.id)
         assert current is not None
         self.assertEqual((current.id, current.name, current.parent), (old.id, old.name, old.parent))
@@ -2127,9 +2135,32 @@ class StaffAdmissionTests(MeshCommandFixture):
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(len(self.methods("turn/start")), 1)
 
+    def test_same_family_retry_delivers_the_saved_extract_without_creating_a_second_thread(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        allowed = worker_admission.admit("worker", self.session_dir)
+        assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
+        row = allowed.slot.row
+        prompt = self.session_dir / "prompt.txt"
+        _ = prompt.write_text("Continue the interrupted switch.\n")
+        extract = worker_admission.handoff_path(self.session_dir, row)
+        _ = extract.write_text(f"{worker_admission.HANDOFF_SOURCE_PREFIX}{self.session_dir / 'source.jsonl'}\nKeep the source work.\n")
+        worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt),
+                                         worker_admission.SwitchState.CREATION_INTENT_RECORDED)
+        self.server.requests.clear()
+        self.assertEqual(self.run_start(), (0, ""))
+        self.assertEqual(self.methods("thread/start"), [])
+        turns = self.methods("turn/start")
+        self.assertEqual(len(turns), 1)
+        params = cast(dict[str, object], turns[0]["params"])
+        self.assertEqual(params["threadId"], row.current_session)
+        opening = json.dumps(params["input"])
+        self.assertLess(opening.index(str(extract)), opening.index(prompt.read_text().strip()))
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state,
+                         worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
     def test_interrupted_dispatch_uses_delivery_evidence_before_submission(self) -> None:
         self.assertEqual(self.run_start(), (0, ""))
-        allowed = worker_admission.admit("worker", self.session_dir, role="impl")
+        allowed = worker_admission.admit("worker", self.session_dir)
         request = worker_admission.assignment_id(self.session_dir / "prompt.txt")
         self.assertTrue(request)
         worker_admission.record_dispatch(allowed, request, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
@@ -2138,7 +2169,7 @@ class StaffAdmissionTests(MeshCommandFixture):
                 _ = self.run_start()
         evidence.assert_called_once()
         self.assertEqual(len(self.methods("turn/start")), 1)
-        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
 
 
     def test_the_worker_row_is_available_while_its_codex_turn_runs(self) -> None:
@@ -2209,7 +2240,7 @@ class StaffAdmissionTests(MeshCommandFixture):
             self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
             self.assertEqual(loaded, {sibling})
             self.assertEqual(staff.by_id(old.id), old)
-            self.assertTrue(worker_admission.dispatch_record(allowed).assignment_id)
+            self.assertTrue(worker_admission.dispatch_record(allowed.run, allowed.name).assignment_id)
             starts.append(identity)
             if len(starts) == 1:
                 raise OSError("destination creation failed after source release")
@@ -2222,14 +2253,14 @@ class StaffAdmissionTests(MeshCommandFixture):
             observed.append(published.row)
             return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
 
-        allowed = worker_admission.admit(old.name, self.session_dir, role="impl")
+        allowed = worker_admission.admit(old.name, self.session_dir)
         with patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)):
             with self.assertRaisesRegex(OSError, "destination creation failed after source release"):
                 _ = worker_admission.switch_worker(allowed, "claude", start=start,
                     dispatch=dispatch, cleanup=lambda native: self.fail("uncreated destination was discarded: " + native))
             self.assertEqual(staff.by_id(old.id), old)
             self.assertEqual(observed, [])
-            allowed = worker_admission.admit(old.name, self.session_dir, role="impl", reference=old.id)
+            allowed = worker_admission.admit(old.name, self.session_dir, reference=old.id)
             result = worker_admission.switch_worker(allowed, "claude", start=start,
                 dispatch=dispatch, cleanup=lambda native: self.fail("published destination was discarded: " + native))
         self.assertEqual(observed, [result.row])
@@ -2251,7 +2282,9 @@ class StaffAdmissionTests(MeshCommandFixture):
             ("mixed retained records", {"previous_servers": [stopped, {}]}, True, stop_results.SourceReleaseUnknown),
             ("missing current pid", {"port": 9, "previous_servers": [stopped]}, True, stop_results.SourceReleaseUnknown),
             ("stopped retained servers", {"previous_servers": [stopped]}, True, stop_results.SourceReleased),
-            ("missing server file", None, True, stop_results.SourceUnresolved),
+            ("missing server file", None, True, stop_results.SourceReleased),
+            ("empty server list", {"previous_servers": []}, True, stop_results.SourceReleased),
+            ("missing server file, unrelated row", None, False, stop_results.SourceUnresolved),
         )
         for label, evidence, identified, expected in cases:
             with self.subTest(evidence=label):
@@ -2275,10 +2308,9 @@ class StaffAdmissionTests(MeshCommandFixture):
         from scripts.shutdown import stop_resume
 
         old = self.codex_switch_source()
-        allowed = worker_admission.admit(old.name, self.session_dir, role="impl")
+        allowed = worker_admission.admit(old.name, self.session_dir)
         server = self.session_dir / codex_mesh.SERVER_FILE
-        for reason, change in (("stop is unresolved", lambda: server.unlink()),
-                               ("worker state unreadable", lambda: server.write_text("{unknown server state"))):
+        for reason, change in (("worker state unreadable", lambda: server.write_text("{unknown server state")),):
             with self.subTest(reason=reason):
                 _ = change()
                 before = Path(os.environ["STAFF_FILE"]).read_bytes(), self.worker_record()
@@ -2291,6 +2323,60 @@ class StaffAdmissionTests(MeshCommandFixture):
                 self.assertEqual((Path(os.environ["STAFF_FILE"]).read_bytes(), self.worker_record()), before)
                 self.assertEqual(self.methods("thread/unsubscribe"), [])
                 self.assertEqual(self.methods("turn/start"), [])
+
+    def test_switch_without_a_source_server_record_publishes_and_dispatches_the_destination(self) -> None:
+        from scripts.production.staff_test_support import fixture_session
+        from scripts.shutdown import stop_resume
+
+        old = self.codex_switch_source()
+        allowed = worker_admission.admit(old.name, self.session_dir)
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        identity = fixture_runtime_id("Claude after source server stop")
+        dispatched: list[staff.StaffRow] = []
+
+        def start(handoff: worker_admission.FamilyHandoff) -> str:
+            self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
+            self.assertEqual(staff.by_id(old.id), old)
+            fixture_session(identity, staff.ClaudeBackend())
+            return identity
+
+        def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
+            self.assertEqual(staff.by_id(old.id), published.row)
+            dispatched.append(published.row)
+            return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
+
+        with patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(old.current_session)):
+            result = worker_admission.switch_worker(allowed, "claude", start=start, dispatch=dispatch,
+                cleanup=lambda native: self.fail("published destination was discarded: " + native))
+        self.assertEqual(result.row, dataclasses.replace(old, current_session=staff.StaffId(identity)))
+        self.assertEqual(dispatched, [result.row])
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+        self.assertEqual(self.methods("thread/unsubscribe"), [])
+
+    def test_idle_stop_preserves_a_live_retained_server_for_source_release(self) -> None:
+        old = self.codex_switch_source()
+        retained = StubAppServer(self.respond)
+        self.addCleanup(retained.close)
+        self.retain_server(retained.port)
+        expected = codex_mesh.run_server_records(self.session_dir)[0]
+        age = codex_mesh.SERVER_IDLE_SECS + 60
+        stale = time.time() - age
+        for name in codex_mesh.SWEEP_ACTIVITY_FILES:
+            path = self.session_dir / name
+            if path.exists():
+                os.utime(path, (stale, stale))
+        stop_unused = cast(Callable[[tuple[Path, ...], int, int], bool], getattr(codex_mesh, "_stop_unused_with_lock_held"))
+        with (patch.object(codex_mesh, "_running_servers", return_value=[
+                (os.getpid(), self.server.port, age), (os.getpid(), retained.port, age)]),
+              patch.object(codex_mesh, "_client_counts", return_value={}),
+              patch.object(codex_mesh, "_reap", return_value=True) as reap):
+            self.assertTrue(stop_unused((self.session_dir.parent,), os.getpid(), self.server.port))
+        reap.assert_called_once_with(os.getpid(), deadline=worker_lifecycle.NO_LOCK_DEADLINE)
+        self.assertEqual(codex_mesh.run_server_records(self.session_dir), [expected])
+        self.failing_method = "thread/loaded/list"
+        result = codex_mesh.stop_worker_for_switch(old, (self.session_dir,))
+        self.assertIsInstance(result, stop_results.SourceReleaseUnknown)
+        self.assertIn("thread/loaded/list", [request.get("method") for request in retained.requests])
 
     def test_start_uses_staff_worktree_instead_of_caller_or_saved_shell_folder(self) -> None:
         parent = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
@@ -2376,7 +2462,8 @@ class StaffAdmissionTests(MeshCommandFixture):
             return respond(request)
 
         self.server.respond = check
-        _ = codex_mesh.open_unit_worker(str(self.session_dir), "test", "test")
+        _ = codex_mesh.open_unit_worker(str(self.session_dir), "test", "test",
+            configuration=models_registry.launch_configuration(os.environ))
         self.assertEqual(observed, [])
         published = staff.by_id(staff.StaffId(THREAD_ID))
         assert published is not None
@@ -5351,7 +5438,10 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         registry_file = self.session_dir / "models.conf"
         config_file = self.session_dir / "codex.toml"
         _ = write_registry(registry_file, registry)
+        os.utime(registry_file, (1, 1))
         _ = config_file.write_text(config, encoding="utf-8")
+        os.utime(config_file, (1, 1))
+        os.utime(os.environ["CODEX_CATALOG_SYNC_STATE_FILE"], (2, 2))
         return {"MODELS_CONFIG_FILE": str(registry_file), "CODEX_CONFIG_FILE": str(config_file),
                 "CODEX_PACER_TIER_FILE": str(self.session_dir / "pacer-tier")}
 
@@ -5361,7 +5451,11 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 function, row = task.split(".")
                 environment = self.tier_environment(
                     {"delegate.options": {"codex_service_tier": "flex"},
+                     f"{function}.codex": {row: "gpt-test:high"},
+                     "direct.codex": {"review": "gpt-test:high"},
+                     "codex.agents": {"gpt-next": "low"},
                      f"{function}.options": {f"codex_service_tier.{row}": "fast"}})
+                probe = RegistryReadProbe(self.session_dir, Path(environment["MODELS_CONFIG_FILE"]))
                 self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
                 self.server.requests.clear()
                 read = codex_mesh.Client.next_frame
@@ -5379,10 +5473,14 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                                 message="Run finished: fixture build passed", message_file="")), 0)
                         _ = write_registry(Path(environment["MODELS_CONFIG_FILE"]),
                             {"delegate.options": {"codex_service_tier": "flex"},
+                             f"{function}.codex": {row: "gpt-next:low"},
+                             "direct.codex": {"review": "gpt-next:low"},
+                             "codex.agents": {"gpt-next": "low"},
                              f"{function}.options": {f"codex_service_tier.{row}": "default"}})
                     return frame
 
-                with patch.dict(os.environ, environment), patch.object(codex_mesh.Client, "next_frame", wake):
+                with probe.active({**os.environ, **environment}), \
+                        patch.object(codex_mesh.Client, "next_frame", wake):
                     if follow:
                         code, _output, errors = self.run_mesh(
                             self.follow_cli("--task", task, "--service-tier", "fast"))
@@ -5397,6 +5495,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                 self.assertEqual((code, errors), (0, ""))
                 params = [_as_test_dict(start["params"]) for start in self.methods("turn/start")]
                 self.assertEqual([item.get("serviceTier") for item in params], ["fast", "default"])
+                self.assertEqual([(item.get("model"), item.get("effort")) for item in params],
+                                 [("gpt-test", "high"), ("gpt-next", "low")])
+                self.assertEqual(probe.total(), 2, probe.reads())
                 self.assertEqual(self.turn_inputs[-1], "Run finished: fixture build passed")
                 self.assertEqual(self.worker_record().get("task"), task)
 
@@ -6167,6 +6268,18 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(self.worker_record()["status"], "done")
         self.assertEqual(len(self.methods("turn/start")), 2)
 
+    def test_follow_claim_replaces_an_interactive_assignment_with_the_claim_role(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        agents_log.append(THREAD_ID, "interactive", None, datetime.now(timezone.utc))
+        self.assertIsInstance(codex_mesh.task_role(THREAD_ID, codex_mesh.task_assignments()),
+                              codex_mesh.RolelessThread)
+        args = self.start_args()
+        args.to, args.role, args.claim_pid = "worker", "fix", os.getpid()
+        self.assertEqual(codex_mesh.command_can_follow(args), 0)
+        self.assertEqual(codex_mesh.task_role(THREAD_ID, codex_mesh.task_assignments()),
+                         codex_mesh.AssignedWorkerRole("fix"))
+        self.assertEqual(self.worker_record()["launcher_pid"], os.getpid())
+
     def test_resident_start_without_task_role_keeps_the_staff_role(self) -> None:
         args = self.start_args()
         args.role = ""
@@ -6576,10 +6689,41 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(self.methods("thread/compact/start"), [])
         self.assertEqual(self.methods("turn/interrupt"), [])
 
+    def start_with_a_registry_edit_after_the_first_submission(self) -> tuple[int, str]:
+        environment = self.tier_environment({"direct.codex": {"impl": "gpt-first:high"},
+            "codex.agents": {"gpt-first": "high", "gpt-next": "low"},
+            "direct.options": {"codex_service_tier": "fast"}})
+        probe = RegistryReadProbe(self.session_dir, Path(environment["MODELS_CONFIG_FILE"]))
+        original = self.server.respond
+        changed = False
+
+        @bounded_fixture
+        def edit_after_submission(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal changed
+            if request.get("method") == "turn/start" and not changed:
+                changed = True
+                _ = write_registry(Path(environment["MODELS_CONFIG_FILE"]), {
+                    "direct.codex": {"impl": "gpt-next:low"}, "codex.agents": {"gpt-next": "low"},
+                    "direct.options": {"codex_service_tier": "flex"}})
+            return original(request)
+
+        self.server.respond = edit_after_submission
+        with probe.active({**os.environ, **environment}):
+            code, _output, errors = self.run_mesh([
+                "start", "--name", "worker", "--role", "impl", "--task", "direct.impl",
+                "--prompt-file", str(self.session_dir / "prompt.txt"),
+                "--summary-file", str(self.session_dir / "summary.txt"),
+                "--log-file", str(self.session_dir / "worker.log"), "--timeout", "5"])
+        params = [_as_test_dict(item["params"]) for item in self.methods("turn/start")]
+        self.assertEqual([(item.get("model"), item.get("effort"), item.get("serviceTier")) for item in params],
+                         [("gpt-first", "high", "fast"), ("gpt-next", "low", "flex")])
+        self.assertEqual(probe.total(), 2, probe.reads())
+        return code, errors
+
     def test_context_overflow_starts_one_continue_turn_and_posts_once(self) -> None:
         self.outcomes = ["overflow", "completed"]
 
-        code, errors = self.run_start()
+        code, errors = self.start_with_a_registry_edit_after_the_first_submission()
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(
@@ -9322,7 +9466,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
 
     def test_capacity_resumes_its_thread_without_repeating_the_prompt(self) -> None:
         self.outcomes = ["capacity", "completed"]
-        code, errors = self.run_start()
+        code, errors = self.start_with_a_registry_edit_after_the_first_submission()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(len(self.methods("thread/start")), 1)
         starts = self.methods("turn/start")
@@ -13468,7 +13612,7 @@ class GuardedWorkerEndTests(MeshCommandFixture):
             self.assertEqual(self.worker_record()["status"], "ended")
             clock_offset = 0
             code, output, errors = self.run_mesh(["end", "--to", "worker",
-                "--expected-thread-id", THREAD_ID, "--cleanup-only"])
+                "--expected-thread-id", THREAD_ID])
         self.assertEqual(code, 0, output + errors)
         self.assertEqual(self.queued, [])
         self.assertEqual(self.live_turn, "")
@@ -14043,7 +14187,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
 
     def test_opening_a_unit_worker_passes_the_configured_service_tier_to_the_server(self) -> None:
         self.configure_allocation()
-        record = codex_mesh.open_unit_worker(str(self.session_dir), "impl", "impl")
+        record = codex_mesh.open_unit_worker(str(self.session_dir), "impl", "impl", configuration=models_registry.launch_configuration(os.environ))
         self.assertEqual(record["thread_id"], THREAD_ID)
         starts = self.methods("thread/start")
         self.assertEqual(len(starts), 1)
@@ -14092,7 +14236,8 @@ class WorkerAdoptionTests(MeshCommandFixture):
         try:
             reap = MagicMock(return_value=True)
             with self.fixture_reaping(reap), ThreadPoolExecutor(max_workers=2) as executor:
-                creator = executor.submit(codex_mesh.open_unit_worker, str(self.session_dir), "impl", "impl")
+                creator = executor.submit(codex_mesh.open_unit_worker, str(self.session_dir), "impl", "impl",
+                    configuration=models_registry.launch_configuration(os.environ))
                 creator.add_done_callback(lambda completed: creating.set())
                 try:
                     guard.event(creating)
@@ -14130,7 +14275,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         jobs = dict(configured.jobs)
         jobs["code_reviewer"] = ("code checker",)
         with patch.object(names, "runtime_names", return_value=names.Names(jobs, configured.audiences)):
-            record = codex_mesh.open_unit_worker(str(self.session_dir), "repository-review2", "review")
+            record = codex_mesh.open_unit_worker(str(self.session_dir), "repository-review2", "review", configuration=models_registry.launch_configuration(os.environ))
         self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
             "threadId": THREAD_ID, "name": "sdlc · roles · code checker"})
         self.assertEqual(record["role"], "review")
@@ -14179,7 +14324,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         def admit() -> object:
             if adopting:
                 return codex_mesh.adopt_unit_worker(self.session_dir, target, "worker")
-            return codex_mesh.open_unit_worker(str(target), "impl", "impl")
+            return codex_mesh.open_unit_worker(str(target), "impl", "impl", configuration=models_registry.launch_configuration(os.environ))
 
         args = argparse.Namespace(session_dir=str(target), pause=False)
         with (self.fixture_reaping(reap),
@@ -14231,7 +14376,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
                             _ = patches.enter_context(patch.object(
                                 codex_mesh, "_update_roster_if_expected", side_effect=OSError("fixture roster write failed")))
                         with self.assertRaises((SystemExit, unit_workers.WorkerUnavailable, OSError)):
-                            _ = codex_mesh.open_unit_worker(str(self.session_dir), "impl", "impl")
+                            _ = codex_mesh.open_unit_worker(str(self.session_dir), "impl", "impl", configuration=models_registry.launch_configuration(os.environ))
                 finally:
                     self.failing_method = ""
                 releases = self.methods("thread/unsubscribe")
@@ -17605,6 +17750,14 @@ class WorkersHomeTests(unittest.TestCase):
             _ = codex_mesh._start_server(str(self.session_dir), agent_accounts.workers_home())  # pyright: ignore[reportPrivateUsage]
         return cast(dict[str, str], launch.call_args.kwargs["env"])
 
+    def test_app_server_environment_excludes_the_launch_and_editor_configuration(self) -> None:
+        environment = self.started_environment({"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
+            "MODELS_REGISTRY_EDIT_BASE": "editor-generation", "KEEP": "server-value"})
+        self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", environment)
+        self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", environment)
+        self.assertEqual(environment["KEEP"], "server-value")
+        self.assertEqual(environment["CODEX_HOME"], str(self.home / ".codex1"))
+
     def test_a_run_folders_server_names_its_run_whatever_the_caller_carries(self) -> None:
         # implement.sh's claim step can start the server before the launcher exports the run.
         with patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)):
@@ -18812,6 +18965,39 @@ class ServerRecordTests(unittest.TestCase):
 
         self.assertIsNotNone(process.poll())
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_failed_start_after_publication_preserves_the_retained_server_for_source_release(self) -> None:
+        def respond(request: dict[str, object]) -> list[dict[str, object]]:
+            if request.get("method") == "thread/loaded/list":
+                return [{"id": request["id"], "error": {"message": "retained source proof unavailable"}}]
+            return [_reply(request, {})]
+
+        retained = StubAppServer(respond)
+        self.addCleanup(retained.close)
+        replacement = StubAppServer(respond)
+        self.addCleanup(replacement.close)
+        write_server_record(self.session_dir, retained.port, agent_accounts.workers_home())
+        before = codex_mesh.run_server_records(self.session_dir)
+        worker = fixture_worker("worker", staff.StaffId(os.environ["CODEX_THREAD_ID"]),
+            backend=staff.CodexBackend(agent_accounts.workers_home()))
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            worker.name: {"staff_id": worker.id, "status": "done"}}))
+        process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], start_new_session=True)
+        self.spawned.append(process)
+        with (patch.object(codex_mesh, "_free_port", return_value=replacement.port),
+              patch.object(subprocess, "Popen", return_value=process),
+              patch.object(codex_mesh, "_start_watcher", side_effect=OSError("watcher start failed"))):
+            with self.assertRaisesRegex(OSError, "watcher start failed"):
+                start_server = cast(Callable[[str, Path], int], getattr(codex_mesh, "_start_server"))
+                _ = start_server(str(self.session_dir), agent_accounts.workers_home())
+        self.assertIsNotNone(process.poll())
+        self.assertEqual(codex_mesh.run_server_records(self.session_dir), before)
+        result = codex_mesh.stop_worker_for_switch(worker, (self.session_dir,))
+        self.assertIsInstance(result, stop_results.SourceReleaseUnknown)
+        assert isinstance(result, stop_results.SourceReleaseUnknown)
+        self.assertIn("retained source proof unavailable", result.reason)
+        self.assertEqual([request["method"] for request in retained.requests if request.get("method") != "initialize"],
+                         ["thread/loaded/list"])
 
     def watcher(self, pid: int, *, fresh_probes: int = 0) -> tuple[subprocess.Popen[bytes], Path]:
         """Start the real watcher with a stand-in for the Python that would run `idle-stop`."""

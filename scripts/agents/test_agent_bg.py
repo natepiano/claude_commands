@@ -13,10 +13,13 @@ import signal
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib import models_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.lib.process_group import send_process_group
 from scripts.message import sessions
 from scripts.production import staff, worker_admission
+from scripts.usage import agents_log
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.socket_test_support import ShortUnixSocket
@@ -28,6 +31,7 @@ sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 log = Path(os.environ["FIXTURE_BACKEND_LOG"])
 with log.open("a") as output:
     output.write(json.dumps({"arguments": sys.argv[1:], "STAFF_ID": os.environ.get("STAFF_ID", ""),
+        "operation_environment": {key: os.environ[key] for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE") if key in os.environ},
         "row_locks": [key for key in os.environ if key.startswith("STAFF_ROW_FD_")],
         "lock_fds": [str(path.resolve()) for path in (Path("/proc/self/fd").glob("*") if sys.platform == "linux" else ())
                      if "/rows/" in str(path.resolve()) and str(path.resolve()).endswith(".lock")]}) + "\\n")
@@ -59,11 +63,18 @@ SEND = '''import json, os, sys, socket
 from pathlib import Path
 sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production import staff
+from scripts.direct import workers
+from scripts.usage import agents_log
+try:
+    history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+except OSError:
+    history = agents_log.RoleLog({}, ())
 row = staff.by_current_session(os.environ["FIXTURE_NATIVE_ID"])
 if row is None:
     raise SystemExit("opening prompt preceded staff publication")
 prompt = Path(sys.argv[sys.argv.index("--file") + 1]).read_text()
-Path(os.environ["FIXTURE_SENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "row": row.to_json(), "prompt": prompt}))
+Path(os.environ["FIXTURE_SENT"]).write_text(json.dumps({"arguments": sys.argv[1:], "row": row.to_json(), "prompt": prompt,
+    "role": workers._worker_task_role({"staff_id": row.id}, staff.local_snapshot(), history)}))
 if os.environ.get("FIXTURE_GATE"):
     with socket.socket(socket.AF_UNIX) as gate:
         gate.connect(os.environ["FIXTURE_GATE"])
@@ -121,9 +132,11 @@ class NativeClaudeWorkerTests(StaffTestCase):
         record: dict[str, object] = {"pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
                   "sessionId": identity, "name": "fresh-impl", "entrypoint": "cli",
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
+        models = write_registry(self.root / "models.conf")
+        self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
             "CONF_DIR": str(CHECKOUT / "config"),
-            "CLAUDE_BIN": str(backend), "AGENT_BG_ROLE": "impl", "AGENT_BG_DETACH": "1", "AGENT_BG_SEND_SCRIPT": str(sender),
+            "CLAUDE_BIN": str(backend), "AGENT_BG_DETACH": "1", "AGENT_BG_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),
             "FIXTURE_REGISTRY_PATH": str(registry), "FIXTURE_REGISTRY_RECORD": json.dumps(record)}
@@ -151,6 +164,36 @@ class NativeClaudeWorkerTests(StaffTestCase):
 
     def backend_calls(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in self.fixture.backend_log.read_text().splitlines()]
+
+    def test_claude_dispatch_records_the_task_role_before_delivery(self) -> None:
+        for switched in (False, True):
+            with self.subTest(switched=switched):
+                environment = {"AGENT_BG_ROLE": "impl"}
+                if switched:
+                    backend = staff.CodexBackend(self.root / "source-codex")
+                    source = fixture_worker("fresh-impl", self.fixture.unit.id, backend=backend)
+                    _ = transcript_fixture(source, backend)
+                    modules = stopped_worker_module(self.root / "source-stop-modules")
+                    environment.update(CODEX_HOME=str(backend.codex_home),
+                        FIXTURE_STOPPED=str(self.root / "source-stopped.json"),
+                        PYTHONPATH=os.pathsep.join((str(modules), str(CHECKOUT))))
+                result = self.launch(**environment)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
+                self.assertEqual(sent["role"], "impl")
+                history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+                self.assertEqual(history.assignments[self.fixture.identity][-1].role, "impl")
+                row = staff.by_current_session(self.fixture.identity)
+                assert row is not None
+                self.clear_worker(row)
+
+    def test_claude_consultation_without_a_role_preserves_the_assignment_history(self) -> None:
+        result = self.launch(AGENT_BG_ROLE="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        history = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
+        self.assertEqual(history.assignments, {})
+        sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
+        self.assertEqual(sent["prompt"], self.fixture.prompt.read_text())
 
     def test_claude_admission_completes_and_cancels_without_linux_process_files(self) -> None:
         read_text = Path.read_text
@@ -243,13 +286,13 @@ class NativeClaudeWorkerTests(StaffTestCase):
                     self.assertIn("the worker completed the assignment", (self.root / "summary").read_text())
                 self.clear_worker(row)
 
-    def test_fresh_claude_publication_precedes_work_for_each_task_role_and_parent_state(self) -> None:
-        for count, (role, removed) in enumerate((("", False), ("impl", True)), 1):
-            with self.subTest(role=role, removed=removed):
+    def test_fresh_claude_publication_precedes_work_for_each_parent_state(self) -> None:
+        for count, removed in enumerate((False, True), 1):
+            with self.subTest(removed=removed):
                 if removed:
                     _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.work),
                                            expected=self.fixture.unit.worktree)
-                result = self.launch(AGENT_BG_ROLE=role, UNIT_TEAM_ROLE="")
+                result = self.launch(UNIT_TEAM_ROLE="")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 row = staff.by_id(staff.StaffId(self.fixture.identity))
                 assert row is not None
@@ -286,12 +329,19 @@ if sys.argv[1:2] == ["coordinate-claude"]:
         return sessions.RegistryRead((), ()) if read_count <= 2 else read_registry()
     sessions.read_registry = delayed_registry
 ''')
-        result = self.launch(PYTHONPATH=os.pathsep.join((str(fake_modules), str(CHECKOUT))),
-                             FIXTURE_REGISTRY_READS=str(reads), CLAUDE_CODE_CHILD_SESSION="1")
+        environment = models_registry.launch_configuration(os.environ).environment(
+            models_registry.edit_base(os.environ).environment(self.fixture.environment))
+        result = self.launch(**{**environment, "PYTHONPATH": os.pathsep.join((str(fake_modules), str(CHECKOUT))),
+                               "FIXTURE_REGISTRY_READS": str(reads), "CLAUDE_CODE_CHILD_SESSION": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         arguments = cast(list[str], self.backend_calls()[0]["arguments"])
         settings = cast(dict[str, object], json.loads(arguments[arguments.index("--settings") + 1]))
         self.assertNotIn("CLAUDE_CODE_CHILD_SESSION", cast(dict[str, str], settings["env"]))
+        for surface, environment in (("process", self.backend_calls()[0]["operation_environment"]),
+                                     ("settings", settings["env"])):
+            with self.subTest(surface=surface):
+                self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", cast(dict[str, str], environment))
+                self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", cast(dict[str, str], environment))
         self.assertEqual(reads.read_text().splitlines(), ["empty", "empty", "ready"])
         row = staff.by_id(staff.StaffId(self.fixture.identity))
         assert row is not None

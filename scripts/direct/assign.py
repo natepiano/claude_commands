@@ -26,7 +26,7 @@ from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
 from scripts.direct import phase_reservation, progress_history, simplify_daily, workers
-from scripts.direct.worker_state import worker_claim_lock, worker_record_path
+from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_status_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -224,16 +224,17 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
 
 def resolve_model(args: Arguments, role: str, env: dict[str, str]) -> tuple[str, str, str, str]:
     task = f"direct.{role}"
-    result = call(["bash", "-c", '''source "$1"; agents_resolve "$2" || exit 2
+    result = call(["bash", "-c", '''source "$1"; models_launch_configuration || exit 2; agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_MODEL}"
  [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
  [[ -z "$4" ]] || pair="${pair%%:*}:$4"
  _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
-printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"
+printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}" "$MODELS_LAUNCH_CONFIGURATION"
 ''', "assign", str(SCRIPTS / "../agents/models_config.sh"), task, args.model, args.effort], env, capture=True)
-    family, model, effort, tier = result.stdout.strip().splitlines()[-4:]
+    family, model, effort, tier, configuration = result.stdout.strip().splitlines()[-5:]
+    env["MODELS_LAUNCH_CONFIGURATION"] = configuration
     return family, model, effort, tier
 
 
@@ -273,6 +274,7 @@ class Dispatch:
     tier: str
     env: dict[str, str]
     reservation: dict[str, object]
+    switching: staff.StaffRow | None = None
     claim: WorkerClaim | None = None
     pass_open: bool = False
     agent: subprocess.Popen[str] | None = None
@@ -311,7 +313,8 @@ class Dispatch:
                   "--phase-id", self.phase, "--prompt-file", str(self.prompt), "--fix-cause", self.args.fix_cause,
                   "--fix-pass", str(self.args.pass_number if self.role == "fix" else 0), "--activity", shown,
                   "--called-task", f"direct.{self.role}", "--worker-name", self.worker,
-                  "--worker-id", text(read_roster(self.run, self.worker)["staff_id"]), "--called-family", self.family,
+                  "--worker-id", self.switching.id if self.switching else text(read_roster(self.run, self.worker)["staff_id"]),
+                  "--called-family", self.family,
                   "--called-model", self.model, "--called-effort", self.effort or "unset",
                   "--launcher-command", json.dumps(["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])], self.env)
         self.pass_open = True
@@ -424,7 +427,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 claim_path.unlink(missing_ok=True)
             else:
                 refuse(f"{dispatch.worker} is claimed by launcher {pid}")
-        status_path = dispatch.run / f"impl_status_{slot}"
+        status_path = worker_status_path(dispatch.run, slot)
         if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
             launcher = record.get("launcher_pid")
             if isinstance(launcher, int) and launcher > 0:
@@ -548,9 +551,18 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
     return 0 if completed else 2 if code == 2 else 1
 
 
+def image_note(images: list[str]) -> str:
+    """Name each attached image for a worker that cannot receive it as an option."""
+    if not images:
+        return ""
+    return "\nRead these images:\n" + "\n".join(str(Path(image).resolve()) for image in images)
+
+
 def execute(dispatch: Dispatch, paths: list[str]) -> int:
     try:
-        dispatch.claim = claim_worker(dispatch)
+        dispatch.claim = (WorkerClaim(worker_record_path(dispatch.run, dispatch.worker, dispatch.worker), dispatch.worker,
+                                      dispatch.model, dispatch.effort)
+                          if dispatch.switching else claim_worker(dispatch))
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2
     shown = workers.shown_name(dispatch.run, dispatch.worker)
@@ -576,12 +588,15 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
         number = max(numbers, default=0) + 1
         _ = (phase_dir / f"dispatch_{number}_paths.json").write_text(json.dumps(
             {"worker": dispatch.worker, "round": number, "paths": paths}) + "\n")
+    assignment = dispatch.prompt
     message = phase_dir / f"dispatch_{number}_prompt.txt"
     receipts = phase_dir / f"dispatch_{number}_submissions.jsonl"
     output_instruction = ("Return the complete review result in your final reply; the runner saves the artifacts."
                           if dispatch.role == "review" else f"As your last act, write your summary to {summary}.")
+    # `start` has no image option, so a switched worker opens each image by its path.
     _ = message.write_text(dispatch.prompt.read_text() + "\n" + RULES +
-                           f"\nWorker: {shown}\n{output_instruction}\n")
+                           f"\nWorker: {shown}\n{output_instruction}\n" +
+                           (image_note(args.image) if dispatch.switching else ""))
     if args.style_since:
         end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
         try:
@@ -617,7 +632,11 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     if args.early_ready:
         follow += ["--submission-receipt-file", str(receipts)]
         dispatch.watch_stage_two(shown)
-    code = dispatch.follow(follow, shown, log)
+    launch = follow if dispatch.switching is None else mesh_command(
+        args, dispatch.run, dispatch.worker, SwitchStart(
+            dispatch.cwd, message, assignment, str(summary), reply, str(log),
+            dispatch.model, dispatch.effort, dispatch.tier))
+    code = dispatch.follow(launch, shown, log)
     if code == 0 and dispatch.stage_thread is not None:
         # Stage 1 may finish before the sentinel. Keep the dispatch claim while
         # the native file watcher waits, then follow any still-held Stage 2.
@@ -668,8 +687,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     reply = directory / f"{slot}_reply{suffix}.txt"
     log = directory / f"{slot}_agent{suffix}.log"
     content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
-    if args.image:
-        content += "\nRead these images:\n" + "\n".join(str(Path(image).resolve()) for image in args.image)
+    content += image_note(args.image)
     if not message.is_file() or message.read_text() != content:
         write_text_atomic(message, content)
     end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
@@ -760,17 +778,46 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
     return result
 
 
-def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAllowed,
-                      env: dict[str, str]) -> int:
-    """Translate an admitted assignment into its recovery operation."""
-    run, worker = admitted.run, admitted.name
+@dataclass(frozen=True)
+class SwitchStart:
+    """The values that only the start of a family switch reads."""
+    cwd: Path
+    prompt: Path
+    assignment: Path
+    summary: str
+    reply: Path
+    log: str
+    model: str
+    effort: str
+    tier: str
+
+
+def mesh_command(args: Arguments, run: Path, worker: str, switch: SwitchStart | None = None) -> list[str]:
+    """Build the one codex_mesh command of an admitted assignment."""
     command = [PYTHON, MESH]
     context = ["--session-dir", str(run)]
-    if args.operation == AssignmentOperation.ADOPT:
+    if switch is not None:
+        role = "impl" if args.role == "implement" else args.role
+        command += ["start", *context, "--name", worker, "--role", role, "--cwd", str(switch.cwd),
+                    "--prompt-file", str(switch.prompt), "--assignment-file", str(switch.assignment),
+                    "--summary-file", switch.summary, "--reply-file", str(switch.reply), "--log-file", switch.log,
+                    "--task", f"direct.{role}", "--model", switch.model, "--effort", switch.effort,
+                    "--service-tier", switch.tier]
+        if role == "review":
+            command += ["--sandbox", "read-only"]
+        if args.lens:
+            command += ["--lens", args.lens]
+    elif args.operation == AssignmentOperation.ADOPT:
         command += ["adopt", *context, "--name", worker, "--from", str(Path(args.from_session_dir).resolve())]
     else:
         command += ["resume-account-move", *context, "--to", worker]
-    return call(command, env, check=False).returncode
+    return command
+
+
+def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAllowed,
+                      env: dict[str, str]) -> int:
+    """Translate an admitted assignment into its recovery operation."""
+    return call(mesh_command(args, admitted.run, admitted.name), env, check=False).returncode
 
 
 def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
@@ -830,7 +877,7 @@ def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str
     opened, held, result = False, "", 1
     try:
         result = call([PYTHON, MESH, "prime", *context, "--name", args.new_worker,
-                       "--role", "astra-reviewer", "--instructions-file", str(prompt),
+                       "--instructions-file", str(prompt),
                        "--sandbox", "read-only", *settings], env, check=False).returncode
         if result:
             return result
@@ -915,9 +962,8 @@ def main() -> int:
         return simplify_daily.main(["--session-dir", args.session_dir, "--cwd", args.cwd])
     env = dict(os.environ)
     if args.operation in RECOVERY_OPERATIONS:
-        role = "impl" if args.role == "implement" else args.role
         try:
-            admitted = worker_admission.admit(args.to, Path(args.session_dir).expanduser().resolve(), role=role)
+            admitted = worker_admission.admit(args.to, Path(args.session_dir).expanduser().resolve())
         except ValueError as error:
             print(str(error), file=sys.stderr)
             return 2
@@ -963,25 +1009,35 @@ def main() -> int:
         worker = resolved.stdout.strip()
         reservation = workers.allocation_for_follow(run, worker)
     try:
-        _ = worker_admission.admit(worker, run, role=role)
+        _ = worker_admission.admit(worker, run)
     except ValueError as error:
         workers.release_allocation(run, worker, reservation)
         print(str(error), file=sys.stderr)
         return 2
     env["UNIT_TEAM_ROLE"] = worker
     env["UNIT_PASS_OWNER"] = "launcher"
+    membership = staff.local_snapshot()
+    member = worker_admission.member(run, worker, membership)
+    switches = member is not None and (session_staff.worker_family(membership, member.id) != family
+        or (family == "codex" and worker_admission.dispatch_pending(run, worker, prompt)))
     if family == "claude":
+        if switches:
+            args.to = worker
         slot = ({"adversary": "test", "contract": "impl", "": ""}.get(args.lens, "review")
                 if args.role == "review" else worker)
         started_before = pass_start_count(run, slot)
-        code = execute_claude(args, run, phase, cwd, prompt, env)
+        try:
+            code = execute_claude(args, run, phase, cwd, prompt, env)
+        finally:
+            workers.release_allocation(run, worker, reservation)
         try:
             if code and pass_start_count(run, slot) > started_before:
                 end_failed_launch(run, slot, env)
         except Exception as error:
             print(f"assign.sh: unable to end failed run {run}: {error}", file=sys.stderr)
         return code
-    dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation)
+    dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation,
+                        switching=member if switches else None)
     try:
         code = execute(dispatch, paths)
     finally:
