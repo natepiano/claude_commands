@@ -350,7 +350,7 @@ only I can bump
 
 **Notice:** Name `scripts/production/merge_gate.py` as also-touches (owner sdlc devtools-unit). Give the measured gate CPU and wall time before and after (builds, 2026-11-05).
 
-### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: todo
+### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: done
 
 **Depends on:** 10k (runs after it; both may touch the client). Source: the 10x deploy check, 2026-11-05. User approval: "fix then" (2026-11-05, answer to the question whether a waiting build may stop with a clear message when the service keeps failing to start).
 
