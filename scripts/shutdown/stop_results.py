@@ -24,6 +24,14 @@ def shutdown_state_root() -> Path:
 
 
 @dataclass(frozen=True)
+class NoRoleAccount:
+    """The recipient has no staff role that selects a Claude account."""
+
+
+NO_ROLE_ACCOUNT = NoRoleAccount()
+
+
+@dataclass(frozen=True)
 class Stopped:
     session_id: str
     pid: int

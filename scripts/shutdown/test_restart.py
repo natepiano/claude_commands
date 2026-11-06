@@ -343,7 +343,9 @@ class RestartTests(ShutdownTestCase):
             "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
         }))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root),
-                                                     "XDG_STATE_HOME": str(self.root)})))
+                                                     "XDG_STATE_HOME": str(self.root), "HOME": str(self.root),
+                                                     "CODEX_HOME": str(self.root / ".codex"),
+                                                     "CLAUDE_CONFIG_DIR": str(config)})))
         self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
             worktree=staff.PresentWorktree("natedev", self.root)) for n in range(3))
@@ -358,8 +360,10 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(stop_resume, "stop_unit_workers", return_value=[], create=True))
         _ = self.enterContext(patch.object(restart, "session_launch", side_effect=self.session_launch))
         _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
-        _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
-            "claude2", self.root / ".claude2")))
+        def role_account(role: str) -> accounts.AccountSelection:
+            return (accounts.CodexWorkersAccount("codex1", self.root / ".codex1") if role == "workers" else
+                    accounts.NamedAccount("claude2", self.root / ".claude2"))
+        _ = self.enterContext(patch.object(accounts, "role_account", side_effect=role_account))
         _ = self.enterContext(patch.object(accounts, "trust_sources", return_value=[]))
         _ = self.enterContext(patch.object(herdr, "prepare_session_environment",
             return_value=herdr.PreparedAgentEnvironment(self.root, {})))
@@ -673,6 +677,27 @@ class RestartTests(ShutdownTestCase):
             prepare.assert_called_once_with(str(self.rows[0].current_session), str(self.root),
                                             environment, herdr.NO_ENVIRONMENT_REMOVALS)
             self.assertEqual(pane, "w1:p0")
+
+    def test_start_row_selects_the_workers_account_unless_the_target_is_explicit(self) -> None:
+        self.running.clear()
+        row = self.rows[0]
+        for requested in ("", "codex3"):
+            expected = requested or "codex1"
+            with (self.subTest(target=requested),
+                  patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+                      "codex1", self.root / ".codex1")) as role,
+                  patch.object(restart, "session_launch", return_value=("codex", {"CODEX_HOME": str(self.root / ".codex2")},
+                      ["resume", str(row.current_session)])),
+                  patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                      self.root, {})) as prepare,
+                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                      "w1:p0", herdr.PromptSubmissionNotRequired()))):
+                _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"), target_account=requested)
+            self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
+            if requested:
+                role.assert_not_called()
+            else:
+                role.assert_called_once_with("workers")
 
     def test_start_row_with_a_saved_entry_uses_the_role_account(self) -> None:
         self.running.clear()

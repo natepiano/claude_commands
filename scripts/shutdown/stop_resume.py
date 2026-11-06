@@ -21,7 +21,7 @@ from io import StringIO
 from importlib import import_module
 from threading import Event
 from time import monotonic
-from typing import TYPE_CHECKING, Never, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Never, Protocol, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -30,8 +30,8 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import herdr
-from scripts.accounts import moves
-from scripts.whoami import note_file
+from scripts.accounts import accounts, moves
+from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, operation_deadline
 from scripts.message import session_send
 import pane_record
@@ -46,7 +46,7 @@ from scripts.lib.resume_message import (
     resume_worker_command as resume_worker_command,
 )
 from scripts.shutdown.stop_results import (
-    Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
+    Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed, NoRoleAccount, NO_ROLE_ACCOUNT,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
     ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
 class RowStarter(Protocol):
     def start_row(self, row: StaffRow, record: StaffSnapshot, client: herdr.Herdr, *,
                   target_account: str) -> str: ...
+    def session_launch(self, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
 
 
 
@@ -515,6 +516,50 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         return _resume(session, why=why, to=to, requester=requester)
 
 
+def _codex_name_ids(name: str) -> list[str]:
+    """Read exact names from one copy of the shared Codex index."""
+    try:
+        entries = [cast(dict[str, str], json.loads(line))
+                   for line in (agent_accounts.codex_home() / "session_index.jsonl").read_text().splitlines() if line.strip()]
+        return sorted({entry["id"] for entry in entries if entry.get("thread_name") == name})
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        print(f"{name}: index anomaly: {error}", file=sys.stderr)
+        return []
+
+
+def resume_account(kind: Literal["claude", "codex"], row: StaffRow | NoRoleAccount = NO_ROLE_ACCOUNT,
+                   *, to: str = "") -> accounts.AccountSelection | NoRoleAccount:
+    """Select the requested account or read the recipient's role account."""
+    if to:
+        return (accounts.CodexWorkersAccount(to, agent_accounts.codex_account_home(to).home)
+                if kind == "codex" else accounts.NamedAccount(to, accounts.account_dir(to)))
+    if kind == "codex":
+        return accounts.role_account("workers")
+    if not isinstance(row, NoRoleAccount) and row.kind in ("unit", "showrunner"):
+        return accounts.role_account(row.kind)
+    return NO_ROLE_ACCOUNT
+
+
+def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionNotFound:
+    """Read the native resume arguments and the folder from the rollout metadata."""
+    path = next((agent_accounts.codex_home() / "sessions").glob(f"**/rollout-*{identity}.jsonl"), None)
+    if path is None:
+        return SessionNotFound(identity)
+    restart = cast(RowStarter, cast(object, import_module("scripts.shutdown.restart")))
+    try:
+        kind, environment, arguments = restart.session_launch(identity, identity)
+    except OSError:
+        return SessionNotFound(identity)
+    if kind != "codex":
+        return SessionNotFound(identity)
+    with path.open(encoding="utf-8") as stream:
+        meta = herdr.json_object(cast(object, json.loads(stream.readline())), "Codex rollout metadata")
+    folder = herdr.json_text(herdr.json_object(meta.get("payload"), "Codex session metadata").get("cwd"), "Codex rollout cwd")
+    return pane_record.launch("", identity, folder, environment, [kind, *arguments], kind=kind)
+
+
 def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "") -> ResumeResult:
     names = LaunchNames.read()
     record = names.tab_record
@@ -531,6 +576,12 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
         if machine and machine != remote.local_machine():
             return ResumeFailed(session, f"session is on {machine}")
         session = member.current_session
+    else:
+        identities = _codex_name_ids(session)
+        if len(identities) > 1:
+            return ResumeFailed(session, "ambiguous name; candidates: " + ", ".join(identities))
+        if identities:
+            session = identities[0]
     result = _resume_once(session, why=why, to=to, requester=requester, names=names)
     if isinstance(result, SessionNotFound) and not matches:
         nearby = _nearby_resume_names(session, names)
@@ -564,8 +615,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         row = names.tab_record.by_current_session(identity)
         if isinstance(tab, SessionNotFound):
             original = pane_record.publication_for_session(session, record=names.tab_record)
-            if original is None and row is None:
-                return tab
             if original is not None and any(pane["pane_id"] == original.entry["pane_id"] for pane in client.panes()):
                 return tab
             entry = original.entry if original is not None else None
@@ -574,11 +623,21 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             entry = pane_record.read_strict(client.session).get(tab.pane_id)
             if entry is not None:
                 original = pane_launch.LaunchPublication(pane_record.record_path(client.session), entry)
+        if entry is None and row is None:
+            recovered = _unrecorded_codex_launch(identity)
+            if isinstance(recovered, SessionNotFound):
+                if isinstance(tab, herdr.TabSession):
+                    running = running_on_account(identity, tab.pane_id)
+                    if not isinstance(running, sessions.SessionNotLive):
+                        return running
+                return recovered
+            entry = recovered
         if entry is not None:
             entry = names.resume(entry)
+        kind = pane_launch.agent_kind(entry) if entry is not None else "claude"
         pane_id = entry["pane_id"] if isinstance(tab, SessionNotFound) and entry is not None else (
             tab.pane_id if isinstance(tab, herdr.TabSession) else "")
-        running = running_on_account(identity, pane_id)
+        running = running_on_account(identity, pane_id, kind=kind)
         if not isinstance(running, sessions.SessionNotLive):
             return running
         if entry is None:
@@ -594,21 +653,25 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
 
-        from scripts.accounts import accounts
         from scripts.whoami.account import named_account_environment
 
-        if to is None and row is not None and row.kind in ("unit", "showrunner") and pane_launch.agent_kind(entry) == "claude":
-            to = accounts.role_account(row.kind).label
+        selected = resume_account(kind, row if row is not None else NO_ROLE_ACCOUNT, to=to or "")
         source = Path(entry["config_dir"])
         source_label = accounts.claude_config_label(source)
-        target_dir = (accounts.account_dir(to) if to is not None else
-                      Path(entry["environment"].get("CLAUDE_CONFIG_DIR", str(source))))
-        label = to if to is not None else accounts.claude_config_label(target_dir)
-        account_environment = named_account_environment(target_dir)
-        trust = heal_account_trust(Path(entry["cwd"]), target_dir, source, entry["name"])
+        copied_from = ""
+        if isinstance(selected, accounts.CodexWorkersAccount):
+            target_dir, label = selected.home, selected.label
+            account_environment = {"CODEX_HOME": str(target_dir)}
+        else:
+            target_dir = (selected.dir if isinstance(selected, accounts.NamedAccount) else
+                          Path(entry["environment"].get("CLAUDE_CONFIG_DIR", str(source))))
+            label = selected.label if isinstance(selected, accounts.NamedAccount) else accounts.claude_config_label(target_dir)
+            account_environment = named_account_environment(target_dir)
+            trust = heal_account_trust(Path(entry["cwd"]), target_dir, source, entry["name"])
+            copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
-        if to is not None and original is not None and Path(original.entry["config_dir"]) != target_dir:
+        if not isinstance(selected, NoRoleAccount) and original is not None and Path(original.entry["config_dir"]) != target_dir:
             try:
                 pane_record.write(client.session, entry)
             except (OSError, ValueError) as error:
@@ -634,7 +697,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     _ = client.retitle(tab.pane_id, entry["name"])
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
-        copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         workers = NO_WORKERS
         own = NO_OWN_PASS
         try:
@@ -645,7 +707,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        message = resume_message(why, move=AccountMove(source_label, label) if to else NO_ACCOUNT_MOVE,
+        message = resume_message(why, move=AccountMove(source_label, label) if not isinstance(selected, NoRoleAccount) else NO_ACCOUNT_MOVE,
                                  workers=workers, own_pass=own) if row is None or row.kind != "worker" or isinstance(own, BusyPass) else ""
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             with pane_record.locked(client.session):
@@ -656,12 +718,30 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 pane_record.save(client.session, entries)
             attempt_pane = tab.pane_id
             _exec_in_own_pane(tab, entry, label, message)
-        live = sessions.session_liveness(identity)
-        if isinstance(live, sessions.SessionLivenessUnknown):
-            raise herdr.HerdrFailure(live.reason)
-        if isinstance(live, sessions.SessionNotLive):
+        started: herdr.AgentLaunched | sessions.LiveSessionProcess
+        if kind == "codex":
+            from scripts.lib import nix_env
+
+            prepared = herdr.prepare_session_environment(identity, entry["cwd"], entry["environment"], herdr.NO_ENVIRONMENT_REMOVALS)
+            if isinstance(prepared, nix_env.Refused):
+                raise OSError(str(prepared))
+            opening = (herdr.OpeningPrompt(message, herdr.SessionTranscript(target_dir, identity))
+                       if message else herdr.NoOpeningPrompt())
             attempt_pane = tab.pane_id
-            live = _start_session(tab, entry, label, message)
+            launched = herdr.launch_prepared_agent(client.session, herdr.ExistingPane(tab.pane_id, ""), prepared, kind,
+                trust_arguments(kind, entry["cwd"], pane_record.resume_arguments(entry)), opening,
+                int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000), agent=entry["name"] or identity)
+            if isinstance(launched.outcome, herdr.PromptNotSubmitted):
+                raise herdr.HerdrFailure(launched.outcome.reason)
+            started = launched
+        else:
+            live = sessions.session_liveness(identity)
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                raise herdr.HerdrFailure(live.reason)
+            if isinstance(live, sessions.SessionNotLive):
+                attempt_pane = tab.pane_id
+                live = _start_session(tab, entry, label, message)
+            started = live
         if original is not None:
             try:
                 attempt = pane_launch.resume_attempt(original.path, tab.pane_id)
@@ -670,11 +750,13 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             except (OSError, ValueError, herdr.HerdrFailure) as error:
                 print(f"{identity}: launch record anomaly: {error}", file=sys.stderr)
         attempt_pane = ""
+        if isinstance(started, herdr.AgentLaunched):
+            return ClaudeUp(identity, tab.pane_id, label, monotonic() - began)
         try:
-            generation = sessions.process_start(live.pid)
+            generation = sessions.process_start(started.pid)
             if generation:
                 _detach(["stay", "--session", identity, "--pane", tab.pane_id,
-                         "--account", label, "--pid", str(live.pid), "--generation", generation, "--why", why,
+                         "--account", label, "--pid", str(started.pid), "--generation", generation, "--why", why,
                          *(["--requester", requester] if requester else [])], "stay")
             else:
                 print(f"{identity}: observer anomaly: process generation is unavailable", file=sys.stderr)

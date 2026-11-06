@@ -7,6 +7,7 @@ import math
 import os
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -380,6 +381,101 @@ class StopResumeTests(unittest.TestCase):
                         selection.assert_called_once_with(kind)
                     else:
                         selection.assert_not_called()
+
+    def saved_codex_name(self, name: str = "saved-worker") -> str:
+        identity = "019b3a40-4250-7000-8000-000000000103"
+        home = self.root / ".codex2"
+        atomic_file.write_text_atomic(home / "session_index.jsonl", json.dumps({
+            "id": identity, "thread_name": name, "updated_at": "2026-11-06T00:00:00Z"}) + "\n")
+        atomic_file.write_text_atomic(home / "sessions" / f"rollout-{identity}.jsonl", json.dumps({
+            "type": "session_meta", "payload": {"id": identity, "cwd": str(self.root / "project")}}) + "\n")
+        for label in ("codex1", "codex2"):
+            with sqlite3.connect(":memory:") as database:
+                _ = database.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+                if label == "codex2":
+                    _ = database.execute("INSERT INTO threads VALUES (?)", (identity,))
+                database.commit()
+                atomic_file.write_bytes_atomic(self.root / f".{label}" / "state_5.sqlite", database.serialize())
+        pane_record.save("agents", {})
+        self.client.rows.clear()
+        return identity
+
+    def test_resume_resolves_an_exact_codex_name_and_reports_distinct_candidates(self) -> None:
+        identity = self.saved_codex_name()
+        path = self.root / ".codex2/session_index.jsonl"
+        first = path.read_text()
+        with (patch.dict(os.environ, {"CODEX_HOME": str(path.parent)}),
+              patch.object(stop_resume, "_resume_once", return_value=stop_resume.ClaudeUp(identity, "pane", "codex1")) as once):
+            self.assertIsInstance(stop_resume.resume("saved-worker"), stop_resume.ClaudeUp)
+            self.assertEqual(once.call_args.args[0], identity)
+            atomic_file.write_text_atomic(path, first + first)
+            self.assertIsInstance(stop_resume.resume("saved-worker"), stop_resume.ClaudeUp)
+            atomic_file.write_text_atomic(path, first + json.dumps({"id": "another-id", "thread_name": "saved-worker"}) + "\n")
+            once.reset_mock()
+            result = stop_resume.resume("saved-worker")
+            self.assertIsInstance(result, stop_resume.ResumeFailed)
+            assert isinstance(result, stop_resume.ResumeFailed)
+            self.assertIn("ambiguous name; candidates:", result.reason)
+            self.assertIn(identity, result.reason)
+            self.assertIn("another-id", result.reason)
+            once.assert_not_called()
+            once.return_value = stop_resume.SessionNotFound("saved")
+            self.assertEqual(stop_resume.resume("SAVED-WORKER"), stop_resume.ResumeFailed("SAVED-WORKER", "unknown name"))
+
+    def test_resume_codex_name_uses_the_workers_account_and_the_rollout_folder(self) -> None:
+        identity = self.saved_codex_name()
+        source = self.root / ".codex2"
+        for target in (None, "codex3"):
+            expected = target or "codex1"
+            with (self.subTest(target=target), patch.dict(os.environ, {"CODEX_HOME": str(source)}),
+                  patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+                      "codex1", self.root / ".codex1")) as role,
+                  patch.object(self.client, "open_tab", return_value="w1:p2"),
+                  patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
+                  patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                      self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
+                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                      "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
+                result = stop_resume.resume("saved-worker", to=target)
+                self.assertIsInstance(result, stop_resume.ClaudeUp)
+                assert isinstance(result, stop_resume.ClaudeUp)
+                self.assertEqual((result.session_id, result.account), (identity, expected))
+                self.assertEqual(prepare.call_args.args[1], str(self.root / "project"))
+                self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
+                self.assertEqual(launch.call_args.args[3], "codex")
+                self.assertEqual(launch.call_args.args[4][-2:], ["resume", identity])
+                if target is None:
+                    role.assert_called_once_with("workers")
+                else:
+                    role.assert_not_called()
+
+    def test_resume_of_a_running_codex_name_keeps_its_current_account(self) -> None:
+        identity = self.saved_codex_name()
+        with (patch.dict(os.environ, {"CODEX_HOME": str(self.root / ".codex2")}),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (456,)}, ())),
+              patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.root / ".codex2")),
+              patch.object(accounts, "codex_home_label", return_value="codex2"),
+              patch.object(herdr, "launch_prepared_agent") as launch):
+            result = stop_resume.resume("saved-worker", to="codex1")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)
+        self.assertEqual(result.account, "codex2")
+        launch.assert_not_called()
+
+    def test_closed_showrunner_uses_its_role_account_before_its_first_launch(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "showrunner", "alpha", staff.STAFF_ROOT, current_session=identity)
+        self.client.rows.clear()
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude4", self.root / ".claude4")) as role,
+              patch.object(self.client, "open_tab", return_value="w1:p3"),
+              patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p3", "alpha", "w1", "")]),
+              patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(456)) as start):
+            result = stop_resume.resume("alpha")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        role.assert_called_once_with("showrunner")
+        self.assertEqual(start.call_args.args[1]["config_dir"], str(self.root / ".claude4"))
 
     def test_resume_without_a_pane_record_starts_the_staff_row(self) -> None:
         identity = self.entry["session_id"]
@@ -758,6 +854,8 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root),
+            "CODEX_HOME": str(self.root / ".codex"),
+            "CLAUDE_CONFIG_DIR": str(self.root / ".claude3"),
             "XDG_STATE_HOME": str(self.root / "state"),
             "AGENT_NOTES_DIR": str(self.root / "notes"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),

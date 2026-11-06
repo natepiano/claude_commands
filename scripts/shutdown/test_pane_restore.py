@@ -197,6 +197,11 @@ class PaneRestoreTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.config = self.root / ".claude3"
+        select_role = accounts.role_account
+        def role_account(role: str) -> accounts.AccountSelection:
+            return (accounts.CodexWorkersAccount("codex1", self.root / ".codex1")
+                    if role == "workers" else select_role(role))
+        _ = self.enterContext(mock.patch.object(accounts, "role_account", side_effect=role_account))
         configuration = self.root / "configuration"
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
@@ -659,6 +664,11 @@ class CodexPaneRestoreTests(FolderMoveFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        select_role = accounts.role_account
+        def role_account(role: str) -> accounts.AccountSelection:
+            return (accounts.CodexWorkersAccount("codex2", self.root / "home/.codex2")
+                    if role == "workers" else select_role(role))
+        _ = self.enterContext(mock.patch.object(accounts, "role_account", side_effect=role_account))
         configuration = self.root / "configuration"
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
