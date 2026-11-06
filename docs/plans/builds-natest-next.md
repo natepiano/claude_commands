@@ -1,22 +1,20 @@
 # builds-natest — Next
 
-The phase backlog of natest-unit. At each phase end, rank modules with `python3 ~/.claude/scripts/test_times/show.py top --repo ~/.claude`. The next speed phase takes the highest ranked live module that no phase holds, subject to the floor rule.
+The phase backlog of natest-unit. At each phase end, rank modules by median CPU with `python3 ~/.claude/scripts/test_times/show.py top --repo ~/.claude`. The next speed phase takes the highest ranked live module that no phase holds, subject to the floor rule.
 
-## Descending sort
+## Order
 
-Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module_history.json` on 2026-11-03. Phases 5-7 name the first six rows; each speed phase confirms its targets at dispatch.
+Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed phases confirm their targets at dispatch.
 
-| Rank | Module | Median s | Last s | Last CPU s | Phase |
-| --- | --- | --- | --- | --- | --- |
-| 1 | `direct/test_assign_launcher.py` | 180 | 132 | 127 | 5 |
-| 2 | `direct/test_verify_ssh_targets.py` | 157 | 116 | 117 | 5 |
-| 3 | `agents/test_codex_mesh.py` | 137 | 947 | 79 | excluded: codex-mesh retires |
-| 4 | `direct/test_simplify_lens.py` | 132 | 122 | 61 | 6 |
-| 5 | `production/test_fast_track.py` | 127 | 97 | 85 | 7 |
-| 7 | `shutdown/test_restart.py` | 71 | 59 | 58 | — |
-| 8 | `hana_shot/test_hana_shot.py` | 61 | 56 | 14 | — |
-| 9 | `direct/test_workers.py` | 51 | 57 | 26 | — |
-| 10 | `direct/test_review_launcher_pool.py` | 50 | 37 | 23 | — |
+1. Phase 60: `show.py top` ranks by CPU; `module_cost.py` counts process starts.
+2. Phase 61: the seven largest `test_verify*` files, 590 CPU s.
+3. Further `test_verify*` batches, largest CPU first, after verify sends its files. Each batch is one phase with one bumped checkpoint. Verify's cost doc lists the rest; its list has 122 files.
+4. Phase 55: the assign launcher group, 344 CPU s, beside the batches when models reaches builds.
+5. Phase 44: `copies.py` Git work and `style/test_crate_run.py`, 68.5 CPU s, on the showrunner's word.
+6. Phase 59: `style/test_style_proposals.py`, 60.8 CPU s.
+7. New phases by rank: `production/test_add_unit.py` 59.8, `production/test_fast_track.py` 55.1, `production/test_staff.py` 53.7, `style/test_add_style.py` 51.0.
+
+Held: `style/test_style_sync.py`, 66.6 CPU s; devtools holds it. Never: `types/basedpyright`, 238.4 CPU s; `agents/test_codex_mesh.py`, 232.6 CPU s, retires.
 
 `types/basedpyright` takes 2-4 min in a gate (report-unit, 2026-11-03). It is not in the gate's module files; Phase 2 records it, and it goes to the proposal below, never to a speed phase.
 
@@ -28,17 +26,10 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
   - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
   - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
-- [ ] **Select the next speed target after Phases 24 and 27.** Phase 51 closed with no edit: daily simplify work cut `direct/test_simplify_lens.py` to 15 tests and about 20 s. Phase 54 took `_reuse` and `_identity` of the assign launcher group (floors below). Phase 55 takes `test_assign_launcher.py` after models and herdr reach main. Phase 56 takes `test_verify_ssh_targets_retained.py` and `_retry.py` (2026-11-06).
-  - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
-  - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
-  - Candidate after Phase 56: `style/test_style_proposals.py`, median 112.7 s wall and 60.8 s CPU (2026-11-06). Confirm owner availability, then measure the current revision before dispatch. Keep the floor rule for modules already improved. Phase 42 moved the `direct/test_verify_mac_only.py` floor to 185.8 s; read its gate median against that floor when Phase 42 is on builds.
-  - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), was Phase 31 (floor below). `production/test_fast_track.py`, rank 4 at 216.9 s on 2026-11-05, is Phase 33 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
-  - Held: `style/test_style_sync.py`; devtools holds it and `style_sync.py` until its phase is on main, and the showrunner sends the word (2026-11-06).
-  - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
-- [ ] **The next test to speed up is chosen by the CPU it saves each day, not by its time in one run.** The showrunner placed it here on 2026-11-06; if the two orders differ, the showrunner takes the rule question to the user.
-  - Target: the Introduction of this file and "Select the next speed target"; proposed text: "Choose eligible modules by expected daily CPU saving: observed daily executions × estimated removable CPU per execution. Include merge executions, selected unit executions, and retries; exclude reused results."
-  - Why needed: 5 unit runs ran `direct/test_simplify_lens.py` twice (258 CPU s) and `direct/test_verify_mac_only.py` once (194 CPU s). The sample is small.
-  - Completion condition: after a day on builds, report both orders with the count of red merges that a unit targeted test missed, against the 104-run estimate of 15 (Phase 37).
+- [ ] **Report the red merges that a unit targeted test missed.**
+  - Target: the showrunner's notice, from the merge gate records.
+  - Why needed: Phase 37's selection is outside the K row, because the merge gate runs all modules. The estimate is about 7 more red merges per 104 runs. Rank by CPU per gate settled the target order (the user, 2026-11-06).
+  - Completion condition: after a day on builds, report the count against the 104-run estimate of 15.
   - Revealed by: Phase 37 architect review, 2026-11-06.
 - [ ] **Architecture proposal: the assign launcher starts fewer child processes**
   - Target: `scripts/direct/assign.py` (owner sdlc; models and herdr change it now)
@@ -107,12 +98,15 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Owners (showrunner, 2026-11-05): the lazy `admission_service` import in `build_hold.py` goes to queue-unit with the admission client start, after the `build_hold.py` freeze (measured 9.6 s on this module). A platform column in the `eligible` answer goes to verify-unit as its next item 3.
   - Phase 41 result, 2026-11-05: lazy imports in `build_targets.py` alone gain 1% CPU in `test_verify_mac_only.py`, so they did not land. The gain needs `build_hold`'s chain to leave `eligible` and `reserve`.
   - Phase 42 result, 2026-11-06: the same method in `mac_idle.py` gains 17.9% CPU in `test_verify_mac_only.py`, because the whole chain leaves four of five commands.
+  - Phase 56 result, 2026-11-06: `test_verify_ssh_targets_retained.py` and `_retry.py` reach this same floor after all fixed waits left. Measure them in the same pairs.
   - Completion condition: natest measures `test_verify_ssh_targets_routing.py` again in same-load pairs when each change is on builds.
   - Revealed by: Phase 24, 2026-11-05.
 
 - [x] **Phase notes stopped updating.** Text: `phase table not written: phase note target is not owned by builds/natest-unit: ~/rust/hanadocs/showrunners/builds/natest.md`. Cause: `_note_ownership` in `scripts/direct/phase_table.py` looks up the note's `unit:` field as a staff id, and the notes still hold the older `unit: natest-unit` header (queue, report and fastest also). So each write refuses. Fix: run the one-off `phase_table.py migrate-notes`, which reads `*/*.md` below `--vault-root` and rewrites the header to the staff id. Done 2026-11-05: the showrunner assigned the builds notes to natest; `phase_table.py migrate-notes` rewrote natest, queue, report, resources and verify. natedev has the fastest note.
 
 ## Floors
+
+These are wall floors from before 2026-11-06, not CPU floors. A wall floor does not hold a module back when its CPU rank calls it and direct calls were not tried. The `direct/test_verify*` rows go to the batches.
 
 | Module | Floor (pair median wall s) | Limiting operation | Phase |
 | --- | --- | --- | --- |
@@ -124,3 +118,5 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | `direct/test_verify_lint_judgment.py` | 198.6 | production `verify.sh lint` route: 3.1 s per run with no repair, 5.2 s with repair (step-record and admission client Python starts) plus admission start spacing | 31 |
 | `direct/test_assign_launcher_reuse.py` | 57.4 (load 55-70) | one real launcher process for each later dispatch: 2.6-3.2 s, of which 1.80 s is 12 `subprocess.run` calls in the coordinator | 54 |
 | `direct/test_assign_launcher_identity.py` | 55.8 (load 55-70) | the same launcher process, 14 dispatches in 9 tests | 54 |
+| `direct/test_verify_ssh_targets_retained.py` | 35.5 (load 52-65) | child process starts and the coordination imports through `build_hold.py`; no fixed waits remain | 56 |
+| `direct/test_verify_ssh_targets_retry.py` | 42.1 (load 52-65) | the same starts and imports; `recovery_start_seconds` stays 5 s | 56 |

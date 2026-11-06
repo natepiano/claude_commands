@@ -9,12 +9,20 @@
 
 From the user (via natedev): Mission: find the longest-running ~/.claude tests and make them faster. Keep a descending sort of test times; when it makes the longest one shorter, it takes the next one. Build tools that instantly show the history of ~/.claude test suite times and of individual test times. Use parallelism, removal of trivial tests, shared code and good engineering practice. It must also send architectural change proposals back. It organizes its work in phases so /unit:direct works, and keeps its own phase backlog: the user wants the standard process engaged.
 
+2026-11-06 12:15 EST
+
+From the user (via the showrunner): the verify is a good improvement. i think that it needs to recalibrate its approach to test improvement based on this feedback
+
+From the user (via the showrunner, 12:19 EST): natest should be the one doing the test work, of course
+
+The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 30.2 CPU s and from 1,925 to 982 processes. It tests logic by direct calls and keeps a few real runs. Gate throughput depends on CPU, because many gates share the machine.
+
 ## Standing work
 
 1. At each phase start, read the merge gate's slowdown warnings; natest-unit owns them. A warned module goes to `builds-natest-next.md`.
-2. At each phase end, re-sort with `show.py top`. Before the last todo phase starts, add a speed phase for the top live module that no phase holds.
-3. `builds-natest-next.md` lists each module with a reported floor. A gate median 20% above a floor starts an investigation. A floored module is a target again only when a measure at comparable load confirms the rise.
-4. When no live module has a median over 60 s, the plan holds and tells the showrunner; it does not close.
+2. At each phase end, re-sort with `show.py top`, which ranks by median CPU. Before the last todo phase starts, add a speed phase for the top live module that no phase holds.
+3. `builds-natest-next.md` lists each module with a reported floor. A gate median CPU 20% above a floor starts an investigation. A floor from before 2026-11-06 is a wall floor. It does not hold a module back when the module's CPU rank calls it and direct calls were not tried.
+4. When no live module has a median CPU over 30 s, the plan holds and tells the showrunner; it does not close.
 
 ## Delegation Context
 
@@ -64,18 +72,18 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   - Commit every new file in the disposable gate clone before the gate starts. The aws_target box replica copies only `git ls-files` (Phase 22: an untracked new module turned `test_control.py` red).
   - Each dispatch names one worker that runs the changed modules and their callers after the last edit. With a writer and a tester, the writer runs the chain (Phase 22: each left it to the other).
 
-- **Speed method** (every speed phase):
-  0. Targets: at dispatch, the director takes the top live rows of `test_times top` that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal.
-  1. Baseline: before the edit, run the module three times with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` and keep the median `wall_s` and `cpu_s`. These runs find the cost (step 2); they are not the before number of the gain (step 5). Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
-  2. Find the cost from the JSON: the slowest tests, and `wall_s - tests_s` (import and module or class fixtures). Name the expensive operations before any edit; do not apply a cut the module already has. Estimate each command's removable cost, not the whole script's: Phase 41 estimated 54-62 CPU s and measured 1.8, because 246 of 366 starts already had the light path and two commands kept the heavy chain.
+- **Speed method** (every speed phase; CPU first, 2026-11-06):
+  0. Targets: at dispatch, the director takes the top live rows of `show.py top`, ranked by median CPU per gate, that no phase holds. When they differ from the modules the phase names, the director rewrites its Goal, Files and acceptance first. `types/basedpyright` is never a target; it goes to its architecture proposal. `agents/test_codex_mesh.py` is excluded: it retires.
+  1. Baseline: before the edit, run `python3 scripts/test_times/module_cost.py --tree <tree> <folder>/<file>` for CPU s, processes, execs and wall s. Run the module with `TEST_TIMES_OUT=<run directory>/<module>-before-<n>-<sha>.json python3 scripts/test_times/module_run.py scripts/<folder> <file>` for each test's time. Read `python3 scripts/test_times/show.py module <folder>/<file>` for the gate history.
+  2. Find the cost: the process starts per test, what starts them, and the CPU per test. Name each real end-to-end run and what only it proves. Do not apply a cut the module already has. Estimate each command's removable cost, not the whole script's: Phase 41 estimated 54-62 CPU s and measured 1.8, because 246 of 366 starts already had the light path and two commands kept the heavy chain.
   3. Cut it, in this order:
-     - Find each fixed wait first: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. A fixed wait often also causes flakes, so a flaky module is a speed target too (fastest-unit, Phases 5i and 6: 64 to 35 s, 58 to 24 s). A server fixture that runs `serve_forever` pays its 0.5 s poll interval on each stop; stop it on an event (Phase 20: 62 to 21 s).
+     - Test logic by direct calls of the functions under test. Use `scripts/lib/shell_test_support.py` for Bash functions, and run many cases in one shell where the cases allow it. Keep a few real end-to-end runs: each one proves a path that no direct call can prove. Write a behavior map with one row per assertion: the test that checks it after the phase, and whether that test is a direct call or an end-to-end run. For each moved check, show on a tempdir copy that breaking the function fails the new test (verify Phase 41).
+     - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does. When files share a fake tool or a fixture, change the fixture once. Make no copy of a fixture.
      - Remove trivial tests (Invariants above) only when step 2 shows tests that read as repeats: tests with the same setup and the same assertion target. Then run `python3 scripts/test_times/coverage_overlap.py scripts/<folder> <file>` and compare each candidate's assertions with its covering tests; a candidate whose result a covering test also checks is a trivial test. Skip the sweep in a module whose time is in process starts: Phase 13 found no repeat in five such modules.
-     - Share expensive setup: build a seed once in `setUpModule` or `setUpClass` and copy it for each test, as `scripts/build_hold/test_build_hold.py` does.
-     - Call code in-process in place of a subprocess when the test does not check the process boundary; keep one process test for each boundary.
-     - Split a module whose tests are independent into two or more files, so the gate runs them at the same time. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time. Every file of the group is in acceptance. Time the group with one `module_run.py` process per file, all started at once (as `pairs.sh` does), from the first start to the last end. The gate runs at most half the CPU count of modules at once (`DEFAULT_MAX_RUNNING_JOBS` in `merge_gate.py`); a group with more files than that gains less in the gate.
-  4. A change to a shared support file (for example `scripts/lint/memory_test_support.py`) is allowed only when every module that imports it stays green; name those importers in the final gate run.
-  5. After the edit, measure the gain in same-load pairs: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. Each side sets `TMPDIR` to its own folder under `/dev/shm` and removes it after the round, because the gate runs there and pays no `fsync` cost (Phase 47). A number on the normal disk is a separate result. The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the wall time is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. A floor names its cost breakdown and the one operation that limits it. A proposal names its owner, its revisit condition, and whether its gain is measured or estimated. The pair tool prints the before and after medians as a table when it ends. Report the before and after medians, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
+     - Remove a fixed wait: a sleep, a poll count, or a wait that no published state ends. Wait on the event, file, pipe or ready signal the code already gives. This cut gains wall time and no CPU (Phase 56: 30.5 to 31.1 CPU s), so it does not reach the target alone. A fixed wait often causes flakes, so a flaky module is a target too.
+     - Split a module only to gain wall time. A split adds CPU, so it never counts as a CPU gain. The original file and its new files are one group: compare the group's summed CPU, its test count, and its wall time when its files run at the same time.
+  4. A change to a shared support file (for example `scripts/lint/memory_test_support.py`) is allowed only when every module that imports it stays green; name those importers in the final run. A cut in `verify.sh` or another production file goes to its owner: verify for `verify.sh` (showrunner, 2026-11-06).
+  5. After the edit, measure the gain. Run `module_cost.py` on the phase base and on the result, one after the other, for processes and execs. Same-load pairs give CPU s and wall s: run the module at the phase base (a `copies.py run --commit <base>` copy) and in the worktree at the same time, three rounds, into `<module>-pair-<before|after>-<n>-<sha>.json`, with `/proc/loadavg` beside each round. Each side sets `TMPDIR` to its own folder under `/dev/shm` and removes it after the round, because the gate runs there and pays no `fsync` cost (Phase 47). The host load changes all day, so a before batch and a later after batch do not compare. The director runs the pairs after the last repair lands (example: `phases/7/pairs.sh` in the run directory). Half the CPU is the target. When the allowed edits cannot reach it, report the measured floor and send the rest as an architecture proposal. A floor names its cost breakdown and the one operation that limits it. A proposal names its owner, its revisit condition, and whether its gain is measured or estimated. Report CPU s and process count first, then wall s, each removed test with its reason or covering test, and each architecture proposal with its measured gain.
 
 ## Phases
 
@@ -640,43 +648,14 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Only the modules that call `forbid_real_sender()` are guarded. The next-items backlog holds the proposal that the runner guards every module.
 - A change to `send.py` keeps the guard as the first statement of `main()`.
 
-### Phase 27 — `test_merge_gate_ledger.py` runs in half its time  · status: todo
+### Phase 27 — `test_merge_gate_ledger.py` runs in half its time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_merge_gate_ledger.py` (gate median 121.3 s, 14.8 CPU s; the top live module that no phase holds and that the verify-unit remake does not touch) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+- Closed with no code on 2026-11-06. Queue's Phase 13 start-spacing fix removed the module's 110 s of admission waits. The gate median fell from 121.3 s to 23.2 s, at 16.9 CPU s, rank 130 by wall time. The CPU rank does not call it.
 
-**Spec:** Follow the Speed method. This phase runs while Phase 24 waits on the verify-unit remake (Phase 22 architect review, 2026-11-05). sdlc devtools-unit owns `merge_gate.py` and its test files; natest-unit changes the test files through cargo-berth's flow.
-
-1. Profile before any edit: for each of the 17 tests, find where the wall time goes. The module spends about 106 s of 121 s with no CPU, so look first for waits: poll intervals, sleeps, timeouts, lock or admission waits, and child jobs that wait on a clock. Name each wait, the code line that holds it, and the published state that could end it. Count the gate runs, module jobs and type jobs that each test starts. Write the result into this Spec and name the files and changes before the code dispatch.
-2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
-3. A cut in `merge_gate.py` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase.
-4. A change to `merge_gate_test_support.py` keeps every `test_merge_gate*.py` module green; name each one in the final run.
-5. The two files belong to the sdlc production. sdlc devtools-unit holds them on an unmerged branch while it repairs a `merge_gate.py` guard (showrunner, 2026-11-05). sdlc gave natest the `run_gate` clock fix. The code step starts only after the builds showrunner sends the go with the main hash of devtools' repaired combined merge (due about 07:10 EST). That merge changes `merge_gate_test_support.py`: merge the hash first and build on it. The profile in step 1 is done.
-6. Profile result (2026-11-05, baseline median 118.2 s wall, 11.1 CPU s, 17 tests): 110.0 s is 22 admission start waits of about 5 s each. After each admission, `scripts/lint/memory_admit.py:3716` publishes `NextStartAt(now + recovery_start_seconds)` (`build_admission.conf`: 5 s). The private server keeps that deadline between the gates of one test, and `admission_test_support.py:357-365` moves its fake clock with real time. So each later gate in a test waits 5 real seconds. Seed builds (0.3 s), type environment builds (0.9 s) and scheduler polls (3.7 s, `merge_gate.py:1144`) are small.
-7. Code step (showrunner, 2026-11-05): the fixture does not advance the admission clock by hand. A manual `allow_next_start()` advance in each module is a workaround. Queue Phase 13 fixed the start spacing at its cause: `advance_idle_spacing` in `scripts/build_queue/admission_test_support.py:369`, which `caller_admission` turns on by default. The code step starts when the go in step 5 has come. Merge builds, then measure the 18-test module in same-load pairs before any edit: runs on 2026-11-06 split into 14-17 s and 120-130 s, and the rolling median still reads about 125 s. If the module is at half time, record the result and close the phase with no edit. If not, profile the rest and cut it in the Speed method's order. Keep hold, pressure, queued-head and timing behavior. Leave the mocked nightly calls. Keep every test name, assertion, gate order, module job and type job in all 12 `test_merge_gate*.py` modules. Do not set the spacing to zero or mock the admission result. Add no guard, refusal or check that this Work Order does not name. Projected ledger result after the queue fix: 8-12 s.
-8. Later proposal, not this phase: `merge_gate.py` could wake on child exit in place of 0.05 s polls (at most 3.7 s here; owner sdlc devtools-unit).
-
-**Files:**
-- `scripts/production/merge_gate_test_support.py` — only for a cut the new profile names
-- `scripts/production/test_merge_gate_ledger.py` — only for a cut the new profile names
-
-**Workers:** 1 writer (one module and its fixture; the files do not split)
-- `impl` — all files above
-
-**Constraints from prior phases:**
-- Phase 25: `MergeGateFixture.build_fixture` commits the real `module_run.py` into each fixture checkout, and the gate refuses a checkout with no runner.
-- Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- Architect review after Phase 41: the module now has 18 tests, and `test_targeted_test.py` also imports the fixture. Profile the current module after Phase 36, and add `test_targeted_test.py` to the final run when the fixture changes.
-- Architect review after Phase 34: `merge_gate_test_support.py:273` casts `None` to `AdmissionFixture`, and `admission_started` tracks its lifetime apart. A change to that lifetime uses named states (for example `AdmissionNotStarted | RunningAdmission`). A change that only measures needs no refactor.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_merge_gate_ledger.py'` green, with the same test names and assertions
-- all 12 `scripts/production/test_merge_gate*.py` modules and `scripts/production/test_targeted_test.py` green, with the same test names and assertions; each module's before and after time in same-load pairs
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
+**Binds later work:** `merge_gate.py` could wake on child exit in place of 0.05 s polls: at most 3.7 s here; owner sdlc devtools-unit. Nothing starts it.
 
 ### Phase 28 — The build log isolation test checks every module in parallel  · status: done
 **Depends on:** none
@@ -964,7 +943,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Goal:** each `copies.py` use does less Git work, with the same copies. Phase 40 measured 803 `refresh_remotes` calls, 1,606 fetches, 3,212 config writes and 1,606 update-refs, about 100 s of a 325 s profiled `style/test_crate_run.py` run. The showrunner assigned this on 2026-11-05 and moved queue's item to it.
 
 **Spec:**
-1. Measure before any edit: `style/test_crate_run.py` (same-load pairs) and one real `copies.py run`. The module's median is now 89 s, so the 325 s profile above does not give its current cost. Profile the current `standing` and `workspace` costs, then state the gain.
+1. Measure before any edit: `style/test_crate_run.py` (CPU s and process count first, then wall s; same-load pairs) and one real `copies.py run`. The module's median is now 89 s, so the 325 s profile above does not give its current cost. Profile the current `standing` and `workspace` costs, then state the gain.
 2. `refresh_remotes` (`scripts/copies/copies.py:372`) does only the work a changed source needs.
 3. Remove the full object scan from `copies.py` initialization (0.39 s per `verify.sh doc` run; item from queue-unit).
 4. Queue-unit keeps the `copies.py` list labels item. On `copies.py`, the second lander resolves.
@@ -1155,24 +1134,29 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Ruled out:** In-process launcher calls: the identity check needs the real process chain.
 
-### Phase 55 — `direct/test_assign_launcher.py` runs in half its time  · status: todo
+### Phase 55 — The assign launcher tests use half their CPU  · status: todo
 **Depends on:** Phase 54
 **Blocked by:** models a0b90e899 and herdr 14a on main; the showrunner sends the word. Do not merge the sdlc branch.
 
 #### Work Order
 
-**Goal:** `scripts/direct/test_assign_launcher.py` (85 s wall, 69 CPU s at 21 tests) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+**Goal:** the five assign launcher test files (344 CPU s per gate on 2026-11-06, the largest group outside `test_verify*`) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept.
 
 **Spec:** Follow the Speed method.
-1. Take a new baseline after the merge. Recent trees ran 21, 39 and 42 tests in this module, so name the test count at dispatch.
-2. A test that only needs the state of a first dispatch uses `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. A later dispatch stays a real process. Keep one process test per boundary.
+1. Take a new baseline after the merge. Name each file's test count at dispatch, and each real launcher process each test starts.
+2. Test launcher logic by direct calls. Keep a few real dispatches, each for a path that no direct call can prove. A test that only needs the state of a first dispatch uses `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. The Phase 54 wall floors of `_reuse` and `_identity` do not hold these files back.
 3. A cut in a production file goes to the director first, with the measured gain.
 4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
 
 **Files:**
-- `scripts/direct/test_assign_launcher.py` — the module
+- `scripts/direct/test_assign_launcher.py` — 120.7 CPU s
+- `scripts/direct/test_assign_launcher_reuse.py` — 71.9 CPU s
+- `scripts/direct/test_assign_launcher_identity.py` — 64.5 CPU s
+- `scripts/direct/test_assign_launcher_review.py` — 43.8 CPU s
+- `scripts/direct/test_implement_launcher_records.py` — 43.6 CPU s
+- `scripts/direct/assign_launcher_test_support.py` — the shared fixture
 
-**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
+**Workers:** 1 writer on slot `impl4` (the files share one fixture, so they do not split)
 - `impl4` — all files above, role impl
 
 **Constraints from prior phases:**
@@ -1181,44 +1165,31 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher.py'` green, with the same test names and assertions
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- each changed file green; the behavior map has one row per assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after for each file, in the checkpoint notice
 - the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 56 — The SSH retained and retry tests run in half their time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_verify_ssh_targets_retained.py` (65 s wall, 32 CPU s) and `scripts/direct/test_verify_ssh_targets_retry.py` (63 s wall, 34 CPU s) each run in half their time, or a measured floor shows why they cannot, with every checked behavior kept. They are the top live modules that no phase holds and no branch edits, and wall time is about twice CPU time in both.
-
-**Spec:** Follow the Speed method.
-1. Each module has 4 tests. `test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup`, `test_mac_memory_retry_recovers_its_claim_without_a_reservation_file` and `test_mac_memory_retry_waits_until_its_retry_deadline` take 17-20 s each. Profile before any edit. Name each wait, what sets its length, and the behavior that needs it.
-2. Cut in the Speed method's order, fixed waits first. A wait that a test can shorten through config or the fixture stays in the test files. A cut in a production file goes to the director first, with the measured gain. Do not edit `build_hold.py`: it is frozen.
-3. A change to `verify_ssh_targets_test_support.py` keeps every importer green: `direct/test_verify_ssh_targets.py`, `_routing.py`, `_results.py`, `_retained.py`, `_retry.py`.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- The shared fixture waits on events, not on fixed seconds. Each module loses about 28 s of fixed waits; CPU does not change.
+- Same-load pair medians, load 52-65: `test_verify_ssh_targets_retained.py` 62.67 s to 35.46 s, ratio 0.566, 4 to 7 tests. `test_verify_ssh_targets_retry.py` 64.50 s to 42.11 s, ratio 0.653, 4 tests. Half is not reached.
+- `verify` holds `memory-hook-ack` open with `os.O_RDWR` from before the start until its end. The hook reads exactly the acknowledgment length, so a hook that skips its read blocks nothing.
+- `test_verify_returns_when_settled_hook_skips_acknowledgment` and two more regression tests pin the settled hook, early exit and output drain paths.
 
 **Files:**
-- `scripts/direct/test_verify_ssh_targets_retained.py` — the first module
-- `scripts/direct/test_verify_ssh_targets_retry.py` — the second module
 - `scripts/direct/verify_ssh_targets_test_support.py` — the shared fixture
+- `scripts/direct/test_verify_ssh_targets_retained.py` — the module and the regression tests
+- `scripts/direct/test_verify_ssh_targets_retry.py` — unchanged; it gains through the fixture
 
-**Workers:** 1 writer on slot `impl4` (the files share one fixture and do not split)
-- `impl4` — all files above, role impl
+**Binds later work:** The floor is the child process starts and the coordination imports through `build_hold.py`, as in Phase 24. `recovery_start_seconds` stays 5 s (Phase 27 constraint). Measure both modules in pairs when queue-unit's `build_hold.py` cut is on builds.
 
-**Constraints from prior phases:**
-- Phase 24: `eligible` and `reserve` start the coordination imports through `build_hold.py`, and that cost sets the routing floor. queue-unit takes the `build_hold.py` import after the freeze. A warm command server in the fixture tests a different process boundary, so do not use one.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Phase 27: the fixture uses `caller_admission`. Do not advance the admission clock by hand, set the spacing to zero or mock the admission result. queue-unit owns the spacing fix in `scripts/build_queue/admission_test_support.py`. Report any measured spacing cost to the director for queue-unit.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:** A FIFO open for write blocks until a reader opens it, so a test holds one read-write descriptor. A retry interval near 0.01 s starves ready admission replies. A short retry repair has no regression test, because it needs a scheduling delay injected in a production file.
 
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets_retained.py'` and the same line for `test_verify_ssh_targets_retry.py` green, with the same test names and assertions
-- every importer of the support file green, if the phase changes it
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** A warm command server in the fixture: it tests a different process boundary.
 
 ### Phase 57 — The merge tip holds the queue stack, and the unit's narrow run is called targeted test  · status: done
 **Depends on:** none
@@ -1260,3 +1231,116 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Gotchas:** The test reads the default root with `BUILDLOG_DIR` removed, under the patched `HOME`.
 
 **Ruled out:** A proof that appends to the real shared log: it puts false rows in a log other tools read.
+
+### Phase 59 — `style/test_style_proposals.py` uses half its CPU  · status: todo
+**Depends on:** Phase 61
+
+#### Work Order
+
+**Goal:** `scripts/style/test_style_proposals.py` (60.8 CPU s, 112.7 s wall, 186 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method.
+1. Profile before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count.
+2. Cut in the Speed method's order, direct calls first.
+3. A cut in a production file goes to the director first, with the measured gain. Do not edit `scripts/style/style_sync.py` or `scripts/style/test_style_sync.py`: devtools holds them.
+4. devtools 3z holds this file and `style_proposals.py` for import lines only. Before the checkpoint, take 3z through builds when the showrunner says builds has it (showrunner, 2026-11-06).
+5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/style/test_style_proposals.py` — the module
+
+**Workers:** 1 writer on slot `impl` (one module; the file does not split)
+- `impl` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Phase 56: an event wait uses one held descriptor and bounded reads. Same-load pairs run after the last repair lands.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/style -p 'test_style_proposals.py'` green; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
+- CPU s, processes, execs and wall s before and after, in the checkpoint notice
+- the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 60 — `show.py top` ranks by CPU, and `module_cost.py` counts process starts  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the director sees the targets by CPU per gate at once, and measures any module's CPU s, processes, execs and wall s with one command.
+
+**Spec:**
+1. `show.py top` for `~/.claude` ranks gate modules by median CPU. The columns are: rank, suite/module, median CPU s, median s, last s, tests run, slowest kept test. The sum line sums median CPU. The nextest view for another repository stays as it is.
+2. New `scripts/test_times/module_cost.py --tree <path> <folder>/<file> [<folder>/<file> ...]` prints one table row for each module and a total row: CPU s, processes, execs, wall s, test status.
+3. For each module, one run gives CPU s and wall s: `python3 -m unittest discover -s scripts/<folder> -p <file>` with cwd `<path>`, `HERDR_BIN=/nonexistent/herdr` and `PYTHONDONTWRITEBYTECODE=1`, from `os.wait4` resource use and the clock.
+4. A separate run under `strace -f` gives the counts: processes are `fork`, `vfork`, `clone` and `clone3` calls that succeed without `CLONE_THREAD`, and execs are `execve` calls that succeed. The trace goes in a tempdir, which is removed after. This is verify's Phase 41 method, in one shared place.
+5. A red module prints its status in its row, and the command exits nonzero. No `strace` on PATH prints one error line and exits 2.
+6. Change every text that says `top` ranks by wall time: `commands/test_times.md` and any doc that `git grep` finds.
+7. Add no guard, refusal or check beyond item 5. Add no option that this Spec does not name.
+
+**Files:**
+- `scripts/test_times/show.py` — the rank
+- `scripts/test_times/test_show.py` — the rank's tests
+- `scripts/test_times/module_cost.py` — new
+- `scripts/test_times/test_module_cost.py` — new
+- `commands/test_times.md` — the text
+
+**Workers:** 1 writer on slot `impl3` (one small tool and one query; the tests need both)
+- `impl3` — all files above, role impl
+
+**Constraints from prior phases:**
+- `show.py` loads only what its command needs; it is an instant tool (the user's mission).
+- Phase 16: `top` keeps one view from the root and from a subdirectory, and `--host` selects Mac history.
+- A count test uses captured `strace` lines by direct call. One real run counts a tempdir module that starts two children; it skips when `strace` is absent, as on the Mac.
+
+**Acceptance gate:**
+- `test_show.py` and `test_module_cost.py` green, with each changed assertion named in the summary
+- `show.py top --repo ~/.claude` prints in under 1 s, ranked by median CPU
+- `module_cost.py` on `direct/test_verify_mac_arguments.py` agrees with verify's method on the same tree: within 5% on processes
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 61 — The seven largest verify test files test logic by direct calls  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Source:** the user via the showrunner, 2026-11-06: natest does the test work. Remaining `test_verify*` files go first, largest CPU first, one bumped checkpoint per batch.
+
+**Goal:** these seven files (590 CPU s per gate) use half their CPU, or a measured floor shows why they cannot, with every checked behavior kept. None of them is in the order of verify's cost doc, so verify's current batch does not hold them.
+
+**Spec:** Follow the Speed method, direct calls first.
+1. Each file gets a behavior map with one row per assertion: the test that checks it after the phase, and whether that test is a direct call or an end-to-end run.
+2. Move argument, routing, selection and result checks onto direct calls of the Bash functions in `verify.sh` and the Python functions they use. Use `scripts/lib/shell_test_support.py` for Bash functions.
+3. A file is finished when each real `verify.sh` run left in it proves something that no direct call can prove.
+4. Put no copy of a fixture in a test file. The SSH writer owns `verify_ssh_targets_test_support.py`. The Mac and lint fixtures are shared with 40 or more files and verify's batch may hold them: send the director a wanted change and its measured gain.
+5. A cut in `verify.sh` or another production file goes to the director with the measured gain. The director sends it to verify.
+6. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/direct/test_verify_mac_only.py` — 186.0 CPU s, 17 tests
+- `scripts/direct/test_verify_lint_judgment.py` — 131.5 CPU s, 10 tests
+- `scripts/direct/test_verify_lint_cache_versions.py` — 83.6 CPU s, 7 tests
+- `scripts/direct/test_verify_ssh_targets_routing.py` — 75.5 CPU s, 13 tests
+- `scripts/direct/test_verify_ssh_targets_results.py` — 47.8 CPU s, 8 tests
+- `scripts/direct/test_verify_ssh_targets_retry.py` — 35.0 CPU s, 4 tests
+- `scripts/direct/test_verify_ssh_targets_retained.py` — 31.0 CPU s, 7 tests
+- `scripts/direct/verify_ssh_targets_test_support.py` — the SSH fixture
+
+**Workers:** 3 writers; each family has its own fixture
+- `impl` — `test_verify_mac_only.py`, role impl
+- `test` — `test_verify_lint_judgment.py`, `test_verify_lint_cache_versions.py`, opens as impl
+- `impl4` — the four `test_verify_ssh_targets_*` files and `verify_ssh_targets_test_support.py`, role impl
+
+**Constraints from prior phases:**
+- Phase 42: `test_verify_mac_only.py` went from 183.67 to 150.76 CPU s through light imports in `mac_idle.py`; do not repeat that cut.
+- Phase 56: the SSH fixture holds one read-write descriptor for its event wait. Its fixed waits are gone, so CPU there is process starts and imports through `build_hold.py`.
+- Phase 31: lint judgment cost is real lint scripts under `verify.sh`. Its 198.6 s wall floor does not hold it back.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- The behavior map has a row for each assertion of each file, and no row lacks a test. A reviewer reads the old assertions against the map.
+- For each moved check, breaking the function fails the new test, shown on a tempdir copy.
+- CPU s, processes, execs and wall s before and after for each file, from `module_cost.py` and same-load pairs, in the checkpoint notice.
+- The changed files and every importer of a changed fixture pass. No full suite: this batch is bumped, so it runs lint and the tests of the changed files only (showrunner, 2026-11-06).
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`.
