@@ -254,7 +254,7 @@ class StaffSourcesTests(StaffTestCase):
                   mock.patch.object(process_table, "snapshot", side_effect=[table, {}]),
                   mock.patch.object(herdr, "process_environment", side_effect=failure),
                   redirect_stderr(io.StringIO()) as errors):
-                evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+                evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
             self.assertEqual(evidence.diagnostics, ())
             self.assertEqual(errors.getvalue(), "")
 
@@ -266,7 +266,7 @@ class StaffSourcesTests(StaffTestCase):
         with (mock.patch.object(process_table, "snapshot", side_effect=[table, table]),
               mock.patch.object(herdr, "process_environment", side_effect=PermissionError("permission denied"))):
             with self.assertRaisesRegex(staff.StaffUnreadable, "Codex processes: permission denied"):
-                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources(()))
 
 
     def test_codex_without_a_thread_in_an_unowned_pane_reports_a_diagnostic_without_refusal(self) -> None:
