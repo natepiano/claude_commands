@@ -558,6 +558,14 @@ def setUpModule() -> None:
     roster_locks = patch.object(fcntl, "flock", new=RosterRelockGuard())
     _ = roster_locks.start()
     unittest.addModuleCleanup(roster_locks.stop)
+    pane_environment = {key: value for key, value in os.environ.items() if key.startswith("HERDR_")}
+    for key in pane_environment:
+        del os.environ[key]
+
+    def restore_pane_environment() -> None:
+        os.environ.update(pane_environment)
+
+    unittest.addModuleCleanup(restore_pane_environment)
     # No test sees a real sign-in; the synthetic selection predates every fake server.
     home = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-home-")
     usage = tempfile.TemporaryDirectory()

@@ -487,6 +487,10 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
         if process.place.session not in running:
             continue
         native = holders[process.pid][1]
+        problem = unread.places.get(process.place, unread.unplaced.reason
+                                    if isinstance(unread.unplaced, RecordsPartlyUnread) else "")
+        if problem and process.pid not in claudes:
+            session_staff.report_anomaly(f"pid {process.pid} in {place_text(process.place)}: {problem}", pid=process.pid)
         if not native:
             if process.place in unread.places or process.command in ("claude", "codex"):
                 yield LabeledSession("", ClaudeUnknown("native runtime identity is unavailable"), process.place,
@@ -495,10 +499,8 @@ def _herdr_labeled(claudes: dict[int, LiveClaude], unread: UnreadAt,
         claude: Claude
         if process.pid in claudes:
             claude = claudes[process.pid]
-        elif process.place in unread.places:
-            claude = ClaudeUnknown(unread.places[process.place])
-        elif isinstance(unread.unplaced, RecordsPartlyUnread):
-            claude = ClaudeUnknown(unread.unplaced.reason)
+        elif problem:
+            claude = ClaudeUnknown(problem)
         elif (process.command in ("sh", "bash", "zsh", "dash", "fish", "ksh") and process_counts[process.place] == 1
               and process.marks.get("CLAUDE_CODE_SESSION_ID") == native
               and not process.marks.get("CODEX_THREAD_ID")):

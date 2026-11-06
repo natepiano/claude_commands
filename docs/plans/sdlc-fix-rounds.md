@@ -291,9 +291,13 @@ From the sdlc showrunner, 2026-11-05. Dropped on 2026-11-06: hash `50bfbdcf6` do
 
 Devtools 3y `finish_repair` in `scripts/direct/assign.py` resolves the round: `landed` on a clean exit, `abandon --edits-landed` on an error. The fix call in `commands/unit/direct.md` sets `UNIT_RESOLVES_ROUND=1`, so a director passes that prefix on each repair round.
 
+### Phase 9w — The units table prints an anomaly only for a fault someone must act on  · status: done
+
+From the user's C1156 verdict and the sdlc showrunner, 2026-11-06. All 18 anomaly lines in the user's screenshot were false: a test's fake codex with an inherited pane id, three staff workers read as not staff, and one session with no staff row. Remove the process scan from the table, remove the lines for a process with no staff row, stop placing a process under a unit by its pane alone when its id has no staff row, print each process once, and run the test's fake without the pane variables. If another caller uses the lookup that calls a staff worker not staff, fix it; otherwise delete the dead path. The user approved one new check: an --except value that matches no unit of the production refuses the pause, changes nothing, and names the bad value.
+
 ### Phase 9v — A production pause keeps each unit named in --except  · status: done
 
-From the sdlc showrunner, 2026-11-06. `staff.py pause --production hana --except fastest-unit` paused every unit, because the exception compares only the row name and id. Resolve each value through the one unit lookup: the name, the -unit form and the id all match. Add a test for each form. One matcher, unit_match, limited to the production's own members. A refusal for an unmatched value is a new check, and it waits for the user's answer.
+From the sdlc showrunner, 2026-11-06. `staff.py pause --production hana --except fastest-unit` paused every unit, because the exception compares only the row name and id. Resolve each value through the one unit lookup: the name, the -unit form and the id all match. Add a test for each form. One matcher, unit_match, limited to the production's own members. The user approved a refusal for an unmatched value on 2026-11-06; Phase 9w carries it.
 
 ### Phase 9u — The units hash merges with the staff-name change on sdlc  · status: done
 

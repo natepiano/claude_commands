@@ -1267,7 +1267,7 @@ class Herdr:
             if label is not None and not isinstance(label, str):
                 print(f"herdr {self.session}: pane label is unreadable; pane id used", file=sys.stderr)
                 label = None
-            session_id = _pane_session(pane) or None
+            session_id = pane_session(pane) or None
             entry: PaneIdentity = {"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
                                   "terminal_id": json_text(pane.get("terminal_id", ""), "herdr terminal id"),
                                   "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
@@ -1841,7 +1841,7 @@ class Herdr:
     def _codex_launch(self, pane: str, info: dict[str, object],
                       arguments: Sequence[str]) -> pane_launch.PaneLaunch:
         row = self.pane_row(pane)
-        reported = _pane_session(row) if not isinstance(row, NoPane) and codex_without_session(info) else ""
+        reported = pane_session(row) if not isinstance(row, NoPane) and codex_without_session(info) else ""
         thread = "" if reported else self.codex_client_session(pane)
         matches: list[pane_launch.PaneLaunch] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
@@ -2414,7 +2414,8 @@ def _pane_process_ids(info: dict[str, object], context: str) -> tuple[int, int]:
     return cast(tuple[int, int], values)
 
 
-def _pane_session(row: Mapping[str, object]) -> str:
+def pane_session(row: Mapping[str, object]) -> str:
+    """Read the native session recorded in a pane's metadata."""
     report = row.get("agent_session")
     session = cast(dict[str, object], report).get("value") if isinstance(report, dict) else row.get("session_id")
     if session is not None and not isinstance(session, str):
@@ -2432,7 +2433,7 @@ def codex_without_session(info: dict[str, object]) -> bool:
 def pane_native_process(info: dict[str, object], kind: str,
                          pane: Mapping[str, object]) -> NativeAgentProcess:
     foreground = json_items(info.get("foreground_processes"), "native foreground processes")
-    reported = _pane_session(pane) if kind == "codex" and codex_without_session(info) else ""
+    reported = pane_session(pane) if kind == "codex" and codex_without_session(info) else ""
     processes: list[NativeAgentProcess] = []
     for value in foreground:
         process = json_object(value, "native foreground process")
@@ -3291,7 +3292,8 @@ def codex_rollout_thread(pid: int) -> str:
     return next(iter(identities))
 
 
-def _codex_resume_thread(pid: int) -> str:
+def codex_resume_thread(pid: int) -> str:
+    """Read the Codex thread from its resume arguments."""
     if _platform() == "darwin":
         process = next((process for process in _darwin_processes() if process.pid == pid), None)
         if process is None or isinstance(process.arguments, UnreadableProcessArguments):
@@ -3327,7 +3329,7 @@ def native_process(pid: int, kind: str, reported: str = "") -> NativeAgentProces
             identity = RolloutThread(codex_rollout_thread(pid))
         except NoOpenCodexRollout:
             try:
-                resume = _codex_resume_thread(pid)
+                resume = codex_resume_thread(pid)
             except ValueError:
                 if not reported:
                     raise

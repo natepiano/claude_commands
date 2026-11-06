@@ -116,11 +116,6 @@ def _problem(path: Path | str, error: object, *, pid: int = 0) -> None:
         print(message, file=sys.stderr)
 
 
-def is_non_staff_note(message: str) -> bool:
-    """Identify a diagnostic that excludes an agent from staff."""
-    return message.endswith("; not staff")
-
-
 def codex_thread_host(arguments: list[str]) -> bool:
     """An app-server hosts threads; its inherited staff mark is not a session."""
     index = 2 if arguments and Path(arguments[0]).name in ("node", "nodejs") else 1
@@ -140,7 +135,7 @@ def codex_thread_host(arguments: list[str]) -> bool:
 
 
 def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources, pane: str) -> bool:
-    """Join the pane's retained identity or unit labels to the supplied staff snapshot."""
+    """Join a pane's retained launch to the supplied staff snapshot."""
     for launch in sources.launches:
         if launch.get("pane_id") != pane or launch.get("ended"):
             continue
@@ -149,21 +144,8 @@ def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources
     return False
 
 
-def codex_non_staff_reason(record: staff.StaffSnapshot, sources: _MemberSources,
-                           environment: Mapping[str, str]) -> str:
-    """Exclude a process without a thread only when its pane has no staff owner."""
-    if environment.get("CODEX_THREAD_ID", ""):
-        return ""
-    pane = environment.get("HERDR_PANE_ID", "")
-    if not pane:
-        return "not in a herdr pane; not staff"
-    if not pane_holds_staff_member(record, sources, pane):
-        return "pane holds no staff member; not staff"
-    return ""
-
-
 class CodexProcessThreads:
-    """Read a thread from its environment or the daemon's named terminal."""
+    """Read a thread from its process or terminal metadata."""
 
     def __init__(self) -> None:
         self.panes: dict[tuple[str, str], dict[str, object]] = {}
@@ -176,6 +158,10 @@ class CodexProcessThreads:
         if identity := environment.get("CODEX_THREAD_ID", ""):
             return identity
         try:
+            try:
+                return herdr.codex_resume_thread(pid)
+            except (OSError, ValueError):
+                pass
             place = herdr.herdr_place_of(pid)
             if isinstance(place, herdr.NotInHerdr):
                 return ""
@@ -184,6 +170,8 @@ class CodexProcessThreads:
                 self.panes[key] = herdr.json_object(herdr.Herdr(place.session).result("pane", "get", place.pane).get("pane"),
                                                   "Codex pane")
             pane = self.panes[key]
+            if identity := herdr.pane_session(pane):
+                return identity
             title = pane.get("terminal_title_stripped")
             if not isinstance(title, str):
                 return ""
@@ -276,8 +264,6 @@ class _WorkerSources:
         self.running: dict[str, sessions.SessionRecord] = {
             item.record["sessionId"]: item.record for item in registry.entries if sessions.running_session(item.record)
         }
-        self.native_processes: dict[str, list[tuple[int, str]]] = {
-            identity: [(session["pid"], "claude")] for identity, session in self.running.items()}
         self.native_running: dict[str, dict[str, str]] = {
             identity: {"claude": identity} for identity in self.running}
         from scripts.message import process_table
@@ -288,6 +274,7 @@ class _WorkerSources:
             self.codex_scan_incomplete = True
             _problem("Codex processes", error)
             processes = {}
+        threads = CodexProcessThreads()
         for process in processes.values():
             try:
                 try:
@@ -306,17 +293,16 @@ class _WorkerSources:
                     if process.pid in process_table.snapshot():
                         raise
                     continue
-                native = environment.get("CODEX_THREAD_ID", "")
+                native = threads.thread(process.pid, environment)
                 if session_staff.report_process(process.pid, native).is_morty:
                     continue
                 if native:
-                    self.native_running[native] = {"codex": native}
-                    self.native_processes.setdefault(native, []).append((process.pid, "codex"))
-                elif reason := codex_non_staff_reason(record, sources, environment):
-                    _problem(f"Codex process {process.pid}", reason, pid=process.pid)
-                else:
+                    if record.by_current_session(native) is not None:
+                        self.native_running[native] = {"codex": native}
+                elif (pane := environment.get("HERDR_PANE_ID", "")) and pane_holds_staff_member(record, sources, pane):
                     self.codex_scan_incomplete = True
-                    _problem(f"Codex process {process.pid}", "native thread identity is unavailable", pid=process.pid)
+                    _problem(f"Codex process {process.pid} in pane {pane}",
+                             "cannot read its thread; staff status may be incomplete", pid=process.pid)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 self.codex_scan_incomplete = True
                 _problem(f"Codex process {process.pid}", error, pid=process.pid)
@@ -367,15 +353,6 @@ def production_units(slug: str) -> tuple[staff.StaffRow, ...]:
     """Read unit membership for the staff pause and resume commands."""
     record = staff.snapshot()
     return session_staff.production_members(record).get(slug, ())
-
-
-def unplaced_processes(record: staff.StaffSnapshot, sources: _MemberSources) -> None:
-    """Include the process scanner's unplaced agents in the units report."""
-    scan = _WorkerSources(record, sources)
-    for identity in scan.native_running:
-        if record.by_current_session(identity) is None:
-            for pid, command in scan.native_processes[identity]:
-                session_staff.report_anomaly(f"pid {pid} ({command}): {identity}: no current staff row", pid=pid)
 
 
 def _live_member(row: staff.StaffRow, role: LiveRole, identity: Mapping[str, str]) -> dict[str, object]:

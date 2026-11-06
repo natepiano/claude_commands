@@ -273,9 +273,14 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `units_of(name)` uses that reader and prints its anomalies on stderr.
     `units_in(name, every)` joins supplied observations and adds each unit's staff status.
     `session_staff.anomalies` collects diagnostics and preserves other callers' stderr output.
-    The command prints unplaced processes below the table on stdout.
-    The process scanner also supplies processes outside the pane lookup.
-    `CodexProcessThreads.thread` reads native identity, terminal metadata and a unique loaded daemon thread name.
+    The command prints read failures below the table on stdout when they make the table wrong or incomplete.
+    Staff name conflicts also produce lines. Each process has at most one line.
+    The command does not scan other processes.
+    A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
+    A process without an identity can retain its pane placement for status and recovery.
+    `CodexProcessThreads.thread` reads the thread environment, resume arguments, the native pane session, and the terminal title with daemon names.
+    The worker scanner uses this reader before it joins the current thread to its staff row.
+    A missing pane launch record does not make a resolved staff worker unknown.
     `send.morty_stamp` matches Morty's thread against `MORTY_NATIVE_ID` from `config/send.conf`.
     A match produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).

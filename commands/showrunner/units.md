@@ -51,7 +51,11 @@ and shows only when it differs. The date is now plus `approved / r` days.
 When `r` is zero, it ends with `no ETA: nothing built in 24 h`. Numbers use
 thousands commas. Times and the date use the production zone.
 
-Unplaced processes appear as `anomaly:` lines under the table. Morty produces no anomaly when its thread matches `MORTY_NATIVE_ID` in `config/send.conf`.
+Read failures that make the table wrong or incomplete appear as `anomaly:` lines below the table.
+Staff name conflicts also produce lines. The command does not scan other processes.
+A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
+A process without an identity can retain its pane placement for status and recovery.
+Morty produces no anomaly when its thread matches `MORTY_NATIVE_ID` in `config/send.conf`.
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 
