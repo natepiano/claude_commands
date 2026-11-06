@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import math
 import json
 import os
 import signal
@@ -27,6 +28,7 @@ from scripts.accounts import accounts
 from scripts.message import codex_daemon
 from scripts.shutdown import shutdown_record, stop_resume, pane_record
 from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from test_support import ShutdownTestCase, registry_confirmation
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
@@ -242,6 +244,14 @@ class SessionLaunchTests(ShutdownTestCase):
 
 
 class RecordedResumeTests(ShutdownTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+            write_text_atomic(configuration / source.name, source.read_text())
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+
     folder: Path = Path("/tmp/recorded-resume")
 
     def entry(self, kind: Literal["claude", "codex"], model: str) -> pane_record.PaneLaunch:
@@ -320,6 +330,10 @@ class RestartTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+            write_text_atomic(configuration / source.name, source.read_text())
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / ".claude2"
         config.mkdir()
@@ -339,6 +353,7 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(sessions, "_readable_records", side_effect=self.records))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop))
+        _ = self.enterContext(patch.object(stop_resume, "stop_unit_workers", return_value=[], create=True))
         _ = self.enterContext(patch.object(restart, "session_launch", side_effect=self.session_launch))
         _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
         _ = self.enterContext(patch.object(accounts, "role_account", return_value=accounts.NamedAccount(
@@ -349,6 +364,7 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(herdr, "launch_prepared_agent", side_effect=self.launch))
         _ = self.enterContext(patch.object(herdr, "restore_server"))
         _ = self.enterContext(patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
+        _ = self.enterContext(patch.object(herdr.Herdr, "sort_tabs"))
         _ = self.enterContext(patch.object(herdr.Herdr, "save_layout"))
         _ = self.enterContext(patch.object(herdr.Herdr, "remember_row_tab"))
         _ = self.enterContext(patch.object(herdr.Herdr, "tab_sessions", return_value=[]))
@@ -403,7 +419,8 @@ class RestartTests(ShutdownTestCase):
     def native(self, pane: str, _kind: str, _timeout: float) -> str:
         return str(self.rows[int(pane.rsplit("p", 1)[1])].current_session)
 
-    def stop(self, identity: str) -> stop_resume.Stopped:
+    def stop(self, identity: str, *, deadline: float = math.inf) -> stop_resume.Stopped:
+        _ = deadline
         row = next(row for row in self.rows if row.current_session == identity)
         self.stops.append(str(row.id))
         self.running.discard(str(row.current_session))
@@ -690,6 +707,7 @@ class RestartTests(ShutdownTestCase):
         for identity, label, unavailable in ((str(self.rows[0].current_session), "live", False), (None, "live", False),
                                            (str(self.rows[0].current_session), None, False), (None, "live", True)):
             with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)),
+                  patch.object(restart, "_pane_workers", return_value=False),
                   patch.object(herdr.Herdr, "panes", return_value=[{**self.panes()[0], "session_id": identity}],
                                side_effect=herdr.HerdrFailure("socket unavailable") if unavailable else None),
                   patch.object(herdr, "saved_layout", return_value=layout),
@@ -1094,3 +1112,60 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(self.stops, [])
         self.assertEqual(self.launches, [])
         self.assertIn("would signal a process that does not run session", errors.getvalue())
+
+    def test_restart_rerun_after_director_tab(self) -> None:
+        from scripts.production import worker
+
+        holder = self.rows[0]
+        child = replace(self.rows[1], kind="worker", parent=staff.ReportsTo(holder.id))
+        record = staff.StaffSnapshot((holder, child))
+        self.running.clear()
+        shutdown_record.save([str(holder.id), str(child.id)])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(unit_runs, "worker_transport", return_value="herdr"),
+              patch.object(worker, "restore", side_effect=[worker.ExitCode.UNCERTAIN, worker.ExitCode.OK]) as restore):
+            self.assertEqual(restart.restart(), 0)
+            self.assertEqual(shutdown_record.read(), [str(holder.id), str(child.id)])
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(restore.call_args_list, [call(holder.id), call(holder.id)])
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(shutdown_record.read(), [])
+
+    def test_restart_rerun_after_first_worker(self) -> None:
+        from scripts.production import worker
+
+        holder = self.rows[0]
+        children = tuple(replace(row, kind="worker", parent=staff.ReportsTo(holder.id)) for row in self.rows[1:])
+        record = staff.StaffSnapshot((holder, *children))
+        resumed: set[staff.StaffId] = set()
+
+        def restore(_parent: staff.StaffId) -> worker.ExitCode:
+            if not resumed:
+                resumed.add(children[0].id)
+                raise OSError("interrupted after first worker")
+            resumed.update(child.id for child in children)
+            return worker.ExitCode.OK
+
+        shutdown_record.save([str(row.id) for row in record.rows])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(unit_runs, "worker_transport", return_value="herdr"),
+              patch.object(worker, "restore", side_effect=restore)):
+            self.assertEqual(restart.restart(), 0)
+            self.assertEqual(len(shutdown_record.read()), 3)
+            self.assertEqual(restart.restart(), 0)
+            self.assertEqual(restart.restart(only=(str(holder.id),)), 0)
+        self.assertEqual(resumed, {child.id for child in children})
+        self.assertEqual(self.launches, [])
+        self.assertEqual(shutdown_record.read(), [])
+
+        from scripts.herdr import worker_panes
+
+        child = children[0]
+        for state, success in ((worker_panes.StoppedWorker(child, "w1:p1", "terminal-1"), True),
+                               (worker_panes.StoppedWorker(child, "w1:p1", "changed-terminal"), False),
+                               (worker_panes.ClosedWorker(child), False)):
+            self.running.add(str(child.current_session))
+            with (self.subTest(state=state), patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(unit_runs, "worker_transport", return_value="herdr"),
+                  patch.object(worker_panes, "observe", return_value=[state])):
+                self.assertEqual(restart.stop_row(child, herdr.Herdr("fixture")), success)

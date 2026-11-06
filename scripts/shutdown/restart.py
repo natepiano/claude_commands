@@ -7,10 +7,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, cast
+from importlib import import_module
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
@@ -20,11 +20,42 @@ for dependency in ("herdr", "message", "lib", "shutdown"):
 import herdr
 import sessions
 from scripts.production import staff, session_staff
-from scripts.lib import nix_env, operation_deadline
-from scripts.shutdown import shutdown_record, stop_resume, pane_record
+from scripts.lib import conf, nix_env, operation_deadline, unit_runs
+from scripts.shutdown import shutdown_record, pane_record
+from scripts.shutdown.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.shutdown.codex_trust import trust_arguments
-from scripts.herdr import pane_launch
+import pane_launch
 from scripts.whoami.account import named_account_environment
+
+
+class WorkerRow(Protocol):
+    row: staff.StaffRow
+
+
+class WorkerShell(WorkerRow, Protocol):
+    pane: str
+    terminal: str
+
+
+class WorkerPanes(Protocol):
+    StoppedWorker: type[WorkerShell]
+    ClosedWorker: type[WorkerRow]
+    def observe(self, parent: staff.StaffId, record: staff.StaffSnapshot) -> list[WorkerRow]: ...
+    def worker_run(self, parent: staff.StaffRow) -> Path: ...
+
+
+class WorkerRestore(Protocol):
+    def restore(self, parent: staff.StaffId) -> int: ...
+
+
+class MemberLifecycle(Protocol):
+    def stop(self, session: str, *, deadline: float) -> StopResult: ...
+    def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
+    def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
+
+
+worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
+stop_resume = cast(MemberLifecycle, cast(object, import_module("scripts.shutdown.stop_resume")))
 
 
 @dataclass(frozen=True)
@@ -68,10 +99,18 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
         except (herdr.HerdrFailure, OSError, ValueError) as error:
             _anomaly(row, error)
             return False
-        result = stop_resume.stop(str(row.current_session))
-        if isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+        result = stop_resume.stop(str(row.current_session), deadline=deadline)
+        if isinstance(result, (Stopped, NotRunning)):
+            record = staff.initial_snapshot()
+            parent = record.parent_of(row)
+            if row.kind == "worker" and parent is not None and _pane_workers(parent):
+                state = next((state for state in worker_panes.observe(parent.id, record) if state.row.id == row.id), None)
+                if isinstance(state, worker_panes.StoppedWorker):
+                    return bool(panes and panes[0]["pane_id"] == state.pane
+                                and panes[0].get("terminal_id") == state.terminal)
+                return False
             return True
-        _anomaly(row, result.reason if isinstance(result, stop_resume.StopFailed) else "session not found")
+        _anomaly(row, result.reason if isinstance(result, StopFailed) else "session not found")
         return False
 
 
@@ -103,12 +142,30 @@ def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"]
     raise OSError(f"no transcript for {identity}")
 
 
+def _pane_workers(row: staff.StaffRow) -> bool:
+    return unit_runs.worker_transport(worker_panes.worker_run(row)) != "mesh"
+
+
+def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
+    worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
+    if row.kind in ("unit", "showrunner") and any(
+            child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
+            ) and _pane_workers(row) and worker.restore(row.id) != 0:
+        raise OSError("worker restore is incomplete")
+
+
 def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.Herdr, *,
               present: bool = False, target_account: str = "", deadline: float = math.inf,
               resolver: session_staff.RowResolver | None = None) -> str:
     with operation_deadline.within(deadline):
+        if row.kind == "worker":
+            parent = record.parent_of(row)
+            if parent is not None and _pane_workers(parent):
+                return start_row(parent, record, client, present=present, target_account=target_account,
+                                 deadline=deadline, resolver=resolver)
         live = herdr.read_conversation(str(row.current_session))
         if isinstance(live, herdr.LiveConversation):
+            _restore_workers(row, record)
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(live, herdr.UnknownConversation):
@@ -117,6 +174,11 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         import remote
         if machine != remote.local_machine():
             raise ValueError(f"{row.name}: session is on {machine}")
+        from scripts.shutdown.launch_names import LaunchNames
+
+        names = LaunchNames(record)
+        original = pane_record.launch_for_session(str(row.current_session)) or pane_record.launch_for_session(str(row.id))
+        projected = names.resume(original) if original is not None else None
         kind, environment, arguments = session_launch(str(row.current_session), row.name)
         if kind == "claude" and not target_account and row.kind in ("unit", "showrunner"):
             from scripts.accounts import accounts
@@ -129,6 +191,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             _ = stop_resume.heal_account_trust(folder, target_dir,
                 Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"), row.name)
             environment = named_account_environment(target_dir)
+        if projected is not None:
+            environment = {**names.environment(projected), **environment}
         destination = client.saved_row_tab(str(row.id), row.name)
         prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
                                                       herdr.NO_ENVIRONMENT_REMOVALS)
@@ -141,23 +205,34 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 _anomaly(row, "duplicate panes retained")
             elif panes and not panes[0].get("terminal_id"):
                 _anomaly(row, "pane has no terminal id; pane retained")
-            elif panes:
+            elif panes and (original is None or original["cwd"] == str(folder)):
                 target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             _anomaly(row, error)
         # Read liveness again immediately before the launch.
         current = herdr.read_conversation(str(row.current_session), kind)
         if isinstance(current, herdr.LiveConversation):
+            _restore_workers(row, record)
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
             herdr.conversation_note(current)
+        settings = conf.read("shutdown")
+        start_seconds = settings.number("START_SECONDS")
+        if start_seconds <= 0:
+            raise conf.Unusable(f"{settings.source}: START_SECONDS must be positive")
         operation_deadline.check()
         result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
             trust_arguments(kind, str(folder), arguments), herdr.NoOpeningPrompt(),
-            int(operation_deadline.remaining(herdr.PROGRAM_TIMEOUT_SECONDS) * 1000), agent=row.name,
+            int(operation_deadline.remaining(start_seconds) * 1000), agent=row.name,
             reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
                               live.reason if isinstance(live, herdr.UnknownConversation) else ""))
+        if isinstance(result.outcome, herdr.PromptNotSubmitted):
+            raise OSError(result.outcome.reason)
+        if original is not None and projected is not None and result.pane != original["pane_id"]:
+            path = pane_record.record_path(client.session)
+            pane_launch.finish_restore(path, original, pane_launch.resume_attempt(path, result.pane),
+                                       names.resume_proof(original, projected), close=client.close_tab_confirmed)
         try:
             client.remember_row_tab(str(row.id), result.pane)
             if present:
@@ -165,6 +240,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 client.close_startup_workspaces(result.pane.split(":", 1)[0])
         except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
             _anomaly(row, error)
+        _restore_workers(row, record)
         print(f"{row.name}: restarted")
         return result.pane
 
@@ -243,7 +319,14 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     for identity in sorted(candidates.keys() - owned):
         if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
             print(f"{' '.join(candidates[identity].splitlines())}: restart anomaly: unassigned live session", file=sys.stderr)
-    selected = live_members(record.rows, record, resolver=resolver, codex=codex)
+    workers: dict[staff.StaffId, WorkerRow] = {}
+    for holder in record.rows:
+        if holder.kind in ("unit", "showrunner") and any(child.parent == staff.ReportsTo(holder.id) for child in record.rows) and _pane_workers(holder):
+            workers.update((state.row.id, state) for state in worker_panes.observe(holder.id, record))
+    selected = live_members((row for row in record.rows if row.id not in workers), record,
+                            resolver=resolver, codex=codex)
+    selected.extend(state.row for state in workers.values()
+                    if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker)))
     if save_tabs:
         try:
             client.save_layout()
@@ -300,46 +383,64 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         for row in selected:
             print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}")
         return 0
-    errors = (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError)
+    errors = (OSError, ValueError, staff.StaffRefused, herdr.HerdrFailure, subprocess.SubprocessError)
     pending: list[str] = []
     started: list[str] = []
-    with ExitStack() as locks:
-        locked: list[staff.StaffRow] = []
-        for row in selected:
+    holders: dict[staff.StaffId, staff.StaffRow] = {}
+    for row in selected:
+        parent = record.parent_of(row) if row.kind == "worker" else None
+        holder = parent if parent is not None and _pane_workers(parent) else row
+        holders[holder.id] = holder
+    if stop_all:
+        for holder in tuple(holders.values()):
             try:
-                _ = locks.enter_context(staff.row_operation(str(row.id)))
-                current = staff.initial_snapshot().by_id(row.id)
-                if current is not None:
-                    locked.append(current)
-            except (OSError, staff.StaffRefused) as error:
-                _anomaly(row, error)
-        if stop_all:
-            for row in locked:
-                try:
-                    _ = stop_row(row, client)
-                except errors as error:
-                    _anomaly(row, error)
-        present = False
-        if locked:
-            try:
-                server = herdr.restore_server(client.session, int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000),
-                                         session_kind=herdr.security_session())
-                present = isinstance(server, herdr.WindowServerCreated)
+                settings = conf.read("shutdown")
+                durations = [settings.number(key) for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS")]
+                if any(value <= 0 for value in durations):
+                    raise conf.Unusable(f"{settings.source}: stop durations must be positive")
+                deadline = time.monotonic() + sum(durations)
+                with staff.row_operation(str(holder.id)), operation_deadline.within(deadline):
+                    shutdown_record.update(started=[], pending=[str(row.id) for row in selected
+                        if row.id == holder.id or row.parent == staff.ReportsTo(holder.id)])
+                    if holder.kind in ("unit", "showrunner"):
+                        _ = stop_resume.stop_unit_workers(holder.id, record)
+                    _ = stop_row(holder, client, deadline=deadline)
+            except staff.StaffRefused as error:
+                _ = holders.pop(holder.id)
+                _anomaly(holder, error)
             except errors as error:
-                print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
-        for row in locked:
-            try:
-                record = staff.initial_snapshot()
-                current = record.by_id(row.id)
+                _anomaly(holder, error)
+    present = False
+    if holders:
+        try:
+            server = herdr.restore_server(client.session, int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000),
+                                     session_kind=herdr.security_session())
+            present = isinstance(server, herdr.WindowServerCreated)
+        except errors as error:
+            print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+    for holder in holders.values():
+        members = [str(row.id) for row in selected if row.id == holder.id or
+                   isinstance(row.parent, staff.ReportsTo) and row.parent.id == holder.id]
+        try:
+            with staff.row_operation(str(holder.id)):
+                current_record = staff.initial_snapshot()
+                current = current_record.by_id(holder.id)
                 if current is None:
                     raise ValueError("staff row no longer exists")
-                resolver.record = record
-                _ = start_row(current, record, client, present=present, resolver=resolver)
-                started.append(str(row.id))
-                present = False
-            except errors as error:
-                pending.append(str(row.id))
-                _anomaly(row, error)
-        if started or pending:
-            shutdown_record.update(started=started, pending=pending)
+                resolver.record = current_record
+                _ = start_row(current, current_record, client, present=present, resolver=resolver)
+            started.extend(members)
+            present = False
+        except staff.StaffRefused as error:
+            _anomaly(holder, error)
+        except errors as error:
+            pending.extend(members)
+            _anomaly(holder, error)
+    if started or pending:
+        shutdown_record.update(started=started, pending=pending)
+    if started:
+        try:
+            _ = client.sort_tabs()
+        except errors as error:
+            print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
     return 0

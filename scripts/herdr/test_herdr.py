@@ -5616,6 +5616,15 @@ class RowTabTests(StaffTestCase):
         self.assertFalse(self.client.retitle_row(self.rows["unit"].id))
         self.assertEqual(self.client.commands, [])
 
+    def test_sort_preserves_worker_columns(self) -> None:
+        before = [(pane["pane_id"], pane["tab_id"], pane["terminal_id"]) for pane in self.client.tabs]
+        _ = self.client.sort_tabs()
+        self.assertCountEqual(before, [(pane["pane_id"], pane["tab_id"], pane["terminal_id"])
+                                      for pane in self.client.tabs])
+        self.client.commands.clear()
+        _ = self.client.sort_tabs()
+        self.assertFalse(any(command[0] == "tab.move" for command in self.client.commands))
+
     def test_ordering_retry_keeps_split_tabs_and_closes_only_the_placeholder(self) -> None:
         self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))
         original = {pane["terminal_id"]: (pane["pane_id"], pane["tab_id"]) for pane in self.client.tabs}
