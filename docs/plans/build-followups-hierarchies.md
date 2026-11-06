@@ -651,31 +651,37 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 26 — An answer replay after a rename names the current production and unit  · status: done
 
+#### As-built
+
+- No production code changed. The design already holds on origin/sdlc 016475b0f through devtools 7u and 8a.
+- `outstanding_file` and `outstanding_path` key the list and its answered record by the owner's staff id. `remove_open_item` stores `asked_by` as a staff id. `answer` and `relay_line` read current names from staff.
+- `test_update_registration_answers.py` proves a replay after three changes: the asking unit is renamed, the production owner is renamed, and the asking unit moves to another production. Each replay prints `already answered <time>` with the original time, names the current destination, and leaves the answered record's bytes unchanged.
+- Mutations proved that the tests detect a stored name and a name-keyed answer file.
+- The 48-hour life of the answered record stays. It is the replay's own rule, not a rename rule.
+- `rename.py`, `rename_unit.py` and `rename_state.py` are unchanged.
+
+**Files:** `scripts/production/test_update_registration_answers.py`.
+
+### Phase 27 — A worker list numbers each row  · status: todo
+
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** sdlc's answer of 2026-11-06 on the next item. Store the asker and the production as staff ids, and read the current names at use. A rename needs no code in `rename.py`, `rename_unit.py` or `rename_state.py`.
-
-**What the director read on origin/sdlc 016475b0f:**
-- `outstanding_file` and `outstanding_path` in `scripts/production/update_registration.py` key the list and its answered record by the owner's staff id.
-- `remove_open_item` stores `asked_by` as the asker's staff id. `answer` sets the saved item's `name` from the current owner. `relay_line` reads the current names from staff.
-- `rename_state.py` holds no reader of this list.
-- So the design may already hold. No test proves it for a replay.
+**Goal:** the user's words via the showrunner, 2026-11-06: "i asked for a # number as a first column to more readily read the count". This closes the feedback on change C1142. `/unit:worker list` and `/showrunner:worker list` number each worker row, so the last number is the count.
 
 **Spec:**
-1. In `scripts/production/test_update_registration_answers.py`, add tests that answer an item, then change staff, then replay the same answer. Use `staff.rename` and `staff.move` on fixture rows. The cases are:
-   - the asking unit is renamed;
-   - the production owner is renamed;
-   - the asking unit moves to another production.
-2. Each replay exits 0, prints `already answered <time>` with the original answer time, and names the current destination in its relay line. The answered record's bytes do not change.
-3. If a case fails, fix the cause in `update_registration.py` only. Store staff ids and read names at use. Add no code to `rename.py`, `rename_unit.py` or `rename_state.py`.
-4. The 48-hour life of the answered record stays as it is. It is the replay's own rule, not a rename rule.
-5. Add no check, guard or refusal. Tests never act on a live unit.
+1. In `scripts/production/worker.py`, the first column of each text row of `list` is its number, 1 to n, right-aligned to the width of n. A space and the existing fields follow. Row order and the other fields do not change.
+2. `list --json` does not change.
+3. An empty list prints nothing, as it does now.
+4. Update `commands/unit/worker.md` where it states what `list` shows.
+5. In `scripts/production/test_worker.py`, add one test of the text output: rows carry 1 to n and the existing fields. Update each existing assertion that reads a text row, and report it.
+6. Find each reader of the text output of `worker.py list`. Update a reader that the number breaks. Add no check, guard or refusal. Tests never act on a live unit.
 
 **Files:**
-- `scripts/production/test_update_registration_answers.py`
-- `scripts/production/update_registration.py`
+- `scripts/production/worker.py`
+- `scripts/production/test_worker.py`
+- `commands/unit/worker.md`
 
 **Workers:** 1 writer, slot impl2.
 
@@ -683,5 +689,5 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Acceptance gate:**
 - basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
-- These modules pass: `scripts/production/test_update_registration_answers.py`, `scripts/production/test_update_registration_questions.py`, `scripts/production/test_update_registration.py`.
-- The merge gate on the merged tree is green.
+- `scripts/production/test_worker.py` and each caller module of the text output pass.
+- The showrunner's merge test on the merged tree is green. The unit runs the modules above, not the full gate (55 minutes at this load).
