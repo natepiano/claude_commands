@@ -384,26 +384,25 @@ only I can bump
 
 **Acceptance gate:** copies and hook suites pass; basedpyright 0/0/0. Change-Review: a command that the guard refused now runs.
 
-### Phase 17 — copies.py list shows remote mirrors, and copies.py starts without an object scan  · status: todo
+### Phase 17 — copies.py list shows remote mirrors  · status: todo
 
-**Depends on:** 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items.
+**Depends on:** 16 and verify P35 on GitHub builds. Builds rulings, 2026-11-05. The verify 35b unit keeps the 26 simplify items. The copy start object scan moved to natest's copies.py Git-work speed phase (builds, 2026-11-05). On `copies.py` the second lander resolves.
 
 #### Work Order
 
-**Goal:** `copies.py list` answers who holds a mirror, and a copy start does no full object scan.
+**Goal:** `copies.py list` answers who holds a mirror.
 
 **Spec:**
 1. **List.** `copies.py list` prints a header row with labeled columns, the number column included: owner, repository, host, path and session. It shows remote mirrors. Today it shows local standing checkouts only and skips `.remote-mirrors` (`copies.py:804`).
-2. **Start.** Remove the initial `git rev-list --objects --all` scan (0.39 s per `verify.sh doc`). Rebuild `.git` once when fetch or checkout reports object damage. Preserve the exclusive checkout lease and the damaged-index recovery tests.
-3. **Proof.** List tests for remote-only records and mixed local and remote records. Measure the documentation-run cost before and after, and state both numbers in the summary.
+2. **Proof.** List tests for remote-only records and mixed local and remote records.
 
 **Files:**
-- `scripts/copies/copies.py` — the list and the start.
+- `scripts/copies/copies.py` — the list.
 - `scripts/copies/test_copies.py` — the tests.
 
 **Workers:** `1 writer + 1 tester`.
 
-**Acceptance gate:** copies and verify documentation suites pass; basedpyright 0/0/0. Change-Review: `copies.py list` output.
+**Acceptance gate:** copies suites pass; basedpyright 0/0/0. Change-Review: `copies.py list` output.
 
 ### Phase 10m — The build page is a repository tool and shows leftover-process ages  · status: todo
 
