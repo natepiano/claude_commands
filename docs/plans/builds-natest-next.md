@@ -114,5 +114,6 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | `direct/test_simplify_lens.py` | 118 | one real review-launcher run per test (3-6 s) | 6 |
 | `production/test_fast_track.py` | 97.9 | production Git, CLI children, blocked-hook deadlines and promotion retries | 33 |
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | Python start-up of `eligible` and `reserve` (`build_hold` -> `admission_service` -> `memory_admit`) | 24 |
+| `style/test_crate_run.py` | 257.2 (clean rounds, no pairs) | production Git work: `copies.refresh_remotes` 803 calls, 99.7 s of a 325 s profiled run; Phase 44 cuts it | 40 |
 | `direct/test_verify_mac_only.py` | 156.5 (clean rounds, no pairs) | `build_targets.py` and `mac_idle.py` process starts: 77.5 of 127.5 CPU s | 39 |
 | `direct/test_verify_lint_judgment.py` | 198.6 | production `verify.sh lint` route: 3.1 s per run with no repair, 5.2 s with repair (step-record and admission client Python starts) plus admission start spacing | 31 |

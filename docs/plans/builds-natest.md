@@ -46,7 +46,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   - `~/.local/state/merge-gate/module_history.json` — the gate's last 5 wall times for each module, with no times of day; it seeds the first sort only
 - **Test lanes:** none as `tests/` folders. Each module's tests sit beside it as `scripts/<folder>/test_<name>.py`; the `test` worker writes those files.
 - **Build:** none (Python).
-- **Test:** for each named test file, `python3 -m unittest discover -s scripts/<folder> -p '<file>'` from the worktree root; always also `python3 -m unittest discover -s scripts/lib`. A worker's verification lists every test module that calls a changed function, unchanged callers and subprocess fixtures included (Phase 18: a caller's adjacency test was missed). Checkpoint gate: merge origin's merge branch first, then `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout <tree> --tests-only` (main's copy of the gate).
+- **Test:** for each named test file, `python3 -m unittest discover -s scripts/<folder> -p '<file>'` from the worktree root; always also `python3 -m unittest discover -s scripts/lib`. A worker's verification lists every test module that calls a changed function, unchanged callers and subprocess fixtures included (Phase 18: a caller's adjacency test was missed). Checkpoint gate: merge origin's merge branch first, then the full test: `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/full_test.py --checkout <tree>` (main's copy). Until Phase 36 is on main, main has only `merge_gate.py --checkout <tree> --tests-only`, which runs all modules.
 - **Lint:** `basedpyright <changed Python files>` passes when its output has the `0 errors, 0 warnings, 0 notes` line; the exit status says nothing.
 - **Invariants:**
   - Tests use fixtures. They never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `~/.local/state/merge-gate`, `/tmp/claude` (the gate's as-built).
@@ -917,7 +917,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Measured CPU per unit run, before and after, in the checkpoint notice. Before: the mean CPU of the unit runs in the merge-gate records of the 24 hours to the Phase 37 start. After: the final `full_test.py` on 5 recent unit commits, in clones, with the sample size stated. These numbers go to the user.
 - Each of the four selection rules has a test with a real scratch repository. A deleted Python file selects its surviving direct importers, and a dirty path selects as a changed path.
 - A clean tree with no reach selects no module and passes.
-- `test_affected_modules.py`, `test_full_test.py` and each `test_merge_gate*.py` green in the gate form, and `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`.
+- `test_affected_modules.py`, `test_full_test.py` and each `test_merge_gate*.py` green in the gate form, and the full test green on the phase commit merged with `origin/builds`.
 - After landing, the checkpoint's Change-Review line: the user reads `full test` runs on the queue page and sees fewer modules.
 
 ### Phase 38 — Three scripts start Python through `scripts/lib/py`  · status: todo
@@ -950,7 +950,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'` green
 - each caller module of the hook and of `scripts/lint/lint` green in the gate form
 - the Mac result of step 2 and of the same routes after the edit, in the checkpoint notice
-- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
+- the full test green on the phase commit merged with `origin/builds`
 
 ### Phase 39 — `test_verify_mac_only.py` runs in half its time  · status: done
 **Depends on:** none
@@ -966,33 +966,19 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - Another seed in `verify_mac_offload_test_support.py`: the fixture already builds one seed per class and copies it for each test, and the cost is not there.
 
-### Phase 40 — `style/test_crate_run.py` runs in half its time  · status: todo
+### Phase 40 — `style/test_crate_run.py` runs in half its time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/style/test_crate_run.py` (rank 7 in `test_times top` at 154.1 s median, 62.6 CPU s, 97 tests, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+- No repository change. The phase ended at a measured floor, with every test name and assertion kept.
+- Three clean rounds at base 58b84efc2: median 257.2 s wall, 67.9 CPU s, 97 tests, at load 45-75. Load changed during the rounds, so they find the cost and do not measure a gain.
+- The module has no fixed wait, and repeated setup is at most 31.8 s (9.8%). One diagnostic run records 24,316 process starts and 211 s in `subprocess.run`.
+- Floor: production Git work. `copies.refresh_remotes` has 803 calls and 99.7 s (1,606 fetches, 3,212 config writes, 1,606 update-refs). `style/bulk_run.py` and `style/git_process.py` have 10,444 Git calls and 60.9 s. Durable publications have 5,777 fsync calls and 44.4 s.
+- Proposal, sent to the showrunner 2026-11-05. It assigned the `copies.py` part as Phase 44. The other parts are estimates and have no owner phase.
 
-**Spec:** Follow the Speed method. Ranks 1 and 5 are excluded. Ranks 2, 3 and 4 are floors whose CPU has not risen. Rank 6, `direct/test_simplify_lens.py`, is above its floor, but sdlc devtools is changing its launcher now.
-1. Profile before any edit. Gate wall time ranges from 69 s to 265 s while CPU stays near 58 s, so name what each slow test waits on and what is only host load.
-2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts. A per-class seed gave no gain in an earlier phase (128 s to 126 s), so do not repeat it.
-3. A cut in a production file or a support file goes to the director first, with the measured gain.
-4. Keep every test name and assertion. Add no guard, refusal or check that this Work Order does not name (user rule, 2026-11-05).
-
-**Files:**
-- `scripts/style/test_crate_run.py` — the module
-
-**Workers:** 1 writer on slot `test` (one module; the file does not split)
-- `test` — all files above, role impl
-
-**Constraints from prior phases:**
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/style -p 'test_crate_run.py'` green, with the same test names and assertions
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- A per-class seed: an earlier phase gained nothing (128 s to 126 s).
 
 ### Phase 41 — `build_targets.py` loads only what its command needs  · status: todo
 **Depends on:** none
@@ -1022,7 +1008,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - Measured CPU before and after in the checkpoint notice: `test_verify_mac_only.py` in same-load pairs (`pairs.sh`), and one real `verify.sh` run.
 - Each `scripts/build_targets/test_*.py`, `scripts/build_hold/test_build_hold.py`, `scripts/build_hold/test_hold_applies.py`, `scripts/build_hold/test_override_guard.py` and each `scripts/direct/test_verify_*.py` that starts `build_targets.py` green, with the same test names and assertions.
-- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`.
+- the full test green on the phase commit merged with `origin/builds`.
 - `basedpyright` on the changed Python file prints `0 errors, 0 warnings, 0 notes`.
 
 ### Phase 42 — `mac_idle.py` loads only what its command needs  · status: todo
@@ -1050,6 +1036,64 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - Measured CPU before and after in the checkpoint notice: `test_verify_mac_only.py` in same-load pairs (`pairs.sh`), and one real `verify.sh` run.
 - Each caller module of `mac_idle.py` green, with the same test names and assertions.
-- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`.
+- the full test green on the phase commit merged with `origin/builds`.
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
 
+### Phase 43 — `direct/test_verify_token_renew.py` runs in half its time  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_verify_token_renew.py` (rank 8 in `test_times top` at 151 s median, 59.6 CPU s, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+
+**Spec:** Follow the Speed method. Ranks 1 and 5 are excluded. Ranks 2, 3, 4, 6, 7 are floors whose CPU has not risen; rank 7 is the Phase 40 floor.
+1. Profile before any edit. Its wall time is 2.5 times its CPU, so name each real wait and what is only host load.
+2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
+3. A cut in a production file or a support file goes to the director first, with the measured gain.
+4. Keep every test name and assertion. Add no guard, refusal or check that this Work Order does not name (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/direct/test_verify_token_renew.py` — the module
+
+**Workers:** 1 writer on slot `impl3` (one module; the file does not split; slot `test` holds the Phase 36 repair)
+- `impl3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/direct -p 'test_verify_token_renew.py'` green, with the same test names and assertions
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 44 — `copies.py` does less Git work  · status: todo
+**Depends on:** none
+**Blocked by:** verify P35 on GitHub builds — it moves every copy maker onto `copies.py`; the showrunner says when.
+
+#### Work Order
+
+**Goal:** each `copies.py` use does less Git work, with the same copies. Phase 40 measured 803 `refresh_remotes` calls, 1,606 fetches, 3,212 config writes and 1,606 update-refs, about 100 s of a 325 s profiled `style/test_crate_run.py` run. The showrunner assigned this on 2026-11-05 and moved queue's item to it.
+
+**Spec:**
+1. Measure before any edit: `style/test_crate_run.py` (same-load pairs) and one real `copies.py run`.
+2. `refresh_remotes` (`scripts/copies/copies.py:372`) does only the work a changed source needs.
+3. Remove the full object scan from `copies.py` initialization (0.39 s per `verify.sh doc` run; item from queue-unit).
+4. Queue-unit keeps the `copies.py` list labels item. On `copies.py`, the second lander resolves.
+5. Behavior does not change: same trees, same remote refs, same exit status. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/copies/copies.py` — the cuts
+- `scripts/copies/test_copies.py` — tests for the changed paths
+
+**Workers:** 1 writer on slot `impl` (one module and its tests; the file does not split)
+- `impl` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 40 measured the cost; the module itself is at a floor.
+
+**Acceptance gate:**
+- caller suites for `copies.py` green
+- measured before and after for `style/test_crate_run.py` and one `copies.py run`, in the checkpoint notice
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
