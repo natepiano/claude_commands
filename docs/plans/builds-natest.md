@@ -1335,7 +1335,7 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 - The changed files and every importer of a changed fixture pass. No full suite: this batch is bumped, so it runs lint and the tests of the changed files only (showrunner, 2026-11-06).
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`.
 
-### Phase 62 — A test runner ends each process its tests leave  · status: todo
+### Phase 62 — A test runner ends each process its tests leave  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1449,3 +1449,36 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 - A fixture row with a CPU-heavy `setUpClass` shows that cost in its own row. `test_module_run.py` names this case.
 - Module `wall_s`, `cpu_s` and test status do not change meaning. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
 
+### Phase 65 — The first test time list after a gap appears in under a second  · status: todo
+**Depends on:** Phase 60
+
+#### Work Order
+
+**Source:** Phase 60 add-on, accepted by the showrunner on 2026-11-06. Order: first after Phase 62. The showrunner's words: "Measure the cause before the fix."
+
+**Goal:** the first `show.py top` after a gap prints in under 1 s at normal load, or the measured floor is stated.
+
+**Spec:**
+1. Measure first, and change no file. `open_report_index()` at `scripts/test_times/show.py:405` calls `index.update()` on every run. The first run after a gap took 1m58 real and 61 s user at load about 70. A warm run took 0.455 s.
+2. Measure three cases with CPU s and wall s, and with a profile of `update_in()` by function: a full build of a new index, an update after a gap of about 30 minutes, and a run with nothing new. `index_path_in()` names the index by its schema, so a tree with a changed schema builds a new index. Count how often each case occurs from the index files in the build log root.
+3. Measure on a private root, through `BUILDLOG_DIR`. Link the live JSONL files into it, and keep its index on disk, not on tmpfs. Write nothing to the live build log root.
+4. The director picks the cut from the measure, and writes it here before any edit.
+5. `show.py` keeps its current results: a test time list holds every gate record that existed when the command started, unless the director's written cut states another rule.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/test_times/show.py` — the report index open
+- `scripts/test_times/test_show.py` — the case
+- `scripts/buildlog/index.py` — only if the measure puts the cause here; owner report-unit
+- `scripts/buildlog/test_index.py` — the case for an index change
+- `commands/test_times.md` — only if what a reader sees changes
+
+**Workers:** 1 writer on slot `impl3` (one read path; the fix is small or the floor is stated)
+- `impl3` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 60: `show.py top` ranks by CPU, and loads only what a command needs. Rows must stay the same.
+
+**Acceptance gate:**
+- Live check: on the private root with about 24 hours of unindexed lines, the first `show.py top` prints in under 1 s of wall time at load under 30. Report CPU s and wall s, before and after.
+- `test_show.py` and `test_index.py` pass through a clone. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.

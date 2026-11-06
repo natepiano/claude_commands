@@ -8,7 +8,7 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 
 1. Phase 60: `show.py top` ranks by CPU; `module_cost.py` counts process starts.
 2. Phase 61: the seven largest `test_verify*` files, 590 CPU s.
-3. Phase 62, now: the module runner ends each process its tests leave. Phase 63, after verify's batch hash: three flaky verify files. Phase 64, after Phase 62: `module_cost.py` names the tests with the most CPU.
+3. Phase 62, now: the module runner ends each process its tests leave. Phase 65, first after Phase 62 and measured from now: the first test time list after a gap. Phase 63, after verify's batch hash: three flaky verify files. Phase 64, after Phase 62: `module_cost.py` names the tests with the most CPU.
 4. Further `test_verify*` batches, largest CPU first, after verify sends its files. Each batch is one phase with one bumped checkpoint. Verify's cost doc lists the rest; its list has 122 files.
 5. Phase 55: the assign launcher group, 344 CPU s, beside the batches when models reaches builds.
 6. Phase 44: `copies.py` Git work and `style/test_crate_run.py`, 68.5 CPU s, on the showrunner's word.

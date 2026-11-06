@@ -8,6 +8,8 @@ import math
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.test_times.gate_record import ModuleTimes
 
 RUNNER = Path(__file__).with_name("module_run.py").resolve()
@@ -103,6 +106,48 @@ class DiscoveryBoundaries(unittest.TestCase):
 
     def test_import_environment(self) -> None:
         self.assertIsNone(IMPORTED_OUTPUT, "Discovery must not receive the output path")
+'''
+
+
+ORPHAN_PROCESS = '''\
+import os
+import select
+import signal
+import sys
+import unittest
+
+class OrphanProcess(unittest.TestCase):
+    def test_orphan(self):
+        reader, writer = os.pipe()
+        intermediate = os.fork()
+        if intermediate == 0:
+            os.close(reader)
+            if os.fork() != 0:
+                os._exit(0)
+            os.setsid()
+            os.write(writer, str(os.getpid()).encode())
+            os.close(writer)
+            for descriptor in (0, 1, 2):
+                os.close(descriptor)
+            while True:
+                signal.pause()
+        os.close(writer)
+        pid = int(os.read(reader, 32))
+        os.close(reader)
+        os.waitpid(intermediate, 0)
+        descriptor = os.pidfd_open(pid)
+        try:
+            print(pid, flush=True)
+            sys.stdin.buffer.read(1)
+            if __REAP__:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                reaped = select.poll()
+                reaped.register(descriptor, select.POLLHUP)
+                self.assertTrue(reaped.poll(__HANG_GUARD_MS__), "The orphan remains unreaped")
+            if __FAIL__:
+                self.fail("fixture failure after orphan launch")
+        finally:
+            os.close(descriptor)
 '''
 
 
@@ -422,3 +467,75 @@ class ModuleRunnerTests(unittest.TestCase):
             self.assertEqual(len(warnings), 1, result.stderr)
             self.assertTrue(output.is_dir())
             self.assertEqual(list(root.glob(".output.*")), [])
+
+
+@unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
+class ModuleProcessCleanupTests(unittest.TestCase):
+    def test_ignored_sigchld_keeps_the_test_process_status_and_inheritance(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (root / "test_signal.py").write_text(
+            """import signal, unittest
+class InheritedSignal(unittest.TestCase):
+    def test_sigchld(self):
+        self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN)
+""",
+            encoding="utf-8")
+        environment = {**os.environ, "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
+                       "BUILDLOG_DIR": str(root / "buildlog")}
+        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
+            _ = environment.pop(name, None)
+        launcher = ("import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
+                    "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])")
+        for arguments, status in (([], 2), ([str(root), "test_signal.py"], 0)):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, "-c", launcher, str(RUNNER), *arguments],
+                    cwd=root, env=environment, capture_output=True, text=True, check=False,
+                    timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def run_orphan(self, *, fail: bool = False, terminate: bool = False, reap: bool = False) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        source = (ORPHAN_PROCESS.replace("__REAP__", repr(reap)).replace("__FAIL__", repr(fail))
+                  .replace("__HANG_GUARD_MS__", str(TEST_HANG_GUARD_SECS * 1000)))
+        _ = (root / "test_orphan.py").write_text(source, encoding="utf-8")
+        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
+            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
+            "PYTHONDONTWRITEBYTECODE": "1"})
+        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
+            _ = environment.pop(name, None)
+        process: subprocess.Popen[str] = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_orphan.py"],
+            cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True)
+        processes.track(process)
+        output = process.stdout
+        self.assertIsNotNone(output)
+        if output is None:
+            raise AssertionError("The runner has no output pipe")
+        self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0], "The orphan did not start")
+        line = cast(str, output.readline())
+        self.assertTrue(line.strip().isdigit(), line)
+        descriptor = os.pidfd_open(int(line))
+        self.addCleanup(os.close, descriptor)
+        if terminate:
+            os.killpg(process.pid, signal.SIGTERM)
+        stdout, stderr = process.communicate(input="x", timeout=TEST_HANG_GUARD_SECS)
+        expected = -signal.SIGTERM if terminate else 1 if fail else 0
+        self.assertEqual(process.returncode, expected, stdout + stderr)
+        # POLLHUP means the process was reaped, rather than left as a zombie.
+        observer = select.poll()
+        observer.register(descriptor, select.POLLHUP)
+        self.assertTrue(observer.poll(0), "The orphan remains alive or unreaped")
+
+    def test_normal_end_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan()
+
+    def test_failed_test_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan(fail=True)
+
+    def test_sigterm_to_the_runner_group_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan(terminate=True)
+
+    def test_a_running_test_sees_its_killed_orphan_reaped(self) -> None:
+        self.run_orphan(reap=True)

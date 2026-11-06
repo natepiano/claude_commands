@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 _STARTED_AT = time.perf_counter()
+startup_cpu_s = 0.0
 
 import json
 import os
@@ -12,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import resource
+import signal
 import sys
 import tempfile
 from types import TracebackType
@@ -164,7 +166,7 @@ def write_times(path: Path, result: TimedResult, wall_s: float) -> None:
         tests = test_times(result)
         times: ModuleTimes = {
             "wall_s": wall_s,
-            "cpu_s": own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime,
+            "cpu_s": startup_cpu_s + own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime,
             "tests_s": sum(test["s"] for test in tests),
             "tests_run": result.testsRun,
             "failures": len(result.failures),
@@ -226,5 +228,74 @@ def main() -> None:
         raise
 
 
+class RunnerInterrupted(BaseException):
+    """A signal requests the end of the runner and its descendants."""
+
+
+def run_with_descendant_cleanup() -> None:
+    """Run tests in a child while the parent reaps their orphaned processes."""
+    global startup_cpu_s
+    sys.path[0] = str(Path(__file__).resolve().parents[2])
+    from scripts.lib.descendants import adopt_descendants
+
+    if not adopt_descendants():
+        main()
+        return
+    watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    received: list[int] = []
+    cleaning = False
+
+    def interrupted(number: int, frame: object) -> None:
+        del frame
+        received.append(number)
+        if not cleaning:
+            raise RunnerInterrupted
+
+    previous = {number: signal.signal(number, interrupted) for number in watched}
+    previous_sigchld = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    test_pid = os.fork()
+    if test_pid == 0:
+        startup_cpu_s = usage.ru_utime + usage.ru_stime
+        _ = signal.signal(signal.SIGCHLD, previous_sigchld)
+        for number, handler in previous.items():
+            _ = signal.signal(number, handler)
+        _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+        main()
+        return
+    status = 0
+    try:
+        _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+        while True:
+            pid, child_status = os.waitpid(-1, 0)
+            if pid == test_pid:
+                status = child_status
+                break
+    except RunnerInterrupted:
+        pass
+    finally:
+        cleaning = True
+        while True:
+            children = Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
+            for child in children:
+                try:
+                    os.kill(int(child), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                pid, child_status = os.waitpid(-1, 0)
+            except ChildProcessError:
+                break
+            if pid == test_pid:
+                status = child_status
+    exit_code = os.waitstatus_to_exitcode(status)
+    if received or exit_code < 0:
+        number = received[0] if received else -exit_code
+        _ = signal.signal(number, signal.SIG_DFL)
+        os.kill(os.getpid(), number)
+    sys.exit(exit_code)
+
+
 if __name__ == "__main__":
-    main()
+    run_with_descendant_cleanup()

@@ -38,6 +38,16 @@ SCRIPT = Path(__file__).with_name("merge_gate.py")
 FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "fixture_b", "fixture_c")
 # Each folder holds test_first.py, and lib also holds test_second.py.
 
+
+def install_test_runner(checkout: Path) -> Path:
+    """Install the real runner and its descendant helper in a fixture checkout."""
+    for relative in ("test_times/module_run.py", "lib/descendants.py"):
+        destination = checkout / "scripts" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copyfile(SCRIPT.parents[1] / relative, destination)
+    return checkout / "scripts/test_times/module_run.py"
+
+
 TOOL_STUB = '''#!/usr/bin/env python3
 import json
 import os
@@ -160,9 +170,9 @@ class FixtureTest(unittest.TestCase):
             statuses = [subprocess.run(command, env=environment, check=False, timeout=TEST_HANG_GUARD_SECS).returncode for command in commands]
             (state / "tool-statuses.json").write_text(json.dumps(statuses))
         if (state / "concurrency-barrier").exists():
-            (state / (str(os.getpid()) + ".started")).touch()
+            (state / (str(os.getpgrp()) + ".started")).touch()
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-            while not (state / (str(os.getpid()) + ".released")).exists():
+            while not (state / (str(os.getpgrp()) + ".released")).exists():
                 if time.monotonic() >= deadline:
                     self.fail("runner never released the module")
                 time.sleep(0.01)
@@ -185,7 +195,7 @@ class FixtureTest(unittest.TestCase):
             Path("unit.txt").write_text("gate debris\\n")
             self.fail("fixture edited a tracked checkpoint file")
         if (state / "hold-module").exists() and suite == "hooks":
-            (state / "module-held.tmp").write_text(str(os.getpid()))
+            (state / "module-held.tmp").write_text(str(os.getpgrp()))
             # Publish by rename: a reader must never see the file empty.
             os.replace(state / "module-held.tmp", state / "module-held")
             signal.alarm(TEST_HANG_GUARD_SECS)
@@ -473,8 +483,7 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "settings.json", '{"fixture": true}\n')
         self.write(self.checkout / "subject.txt", "base\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
-        self.write(self.checkout / "scripts/test_times/module_run.py",
-                   (SCRIPT.parents[1] / "test_times/module_run.py").read_text())
+        _ = install_test_runner(self.checkout)
         for suite in self.suites:
             self.write(self.checkout / "scripts" / suite / "test_first.py", SUITE_MODULE)
         if "lib" in self.suites:

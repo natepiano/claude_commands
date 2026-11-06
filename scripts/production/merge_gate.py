@@ -1110,7 +1110,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
                         job.killed_for = f"killed: still running after {module_time_limit_s:g} s, the module time limit"
                         print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
-                        kill_job_group(job)
+                        stop_gate_jobs([job])
                         status = job.process.returncode
                     if status is None:
                         continue

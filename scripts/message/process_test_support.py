@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import os
 from pathlib import Path
 import select
@@ -12,26 +11,21 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import cast
 from uuid import uuid4
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.descendants import adopt_descendants
 from scripts.message import darwin_test_processes as darwin
 
 
 TestChild = subprocess.Popen[str] | subprocess.Popen[bytes]
 OWNERS = "MESSAGE_TEST_PROCESS_OWNERS"
 USE_PIDFD = sys.platform == "linux"
-PR_SET_CHILD_SUBREAPER = 36  # Linux prctl ABI, not a policy value.
 
 
 def adopt_test_descendants() -> None:
     """Let the test reap descendants after their immediate parents exit."""
-    if sys.platform != "linux":
-        return
-    libc = ctypes.CDLL(None, use_errno=True)
-    if cast(int, libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)) != 0:
-        raise OSError(ctypes.get_errno(), "cannot adopt test descendants")
+    _ = adopt_descendants()
 
 
 def direct_children() -> set[int]:

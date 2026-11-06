@@ -19,6 +19,15 @@ A clean tree with a recorded full pass on this host reuses its test modules.
 Test modules use `builds.slice` scopes when available.
 After the parallel pass, up to eight failed modules run once more, alone.
 The final test results decide the gate.
+On Linux, `module_run.py` adopts orphaned test processes in a separate parent before it imports test code.
+The parent reaps adopted processes while the test child runs.
+After the test child ends, the parent kills and reaps every remaining descendant, including processes in separate sessions.
+SIGTERM, SIGINT and SIGHUP also start this cleanup.
+The runner preserves the test child's exit status or the signal that stopped the runner.
+Timing records retain test execution and interpreter startup costs; they exclude the parent's final process cleanup.
+Other platforms retain the single-process runner.
+A SIGKILL of the parent prevents this cleanup.
+The module time limit sends SIGTERM first, so the cleanup runs.
 On success, the gate pushes the merge branch.
 With `--promote`, it also advances `~/.claude` main and the Mac.
 On failure, it undoes the merge and prints the failed suites' output.
