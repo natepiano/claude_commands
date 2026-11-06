@@ -12,7 +12,7 @@
 
 **Source:** builds (showrunner), 2026-10-30, from the Phase 1 trace: "mac_idle.py costs 122 ms per step, and it is your file, so put it in your next-items list."
 
-**Today:** each `verify.sh` step starts `mac_idle.py`, which costs about 122 ms of CPU (Phase 1 trace, real lint run).
+**Today:** `verify.sh` starts `mac_idle.py` for Mac retry registration, exclusion and cleanup. `register_mac_wait` (`verify.sh:2068`) limits registration to Mac routes on Linux. The Phase 1 lint trace measured about 122 ms of CPU.
 
 **Needed:** measure its imports and work with `VERIFY_PY_TRACE` and `python -X importtime`, then remove the start or its slow imports where the step does not need them, with every output unchanged. Done when the same trace shows the cost removed or named per cause.
 
@@ -47,15 +47,17 @@
 
 **Source:** natest, approved by builds 2026-11-05. Order: first of the three speed items here.
 
-**Today:** each published step state starts its own Python process (`verify.sh:356-358`, `:1925-1934`, `scripts/direct/step_record.py`). That is 3.6 s of process spans per no-repair run and 6.9 s per repair run in `test_verify_lint_judgment.py`.
+**Today:** `step_state` (`verify.sh:412-415`) starts Python for each state publication, and the initial record write is at `verify.sh:1944-1954` (`scripts/direct/step_record.py`). `test_verify_lint_judgment.py` measured 3.6 s of process spans per no-repair run and 6.9 s per repair run.
 
-**Needed:** reuse the state, for a gain of 1-2 s per `verify.sh` call. Measure before and after, and tell the user the build cost change in one line.
+**Baseline:** `direct/test_verify_token_renew.py`: 225 step-record starts take 19.96 process s (natest). `direct/test_verify_lint_cache_versions.py` (natest Phase 45): 135.9 s wall, 94.0 CPU s; 29 `verify.sh lint` calls start `step_record.py` 486 times (23.1 CPU s) and `tree_watch.py` 155 times (7.8 CPU s). One interpreter per `verify.sh` call removes about 21.7 CPU s (natest estimate, not measured).
+
+**Needed:** reuse the state, for a gain of 1-2 s per `verify.sh` call. Put the measured before and after time in the notice, and tell the user the build cost change in one line.
 
 ## A callable repair decision
 
 **Source:** natest, approved by builds 2026-11-05. Order: second of the three speed items.
 
-**Today:** the decision is inline at `verify.sh:3711-3714`.
+**Today:** the repair decision is inline at `verify.sh:3731-3735`. It uses the lint hold, Cargo status, killed-attempt flag and compiler signal text.
 
 **Needed:** give it one callable home. Move the 10-case status table to direct tests, and keep one end-to-end run for each route. This saves about 31 s on `test_verify_lint_judgment.py`. Measure before and after, and tell the user the build cost change in one line.
 
@@ -91,3 +93,19 @@
 **Owner:** whoever holds `scripts/lint/sweep.py` when the builds file freeze lifts. Queue-unit owns the `sweep.py` callers of the floor interfaces once Phase 35 is on GitHub builds.
 
 **Needed:** `lint/sweep.py` (near lines 3298, 3321 and 3678-3682) has one busy-mirror `LockHeld` loop in `_hold_floor_pass`. Rename `leased_mirrors` to `busy_mirrors`. Then close its route from the Phase 35 ledger (F031).
+
+## Mirror scans after the sweep.py file freeze
+
+**Source:** Phase 35b review, findings F028 and F029.
+
+**Order:** the first checkpoint after `scripts/lint/sweep.py` leaves the file freeze, together with F031 above.
+
+**Owner:** verify-unit, with queue-unit for the copies and floor interfaces.
+
+**Today:** `copies.py` imports the process scanners from `scripts/lint/tmp_sweep.py`. The Mac floor sweep runs `lsof -F pfn` twice (`copies.scan_mirror_processes`, `sweep.MacFloor.uses`), about 0.23 s more per low-disk sweep.
+
+**Needed:**
+1. Move `ProcessUsesKnown`, `ProcessUsesUnavailable`, `process_paths`, `lsof_paths` and `parse_lsof` from `lint/tmp_sweep.py` to `scripts/lib`, and change every caller together. Keep no re-export.
+2. Share one Mac `lsof` scan between mirror protection and the approved floor roots. Keep the current rule in `mirror_lease_set`: all candidate leases before the one scan.
+3. Keep unavailable-scan protection, unreadable-process protection, path matching and cancellation behavior. Keep the existing scan and floor tests.
+4. Put the measured scan count and time before and after in the notice. Close the routes F028 and F029 from the Phase 35b ledger.
