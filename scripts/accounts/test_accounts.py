@@ -7106,16 +7106,35 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual({pane: self.world.foreground[pane] for pane in processes}, processes)
         self.assertEqual(self.world.closed, [])
 
+    def test_move_elapsed_time_includes_stopping_the_worker(self) -> None:
+        row = self.worker()
+        self.dispatch(row, status="completed")
+        with patch.object(time, "monotonic", return_value=100.0) as clock:
+            def stop(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
+                stopped = self.stop_worker(row, client, deadline=deadline)
+                clock.return_value = 102.5
+                return stopped
+
+            self.stop.side_effect = stop
+            result = self.move("claude2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcome = result.outcomes[0]
+        assert isinstance(outcome, stop_results.ClaudeUp)
+        self.assertEqual(outcome.elapsed_seconds, 2.5)
+        self.assertIn("Claude is up on claude2 in w1:p1 (2.5 s)", result.stdout)
+
     def test_codex_move_reads_the_process_account_and_resumes_the_same_thread(self) -> None:
         row = self.worker(family="codex")
         self.dispatch(row, status="completed")
         result = self.move("codex2")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Codex is up on codex2", result.stdout)
         self.assertEqual(self.world.requests[0][0], "codex")
         self.assertEqual(self.world.requests[0][1][:2], ["resume", row.current_session])
         self.assertEqual(self.world.requests[0][2]["CODEX_HOME"], str(self.root / ".codex2"))
         result = self.move("codex2")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unchanged; Codex runs on codex2", result.stdout)
         self.assertEqual(len(self.world.launches), 1)
         member = accounts.LiveGroupMember(str(row.current_session), row.name, "units", self.root / ".codex2")
         self.assertTrue(accounts.session_on_account(member, "codex2"))

@@ -112,6 +112,7 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
                         role: staff.WorkerRole, hold: worker_panes.WorkerLockHold) -> SessionMoveOutcome:
     terminal = state.terminal if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)) else ""
     common = _request(move, source, terminal)
+    began = time.monotonic()
     if isinstance(state, worker_panes.OpenWorker):
         settings = conf.read("shutdown")
         stop_seconds = sum(settings.whole(key) for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "MOVE_STOP_MARGIN_SECONDS"))
@@ -124,9 +125,10 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
     result = worker_panes.start_or_resume(move.parent, staff.WorkerName.parse(move.row.name), role,
                 account=worker_panes.DestinationWorkerAccount(move.target), lock=hold)
     if isinstance(result, worker_panes.OpenWorker):
+        elapsed_seconds = time.monotonic() - began
         _confirm(move, common)
         _continue_pass(move, result, source, move.target)
-        return stop_results.ClaudeUp(move.row.id, result.pane, move.target)
+        return stop_results.ClaudeUp(move.row.id, result.pane, move.target, elapsed_seconds=elapsed_seconds)
     failure = _failed(move.row, result)
     reason = f"{failure.reason}; {_recover_source(move, source, state, role, hold)}"
     moves.append_move(moves.FailedMove(**common, kind="failed", reason=reason))

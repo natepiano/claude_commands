@@ -22,7 +22,7 @@ from unittest.mock import Mock, call, patch
 from scripts.message import sessions as runtime_sessions
 from scripts.accounts import accounts
 from scripts.whoami import account
-from scripts.shutdown import restart, stop_resume
+from scripts.shutdown import restart, stop_resume, stop_results
 from scripts.shutdown.stop_results import ClaudeStartState
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
@@ -44,6 +44,17 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_up_lines_name_the_agent_from_the_account(self) -> None:
+        for label, agent in (("codex1", "Codex"), ("claude1", "Claude"), ("default", "Claude")):
+            with self.subTest(account=label):
+                started = stop_results.ClaudeUp("worker", "w1:p2", label, elapsed_seconds=2.5)
+                running = stop_results.ClaudeUp("worker", "w1:p2", label,
+                                              start_state=ClaudeStartState.ALREADY_RUNNING)
+                self.assertEqual(stop_results.claude_up_line(started),
+                                 f"worker: {agent} is up on {label} in w1:p2 (2.5 s)")
+                self.assertEqual(stop_results.claude_up_line(running),
+                                 f"worker: unchanged; {agent} runs on {label} in w1:p2")
+
     def test_resume_uses_the_group_account_unless_the_target_is_explicit(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         for kind in ("unit", "showrunner", "agent"):
