@@ -31,7 +31,8 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import atomic_file, models_registry, unit_runs  # noqa: E402
+from scripts.lib import models_registry, unit_runs
+from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import session_staff, staff, unit_config  # noqa: E402
@@ -494,7 +495,7 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     if state.get(unit_runs.OWNER_FIELD) and state.get("status") == "active":
         for key in ("production", "unit", "branch"):
             _ = stored.pop(key, None)
-    atomic_file.write_text_atomic(
+    write_text_atomic(
         _state_path(session_dir), json.dumps(stored, indent=2, sort_keys=True) + "\n",
     )
 
@@ -1535,6 +1536,7 @@ def _start_phase(args: argparse.Namespace) -> None:
                       or _optional_epoch(args, "started_at", "--started-at", now)
                       == _number(open_phase.get("started_at")))
         if same_title and same_start:
+            _finish_phase_start(session_dir, state, open_phase)
             return
         worktree = phase_reservation.phase_worktree(phase_dir)
         root = phase_reservation.repository_root(Path.cwd())
@@ -1596,7 +1598,6 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["last_percent"] = None
     state["percent_started_at"] = None
     state["pending_calibration"] = None
-    _write_state(session_dir, state)
     event = _event(state, "phase_started", started_at)
     source = _phase_source_identity(state)
     event.update(production=_phase_metadata_fields(source.production),
@@ -1608,7 +1609,22 @@ def _start_phase(args: argparse.Namespace) -> None:
         event["recorded_at"] = _iso_time(now)
         event["backfilled"] = True
     event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
-    _append_event(state, event)
+    phase["start_event"] = event
+    _write_state(session_dir, state)
+    _finish_phase_start(session_dir, state, phase)
+
+
+def _finish_phase_start(session_dir: Path, state: dict[str, object], phase: dict[str, object]) -> None:
+    """Publish a saved phase start once, including after a stopped state write."""
+    if not any(event.get("event_type") == "phase_started"
+               and event.get("phase_instance_id") == phase.get("instance_id") for event in _run_events(state)):
+        event = _object_dict(phase.get("start_event"))
+        if event is None:
+            event = _event(state, "phase_started", _number(phase.get("started_at")), phase_record=phase)
+        _append_event(state, event)
+    if "start_event" in phase:
+        del phase["start_event"]
+        _write_state(session_dir, state)
     _refresh_phase_table(session_dir)
 
 
@@ -5494,6 +5510,8 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
                   "owner_session": owner, "wait_started_at": _iso_time(now),
                   "wait_started_epoch": now, "wait_end": {"state": "Open"},
                   "holder": _holder_fields(holder)})
+    if declaration := _optional_arg(args, "declaration_id"):
+        event["declaration_id"] = declaration
     if hasattr(args, "expected_supplier"):
         event["expected_supplier"] = cast(object, args.expected_supplier)
     if isinstance(resolution, ResolvedWorkerPass):
@@ -5880,6 +5898,15 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
     return VerifiedSupplierMessage(forward[2], SupplierMessageRoute.POSTMASTER_REPLY)
 
 
+def _turn_waits_for_marker(marker: dict[str, object], waits: dict[str, dict[str, object]]) -> list[dict[str, object]]:
+    """Find the declared wait even when its marker lacks the event's wait id."""
+    declaration = _string(marker.get("declaration_id"))
+    if declaration:
+        return [wait for wait in waits.values() if wait.get("declaration_id") == declaration]
+    previous = waits.get(_string(marker.get("wait_id")))
+    return [previous] if previous is not None else []
+
+
 def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) -> bool:
     """Start a director's declared user/supplier wait once, before the stop."""
     if os.environ.get(PROBE_ENV) == "1":
@@ -5909,17 +5936,33 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
             marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
         except FileNotFoundError:
             marker = {}
-        previous = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
-        if previous is not None and previous.get("event_type") == "wait_started":
-            if (previous.get("owner_session") == owner_session and previous.get("wait_kind") == kind
-                    and previous.get("expected_supplier") == supplier_fields):
+        phase = _object_dict(state.get("phase")) or {}
+        identity: dict[str, object] = {"owner_session": owner_session, "wait_kind": kind,
+                                       "expected_supplier": supplier_fields,
+                                       "phase_instance_id": _string(phase.get("instance_id"))}
+        waits = _waits_by_id(_run_events(state))
+        same_declaration = all(marker.get(key) == value for key, value in identity.items())
+        declaration = _string(marker.get("declaration_id")) if same_declaration else ""
+        matching = _turn_waits_for_marker(marker, waits) if declaration else []
+        recovered = next((wait for wait in matching if wait.get("event_type") == "wait_started"), None)
+        previous = waits.get(_string(marker.get("wait_id")))
+        if recovered is None and not marker.get("declaration_id") and previous is not None:
+            if previous.get("event_type") == "wait_started" and all(previous.get(key) == value for key, value in identity.items()):
                 return True
+        if recovered is not None:
+            write_text_atomic(marker_path, json.dumps({**marker, "wait_id": recovered["wait_id"]}) + "\n")
+            return True
+        if previous is not None and previous.get("event_type") == "wait_started":
             _end_wait(state, previous, plan_history.now_epoch(), unclosed=True)
+        if not declaration or matching:
+            declaration = str(uuid.uuid4())
+        marker = {**identity, "declaration_id": declaration}
+        write_text_atomic(marker_path, json.dumps(marker) + "\n")
         args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
-                                  owner_session=owner_session, unit="", expected_supplier=supplier_fields)
+                                  owner_session=owner_session, unit="", expected_supplier=supplier_fields,
+                                  declaration_id=declaration)
         wait_id = _record_wait(state, args)
-        _ = marker_path.write_text(json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n",
-                                   encoding="utf-8")
+        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": wait_id}) + "\n")
     return True
 
 
@@ -5937,9 +5980,11 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         if marker.get("owner_session") != owner_session:
             return
         state = _read_state(session_dir)
-        wait = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
-        if wait is None or wait.get("event_type") != "wait_started":
+        waits = [wait for wait in _turn_waits_for_marker(marker, _waits_by_id(_run_events(state)))
+                 if wait.get("event_type") == "wait_started"]
+        if not waits:
             return
+        wait = waits[0]
         supplier = _object_dict(wait.get("expected_supplier")) or {}
         message = (_supplier_message(_string(supplier.get("address")), prompt, owner_session)
                    if source == "PEER" and supplier.get("state") == "NamedSupplier"
@@ -5951,7 +5996,7 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         relay = from_supplier and body.lstrip().startswith("From the user (via the showrunner):")
         if not ((user_wait and (source == "TYPED" or relay)) or (not user_wait and from_supplier)):
             return
-        _finish_wait(argparse.Namespace(session_dir=str(session_dir), wait_id=_string(marker.get("wait_id"))))
+        _finish_wait(argparse.Namespace(session_dir=str(session_dir), wait_id=_string(wait.get("wait_id"))))
         marker_path.unlink()
 
 

@@ -757,8 +757,7 @@ def end_unit(owner: staff.StaffRow) -> None:
                                         print(f"cancelled pending message of {name}: {message}")
                                     _write_inbox(inbox, {})
                                 current = _object(_read_roster(run).get(name))
-                                if (isinstance(worker.backend, CodexThread) and current
-                                        and current.get("status") != "ended"):
+                                if isinstance(worker.backend, CodexThread) and current:
                                     result = codex_mesh.end_worker_locked(argparse.Namespace(session_dir=str(run), to=name))
                                     if result:
                                         raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")

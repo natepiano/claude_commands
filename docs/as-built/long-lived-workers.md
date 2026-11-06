@@ -343,9 +343,9 @@ Role IDs are `<design_id>/designer` and `<design_id>/reviewer`. Instance names a
 | `open --repository <id> --document --role --production [--unit] --area [--run-directory --phase --checkout --output-path …]` | `open_role` | Reserve placement, create the slot, start one thread. `--repository` is the registered repository ID; the checkout comes from the authority. |
 | `adopt … --source-mesh --name --thread-id --adoption-id` | `adopt` | Move an existing idle thread into the store. |
 | `resume <instance> --prompt-file` | `resume` | Build a headed prompt, claim and dispatch one turn, print the reply path. |
-| `recover <instance>` | `recover` | Prove the recorded thread idle and clear an uncertain claim. |
+| `recover <instance>` | `recover` | Prove the recorded thread idle and clear an uncertain claim. With no worker evidence, it refuses and names `end`, and it never starts a second thread. |
 | `rebind <design> --expected-generation --reason [--unbind / --run-directory --phase --output-path / --production --unit / --checkout --document]` | `rebind` | Change holder, binding, checkout or document while idle; advances the generation. |
-| `end <instance>` | `end` | End one role. When no role of the design stays open, it also stops the design mesh server and writes `end-server-release.json`; a failed stop leaves the role `RoleNeedsRecovery`. |
+| `end <instance>` | `end` | End one role. The role's own `outcome_unknown` creation claim does not count as busy, and a missing worker counts as ended for that claim. When no role of the design stays open, it also stops the design mesh server and writes `end-server-release.json`; a failed stop leaves the role `RoleNeedsRecovery`. |
 | `unbind-run <run>` | `unbind_run` | Unbind every design bound to that run. |
 | `list [--json]` | `list_roles` | Default: one plain line per role with instance ID, role, lifecycle state, holder, holder session or unavailable reason, thread ID when present, and document; `no held roles` when empty, then one line per problem. `--json`: the full local roles and problems dict, with `transition.json`, move marker and failed status mapped to recovery/paused states; no network calls. |
 | `register --repository --host --checkout` | `register_repository` | Register a repository with the authority. |

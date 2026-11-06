@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import builtins
 import fcntl
 import hashlib
 import json
@@ -31,12 +32,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 import send
 import repeat_guard
 from relay_identity import relay_session_name
 from relay_test_support import write_relay_record
-from scripts.lib import names
+from scripts.lib import names, process_start
 from scripts.production import staff
 from scripts.whoami import account
 import process_table
@@ -2105,8 +2108,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 del legacy["send_order"]
                 legacy["text"] = "Legacy body"
                 first, second = (ordered, legacy) if ordered_first else (legacy, ordered)
-                send.write_atomic(path, json.dumps(first) + "\n")
-                send.write_atomic(name_path, json.dumps(second) + "\n")
+                write_text_atomic(path, json.dumps(first) + "\n")
+                write_text_atomic(name_path, json.dumps(second) + "\n")
                 delivered = send.pending("session:recipient")
                 self.assertEqual(delivered.count("Ordered body"), 1)
                 self.assertNotIn("Legacy body", delivered)
@@ -2346,6 +2349,93 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             f"SKIPPED: an emergency push with key github-cold went to the user at {sent.astimezone(zone):%H:%M:%S %Z}"
             + f" and is still live until {(sent + timedelta(hours=3)).astimezone(zone):%H:%M:%S %Z}; to send a new one,"
             + " retire it first: send.py retire --to user --from hana --key github-cold\n"))
+
+    def test_replaced_emergency_retries_until_delivered_then_keeps_its_live_window(self) -> None:
+        started = send.now()
+        key = "replaced-emergency"
+        with mock.patch.object(send, "run", side_effect=[
+                (5, "pushover: replaced: a newer version replaced this push\n", ""),
+                (0, "pushover: sent\n", "")]) as delivery:
+            replaced = self.emergency_at(started, "--key", key)
+            retried = self.emergency_at(started + timedelta(seconds=1), "--key", key)
+            repeated = self.emergency_at(started + timedelta(seconds=2), "--key", key)
+        self.assertEqual(replaced.outcome, "replaced", replaced.detail)
+        self.assertEqual(retried.outcome, "sent", retried.detail)
+        self.assertEqual(repeated.outcome, "skipped", repeated.detail)
+        self.assertIn("still live until", repeated.detail)
+        self.assertEqual(delivery.call_count, 2)
+
+    def test_emergency_rerun_after_claim_before_delivery_never_reports_a_live_push(self) -> None:
+        started = send.now()
+        options = send.parse(self.emergency("--key", "stopped-emergency"))
+        with stop_once(send, "user", when="before"), self.assertRaises(InjectedStop):
+            _ = send.send(options)
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as delivery:
+            result = self.emergency_at(started + timedelta(seconds=1), "--key", "stopped-emergency")
+        self.assertNotIn("still live until", result.detail)
+        self.assertIn(result.outcome, ("sent", "pending"))
+        if result.outcome == "pending":
+            self.assertIn("not yet accepted", result.detail)
+        else:
+            delivery.assert_called_once()
+
+    def test_emergency_rerun_after_the_owner_stops_reclaims_the_unaccepted_push(self) -> None:
+        started = send.now()
+        options = send.parse(self.emergency("--key", "dead-emergency-owner"))
+        stop_in_child(lambda: send.send(options), send, "user", when="before")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as delivery:
+            result = self.emergency_at(started + timedelta(seconds=1), "--key", "dead-emergency-owner")
+        self.assertEqual(result.outcome, "sent", result.detail)
+        delivery.assert_called_once()
+
+    def test_emergency_rerun_past_the_budget_keeps_live_and_unknown_owners(self) -> None:
+        for state in ("live", "unknown"):
+            with self.subTest(state=state):
+                key = "emergency-owner-" + state
+                started = send.now()
+                options = send.parse(self.emergency("--key", key))
+                with stop_once(send, "user", when="before"), self.assertRaises(InjectedStop):
+                    _ = send.send(options)
+                observed = process_start.process_start(os.getpid()) if state == "live" else process_start.Unreadable("fixture")
+                with (mock.patch.object(process_start, "process_start", return_value=observed),
+                      mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as delivery):
+                    result = self.emergency_at(started + timedelta(days=1), "--key", key)
+                self.assertEqual(result.outcome, "pending", result.detail)
+                self.assertIn("not yet accepted", result.detail)
+                delivery.assert_not_called()
+
+    def test_emergency_rerun_after_acceptance_repairs_its_clearing_record_without_another_push(self) -> None:
+        started = send.now()
+        key = "accepted-emergency-clearing"
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as delivery:
+            with stop_once(send, "write_emergencies", when="before"), self.assertRaises(InjectedStop):
+                _ = self.emergency_at(started, "--key", key)
+            retried = self.emergency_at(started + timedelta(seconds=1), "--key", key)
+        self.assertEqual(retried.outcome, "skipped", retried.detail)
+        delivery.assert_called_once()
+        records = [record for record in send.read_emergencies() if record["key"] == key]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["check"], "true")
+
+    def test_pending_rerun_after_output_failure_keeps_the_accepted_text(self) -> None:
+        self.outcome = send.Result("queued", "recipient unavailable")
+        self.assertEqual(self.send("--text", "Keep this accepted message.").outcome, "queued")
+        with stop_once(builtins, "print", when="before",
+                       matches=lambda value: "Queued message" in str(value)), self.assertRaises(InjectedStop):
+            _ = send.main(["pending", "bogus"])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(send.main(["pending", "bogus"]), 0)
+        self.assertIn("Keep this accepted message.", output.getvalue())
+        self.assertEqual(send.pending("bogus"), "")
+
+    def test_template_notice_rerun_after_stamp_before_spawn_launches_the_notice(self) -> None:
+        record: dict[str, object] = {"text_id": "quota", "body": "The work stopped."}
+        stop_in_child(lambda: send.template_fix_notice(record), subprocess, "Popen", when="before")
+        with mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch:
+            send.template_fix_notice(record)
+        launch.assert_called_once()
+        command = cast(list[str], launch.call_args.args[0])
+        self.assertEqual(command[2:4], ["template-fix-deliver", "quota"])
 
     def test_an_emergency_push_with_no_key_takes_one_from_its_sender_and_title(self) -> None:
         sent = send.now()

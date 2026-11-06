@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
+
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib import unit_runs
 
@@ -2116,6 +2118,93 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual((waits[0]["event_type"], waits[0]["wait_started_epoch"], waits[0]["owner_session"]),
                          ("wait_started", 1020, "director"))
         self.assertEqual((session / "turn_wait.json").read_text(), marker)
+
+    def test_turn_wait_rerun_after_event_before_marker_keeps_one_wait(self) -> None:
+        name = "stopped-wait-publication"
+        session = self.covered_wait_phase(name)
+        message = "blocked: waiting on uds:/supplier.sock"
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", message)
+            self.assertTrue(progress_history.record_turn_wait(session, "director", message))
+        waits = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual(len(waits), 1)
+        marker = cast(dict[str, object], json.loads((session / "turn_wait.json").read_text()))
+        self.assertEqual(marker["wait_id"], waits[0]["wait_id"])
+
+    def test_typed_answer_finishes_a_wait_after_event_before_marker_publication(self) -> None:
+        name = "typed-answer-after-wait-stop"
+        session = self.covered_wait_phase(name)
+        marker_path = session / "turn_wait.json"
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", "decision: choose the next phase")
+            marker = cast(dict[str, object], json.loads(marker_path.read_text()))
+            self.assertNotIn("wait_id", marker)
+            starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(marker["declaration_id"], starts[0]["declaration_id"])
+            os.environ["UNIT_NOW_EPOCH"] = "1030"
+            progress_history.finish_turn_wait(session, "director", source="TYPED", prompt="Continue.")
+            progress_history.finish_turn_wait(session, "director", source="TYPED", prompt="Continue.")
+        waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+        self.assertEqual(waits[1]["wait_id"], starts[0]["wait_id"])
+        self.assertEqual(waits[1]["wait_end"], {"state": "Finished", "at": waits[1]["timestamp"], "epoch": 1030})
+        self.assertFalse(marker_path.exists())
+
+    def test_start_phase_rerun_after_state_before_event_repairs_the_history(self) -> None:
+        name = "stopped-phase-publication"
+        session = self.start_run(name, 1000)
+        arguments = ["start-phase", "--session-dir", str(session), "--phase-id", "13", "--phase-title", "Rerun"]
+        with stop_once(progress_history, "_append_event", when="before",
+                       argument=1, matches=lambda value: isinstance(value, dict)
+                       and cast(dict[str, object], value).get("event_type") == "phase_started"):
+            with self.assertRaises(InjectedStop):
+                _ = self.run_command(*arguments, at=1020)
+        _ = self.run_command(*arguments, at=1020)
+        events = [event for event in self.read_events(name) if event["event_type"] == "phase_started"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["phase_id"], "13")
+
+    def test_turn_wait_rerun_with_stale_marker_recovers_the_replacement(self) -> None:
+        name = "replacement-wait-stop"
+        session = self.covered_wait_phase(name)
+        message = "decision: choose the next phase"
+        marker_path = session / "turn_wait.json"
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            self.assertTrue(progress_history.record_turn_wait(session, "director", message))
+            original = cast(dict[str, object], json.loads(marker_path.read_text()))
+            progress_history.finish_turn_wait(session, "director", source="TYPED", prompt="Continue.")
+            _ = marker_path.write_text(json.dumps(original))
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", message)
+            starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+            self.assertEqual(len(starts), 2)
+            replacement_id = starts[-1]["wait_id"]
+            stale = cast(dict[str, object], json.loads(marker_path.read_text()))
+            stale["wait_id"] = original["wait_id"]
+            _ = marker_path.write_text(json.dumps(stale))
+            self.assertTrue(progress_history.record_turn_wait(session, "director", message))
+        starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual([event["wait_id"] for event in starts], [original["wait_id"], replacement_id])
+        self.assertEqual(cast(dict[str, object], json.loads(marker_path.read_text()))["wait_id"], replacement_id)
+
+    def test_turn_wait_for_another_phase_does_not_adopt_an_orphan(self) -> None:
+        name = "cross-phase-wait-stop"
+        session = self.covered_wait_phase(name)
+        message = "blocked: waiting on uds:/supplier.sock"
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", message)
+            _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "7",
+                                 "--phase-title", "Another phase", at=1030)
+            self.assertTrue(progress_history.record_turn_wait(session, "director", message))
+        starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual(len(starts), 2)
+        self.assertNotEqual(starts[0]["phase_instance_id"], starts[1]["phase_instance_id"])
+        marker = cast(dict[str, object], json.loads((session / "turn_wait.json").read_text()))
+        self.assertEqual(marker["wait_id"], starts[1]["wait_id"])
 
     def test_phase_finish_closes_an_open_declared_supplier_wait_as_unclosed(self) -> None:
         session = self.covered_wait_phase("declared-phase-end")

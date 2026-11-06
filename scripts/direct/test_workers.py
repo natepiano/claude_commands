@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
@@ -31,6 +32,7 @@ from scripts.agents import codex_mesh, worker_lifecycle, test_codex_mesh as mesh
 from scripts.direct import workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 from scripts.message import sessions
 from scripts.production import staff, session_staff, worker_admission
 from scripts.usage import agents_log
@@ -259,6 +261,82 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         cast(dict[str, object], roster[name])["unit_ledger"] = str(store.path)
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(session_staff.stored_worker_records(roster)))
         return store
+
+    def test_roster_rerun_after_interrupted_publication_keeps_other_workers_and_receipts(self) -> None:
+        self.open_worker("kept")
+        path = self.session_dir / codex_mesh.ROSTER_FILE
+        write_roster = cast(Callable[[worker_lifecycle.WorkerStateFile, dict[str, object]], None],
+                            getattr(workers, "_write_roster"))
+        with worker_lifecycle.locked_state(path) as handle:
+            roster = handle.read_object()
+            original = dict(roster)
+            entry = cast(dict[str, object], roster["kept"])
+            entry["assignment_id"] = "accepted-before-stop"
+            write_roster(handle, roster)
+            before = path.read_bytes()
+            entry["task"] = "next assignment"
+            with stop_once(os, "replace", when="before", argument=1,
+                           matches=lambda destination: Path(str(destination)) == path), self.assertRaises(InjectedStop):
+                write_roster(handle, roster)
+        self.assertEqual(path.read_bytes(), before)
+        with worker_lifecycle.locked_state(path) as handle:
+            recovered = handle.read_object()
+            cast(dict[str, object], recovered["kept"])["task"] = "next assignment"
+            write_roster(handle, recovered)
+        saved = cast(dict[str, object], json_object(path)["kept"])
+        self.assertEqual(saved["task"], "next assignment")
+        self.assertEqual(saved["assignment_id"], "accepted-before-stop")
+        self.assertEqual(saved["staff_id"], cast(dict[str, object], original["kept"])["staff_id"])
+
+    def test_roster_two_writers_keep_workers_and_mesh_updates(self) -> None:
+        self.open_worker("kept")
+        path = self.session_dir / codex_mesh.ROSTER_FILE
+        barrier = threading.Barrier(2)
+        write_roster = cast(Callable[[worker_lifecycle.WorkerStateFile, dict[str, object]], None],
+                            getattr(workers, "_write_roster"))
+        update_roster = cast(Callable[[str, str, codex_mesh.ThreadRecord], bool],
+                             getattr(codex_mesh, "_update_roster"))
+
+        def worker_write() -> None:
+            _ = barrier.wait(timeout=10)
+            with worker_lifecycle.locked_state(path) as handle:
+                roster = handle.read_object()
+                cast(dict[str, object], roster["kept"])["assignment_id"] = "accepted"
+                write_roster(handle, roster)
+
+        def mesh_write() -> None:
+            _ = barrier.wait(timeout=10)
+            record: codex_mesh.FollowableRecord = {
+                "thread_id": mesh_fixture.THREAD_ID, "status": "done", "task": "mesh update"}
+            self.assertTrue(update_roster(str(self.session_dir), "kept", record))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(worker_write)
+            second = pool.submit(mesh_write)
+            first.result(timeout=20)
+            second.result(timeout=20)
+        saved = cast(dict[str, object], json_object(path)["kept"])
+        self.assertEqual(saved["task"], "mesh update")
+        self.assertEqual(saved["assignment_id"], "accepted")
+        self.assertEqual(saved["thread_id"], mesh_fixture.THREAD_ID)
+
+    def test_end_unit_rerun_after_end_marker_retries_transport_cleanup(self) -> None:
+        store = self.lifecycle_worker()
+        member = staff.by_current_session(mesh_fixture.THREAD_ID)
+        assert member is not None
+        owner = staff.local_snapshot().parent_of(member)
+        assert owner is not None
+        with stop_once(session_staff, "publish_worker_roster", argument=1,
+                       matches=lambda value: isinstance(value, dict)
+                       and cast(dict[str, object], cast(dict[str, object], value).get("w7", {})).get("status") == "ended"):
+            with self.assertRaises(InjectedStop):
+                workers.end_unit(owner)
+        self.assertTrue(store.path.exists())
+        with patch.object(codex_mesh, "end_worker_locked", wraps=codex_mesh.end_worker_locked) as cleanup:
+            workers.end_unit(owner)
+        cleanup.assert_called_once()
+        with store.locked(write=False) as ledger:
+            self.assertNotIn("w7", ledger.workers)
 
 
     def test_backend_loss_preserves_unresolved_ledger_entries_on_save(self) -> None:
