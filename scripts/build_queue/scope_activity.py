@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Protocol
@@ -33,6 +33,27 @@ class EmptyBuildScope:
 
 
 @dataclass(frozen=True)
+class NotServiceSlice:
+    pass
+
+
+@dataclass(frozen=True)
+class IdleService:
+    pass
+
+
+@dataclass(frozen=True)
+class RunningServiceJob:
+    started_at: float
+
+
+@dataclass(frozen=True)
+class ScopeProcess:
+    pid: int
+    program: str
+
+
+@dataclass(frozen=True)
 class ScopeProcesses:
     count: int
     session_id: str
@@ -42,6 +63,7 @@ class ScopeProcesses:
     started_at: float
     test_fixture: bool
     run: LiveBuildRun | NoLiveBuildRun
+    members: tuple[ScopeProcess, ...] = field(default=(), kw_only=True)
 
 
 class ScopeActivityReader:
@@ -145,4 +167,6 @@ class ScopeActivityReader:
                 except OSError:
                     pass
         return ScopeProcesses(len(members), session, name, folder, program,
-                              self.started_at(oldest), fixture, run)
+                              self.started_at(oldest), fixture, run,
+                              members=tuple(ScopeProcess(pid, Path(self.command(pid)[0]).name if self.command(pid) else "unknown program")
+                                            for pid in sorted(members, key=lambda pid: (self.started_at(pid), pid))))

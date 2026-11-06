@@ -44,14 +44,6 @@ def age(since: float, now: float) -> int:
     return max(0, int((now - since) // 60))
 
 
-def pad_left(text: str, cells: int) -> str:
-    return " " * max(0, cells - terminal_width(text)) + text
-
-
-def pad_right(text: str, cells: int) -> str:
-    return text + " " * max(0, cells - terminal_width(text))
-
-
 def cut_tail(text: str, cells: int) -> str:
     return plain([clip((Span(text),), cells)])
 

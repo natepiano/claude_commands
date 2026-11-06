@@ -95,6 +95,7 @@ class BroadcastTests(unittest.TestCase):
             + "    if item.startswith(('BROADCAST_SEND=', 'BROADCAST_CLOSING_MACHINES=')): key, value = item.split('=', 1); os.environ[key] = value\n"
             + "os.environ.pop('CODEX_THREAD_ID', None); os.environ.pop('CLAUDE_CODE_SESSION_ID', None)\n"
             + "os.environ['LOG'] = os.environ['PEER_LOG']; os.environ['TOGETHER'] = '1'\n"
+            + f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
             + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
             + "import broadcast, roster\n"
             + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"

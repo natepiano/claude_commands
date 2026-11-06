@@ -6,13 +6,14 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lint import memory_admit as gate
 from scripts.lib.py_floor_test_support import cache_file_name
 
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
 from collections.abc import Callable
 
 import json
 import os
 import signal
+import shlex
 import shutil
 import sys
 import select
@@ -24,7 +25,8 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -169,7 +171,7 @@ esac
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         # Admission must use this test's memory state, including pressure.
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         # Interpreter selection is independent of token ownership. Seed the
         # shim's normal cache once rather than rediscovering Python per test.
         interpreter = self.root / "cache" / "claude" / cache_file_name()
@@ -185,13 +187,11 @@ esac
             + f"timeout={TEST_HANG_GUARD_SECS})\n")
         # Memory changes are events. Token retry tests may replace this stub
         # with their own acquisition marker or clock advancement.
-        _ = (stubs / "sleep").write_text(
-            '#!/bin/sh\n'
-            + 'if [ "$1" = "${BUILDLOG_MEM_POLL_S:-5}" ]; then\n'
+        self.write_wait_sleep(
+            'if [ "$1" = "${BUILDLOG_MEM_POLL_S:-5}" ]; then\n'
             + '    read -r label available unit < "$BUILDLOG_MEMINFO"\n'
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
             + 'fi\nexit 0\n')
-        (stubs / "sleep").chmod(0o755)
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
@@ -247,6 +247,19 @@ esac
             "TEST_CARGO_PID": str(self.root / "cargo-pid"),
             "TEST_MEMORY_EVENT": str(memory_event),
         }
+
+    def write_wait_sleep(self, body: str) -> None:
+        """Fake queue delays. Keep renewal and other delays on the real clock."""
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            self.fail("the token fixture requires sleep on PATH")
+        path = self.root / "stubs" / "sleep"
+        _ = path.write_text(
+            '#!/bin/sh\n'
+            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}"|3) ;;\n'
+            + f'    *) exec {shlex.quote(real_sleep)} "$@" ;;\nesac\n'
+            + body)
+        path.chmod(0o755)
 
     @override
     def tearDown(self) -> None:
@@ -314,14 +327,16 @@ esac
                     os.close(descriptor)
 
     def record_phase(self, session: Path) -> None:
+        record_wait_workers(self.root, session, self.environment,
+                            {f"fixture-{slot}": f"thread-{slot}" for slot in ("impl", "first", "second")})
         self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
                                  "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
-                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": "thread-impl",
+                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": fixture_runtime_id("thread-impl"),
                                  "CLAUDE_PROBE_SESSION": ""})
         for arguments in (
             ["start-run", "--session-dir", str(session), "--working-dir", str(self.root),
              "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
-             "--main-session-id", "fixture-director"],
+             "--main-session-id", fixture_runtime_id("fixture-director")],
             ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Resources"],
         ):
             result = invoke_recorder(arguments, self.environment, self.root)
@@ -333,8 +348,6 @@ esac
             result = invoke_recorder(arguments, {**self.environment, "UNIT_TEAM_ROLE": slot}, self.root)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-        _ = (session / "mesh_roster.json").write_text(json.dumps({
-            f"fixture-{slot}": {"thread_id": f"thread-{slot}"} for slot in ("impl", "first", "second")}))
 
     def phase_waits(self, session: Path) -> list[dict[str, object]]:
         return [row for row in (cast(dict[str, object], json.loads(line)) for line in
@@ -376,6 +389,10 @@ esac
 
         verify.sh tees its step output to stdout, so both streams go to `errors`.
         """
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            if not admission.server.reservations and not admission.server.slots:
+                _ = admission.occupy_host()
         with errors.open("wb") as stream:
             process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                        cwd=self.root, env=environment, stdout=stream,

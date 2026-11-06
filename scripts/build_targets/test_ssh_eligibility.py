@@ -14,6 +14,14 @@ import subprocess
 import sys
 import tempfile
 from typing import TYPE_CHECKING, cast, override
+
+if TYPE_CHECKING:
+    from ..lib import process_start as process_identity
+    from ..lib.process_start_test_support import process_reader
+else:
+    from scripts.lib import process_start as process_identity
+    from scripts.lib.process_start_test_support import process_reader
+
 import unittest
 from unittest import mock
 
@@ -78,7 +86,7 @@ class SshEligibilityTests(unittest.TestCase):
                                                return_value=offload.KnownRepository("hana", "github.com/team/hana")))
         _ = self.enterContext(mock.patch.object(mac_test, "target_claim_scope",
                                                return_value=mac_test.RepositoryScope("hana", "github.com/team/hana")))
-        _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", side_effect=self.process_start))
+        _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
         book = ledger.CostLedger(mac_test.state_paths("aws").directory)
@@ -177,7 +185,7 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_a_mac_block_stops_a_memory_wait_from_reusing_its_reservation(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\n")
         self.assertEqual(self.reserve("mac"), 0)
         paths = mac_test.state_paths("mac")
         claim, = mac_test.read_claims(paths)
@@ -241,7 +249,7 @@ class SshEligibilityTests(unittest.TestCase):
         def start(pid: int) -> str | None:
             return None if pid in (71, 72) else self.process_start(pid)
 
-        with mock.patch.object(mac_test, "process_start_time", side_effect=start), \
+        with mock.patch.object(process_identity, "process_start", side_effect=process_reader(start)), \
                 mock.patch.object(subprocess, "run", side_effect=cleanup), redirect_stderr(io.StringIO()):
             self.assertEqual(self.aws()[1:3], ["excluded", "spending_limit"])
             self.assertEqual(self.reserve(recover_only=True), 1)
@@ -259,7 +267,7 @@ class SshEligibilityTests(unittest.TestCase):
         def start(pid: int) -> str | None:
             return None if pid == 71 else self.process_start(pid)
 
-        with mock.patch.object(mac_test, "process_start_time", side_effect=start), \
+        with mock.patch.object(process_identity, "process_start", side_effect=process_reader(start)), \
                 mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
                     ["ssh"], 0, "leftovers=2\nrc=0\n", "")), redirect_stderr(io.StringIO()):
             self.assertEqual(self.reserve(recover_only=True), 1)
@@ -342,7 +350,7 @@ class SshEligibilityTests(unittest.TestCase):
             cleaned.append(list(arguments))
             return subprocess.CompletedProcess(arguments, 0, "leftovers=0\nrc=0\n", "")
 
-        with mock.patch.object(mac_test, "process_start_time", side_effect=start), \
+        with mock.patch.object(process_identity, "process_start", side_effect=process_reader(start)), \
                 mock.patch.object(subprocess, "Popen", new=REAL_POPEN), \
                 mock.patch.object(subprocess, "run", side_effect=cleanup), redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(self.aws()[1:3], ["excluded", "spending_unavailable"])
@@ -403,7 +411,7 @@ class SshEligibilityTests(unittest.TestCase):
                 def start(pid: int) -> str | None:
                     return None if pid == 71 else self.process_start(pid)
 
-                with mock.patch.object(mac_test, "process_start_time", side_effect=start), \
+                with mock.patch.object(process_identity, "process_start", side_effect=process_reader(start)), \
                         mock.patch.object(subprocess, "Popen", new=REAL_POPEN), \
                         mock.patch.object(subprocess, "run", new=git_only), redirect_stderr(io.StringIO()) as errors:
                     self.assertEqual(self.reserve(recover_only=True), 1)
@@ -438,7 +446,7 @@ class SshEligibilityTests(unittest.TestCase):
             self.assertEqual(options["timeout"], 23)
             return subprocess.CompletedProcess(arguments, 0, "leftovers=0\nrc=0\n", "")
 
-        with mock.patch.object(mac_test, "process_start_time", side_effect=start), \
+        with mock.patch.object(process_identity, "process_start", side_effect=process_reader(start)), \
                 mock.patch.object(subprocess, "Popen", new=REAL_POPEN), \
                 mock.patch.object(subprocess, "run", side_effect=cleanup), redirect_stderr(io.StringIO()):
             self.assertEqual(self.reserve(recover_only=True), 1)

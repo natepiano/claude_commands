@@ -13,7 +13,7 @@ from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
-from scripts.production import change_review, change_routing
+from scripts.production import change_review, change_routing, staff
 from scripts.production.change_routing import UnavailableProduction
 from scripts.production.proposals_folder import slug_of
 from scripts.review_links import change_page
@@ -105,12 +105,12 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
         root = runner
         while root is not None:
             parent = root.parent
-            if parent is None or parent not in routing.runners:
+            if not isinstance(parent, staff.ReportsTo) or parent.id not in routing.runners:
                 break
-            root = routing.runners[parent]
+            root = routing.runners[parent.id]
         current = (defaults.get(root.name) if root is not None else None) or routing.list_paths.get(tab) or defaults.get(tab, page.review_list)
         name = change_review.queue(current)
-        if runner is not None and runner.parent is not None and isinstance(page, change_page.AssignedReviewPage):
+        if runner is not None and isinstance(runner.parent, staff.ReportsTo) and isinstance(page, change_page.AssignedReviewPage):
             name += "-" + slug_of(page.production)
         entries: list[urgency.Entry[dict[str, str]]] = []
         by_key: dict[str, WaitingChange] = {}
@@ -137,7 +137,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         return f'''<section hidden data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
 <div class="id">{html.escape(change.key)}</div><h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2><pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
+<h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p></section>'''
     form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
         '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
@@ -148,7 +148,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
 <div class="id">{html.escape(change.key)} · {html.escape(row.get('Merged', ''))}</div>
 <h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
-<pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
+{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}</section>'''
 
 

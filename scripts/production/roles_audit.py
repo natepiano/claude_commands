@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import subprocess
 import sys
 import tomllib
 import tokenize
@@ -27,7 +28,7 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import showrunners, staff, unit_lookup, unit_names
-from scripts.production.production_doc import cell_value
+from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402
@@ -441,9 +442,10 @@ def measure_definitions(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) ->
     return tuple(result)
 
 
-def parse_production(slug: str, doc: Path, text: str, record: staff.StaffSnapshot) -> ProductionNames:
-    prefix = "- **Showrunner session:** "
-    session = next((cell_value(line[len(prefix):]) for line in text.splitlines() if line.startswith(prefix)), slug)
+def parse_production(slug: str, doc: Path, record: staff.StaffSnapshot) -> ProductionNames:
+    row = record.by_doc(remote.local_machine(), doc)
+    timer = showrunners.timer_for(row, record) if row is not None else showrunners.NoTimer("no staff row")
+    session = timer.target.removeprefix("session:") if isinstance(timer, showrunners.TimerRegistration) else slug
     units = tuple(unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, record))
     return ProductionNames(slug, str(doc), session, units)
 
@@ -888,9 +890,19 @@ def read_live_file(root: Path, retired: re.Pattern[str], select_candidates: bool
 
 
 def read_live_sources(root: Path, *, retired_forms: tuple[str, ...] = (), fixed_forms: tuple[str, ...] = ()) -> LiveSources:
-    paths: set[Path] = {root / "CLAUDE.md"} if (root / "CLAUDE.md").is_file() else set()
-    for folder in ("commands", "docs", "skills", "scripts"):
-        paths.update(path for path in (root / folder).rglob("*") if path.is_file())
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z",
+         "--", "commands/", "docs/", "skills/", "scripts/", "CLAUDE.md"],
+        capture_output=True, text=True, check=False)
+    if listed.returncode == 0:
+        paths: set[Path] = {root / name for name in listed.stdout.split("\0") if name and (root / name).is_file()}
+    elif "not a git repository" in listed.stderr:
+        # Fixture callers also audit source folders outside Git trees.
+        paths = {root / "CLAUDE.md"} if (root / "CLAUDE.md").is_file() else set()
+        for folder in ("commands", "docs", "skills", "scripts"):
+            paths.update(path for path in (root / folder).rglob("*") if path.is_file())
+    else:
+        raise ValueError(f"cannot list audit sources through git: {listed.stderr.strip()}")
     selected: list[Path] = []
     # No word boundaries: even a raw match inside an identifier selects extraction.
     retired = re.compile("|".join(re.escape(name) for name in retired_forms) if retired_forms else r"(?!)", re.IGNORECASE)
@@ -1043,7 +1055,7 @@ def baseline(root: Path, window: AuditWindow, *, tables: bool = False) -> str:
     record = staff.snapshot()
     for slug, doc in sorted(showrunners.timer_docs().items()):
         try:
-            productions.append(parse_production(slug, doc, doc.read_text(encoding="utf-8"), record))
+            productions.append(parse_production(slug, doc, record))
         except (OSError, UnicodeError, staff.StaffUnreadable) as error:
             unread_production_docs.append(UnreadSource(str(doc), str(error)))
             issues.append(f"{doc}: {error}")

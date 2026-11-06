@@ -26,6 +26,8 @@ class VerifyDocTests(VerifyDocFixture):
         index_before = (self.repo / ".git/index").read_bytes()
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / "runtime/lint-sweep").exists(),
+                         "The doc fixture must not start a background sweep.")
         self.assertEqual((self.repo / ".git/index").read_bytes(), index_before)
         self.assertEqual(source.read_text(encoding="utf-8"), "pub fn unstaged() {}\n")
         self.assertEqual(other.read_text(encoding="utf-8"), "pub fn unrelated_unstaged() {}\n")

@@ -4,17 +4,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from scripts.production import staff, showrunners, unit_names
-
-
-def showrunner_owner(record: staff.StaffSnapshot, slug: str, document: str) -> staff.StaffRow | None:
-    """A timer names a staff path or a unique showrunner short name, including nested owners."""
-    name = showrunners.space_from_text(slug, document)
-    row = record.by_path(name)
-    if row is not None and row.kind == "showrunner":
-        return row
-    owners = [owner for owner in record.find(kind="showrunner") if owner.name == name]
-    return owners[0] if len(owners) == 1 else None
+from scripts.production import staff, showrunners
+from scripts.lib import legacy_identity
 
 
 @dataclass(frozen=True)
@@ -35,31 +26,15 @@ class StaffLabels:
         parents: dict[str, staff.StaffRow] = {}
         for row in record.find(kind="showrunner"):
             timer = showrunners.timer_for(row, record, sources=sources)
-            if isinstance(timer, showrunners.Timer):
+            if isinstance(timer, showrunners.TimerRegistration):
                 parents[timer.slug] = row
         return cls(record, productions, parents)
 
     def environment(self, environment: Mapping[str, str], session_id: str) -> dict[str, str]:
         """Join the current native runtime identity without inferring a member."""
-        result = {key: value for key, value in environment.items() if key != "STAFF_ID"}
+        result = legacy_identity.without_legacy_identity(environment)
         row = self.record.by_current_session(session_id) if session_id else None
         if row is None:
             return result
         result["CLAUDE_CODE_SESSION_ID"] = row.current_session
-        if row.kind in ("showrunner", "agent"):
-            _ = result.pop("SHOWRUNNER_UNIT", None)
-            _ = result.pop("SHOWRUNNER_UNIT_ID", None)
-        elif row.kind == "unit":
-            parent = self.record.by_id(row.parent) if row.parent is not None else None
-            if parent is None or parent.kind != "showrunner":
-                return result
-            slugs = [slug for slug, owner in self.showrunners.items() if owner.id == parent.id]
-            slug = slugs[0] if len(slugs) == 1 else parent.name
-            result["SHOWRUNNER_UNIT"] = slug
-            retained_id = result.get("SHOWRUNNER_UNIT_ID", "")
-            try:
-                retained_owner = unit_names.name(retained_id) if retained_id else ""
-            except unit_names.BadName:
-                retained_owner = ""
-            result["SHOWRUNNER_UNIT_ID"] = retained_id if retained_owner == row.name else unit_names.unit_id(row.name)
         return result

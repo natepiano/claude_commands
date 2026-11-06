@@ -119,6 +119,83 @@ class StandingTests(unittest.TestCase):
         return subprocess.run([sys.executable, "-c", program, *arguments],
                               capture_output=True, text=True, timeout=10)
 
+    def test_clone_cli_creates_a_task_owned_checkout_without_a_root_busy_mark(self) -> None:
+        result = self.cli("clone", str(self.source), "--task", "gate:camera", "--name", "camera")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        checkout = Path(result.stdout.strip())
+        self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
+        self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
+        self.assertFalse((checkout / scratch.BUSY).exists())
+        record = scratch.task_of(checkout.parent)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.task, "gate:camera")
+        self.assertIs(record.fields["test_hana_clone"], True)
+        self.assertEqual(record.fields["source_path"], str(self.source))
+        self.assertEqual(scratch.end("gate:camera"), [checkout.parent])
+        self.assertFalse(checkout.parent.exists())
+        self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
+    def symlink_scratch_root(self) -> Path:
+        physical = self.base / "physical-scratch"
+        physical.mkdir()
+        alias = self.base / "scratch-alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        os.environ["SCRATCH_ROOT"] = str(alias)
+        return alias
+
+    def test_clone_through_symlink_scratch_root(self) -> None:
+        alias = self.symlink_scratch_root()
+        result = self.cli("clone", str(self.source), "--task", "gate:symlink", "--name", "camera")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        checkout = Path(result.stdout.strip())
+        self.assertTrue(checkout.is_relative_to(alias))
+        self.assertNotEqual(checkout, checkout.resolve())
+        self.assertEqual(self.git(checkout, "rev-parse", "--absolute-git-dir"),
+                         str((checkout / ".git").resolve()))
+        self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.head)
+        self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
+        self.assertEqual(scratch.end("gate:symlink"), [checkout.parent])
+        self.assertFalse(checkout.parent.exists())
+
+    def test_symlink_scratch_clone_refuses_foreign_git_directory(self) -> None:
+        _ = self.symlink_scratch_root()
+        checkout = copies.clone(self.source, task="gate:foreign")
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(self.source / ".git")}):
+            with self.assertRaisesRegex(copies.CopyError, "Git directory is .*expected"):
+                copies.initialize_git(checkout, self.source)
+        self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.head)
+
+    def test_symlink_scratch_clone_refuses_symlink_git_directory(self) -> None:
+        _ = self.symlink_scratch_root()
+        checkout = copies.clone(self.source, task="gate:git-link")
+        metadata = checkout / ".git"
+        saved = checkout / "saved-git"
+        _ = metadata.rename(saved)
+        metadata.symlink_to(saved, target_is_directory=True)
+        with self.assertRaisesRegex(copies.CopyError, "must own its .git directory"):
+            copies.initialize_git(checkout, self.source)
+
+    def test_apply_changes_through_symlink_scratch_root(self) -> None:
+        _ = self.symlink_scratch_root()
+        checkout = copies.clone(self.source, task="gate:apply-link")
+        _ = (self.source / "untracked.txt").write_text("new file\n")
+        copies.apply_changes(checkout, self.source, self.head)
+        self.assertEqual((checkout / "untracked.txt").read_text(), "new file\n")
+
+    def test_borrower_order_resolves_stored_git_directory(self) -> None:
+        alias = self.symlink_scratch_root()
+        with copies.workspace("verify-unit", self.source, self.head, name="a-parent", branch="parent") as parent:
+            pass
+        with copies.workspace("verify-unit", parent, self.head, name="z-child", branch="child") as child:
+            pass
+        link = alias / "parent"
+        link.symlink_to(parent, target_is_directory=True)
+        _ = scratch.update_record(child, lambda record: {
+            **(record.fields if isinstance(record, copy_record.Registered) else {}),
+            "borrows_from": str(link / ".git"),
+        })
+        self.assertEqual([tree for tree, _ in copies.owned_workspaces("verify-unit")], [child, parent])
+
     def test_first_use_owns_git_and_never_changes_source_branch(self) -> None:
         _ = self.git(self.source, "status", "--porcelain")
         before = self.snapshot(self.source)
@@ -131,6 +208,91 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
         self.assertEqual(self.snapshot(self.source), before)
         self.assertEqual(self.git(self.source, "rev-parse", "main"), self.head)
+
+    def test_copies_use_upstream_url_and_tracking_refs_instead_of_local_branches(self) -> None:
+        _ = self.git(self.source, "branch", "builds", self.head)
+        _ = self.git(self.source, "update-ref", "refs/remotes/origin/builds", self.published)
+        origin = self.git(self.source, "remote", "get-url", "origin")
+        with ExitStack() as stack:
+            trees = [stack.enter_context(copies.standing("verify-unit", self.source, self.head)),
+                     stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
+                                                         name="upstream", branch="worker")),
+                     copies.clone(self.source, task="gate:upstream", word="upstream")]
+            for tree in trees:
+                with self.subTest(tree=tree):
+                    self.assertEqual(self.git(tree, "remote", "get-url", "origin"), origin)
+                    self.assertEqual(self.git(tree, "rev-parse", "origin/builds"), self.published)
+                    self.assertNotEqual(self.git(tree, "rev-parse", "origin/builds"),
+                                        self.git(self.source, "rev-parse", "builds"))
+                    self.assertEqual(self.git(tree, "remote", "get-url", "source"), str(self.source))
+                    self.assertEqual(self.git(tree, "config", "--get-all", "remote.source.fetch"),
+                                     "+refs/heads/*:refs/remotes/source/*")
+                    self.assertEqual(self.git(tree, "rev-parse", "source/builds"), self.head)
+                    self.assertIsNone(scratch.repo_problem(tree))
+                    self.assertEqual((tree / ".git/objects/info/alternates").read_text().strip(),
+                                     str(self.source / ".git/objects"))
+
+    def test_existing_copies_heal_local_origin_and_prune_local_branch_refs(self) -> None:
+        _ = self.git(self.source, "branch", "builds", self.head)
+        _ = self.git(self.source, "update-ref", "refs/remotes/origin/builds", self.published)
+        with copies.standing("verify-unit", self.source, self.head) as standing:
+            pass
+        with copies.workspace("verify-unit", self.source, self.head, name="heal", branch="worker") as workspace:
+            pass
+        for tree in (standing, workspace):
+            _ = self.git(tree, "remote", "set-url", "origin", str(self.source))
+            _ = self.git(tree, "update-ref", "refs/remotes/origin/builds", self.head)
+            _ = self.git(tree, "update-ref", "refs/remotes/origin/local-only", self.head)
+            _ = self.git(tree, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/builds")
+            _ = self.git(tree, "remote", "remove", "source")
+        with ExitStack() as stack:
+            trees = [stack.enter_context(copies.standing("verify-unit", self.source, self.head)),
+                     stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
+                                                         name="heal", branch="worker"))]
+            self.assertEqual(trees, [standing, workspace])
+            for tree in trees:
+                with self.subTest(tree=tree):
+                    self.assertEqual(self.git(tree, "remote", "get-url", "origin"),
+                                     self.git(self.source, "remote", "get-url", "origin"))
+                    self.assertEqual(self.git(tree, "rev-parse", "origin/builds"), self.published)
+                    self.assertEqual(self.git(tree, "for-each-ref", "--format=%(refname) %(objectname)",
+                                              "refs/remotes/origin"),
+                                     self.git(self.source, "for-each-ref", "--format=%(refname) %(objectname)",
+                                              "refs/remotes/origin"))
+                    self.assertEqual(self.git(tree, "remote", "get-url", "source"), str(self.source))
+                    self.assertEqual(self.git(tree, "rev-parse", "source/builds"), self.head)
+                    self.assertIsNone(scratch.repo_problem(tree))
+        for tree in (standing, workspace):
+            self.assertEqual(self.git(tree, "rev-parse", "origin/builds"), self.published)
+
+    def test_origin_head_is_copied_only_when_the_source_records_it(self) -> None:
+        _ = self.git(self.source, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        with copies.standing("verify-unit", self.source, self.head) as tree:
+            self.assertEqual(self.git(tree, "rev-parse", "origin/HEAD"), self.published)
+        _ = self.git(self.source, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        with copies.standing("verify-unit", self.source, self.head) as tree:
+            self.assertEqual(self.git(tree, "for-each-ref", "--format=%(refname)",
+                                      "refs/remotes/origin/HEAD"), "")
+
+    def test_end_of_use_refreshes_source_branches_for_the_copy_sweep(self) -> None:
+        with ExitStack() as stack:
+            trees = [stack.enter_context(copies.standing("verify-unit", self.source, self.head)),
+                     stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
+                                                         name="saved", branch="worker"))]
+            incoming = self.incoming()
+        for tree in trees:
+            with self.subTest(tree=tree):
+                self.assertEqual(self.git(tree, "rev-parse", "source/incoming"), incoming)
+                self.assertIsNone(scratch.repo_problem(tree))
+
+    def test_source_without_origin_keeps_local_url_and_branch_tracking(self) -> None:
+        _ = self.git(self.source, "remote", "remove", "origin")
+        _ = self.git(self.source, "branch", "builds", self.head)
+        with copies.standing("verify-unit", self.source, self.head) as tree:
+            self.assertEqual(self.git(tree, "remote", "get-url", "origin"), str(self.source))
+            self.assertEqual(self.git(tree, "rev-parse", "origin/builds"), self.head)
+            self.assertEqual(self.git(tree, "remote", "get-url", "source"), str(self.source))
+            self.assertEqual(self.git(tree, "rev-parse", "source/builds"), self.head)
 
     def test_new_commit_reuses_tree_keeps_unchanged_mtime_and_target(self) -> None:
         with copies.standing("verify-unit", self.source, self.head) as tree:
@@ -335,6 +497,23 @@ class StandingTests(unittest.TestCase):
         copies.end_workspaces("gate:legacy-run", [tree])
         self.assertNotIn(str(tree), scratch.holds())
         self.assertFalse(tree.exists())
+
+    def test_legacy_workspace_refuses_matching_relative_urls_for_different_repositories(self) -> None:
+        tree = self.base / "old-run/worker"
+        tree.mkdir(parents=True)
+        copies.initialize_git(tree, self.source)
+        _ = self.git(tree, "checkout", "-q", "-B", "worker", self.head)
+        _ = self.git(self.base, "clone", "-q", "--bare", str(self.source), str(tree.parent / "origin.git"))
+        for repo in (self.source, tree):
+            _ = self.git(repo, "remote", "set-url", "origin", "../origin.git")
+
+        with self.assertRaisesRegex(copies.CopyError, "legacy workspace source differs"):
+            with copies.workspace("verify-unit", self.source, self.head, name="legacy", branch="worker", path=tree):
+                self.fail("the unrelated workspace reached the caller")
+
+        self.assertIsInstance(scratch.task_of(tree), copy_record.NotRegistered)
+        self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+        self.assertEqual(self.git(tree, "remote", "get-url", "origin"), "../origin.git")
 
     def test_workspace_uses_the_existing_copy_sweep(self) -> None:
         with copies.workspace("verify-unit", self.source, self.published,
@@ -793,7 +972,8 @@ with copies.standing('verify-unit', Path(sys.argv[1]), 'HEAD'):
             self.assertEqual(reused, tree)
             self.assertEqual(cache.read_text(), "warm")
             self.assertEqual(self.record(tree)["source"], str(relocated))
-            self.assertEqual(self.git(tree, "remote", "get-url", "origin"), str(relocated))
+            self.assertEqual(self.git(tree, "remote", "get-url", "origin"),
+                             self.git(relocated, "remote", "get-url", "origin"))
             self.assertEqual((tree / ".git/objects/info/alternates").read_text().strip(),
                              str(relocated / ".git/objects"))
 

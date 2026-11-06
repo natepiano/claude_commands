@@ -28,7 +28,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import completion_receipt, staff, staff_sources, session_staff, unit_config
+from scripts.production import completion_receipt, staff, staff_sources, unit_config
 from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
@@ -54,7 +54,7 @@ class Promotion(NamedTuple):
     unit: str
     parent: Production
     child: Production
-    marked: unit_lookup.MarkedUnit
+    marked: unit_lookup.LabeledSession
     claude: unit_lookup.LiveClaude
     worktree: Path
 
@@ -75,7 +75,7 @@ def _session_status(pid: int) -> str:
     return record.get("status", "")
 
 
-def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveClaude) -> None:
+def _quiet(unit: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude) -> None:
     """Refuse a unit mid-turn or with a form, prompt or draft on screen: `/exit` would land in it."""
     if _session_status(claude.pid) == "busy":
         raise Refusal(f"{unit} is mid-turn; promote it once its turn ends")
@@ -106,7 +106,7 @@ def _committed(doc: Path) -> None:
 
 
 def checked(name: str, child_doc: Path, *,
-            record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Promotion:
+            record: staff.StaffSnapshot | None = None) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
     parent_doc = showrunners.production_of(staff.runtime_id())
     if parent_doc is None:
@@ -114,7 +114,7 @@ def checked(name: str, child_doc: Path, *,
     parent = read_production(parent_doc)
     unit = name if name.replace("_", "-").endswith("-unit") else f"{name}-unit"
     pending = promotion_record(parent, unit)
-    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    record = staff.snapshot() if record is None else record
     if pending.exists():
         fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
         if Path(fields["child_doc"]).resolve() != child_doc.expanduser().resolve():
@@ -133,7 +133,7 @@ def checked(name: str, child_doc: Path, *,
             worktree = location.path
         child = read_production(child_doc)
         claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
-        marked = unit_lookup.MarkedUnit(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
+        marked = unit_lookup.LabeledSession(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
         return Promotion(unit, parent, child, marked, claude, worktree)
     try:
         selected = staff_sources.member(staff_sources.UnitMember(parent.slug, unit), record)
@@ -143,7 +143,7 @@ def checked(name: str, child_doc: Path, *,
         if not isinstance(location, staff.PresentWorktree):
             raise Refusal(f"{unit} is retired")
         worktree = location.path
-        marked = unit_lookup.marked_unit(parent.slug, unit)
+        marked = unit_lookup.labeled_session(parent.slug, unit)
     except (OSError, UnicodeError) as error:
         raise Refusal(str(error)) from error
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
@@ -312,7 +312,7 @@ def _main(argv: list[str]) -> int:
     if not was_pending:
         save_promotion(promotion, target_directory)
     try:
-        current = unit_lookup.marked_unit(promotion.parent.slug, unit) if was_pending else promotion.marked
+        current = unit_lookup.labeled_session(promotion.parent.slug, unit) if was_pending else promotion.marked
         if current is not None and isinstance(current.claude, unit_lookup.ClaudeUnknown):
             raise Refusal(f"cannot tell whether {unit} still runs: {current.claude.reason}")
         if current is not None and isinstance(current.claude, unit_lookup.LiveClaude):
@@ -336,12 +336,15 @@ def _main(argv: list[str]) -> int:
     document = staff.LiveDoc(remote.local_machine(), promotion.child.doc.resolve())
     retained = record.by_current_session(native)
     if (retained is not None and retained.kind == "showrunner"
-            and (retained.name, retained.parent, retained.doc) == (name, parent_row.id, document)):
+            and (retained.name, retained.parent, retained.doc) == (name, staff.ReportsTo(parent_row.id), document)):
+        print("unchanged", file=sys.stderr)
         new_member = staff_sources.MemberFound(retained)
     else:
         new_member = staff_sources.MemberFound(staff.promote_unit(
             retained.id if retained is not None else native, name=name, parent=parent_row.id, doc=document))
     try:
+        import showrunner_parent
+        showrunner_parent.save_notice(slug, showrunner_parent.PendingParentNotice("attach", promotion.parent.slug))
         if was_pending and showrunners.current_name(slug):
             started = showrunners.main(["attach", slug, promotion.parent.slug])
         else:

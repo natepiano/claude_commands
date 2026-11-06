@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,6 +23,10 @@ from code_kind import is_test_code  # noqa: E402
 
 import gpu_xid
 import push_texts
+if TYPE_CHECKING:
+    from ..message import session_send
+else:
+    from scripts.message import session_send
 from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
@@ -58,7 +62,11 @@ def literal_delivery_calls(source: str) -> list[int]:
     for node in ast.walk(tree):
         if isinstance(node, (ast.List, ast.Tuple, ast.Call)):
             arguments = node.args if isinstance(node, ast.Call) else node.elts
-            if len(arguments) > 2 and literal_path(arguments[2]) == "retire":
+            uses_builder = (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and isinstance(node.func.value, ast.Name) and node.func.value.id == "session_send"
+                            and node.func.attr == "send_argv")
+            command_index = 0 if uses_builder else 2
+            if len(arguments) > command_index and literal_path(arguments[command_index]) == "retire":
                 continue
             for left, right in zip(arguments, arguments[1:]):
                 if literal_path(left) == "--to" and literal_path(right) == "user":
@@ -166,6 +174,19 @@ class PushTextTests(unittest.TestCase):
         push = push_texts.render_entry(entry, entry.examples[0].values)
         argv = push_texts.user_send_argv(push, question="/tmp/question-layout.md")
         self.assertEqual(argv[argv.index("--question") + 1], "/tmp/question-layout.md")
+
+    def test_user_commands_use_the_current_sender_and_preserve_an_explicit_override(self) -> None:
+        entry = self.entry()
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        with tempfile.TemporaryDirectory() as folder:
+            current, override = Path(folder) / "current.py", Path(folder) / "override.py"
+            with mock.patch.object(session_send, "SEND_SCRIPT", current):
+                default = push_texts.user_send_argv(push)
+                explicit = push_texts.user_send_argv(push, send_script=override)
+                retired = push_texts.user_retire_argv("sender", "held")
+        self.assertEqual(default[:2], [sys.executable, str(current)])
+        self.assertEqual(explicit, [sys.executable, str(override), *default[2:]])
+        self.assertEqual(retired, [sys.executable, str(current), "retire", "--to", "user", "--from", "sender", "--key", "held"])
 
     def test_decision_choices_builds_the_approved_rows_and_keeps_structured_values(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
@@ -543,6 +564,14 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(literal_delivery_calls(imported + "\n" + call), [2])
         self.assertEqual(literal_delivery_calls('run(user_send_argv(render("good")))'), [])
         self.assertEqual(literal_delivery_calls('other.send("user", "text")'), [])
+
+    def test_shared_sender_builder_exempts_retirement_but_checks_delivery(self) -> None:
+        self.assertEqual(literal_delivery_calls(
+            'session_send.send_argv("retire", "--to", "user", "--key", "held")'), [])
+        self.assertEqual(literal_delivery_calls(
+            'session_send.send_argv("--to", "user", "--text", "literal")'), [1])
+        self.assertEqual(literal_delivery_calls(
+            'other.send_argv("retire", "--to", "user")'), [1])
 
     def test_rendered_binding_cannot_excuse_a_later_string_or_conditional_string(self) -> None:
         self.assertEqual(literal_delivery_calls('push = render("good")\npush = "literal"\nbroadcast.send("user", "script", push)'), [3])

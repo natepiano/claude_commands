@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
+
 from scripts.lib.py_floor_test_support import cache_file_name
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -45,10 +48,10 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
     def prepare_fast_track_review(self, name: str) -> tuple[Path, dict[str, str], str]:
         session = self.start_implementation(name)
         self.finish_implementation(session)
-        state_path = session / "progress_history_state.json"
-        state = cast(dict[str, object], json.loads(state_path.read_text()))
-        state["unit"] = "alpha-unit"
-        _ = state_path.write_text(json.dumps(state))
+        with isolated_staff_file(self.root / "staff.json", {}):
+            owner = staff.local_snapshot().by_member_reference(self.staff_parent)
+            assert owner is not None
+            _ = staff.rename(owner.id, "alpha-unit")
         _ = (self.working_dir / "fast-fix.txt").write_text(f"already pushed fast fix {name}\n")
         for arguments in (["add", "fast-fix.txt"],
                           ["-c", "user.name=Review Test", "-c", "user.email=review@example.invalid",
@@ -327,11 +330,9 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             json.loads((session_dir / "impl_worker_review2.json").read_text()),
         )
         self.assertEqual(identity, {
-            "name": worker,
+            "staff_id": roster[worker]["staff_id"],
             "slot": "review2",
-            "family": "codex",
             "model": "gpt-called",
-            "worker_id": f"thread-{worker}",
         })
 
         implementation = subprocess.run(
@@ -356,24 +357,21 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
     def test_a_test_worker_keeps_one_identity_when_assigned_a_review(self) -> None:
         run = self.start_implementation("test-becomes-review")
         self.finish_implementation(run)
-        worker = "project-test"
-        identity = {"name": worker, "slot": "test", "role": "test", "family": "codex",
-                    "model": "gpt-called", "worker_id": "thread-test"}
+        worker = self.open_worker(run, name="project-test", role="test", thread_id="thread-test")
+        member = self.recorded_worker(run, worker)
+        identity = {"staff_id": member.id, "slot": "test", "model": "gpt-called"}
         path = run / "impl_worker_test.json"
         _ = path.write_text(json.dumps(identity))
-        _ = (run / "mesh_roster.json").write_text(json.dumps({worker: {
-            "thread_id": "thread-test", "status": "done", "role": "test", "context_tokens": 0}}))
-        _ = (run / "workers").write_text(f"thread-test\t{worker}\n")
 
         reviewed = self.run_assigned_review(run, worker)
 
-        self.assertEqual(reviewed.returncode, 0, reviewed.stderr)
+        self.assertEqual(reviewed.returncode, 0, reviewed.stderr + (run / "review_agent_1-test.log").read_text())
         records = [cast(dict[str, object], json.loads(item.read_text()))
                    for item in run.glob("impl_worker_*.json")]
-        identities = [record for record in records if record.get("name") == worker]
+        identities = [record for record in records if record.get("staff_id") == member.id]
         self.assertEqual(len(identities), 1, records)
-        self.assertEqual(identities[0]["worker_id"], "thread-test")
-        self.assertEqual(cast(dict[str, object], json.loads(path.read_text()))["name"], worker)
+        self.assertEqual(identities[0]["staff_id"], member.id)
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text()))["staff_id"], member.id)
         roster = cast(dict[str, dict[str, object]], json.loads((run / "mesh_roster.json").read_text()))
         self.assertEqual(roster[worker]["role"], "review")
 
@@ -467,7 +465,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["can-follow", "follow"])
         roster = cast(dict[str, dict[str, object]], json.loads((session_dir / "mesh_roster.json").read_text()))
-        self.assertEqual(roster[worker]["thread_id"], "thread-fixture")
+        self.assertEqual(roster[worker]["thread_id"], fixture_runtime_id("thread-fixture"))
         self.assertEqual((session_dir / "follow_message.txt").read_text(), "Review the diff.\n")
         self.assertEqual((session_dir / "review_status").read_text(), "reviewed\n")
 

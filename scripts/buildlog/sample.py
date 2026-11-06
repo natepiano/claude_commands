@@ -11,6 +11,9 @@ from typing import Literal, NamedTuple, TypedDict
 import store
 import cgroup_capture
 import filesystem
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from cargo_output import CargoOutputRoots, read_cargo_output_roots
 from cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
                             parse_pressure as parse_pressure)
@@ -150,7 +153,16 @@ class FilesystemMeasured(TypedDict):
 
 
 def filesystem_reading() -> FilesystemMeasured | cgroup_capture.ReadingUnavailable:
-    path = os.environ.get("BUILDLOG_TARGET_FILESYSTEM", os.environ.get("CARGO_TARGET_DIR", str(Path.home() / "rust")))
+    path = os.environ.get("BUILDLOG_TARGET_FILESYSTEM", "")
+    if not path:
+        roots = read_cargo_output_roots(Path(os.environ.get("BUILDLOG_WORKSPACE", os.getcwd())))
+        if not isinstance(roots, CargoOutputRoots):
+            return {"state": "unavailable"}
+        path = str(roots.build_directory)
+    existing = Path(path)
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    path = str(existing)
     try:
         reading = filesystem.filesystem_usage(path)
         return {"state": "measured", "path": path, "total": reading.total, "used": reading.used,
@@ -162,13 +174,14 @@ def filesystem_reading() -> FilesystemMeasured | cgroup_capture.ReadingUnavailab
 class SampleTaken(NamedTuple):
     at: float
     host: str
-    slices: cgroup_capture.SliceCollection = {"builds": {"state": "absent"}, "ci": {"state": "absent"}}
 
 
 def sample() -> SampleTaken:
     """Append the current machine counters to a separate monthly JSONL file."""
     if not all(path.exists() for path in (MEMINFO, PRESSURE, BOOT_ID)):
         raise SystemExit("buildlog sample is Linux only (requires /proc).")
+    from memory import read_zram
+
     at = time.time()
     host = store.host_name()
     boot_id = parse_boot_id(BOOT_ID.read_text())
@@ -189,6 +202,7 @@ def sample() -> SampleTaken:
         "at": store.utc_iso(at),
         "boot_id": boot_id,
         "slices": slices,
+        "zram": read_zram(),
         "filesystem": filesystem_reading(),
         "jobserver": {"builds": free_pool_tokens("/dev/steve"), "ci": free_pool_tokens("/dev/steve-ci")},
         "mem_used_bytes": memory.memory_bytes,
@@ -209,4 +223,4 @@ def sample() -> SampleTaken:
         "power_profile_since": store.utc_iso(profile.since_epoch) if isinstance(profile, PowerProfile) else None,
     }
     store.append_line(store.sample_file(host, at), record)
-    return SampleTaken(at, host, slices)
+    return SampleTaken(at, host)

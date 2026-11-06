@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import subprocess
 import sys
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.production import showrunners, staff, staff_move, staff_sources, unit_move, unit_names
+from scripts.production import showrunners, staff, staff_move, staff_sources, unit_names
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused
 
@@ -25,7 +26,7 @@ class UnitTransfer:
 
 
 def _production(slug: str) -> Production:
-    checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
+    checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / showrunners.timer_name(slug))
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise ValueError(f"{slug}: {checked.reason}")
     return read_production(checked.path)
@@ -46,10 +47,15 @@ def build(from_slug: str, given: str, to_doc: Path) -> UnitTransfer:
 
 def apply(from_slug: str, unit: str, to_doc: Path) -> UnitTransfer:
     request = build(from_slug, unit, to_doc)
-    with unit_move.folder_move_lock(request.member.id), staff.operation():
-        changed = request.member.parent != request.parent.id
+    with staff.row_operation(str(request.member.id)):
+        changed = request.member.parent != staff.ReportsTo(request.parent.id)
         if changed:
-            _ = staff.move(request.member.id, request.parent.id)
+            _ = staff.move(request.member.id, staff.ReportsTo(request.parent.id))
+            notice = showrunners.send_to_address(
+                f"staff:{request.member.id}", f"transfer:{request.member.id}:{request.parent.id}",
+                f"Your unit now belongs to production {request.receiving.slug}.", recipient=request.unit)
+            for line in notice.lines:
+                print(line)
         _ = staff_move.move_unit(from_slug, request.unit, request.receiving.slug,
                                  identity=staff_move.PinnedUnit(request.member.id, request.parent.id))
         print("done" if changed else "unchanged")
@@ -72,6 +78,9 @@ def main(argv: list[str]) -> int:
             else:
                 _ = apply(cast(str, args.from_slug), cast(str, args.unit), cast(Path, args.to_doc))
             return 0
+        except subprocess.TimeoutExpired as error:
+            print(f"transfer_unit: error: {str(error).splitlines()[0]}", file=sys.stderr)
+            return 1
         except (ValueError, OSError, RenameRefused, Refusal) as error:
             print(f"transfer_unit: {error}", file=sys.stderr)
             return 1

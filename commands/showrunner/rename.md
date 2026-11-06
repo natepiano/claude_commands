@@ -1,48 +1,27 @@
 ---
-description: Rename a production and its records.
-argument-hint: "plan <old> <new> | apply <old> <new> | unit <new> <unit> | checkout <new> [<path>]"
+description: Rename a showrunner row and its session and display names.
+argument-hint: "plan|apply <old> <new> [--to-doc <path> --to-branch <name>]"
 ---
 
-# Rename production
+# Rename showrunner
 
-Run from the showrunner session. Pass the arguments to:
+Run from the showrunner session:
 
 ```sh
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/rename.py" <arguments>
 ```
 
-Show the output. On a nonzero exit, show the error and stop. Use this order:
+1. Run `plan <old> <new>` to inspect the row and display changes.
+2. Run `apply <old> <new>` to change the row, session, tab, and workspace names.
+3. Run `apply <new> <new>` to repair names after an interruption.
 
-1. `plan <old> <new>` prints the document, timer, state and merge-branch
-   changes. It writes nothing. The source needs a registered update timer that
-   names its production doc. Read every path before you apply. The new slug
-   starts with an ASCII letter or digit and contains only ASCII letters,
-   digits, `_` or `-`. It cannot be a reserved state name or a current
-   production name.
-2. `apply <old> <new>` writes the staff name first. Then it renames the
-   production doc, records the Formerly name, updates the unit-plan headers,
-   moves the timer, the saved state, the stall-watch files and the worker
-   ledgers, and retargets the phase notes. A merge branch named `<old>` takes
-   the name `<new>` with `git branch -m`. Another merge branch (`main`,
-   `init/catalyst`) keeps its name. Apply commits the documents, pushes the
-   merge branch and sets the herdr tab title. A step that fails prints
-   `anomaly: <step>: <reason>`, and the next step runs. Run `apply` again
-   until it prints `unchanged`.
-3. For each unit that is not retired, run `unit <new> <unit>` with its exact
-   staff row name. `unit` uses the folder move: it stops the unit and its
-   workers, moves the worktree, writes the staff worktree and starts them
-   again. Then it renames the unit branch with `git branch -m`. A rerun with
-   nothing to change prints `<unit>: unchanged`.
-4. `checkout <new> [<path>]` moves the showrunner checkout to `<path>`, by
-   default its folder name with the old slug replaced by `<new>`. It stops
-   this showrunner session and restarts it in the new folder, so end the turn
-   after it prints. After the restart, run the same command again: it pushes
-   the merge-branch commit that names the new checkout. If the move fails part
-   way, the showrunner restarts in the folder that holds the checkout. Show
-   the printed reason.
+Use a staff id or a current staff name for `<old>`.
+A same-name rename prints `unchanged` when all names agree.
+Show each anomaly line and the final output.
 
-The production argument of `apply` and `unit` accepts the old, the new or a
-former name. Never rewrite history: existing commit subjects, log lines and
-transcript contents keep the old name. Never force-push to do a rename.
+Add both `--to-doc <path>` and `--to-branch <name>` only for an explicit document and branch move.
+The command saves the move journal first and sets the staff document after the file moves.
+Repeat the same command after an interruption.
+The command creates no commit and makes no push.
 
-Implementation details: `docs/as-built/production-rename.md`.
+See `docs/as-built/production-rename.md`.

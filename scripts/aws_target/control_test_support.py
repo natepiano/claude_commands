@@ -139,8 +139,9 @@ class ControlFixture(CostFixture):
 
     def snapshot(self, *rows: memory_admit.Waiter, age: int = 0) -> None:
         inputs = memory_admit.QueueInputs(
-            [(self.queue_directory / f"{row['pid']}.waiting", row) for row in rows], (), (),
+            [(self.queue_directory / f"{row['pid']}.waiting", memory_admit.rank_waiter(row, memory_admit.NormalOrder()))
+             for row in rows], (), (),
             memory_admit.HostMemory(1024**3, 1024**3), memory_admit.NoPressureHold(),
-            memory_admit.NoRecoverySpacing(), memory_admit.NoHeadAdmissionOverride(), float(self.clock.now - age))
+            memory_admit.ReadyToStart(), memory_admit.NoHeadAdmissionOverride(), float(self.clock.now - age))
         queue_snapshot.write_queue_snapshot(self.queue_directory, inputs, admission_policy_fixture())
         self.assertIsInstance(queue_snapshot.read_queue_snapshot(self.queue_directory), queue_snapshot.QueueSnapshot)

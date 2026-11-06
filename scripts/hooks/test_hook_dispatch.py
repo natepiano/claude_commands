@@ -42,6 +42,7 @@ LEGACY: dict[str, tuple[tuple[str, str, float], ...]] = {
     "stop": (
         ("stop-conversation-pause.py", "", 600),
         ("stop-assistant-prose-banned-words.py", "", 600),
+        ("stop-context-deferral.py", "", 10),
         ("herdr_tab_title.py", "", 600),
     ),
 }
@@ -180,6 +181,17 @@ class IsolatedHookTests(unittest.TestCase):
 
 
 class RealHookEquivalenceTests(IsolatedHookTests):
+    def test_context_deferral_block_reaches_the_caller(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "context_deferral.conf").write_bytes((ROOT / "config/context_deferral.conf").read_bytes())
+        self.environment["CONF_DIR"] = str(config)
+        result = self.run_python([str(DISPATCH), "stop"], {
+            "last_assistant_message": "I will do it after the context reset.",
+        })
+        self.assertEqual((result.returncode, result.stdout), (2, ""))
+        self.assertEqual(result.stderr, "Compaction runs by itself mid-work; do the work now.\n")
+
     def compare(self, event: str, payload: dict[str, object]) -> EventOutcome:
         state = self.home / ".claude/state"
         legacy_state = self.root / "legacy-counter-state"
@@ -799,12 +811,13 @@ class CopyGuardDispatchTests(IsolatedHookTests):
         for case in shell_policy_cases():
             with self.subTest(command=case.command):
                 result = self.run_python([str(DISPATCH), "pre_tool_use"], {
-                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": str(self.root)})
+                    "tool_name": "Bash", "tool_input": {"command": case.command}, "cwd": "/"})
                 self.assertEqual(result.returncode, 2 if case.operation else 0, result.stderr)
                 if case.operation:
                     self.assertTrue(result.stderr.startswith(case.operation + ":"), result.stderr)
                 else:
                     self.assertNotIn("copies.py run", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_pre_tool_use_refuses_repository_creation_through_dispatcher(self) -> None:
         result = self.run_python([str(DISPATCH), "pre_tool_use"], {

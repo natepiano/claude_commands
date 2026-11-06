@@ -83,21 +83,21 @@ class RegistryUnavailable:
 
 
 def remote_control_who(session: Mapping[str, object]) -> str:
-    """Name live registry/pane data; accept the retiring restart wrapper at its boundary."""
+    """Name the staff row selected by the native runtime id."""
+    from scripts.production import staff
+
     nested = session.get("session")
     if isinstance(nested, dict):
         session = cast(Mapping[str, object], nested)
-    environment = session.get("environment", {})
-    marks: Mapping[str, object] = cast(Mapping[str, object], environment) if isinstance(environment, dict) else {}
-    host = session.get("host", {})
-    place: Mapping[str, object] = cast(Mapping[str, object], host) if isinstance(host, dict) else {}
-    unit = marks.get("SHOWRUNNER_UNIT_ID") or place.get("unit")
-    if isinstance(unit, str) and unit:
-        return unit.removesuffix("-unit") + " unit"
-    production = session.get("production") if session.get("kind") == "showrunner" else marks.get("SHOWRUNNER_UNIT")
-    if isinstance(production, str) and production:
-        return production + " showrunner"
-    name = session.get("name") or session.get("sessionId") or session.get("session_id")
+    identity = session.get("sessionId") or session.get("session_id")
+    try:
+        row = staff.initial_snapshot().by_current_session(identity) if isinstance(identity, str) else None
+    except (OSError, ValueError) as error:
+        print(f"{identity}: staff anomaly: {error}", file=sys.stderr)
+        row = None
+    if row is not None:
+        return row.name.removesuffix("-unit") + " " + row.kind
+    name = session.get("name") or identity
     return name if isinstance(name, str) else ""
 
 
@@ -160,6 +160,7 @@ def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteCont
     attempt_until = flag_until
     attempts = 0
     last_error = ""
+    missing_bridge_reported = False
 
     def failed(reason: str) -> RemoteControlOutcome:
         fresh = _observe(session_id, pid, proc_start)
@@ -177,8 +178,10 @@ def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteCont
             return TurnedOn() if attempts else AlreadyOn()
         now = clock.monotonic()
         if now >= deadline:
+            if missing_bridge_reported:
+                return failed("pane reported Remote Control active but registry had no bridgeSessionId")
             return failed("Remote Control did not become active before the deadline")
-        if now >= flag_until and isinstance(observed, ConfirmedSession):
+        if not missing_bridge_reported and now >= flag_until and isinstance(observed, ConfirmedSession):
             try:
                 place = session_pane.record_place(observed.record)
             except session_pane.NoSuchTarget:
@@ -189,10 +192,11 @@ def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteCont
             if attempts:
                 try:
                     if "/remote-control is active" in session_pane.read_place(place):
-                        return TurnedOn()
+                        print(f"anomaly: {session_id}: pane reports Remote Control active without registry bridgeSessionId", file=sys.stderr)
+                        missing_bridge_reported = True
                 except (OSError, session_pane.HerdrFailure):
                     pass
-            if now >= attempt_until:
+            if not missing_bridge_reported and now >= attempt_until:
                 if attempts >= ATTEMPTS:
                     return failed(f"Remote Control did not become active after {ATTEMPTS} attempts")
                 # Resolve the session's own pane, then recheck identity and idle

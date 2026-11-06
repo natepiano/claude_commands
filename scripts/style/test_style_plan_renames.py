@@ -12,12 +12,14 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from ledger_test_support import ticket_owner_id
+
 import style_plan
 
 import mechanical_classes
 import rules
 
-from style_plan_test_support import StylePlanFixture
+from style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
@@ -144,7 +146,7 @@ class StylePlanTests(StylePlanFixture):
             self.assertEqual(style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", extra,
                                               "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
         self.write_approved_phase()
-        at = self.ledger().ticket_open("names-unit")[0]["widened"][0]["widened_at"]
+        at = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["widened"][0]["widened_at"]
         self.assertIn(f"**Files:**\n- `{self.sources[0]}`\n"
                       + f"- widened: {extra} — the move needs a new file (showrunner, {at})\n", self.plan.read_text())
 
@@ -178,15 +180,15 @@ class StylePlanTests(StylePlanFixture):
                                 "outside").finding_id for line, held_rule in enumerate((rule, uncovered), start=1))
         for finding_id in ids:
             ledger.file_held(finding_id, issue)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+        _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0]],
+        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [self.sources[0]],
                           [rule, uncovered], proposal=str(issue), finding_ids=ids)
-        ticket = ledger.queued_tickets("names-unit")[0]
+        ticket = ledger.queued_tickets(ticket_owner_id("names-unit"))[0]
         ledger.ticket_assign(ticket["id"], "demo-style-names")
         style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
         text = self.plan.read_text()
-        self.assertIn("`style_ledger.py record --ticket names-unit-1 --rule <rule> --path <file>`", text)
+        self.assertIn("`style_ledger.py record --ticket 1 --rule <rule> --path <file>`", text)
         self.assertIn(f"- `{uncovered}` · `{self.sources[0]}`", text)
         self.assertNotIn(f"- `{rule}` · `{self.sources[0]}`", text)
         self.assertNotIn("Record every judged cell", text)
@@ -203,11 +205,11 @@ class StylePlanTests(StylePlanFixture):
                     for path in (self.sources[0], "docs/notes.md"))
         for finding_id in ids:
             ledger.file_held(finding_id, issue)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+        _ = issue.write_text(f"---\nstatus: open\ntags: [proposal, style]\nunit: {unit_staff_id('names-unit')}\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0], "docs/notes.md"],
+        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [self.sources[0], "docs/notes.md"],
                           [rule], proposal=str(issue), finding_ids=ids)
-        ticket = ledger.queued_tickets("names-unit")[0]
+        ticket = ledger.queued_tickets(ticket_owner_id("names-unit"))[0]
         ledger.ticket_assign(ticket["id"], "demo-style-names")
         style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
         text = self.plan.read_text()

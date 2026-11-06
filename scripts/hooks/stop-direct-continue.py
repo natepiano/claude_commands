@@ -3,9 +3,8 @@
 
 The separate asyncRewake Stop entry runs this hook in the background.
 Exit 2 sends the reason from stderr to the agent in a system-reminder.
-The wake starts a new request for compaction.
 The guards permit declared waits, background tasks, and stops without context measurements.
-The next Stop payload sets stop_hook_active, so the hook wakes once only.
+The hook repeats the wake above the threshold until compaction reduces the context.
 Exceptions permit the stop without output.
 """
 
@@ -28,11 +27,10 @@ from direct_run import active_run
 
 REASON = """\
 /unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%).
-Compaction runs on the next request.
-Take the next workflow action.
+Compaction runs when the context reaches {trigger:,} tokens. It does not run while the session is idle.
+Take the next workflow action now. Do not wait for compaction.
 Read ~/.claude/commands/unit/direct.md after compaction.
-If you need a user decision, state it in one line and end the turn.
-This hook wakes once only."""
+If you need a user decision, state it in one line and end the turn."""
 
 
 class StopPayload(HookInput, total=False):
@@ -64,9 +62,6 @@ def main() -> None:
     from scripts.direct.progress_history import record_turn_wait
 
     if record_turn_wait(session_dir, session_id, final_message):
-        return
-    # Already continuing because of a previous block -- let this one through.
-    if payload.get("stop_hook_active"):
         return
     # Measure first: the window is clamped to the model's own context window, and
     # only the transcript names the model.

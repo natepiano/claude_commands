@@ -86,7 +86,7 @@ class MomentTests(unittest.TestCase):
         # These cases exercise the indexed Hana predicate, including each
         # evidence column in isolation. The index derives these three columns
         # from other source fields, so bind their fixture values after indexing.
-        with closing(sqlite3.connect(self.fixture.root / "index.sqlite")) as fixture_index:
+        with closing(sqlite3.connect(index.index_path_in(self.fixture.root))) as fixture_index:
             with fixture_index:
                 for record in records:
                     if record.get("kind") == "step":
@@ -554,6 +554,7 @@ class MemoryMomentTests(unittest.TestCase):
         return records
 
     def test_configured_kill_level_changes_the_python_split_and_definition(self) -> None:
+        target = memory_fixtures.cargo_output(self.journal.base / "cargo-output")
         at = START + timedelta(days=1)
         self.journal.stub_journal(early=[
             memory_fixtures.journal_entry(at + timedelta(minutes=1),
@@ -561,7 +562,7 @@ class MemoryMomentTests(unittest.TestCase):
             memory_fixtures.journal_entry(at + timedelta(minutes=2),
                 memory_fixtures.earlyoom_message(107, adj=500, cmdline="/usr/bin/editor")),
             memory_fixtures.journal_entry(at + timedelta(minutes=3),
-                memory_fixtures.earlyoom_message(108, adj=200, cmdline="/work/target/debug/test")),
+                memory_fixtures.earlyoom_message(108, adj=200, cmdline=f"{target}/debug/test")),
         ], kernel=[])
         config = write_lint_config(self.journal.base, 650)
         with closing(self.fixture.connection()):
@@ -617,15 +618,16 @@ with index.read_only() as connection:
         self.assertEqual(sum("A window shorter than 2 day is thin" in line for line in section), 1)
 
     def test_memory_table_counts_kills_stalls_zero_waits_and_stopped_retries(self) -> None:
+        target = memory_fixtures.cargo_output(self.journal.base / "cargo-output")
         at = START + timedelta(days=1)
         moment = moments.MemoryMoment(at, "fixture budget raise")
         before_messages = [memory_fixtures.earlyoom_message(number) for number in range(6)]
-        before_messages.append(memory_fixtures.earlyoom_message(10, adj=200, cmdline="/work/target/debug/test"))
+        before_messages.append(memory_fixtures.earlyoom_message(10, adj=200, cmdline=f"{target}/debug/test"))
         before_messages.extend((memory_fixtures.earlyoom_message(11, adj=200, cmdline="/usr/bin/editor"),
                                 memory_fixtures.earlyoom_message(12, adj=None)))
         after_messages = [memory_fixtures.earlyoom_message(20),
-                          memory_fixtures.earlyoom_message(21, adj=200, cmdline="/work/target/debug/test"),
-                          memory_fixtures.earlyoom_message(22, adj=100, cmdline="/work/target/release/test"),
+                          memory_fixtures.earlyoom_message(21, adj=200, cmdline=f"{target}/debug/test"),
+                          memory_fixtures.earlyoom_message(22, adj=100, cmdline=f"{target}/release/test"),
                           memory_fixtures.earlyoom_message(23, adj=None)]
         self.journal.stub_journal(early=[
             *(memory_fixtures.journal_entry(at - timedelta(minutes=10), message) for message in before_messages),

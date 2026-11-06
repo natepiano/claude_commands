@@ -6,9 +6,14 @@ without importing an account consumer back into their own module.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from scripts.production.staff import StaffRow, ClaudeBackend, CodexBackend, BackendUnavailable
 
 
 def shutdown_state_root() -> Path:
@@ -82,3 +87,25 @@ def claude_up_line(result: ClaudeUp) -> str:
     return (f"{result.session_id}: Claude is up on {result.account} in {result.pane_id} "
             + f"({result.elapsed_seconds:.1f} s)"
             + (f"; copied folder trust from {result.trust_copied_from}" if result.trust_copied_from else ""))
+
+
+StopResult = Stopped | NotRunning | StopFailed | SessionNotFound
+
+
+@dataclass(frozen=True)
+class SourceReleased:
+    """Every applicable source server released the native session."""
+
+
+@dataclass(frozen=True)
+class SourceUnresolved:
+    reason: str
+
+
+@dataclass(frozen=True)
+class SourceReleaseUnknown:
+    reason: str
+
+
+SourceRelease = SourceReleased | SourceUnresolved | SourceReleaseUnknown
+ReleaseSource = Callable[["StaffRow", Callable[[], tuple[Path, ...]], "ClaudeBackend | CodexBackend | BackendUnavailable"], SourceRelease]

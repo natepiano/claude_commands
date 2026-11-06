@@ -10,19 +10,20 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib import atomic_file, conf, file_lock
-from scripts.message import send_result
+from scripts.message import send_result, session_send
 
 
 def send_message(recipient: str, sender: str, message: str) -> None:
     """Accept delivered messages and messages kept in the sender's queue."""
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
-                             "--to", recipient, "--from", sender, "--text", message],
+    result = subprocess.run(session_send.send_argv("--to", recipient, "--from", sender, "--text", message),
                             capture_output=True, text=True, check=False)
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         match outcome.header.outcome:
             case "sent" | "queued" | "kept":
                 return
+            case "retry":
+                raise RuntimeError(f"RETRY: {outcome.header.detail}")
             case "skipped" | "replaced" | "failed" | "refused" | "held" | "pending":
                 pass
     raise RuntimeError((result.stderr or result.stdout).strip() or "message delivery failed")

@@ -18,8 +18,8 @@ def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]
     members = staff_sources.showrunner_members(record)
     names = {row.id: row.name for row in staff.active(record, "showrunner")}
     names.update({row.id: slug for slug, row in members.items() if row.id in names})
-    return {names[row.id]: names[row.parent] for row in staff.active(record, "showrunner")
-            if row.parent is not None and row.parent in names}
+    return {names[row.id]: names[row.parent.id] for row in staff.active(record, "showrunner")
+            if isinstance(row.parent, staff.ReportsTo) and row.parent.id in names}
 
 
 def edges(slugs: set[str] | None = None, *, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
@@ -165,20 +165,6 @@ def edges_to_release(slug: str, *, record: staff.StaffSnapshot | None = None) ->
     parent = tree.get(slug, "")
     children = tuple(sorted(child for child, above in tree.items() if above == slug))
     return WrapRelease(ReportedTo(parent) if parent else Root(), children, ())
-
-
-def release_edges(slug: str, released: WrapRelease, *, record: staff.StaffSnapshot | None = None) -> None:
-    """Remove captured legacy files unless the record has a subsequent attachment."""
-    tree = edges(record=record)
-    captured = [(child, slug) for child in released.former_children]
-    if isinstance(released.former_parent, ReportedTo):
-        captured.insert(0, (slug, released.former_parent.parent))
-    for child, parent in captured:
-        current = tree.get(child, "")
-        if not current or current == parent:
-            (showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE).unlink(missing_ok=True)
-        else:
-            print(f"showrunners: keep {child} -> {current}; captured parent was {parent}", file=sys.stderr)
 
 
 def main(action: str, slug: str) -> int:

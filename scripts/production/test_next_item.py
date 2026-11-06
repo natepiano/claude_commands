@@ -18,6 +18,7 @@ from unittest import mock
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import change_review
 import footer_counts
@@ -28,7 +29,7 @@ from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
 from scripts.production.staff_test_support import (
-    fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
+    fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
 )
 from scripts.production.test_change_review import producer_rows
 from change_review import Visible
@@ -56,11 +57,6 @@ def at(day: int) -> datetime:
     return datetime(2026, 10, day, 9, 0)
 
 
-def demo_slug(doc: Path) -> str:
-    del doc
-    return "demo"
-
-
 def run(*arguments: str) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -86,9 +82,10 @@ class NextItemTests(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**source_environment(self.root / "sources"),
+                "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_source_readers())
-        _ = fixture_member("showrunner", name="fixture")
+        _ = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", PRODUCTION))
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
@@ -104,8 +101,9 @@ class NextItemTests(unittest.TestCase):
                                                 Entry("Q2", "demo: Newest question", since=at(5))]),
         }
 
-    def read(self, kind: str, production: Path | None, below: bool = False) -> Queue:
-        del production, below
+    def read(self, kind: str, production: Path | None, below: bool = False,
+             *, record: staff.StaffSnapshot | None = None) -> Queue:
+        del production, below, record
         if kind not in self.queues:
             raise NextError(f"{kind}: not readable")
         return self.queues[kind]
@@ -113,8 +111,175 @@ class NextItemTests(unittest.TestCase):
     def patched(self) -> contextlib.AbstractContextManager[object]:
         stack = contextlib.ExitStack()
         _ = stack.enter_context(mock.patch.object(next_item, "read_queue", self.read))
-        _ = stack.enter_context(mock.patch.object(next_item, "slug_of", demo_slug))
         return stack
+
+    def test_pin_migration_keeps_order_and_recovers_after_clear(self) -> None:
+        import json
+        from scripts.production import migrate_next_pins
+
+        owner = staff.snapshot().rows[0]
+        directory = self.root / "next"
+        directory.mkdir()
+        values: dict[str, dict[str, object]] = {
+            "next-demo": {"source": "question-demo", "current": "demo: Choose", "ended": {}},
+            "question-demo-all-below": {"current": "demo: Choose", "ended": {"demo: Later": 1}},
+            "proposal-demo": {"current": "P2", "ended": {"P1": 1}},
+        }
+        for name, fields in values.items():
+            _ = (directory / f"{name}.json").write_text(json.dumps(fields))
+        self.assertEqual(migrate_next_pins.migrate(stop_after=1), 75)
+        _ = staff.update_current_session(owner.current_session,
+                                        staff.native_id(fixture_runtime_id("pins-clear")))
+        self.assertEqual(migrate_next_pins.migrate(), 0)
+        expected: dict[str, dict[str, object]] = {
+            f"next-{owner.id}.json": {"source": f"question-{owner.id}", "current": f"{owner.id}: Choose", "ended": {}},
+            f"question-{owner.id}-all-below.json": {"current": f"{owner.id}: Choose", "ended": {f"{owner.id}: Later": 1}},
+            f"proposal-{owner.id}.json": {"current": "P2", "ended": {"P1": 1}},
+        }
+        self.assertEqual({path.name: json.loads(path.read_text()) for path in directory.glob("*.json")}, expected)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}
+        self.assertEqual(migrate_next_pins.migrate(), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
+        self.assertEqual(len(staff.snapshot().rows), 1)
+
+    def test_pin_migration_resolves_renamed_question_files_and_aggregate_sources(self) -> None:
+        import json
+        from scripts.production import migrate_next_pins, session_staff
+
+        owner = staff.snapshot().rows[0]
+        old_doc = self.root / "old-production.md"
+        document = "# Production\n\n## Production Context\n\n- **Formerly:** `old`\n"
+        _ = old_doc.write_text(document)
+        _ = staff.rename(owner.id, "old")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", old_doc))
+        new_doc = old_doc.rename(self.root / "new-production.md")
+        _ = staff.rename(owner.id, "new")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", new_doc))
+        sources = session_staff.MemberSources({
+            "new": showrunners.ShowrunnerSource(showrunners.Timer("new", "", new_doc, "UTC"), new_doc.read_text()),
+        }, ())
+        directory = self.root / "next"
+        directory.mkdir()
+        values: dict[str, dict[str, object]] = {
+            "question-old": {"current": "old: Choose", "ended": {"old: Later": 1}},
+            "next-old-all-below": {"source": "question-old-all-below", "current": "old: Choose"},
+            "next-new": {"source": "question-old", "current": "old: Choose"},
+        }
+        for name, fields in values.items():
+            _ = (directory / f"{name}.json").write_text(json.dumps(fields))
+        journal = self.root / "showrunner/new/rename.json"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_text(json.dumps({"old": "old", "new": "new"}))
+        with (mock.patch.object(session_staff, "member_sources", return_value=sources),
+              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.root / "showrunner")):
+            self.assertEqual(migrate_next_pins.migrate(stop_after=1), 75)
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+            expected: dict[str, dict[str, object]] = {
+                f"question-{owner.id}.json": {"current": f"{owner.id}: Choose", "ended": {f"{owner.id}: Later": 1}},
+                f"next-{owner.id}-all-below.json": {"source": f"question-{owner.id}-all-below",
+                                                       "current": f"{owner.id}: Choose"},
+                f"next-{owner.id}.json": {"source": f"question-{owner.id}", "current": f"{owner.id}: Choose"},
+            }
+            self.assertEqual({path.name: json.loads(path.read_text()) for path in directory.glob("*.json")}, expected)
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
+
+    def test_pin_migration_keeps_ambiguous_former_names_and_moves_other_files(self) -> None:
+        from scripts.production import migrate_next_pins, session_staff
+
+        productions: dict[str, showrunners.ShowrunnerSource] = {}
+        owners: dict[str, staff.StaffRow] = {}
+        for name in ("first", "second"):
+            doc = self.root / f"{name}-production.md"
+            text = "# Production\n\n## Production Context\n\n- **Formerly:** `old`\n"
+            _ = doc.write_text(text)
+            owners[name] = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+            productions[name] = showrunners.ShowrunnerSource(showrunners.Timer(name, "", doc, "UTC"), doc.read_text())
+        sources = session_staff.MemberSources(productions, ())
+        directory = self.root / "next"
+        directory.mkdir()
+        unchanged = {"question-old.json": '{"current":"old: Choose"}',
+                     "next-first.json": '{"source":"question-old","current":"old: Choose"}'}
+        for name, text in unchanged.items():
+            _ = (directory / name).write_text(text)
+        before = {directory / name: ((directory / name).read_bytes(), (directory / name).stat().st_mtime_ns)
+                  for name in unchanged}
+        _ = (directory / "proposal-second.json").write_text('{"current":"P1"}')
+        error = io.StringIO()
+        with mock.patch.object(session_staff, "member_sources", return_value=sources), contextlib.redirect_stderr(error):
+            self.assertEqual(migrate_next_pins.migrate(), 1)
+        self.assertEqual(error.getvalue().splitlines(), [
+            "unavailable: old: showrunner ownership evidence is unavailable",
+            "unavailable: old: showrunner ownership evidence is unavailable",
+        ])
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before}, before)
+        self.assertEqual({path.name for path in directory.glob("*.json")},
+                         {*unchanged, f"proposal-{owners['second'].id}.json"})
+
+    def test_pin_migration_prefers_a_fixed_id_over_a_former_slug(self) -> None:
+        from scripts.production import migrate_next_pins, session_staff
+
+        owner = staff.snapshot().rows[0]
+        doc = self.root / "other-production.md"
+        text = f"# Production\n\n## Production Context\n\n- **Formerly:** `{owner.id}`\n"
+        _ = doc.write_text(text)
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", doc))
+        sources = session_staff.MemberSources({
+            "other": showrunners.ShowrunnerSource(showrunners.Timer("other", "", doc, "UTC"), doc.read_text()),
+        }, ())
+        directory = self.root / "next"
+        directory.mkdir()
+        path = directory / f"question-{owner.id}.json"
+        _ = path.write_text(f'{{"current":"{owner.id}: Choose"}}')
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with mock.patch.object(session_staff, "member_sources", return_value=sources) as read_sources:
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+        read_sources.assert_not_called()
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(list(directory.glob("*.json")), [path])
+
+    def test_pin_migration_refuses_missing_ownership_and_unequal_destination(self) -> None:
+        from scripts.production import migrate_next_pins
+
+        owner = staff.snapshot().rows[0]
+        directory = self.root / "next"
+        directory.mkdir()
+        contents = {"next-fixture.json": '{"current":"old"}',
+                    f"next-{owner.id}.json": '{"current":"different"}',
+                    "question-missing.json": '{"current":"keep"}'}
+        for name, text in contents.items():
+            _ = (directory / name).write_text(text)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}
+        self.assertEqual(migrate_next_pins.migrate(), 1)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.glob("*.json")}, before)
+
+    def test_finished_pin_migration_ignores_invalid_launch_records(self) -> None:
+        import json
+        from scripts.production import migrate_next_pins, session_staff
+
+        owner = staff.snapshot().rows[0]
+        directory = self.root / "next"
+        directory.mkdir()
+        path = directory / f"question-{owner.id}.json"
+        _ = path.write_text(json.dumps({"current": f"{owner.id}: Choose", "ended": {f"{owner.id}: Later": 1}}))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with mock.patch.object(session_staff, "member_sources",
+                               side_effect=staff.StaffUnreadable("invalid launch record")) as sources:
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+            self.assertEqual(migrate_next_pins.migrate(), 0)
+        sources.assert_not_called()
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_efficiency_show_reads_the_local_ledger_when_staff_is_unavailable(self) -> None:
+        ledger = self.root / "ledger.md"
+        _ = ledger.write_text(LEDGER)
+        document = self.root / "demo-production.md"
+        _ = document.write_text(f"# Demo\n- **Efficiency ledger:** {ledger}\n")
+        with mock.patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("staff unavailable")) as snapshot:
+            self.assertEqual(run("show", "--kind", "efficiency", "--production", str(document)),
+                             (0, f"efficiency\n{LEDGER.splitlines()[0]}\n", ""))
+        snapshot.assert_not_called()
 
     def test_bare_next_shows_the_most_urgent_item_across_the_lists_and_keeps_it(self) -> None:
         with self.patched():
@@ -211,7 +376,7 @@ class NextItemTests(unittest.TestCase):
                          "no efficiency is waiting for you\n")
         path = self.root / "change-review" / "change-review - natedev.md"
         _ = change_review.append_rows(path, [Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")],
-                                      date(2026, 10, 15), "", PRODUCTION)
+                                      date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
         def the_list(production: str) -> Path:
             del production
             return path
@@ -219,7 +384,7 @@ class NextItemTests(unittest.TestCase):
         _ = fixture_member("showrunner", name="natedev", doc=staff.LiveDoc("natedev", PRODUCTION))
         with mock.patch.object(change_review, "production_list", the_list):
             self.assertEqual(run("show", "--kind", "change", "--production", str(PRODUCTION)), (0, "\n".join([
-                "change", "C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
+                "change", "natedev/C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
                 "  Merged: 2026-10-15", "  Production: demo", ""]), ""))
 
     def test_each_kind_shows_its_own_production_and_with_all_below_each_lower_one_never_above(self) -> None:
@@ -235,15 +400,15 @@ class NextItemTests(unittest.TestCase):
             _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug}-item gain — proposed\n")
             _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n"
                                + f"- **Proposals:** {issues_folder}\n")
+            owner = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", doc))
             _ = (issues_folder / f"{slug}-item.md").write_text(
-                f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
-            _ = (outstanding / f"{slug}.json").write_text(f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
+                f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {owner.id}\ndate_created: 2026-10-01\n---\n")
         path = self.root / "change-review" / "change-review - natedev.md"
         # The side production is a root of its own, with its own list.
         side_list = path.with_name("change-review - side.md")
         for slug in (*slugs, "gone"):
             _ = change_review.append_rows(side_list if slug == "side" else path, [Visible(f"{slug}-item change", "Run it", "It works")], date(2026, 10, 15),
-                                          "", plans / f"{slug}-production.md")
+                                          "", plans / f"{slug}-production.md", record=staff.snapshot())
         # A row written before the Production column belongs to the list's root.
         _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -253,8 +418,10 @@ class NextItemTests(unittest.TestCase):
             parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
             existing = staff.snapshot().by_path(slug)
             if existing is not None:
-                _ = staff.move(existing.id, parent)
+                _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
             owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
+            _ = (outstanding / f"{owner.id}.json").write_text(
+                f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
             timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
             timer.mkdir(parents=True)
             _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
@@ -309,7 +476,7 @@ class NextItemTests(unittest.TestCase):
     def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
         path = self.root / "change-review - top.md"
         _ = change_review.append_rows(path, [Visible("kid change", "Run it", "It works")], date(2026, 10, 15), "",
-                                      self.root / "kid-production.md")
+                                      self.root / "kid-production.md", record=staff.snapshot())
         top, kid = self.root / "top-production.md", self.root / "kid-production.md"
 
         def the_list(production: str) -> Path:

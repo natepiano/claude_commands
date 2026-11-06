@@ -18,8 +18,9 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import roles_audit as audit
+from scripts.production import roles_audit as audit
 from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.test_names import NAMES_TOML
 from scripts.shutdown import remote
 
@@ -27,9 +28,9 @@ from scripts.shutdown import remote
 def owned_units(doc: Path, *names: str, retired: tuple[str, ...] = ()) -> staff.StaffSnapshot:
     """The showrunner row that owns `doc`, then its unit rows in row order."""
     machine = remote.local_machine()
-    owner = staff.StaffRow(staff.StaffId("s-owner"), "showrunner", "alpha", None,
+    owner = staff.StaffRow(staff.StaffId("s-owner"), "showrunner", "alpha", staff.StaffRoot(),
                            current_session=staff.StaffId("s-owner"), doc=staff.LiveDoc(machine, doc.resolve()))
-    units = (staff.StaffRow(staff.StaffId(f"s-{name}"), "unit", name, owner.id, current_session=staff.StaffId(f"s-{name}"),
+    units = (staff.StaffRow(staff.StaffId(f"s-{name}"), "unit", name, staff.ReportsTo(owner.id), current_session=staff.StaffId(f"s-{name}"),
                             worktree=(staff.RemovedWorktree if name in retired else staff.PresentWorktree)(machine, Path("/fixture", name)))
              for name in names)
     return staff.StaffSnapshot((owner, *units))
@@ -623,6 +624,22 @@ class SourceCheckTests(unittest.TestCase):
             _ = subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
             self.assertEqual(audit.check_sources(root), expected)
 
+    def test_reader_does_not_read_ignored_binary_build_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_check_root(root, {"scripts/current.py": 'print("Dispatch a worker.")\n'})
+            _ = subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
+            _ = (root / "scripts/.gitignore").write_text("target/\n", encoding="utf-8")
+            target = root / "scripts/target"
+            target.mkdir()
+            _ = (target / "binary").write_bytes(b"\x80")
+            _ = subprocess.run(["git", "-C", str(root), "add", "scripts/current.py"],
+                               check=True, capture_output=True)
+            _ = (root / "scripts/untracked.py").write_text('print("Ready.")\n', encoding="utf-8")
+            sources = audit.read_live_sources(root)
+            self.assertEqual([file.path for file in sources.files], ["scripts/current.py", "scripts/untracked.py"])
+            self.assertEqual(sources.unread_sources, ())
+
     def test_repository_candidate_check_matches_full_extraction(self) -> None:
         repository = Path(__file__).resolve().parents[2]
         # The full-tree reference found no findings or read issues. Keep its
@@ -770,8 +787,9 @@ class SourceCheckTests(unittest.TestCase):
 class ProductionNameTests(unittest.TestCase):
     def test_reads_staff_units_and_finds_cross_role_collisions(self) -> None:
         doc = Path("/fixture/one.md")
-        first = audit.parse_production("one", doc, "# A\n- **Showrunner session:** alpha\n",
-                                       owned_units(doc, "render", "old", retired=("old",)))
+        timer = showrunners.Timer("one", "session:alpha", doc, "UTC")
+        with patch.object(showrunners, "timer_for", return_value=timer):
+            first = audit.parse_production("one", doc, owned_units(doc, "render", "old", retired=("old",)))
         second = audit.ProductionNames("two", "/fixture/two.md", "render-unit", ("tools-unit",))
         rows = audit.measure_production_names((first, second))
         self.assertEqual(first.units, ("render-unit", "old-unit"))
@@ -848,7 +866,8 @@ other_names = ["seat"]
             doc = root / "fixture-production.md"
             _ = doc.write_text("# Fixture\n", encoding="utf-8")
             at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-            with patch.object(showrunners, "timer_docs", return_value={"fixture": doc}), \
+            with isolated_staff_file(root / "staff.json", {}), \
+                    patch.object(showrunners, "timer_docs", return_value={"fixture": doc}), \
                     patch.object(staff, "snapshot", return_value=owned_units(doc, "render")), \
                     patch.object(Path, "home", return_value=root), \
                     patch.dict("os.environ", {"USER_ZONE": "America/New_York"}):

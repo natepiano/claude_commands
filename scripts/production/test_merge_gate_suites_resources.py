@@ -18,6 +18,7 @@ from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -49,7 +50,7 @@ if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
 from scripts.lint import memory_admit
-from scripts.lib import copy_record
+from scripts.lib import copy_record, scratch
 
 
 @final
@@ -74,7 +75,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
             return result
 
         with merge_gate.rollback_signals(), mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
-            with self.assertRaisesRegex(merge_gate.GateRefused, "interrupted by SIGTERM"):
+            with self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
                 merge_gate.reap_gate_job(finished)
         self.assertEqual(finished.process.returncode, 7)
         self.assertGreater(finished.cpu_seconds, 0.0)
@@ -171,7 +172,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         path = Path(self.environment["BUILDLOG_JOBSERVER_FIFO"])
         path.unlink()
         self.write(path, "Q")
-        with mock.patch.dict(os.environ, self.environment), self.assertRaises(merge_gate.GateRefused):
+        with mock.patch.dict(os.environ, self.environment), self.assertRaises(GateRefused):
             with merge_gate.shared_cpu_pool():
                 self.fail("a regular file must not provide CPU slots")
         self.assertEqual(path.read_text(), "Q")
@@ -181,11 +182,18 @@ class MergeGateResourcesTests(GateSuitesFixture):
         metadata = Path(self.environment["BUILDLOG_JOBSERVER_FIFO"]).stat()
         mode = os.stat_result((stat.S_IFCHR | 0o600, *metadata[1:]))
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(os, "fstat", return_value=mode), merge_gate.shared_cpu_pool() as pool, \
-                mock.patch.object(os, "read", side_effect=AssertionError("read before the pool was ready")):
+                mock.patch.object(os, "fstat", return_value=mode), merge_gate.shared_cpu_pool() as pool:
             if not isinstance(pool, merge_gate.SharedCPUPool):
                 self.fail("the private pool was not opened")
-            self.assertIsInstance(pool.try_acquire(), merge_gate.WaitingForCPU)
+            pool_descriptor = pool.descriptor
+            read = os.read
+
+            def read_other_descriptor(descriptor: int, count: int) -> bytes:
+                self.assertNotEqual(descriptor, pool_descriptor, "read before the pool was ready")
+                return read(descriptor, count)
+
+            with mock.patch.object(os, "read", side_effect=read_other_descriptor):
+                self.assertIsInstance(pool.try_acquire(), merge_gate.WaitingForCPU)
 
     @gate_suites("lib")
     def test_one_shared_slot_serializes_modules_and_is_returned_after_each(self) -> None:
@@ -224,7 +232,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         admitted = False
 
         def assert_busy() -> None:
-            with (self.checkout / ".claude-busy").open("r") as lock:
+            with scratch.busy_path(self.checkout).open("r") as lock:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -234,7 +242,8 @@ class MergeGateResourcesTests(GateSuitesFixture):
             if result.decision.state == "hold":
                 assert_busy()
                 waited.add("memory")
-                replies = self.admission.server.handle_request(wire.ReleaseRequest("release-busy", busy.reservation, 0))
+                with self.admission.loop_turn():
+                    replies = self.admission.server.handle_request(wire.ReleaseRequest("release-busy", busy.reservation, 0))
                 self.assertEqual(replies, [wire.Ok()])
 
         def free_slot(seconds: float) -> None:

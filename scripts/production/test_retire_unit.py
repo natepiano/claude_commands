@@ -4,7 +4,7 @@ Shutdown, the Codex mesh and build_hold are recording stand-ins. Claude
 sessions are fixture records; nothing real stops."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_worker
 
 import io
 import json
@@ -38,13 +38,15 @@ from scripts.production.staff_test_support import StaffTestCase
 from scripts.lib import process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import stop_resume
+from scripts.shutdown import pane_record as staff_pane_record
 import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
-from scripts.issue_score.selection import UseConfiguredValue
-from scripts.lib import conf
+from scripts.lib.conf import UseConfiguredValue
 from scripts.copies import copies
+from scripts.lib import conf
 from scripts.agents import worker_lifecycle
+from scripts.direct import workers
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 # The fixture replaces the lookup; a test of the lookup itself puts it back.
@@ -103,7 +105,7 @@ class RetireUnitTests(unittest.TestCase):
     run_folder: Path = Path()
     calls: list[list[str]] = []
     claude: list[SessionRecord] = []
-    marked: unit_lookup.MarkedUnit | None = None
+    marked: unit_lookup.LabeledSession | None = None
     config: Path = Path()
     unit_staff_id: StaffId = StaffId("")
 
@@ -271,13 +273,8 @@ class RetireUnitTests(unittest.TestCase):
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
         self.run_folder.mkdir(parents=True)
-        _ = (self.run_folder / "progress_history_state.json").write_text(
-            json.dumps({"working_dir": str(self.worktree)}), encoding="utf-8")
-        _ = (self.run_folder / "director").write_text(DIRECTOR + "\n", encoding="utf-8")
         # The test's own pid stands in for the app-server: the mesh stand-in never signals it.
         _ = (self.run_folder / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
-        _ = (self.run_folder / "mesh_roster.json").write_text(
-            json.dumps({"alpha-impl": {"status": "running"}, "alpha-old": {"status": "ended"}}), encoding="utf-8")
         holds = self.root / "holds"
         holds.mkdir()
         _ = (holds / DIRECTOR).write_text("{}", encoding="utf-8")
@@ -310,7 +307,7 @@ class RetireUnitTests(unittest.TestCase):
             owner = next((item for item in self.claude if item["sessionId"] == session_id), None)
             if owner:
                 return sessions.LiveSessionProcess(owner["pid"])
-            marked = unit_lookup.marked_unit("alpha", "alpha-unit")
+            marked = unit_lookup.labeled_session("alpha", "alpha-unit")
             if marked and isinstance(marked.claude, unit_lookup.LiveClaude) and marked.claude.session_id == session_id:
                 return sessions.LiveSessionProcess(marked.claude.pid)
             return sessions.SessionNotLive()
@@ -320,6 +317,16 @@ class RetireUnitTests(unittest.TestCase):
                                                        "BUILD_HOLD_DIR": str(holds),
                                                        "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
                                                        "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}))
+        roster: dict[str, object] = {}
+        home = self.root / "codex"
+        store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha-unit"))
+        with store.locked() as ledger:
+            for name, status in (("alpha-impl", "running"), ("alpha-old", "ended")):
+                row = fixture_worker(name, self.unit_staff_id, backend=staff.CodexBackend(home))
+                roster[name] = {"staff_id": row.id, "status": status}
+                ledger.workers[name] = workers.UnitWorker(name, "impl", "codex", "", "", {},
+                    workers.CodexThread(row.current_session, str(home)), workers.Paused(), [], staff_id=row.id)
+        _ = (self.run_folder / "mesh_roster.json").write_text(json.dumps(roster), encoding="utf-8")
         _ = self.enterContext(mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "claims"))
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
@@ -328,25 +335,27 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(retire_unit, "reservations", no_reservations))
         _ = self.enterContext(mock.patch.object(sessions, "session_processes", session_processes))
         _ = self.enterContext(mock.patch.object(sessions, "session_liveness", session_liveness))
-        self.marked = unit_lookup.MarkedUnit(
+        self.marked = unit_lookup.LabeledSession(
             "alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
 
-        def marked_unit(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
+        def labeled_session(_slug: str, _name: str) -> unit_lookup.LabeledSession | None:
             return self.marked
 
+        self.config = self.root / "config"
+        self.enterContext(mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(self.root / "panes")}))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
+        _ = self.enterContext(mock.patch.object(staff_pane_record, "RECORD_DIR", self.root / "panes"))
         pane_record.write("alpha", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
-            {"CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude", "-n", "alpha"]))
+            {"CLAUDE_CONFIG_DIR": str(self.config), ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude", "-n", "alpha"]))
         def process_info(*_arguments: str, deadline: float = math.inf) -> dict[str, object]:
             del deadline
             # Existing cases launch Claude with exec: it replaces the pane's shell.
             pid = self.marked.claude.pid if self.marked and isinstance(self.marked.claude, unit_lookup.LiveClaude) else 4101
             return {"process_info": {"shell_pid": pid}}
 
-        self.config = self.root / "config"
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", marked_unit))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", labeled_session))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", side_effect=process_info))
-        _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: [self.config]))
+        _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [self.config]))
         self.transcript(self.worktree)
 
     def transcript(self, cwd: Path) -> None:
@@ -532,7 +541,6 @@ class RetireUnitTests(unittest.TestCase):
 
 
     def outside_director(self) -> Path:
-        (self.run_folder / "director").unlink()
         self.claude = []
         old = self.config / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
         old.unlink()

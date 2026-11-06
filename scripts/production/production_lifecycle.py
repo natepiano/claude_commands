@@ -18,6 +18,7 @@ from scripts.production import session_staff, staff, staff_sources, unit_config,
 from scripts.shutdown.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
+from scripts.production.store_owner import showrunner_id
 from scripts.production import showrunners
 import showrunner_tree
 import tidy_wrapped
@@ -167,8 +168,9 @@ def checkout_ready(production: Production) -> PlanLanded | PlanPending:
 
 
 def move_session_state(slug: str, scratch: Path) -> None:
-    copied = showrunners.copy_session_state(slug, scratch)
-    report("state-dir", "ok", f"{showrunners.session_state_dir(slug)}"
+    identity = showrunner_id(slug)
+    copied = showrunners.copy_session_state(identity, scratch)
+    report("state-dir", "ok", f"{showrunners.session_state_dir(identity)}"
            + (f"; copied {', '.join(copied)} from {scratch}" if copied else ""))
 
 
@@ -181,7 +183,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         return
     owed: tuple[str, ...] = ()
     try:
-        owed = judgment_state(showrunners.session_state_dir(production.slug) / "showrunner_state.json", "load").owed
+        owed = judgment_state(showrunners.session_state_dir(showrunner_id(production.slug)) / "showrunner_state.json", "load").owed
     except FileNotFoundError:
         pass
     except (RegistrationFailure, OSError, ValueError, UnicodeError) as error:
@@ -190,7 +192,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
     history = (merge_branch_history(production.checkout, production.merge_branch)
                if isinstance(state, PlanLanded) else None)
     try:
-        marked = unit_lookup.marked_units(production.slug)
+        marked = unit_lookup.labeled_sessions(production.slug)
     except OSError as error:
         raise LifecycleStop("session", "failed", str(error)) from error
     for row in unit_lookup.doc_units(production.doc, staff.snapshot()):
@@ -199,7 +201,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         detail = (f"phase {last.phase} at {last.merge_hash}" if isinstance(last, MergeEntry)
                   else "no code checkpoint")
         report("last-merged", "ok", f"{name}: {detail}")
-        found = marked.get(name)
+        found = marked.get(row.name)
         report("session", "ok", f"{name}: " + (f"{found.place.session} live" if found is not None else "gone"))
 
 
@@ -411,12 +413,13 @@ def refuse_running_children(slug: str, record: staff.StaffSnapshot) -> None:
                             + f"to {slug}; wrap each first, or detach it with `showrunners.py detach <child>`")
 
 
-def release_path(slug: str) -> Path:
-    return showrunners.SHOWRUNNER_STATE_DIR / slug / "wrap_release.json"
+def release_path(slug: str, *, record: staff.StaffSnapshot | None = None) -> Path:
+    return showrunners.SHOWRUNNER_STATE_DIR / showrunner_id(slug, record=record) / "wrap_release.json"
 
 
-def save_release(slug: str, released: showrunner_tree.WrapRelease) -> None:
-    path = release_path(slug)
+def save_release(slug: str, released: showrunner_tree.WrapRelease, *,
+                 record: staff.StaffSnapshot | None = None) -> None:
+    path = release_path(slug, record=record)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, json.dumps({
         "former_parent": released.former_parent.parent if isinstance(released.former_parent, showrunner_tree.ReportedTo) else None,
@@ -425,10 +428,10 @@ def save_release(slug: str, released: showrunner_tree.WrapRelease) -> None:
 
 
 def capture_release(slug: str, *, record: staff.StaffSnapshot | None = None) -> showrunner_tree.WrapRelease:
-    path = release_path(slug)
+    path = release_path(slug, record=record)
     if not path.exists():
         released = showrunner_tree.edges_to_release(slug, record=record)
-        save_release(slug, released)
+        save_release(slug, released, record=record)
         return released
     value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     if not isinstance(value, dict):
@@ -444,9 +447,8 @@ def capture_release(slug: str, *, record: staff.StaffSnapshot | None = None) -> 
 
 
 def release_edges(slug: str, *, record: staff.StaffSnapshot | None = None) -> None:
-    """Release captured edges and persist each completed notice before continuing."""
+    """Send captured wrap notices and save each completed delivery."""
     released = capture_release(slug, record=record)
-    showrunner_tree.release_edges(slug, released, record=record)
     notices: dict[str, str] = {}
     if isinstance(released.former_parent, showrunner_tree.ReportedTo):
         notices[released.former_parent.parent] = f"{slug} wrapped; its recorded parent is retained for history."
@@ -459,7 +461,7 @@ def release_edges(slug: str, *, record: staff.StaffSnapshot | None = None) -> No
             if told.failed:
                 raise LifecycleStop("tree", "failed", "; ".join(told.lines))
             released = replace(released, told=(*released.told, target))
-            save_release(slug, released)
+            save_release(slug, released, record=record)
             messages.extend(told.lines)
     above = f"retained parent {released.former_parent.parent}" if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ""
     below = f"retained children {', '.join(released.former_children)}" if released.former_children else ""
@@ -620,10 +622,6 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     held = retire_wrap_rows(rows, record, runner.row) or held
     if isinstance(status, ProductionRunning):
         release_edges(production.slug, record=record)
-        notifier = Path.home() / ".claude/scripts/message/notifier.sh"
-        # The update timer is the one record of the showrunner, so removing it unregisters it.
-        _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
-        report("notifier", "ok", "update timer removed")
         archived = command(
             "phase-notes",
             production.checkout,
@@ -641,6 +639,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             if count
             else "no phase notes to archive",
         )
+        notifier = Path.home() / ".claude/scripts/message/notifier.sh"
+        _ = command("notifier", production.checkout, str(notifier), "remove", showrunners.timer_name(production.slug))
+        report("notifier", "ok", "update timer removed")
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         write_text_atomic(production.doc, "\n".join(updated) + "\n")

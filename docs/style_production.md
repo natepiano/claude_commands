@@ -562,11 +562,9 @@ remaining finding touches, rerun the gate and leave dropped cells stale.
 ## Merging back
 
 Merge each unit checkpoint into the style merge branch as soon as it arrives;
-the `ticket merge` after it releases its berth reservation. Use the ordinary
-`merge_checkpoint.py --production <style doc> <unit> <phase> <hash> --started …`
-with one `--also <path>` for each entry of the unit's open ticket's `files`
-(`style_ledger.py ticket open --repo <checkout> --unit <unit>`). Its Owns is
-`none — takes what the board leaves free`; paths outside that ticket stay refused.
+the `ticket merge` after it releases its berth reservation. Use the ordinary command:
+`merge_checkpoint.py --production <style doc> <unit> <phase> <hash> --started …`.
+The checkpoint does not filter code paths by responsibilities. The ticket gate and cargo-berth manage the ticket files and reservations.
 
 A style ticket's checkpoint does not release its berth reservation: the unit's
 reservation record holds it for the ticket, and `ticket checkpoint` keeps the

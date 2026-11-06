@@ -14,11 +14,13 @@ from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.lib import scratch
 from scripts.production import change_review, merge_gate, staff
+from scripts.production.gate_modules import GateRefused
 from scripts.lint import memory_admit
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
-    fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+    fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
 )
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
@@ -28,6 +30,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = fixture_member("showrunner", name="unrelated")
         environment = source_environment(self.root / "staff-sources")
         environment["NOTIFIER_STATE_DIR"] = self.environment["NOTIFIER_STATE_DIR"]
         self.environment.update(environment)
@@ -40,10 +44,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
         exclude = Path(self.git(self.unit, "rev-parse", "--git-path", "info/exclude"))
         exclude = exclude if exclude.is_absolute() else self.unit / exclude
         self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
-        path = Path(self.environment["HOME"]) / ".local/state/staff/staff.json"
-        with isolated_staff_file(path, self.environment):
-            runner = recorded_showrunner("fixture-showrunner", doc)
-            unit = fixture_unit_location(runner, "fixture-unit", self.unit)
+        runner = recorded_showrunner("fixture-showrunner", doc)
+        self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
+        unit = fixture_unit_location(runner, "fixture-unit", self.unit)
         return unit.id
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
@@ -56,12 +59,12 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
             self.assertEqual(repo, checkout)
-            with (repo / ".claude-busy").open("a") as contender:
+            with scratch.busy_path(repo).open("a") as contender:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
             observed.append(repo)
-            raise merge_gate.GateRefused("injected suite stop")
+            raise GateRefused("injected suite stop")
 
         with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
             result = self.run_gate("--tests-only", "--checkout", str(checkout))
@@ -71,7 +74,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         excludes = (checkout / ".git/info/exclude").read_text().splitlines()
         self.assertEqual(excludes.count("/.claude-busy"), 1)
         self.assertEqual(excludes.count("/.scratch.json"), 1)
-        with (checkout / ".claude-busy").open("a") as contender:
+        with scratch.busy_path(checkout).open("a") as contender:
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_checkpoint_names_its_unit_before_admission_and_suites(self) -> None:
@@ -100,7 +103,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
                         self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture-unit")
                         if outcome == "exception":
-                            raise merge_gate.GateRefused("injected suite failure")
+                            raise GateRefused("injected suite failure")
                         return merge_gate.GateRun((), 0, 0, memory_within_cap=outcome != "red", tests_reused=True)
 
                     def merge(arguments: merge_gate.GateArguments) -> int:
@@ -120,7 +123,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
-                raise merge_gate.GateRefused("injected stop before push")
+                raise GateRefused("injected stop before push")
             return checked(repo, *arguments)
 
         with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
@@ -145,7 +148,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
-                raise merge_gate.GateRefused("injected stop before push")
+                raise GateRefused("injected stop before push")
             return checked(repo, *arguments)
 
         with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
@@ -168,7 +171,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def stop_at_push(repo: Path, *arguments: str) -> str:
             if arguments == ("push", "origin", "integration"):
-                raise merge_gate.GateRefused("injected push failure")
+                raise GateRefused("injected push failure")
             return checked(repo, *arguments)
 
         with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
@@ -205,8 +208,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
         self.assertNotRegex(result.stdout, r"(?m)^tests:")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
-        folders = [call["args"][call["args"].index("-s") + 1] for call in launches]
-        self.assertCountEqual(folders, [str(nested.parent), str(nested.parent.parent)] * 2)
+        runner = str(self.checkout / "scripts/test_times/module_run.py")
+        self.assertCountEqual([call["args"] for call in launches],
+                              [[runner, str(folder), nested.name]
+                               for folder in (nested.parent, nested.parent.parent)] * 2)
         self.assertTrue(all(call["cwd"] == str(self.checkout) for call in launches))
         timings = merge_gate.read_measures(self.state / "runner" / "module_seconds.json")
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
@@ -344,7 +349,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
-        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | production | {producer} |" for day in days}
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {producer} | {producer} |" for day in days}
         self.assertIn(written, rows)
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
@@ -369,9 +374,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
     def test_without_production_the_calling_showrunners_list_takes_the_rows(self) -> None:
         review, doc = self.review_list()
         producer = self.review_producer(doc)
-        timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / "showrunner-fixture"
+        runner = staff.by_id(producer)
+        assert runner is not None and isinstance(runner.parent, staff.ReportsTo)
+        timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.parent.id}"
         timer.mkdir(parents=True)
-        self.write(timer / "conf", "TARGET=session:fixture-showrunner\n"
+        self.write(timer / "conf", f"TARGET=session:{runner.parent.id}\n"
                    + f"CHECK=bash /scripts/production/production_check.sh {doc}\n")
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
@@ -462,8 +469,12 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertRegex(result.stdout, r"(?m)^Largest module peak: [\d.]+ GiB \(sampled memory\); module: (?:\w+/test_\w+\.py|\(not sampled\))$")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
         self.assertEqual(len(launches), self.module_count)
+        runner = str(self.checkout / "scripts/test_times/module_run.py")
+        expected = [[runner, str(self.checkout / "scripts" / suite), "test_first.py"] for suite in self.suites]
+        if "lib" in self.suites:
+            expected.append([runner, str(self.checkout / "scripts/lib"), "test_second.py"])
+        self.assertCountEqual([call["args"] for call in launches], expected)
         for call in launches:
-            self.assertIn("discover", call["args"])
             self.assertEqual(call["cwd"], str(self.checkout))
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
         self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
@@ -526,7 +537,7 @@ class MergeGateProducerTests(ProducerFixture):
             merge_gate.record_changes(self.repo, self.listing, self.doc,
                                       change_review.publication_changes(commits, self.doc), "main")
         self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
-        self.assertEqual(change_review.pending(self.listing)[0]["Production"], "top")
+        self.assertEqual(change_review.pending(self.listing)[0]["Production"], self.unit.id)
 
     def test_record_changes_keeps_an_unknown_producer_empty_and_prints_one_named_note(self) -> None:
         merged = self.merge()

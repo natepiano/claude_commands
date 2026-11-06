@@ -27,7 +27,7 @@ from unit_lookup import UnitState
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
-    fixture_showrunner_name, isolated_staff_file, recorded_unit, showrunner_launch, showrunner_relationship,
+    fixture_showrunner_name, isolated_staff_file, recorded_showrunner, recorded_unit, showrunner_launch, showrunner_relationship,
     unit_membership,
 )
 
@@ -185,6 +185,7 @@ class DailiesInputFixture(unittest.TestCase):
     phase_table_events: Path = Path()
     showrunner_state: Path = Path()
     env: dict[str, str] = {}
+    unit_ids: dict[str, staff.StaffId] = {}
 
     @override
     def setUp(self) -> None:
@@ -198,9 +199,12 @@ class DailiesInputFixture(unittest.TestCase):
         self.env = self.fixture_env.copy()
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         _ = self.enterContext(production_paths(self.env))
+        self.unit_ids = {}
+        _ = self.unit_id()
         self.patch_commands()
 
     def build_fixture(self) -> None:
+        self.unit_ids = {}
         self.home = self.root / "home"
         self.home.mkdir()
         self.origin = self.root / "origin.git"
@@ -228,7 +232,7 @@ class DailiesInputFixture(unittest.TestCase):
         self.showrunner_state = self.root / "showrunner-state"
         upgrade = self.root / "bevy upgrade stub.py"
         _ = upgrade.write_text(BEVY_UPGRADE_STUB, encoding="utf-8")
-        self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
+        self.env = {**os.environ, "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles", "BUILD_HOLD_DIR": str(self.holders),
                     "DAILIES_BEVY_UPGRADE": str(upgrade),
                     "DAILIES_BEVY_EVENTS": str(self.root / "bevy-events.json"),
                     "DAILIES_BEVY_OUTPUT": "", "DAILIES_BEVY_STDERR": "",
@@ -320,7 +324,7 @@ class DailiesInputFixture(unittest.TestCase):
             "- **Showrunner session:** test-showrunner",
             "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles",
-            "- **Updates:** every 15 minutes", "", "## Gates", "",
+            "- **Updates:** every 15 minutes", "",
         ]
         _ = self.doc.write_text("\n".join(rows), encoding="utf-8")
         self.timer("example")
@@ -331,9 +335,14 @@ class DailiesInputFixture(unittest.TestCase):
     def status_lines(self, *lines: str) -> None:
         _ = self.status.write_text("\n".join((STAMP, *lines)) + "\n", encoding="utf-8")
 
+    def unit_id(self, name: str = ALPHA) -> staff.StaffId:
+        if name not in self.unit_ids:
+            self.unit_ids[name] = unit_membership(fixture_showrunner_name("example", self.doc), name).id
+        return self.unit_ids[name]
+
     def judgment_file(self, *, beta: bool = False, alpha: dict[str, object] | None = None) -> None:
         base: dict[str, object] = {
-            "unit": ALPHA,
+            "unit": self.unit_id(ALPHA),
             "project": "panels that stay readable",
             "phase": "Phase 2 of 3: panel labels stay clear",
             "started": "2026-10-06T09:00",
@@ -347,7 +356,7 @@ class DailiesInputFixture(unittest.TestCase):
         units: list[dict[str, object]] = [base]
         if beta:
             units.append({
-                "unit": BETA,
+                "unit": self.unit_id(BETA),
                 "project": "buttons that stay readable",
                 "phase": "Phase 1 of 2: button labels stay clear",
                 "started": "2026-10-06T09:00",
@@ -487,7 +496,7 @@ class DailiesInputFixture(unittest.TestCase):
     def parsed_block(self) -> tuple[Running | SessionGone | ClaudeNotRunning,
                                     tuple[FormWaiting | Decision | StillWaiting | Block | TicksFailing, ...],
                                     tuple[Activity, ...]]:
-        block = status_blocks(self.status, (UnitRow(ALPHA, ALPHA, UnitState.RUNNING),))[0]
+        block = status_blocks(self.status, (UnitRow(ALPHA, ALPHA, UnitState.RUNNING, self.unit_id()),))[0]
         return block.state, block.flags, block.activity
 
     def assert_refused_without_output(self, *extra: str, mention: str) -> str:
@@ -526,10 +535,13 @@ class DailiesInputFixture(unittest.TestCase):
         """A production with a complete update timer, so the tree counts it."""
         instance = self.root / "notifier-state" / f"showrunner-{slug}"
         instance.mkdir(parents=True, exist_ok=True)
-        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
+        document = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+        if not document.exists():
+            _ = document.write_text(f"# Production — {slug}\n", encoding="utf-8")
+        row = recorded_showrunner(fixture_showrunner_name(slug, self.doc), document)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
-        showrunner_launch(row, row.id, self.env)
+            f"TARGET=session:{row.current_session}\nCHECK=zsh /x/production_check.sh {document}\n", encoding="utf-8")
+        showrunner_launch(row, row.current_session, self.env)
 
     def attach(self, child: str, parent: str) -> None:
         for slug in (child, parent):
@@ -538,7 +550,7 @@ class DailiesInputFixture(unittest.TestCase):
         _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
 
     def saved_report(self, slug: str) -> Path:
-        return self.showrunner_state / slug / "dailies_last.json"
+        return self.showrunner_state / self.production_id(slug) / "dailies_last.json"
 
     def write_saved_report(self, slug: str, **changed: object) -> None:
         fields: dict[str, object] = {
@@ -550,7 +562,7 @@ class DailiesInputFixture(unittest.TestCase):
         _ = self.saved_report(slug).write_text(json.dumps(fields), encoding="utf-8")
 
     def write_open_for(self, slug: str, content: str) -> None:
-        path = self.showrunner_state / "outstanding" / f"{slug}.json"
+        path = self.showrunner_state / "outstanding" / f"{self.production_id(slug)}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(content, encoding="utf-8")
 
@@ -582,3 +594,8 @@ class DailiesInputFixture(unittest.TestCase):
         content = self.doc.read_text(encoding="utf-8")
         _ = self.doc.write_text(content.replace("## Production Context", "## Production Context\n\n- **Kind:** style"),
                                 encoding="utf-8")
+
+    def production_id(self, slug: str) -> staff.StaffId:
+        document = self.doc if slug == "example" else self.root / f"{slug}-production.md"
+        return next(row.id for row in staff.snapshot().find(kind="showrunner")
+                    if isinstance(row.doc, staff.LiveDoc) and row.doc.path == document)

@@ -134,6 +134,7 @@ class RoleMap:
     workers: str
     workers_claude: WorkersClaudeAccount = DEFAULT_WORKERS_CLAUDE_ACCOUNT
     provenance: RoleMapProvenance = field(default_factory=CurrentRoleMap, compare=False)
+    upcoming_moves: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,7 @@ class RoleMapDocument(TypedDict):
     groups: StoredGroupSelections
     workers: str
     workers_claude: NotRequired[WorkersClaudeRouteDocument]
+    upcoming_moves: NotRequired[list[str]]
 
 
 class RoleChangeDocument(TypedDict):
@@ -384,11 +386,17 @@ def decode_role_map(text: str) -> RoleMap:
     groups, workers = fields.get("groups"), fields.get("workers")
     if not isinstance(groups, dict) or not isinstance(workers, str):
         raise ValueError("invalid role map")
-    return RoleMap(_groups(cast(dict[str, object], groups)), workers, _workers_claude_account(fields))
+    upcoming = fields.get("upcoming_moves", [])
+    if not isinstance(upcoming, list) or not all(isinstance(line, str) for line in cast(list[object], upcoming)):
+        raise ValueError("invalid upcoming moves")
+    return RoleMap(_groups(cast(dict[str, object], groups)), workers, _workers_claude_account(fields),
+                   upcoming_moves=tuple(cast(list[str], upcoming)))
 
 
 def _map_document(value: RoleMap) -> RoleMapDocument:
     document = RoleMapDocument(groups=value.groups, workers=value.workers)
+    if value.upcoming_moves:
+        document["upcoming_moves"] = list(value.upcoming_moves)
     if isinstance(value.workers_claude, NamedWorkersClaudeAccount):
         document["workers_claude"] = WorkersClaudeRouteDocument(
             label=value.workers_claude.label, until=value.workers_claude.until.isoformat())

@@ -1,48 +1,11 @@
 #!/usr/bin/env bash
-# agent_bg.sh — Launch a worker as a NAMED BACKGROUND Claude session and block
-# until it finishes, so callers can treat it like any foreground worker.
-#
-# Usage: agent_bg.sh <mesh_name> <working_dir> <prompt_file> <summary_file>
-#                    <log_file> <id_file> [model] [poll_secs]
-#   env AGENT_BG_WORKERS=1        use the workers account route
-#   env AGENT_BG_ROLE=<role>      the worker's opening role, independent of its slot
-#   env AGENT_BG_EFFORT=<effort>  adds --effort to the launch
-#   env AGENT_BG_DETACH=1         return once the session is registered, with
-#                                 its id in <id_file>, instead of waiting for
-#                                 its turn to end -- for a caller that talks to
-#                                 the session itself (ask_a_friend) rather than
-#                                 waiting on a summary
-#   env AGENT_BG_LEDGER=<file>    append `<id>\t<mesh_name>` to <file> once the
-#                                 session is registered, for the caller's
-#                                 cleanup -- direct/remove_workers.py reads it
-#
-# Why this exists rather than agent_exec.sh: a worker launched with
-# `claude --print` is INVISIBLE. It holds the ListAgents/SendMessage tools but
-# registers nowhere, so it sees no peers, no peer sees it, and the orchestrator
-# cannot reach it -- verified by running two concurrent print sessions in one
-# directory, each of which reported "no reachable agents" four times while the
-# other was live. `claude --bg` registers the session instead: it appears in
-# ListAgents as a peer, `claude agents --json` lists it, and messages flow in
-# every direction (worker to worker, worker to the main session, and back).
-# That mesh is the whole point -- a worker that finds a blocker can tell the
-# user's session directly instead of burying it in a summary nobody reads until
-# the phase ends.
-#
-# The cost of --bg is that it returns immediately, which would break every
-# caller that waits on a pid. So this script keeps the process shape: it stays
-# in the foreground for the life of the agent and exits with its outcome, and
-# the caller's `wait`, heartbeat watch, and pass recording work unchanged.
-#
-# The session is deliberately LEFT ALIVE when its turn ends. A message resumes a
-# stopped-turn session from its transcript, so a finished implementer can still
-# answer the tester's question. The caller ends it: a worker through the
-# AGENT_BG_LEDGER record and direct/remove_workers.py, a friend through the id
-# in <id_file>.
+# Start a named Claude worker and wait for its turn.
+# The session remains available after its turn ends.
+# Staff supplies its current identity for later messages and cleanup.
 
 set -euo pipefail
+"${BASH_SOURCE[0]%/*}/../lib/py" "${BASH_SOURCE[0]%/*}/../direct/assign_gate.py"
 unset STAFF_ID
-UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
-[[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 ATTACH=0
 if [[ "${1:-}" == "--attach" ]]; then
@@ -50,28 +13,26 @@ if [[ "${1:-}" == "--attach" ]]; then
   shift
 fi
 
-# python3 goes through the repo shim, which picks an interpreter by VERSION
-# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.12.
+[[ "${1:-}" == --run ]] || { echo "agent_bg.sh: --run <session_dir> is required" >&2; exit 2; }
+ADMISSION_RUN="${2:?missing session_dir}"
+shift 2
+export UNIT_RUN_DIR="$ADMISSION_RUN"
+
+# Use the repository interpreter shim on both machines.
 PY="${HOME}/.claude/scripts/lib/py"
 NIX_ENV_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 
-MESH_NAME="${1:?Usage: agent_bg.sh <mesh_name> <working_dir> <prompt_file> <summary_file> <log_file> <id_file> [model] [poll_secs]}"
+MESH_NAME="${1:?Usage: agent_bg.sh [--attach] --run <session_dir> <mesh_name> <working_dir> <prompt_file> <summary_file> <log_file> [model] [poll_secs]}"
 WORKING_DIR="${2:?missing working_dir}"
 PROMPT_FILE="${3:?missing prompt_file}"
 SUMMARY_FILE="${4:?missing summary_file}"
 LOG_FILE="${5:?missing log_file}"
-ID_FILE="${6:?missing id_file}"
-MODEL="${7:-}"
-POLL_SECS="${8:-15}"
+MODEL="${6:-}"
+POLL_SECS="${7:-15}"
 EFFORT="${AGENT_BG_EFFORT:-}"
 DETACH="${AGENT_BG_DETACH:-0}"
-LEDGER="${AGENT_BG_LEDGER:-}"
 
-# Never the bare name: the user's interactive shell aliases `claude` to inject
-# `--remote-control "<dir> <date>"`, which turns `claude stop <id>` into a new
-# session prompted with the words "stop <id>". Scripts do not load that alias,
-# but a caller that sources a profile would, and the failure is silent.
+# Use an executable path. Interactive aliases can change stop commands.
 CLAUDE_BIN="${CLAUDE_BIN:-}"
 if [[ -z "${CLAUDE_BIN}" ]]; then
   if [[ -x "${HOME}/.local/bin/claude" ]]; then
@@ -90,85 +51,76 @@ if [[ ! -f "${PROMPT_FILE}" ]]; then
   exit 2
 fi
 
-# A mesh name is an address other agents type. Keep it to something a peer can
-# reproduce from the role alone, and reject anything that would need quoting.
 if [[ ! "${MESH_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
   echo "agent_bg.sh: invalid mesh name '${MESH_NAME}'." >&2
   exit 2
 fi
 
 WORKER_FILL="$(dirname "${BASH_SOURCE[0]}")/../production/worker_fill.py"
-ADMISSION_RUN="${UNIT_RUN_DIR:-${WORKING_DIR}}"
-OPENING_ROLE="${AGENT_BG_ROLE:-${UNIT_TEAM_ROLE:-}}"
-"$PY" "$WORKER_FILL" admit --name "$MESH_NAME" --run "$ADMISSION_RUN" --role "$OPENING_ROLE" || exit 2
-
-publish_worker() {
-  # The banner can precede the registry record. Wait only while no record matches.
-  source "$NIX_ENV_LIB/conf.sh"
-  local register_wait
-  register_wait="$(conf_value direct CLAUDE_WORKER_REGISTER_WAIT_SECS)" || return 2
-  NATIVE_ID="$(BG_ID="$BG_ID" "$PY" - "$NIX_ENV_LIB/../.." "$register_wait" <<'PYREG'
-import sys
-import os
-import time
-sys.path.insert(0, sys.argv[1])
-from scripts.message import sessions
-from scripts.production import staff
-wait_seconds = int(sys.argv[2])
-deadline = time.monotonic() + wait_seconds
-while True:
-    registry = sessions.read_registry()
-    if registry.unreadable:
-        raise SystemExit("staff: registry is incomplete; native identity not published")
-    found = [item.record for item in registry.entries
-             if item.record["sessionId"].startswith(os.environ["BG_ID"])
-             and sessions.running_session(item.record)]
-    remaining = deadline - time.monotonic()
-    if found or remaining <= 0:
-        break
-    time.sleep(min(0.1, remaining))
-if len(found) != 1:
-    waited = f" (waited {wait_seconds}s)" if not found else ""
-    raise SystemExit("staff: backend has no unique live registry identity" + waited)
-row = found[0]
-if staff.runtime_id(row["pid"]) != row["sessionId"]:
-    raise SystemExit("staff: Claude process changed during publication")
-print(row["sessionId"])
-PYREG
-)" || return 2
-  if ! "$PY" "$WORKER_FILL" publish --name "$MESH_NAME" --run "$ADMISSION_RUN" --role "$OPENING_ROLE" --runtime-id "$NATIVE_ID"; then
-    echo "staff: ${MESH_NAME}: ${NATIVE_ID}: publication refused; no work dispatched" >&2
-    return 2
+close_switch_fds() { exec {SWITCH_READ}<&- {SWITCH_WRITE}>&-; }
+switch_signal() {
+  printf '%s\n' "$1" >&"$SWITCH_WRITE"
+  if [[ "$1" == dispatched ]]; then
+    close_switch_fds
+    wait "$SWITCH_PID" || return "$?"
+    trap - EXIT INT TERM HUP
+    SWITCH_PID=""
+  else
+    local reply
+    read -r -u "$SWITCH_READ" reply NATIVE_ID || { wait "$SWITCH_PID"; return 2; }
+    [[ "$reply" == published ]] || return 2
+    WORKER_PUBLISHED=1
   fi
 }
 
+SWITCH_PID=""
+WORKER_PUBLISHED=0
+if [[ "$ATTACH" == 0 ]]; then
+  coproc ADMISSION { exec "$PY" "$WORKER_FILL" coordinate-claude --name "$MESH_NAME" --run "$ADMISSION_RUN" \
+    --prompt "$PROMPT_FILE" --staff-id "${WORKER_STAFF_ID:-}"; }
+  SWITCH_PID=$ADMISSION_PID
+  exec {SWITCH_READ}<&"${ADMISSION[0]}" {SWITCH_WRITE}>&"${ADMISSION[1]}"
+  close_switch() {
+    local status=$?
+    close_switch_fds
+    kill "$SWITCH_PID" 2>/dev/null || true
+    wait "$SWITCH_PID" 2>/dev/null || true
+    if [[ "$WORKER_PUBLISHED" == 0 && -n "${BG_ID:-}" ]]; then
+      "$CLAUDE_BIN" stop "$BG_ID" || echo "staff: ${MESH_NAME}: ${BG_ID}: cleanup unproved" >&2
+    fi
+    exit "$status"
+  }
+  trap close_switch EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  read -r -u "$SWITCH_READ" action || { wait "$SWITCH_PID"; exit 2; }
+  case "$action" in
+    unchanged) wait "$SWITCH_PID"; echo unchanged; exit 0 ;;
+    attach) ATTACH=1 ;;
+    launch) ;;
+    *) exit 2 ;;
+  esac
+  read -r -u "$SWITCH_READ" PROMPT_FILE || exit 2
+fi
+
 if [[ "${ATTACH}" == "1" ]]; then
-  BG_ID="$(cat "${ID_FILE}" 2>/dev/null || true)"
-  [[ -n "${BG_ID}" ]] || { echo "agent_bg.sh: missing worker id" >&2; exit 2; }
+  if [[ -n "$SWITCH_PID" ]]; then
+    switch_signal attached
+  else
+    read -r FAMILY NATIVE_ID < <("$PY" "$WORKER_FILL" member --run "$ADMISSION_RUN" --name "$MESH_NAME" --staff-id "${WORKER_STAFF_ID:-}")
+    [[ "$FAMILY" == claude ]] || exit 2
+  fi
+  BG_ID="${NATIVE_ID:0:8}"
   transcript_count() {
-    BG_ID="${BG_ID}" MESH_NAME="${MESH_NAME}" "$PY" - <<'PY'
+    NATIVE_ID="${NATIVE_ID}" "$PY" - <<'PY'
 import json
 import os
 from pathlib import Path
-
-sessions = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions")))
-projects = Path(os.environ.get("CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude/projects")))
-session_id = ""
-for path in sessions.glob("*.json"):
-    try:
-        row = json.loads(path.read_text())
-    except (OSError, ValueError):
-        continue
-    if row.get("name") == os.environ["MESH_NAME"] and (
-        row.get("id") == os.environ["BG_ID"]
-        or str(row.get("sessionId", "")).startswith(os.environ["BG_ID"])
-    ):
-        session_id = str(row.get("sessionId", ""))
-        break
-if not session_id:
-    print(-1)
-    raise SystemExit
-matches = list(projects.glob(f"*/{session_id}.jsonl"))
+import sys
+sys.path.insert(0, str(Path(os.environ["HOME"]) / ".claude"))
+from scripts.message import sessions
+matches = sessions.transcript_locations(os.environ["NATIVE_ID"])
 count = 0
 if matches:
     try:
@@ -184,70 +136,8 @@ if matches:
 print(count)
 PY
   }
-  publish_worker || exit 2
   before="$(transcript_count)"
-  [[ "${before}" != "-1" ]] || { echo "agent_bg.sh: session transcript identity unavailable" >&2; exit 2; }
-  SEND_SCRIPT="${AGENT_BG_SEND_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/../message/send.py}"
-  delivery="$("$PY" "${SEND_SCRIPT}" --to "${MESH_NAME}" --from "launcher" --file "${PROMPT_FILE}")" || {
-    echo "agent_bg.sh: follow-up was not delivered to ${MESH_NAME}" >&2
-    exit 1
-  }
-  if [[ "${delivery}" == QUEUED* || "${delivery}" == FAILED* ]]; then
-    echo "agent_bg.sh: ${delivery}" >&2
-    exit 1
-  fi
-  # The transcript index identifies this turn even if it finishes before the
-  # first poll. Keep it with the launcher's claim for killed-launch recovery.
-  if [[ -n "${UNIT_RUN_DIR:-}" && -n "${UNIT_TEAM_ROLE:-}" ]]; then
-    FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" <<'PY'
-import fcntl
-import json
-import os
-from pathlib import Path
-
-import sys
-sys.path.insert(0, sys.argv[1])
-from worker_state import worker_claim_lock
-
-root = Path(os.environ["UNIT_RUN_DIR"])
-slot = os.environ["UNIT_TEAM_ROLE"]
-with worker_claim_lock(root):
-    path = root / f"impl_claim_{slot}.json"
-    try:
-        claim = json.loads(path.read_text())
-    except (OSError, ValueError):
-        raise SystemExit
-    if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
-        claim["turn_id"] = f"claude-turn-{os.environ['FOLLOW_TURN_INDEX']}"
-        path.write_text(json.dumps(claim))
-PY
-  fi
-  while true; do
-    status="$("${CLAUDE_BIN}" agents --json 2>/dev/null | BG_ID="${BG_ID}" "$PY" -c '
-import json, os, sys
-try:
-    rows = json.load(sys.stdin)
-except ValueError:
-    print("unreadable")
-else:
-    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        print("unreadable")
-    else:
-        row = next((row for row in rows if row.get("id") == os.environ["BG_ID"]), None)
-        print(row.get("status", "unreadable") if row else "gone")
-' || true)"
-    if [[ "${status}" == "gone" ]]; then
-      echo "agent_bg.sh: ${MESH_NAME} vanished after delivery" >&2
-      exit 1
-    fi
-    after="$(transcript_count)"
-    if [[ "${after}" =~ ^[0-9]+$ && "${after}" -gt "${before}" && "${status}" == "idle" ]]; then
-      "${CLAUDE_BIN}" logs "${BG_ID}" > "${LOG_FILE}" 2>/dev/null || true
-      exit 0
-    fi
-    sleep "${POLL_SECS}"
-  done
-fi
+else
 
 source "$(dirname "${BASH_SOURCE[0]}")/claude_account.sh"
 if [[ "${AGENT_BG_WORKERS:-0}" == "1" ]]; then
@@ -256,12 +146,8 @@ else
   claude_launch_environment || exit 1
 fi
 
-# `claude --bg` runs the session in a spare process of one long-lived per-user
-# daemon, so the session inherits the environment of whichever launch started
-# the daemon, not this one's: on 2026-10-05 every unit's workers took one unit's
-# cargo token and filed into its session. Hand the worker its worker variables
-# through settings, empty when unset (every reader treats empty as unset), and
-# keep them off the launch below so a daemon it starts carries none.
+# The daemon can retain an earlier worktree environment.
+# Pass the current worker values through its session settings.
 WORKER_ENV_NAMES=(UNIT_RUN_DIR UNIT_TEAM_ROLE MODELS_CONFIG_FILE)
 worker_settings="$("$PY" - "$WORKING_DIR" "$NIX_ENV_LIB" "${WORKER_ENV_NAMES[@]}" <<'PY'
 import json
@@ -276,22 +162,17 @@ loaded = nix_env.ensure(Path(sys.argv[1]))
 if isinstance(loaded, nix_env.Refused):
     print(loaded.reason, file=sys.stderr)
     raise SystemExit(1)
-# The daemon may predate this worktree. Settings carry the worktree's env to
-# the actual session too, rather than proving only the short-lived CLI env.
 env = {name: value for name, value in loaded.env.items()
        if not name.startswith(("HERDR_", "CODEX_", "CLAUDE_CODE_MESSAGING_"))
        and name not in {"CLAUDE_CODE_BRIDGE_SESSION_ID", "TMUX", "TMUX_PANE"}}
 env.update({name: "" for name in os.environ if name not in loaded.env})
 env.update({name: os.environ.get(name, "") for name in sys.argv[3:]})
+env.update({name: os.environ[name] for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR") if name in os.environ})
 env.pop("CLAUDE_CODE_CHILD_SESSION", None)
 print(json.dumps({"sandbox": {"enabled": False}, "env": env}))
 PY
 )" || exit 1
 
-if [[ -s "${ID_FILE}" ]]; then
-  echo "staff: ${MESH_NAME}: not opened: recorded backend must be reconciled with --attach" >&2
-  exit 2
-fi
 launch_args=(--bg --name "${MESH_NAME}"
              --dangerously-skip-permissions
              --settings "${worker_settings}")
@@ -302,17 +183,15 @@ if [[ -n "${EFFORT}" ]]; then
   launch_args+=(--effort "${EFFORT}")
 fi
 
-banner="$(cd "${WORKING_DIR}" \
+banner="$(close_switch_fds
+          cd "${WORKING_DIR}" \
             && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u MODELS_CONFIG_FILE \
                    -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS -u CLAUDE_CODE_CHILD_SESSION \
                    "${PY}" "$NIX_ENV_LIB/nix_env.py" exec "${CLAUDE_BIN}" "${launch_args[@]}" \
             2>&1 || true)"
 
-# The banner reads `backgrounded · <id> · <name>`; the separators are multibyte,
-# so match the id itself rather than splitting on them -- on that line alone. A
-# refused launch prints an error instead, and a path in it can carry an 8-hex
-# run: the caller's own session id sits in its scratchpad path, and taking that
-# as the worker's id hands the caller's session to whatever stops this worker.
+# Read the id only from the launch banner.
+# A diagnostic path can also contain eight hexadecimal characters.
 BG_ID="$(printf '%s\n' "${banner}" | grep 'backgrounded' | grep -oE '\b[0-9a-f]{8}\b' | head -1 || true)"
 if [[ -z "${BG_ID}" ]]; then
   printf '%s\n' "${banner}" > "${LOG_FILE}"
@@ -320,11 +199,9 @@ if [[ -z "${BG_ID}" ]]; then
   printf '%s\n' "${banner}" >&2
   exit 1
 fi
-printf '%s\n' "${BG_ID}" > "${ID_FILE}"
-if ! publish_worker; then
-  "${CLAUDE_BIN}" stop "${BG_ID}" || echo "staff: ${MESH_NAME}: ${BG_ID}: cleanup unproved" >&2
-  exit 2
+switch_signal "$BG_ID" || exit 2
 fi
+
 SEND_SCRIPT="${AGENT_BG_SEND_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/../message/send.py}"
 delivery="$("$PY" "${SEND_SCRIPT}" --to "session:${NATIVE_ID}" --from "launcher" --file "${PROMPT_FILE}")" || exit 2
 if [[ "$delivery" != SENT:* && "$delivery" != SKIPPED:* ]]; then
@@ -332,23 +209,39 @@ if [[ "$delivery" != SENT:* && "$delivery" != SKIPPED:* ]]; then
   exit 2
 fi
 
-if [[ -n "${LEDGER}" ]]; then
-  LEDGER="$("$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" "${LEDGER}" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from worker_state import worker_ledger
+[[ -z "$SWITCH_PID" ]] || switch_signal dispatched || exit 2
 
-path = Path(sys.argv[2])
-print(worker_ledger(path.parent) if path.name in ("seats", "workers") else path)
+if [[ "$ATTACH" == 1 ]]; then
+  if [[ -n "${UNIT_RUN_DIR:-}" && -n "${UNIT_TEAM_ROLE:-}" ]]; then
+    FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" "$ADMISSION_RUN" <<'PY'
+import json
+import os
+from pathlib import Path
+
+import sys
+sys.path.insert(0, sys.argv[1])
+from worker_state import worker_claim_lock
+
+root = Path(sys.argv[2])
+slot = os.environ["UNIT_TEAM_ROLE"]
+with worker_claim_lock(root):
+    path = root / f"impl_claim_{slot}.json"
+    try:
+        claim = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise SystemExit
+    if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
+        claim["turn_id"] = f"claude-turn-{os.environ['FOLLOW_TURN_INDEX']}"
+        path.write_text(json.dumps(claim))
 PY
-)"
-  printf '%s\t%s\n' "${BG_ID}" "${MESH_NAME}" >> "${LEDGER}"
-fi
+  fi
+else
+
 "$PY" "$(dirname "${BASH_SOURCE[0]}")/../usage/agents_log.py" append --id "${BG_ID}" --role worker || true
 if [[ "${DETACH}" == "1" ]]; then
   echo "launched ${MESH_NAME} (${BG_ID})"
   exit 0
+fi
 fi
 
 agent_status() {
@@ -364,37 +257,22 @@ except (json.JSONDecodeError, ValueError):
     sys.exit(0)
 for row in rows:
     if row.get("id") == wanted:
-        # A background row now carries BOTH fields, and they disagree: `status`
-        # speaks the busy/idle vocabulary the poll loop below matches on, while
-        # `state` speaks working/blocked/done and goes stale -- a worker whose turn
-        # ended half an hour ago has been observed still reading `working`.
-        # Prefer `status`; fall back to `state` only when the row omits it, and
-        # translate it, because an untranslated `done` matches no case arm and
-        # the loop then spins until the session is stopped by hand.
-        status = row.get("status")
-        if status:
-            print(status)
-        else:
-            state = row.get("state")
-            print({"working": "busy", "done": "idle", "blocked": "idle"}.get(
-                state, state or "unknown"))
+        state = row.get("state")
+        print(row.get("status") or {"working": "busy", "done": "idle", "blocked": "idle"}.get(
+            state, state or "unknown"))
         break
 else:
     print("gone")
 ' 2>/dev/null || true
 }
 
-# `claude logs` prints a rolling tail, so rewrite the log rather than appending:
-# the heartbeat digest wants the newest line, and appending a rolling buffer
-# every poll would repeat whatever the agent lingered on.
+# Replace the rolling log tail to avoid repeated lines.
 refresh_log() {
   "${CLAUDE_BIN}" logs "${BG_ID}" > "${LOG_FILE}.tmp" 2>/dev/null || return 0
   mv -f "${LOG_FILE}.tmp" "${LOG_FILE}" 2>/dev/null || true
 }
 
-# An agent is done when its turn ends. `idle` is also where a finished session
-# waits to be resumed by a peer's message, so idle is terminal here and the
-# session stays alive on purpose -- see the header.
+# Require evidence that work started before a new session becomes idle.
 seen_busy=0
 while true; do
   status="$(agent_status)"
@@ -404,14 +282,15 @@ while true; do
       seen_busy=1
       ;;
     idle)
-      # Trust a single idle only after the agent has actually started working;
-      # a session polled in the instant between dispatch and first token would
-      # otherwise look finished before it began.
-      if [[ "${seen_busy}" -eq 1 ]]; then
+      if [[ "$ATTACH" == 1 ]]; then
+        after="$(transcript_count)"
+        [[ "$after" =~ ^[0-9]+$ && "$after" -gt "$before" ]] && break
+      elif [[ "$seen_busy" -eq 1 ]]; then
         break
       fi
       ;;
     gone)
+      [[ "$ATTACH" == 0 ]] || { echo "agent_bg.sh: ${MESH_NAME} vanished after delivery" >&2; exit 1; }
       break
       ;;
   esac
@@ -419,9 +298,7 @@ while true; do
 done
 
 refresh_log
-# The worker writes its own summary (its prompt says so) because --bg has no
-# output redirect to capture. Fall back to the visible log so a caller that
-# reads the summary never finds nothing at all.
+# Use the visible reply when the worker leaves no summary.
 if [[ ! -s "${SUMMARY_FILE}" ]]; then
   if [[ -s "${LOG_FILE}" ]]; then
     if ! "$PY" - "${LOG_FILE}" "${SUMMARY_FILE}" <<'PY'
@@ -451,7 +328,6 @@ PY
 fi
 
 if [[ "$(agent_status)" == "gone" ]]; then
-  # A session that vanished without writing a summary did not finish its work.
   [[ -s "${SUMMARY_FILE}" ]] || exit 1
 fi
 exit 0

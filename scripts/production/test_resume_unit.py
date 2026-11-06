@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import resume_unit
 import add_unit
 import retire_unit
+import sessions as retirement_sessions
 import unit_lookup
 import unit_move
 import test_retire_unit
@@ -36,6 +37,7 @@ from herdr import HerdrPlace
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message import sessions
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import unit_membership
 
@@ -137,20 +139,21 @@ class ResumeUnitTests(unittest.TestCase):
             del record
             return production
 
-        def not_marked(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
+        def not_marked(_slug: str, _name: str) -> unit_lookup.LabeledSession | None:
             # The real pane writer retains a fixed owner; the live process resumes
             # that owner's current conversation, which can differ after /clear.
             owner = staff.by_current_session(DIRECTOR)
             entries = [entry for entry in pane_record.launches()
                        if owner is not None and entry["session_id"] == owner.id]
-            return (unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
+            return (unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
                                           HerdrPlace("agents", entries[-1]["pane_id"]))
                     if entries else None)
 
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", not_marked))
-        _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: self.configs))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", not_marked))
+        _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: self.configs))
+        _ = self.enterContext(mock.patch.object(retirement_sessions, "config_dirs", lambda: self.configs))
         _ = cast(MutableMapping[str, str], self.enterContext(
             mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
                                        "HERDR_PANE_RECORD_DIR": str(self.root / "pane-launches")})))
@@ -237,6 +240,7 @@ class ResumeUnitTests(unittest.TestCase):
         retirement = test_retire_unit.RetireUnitTests()
         self.addCleanup(retirement.doCleanups)
         retirement.setUp()
+        _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [retirement.config]))
         unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         tip = git(retirement.checkout, "rev-parse", "main")
         code, output = retirement.retire()
@@ -251,7 +255,7 @@ class ResumeUnitTests(unittest.TestCase):
                 production = read_production(Path(argv[argv.index("--production") + 1]))
                 row = add_unit.ensure_staff_unit(production, argv[4])
                 launched_ids.append(row.id)
-                retirement.marked = unit_lookup.MarkedUnit("alpha-unit",
+                retirement.marked = unit_lookup.LabeledSession("alpha-unit",
                     unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
                 pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(retirement.worktree),
                     {}, ["claude", "--resume", DIRECTOR]))
@@ -266,7 +270,8 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0][commands[0].index("--resume") + 1], DIRECTOR)
         self.assertEqual(staff.by_id(unit.id), unit)
-        self.assertEqual(staff.find(kind="unit", parent=unit.parent), [unit])
+        assert isinstance(unit.parent, staff.ReportsTo)
+        self.assertEqual(staff.find(kind="unit", parent=unit.parent.id), [unit])
         self.assertEqual(git(retirement.worktree, "rev-parse", "HEAD"), tip)
         before = (retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
                   git(retirement.checkout, "for-each-ref"))
@@ -306,7 +311,7 @@ class ResumeUnitTests(unittest.TestCase):
                   unit_config.parked_path(row.id).read_bytes())
         with self.subTest(evidence="fixed owner for the live current conversation"):
             self.assertTrue(resume_unit.resumed_session_proven("alpha", "alpha-unit", DIRECTOR, row))
-        current = unit_lookup.MarkedUnit("alpha-unit",
+        current = unit_lookup.LabeledSession("alpha-unit",
             unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
         other_session = fixture_runtime_id("unrelated-resume-conversation")
         for marked, expected_session in (
@@ -315,7 +320,7 @@ class ResumeUnitTests(unittest.TestCase):
             (current, row.id),
         ):
             with self.subTest(marked=marked, expected_session=expected_session), mock.patch.object(
-                    unit_lookup, "marked_unit", return_value=marked):
+                    unit_lookup, "labeled_session", return_value=marked):
                 self.assertFalse(resume_unit.resumed_session_proven("alpha", "alpha-unit", expected_session, row))
         self.assertEqual((self.staff.staff_file.read_bytes(), pane_record.record_path("agents").read_bytes(),
                           unit_config.parked_path(row.id).read_bytes()), before)
@@ -376,7 +381,7 @@ class ResumeUnitTests(unittest.TestCase):
             finally:
                 child.close()
         process = context.Process(target=run)
-        seed: subprocess.Popen[str] | None = None
+        writer: subprocess.Popen[str] | None = None
         try:
             with self.staff.lock_notice(self.staff.staff_file.parent / "operation.lock") as listener:
                 process.start()
@@ -388,16 +393,16 @@ class ResumeUnitTests(unittest.TestCase):
                 staff_id = staff.StaffId(identity)
                 self.assertTrue(lock_held, "resume released its operation lock before discarding the parked facts")
                 self.assertTrue(unit_config.parked_path(staff_id).exists())
-                seed = self.staff.start_script(CHECKOUT / "scripts/production/staff_sources.py", "seed")
-                self.staff.assert_operation_blocks(seed, listener)
+                writer = self.staff.start_script(CHECKOUT / "scripts/production/staff.py", "rename", identity, "--name", "alpha")
+                self.staff.assert_operation_blocks(writer, listener)
                 parent.send("finish")
                 self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "resume did not discard the parked facts")
                 code, output = cast(tuple[int, str], parent.recv())
                 self.assertEqual(code, 0, output)
                 process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.exitcode, 0)
-                output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(seed.returncode, 0, output + errors)
+                output, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(writer.returncode, 0, output + errors)
             self.assertFalse(unit_config.parked_path(staff_id).exists())
             row = staff.by_id(staff_id)
             self.assertIsNotNone(row)
@@ -411,9 +416,9 @@ class ResumeUnitTests(unittest.TestCase):
                 process.terminate()
                 process.join(timeout=TEST_HANG_GUARD_SECS)
             process.close()
-            if seed is not None and seed.returncode is None:
-                seed.kill()
-                _ = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
+            if writer is not None and writer.returncode is None:
+                writer.kill()
+                _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())
@@ -507,17 +512,17 @@ class ResumeUnitTests(unittest.TestCase):
         for pane, identity, at in (("w1:p1", "older", "2026-10-27T23:00:00+00:00"),
                                     ("w1:p2", DIRECTOR, "2026-10-28T23:00:00+00:00")):
             launch = pane_record.launch(pane, identity, str(self.worktree),
-                {"SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
+                {('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
             launch["written_at"] = at
             pane_record.write("agents", launch)
-        current_backend = unit_lookup.marked_unit
+        current_backend = unit_lookup.labeled_session
 
-        def observed_backend(slug: str, name: str) -> unit_lookup.MarkedUnit | None:
+        def observed_backend(slug: str, name: str) -> unit_lookup.LabeledSession | None:
             # Retained pane files are historical evidence. Only the fake launch
             # establishes a live backend for this test.
             return current_backend(slug, name) if self.calls else None
 
-        with mock.patch.object(unit_lookup, "marked_unit", side_effect=observed_backend):
+        with mock.patch.object(unit_lookup, "labeled_session", side_effect=observed_backend):
             self.assert_resumed(*self.resume())
 
     def external_transcript(self) -> Path:

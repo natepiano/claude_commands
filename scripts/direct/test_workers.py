@@ -3,87 +3,48 @@
 from __future__ import annotations
 
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib.atomic_file import write_bytes_atomic
 
-import contextlib
-import dataclasses
 import fcntl
-import hashlib
 import io
 import json
 import os
 import select
 import shlex
 import shutil
-import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast, override
+from unittest import mock
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, worker_lifecycle, test_codex_mesh as mesh_fixture
-from scripts.direct import progress_history, workers
+from scripts.direct import workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.production import staff
-from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, isolated_source_readers, showrunner_relationship, recorded_unit
+from scripts.message import sessions
+from scripts.production import staff, session_staff, worker_admission
+from scripts.usage import agents_log
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker, StaffTestCase, isolated_source_readers, showrunner_relationship, unit_membership, fixture_worker_records
 
 
 SCRIPT = Path(__file__).with_name("workers.py")
 SECOND_THREAD_ID = fixture_runtime_id("second-worker-thread")
 
 
-class AdoptionWriteInterrupted(BaseException):
-    """A simulated process loss after a durable transaction write."""
-
-
 @contextmanager
 def bounded_worker_change() -> Generator[None, None, None]:
     """A lock-order regression fails instead of hanging the fixture forever."""
     with LauncherHangGuard("worker change").protect():
-        yield
-
-
-@contextmanager
-def observe_adoption_writes(source: Path, destination: Path,
-                            observer: Callable[[str], None]) -> Generator[None, None, None]:
-    """Inject a crash after real durable writes, without a production-only hook."""
-    atomic = workers._atomic  # pyright: ignore[reportPrivateUsage]
-    write_roster = workers._write_roster  # pyright: ignore[reportPrivateUsage]
-    ledger_path = workers.ledger_for_run(destination).path
-    observed: set[str] = set()
-
-    def report(stage: str) -> None:
-        if stage not in observed:
-            observed.add(stage)
-            observer(stage)
-
-    def persisted(path: Path, data: Mapping[str, object]) -> None:
-        atomic(path, data)
-        if path != ledger_path:
-            return
-        if data.get("adoptions"):
-            report("ledger" if "destination" in observed else "intent")
-        elif "ledger" in observed:
-            report("complete")
-
-    def roster_written(handle: worker_lifecycle.WorkerStateFile, roster: dict[str, object]) -> None:
-        write_roster(handle, roster)
-        path = Path(handle.name)
-        if path == source / codex_mesh.ROSTER_FILE:
-            report("source")
-        elif path == destination / codex_mesh.ROSTER_FILE:
-            report("destination")
-
-    with (patch.object(workers, "_atomic", new=persisted),
-          patch.object(workers, "_write_roster", new=roster_written)):
         yield
 
 
@@ -97,7 +58,23 @@ def json_object(path: Path) -> dict[str, object]:
     value = cast(object, json.loads(content))
     if not isinstance(value, dict):
         raise AssertionError(f"expected an object in {path}")
-    return cast(dict[str, object], value)
+    fields = cast(dict[str, object], value)
+    if path.name == codex_mesh.ROSTER_FILE:
+        return fixture_worker_records(fields, staff.local_snapshot())
+    return fields
+
+
+class WorkerScriptTests(unittest.TestCase):
+    def test_worker_script_starts_outside_the_repository(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        with tempfile.TemporaryDirectory(prefix="workers-script-") as directory:
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--help"], cwd=directory,
+                env=environment, capture_output=True, text=True,
+                timeout=TEST_HANG_GUARD_SECS, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
 
 
 class DirectorResolutionTests(StaffTestCase):
@@ -111,12 +88,33 @@ class DirectorResolutionTests(StaffTestCase):
         )))
 
     def test_live_unit_director_keeps_a_running_director_without_a_messaging_socket(self) -> None:
-        registry = self.session_record("director", "builders-unit")
-        run = self.worker_run("demo", "builders-unit", "director")
+        parent = unit_membership("demo", "builders-unit")
+        registry = self.session_record(parent.current_session, "builders-unit")
+        run = self.worker_run("demo", "builders-unit", parent.current_session)
         self.assertEqual(json_object(registry)["messagingSocketPath"], "")
 
-        self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector("director", os.getpid()))
+        self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(parent.current_session, os.getpid()))
 
+    def test_live_unit_director_prefers_the_newest_running_name_match(self) -> None:
+        parent = unit_membership("demo", "builders-unit")
+        older = self.session_record(parent.current_session, "builders-unit")
+        current = staff.update_current_session(parent.current_session, staff.native_id(fixture_runtime_id("newer-director")))
+        newer = self.session_record(current.current_session, "builders-unit")
+        record = json_object(newer)
+        record["updatedAt"] = 2
+        self.write_json(newer, record)
+        run = self.worker_run("demo", "builders-unit", "former-director")
+        self.write_json(self.root / "shutdown/account/history/restart.json", {"session": {
+            "session_id": "former-director", "name": "builders-unit", "run_dirs": [str(run)],
+            "host": {"kind": "unit", "unit": "builders-unit", "session_name": "builders-unit"},
+        }})
+        registry = sessions.read_registry()
+        entries = {item.record["sessionId"]: item for item in registry.entries}
+        # Present readable records in the older-first order that caused the defect.
+        with patch.object(sessions, "read_registry", return_value=sessions.RegistryRead(
+            (entries[older.stem], entries[newer.stem]), registry.unreadable,
+        )):
+            self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(current.current_session, os.getpid()))
 
 
 class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
@@ -129,258 +127,6 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             cwd=self.session_dir.parent / "repository", env=os.environ.copy(),
             capture_output=True, text=True, timeout=self.cli_hang_guard.remaining(), check=False)
 
-    def test_worker_subprocess_uses_the_launcher_guards_remaining_budget(self) -> None:
-        completed = subprocess.CompletedProcess[str]([str(SCRIPT)], 0, "", "")
-        with (patch.object(LauncherHangGuard, "remaining", side_effect=[37.25, 9.5]) as remaining,
-              patch.object(subprocess, "run", return_value=completed) as run):
-            for budget in (37.25, 9.5):
-                result = self.worker_cli("repair-roster", "--session-dir", str(self.session_dir))
-                self.assertIs(result, completed)
-                self.assertEqual(cast(object, run.call_args.kwargs["timeout"]), budget)
-                self.assertEqual(cast(object, run.call_args.args[0]), [
-                    sys.executable, str(SCRIPT), "repair-roster", "--session-dir", str(self.session_dir)])
-            self.assertEqual(remaining.call_count, 2)
-            self.assertEqual(run.call_count, 2)
-
-    def registered_reviewers(self) -> workers.UnitWorkerLedger:
-        """Reproduce the retained ledger with three omitted reviewers and one survivor."""
-        store = self.lifecycle_worker("review4")
-        with store.locked() as ledger:
-            survivor = ledger.workers["review4"]
-            survivor.role = "review"
-            for number in range(1, 4):
-                name = f"review{number}"
-                ledger.workers[name] = dataclasses.replace(
-                    survivor, name=name, backend=workers.CodexThread(f"thread-review{number}", os.environ["CODEX_HOME"]))
-        respond = self.server.respond
-
-        def threads(request: dict[str, object]) -> list[dict[str, object]] | None:
-            frames = respond(request)
-            thread = mesh_fixture._as_test_dict(request.get("params")).get("threadId")  # pyright: ignore[reportPrivateUsage]
-            if isinstance(thread, str) and thread.startswith("thread-review") and frames is not None:
-                return cast(list[dict[str, object]], json.loads(json.dumps(frames).replace(mesh_fixture.THREAD_ID, thread)))
-            return frames
-
-        self.server.respond = threads
-        return store
-
-    def repair_cli(self, run: Path) -> subprocess.CompletedProcess[str]:
-        return self.worker_cli("repair-roster", "--session-dir", str(run))
-
-    def test_resolve_refuses_missing_owned_reviewers_before_allocating_another_thread(self) -> None:
-        _ = self.registered_reviewers()
-        path = self.session_dir / codex_mesh.ROSTER_FILE
-        surviving = path.read_bytes()
-        for state in ("partial", "empty", "missing", "thread mismatch"):
-            with self.subTest(state=state):
-                _ = path.write_bytes(surviving)
-                if state == "empty":
-                    _ = path.write_bytes(b"")
-                elif state == "missing":
-                    path.unlink()
-                elif state == "thread mismatch":
-                    roster = json_object(path)
-                    for number in range(1, 4):
-                        roster[f"review{number}"] = {"thread_id": "wrong-thread", "status": "done", "role": "review"}
-                    _ = path.write_text(json.dumps(roster))
-                before = path.read_bytes() if path.exists() else None
-                result = self.worker_cli(
-                    "resolve", "--session-dir", str(self.session_dir),
-                    "--role", "review", "--owner-pid", str(os.getpid()))
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
-                self.assertIn("review1", result.stderr)
-                self.assertIn(str(path), result.stderr)
-                self.assertIn("repair-roster", result.stderr)
-                self.assertEqual(path.read_bytes() if path.exists() else None, before)
-        self.assertEqual(self.methods("thread/start"), [])
-        self.assertEqual(self.methods("turn/start"), [])
-
-    def test_repair_roster_recovers_ledger_workers_preserves_survivors_and_is_idempotent(self) -> None:
-        _ = self.registered_reviewers()
-        path = self.session_dir / codex_mesh.ROSTER_FILE
-        survivor = json_object(path)["review4"]
-        inbox = self.session_dir / "review4.pending.json"
-        _ = inbox.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID, "messages": ["keep review"]}))
-        queued = inbox.read_bytes()
-        first = self.repair_cli(self.session_dir)
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(len(first.stdout.strip().splitlines()), 1, first.stdout)
-        roster = json_object(path)
-        self.assertEqual(set(roster), {"review1", "review2", "review3", "review4"})
-        self.assertEqual(roster["review4"], survivor)
-        for number in range(1, 4):
-            record = mesh_fixture._as_test_dict(roster[f"review{number}"])  # pyright: ignore[reportPrivateUsage]
-            self.assertEqual(record["thread_id"], f"thread-review{number}")
-            self.assertEqual(record["role"], "review")
-            self.assertNotIn("context_tokens", record)
-            self.assertEqual(record["unit_ledger"], str(workers.ledger_for_run(self.session_dir).path))
-        before, version = path.read_bytes(), path.stat().st_mtime_ns
-        second = self.repair_cli(self.session_dir)
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(len(second.stdout.strip().splitlines()), 1, second.stdout)
-        self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(path.stat().st_mtime_ns, version, "no-op repair republished the roster")
-        self.assertEqual(inbox.read_bytes(), queued)
-        self.assertEqual(self.methods("thread/start"), [])
-
-    def test_repair_missing_roster_uses_registered_identities_without_opening_workers(self) -> None:
-        store = self.registered_reviewers()
-        path = self.session_dir / codex_mesh.ROSTER_FILE
-        path.unlink()
-        before = store.path.read_bytes()
-        first = self.repair_cli(self.session_dir)
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(len(first.stdout.strip().splitlines()), 1)
-        self.assertEqual(set(json_object(path)), {"review1", "review2", "review3", "review4"})
-        self.assertEqual(store.path.read_bytes(), before)
-        repaired = path.read_bytes(), path.stat().st_mtime_ns
-        second = self.repair_cli(self.session_dir)
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(len(second.stdout.strip().splitlines()), 1)
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), repaired)
-        self.assertEqual(self.methods("thread/start"), [])
-        self.assertEqual(self.methods("turn/start"), [])
-
-    def test_repair_roster_preserves_damaged_evidence_and_unknown_context(self) -> None:
-        original = self.registered_reviewers()
-        for index, damaged in enumerate((b"", b'{"review1":', b"not JSON", b"[]", b'\xff\xfe{"review1":\x80\x00\r\n')):
-            with self.subTest(damaged=damaged):
-                run = self.next_run(f"damaged-{index}")
-                store = workers.ledger_for_run(run)
-                with original.locked(write=False) as source, store.locked() as destination:
-                    destination.workers = {name: dataclasses.replace(worker, ownership=workers.HeldBy(str(run)))
-                                           for name, worker in source.workers.items()}
-                path = run / codex_mesh.ROSTER_FILE
-                _ = path.write_bytes(damaged)
-                result = self.repair_cli(run)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                backup = path.with_name(path.name + ".damaged")
-                self.assertEqual(backup.read_bytes(), damaged, "damaged roster was not preserved verbatim")
-                roster = json_object(path)
-                self.assertEqual(set(roster), {"review1", "review2", "review3", "review4"})
-                self.assertTrue(all("context_tokens" not in mesh_fixture._as_test_dict(record)  # pyright: ignore[reportPrivateUsage]
-                                    for record in roster.values()))
-        self.assertEqual(self.methods("thread/start"), [])
-
-    def test_repeated_distinct_damage_keeps_each_incident_and_reuses_identical_evidence(self) -> None:
-        store = self.registered_reviewers()
-        ledger = store.path.read_bytes()
-        path = self.session_dir / codex_mesh.ROSTER_FILE
-        first, second = b'\xff\xfe{"review1":\x80\x00\r\n', b'\xc3\x28different damage\r\n'
-        evidence: dict[Path, tuple[bytes, int]] = {}
-        for index, damaged in enumerate((first, second, second)):
-            with self.subTest(incident=index):
-                _ = path.write_bytes(damaged)
-                result = self.repair_cli(self.session_dir)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(len(result.stdout.strip().splitlines()), 1)
-                backup = path.with_name(path.name + ".damaged" + (
-                    "." + hashlib.sha256(damaged).hexdigest() if index else ""))
-                if backup not in evidence:
-                    evidence[backup] = (damaged, backup.stat().st_mtime_ns)
-                for kept, (content, version) in evidence.items():
-                    self.assertEqual(kept.read_bytes(), content)
-                    self.assertEqual(kept.stat().st_mtime_ns, version, "existing evidence was republished")
-                roster = json_object(path)
-                self.assertEqual(set(roster), {"review1", "review2", "review3", "review4"})
-                self.assertTrue(all("context_tokens" not in mesh_fixture._as_test_dict(record)  # pyright: ignore[reportPrivateUsage]
-                                    for record in roster.values()))
-                before = path.read_bytes(), path.stat().st_mtime_ns
-                repeated = self.repair_cli(self.session_dir)
-                self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
-                self.assertIn("roster already consistent:", repeated.stdout)
-                self.assertEqual(len(repeated.stdout.strip().splitlines()), 1)
-                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
-        self.assertEqual(len(evidence), 2)
-        self.assertEqual(store.path.read_bytes(), ledger)
-        self.assertEqual(self.methods("thread/start"), [])
-        self.assertEqual(self.methods("turn/start"), [])
-
-    def test_repair_interrupted_after_evidence_backup_is_retryable_and_idempotent(self) -> None:
-        store = self.registered_reviewers()
-        path = self.session_dir / codex_mesh.ROSTER_FILE
-        _ = path.write_bytes(b"")
-        ledger = store.path.read_bytes()
-        publish = write_bytes_atomic
-        completed: list[Path] = []
-
-        def stop_after_backup(destination: Path, data: bytes) -> None:
-            publish(destination, data)
-            completed.append(destination)
-            if destination != path:
-                raise AdoptionWriteInterrupted("repair backup published")
-
-        with patch.object(workers, "write_bytes_atomic", stop_after_backup):
-            with self.assertRaises(AdoptionWriteInterrupted):
-                _ = workers.repair_roster(self.session_dir)
-        self.assertEqual(len(completed), 1)
-        backup = completed[0]
-        self.assertNotEqual(backup, path)
-        self.assertEqual(backup.read_bytes(), b"")
-        self.assertEqual(path.read_bytes(), b"")
-        self.assertEqual(store.path.read_bytes(), ledger)
-        first = self.repair_cli(self.session_dir)
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(set(json_object(path)), {"review1", "review2", "review3", "review4"})
-        before = path.read_bytes(), path.stat().st_mtime_ns, backup.stat().st_mtime_ns
-        second = self.repair_cli(self.session_dir)
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(len(second.stdout.strip().splitlines()), 1)
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, backup.stat().st_mtime_ns), before)
-        self.assertEqual(backup.read_bytes(), b"")
-        self.assertEqual(store.path.read_bytes(), ledger)
-        self.assertEqual(self.methods("thread/start"), [])
-
-    def test_repair_refuses_ownership_evidence_inside_a_damaged_owned_row(self) -> None:
-        store = self.registered_reviewers()
-        path = self.session_dir / codex_mesh.ROSTER_FILE
-        survivor = json_object(path)
-        inbox = self.session_dir / "review1.pending.json"
-        _ = inbox.write_text(json.dumps({"thread_id": "thread-review1", "messages": ["retain review"]}))
-        evidence: tuple[dict[str, object], ...] = (
-            {"launcher_pid": os.getpid()},
-            {"transferring_role": {"design_id": "held-design", "role": "review"}},
-            {"launcher_pid": os.getpid(), "transferring_role": {"design_id": "held-design", "role": "review"}},
-            {"role_redirect": {"holder": "another-holder"}},
-            {"adopted_to": str(self.session_dir.parent / "another-run")},
-            {"held_design_id": "missing-design-authority"},
-            {"thread_id": "conflicting-thread"},
-            {"held_role": "designer", "access_policy": {
-                "kind": "PhaseBoundDesigner", "binding_generation": 1, "launch_sandbox": "danger-full-access"}},
-        )
-        for fields in evidence:
-            with self.subTest(evidence=fields):
-                damaged = {**survivor, "review1": {
-                    "thread_id": "thread-review1", "status": 42, **fields}}
-                _ = path.write_text(json.dumps(damaged))
-                before = {file: file.read_bytes() for file in (path, store.path, inbox)}
-                result = self.repair_cli(self.session_dir)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
-                self.assertIn("review1", result.stderr)
-                self.assertEqual({file: file.read_bytes() for file in before}, before)
-                self.assertEqual(list(self.session_dir.glob("mesh_roster.json.damaged*")), [])
-        self.assertEqual(self.methods("thread/start"), [])
-        self.assertEqual(self.methods("turn/start"), [])
-
-    def test_repair_roster_refuses_conflicting_thread_ownership_without_writes(self) -> None:
-        store = self.registered_reviewers()
-        with store.locked() as ledger:
-            ledger.workers["review1"].ownership = workers.HeldBy(str(self.session_dir.parent / "other-run"))
-        path = self.session_dir / codex_mesh.ROSTER_FILE
-        roster = json_object(path)
-        roster["review1"] = {"thread_id": "thread-review1", "status": "paused", "unit_ledger": str(store.path)}
-        _ = path.write_text(json.dumps(roster))
-        before = path.read_bytes(), store.path.read_bytes()
-        result = self.repair_cli(self.session_dir)
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("review1", result.stderr)
-        self.assertEqual((path.read_bytes(), store.path.read_bytes()), before)
-        self.assertEqual(self.methods("thread/start"), [])
-
     def test_restarted_director_comes_from_its_current_unit_mark(self) -> None:
         from scripts.production import unit_lookup
         from scripts.message import sessions
@@ -388,61 +134,15 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
 
         _ = (self.session_dir / workers.STATE).write_text(json.dumps({"production": "demo", "unit": "builders"}))
         _ = (self.session_dir / "director").write_text("old-director")
-        current = unit_lookup.MarkedUnit("builders", unit_lookup.LiveClaude("Builders", "new-director", "/socket", 4321),
+        parent = unit_membership("demo", "builders")
+        member = staff.update_current_session(parent.current_session, staff.native_id(fixture_runtime_id("new-director")))
+        current = unit_lookup.LabeledSession("builders", unit_lookup.LiveClaude("Builders", member.current_session, "/socket", 4321),
                                          HerdrPlace("agents", "w1:p2"))
-        with patch.object(sessions, "live_sessions", return_value=[]), patch.object(unit_lookup, "marked_unit", return_value=current):
+        with patch.object(sessions, "live_sessions", return_value=[]), patch.object(unit_lookup, "labeled_session", return_value=current):
             found = workers.live_unit_director(self.session_dir)
-        self.assertEqual(found, workers.LiveUnitDirector("new-director", 4321))
+        self.assertEqual(found, workers.LiveUnitDirector(member.current_session, 4321))
 
-    def test_ledger_uses_canonical_production_for_both_headers_and_saved_metadata(self) -> None:
-        worktree = self.session_dir.parent / "repository"
-        plan = worktree / "plan.md"
-        production_doc = worktree / "production.md"
-        _ = production_doc.write_text("## Production Context\n\n- **Formerly:** `demo`\n")
-        _ = recorded_unit("demo", "builders", worktree, production_doc, plan="plan.md")
-        notifier = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-renamed"
-        notifier.mkdir(parents=True)
-        _ = (notifier / "conf").write_text(
-            "TARGET=session:fixture\nCHECK="
-            + shlex.join(["zsh", "/opt/tools/production_check.sh", str(production_doc)]) + "\n")
-        for source in ("**Production: demo**", "**Production:** demo", "saved metadata"):
-            with self.subTest(source=source):
-                self.write_run_context(self.session_dir)
-                state = json_object(self.session_dir / workers.STATE)
-                if source == "saved metadata":
-                    state.update({"production": "demo", "unit": "builders"})
-                else:
-                    _ = plan.write_text(f'> {source} — unit `builders`; plan\n')
-                    state["plan_doc"] = str(plan)
-                _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
-                self.assertEqual(progress_history.resolve_production_unit(state),
-                                 progress_history.ProductionUnitIdentity("demo", "builders"))
-                self.assertEqual(workers.ledger_for_run(self.session_dir).path,
-                                 workers.ledger_path("renamed", "builders"))
 
-    def test_plan_header_metadata_resolves_without_completing_a_pending_worker_move(self) -> None:
-        state = json_object(self.session_dir / workers.STATE)
-        worktree = Path(str(state["working_dir"]))
-        plan = worktree / "unit-plan.md"
-        _ = plan.write_text('> **Production: fixture-production** — unit `fixture-unit`; production doc `production.md`\n')
-        document = worktree / "production.md"
-        _ = document.write_text("# Production — fixture-production\n")
-        member = recorded_unit("fixture-production", "fixture-unit", worktree, document, plan=plan.name)
-        _ = staff.rename(member.id, "fixture-unit")
-        state["project_plan_doc"] = plan.name
-        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
-        # A read-only metadata caller must not recover even an invalid pending
-        # migration; recovery is exclusively ledger_for_run's responsibility.
-        journal = workers.ledger_path("fixture-production", "fixture-unit").with_suffix(".move.json")
-        journal.parent.mkdir(parents=True, exist_ok=True)
-        _ = journal.write_text('{"pending": "do not migrate during a hook"}')
-        before = {path: path.read_bytes() for path in (journal, plan, self.session_dir / workers.STATE)}
-        identity = progress_history.resolve_production_unit(state)
-        self.assertEqual(identity, progress_history.ProductionUnitIdentity("fixture-production", "fixture-unit"))
-        self.assertEqual({path: path.read_bytes() for path in before}, before)
-        journal.unlink()
-        self.assertEqual(workers.ledger_for_run(self.session_dir).path,
-                         workers.ledger_path("fixture-production", "fixture-unit"))
 
     @override
     def setUp(self) -> None:
@@ -450,8 +150,12 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.cli_hang_guard = LauncherHangGuard(self.id())
         working = self.session_dir.parent / "repository"
         working.mkdir()
+        owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
+        assert owner is not None
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", working), expected=owner.worktree)
         self.patches.enter_context(patch.dict(os.environ, {
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
+            "USAGE_STATE_DIR": str(self.session_dir.parent / "usage-state"),
             "NOTIFIER_STATE_DIR": str(self.session_dir.parent / "notifier"),
             "MODELS_CONFIG_FILE": str(write_registry(self.session_dir / "registry.conf", {
                 "direct.codex": dict.fromkeys(("impl", "test", "fix", "review"), "gpt-kept-sol:xhigh"),
@@ -461,9 +165,14 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
 
     def write_run_context(self, run: Path) -> None:
         _ = (run / "working_dir").write_text(str(self.session_dir.parent / "repository"))
+        membership = staff.local_snapshot()
+        owner = membership.by_current_session(os.environ["CODEX_THREAD_ID"])
+        assert owner is not None and isinstance(owner.parent, staff.ReportsTo)
+        parent = membership.by_id(owner.parent.id)
+        assert parent is not None
         _ = (run / "progress_history_state.json").write_text(json.dumps({
             "status": "active", "working_dir": str(self.session_dir.parent / "repository"),
-            "run_id": run.name,
+            "run_id": run.name, "production": parent.name, "unit": owner.name,
         }))
 
     def next_run(self, name: str) -> Path:
@@ -474,16 +183,23 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             (self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
         return run
 
-    def resolve(self, run: Path, role: str = "impl", *, working_dir: str = "") -> str:
+    def resolve(self, run: Path, role: str = "impl") -> str:
         result = self.worker_cli(
             "resolve", "--session-dir", str(run), "--role", role,
-            "--owner-pid", str(os.getpid()), *(["--working-dir", working_dir] if working_dir else []))
+            "--owner-pid", str(os.getpid()))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(result.stdout.strip().splitlines()), 1, result.stdout)
         return result.stdout.strip()
 
-    def open_worker(self, name: str = "address-with-no-role-suffix", role: str = "impl") -> None:
+    def record_worker(self, name: str) -> staff.StaffRow:
+        return staff.ensure_worker(staff.native_id(mesh_fixture.THREAD_ID), name,
+                                   staff.native_id(os.environ["CODEX_THREAD_ID"]))
+
+    def open_worker(self, name: str = "address-with-no-role-suffix", role: Literal["impl", "test", "fix", "review"] = "impl") -> None:
+        _ = self.record_worker(name)
+        agents_log.append(mesh_fixture.THREAD_ID, role, None, datetime.now(timezone.utc))
         self.write_pool_roster({name: {
+            "staff_id": mesh_fixture.THREAD_ID,
             "thread_id": mesh_fixture.THREAD_ID, "status": "done", "role": role,
             "model": "gpt-kept-sol", "effort": "xhigh", "family": "codex",
             "turn_model": "gpt-kept-sol", "turn_effort": "xhigh",
@@ -528,24 +244,134 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
         }))
 
-    def lifecycle_worker(self, name: str = "w7") -> workers.UnitWorkerLedger:
-        state = json_object(self.session_dir / workers.STATE)
-        state.update({"production": "before", "unit": "builders"})
-        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
-        self.open_worker(name)
+    def lifecycle_worker(self, name: str = "w7", *, role: Literal["impl", "test", "fix", "review"] = "impl") -> workers.UnitWorkerLedger:
+        self.open_worker(name, role=role)
         store = workers.ledger_for_run(self.session_dir)
         with store.locked() as ledger:
             ledger.workers[name] = workers.UnitWorker(
-                name, "impl", "codex", "gpt-kept-sol", "xhigh", {"kind": "WorkerLaunchPolicy"},
+                name, role, "codex", "gpt-kept-sol", "xhigh", {"kind": "WorkerLaunchPolicy"},
                 workers.CodexThread(mesh_fixture.THREAD_ID, os.environ["CODEX_HOME"]),
                 workers.HeldBy(str(self.session_dir)),
                 [workers.WorkerEvent("opened", "lifecycle fixture", str(self.session_dir), 1_793_188_800.0, {})],
+                staff_id=staff.native_id(self.inbox_staff_id(mesh_fixture.THREAD_ID)),
             )
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         cast(dict[str, object], roster[name])["unit_ledger"] = str(store.path)
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(session_staff.stored_worker_records(roster)))
         return store
 
+
+    def test_backend_loss_preserves_unresolved_ledger_entries_on_save(self) -> None:
+        store = self.lifecycle_worker()
+        before = json_object(store.path)
+        with (patch.object(session_staff, "worker_backend", return_value=
+                           session_staff.WorkerBackendUnavailable("temporary backend loss")),
+              redirect_stderr(io.StringIO()) as errors):
+            with store.locked():
+                pass
+        self.assertEqual(json_object(store.path), before)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        with store.locked(write=False) as ledger:
+            self.assertEqual(set(ledger.workers), {"w7"})
+
+    def test_end_unit_preserves_unresolved_entries_after_backend_loss(self) -> None:
+        store = self.lifecycle_worker()
+        member = staff.by_current_session(mesh_fixture.THREAD_ID)
+        assert member is not None
+        membership = staff.local_snapshot()
+        owner = membership.parent_of(member)
+        assert owner is not None
+        production = membership.parent_of(owner)
+        assert production is not None
+        before = json_object(store.path)
+        with (patch.object(session_staff, "worker_backend", return_value=
+                           session_staff.WorkerBackendUnavailable("temporary backend loss")),
+              patch.object(codex_mesh, "end_worker_locked") as end,
+              redirect_stderr(io.StringIO()) as errors,
+              redirect_stdout(io.StringIO())):
+            workers.end_unit(owner)
+        self.assertTrue(store.path.exists())
+        self.assertEqual(json_object(store.path), before)
+        self.assertEqual(staff.by_id(member.id), member)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("anomaly:", errors.getvalue())
+        end.assert_not_called()
+
+    def test_end_unit_reads_current_parent_after_acquiring_the_ledger_lock(self) -> None:
+        store = self.lifecycle_worker()
+        member = staff.by_current_session(mesh_fixture.THREAD_ID)
+        assert member is not None
+        membership = staff.local_snapshot()
+        former = membership.parent_of(member)
+        assert former is not None
+        production = membership.parent_of(former)
+        assert production is not None
+        destination = unit_membership("before", "destination")
+        inbox = session_staff.inbox_path(member.id)
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        _ = inbox.write_text(json.dumps({"messages": ["held during adoption"]}))
+        before = inbox.read_bytes()
+        acquire = worker_lifecycle.acquire_flock
+        adopted = False
+
+        def adopt_before_lock(handle: int | worker_lifecycle.LockFileDescriptor, *,
+                              mode: int = fcntl.LOCK_EX,
+                              deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            nonlocal adopted
+            descriptor = handle if isinstance(handle, int) else handle.fileno()
+            if not adopted and os.path.samestat(os.fstat(descriptor), store.path.with_suffix(".lock").stat()):
+                adopted = True
+                _ = staff.move(member.id, staff.ReportsTo(destination.id))
+            acquire(handle, mode=mode, deadline=deadline)
+
+        with (patch.object(worker_lifecycle, "acquire_flock", side_effect=adopt_before_lock),
+              patch.object(codex_mesh, "end_worker_locked") as end,
+              redirect_stdout(io.StringIO())):
+            workers.end_unit(former)
+        self.assertTrue(adopted)
+        self.assertEqual(staff.by_id(member.id), replace(member, parent=staff.ReportsTo(destination.id)))
+        self.assertEqual(inbox.read_bytes(), before)
+        with store.locked(write=False) as ledger:
+            self.assertEqual(set(ledger.workers), {member.name})
+        end.assert_not_called()
+
+    def test_ending_the_former_unit_keeps_an_adopted_worker_and_its_queue(self) -> None:
+        store = self.lifecycle_worker()
+        worker = staff.by_current_session(mesh_fixture.THREAD_ID)
+        assert worker is not None
+        membership = staff.local_snapshot()
+        former = membership.parent_of(worker)
+        assert former is not None
+        holder = membership.parent_of(former)
+        assert holder is not None
+        destination = unit_membership("before", "destination")
+        moved = staff.move(worker.id, staff.ReportsTo(destination.id))
+        inbox = session_staff.worker_inbox_path(str(self.session_dir), "w7")
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        _ = inbox.write_text(json.dumps({"messages": ["held before adoption"]}))
+        before = inbox.read_bytes()
+        with (patch.object(workers, "ledger_path", return_value=store.path),
+              patch.object(codex_mesh, "end_worker_locked") as end,
+              redirect_stdout(io.StringIO())):
+            workers.end_unit(former)
+        self.assertEqual(staff.by_id(worker.id), moved)
+        self.assertEqual(inbox.read_bytes(), before)
+        end.assert_not_called()
+
+    def test_adoption_keeps_one_inbox_across_run_folders(self) -> None:
+        _ = self.lifecycle_worker()
+        worker = staff.by_current_session(mesh_fixture.THREAD_ID)
+        assert worker is not None
+        source = session_staff.worker_inbox_path(str(self.session_dir), "w7")
+        source.parent.mkdir(parents=True, exist_ok=True)
+        _ = source.write_text(json.dumps({"messages": ["held before adoption"]}))
+        destination = self.next_run("adoption-destination")
+        parent = unit_membership("before", "destination")
+        _ = staff.move(worker.id, staff.ReportsTo(parent.id))
+        _ = (destination / codex_mesh.ROSTER_FILE).write_text(json.dumps({"w7": {"staff_id": worker.id}}))
+        target = session_staff.worker_inbox_path(str(destination), "w7")
+        self.assertEqual(target, source)
+        self.assertEqual(json_object(target)["messages"], ["held before adoption"])
 
     def test_reviewer_names_use_the_launcher_rule_for_nested_unusual_worktrees(self) -> None:
         working = self.session_dir.parent / ("odd worktree !" + "x" * 50)
@@ -554,7 +380,10 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         nested = working / "nested"
         nested.mkdir()
         state = json_object(self.session_dir / workers.STATE)
-        state["working_dir"] = str(nested)
+        owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
+        assert owner is not None
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", nested), expected=owner.worktree)
+        del state["working_dir"]
         _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         expected = subprocess.run(["bash", str(SCRIPT.with_name("worker_name.sh")), str(nested), "review", "review"],
                                   check=True, capture_output=True, text=True).stdout.strip()
@@ -570,19 +399,18 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         (self.session_dir / workers.STATE).unlink()
         (self.session_dir / "working_dir").unlink()
         store = workers.ledger_for_run(self.session_dir)
-        working = str(self.session_dir.parent / "repository")
         self.configure_new_worker()
         with (self.session_dir.parent / "registry.conf").open("a") as output:
             _ = output.write("review=gpt-kept-sol:xhigh\n")
 
-        first = self.resolve(self.session_dir, "review", working_dir=working)
+        first = self.resolve(self.session_dir, "review")
         self.assertEqual(first, "repository-review")
         self.assertEqual(workers.ledger_for_run(self.session_dir).path, store.path)
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         thread = cast(dict[str, object], roster[first])["thread_id"]
         self.complete_assignment(first, role="review")
 
-        self.assertEqual(self.resolve(self.session_dir, "review", working_dir=working), first)
+        self.assertEqual(self.resolve(self.session_dir, "review"), first)
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         self.assertEqual(set(roster), {first})
         self.assertEqual(cast(dict[str, object], roster[first])["thread_id"], thread)
@@ -590,186 +418,29 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertFalse((self.session_dir / workers.STATE).exists())
         self.assertFalse((self.session_dir / "working_dir").exists())
 
-    def test_reviewer_without_state_or_launcher_worktree_is_unavailable(self) -> None:
+    def test_reviewer_without_staff_or_launcher_worktree_is_unavailable(self) -> None:
         (self.session_dir / workers.STATE).unlink()
         (self.session_dir / "working_dir").unlink()
+        owner = staff.by_current_session(os.environ["CODEX_THREAD_ID"])
+        assert owner is not None
+        _ = staff.set_worktree(owner.id, staff.RemovedWorktree("natedev", self.session_dir.parent / "repository"),
+                              expected=owner.worktree)
         with self.assertRaisesRegex(workers.WorkerUnavailable, "^invalid worker state: missing working_dir$"):
             _ = workers.resolve(self.session_dir, "review")
         self.assertEqual(self.methods("thread/start"), [])
 
-    def test_reviewer_state_worktree_is_authoritative_over_the_launcher(self) -> None:
+    def test_reviewer_staff_worktree_is_authoritative_over_the_launcher(self) -> None:
+        state = json_object(self.session_dir / workers.STATE)
+        state["working_dir"] = str(self.session_dir.parent / "stale-launcher")
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         self.configure_new_worker()
         with (self.session_dir.parent / "registry.conf").open("a") as output:
             _ = output.write("review=gpt-kept-sol:xhigh\n")
-        self.assertEqual(self.resolve(self.session_dir, "review", working_dir=str(self.session_dir)),
+        self.assertEqual(self.resolve(self.session_dir, "review"),
                          "repository-review")
 
 
-    def test_pause_keeps_backend_queued_work_and_reservation_until_retirement(self) -> None:
-        store = self.lifecycle_worker()
-        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-        record = cast(dict[str, object], roster["w7"])
-        record.update({"continuation_owed": True, "allocation_pending": True,
-                       "allocation_id": "keep-this-reservation", "allocation_owner_pid": os.getpid(),
-                       "allocation_expires_at": 4102444800})
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-        inbox = self.session_dir / "w7.pending.json"
-        _ = inbox.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
-                                        "messages": ["keep queued work"], "accepting_messages": True}))
-        before = inbox.read_bytes()
-        workers.pause_unit("before", "builders")
-        with store.locked() as ledger:
-            self.assertIsInstance(ledger.workers["w7"].ownership, workers.Paused)
-            self.assertEqual(ledger.workers["w7"].backend,
-                             workers.CodexThread(mesh_fixture.THREAD_ID, os.environ["CODEX_HOME"]))
-        self.assertEqual(inbox.read_bytes(), before)
-        self.assertEqual(json_object(self.session_dir / codex_mesh.ROSTER_FILE), roster)
 
-    def test_retirement_names_cancelled_work_and_quarantine_then_removes_the_ledger(self) -> None:
-        store = self.lifecycle_worker()
-        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-        cast(dict[str, object], roster["w7"]).update({"continuation_owed": True,
-            "allocation_pending": True, "allocation_id": "retiring", "allocation_owner_pid": os.getpid(),
-            "allocation_expires_at": 4102444800})
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-        _ = (self.session_dir / "w7.pending.json").write_text(json.dumps({
-            "thread_id": mesh_fixture.THREAD_ID, "messages": ["cancel this task"]}))
-        with store.locked() as ledger:
-            ledger.quarantined_workers["damaged"] = {"reason": "invalid backend", "record": {}}
-            ledger.quarantined_adoptions["handoff"] = {"reason": "revision conflict", "intent": {}}
-        output = io.StringIO()
-        with bounded_worker_change(), redirect_stdout(output):
-            workers.end_unit("before", "builders")
-        self.assertFalse(store.path.exists())
-        ended = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["w7"])
-        self.assertEqual(ended["status"], "ended")
-        self.assertFalse(ended["continuation_owed"])
-        self.assertFalse(ended.get("allocation_pending"))
-        self.assertNotIn("allocation_id", ended)
-        self.assertNotIn("cancel this task", (self.session_dir / "w7.pending.json").read_text())
-        for evidence in ("cancel this task", "continuation", "reservation", "damaged", "invalid backend",
-                         "handoff", "revision conflict", str(store.path), "w7"):
-            self.assertIn(evidence, output.getvalue())
-
-    def test_transfer_and_rename_preserve_worker_identity_and_rebind_all_runs(self) -> None:
-        original = self.lifecycle_worker()
-        side = self.next_run("another-unit-run")
-        state = json_object(side / workers.STATE)
-        state.update({"production": "before", "unit": "builders"})
-        _ = (side / workers.STATE).write_text(json.dumps(state))
-        _ = (side / codex_mesh.ROSTER_FILE).write_bytes((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes())
-        preserved = {"allocation_pending": True, "allocation_id": "carry-reservation",
-                     "allocation_owner_pid": os.getpid(), "allocation_expires_at": 4102444800,
-                     "continuation_owed": True}
-        for run in (self.session_dir, side):
-            roster = json_object(run / codex_mesh.ROSTER_FILE)
-            cast(dict[str, object], roster["w7"]).update(preserved)
-            _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-        with original.locked() as ledger:
-            before = ledger.workers["w7"]
-            ledger.quarantined_workers["broken"] = {"reason": "keep diagnostic", "record": {}}
-        with bounded_worker_change():
-            workers.move_unit("before", "after", "builders", runs=(self.session_dir, side))
-            workers.move_unit("before", "after", "builders", runs=(self.session_dir, side))
-            workers.rename_unit("after", "builders", "renamed", runs=(self.session_dir, side))
-        target = workers.ledger_path("after", "renamed")
-        self.assertFalse(original.path.exists())
-        self.assertFalse(workers.ledger_path("after", "builders").exists())
-        with workers.UnitWorkerLedger(target).locked() as ledger:
-            self.assertEqual(ledger.workers["w7"], before)
-            self.assertEqual(ledger.quarantined_workers["broken"]["reason"], "keep diagnostic")
-        for run in (self.session_dir, side):
-            self.assertEqual(workers.ledger_for_run(run).path, target)
-            self.assertEqual(json_object(run / workers.STATE)["production"], "after")
-            self.assertEqual(json_object(run / workers.STATE)["unit"], "renamed")
-            record = cast(dict[str, object], json_object(run / codex_mesh.ROSTER_FILE)["w7"])
-            self.assertEqual(record["unit_ledger"], str(target))
-            self.assertEqual({key: record[key] for key in preserved}, preserved)
-
-    def test_a_move_refuses_another_owners_destination_without_changing_either_ledger(self) -> None:
-        source = self.lifecycle_worker()
-        target = workers.UnitWorkerLedger(workers.ledger_path("after", "builders"))
-        with source.locked() as ledger, target.locked() as destination:
-            destination.workers["other-owner"] = ledger.workers["w7"]
-        snapshots = (source.path.read_bytes(), target.path.read_bytes())
-        with bounded_worker_change(), self.assertRaises(workers.WorkerUnavailable):
-            workers.move_unit("before", "after", "builders", runs=(self.session_dir,))
-        self.assertEqual((source.path.read_bytes(), target.path.read_bytes()), snapshots)
-
-    def test_a_move_recovers_after_each_durable_write_without_a_second_owner(self) -> None:
-        for cut in range(1, 7):
-            with self.subTest(write=cut):
-                store = self.lifecycle_worker()
-                target = workers.ledger_path("after", "builders")
-                target.unlink(missing_ok=True)
-                atomic = workers._atomic  # pyright: ignore[reportPrivateUsage]
-                write_roster = workers._write_roster  # pyright: ignore[reportPrivateUsage]
-                writes = 0
-                set_unit = progress_history.set_unit
-
-                def after_write() -> None:
-                    nonlocal writes
-                    writes += 1
-                    if writes == cut:
-                        raise AdoptionWriteInterrupted()
-
-                def persist(path: Path, data: Mapping[str, object]) -> None:
-                    atomic(path, data)
-                    after_write()
-
-                def roster_write(handle: worker_lifecycle.WorkerStateFile, data: dict[str, object]) -> None:
-                    write_roster(handle, data)
-                    after_write()
-
-                def unit_written(run: Path, production: str, unit: str) -> None:
-                    set_unit(run, production, unit)
-                    after_write()
-
-                with (bounded_worker_change(), patch.object(workers, "_atomic", new=persist),
-                      patch.object(workers, "_write_roster", new=roster_write),
-                      patch.object(progress_history, "set_unit", new=unit_written)):
-                    with self.assertRaises(AdoptionWriteInterrupted):
-                        workers.move_unit("before", "after", "builders", runs=(self.session_dir,))
-                with bounded_worker_change():
-                    workers.move_unit("before", "after", "builders", runs=(self.session_dir,))
-                self.assertFalse(store.path.exists())
-                self.assertEqual(workers.ledger_for_run(self.session_dir).path, target)
-                with workers.UnitWorkerLedger(target).locked() as ledger:
-                    self.assertEqual(set(ledger.workers), {"w7"})
-                    self.assertEqual(ledger.workers["w7"].backend,
-                                     workers.CodexThread(mesh_fixture.THREAD_ID, os.environ["CODEX_HOME"]))
-                target.unlink()
-
-    def test_retirement_terminates_a_supervisor_retained_in_an_adopted_giving_run(self) -> None:
-        _ = self.lifecycle_worker()
-        runs = self.session_dir / "mesh_runs"
-        runs.mkdir()
-        record = runs / "retiring-command.json"
-        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
-                                  "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        try:
-            _ = record.write_text(json.dumps({"worker": "w7", "status": "running", "pid": child.pid,
-                                             "cwd": str(self.session_dir)}))
-            workers.pause_unit("before", "builders")
-            destination = self.next_run("retire-adopted-command")
-            state = json_object(destination / workers.STATE)
-            state.update({"production": "before", "unit": "builders"})
-            _ = (destination / workers.STATE).write_text(json.dumps(state))
-            with bounded_worker_change():
-                self.assertEqual(workers.adopt(self.session_dir, destination, "w7"), "w7")
-            self.assertIn(str(self.session_dir), codex_mesh.worker_run_history(str(destination), "w7"))
-            with bounded_worker_change(), redirect_stdout(io.StringIO()) as output:
-                workers.end_unit("before", "builders")
-            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(child.returncode, -signal.SIGTERM)
-            self.assertIn("retiring-command", output.getvalue())
-            self.assertIn(str(child.pid), output.getvalue())
-            self.assertTrue(record.exists(), "retirement must retain detached-run records")
-        finally:
-            if child.poll() is None:
-                child.kill()
-                _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_retirement_never_trusts_or_signals_a_reused_supervisor_pid(self) -> None:
         _ = self.lifecycle_worker()
@@ -780,7 +451,6 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as unrelated:
             _ = record.write_text(json.dumps({"worker": "w7", "status": "running", "pid": unrelated.pid,
                                              "cwd": str(self.session_dir)}))
-            workers.pause_unit("before", "builders")
             self.assertEqual(workers.live_detached_runs(self.session_dir), ())
             self.assertEqual(workers.protected_working_directories(self.session_dir), ())
             self.assertEqual(workers.retained_detached_runs(self.session_dir), ())
@@ -790,7 +460,14 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                     raise AssertionError("retirement signalled a process that is not the recorded supervisor")
                 real_kill(pid, number)
             with patch.object(os, "kill", new=refuse_foreign_signal), redirect_stdout(io.StringIO()) as output:
-                workers.end_unit("before", "builders")
+                membership = staff.local_snapshot()
+                worker = membership.by_current_session(mesh_fixture.THREAD_ID)
+                assert worker is not None
+                owner = membership.parent_of(worker)
+                assert owner is not None
+                parent = membership.parent_of(owner)
+                assert parent is not None
+                workers.end_unit(owner)
             self.assertIsNone(unrelated.poll())
             self.assertNotIn("cancelled detached run abandoned", output.getvalue())
             _ = unrelated.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -807,111 +484,15 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
             "mesh_runs.py", "supervise", str(linked / "mesh_runs" / record.name)], stdin=subprocess.PIPE)
         self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
-        _ = record.write_text(json.dumps({"worker": "w7", "status": "running", "pid": child.pid,
-                                         "cwd": str(checkout)}))
-        workers.pause_unit("before", "builders")
+        membership = staff.local_snapshot()
+        worker = membership.by_current_session(mesh_fixture.THREAD_ID)
+        assert worker is not None
+        owner = membership.parent_of(worker)
+        assert owner is not None
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", checkout), expected=owner.worktree)
+        _ = record.write_text(json.dumps({"staff_id": worker.id, "worker": "w7", "status": "running", "pid": child.pid}))
         self.assertEqual([path for path, _ in workers.live_detached_runs(self.session_dir.resolve())], [record])
         self.assertEqual(workers.protected_working_directories(self.session_dir.resolve()), (checkout.resolve(),))
-
-    def test_move_finishes_a_pending_adoption_before_rebinding_both_runs(self) -> None:
-        source_store = self.lifecycle_worker()
-        destination = self.next_run("adoption-before-migration")
-        state = json_object(destination / workers.STATE)
-        state.update({"production": "before", "unit": "builders"})
-        _ = (destination / workers.STATE).write_text(json.dumps(state))
-
-        def interrupted(stage: str) -> None:
-            if stage == "source":
-                raise AdoptionWriteInterrupted()
-
-        with bounded_worker_change(), observe_adoption_writes(self.session_dir, destination, interrupted):
-            with self.assertRaises(AdoptionWriteInterrupted):
-                _ = workers.adopt(self.session_dir, destination, "w7")
-        with bounded_worker_change():
-            workers.move_unit("before", "after", "builders", runs=(self.session_dir, destination))
-        target = workers.ledger_path("after", "builders")
-        self.assertFalse(source_store.path.exists())
-        with workers.UnitWorkerLedger(target).locked() as ledger:
-            self.assertEqual(ledger.adoptions, {})
-            self.assertEqual(ledger.workers["w7"].ownership, workers.Adopted(str(destination)))
-        for run in (self.session_dir, destination):
-            self.assertEqual(workers.ledger_for_run(run).path, target)
-            self.assertEqual(cast(dict[str, object], json_object(run / codex_mesh.ROSTER_FILE)["w7"])["unit_ledger"], str(target))
-
-    def test_paused_inbox_handoff_recovers_after_either_durable_queue_write(self) -> None:
-        for interrupted_write in (1, 2):
-            with self.subTest(inbox_write=interrupted_write):
-                _ = self.lifecycle_worker()
-                workers.pause_unit("before", "builders")
-                destination = self.next_run(f"inbox-write-{interrupted_write}")
-                state = json_object(destination / workers.STATE)
-                state.update({"production": "before", "unit": "builders"})
-                _ = (destination / workers.STATE).write_text(json.dumps(state))
-                source_inbox = self.session_dir / "w7.pending.json"
-                target_inbox = destination / "w7.pending.json"
-                _ = source_inbox.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
-                    "messages": ["keep this task once"], "accepting_messages": True}))
-                persist = workers._write_inbox  # pyright: ignore[reportPrivateUsage]
-                writes = 0
-
-                def crash_after_inbox(handle: worker_lifecycle.WorkerStateFile, record: Mapping[str, object]) -> None:
-                    nonlocal writes
-                    persist(handle, record)
-                    writes += 1
-                    if writes == interrupted_write:
-                        raise AdoptionWriteInterrupted()
-
-                with bounded_worker_change(), patch.object(workers, "_write_inbox", new=crash_after_inbox):
-                    with self.assertRaises(AdoptionWriteInterrupted):
-                        _ = workers.adopt(self.session_dir, destination, "w7")
-                with bounded_worker_change():
-                    held = codex_mesh.hold_message(str(self.session_dir), "w7", "arrived during recovery",
-                                                  without_launcher=True)
-                self.assertIsInstance(held, codex_mesh.HeldForNextDispatch)
-                with bounded_worker_change():
-                    workers.recover_adoptions(destination)
-                self.assertEqual(json_object(target_inbox)["messages"], ["keep this task once", "arrived during recovery"])
-                self.assertEqual(json_object(source_inbox)["messages"], [])
-                self.assertEqual(cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)["w7"])["thread_id"], mesh_fixture.THREAD_ID)
-
-    def test_old_adoption_journals_preserve_their_declared_queue_policy(self) -> None:
-        for transfer_queue in (False, True):
-            with self.subTest(transfer_queue=transfer_queue):
-                store = self.lifecycle_worker()
-                inbox = self.session_dir / "w7.pending.json"
-                _ = inbox.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID, "messages": []}))
-                destination = self.next_run(f"legacy-queue-{transfer_queue}")
-                state = json_object(destination / workers.STATE)
-                state.update({"production": "before", "unit": "builders"})
-                _ = (destination / workers.STATE).write_text(json.dumps(state))
-                def interrupted(stage: str) -> None:
-                    if stage == "intent":
-                        raise AdoptionWriteInterrupted()
-                with bounded_worker_change(), observe_adoption_writes(self.session_dir, destination, interrupted):
-                    with self.assertRaises(AdoptionWriteInterrupted):
-                        _ = workers.adopt(self.session_dir, destination, "w7")
-                data = json_object(store.path)
-                intents = cast(dict[str, object], data["adoptions"])
-                for raw in intents.values():
-                    intent = cast(dict[str, object], raw)
-                    self.assertEqual(intent.pop("queue_policy"), "transfer")
-                    intent["carries_work"] = transfer_queue
-                _ = store.path.write_text(json.dumps(data))
-                _ = inbox.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
-                                                "messages": ["arrived after intent"]}))
-                with bounded_worker_change():
-                    if transfer_queue:
-                        workers.recover_adoptions(self.session_dir)
-                    else:
-                        with self.assertRaises(workers.WorkerUnavailable):
-                            workers.recover_adoptions(self.session_dir)
-                if transfer_queue:
-                    self.assertEqual(json_object(destination / "w7.pending.json")["messages"], ["arrived after intent"])
-                    self.assertEqual(json_object(inbox)["messages"], [])
-                else:
-                    self.assertEqual(json_object(inbox)["messages"], ["arrived after intent"])
-                    self.assertNotIn("w7", json_object(destination / codex_mesh.ROSTER_FILE))
-                    workers.recover_adoptions(self.session_dir)
 
     def test_explicit_reservation_owner_survives_resolve_and_becomes_reclaimable_when_it_exits(self) -> None:
         _ = self.lifecycle_worker(name="impl")
@@ -940,10 +521,12 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.configure_new_worker()
         registry = self.session_dir / "director-sessions"
         registry.mkdir()
-        from scripts.lib import unit_runs
         from scripts.message import sessions
-        director = "fixture-director"
-        _ = (self.session_dir / unit_runs.DIRECTOR_FILE).write_text(director)
+        worker = staff.by_current_session(mesh_fixture.THREAD_ID)
+        assert worker is not None and isinstance(worker.parent, staff.ReportsTo)
+        parent = staff.by_id(worker.parent.id)
+        assert parent is not None
+        director = parent.current_session
         with socket.socket(socket.AF_UNIX) as endpoint:
             address = self.session_dir / "director.sock"
             endpoint.bind(str(address))
@@ -1016,31 +599,107 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(record["thread_id"], mesh_fixture.THREAD_ID)
         self.assertEqual((record["turn_model"], record["turn_effort"]), ("gpt-kept-sol", "high"))
 
-    def test_queued_work_and_owed_continuations_exclude_same_run_allocation(self) -> None:
+    def test_owed_continuations_exclude_same_run_allocation(self) -> None:
         self.configure_new_worker()
-        for obstacle in ("continuation", "pending"):
-            with self.subTest(obstacle=obstacle):
-                state = json_object(self.session_dir / workers.STATE)
-                state.update({"production": "same-run-fixture", "unit": obstacle})
-                _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
-                self.open_worker(name="impl")
-                roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-                record = cast(dict[str, object], roster["impl"])
-                pending = self.session_dir / "impl.pending.json"
-                pending.unlink(missing_ok=True)
-                if obstacle == "continuation":
-                    record["continuation_owed"] = True
-                else:
-                    _ = pending.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
-                        "messages": ["Previously queued work."], "accepting_messages": True}))
-                _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-                original = dict(record)
+        self.open_worker(name="impl")
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        record = cast(dict[str, object], roster["impl"])
+        record["continuation_owed"] = True
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(session_staff.stored_worker_records(roster)))
+        original = dict(record)
 
-                self.assertEqual(self.resolve(self.session_dir), "impl2")
-                after = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"])
-                self.assertEqual(after, original)
-                if obstacle == "pending":
-                    self.assertEqual(json_object(pending)["messages"], ["Previously queued work."])
+        self.assertEqual(self.resolve(self.session_dir), "impl2")
+        after = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"])
+        self.assertEqual(after, original)
+
+    def test_queued_work_allows_reservation_and_reaches_the_next_dispatch(self) -> None:
+        self.configure_new_worker()
+        self.open_worker(name="impl")
+        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
+        cast(dict[str, object], roster["impl"])["status"] = "paused"
+        self.write_pool_roster(roster)
+        pending = session_staff.worker_inbox_path(str(self.session_dir), "impl")
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        _ = pending.write_text(json.dumps({"messages": ["Previously queued work."], "accepting_messages": True}))
+
+        self.assertEqual(self.resolve(self.session_dir), "impl")
+        self.assertEqual(json_object(pending)["messages"], ["Previously queued work."])
+        self.complete_assignment("impl")
+
+        turns = self.methods("turn/start")
+        self.assertEqual(len(turns), 1)
+        self.assertIn("Previously queued work.", json.dumps(turns[0]))
+        self.assertEqual(json_object(pending)["messages"], [])
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_a_refused_candidate_does_not_block_a_healthy_allocation(self) -> None:
+        refused = fixture_worker("first-refused", staff.native_id(os.environ["CODEX_THREAD_ID"]),
+            backend=staff.CodexBackend(Path(os.environ["CODEX_HOME"])))
+        agents_log.append(refused.current_session, "impl", None, datetime.now(timezone.utc))
+        for boundary in ("admit", "publish"):
+            with self.subTest(boundary=boundary):
+                self.open_worker(name="healthy")
+                roster = self.roster()
+                roster[refused.name] = {"staff_id": refused.id, "status": "failed",
+                    "model": "gpt-kept-sol", "effort": "xhigh", "port": self.server.port}
+                self.write_pool_roster(roster)
+                staff_file = Path(os.environ["STAFF_FILE"])
+                before = staff_file.read_bytes(), self.roster()[refused.name]
+                with (patch.object(worker_admission, boundary, wraps=getattr(worker_admission, boundary),
+                                   side_effect=[worker_admission.AdmissionRefused("candidate switch refused"), cast(object, mock.DEFAULT)]) as attempted,
+                      redirect_stderr(io.StringIO()) as errors):
+                    selected = workers.resolve(self.session_dir, "impl")
+                attempts = [cast(str, call.args[0]) if boundary == "admit" else cast(worker_admission.WorkerStartAllowed, call.args[0]).name
+                            for call in attempted.call_args_list]
+                self.assertEqual(errors.getvalue().count("candidate switch refused"), 1)
+                self.assertEqual(selected, "healthy")
+                self.assertCountEqual(attempts, [refused.name, "healthy"])
+                self.assertEqual(staff_file.read_bytes(), before[0])
+                after = self.roster()
+                self.assertEqual(after[refused.name], before[1])
+                self.assertTrue(workers.allocation_is_live(cast(dict[str, object], after["healthy"])))
+                self.assertEqual(self.methods("thread/start"), [])
+                self.assertEqual(self.methods("turn/start"), [])
+
+    def test_allocation_maps_astra_tasks_and_tolerates_an_unreadable_usage_log(self) -> None:
+        for name, role, unreadable in (("astra-reviewer", "review", False),
+                                       ("astra-designer", "impl", False), ("impl", "impl", True)):
+            with self.subTest(name=name, unreadable=unreadable):
+                row = self.record_worker(name)
+                self.write_pool_roster({name: {"staff_id": row.id, "status": "done",
+                    "model": "gpt-kept-sol", "effort": "xhigh", "port": self.server.port}})
+                history = agents_log.state_dir() / "agents.jsonl"
+                history.parent.mkdir(parents=True, exist_ok=True)
+                history.unlink(missing_ok=True)
+                if unreadable:
+                    history.mkdir()
+                try:
+                    with redirect_stderr(io.StringIO()) as errors:
+                        selected = workers.resolve(self.session_dir, role)
+                    self.assertEqual(selected, name, errors.getvalue())
+                    self.assertEqual(session_staff.worker_row(cast(dict[str, object], self.roster()[name])), row)
+                    self.assertTrue(workers.allocation_is_live(cast(dict[str, object], self.roster()[name])))
+                    self.assertEqual(self.methods("thread/start"), [])
+                finally:
+                    if unreadable:
+                        history.rmdir()
+                    _ = staff.retire(row.id)
+
+    def test_allocation_shares_one_staff_snapshot_across_its_readers(self) -> None:
+        roles: tuple[Literal["impl", "review"], ...] = ("impl", "review")
+        for role in roles:
+            with self.subTest(role=role):
+                self.open_worker(name=role, role=role)
+                try:
+                    with patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as reads:
+                        selected = workers.resolve(self.session_dir, role)
+                    self.assertEqual(selected, role)
+                    self.assertEqual(reads.call_count, 1)
+                    self.assertTrue(workers.allocation_is_live(cast(dict[str, object], self.roster()[role])))
+                    self.assertEqual(self.methods("thread/start"), [])
+                    self.assertEqual(self.methods("turn/start"), [])
+                finally:
+                    _ = staff.retire(staff.native_id(mesh_fixture.THREAD_ID))
 
     def test_two_simultaneous_resolves_in_one_run_reserve_distinct_workers(self) -> None:
         self.open_worker(name="impl")
@@ -1067,7 +726,6 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         for destination_name in ("same-run", "next-run"):
             with self.subTest(destination=destination_name):
                 state = json_object(self.session_dir / workers.STATE)
-                state.update({"production": "abandoned-resolver", "unit": destination_name})
                 _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
                 self.open_worker(name="impl")
                 child = subprocess.Popen([
@@ -1098,7 +756,6 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         for reservation in ("expired", "legacy"):
             with self.subTest(reservation=reservation):
                 state = json_object(self.session_dir / workers.STATE)
-                state.update({"production": "expired-resolver", "unit": reservation})
                 _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
                 self.open_worker(name="impl")
                 self.assertEqual(self.resolve(self.session_dir), "impl")
@@ -1109,91 +766,12 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                 else:
                     for key in ("allocation_id", "allocation_owner_pid", "allocation_expires_at"):
                         _ = record.pop(key, None)
-                _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+                _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(session_staff.stored_worker_records(roster)))
                 self.assertEqual(self.resolve(self.session_dir), "impl")
                 after = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"])
                 self.assertEqual(after["thread_id"], mesh_fixture.THREAD_ID)
                 self.assertEqual(self.methods("thread/start"), [])
 
-    def test_a_follow_refused_before_claim_releases_its_dispatch_reservation(self) -> None:
-        self.configure_new_worker()
-        for refusal in ("recovery", "ended"):
-            with self.subTest(refusal=refusal):
-                state = json_object(self.session_dir / workers.STATE)
-                state.update({"production": "refused-resolver", "unit": refusal})
-                _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
-                self.open_worker(name="impl")
-                self.assertEqual(self.resolve(self.session_dir), "impl")
-                args = self.start_args()
-                args.to = "impl"
-                args.message_file = str(self.session_dir / "prompt.txt")
-                if refusal == "ended":
-                    roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-                    cast(dict[str, object], roster["impl"])["status"] = "ended"
-                    _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-                with bounded_worker_change(), redirect_stderr(io.StringIO()) as errors:
-                    if refusal == "recovery":
-                        with patch.object(workers, "recover_adoptions",
-                                          side_effect=workers.WorkerUnavailable("recovery must be retried")):
-                            code = codex_mesh.command_follow(args)
-                    else:
-                        code = codex_mesh.command_follow(args)
-                self.assertEqual(code, 2, errors.getvalue())
-                roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-                record = cast(dict[str, object], roster["impl"])
-                self.assertFalse(record.get("allocation_pending"), "refusal left the dispatch stranded")
-                record["status"] = "done"
-                _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-                self.assertEqual(self.resolve(self.session_dir), "impl")
-                self.assertEqual(self.methods("turn/start"), [])
-                self.assertEqual(self.methods("thread/start"), [])
-
-    def test_a_refused_follow_does_not_release_a_newer_dispatch_reservation(self) -> None:
-        self.open_worker(name="impl")
-        self.assertEqual(self.resolve(self.session_dir), "impl")
-        old = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"])
-        recovery = workers.recover_adoptions
-        replacement: dict[str, object] = {}
-
-        def replace_dispatch(run: Path) -> None:
-            recovery(run)
-            roster = json_object(run / codex_mesh.ROSTER_FILE)
-            cast(dict[str, object], roster["impl"])["allocation_expires_at"] = 0
-            _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-            self.assertEqual(workers.resolve(run, "impl"), "impl")
-            replacement.update(cast(dict[str, object], json_object(run / codex_mesh.ROSTER_FILE)["impl"]))
-            raise workers.WorkerUnavailable("old follow lost its dispatch")
-
-        args = self.start_args()
-        args.to = "impl"
-        with (bounded_worker_change(), patch.object(workers, "recover_adoptions", new=replace_dispatch),
-              redirect_stderr(io.StringIO()) as errors):
-            code = codex_mesh.command_follow(args)
-        self.assertEqual(code, 2, errors.getvalue())
-        after = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"])
-        self.assertNotEqual(replacement["allocation_id"], old["allocation_id"])
-        self.assertEqual(after, replacement, "stale refusal cleared a newer owner's dispatch")
-        self.assertTrue(after.get("allocation_pending"))
-        self.assertEqual(self.methods("turn/start"), [])
-
-    def test_finished_run_resolution_requires_reactivation_without_allocating_a_thread(self) -> None:
-        self.open_worker(name="impl")
-        self.configure_new_worker()
-        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-        cast(dict[str, object], roster["impl"])["status"] = "ended"
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-        state = json_object(self.session_dir / workers.STATE)
-        state.update({"status": "completed", "finished_at": 1793200000})
-        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
-        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
-        result = subprocess.run([
-            sys.executable, str(SCRIPT), "resolve", "--session-dir", str(self.session_dir), "--role", "impl",
-            "--owner-pid", str(os.getpid()),
-        ], env=os.environ.copy(), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("start-phase", result.stderr)
-        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
-        self.assertEqual(self.methods("thread/start"), [])
 
     def test_a_locked_roster_is_read_after_its_writer_finishes(self) -> None:
         self.open_worker()
@@ -1234,7 +812,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         _ = instructions.write_text("Review only; report findings.")
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         cast(dict[str, object], roster["reviewer-address"])["instructions_file"] = str(instructions)
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(session_staff.stored_worker_records(roster)))
         self.assertEqual(self.resolve(self.session_dir, "review"), "reviewer-address")
         with workers.ledger_for_run(self.session_dir).locked() as ledger:
             self.assertEqual(ledger.workers["reviewer-address"].access_policy.get("kind"), "ReadOnlyReviewer")
@@ -1253,10 +831,19 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         name = self.resolve(self.session_dir, "impl")
         row = staff.by_id(staff.StaffId(SECOND_THREAD_ID))
         assert row is not None
-        self.assertEqual((row.name, row.parent), (name, staff.StaffId(os.environ["CODEX_THREAD_ID"])))
+        self.assertEqual((row.name, row.parent), (name, staff.ReportsTo(staff.StaffId(os.environ["CODEX_THREAD_ID"]))))
         self.assertEqual(before_creation, [()])
         self.assertEqual(self.methods("turn/start"), [])
         self.assertEqual(cast(dict[str, object], self.roster()[name])["thread_id"], row.id)
+        stored = cast(dict[str, dict[str, object]], json.loads(
+            (self.session_dir / codex_mesh.ROSTER_FILE).read_text()))[name]
+        self.assertEqual(stored["staff_id"], row.id)
+        self.assertTrue({"thread_id", "session_id", "codex_home", "manager", "role"}.isdisjoint(stored))
+        store = workers.ledger_for_run(self.session_dir)
+        ledger = cast(dict[str, dict[str, dict[str, object]]], json.loads(store.path.read_text()))
+        settled = ledger["workers"][row.id]
+        self.assertEqual(settled["staff_id"], row.id)
+        self.assertTrue({"name", "role", "family", "backend"}.isdisjoint(settled))
 
     def test_concurrent_reviews_open_distinct_read_only_unit_workers(self) -> None:
         self.configure_new_worker()
@@ -1289,30 +876,6 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         for request in self.methods("thread/start"):
             self.assertEqual(cast(dict[str, object], request["params"]).get("sandbox"), "read-only")
         self.assertEqual(self.methods("turn/start"), [])
-
-    def test_missing_identities_and_invalid_events_are_refused_when_loading_the_ledger(self) -> None:
-        self.open_worker()
-        name = self.resolve(self.session_dir)
-        store = workers.ledger_for_run(self.session_dir)
-        original = store.path.read_text()
-        invalid_fields: tuple[tuple[str, object], ...] = (
-            ("ownership", {"kind": "HeldBy"}),
-            ("ownership", {"kind": "Adopted", "to_run": ""}),
-            ("backend", {"kind": "CodexThread", "codex_home": os.environ["CODEX_HOME"]}),
-            ("backend", {"kind": "CodexThread", "thread_id": mesh_fixture.THREAD_ID, "codex_home": ""}),
-            ("backend", {"kind": "ClaudeSession", "session_id": ""}),
-            ("events", [{"kind": "opened", "run": str(self.session_dir), "at": 1}]),
-            ("events", [{"kind": "unknown", "cause": "invalid event", "run": str(self.session_dir), "at": 1}]),
-        )
-        for field, variant in invalid_fields:
-            with self.subTest(field=field, variant=variant):
-                data = cast(dict[str, object], json.loads(original))
-                entries = cast(dict[str, object], data["workers"])
-                cast(dict[str, object], entries[name])[field] = variant
-                _ = store.path.write_text(json.dumps(data))
-                with self.assertRaises(workers.WorkerUnavailable):
-                    with store.locked():
-                        self.fail("invalid persisted identity was accepted")
 
     def test_resolve_reuses_the_stored_role_and_live_model_identity(self) -> None:
         self.open_worker()
@@ -1357,30 +920,24 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             self.assertEqual(ledger.workers[chosen].model, "gpt-kept-sol")
         self.assertEqual(self.methods("thread/start"), [])
 
-    def test_shown_context_follows_transfer_and_rename_while_the_address_stays_stable(self) -> None:
-        _ = self.lifecycle_worker("w7")
 
-        def shown() -> str:
-            result = subprocess.run([sys.executable, str(SCRIPT), "shown-name", "--session-dir",
-                                     str(self.session_dir), "--name", "w7"],
-                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            return result.stdout.strip()
-
-        before = shown()
-        self.assertTrue(before.startswith("before · builders · "), before)
-        self.assertNotIn("w7", before)
-        workers.move_unit("before", "after", "builders", runs=(self.session_dir,))
-        self.assertEqual(shown(), before.replace("before ·", "after ·", 1))
-        workers.rename_unit("after", "builders", "renamed", runs=(self.session_dir,))
-        self.assertEqual(shown(), before.replace("before · builders ·", "after · renamed ·", 1))
-        self.assertEqual(self.resolve(self.session_dir), "w7")
+    def test_explicit_working_directory_reaches_a_new_worker(self) -> None:
+        self.configure_new_worker()
+        directory = self.session_dir.parent / "explicit-directory"
+        directory.mkdir()
+        result = self.worker_cli(
+            "resolve", "--session-dir", str(self.session_dir), "--role", "impl",
+            "--owner-pid", str(os.getpid()), "--working-dir", str(directory))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        starts = self.methods("thread/start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(cast(dict[str, object], starts[0]["params"])["cwd"], str(directory))
 
     def test_the_unit_ledger_retains_backend_access_model_and_a_caused_open_event(self) -> None:
         self.open_worker()
         name = self.resolve(self.session_dir)
         store = workers.ledger_for_run(self.session_dir)
-        self.assertEqual(store.path.parent.name, "adhoc")
+        self.assertEqual(store.path.stem, os.environ["CODEX_THREAD_ID"])
         self.assertTrue(store.path.is_relative_to(self.session_dir.parent / "unit-workers"))
         with store.locked() as ledger:
             worker = ledger.workers[name]
@@ -1398,460 +955,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertFalse((self.session_dir / "workers").exists(),
                          "the unit ledger must not overwrite the launch log")
 
-    def test_adoption_recovery_excludes_stale_settlement_and_preserves_transferred_work(self) -> None:
-        self.open_worker("worker")
-        destination = self.next_run("recovered-owner")
-        pending = self.session_dir / "worker.pending.json"
-        _ = pending.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
-            "messages": ["transferred work"], "accepting_messages": True}))
 
-        def interrupt(stage: str) -> None:
-            if stage == "intent":
-                raise AdoptionWriteInterrupted(stage)
-
-        with observe_adoption_writes(self.session_dir, destination, interrupt):
-            with self.assertRaises(AdoptionWriteInterrupted):
-                _ = workers.adopt(self.session_dir, destination, "worker")
-        self.live_turn: str = "transferred-turn"
-        queued: list[dict[str, object]] = [{"id": "transferred-task"}]
-        self.queued: list[dict[str, object]] = queued.copy()
-        recovered, release, settling = threading.Event(), threading.Event(), threading.Event()
-        guard = LauncherHangGuard("adoption recovery versus stale settlement")
-        write = workers._write_roster  # pyright: ignore[reportPrivateUsage]
-
-        def publish(handle: worker_lifecycle.WorkerStateFile, roster: dict[str, object]) -> None:
-            if Path(handle.name) == self.session_dir / codex_mesh.ROSTER_FILE:
-                self.assert_lifecycle_is_held()
-                recovered.set()
-                guard.event(release)
-            write(handle, roster)
-
-        with contextlib.closing(codex_mesh.Client(self.server.port, "old-launcher")) as client:
-            stream = self.stream_for(client)
-
-            def settle() -> codex_mesh.RunOutcome:
-                return codex_mesh._finish_stream(stream)  # pyright: ignore[reportPrivateUsage]
-
-            with patch.object(workers, "_write_roster", publish), ThreadPoolExecutor(max_workers=2) as executor:
-                recovery = executor.submit(workers.recover_adoptions, destination)
-                recovery.add_done_callback(lambda completed: recovered.set())
-                try:
-                    guard.event(recovered)
-                    if recovery.done():
-                        guard.result(recovery)
-                    with self.observe_lifecycle_attempt(settling):
-                        settlement = executor.submit(settle)
-                        guard.event(settling)
-                finally:
-                    release.set()
-                guard.result(recovery)
-                _ = guard.result(settlement)
-        self.assertEqual(self.worker_record()["adopted_to"], str(destination))
-        target = cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)["worker"])
-        self.assertEqual(target["thread_id"], mesh_fixture.THREAD_ID)
-        self.assertEqual(target["status"], "paused")
-        self.assertEqual(self.live_turn, "transferred-turn")
-        self.assertEqual(self.queued, queued)
-        messages = json_object(destination / "worker.pending.json")
-        self.assertEqual(messages["messages"], ["transferred work"])
-        self.assertIs(messages["accepting_messages"], True)
-        self.assertEqual(self.methods("thread/queue/delete"), [])
-        self.assertEqual(self.methods("turn/interrupt"), [])
-        self.assertEqual(json_object(workers.ledger_for_run(destination).path)["adoptions"], {})
-
-    def test_pause_deadline_covers_unfinished_adoption_recovery_and_leaves_it_retryable(self) -> None:
-        self.open_worker("worker")
-        pending = self.session_dir / "worker.pending.json"
-        _ = pending.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
-            "messages": ["keep once"], "accepting_messages": True}))
-        destination = self.next_run("deadline-adoption")
-
-        def interrupt(stage: str) -> None:
-            if stage == "intent":
-                raise AdoptionWriteInterrupted(stage)
-
-        with observe_adoption_writes(self.session_dir, destination, interrupt):
-            with self.assertRaises(AdoptionWriteInterrupted):
-                _ = workers.adopt(self.session_dir, destination, "worker")
-        store = workers.ledger_for_run(self.session_dir)
-        paths = (store.path, pending, self.session_dir / codex_mesh.ROSTER_FILE,
-                 self.session_dir / codex_mesh.SERVER_FILE)
-        before = {path: path.read_bytes() for path in paths}
-        membership = destination / "membership.lock"
-        membership.touch()
-        self.lifecycle_clock.freeze()
-        callbacks: list[str] = []
-        with membership.open("a+") as owner:
-            mesh_fixture.KERNEL_FLOCK(owner, fcntl.LOCK_EX)
-            with (self.expire_contended_lock(membership, 2),
-                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
-                  ThreadPoolExecutor(max_workers=1) as executor):
-                pause = executor.submit(workers.pause_run, self.session_dir,
-                    deadline=self.lifecycle_clock.monotonic() + 1,
-                    pause_workers=lambda: callbacks.append("paused"))
-                with self.assertRaisesRegex(TimeoutError, "membership.lock"):
-                    _ = LauncherHangGuard("pause adoption recovery deadline").result(pause)
-        self.assertEqual(callbacks, [])
-        self.assertEqual({path: path.read_bytes() for path in paths}, before)
-        self.assertEqual(self.methods("turn/interrupt"), [])
-        self.assertEqual(self.methods("thread/queue/delete"), [])
-        workers.pause_run(self.session_dir, pause_workers=lambda: callbacks.append("paused"))
-        self.assertEqual(callbacks, ["paused"])
-        self.assertEqual(json_object(store.path)["adoptions"], {})
-        self.assertEqual(json_object(destination / "worker.pending.json")["messages"], ["keep once"])
-        target = cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)["worker"])
-        self.assertEqual(target["thread_id"], mesh_fixture.THREAD_ID)
-        self.assertEqual(target["status"], "paused")
-        giving = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["worker"])
-        self.assertEqual(giving["adopted_to"], str(destination))
-        with store.locked() as ledger:
-            self.assertEqual(ledger.workers["worker"].ownership, workers.Adopted(str(destination)))
-        self.assertEqual(self.methods("thread/start"), [])
-
-    def test_pause_deadline_starts_before_progress_identity_publication(self) -> None:
-        state_path = self.session_dir / workers.STATE
-        state = json_object(state_path)
-        state.update(production="deadline-production", unit="deadline-unit")
-        _ = state_path.write_text(json.dumps(state))
-        # A canonical rename makes ledger_for_run publish the new identity before
-        # it opens the ledger; contention here must spend the shutdown budget too.
-        lock = self.session_dir / ".progress_history.lock"
-        lock.touch()
-        before = state_path.read_bytes()
-        self.lifecycle_clock.freeze()
-        with lock.open("a+") as owner:
-            mesh_fixture.KERNEL_FLOCK(owner, fcntl.LOCK_EX)
-            with (self.expire_contended_lock(lock, 2),
-                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
-                  patch.object(progress_history, "resolve_production_unit",
-                               return_value=progress_history.ProductionUnitIdentity("canonical-production", "deadline-unit")),
-                  ThreadPoolExecutor(max_workers=1) as executor):
-                pause = executor.submit(workers.pause_run, self.session_dir,
-                                        deadline=self.lifecycle_clock.monotonic() + 1)
-                with self.assertRaisesRegex(TimeoutError, "progress_history.lock"):
-                    _ = LauncherHangGuard("pause progress identity deadline").result(pause)
-        self.assertEqual(state_path.read_bytes(), before)
-
-    def test_migration_ledger_locks_inherit_the_shutdown_deadline(self) -> None:
-        source = self.session_dir / "migration-source.json"
-        destination = self.session_dir / "migration-destination.json"
-        source_lock = source.with_suffix(".lock")
-        destination_lock = destination.with_suffix(".lock")
-        source_lock.touch()
-        destination_lock.touch()
-        self.lifecycle_clock.freeze()
-        with destination_lock.open("a+") as owner:
-            mesh_fixture.KERNEL_FLOCK(owner, fcntl.LOCK_EX)
-            with (self.expire_contended_lock(destination_lock, 2),
-                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
-                  worker_lifecycle.operation_deadline(timeout=1)):
-                with self.assertRaisesRegex(TimeoutError, "migration-destination.lock"):
-                    with workers._migration_locks(source, destination):  # pyright: ignore[reportPrivateUsage]
-                        self.fail("migration passed the contended lock")
-        with workers._migration_locks(source, destination):  # pyright: ignore[reportPrivateUsage]
-            self.assertFalse(source.exists())
-            self.assertFalse(destination.exists())
-
-    def test_adoption_recovers_every_durable_write_before_the_next_command_on_either_run(self) -> None:
-        for stage in ("intent", "source", "destination", "ledger", "complete"):
-            for command in ("adopt", "resolve", "follow"):
-                for side in ("source", "destination"):
-                    with self.subTest(stage=stage, command=command, side=side), bounded_worker_change():
-                        self.assert_recovered_adoption(stage, command, side)
-
-    def assert_recovered_adoption(self, stage: str, command: str, side: str) -> None:
-        identifier = f"{stage}-{command}-{side}"
-        source = self.next_run(identifier + "-source")
-        destination = self.next_run(identifier + "-destination")
-        # Each scenario owns its ledger: an earlier successful recovery must
-        # not reserve a worker needed by a later crash scenario.
-        context = {"status": "active", "production": "recovery-fixture", "unit": identifier,
-                   "working_dir": str(self.session_dir.parent / "repository")}
-        for run in (source, destination):
-            _ = (run / workers.STATE).write_text(json.dumps(context))
-        _ = (source / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": {
-            "thread_id": mesh_fixture.THREAD_ID, "role": "impl", "status": "done",
-            "model": "gpt-kept-sol", "codex_home": os.environ["CODEX_HOME"],
-            "port": self.server.port,
-        }}))
-        reached: list[str] = []
-
-        def interrupt(write: str) -> None:
-            reached.append(write)
-            if write == stage:
-                raise AdoptionWriteInterrupted(write)
-
-        with observe_adoption_writes(source, destination, interrupt):
-            with self.assertRaises(AdoptionWriteInterrupted):
-                _ = workers.adopt(source, destination, "worker")
-        self.assertIn(stage, reached)
-        recovering = source if side == "source" else destination
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            if command == "resolve":
-                # Recovery runs before resolution can adopt back into the
-                # source or allocate another worker. Isolate that later choice
-                # so this probe checks the interrupted transaction alone.
-                with (patch.object(codex_mesh, "open_unit_worker",
-                                   side_effect=workers.WorkerUnavailable("no allocation in recovery probe")),
-                      patch.object(workers, "_adopt",
-                                   side_effect=workers.WorkerUnavailable("no new adoption in recovery probe"))):
-                    try:
-                        _ = workers.resolve(recovering, "impl")
-                    except workers.WorkerUnavailable:
-                        pass
-            elif command == "adopt":
-                third = self.next_run(identifier + "-third")
-                _ = (third / workers.STATE).write_text(json.dumps(context))
-                # A fresh adoption command must recover the interrupted
-                # worker even if its requested name does not exist.
-                with self.assertRaises(workers.WorkerUnavailable):
-                    _ = workers.adopt(recovering, third, "missing-worker")
-            else:
-                try:
-                    _ = codex_mesh.main(["follow", "--session-dir", str(recovering),
-                                         *self.follow_cli()[1:]])
-                except SystemExit:
-                    pass
-        source_record = cast(dict[str, object], json_object(source / codex_mesh.ROSTER_FILE)["worker"])
-        target_record = cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)["worker"])
-        self.assertEqual(source_record["adopted_to"], str(destination))
-        self.assertEqual(target_record["thread_id"], mesh_fixture.THREAD_ID)
-        store = workers.ledger_for_run(destination)
-        data = json_object(store.path)
-        self.assertEqual(data["adoptions"], {}, "recovery left an incomplete handoff")
-        with store.locked() as ledger:
-            owner = ledger.workers["worker"].ownership
-            self.assertIn(owner, (workers.Adopted(str(destination)), workers.HeldBy(str(destination))))
-            events = [event for event in ledger.workers["worker"].events if event.kind == "adopted"]
-            self.assertEqual(len(events), 1, "recovery duplicated the handoff event")
-        self.assertEqual(self.methods("thread/start"), [])
-
-    def test_a_new_run_adopts_the_unit_thread_and_fences_its_previous_roster(self) -> None:
-        self.open_worker()
-        name = self.resolve(self.session_dir)
-        self.complete_assignment(name)
-        destination = self.next_run("next-run")
-        self.assertEqual(self.resolve(destination), name)
-        source = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)[name])
-        target = cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)[name])
-        self.assertEqual(source["adopted_to"], str(destination))
-        self.assertEqual(target["thread_id"], mesh_fixture.THREAD_ID)
-        self.assertEqual(target["model"], "gpt-kept-sol")
-        self.assertEqual(self.methods("thread/start"), [])
-
-    def test_plan_unit_identity_survives_the_worktree_move(self) -> None:
-        old = self.session_dir.parent / "repository"
-        plan = old / "plan.md"
-        _ = plan.write_text('> **Production: demo** — unit `builders`; plan\n')
-        document = self.session_dir.parent / "demo-production.md"
-        _ = document.write_text("# Production — demo\n")
-        row = recorded_unit("demo", "builders", old, document, plan=plan.name)
-        state = json_object(self.session_dir / workers.STATE)
-        state["plan_doc"] = str(plan)
-        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
-        self.open_worker("impl")
-        self.assertEqual(self.resolve(self.session_dir), "impl")
-        self.complete_assignment("impl")
-        workers.pause_unit("demo", "builders")
-        new = old.with_name("moved-repository")
-        _ = old.rename(new)
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", new), expected=row.worktree)
-        destination = self.next_run("after-worktree-move")
-        state = json_object(destination / workers.STATE)
-        state.update({"working_dir": str(new), "plan_doc": str(new / "plan.md")})
-        _ = (destination / workers.STATE).write_text(json.dumps(state))
-        self.assertEqual(workers.adopt(self.session_dir, destination, "impl"), "impl")
-        self.assertEqual(workers.ledger_for_run(self.session_dir).path,
-                         workers.ledger_for_run(destination).path)
-
-    def test_moved_paused_worker_resumes_in_a_new_run_with_its_thread_and_home(self) -> None:
-        old = self.session_dir.parent / "repository"
-        plan = old / "plan.md"
-        _ = plan.write_text('> **Production:** demo — unit `builders`; plan\n')
-        document = self.session_dir.parent / "demo-production.md"
-        _ = document.write_text("# Production — demo\n")
-        row = recorded_unit("demo", "builders", old, document, plan=plan.name)
-        state = json_object(self.session_dir / workers.STATE)
-        state.update({"plan_doc": str(plan), "project_plan_doc": str(plan)})
-        _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
-        self.open_worker("impl")
-        self.assertEqual(self.resolve(self.session_dir), "impl")
-        self.complete_assignment("impl")
-        workers.pause_unit("demo", "builders")
-        roster = json_object(self.session_dir / workers.ROSTER)
-        cast(dict[str, object], roster["impl"]).update({"status": "paused", "cwd": str(old)})
-        _ = (self.session_dir / workers.ROSTER).write_text(json.dumps(roster))
-        original_home = os.environ["CODEX_HOME"]
-        new = old.with_name("moved-repository")
-        _ = old.rename(new)
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", new), expected=row.worktree)
-        with patch.dict(os.environ, {"UNIT_RUN_ROOT": str(self.session_dir.parent)}):
-            found = workers.find_moved_unit_runs((workers.UnitWorktree("demo", "builders", new, "new-branch"),), ())
-            self.assertEqual(len(found.moves), 1)
-            changes = workers.repoint_moved_unit_runs(found.moves[0], from_production="demo")
-            self.assertTrue(changes)
-            before = {path: path.read_bytes() for path in self.session_dir.rglob("*") if path.is_file()}
-            self.assertEqual(workers.repoint_unit_worktree(
-                "demo", "builders", old, new, "new-branch", from_production="demo"), ())
-            self.assertEqual({path: path.read_bytes() for path in before}, before)
-        state = json_object(self.session_dir / workers.STATE)
-        self.assertEqual((state["working_dir"], state["plan_doc"], state["project_plan_doc"]),
-                         (str(new), str(new / "plan.md"), str(new / "plan.md")))
-        record = cast(dict[str, object], json_object(self.session_dir / workers.ROSTER)["impl"])
-        self.assertEqual(record["cwd"], str(new))
-        self.assertEqual(record["status"], "paused")
-        with workers.ledger_for_run(self.session_dir).locked() as ledger:
-            self.assertIsInstance(ledger.workers["impl"].ownership, workers.Paused)
-        destination = self.next_run("after-path-repair")
-        state = json_object(destination / workers.STATE)
-        state.update({"working_dir": str(new), "plan_doc": str(new / "plan.md")})
-        _ = (destination / workers.STATE).write_text(json.dumps(state))
-        self.assertEqual(workers.adopt(self.session_dir, destination, "impl"), "impl")
-        prompt = destination / "continue.txt"
-        _ = prompt.write_text("Continue after the unit move.")
-        with bounded_worker_change(), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
-            code = codex_mesh.main([
-                "follow", "--session-dir", str(destination), "--to", "impl", "--role", "impl",
-                "--message-file", str(prompt), "--summary-file", str(destination / "summary.txt"),
-                "--log-file", str(destination / "impl.log"), "--timeout", "5",
-            ])
-        self.assertEqual(code, 0, errors.getvalue())
-        resumed = self.methods("thread/resume")
-        self.assertTrue(resumed)
-        self.assertTrue(all(cast(dict[str, object], request["params"])["threadId"] == mesh_fixture.THREAD_ID
-                            for request in resumed))
-        with workers.ledger_for_run(destination).locked() as ledger:
-            self.assertEqual(ledger.workers["impl"].backend,
-                             workers.CodexThread(mesh_fixture.THREAD_ID, original_home))
-        self.assertEqual(self.methods("thread/start"), [])
-
-    def test_a_message_arriving_after_adoption_intent_moves_once_to_the_new_owner(self) -> None:
-        self.open_worker(name="worker")
-        destination = self.next_run("message-race")
-        pending = self.session_dir / "worker.pending.json"
-
-        def enqueue_after_intent(stage: str) -> None:
-            if stage == "intent":
-                _ = pending.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
-                    "messages": ["Deliver this exactly once."], "accepting_messages": True}))
-
-        with bounded_worker_change(), observe_adoption_writes(self.session_dir, destination, enqueue_after_intent):
-            self.assertEqual(workers.adopt(self.session_dir, destination, "worker"), "worker")
-        self.assertEqual(json_object(pending)["messages"], [])
-        target = destination / "worker.pending.json"
-        self.assertEqual(json_object(target)["messages"], ["Deliver this exactly once."])
-        source = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["worker"])
-        self.assertEqual(source["adopted_to"], str(destination))
-        self.assertEqual(cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)["worker"])["thread_id"], mesh_fixture.THREAD_ID)
-        with bounded_worker_change():
-            workers.recover_adoptions(destination)
-        self.assertEqual(json_object(target)["messages"], ["Deliver this exactly once."])
-        data = json_object(workers.ledger_for_run(self.session_dir).path)
-        self.assertEqual(data["adoptions"], {})
-
-    def test_conflicting_recovery_preserves_the_new_owner_and_unblocks_other_work(self) -> None:
-        self.open_worker(name="worker")
-        destination = self.next_run("recovery-conflict")
-
-        def interrupted(stage: str) -> None:
-            if stage == "source":
-                raise AdoptionWriteInterrupted(stage)
-
-        with bounded_worker_change(), observe_adoption_writes(self.session_dir, destination, interrupted):
-            with self.assertRaises(AdoptionWriteInterrupted):
-                _ = workers.adopt(self.session_dir, destination, "worker")
-        concurrent = {"worker": {"thread_id": "concurrent-owner-thread", "status": "done",
-                                 "role": "review", "revision": 99}}
-        destination_roster = destination / codex_mesh.ROSTER_FILE
-        _ = destination_roster.write_text(json.dumps(concurrent))
-        destination_inbox = destination / "worker.pending.json"
-        _ = destination_inbox.write_text(json.dumps({"thread_id": "concurrent-owner-thread",
-                                                   "messages": ["Keep the concurrent owner's work."]}))
-        before_roster, before_inbox = destination_roster.read_bytes(), destination_inbox.read_bytes()
-        result = subprocess.run([
-            sys.executable, str(Path(codex_mesh.__file__)), "follow", "--session-dir", str(self.session_dir),
-            *self.follow_cli()[1:],
-        ], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("quarantin", result.stderr.lower())
-        self.assertNotIn("Traceback", result.stderr)
-        self.assertEqual(destination_roster.read_bytes(), before_roster)
-        self.assertEqual(destination_inbox.read_bytes(), before_inbox)
-        source = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["worker"])
-        self.assertNotIn("adopted_to", source)
-        data = json_object(workers.ledger_for_run(self.session_dir).path)
-        self.assertEqual(data["adoptions"], {})
-        self.assertTrue(data.get("quarantined_adoptions"))
-
-        with bounded_worker_change():
-            workers.recover_adoptions(destination)
-        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-        roster["other-worker"] = {"thread_id": fixture_runtime_id("other-worker-recovery"), "status": "done", "role": "test",
-                                  "codex_home": os.environ["CODEX_HOME"], "model": "gpt-kept-sol"}
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-        self.assertEqual(self.resolve(self.session_dir, "test"), "other-worker")
-
-    def test_a_truncated_adoption_intent_is_quarantined_once_and_does_not_poison_resolution(self) -> None:
-        self.open_worker()
-        name = self.resolve(self.session_dir)
-        self.complete_assignment(name)
-        store = workers.ledger_for_run(self.session_dir)
-        data = json_object(store.path)
-        data["adoptions"] = {"truncated-intent": {"id": "truncated-intent"}}
-        _ = store.path.write_text(json.dumps(data))
-        with bounded_worker_change(), self.assertRaises(workers.WorkerUnavailable) as failure:
-            workers.recover_adoptions(self.session_dir)
-        self.assertIn("quarantin", str(failure.exception).lower())
-        self.assertEqual(self.resolve(self.session_dir), name)
-        after = json_object(store.path)
-        self.assertEqual(after["adoptions"], {})
-        self.assertIn("truncated-intent", cast(dict[str, object], after["quarantined_adoptions"]))
-        self.assertEqual(self.methods("thread/start"), [])
-
-    def test_a_damaged_ledger_worker_is_reported_once_and_healthy_follow_and_reopen_continue(self) -> None:
-        self.open_worker(name="impl")
-        self.assertEqual(self.resolve(self.session_dir), "impl")
-        self.complete_assignment("impl")
-        store = workers.ledger_for_run(self.session_dir)
-        data = json_object(store.path)
-        entries = cast(dict[str, object], data["workers"])
-        healthy = entries["impl"]
-        damaged = {**cast(dict[str, object], healthy),
-                   "backend": {"kind": "CodexThread", "codex_home": os.environ["CODEX_HOME"]}}
-        entries["damaged-worker"] = damaged
-        _ = store.path.write_text(json.dumps(data))
-
-        args = self.start_args()
-        args.to = "impl"
-        args.message_file = str(self.session_dir / "prompt.txt")
-        with bounded_worker_change(), redirect_stderr(io.StringIO()) as errors:
-            code = codex_mesh.command_follow(args)
-        self.assertEqual(code, 2, errors.getvalue())
-        self.assertIn("damaged-worker", errors.getvalue())
-        self.assertIn("quarantin", errors.getvalue().lower())
-        after = json_object(store.path)
-        self.assertEqual(cast(dict[str, object], after["workers"])["impl"], healthy)
-        self.assertNotIn("damaged-worker", cast(dict[str, object], after["workers"]))
-        quarantine = cast(dict[str, object], after["quarantined_workers"])
-        saved = cast(dict[str, object], quarantine["damaged-worker"])
-        self.assertEqual(saved["record"], damaged, "quarantine lost the undecodable persisted entry")
-        self.assertTrue(saved["reason"])
-
-        self.complete_assignment("impl")
-        roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-        cast(dict[str, object], roster["impl"])["status"] = "ended"
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
-        with bounded_worker_change(), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
-            code = codex_mesh.main(["reopen", "--session-dir", str(self.session_dir), "--to", "impl"])
-        self.assertEqual(code, 0, errors.getvalue())
-        with bounded_worker_change():
-            workers.recover_adoptions(self.session_dir)
-        final = json_object(store.path)
-        self.assertEqual(final["quarantined_workers"], quarantine)
-        with store.locked() as ledger:
-            self.assertEqual(ledger.workers["impl"].backend,
-                             workers.CodexThread(mesh_fixture.THREAD_ID, os.environ["CODEX_HOME"]))
-        self.assertEqual(self.methods("thread/start"), [])
 
     def test_reactivated_run_reopens_its_worker_on_the_same_thread(self) -> None:
         (self.session_dir / workers.STATE).unlink()
@@ -1876,7 +980,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         record = cast(dict[str, object], roster[name])
         record["status"] = "ended"
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(session_staff.stored_worker_records(roster)))
         marker = self.session_dir / f"{name}.end"
         marker.touch()
         _ = invoke_recorder([

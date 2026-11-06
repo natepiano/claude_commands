@@ -10,6 +10,8 @@ refusing every progress call while two agents were still working.
 from __future__ import annotations
 
 from scripts.lib import test_hang_guard
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file
 
 from scripts.lib.test_models_registry import registry_text, write_registry
 
@@ -34,18 +36,6 @@ AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
 
 
-# The wrapper calls this as: <task> write <working_dir> <prompt> <reply> <log>.
-# Writing both outputs and exiting immediately drives the wrapper's completion
-# branch without a model call; the wrapper copies the reply into the summary
-# file because the stub, like a worker that skipped its last act, left it
-# empty.
-STUB_AGENT_EXEC = """#!/usr/bin/env bash
-set -euo pipefail
-printf 'Wrote the retry path.\\n' > "$5"
-printf 'stub agent log\\n' > "$6"
-if [[ -n "${TEST_WORKER_STARTED:-}" ]]; then : > "$TEST_WORKER_STARTED"; fi
-"""
-
 STUB_MESH = "#!/usr/bin/env python3\n" + STUB_ATOMIC_JSON_WRITER + """
 import json
 import os
@@ -65,12 +55,24 @@ if verb in ('compact', 'can-follow', 'follow'):
     with (session / 'mesh_events.txt').open('a') as events:
         events.write(verb + '\\n')
 if verb == 'follow':
-    (session / 'follow_cwd.txt').write_text(option('--cwd'))
+    from scripts.production import staff, session_staff, worker_admission
+    member = worker_admission.member(session, option('--to'))
+    (session / 'follow_cwd.txt').write_text(str(session_staff.worker_directory(staff.local_snapshot(), member.id)))
 if verb == 'start':
+    baseline = session / 'phases/3/phase_baseline'
+    if baseline.exists():
+        (session / 'baseline-at-worker-open').write_bytes(baseline.read_bytes())
     name = option('--name')
     roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
                     'status': 'done', 'role': option('--role'), 'task': option('--task')}
+    from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
+    from scripts.production import staff
+    with isolated_staff_file(pathlib.Path(os.environ['STAFF_FILE']), {}):
+        worker = fixture_worker(name, staff.native_id(os.environ['CODEX_THREAD_ID']), backend=staff.CodexBackend(pathlib.Path.home() / '.codex'))
+    roster[name]['staff_id'] = worker.id
     pathlib.Path(option('--reply-file')).write_text('initial reply\\n')
+    if os.environ.get('TEST_WORKER_STARTED'):
+        pathlib.Path(os.environ['TEST_WORKER_STARTED']).touch()
 elif verb == 'compact':
     name = option('--to')
     if os.environ.get('STUB_COMPACT_FAIL') == '1':
@@ -181,10 +183,14 @@ if sys.argv[1] == '--bg':
         pathlib.Path(os.environ['STUB_SUMMARY']).write_bytes(own_summary.read_bytes())
     name = sys.argv[sys.argv.index('--name') + 1]
     import uuid
+    session_id = 'abc12345-' + str(uuid.uuid5(uuid.NAMESPACE_URL, name))[9:]
+    projects = pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR') or str(root / '.claude')) / 'projects/fixture'
+    projects.mkdir(parents=True, exist_ok=True)
+    (projects / f'{session_id}.jsonl').write_text(json.dumps({'type': 'assistant', 'message': {'stop_reason': 'end_turn'}}) + '\\n')
     registry = pathlib.Path(os.environ.get('NOTIFIER_SESSIONS_DIR', str(root / 'sessions')))
     registry.mkdir(parents=True, exist_ok=True)
     (registry / f"{os.environ['FIXTURE_BACKEND_PID']}.json").write_text(json.dumps({
-        'id': 'abc12345', 'sessionId': 'abc12345-' + str(uuid.uuid5(uuid.NAMESPACE_URL, name))[9:],
+        'id': 'abc12345', 'sessionId': session_id,
         'name': name, 'pid': int(os.environ['FIXTURE_BACKEND_PID']),
         'procStart': os.environ['FIXTURE_BACKEND_START'], 'updatedAt': 1, 'messagingSocketPath': ''}))
     print(f'backgrounded · abc12345 · {name}')
@@ -202,7 +208,8 @@ elif sys.argv[1:3] == ['agents', '--json']:
     if launch_args.exists():
         arguments = json.loads(launch_args.read_text())
         name = arguments[arguments.index('--name') + 1]
-    print(json.dumps([{'id': 'abc12345', 'name': name, 'status': status}]
+    session_id = json.loads(next((root / 'sessions').glob('*.json')).read_text())['sessionId']
+    print(json.dumps([{'id': 'abc12345', 'sessionId': session_id, 'name': name, 'status': status}]
                      if status != 'gone' else []))
 elif sys.argv[1] == 'logs':
     pane = root / 'pane.bin'
@@ -231,7 +238,7 @@ if behavior == 'gone':
     (root / 'worker_state').write_text('gone\\n')
 if behavior == 'unreadable_once':
     (root / 'unreadable_listing_once').write_text('yes\\n')
-print('DELIVERED')
+print('SENT: fixture')
 """
 
 
@@ -265,6 +272,8 @@ class ImplementLauncherFixture(LauncherFixture):
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         with isolated_staff_file(self.root / "staff.json", {}):
             parent = unit_membership("fixture", "fixture-unit")
+            from scripts.production import staff
+            parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.working_dir), expected=parent.worktree)
         return parent.id
 
     @override
@@ -295,9 +304,20 @@ class ImplementLauncherFixture(LauncherFixture):
         }))
         self.implement_script = self.build_script_tree()
 
+    @override
+    def start_phase(self, name: str) -> Path:
+        session = super().start_phase(name)
+        state_file = session / "progress_history_state.json"
+        state = cast(dict[str, object], json.loads(state_file.read_text()))
+        state["owner_staff_id"] = self.staff_parent
+        _ = state_file.write_text(json.dumps(state))
+        return session
+
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
+        # These tests cover the launcher after admission. Assign tests cover admission.
+        _ = (direct_dir / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
         for name in ("conf.py", "conf.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
@@ -306,9 +326,6 @@ class ImplementLauncherFixture(LauncherFixture):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/py", home_lib / "py")
         configure_launcher_fixture(direct_dir / "implement.sh")
         _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
-        stub = agents / "agent_exec.sh"
-        _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
-        stub.chmod(0o755)
         mesh = agents / "codex_mesh.py"
         _ = mesh.write_text(STUB_MESH, encoding="utf-8")
         mesh.chmod(0o755)
@@ -324,7 +341,7 @@ class ImplementLauncherFixture(LauncherFixture):
         _ = shutil.copy2(AGENTS_DIR / "agent_bg.sh", agent_bg)
         _ = agent_bg.write_text(
             agent_bg.read_text(encoding="utf-8").replace(
-                'POLL_SECS="${8:-15}"', 'POLL_SECS="${8:-0.05}"'
+                'POLL_SECS="${7:-15}"', 'POLL_SECS="${7:-0.05}"'
             ), encoding="utf-8",
         )
         return direct_dir / "implement.sh"
@@ -349,9 +366,6 @@ class ImplementLauncherFixture(LauncherFixture):
             _ = environment.pop(name, None)
         environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
-        # The plain launcher, so the stub above stands in for the agent. The mesh
-        # path would need a live app-server, which is a different test's subject.
-        environment["UNIT_CODEX_MESH"] = "0"
         return environment
 
     def launch(
@@ -414,7 +428,6 @@ printf '%s\\n' '{answer}'
 
     def mesh_environment(self, fail: bool = False) -> dict[str, str]:
         environment = self.environment()
-        environment["UNIT_CODEX_MESH"] = "1"
         if fail:
             environment["STUB_FOLLOW_FAIL"] = "1"
         return environment
@@ -517,12 +530,19 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     def observed_status(self, session_dir: Path, command: str) -> str:
         return (session_dir / f"observed_{command}.txt").read_text(encoding="utf-8")
 
+    def recorded_worker(self, session_dir: Path, slot: str = "impl") -> staff.StaffRow:
+        identity = cast(dict[str, object], json.loads((session_dir / f"impl_worker_{slot}.json").read_text()))
+        with isolated_staff_file(self.root / "staff.json", {}):
+            member = staff.local_snapshot().by_id(staff.native_id(str(identity["staff_id"])))
+        assert member is not None
+        return member
+
     def claude_worker(self, session_dir: Path) -> Path:
         registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, base_text=CLAUDE_REGISTRY)
         sessions = self.root / "sessions"
         sessions.mkdir()
-        projects = self.root / "projects" / "fixture"
+        projects = self.root / ".claude" / "projects" / "fixture"
         projects.mkdir(parents=True)
         session_id = "abc12345-2222-4333-8444-555555555555"
         _ = (sessions / f"{os.getpid()}.json").write_text(json.dumps({
@@ -535,21 +555,20 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             json.dumps({"type": "assistant", "message": {"stop_reason": "end_turn"}})
             + "\n", encoding="utf-8"
         )
-        _ = (session_dir / "workers").write_text(
-            "abc12345\tfixture-impl\n", encoding="utf-8"
-        )
-        _ = (session_dir / "impl_bg_id_impl").write_text(
-            "abc12345\n", encoding="utf-8"
-        )
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_worker, isolated_staff_file
+        with isolated_staff_file(self.root / "staff.json", {
+            "CLAUDE_CONFIG_DIR": str(projects.parent.parent),
+        }):
+            worker = fixture_worker("fixture-impl", staff.native_id(self.staff_parent), runtime_id=session_id)
         _ = (session_dir / "impl_worker_impl.json").write_text(json.dumps({
-            "name": "fixture-impl", "slot": "impl", "family": "claude",
-            "model": "opus", "worker_id": session_id,
+            "staff_id": worker.id, "slot": "impl", "model": "opus",
         }), encoding="utf-8")
         _ = (session_dir / "impl_status_impl").write_text(
             "implemented\n", encoding="utf-8"
         )
         _ = (self.root / "worker_state").write_text("idle\n", encoding="utf-8")
-        for name, content in (("claude", STUB_CLAUDE), ("send", STUB_SEND)):
+        for name, content in (("claude-bin", STUB_CLAUDE), ("send", STUB_SEND)):
             script = self.root / name
             _ = script.write_text(content, encoding="utf-8")
             script.chmod(0o755)
@@ -560,10 +579,10 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     ) -> subprocess.CompletedProcess[str]:
         environment = self.environment()
         environment.update({
-            "CLAUDE_BIN": str(self.root / "claude"),
+            "CLAUDE_BIN": str(self.root / "claude-bin"),
             "AGENT_BG_SEND_SCRIPT": str(self.root / "send"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "CLAUDE_PROJECTS_DIR": str(self.root / "projects"),
+            "CLAUDE_PROJECTS_DIR": str(transcript.parent.parent),
             "STUB_CLAUDE_ROOT": str(self.root),
             "STUB_TRANSCRIPT": str(transcript),
             "STUB_SUMMARY": str(session_dir / "impl_summary_impl.txt"),
@@ -592,7 +611,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     ) -> subprocess.CompletedProcess[str]:
         registry = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
-        stub = self.root / "claude"
+        stub = self.root / "claude-bin"
         _ = stub.write_text(STUB_CLAUDE, encoding="utf-8")
         stub.chmod(0o755)
         environment = self.environment()

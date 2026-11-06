@@ -19,8 +19,14 @@ import index
 import cgroup_capture
 from cgroup_capture import SliceAbsent as SliceAbsent, SlicePresent as SlicePresent, SliceCollection as SliceCollection
 import store
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.build_queue import queue_snapshot
+from scripts.build_queue.queue_evidence import room_text
+from scripts.lint import memory_admit as gate
 
 import conf
 
@@ -48,8 +54,8 @@ class MemorySnapshot(TypedDict):
     kind: Literal["memory_snapshot"]
     at: str
     host: str
-    slices: SliceCollection
     zram: ZramPresent | ZramAbsent
+    slices: SliceCollection
 
 
 class SnapshotUnavailable(TypedDict):
@@ -77,6 +83,16 @@ def cmdline_program(cmdline: str) -> str:
     return cmdline.partition(" ")[0]
 
 
+def build_output_program(program: str) -> bool:
+    """Check the resolved program's parent folders for Cargo output."""
+    executable = Path(program)
+    if not executable.is_absolute():
+        return False
+    import sweep
+
+    return any(sweep.is_cargo_target(str(parent)) for parent in executable.resolve().parents)
+
+
 @dataclass(frozen=True)
 class EarlyoomKill:
     at: datetime
@@ -85,16 +101,18 @@ class EarlyoomKill:
     oom_score_adj: int | OomScoreAdjUnavailable = OomScoreAdjUnavailable.VALUE
     cmdline: str | CmdlineUnavailable = CmdlineUnavailable.VALUE
 
+    def _target_program(self) -> bool:
+        return isinstance(self.cmdline, str) and build_output_program(cmdline_program(self.cmdline))
+
     @property
     def outside_build_gate(self) -> bool:
-        if self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj") or not isinstance(self.cmdline, str):
-            return False
-        return "/target/" in cmdline_program(self.cmdline)
+        gated = self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
+        return not gated and self._target_program()
 
     @property
     def is_build(self) -> bool:
-        return (self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
-                or isinstance(self.cmdline, str) and "/target/" in cmdline_program(self.cmdline))
+        gated = self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
+        return gated or self._target_program()
 
 
 def service_state(value: int | None) -> ServiceState:
@@ -121,29 +139,30 @@ def slice_state(path: Path) -> SlicePresent | SliceAbsent:
 
 
 def zram_state(path: Path) -> ZramPresent | ZramAbsent:
-    if not path.is_dir():
-        return {"state": "absent"}
     try:
+        if not path.is_dir():
+            return {"state": "absent"}
         data, compressed, *_ = (path / "mm_stat").read_text().split()
         return {"state": "present", "data_bytes": int(data), "compressed_bytes": int(compressed)}
     except (OSError, ValueError, UnicodeError):
         return {"state": "absent"}
 
 
-def write_snapshot(at: float, host: str, slices: SliceCollection | None = None) -> MemorySnapshot:
+def read_zram() -> ZramPresent | ZramAbsent:
+    return zram_state(Path(os.environ.get("BUILDLOG_ZRAM", "/sys/block/zram0")))
+
+
+def snapshot() -> MemorySnapshot:
+    at, host = time.time(), store.host_name()
     record: MemorySnapshot = {
         "kind": "memory_snapshot",
         "at": store.utc_iso(at),
         "host": host,
-        "slices": slices if slices is not None else cgroup_capture.read_slices(),
-        "zram": zram_state(Path(os.environ.get("BUILDLOG_ZRAM", "/sys/block/zram0"))),
+        "zram": read_zram(),
+        "slices": cgroup_capture.read_slices(),
     }
     store.append_line(store.sample_file(host, at), record)
     return record
-
-
-def snapshot() -> MemorySnapshot:
-    return write_snapshot(time.time(), store.host_name())
 
 
 def local_time(value: datetime | str, *, with_date: bool = False) -> str:
@@ -276,15 +295,35 @@ def earlyoom_kills(start: datetime, end: datetime) -> list[EarlyoomKill] | Journ
 def nearest_snapshot(connection: sqlite3.Connection, instant: datetime) -> SnapshotNearInstant:
     left = stored_bound(instant - timedelta(seconds=SNAPSHOT_DISTANCE_S))
     right = stored_bound(instant + timedelta(seconds=SNAPSHOT_DISTANCE_S))
-    rows = cast(list[tuple[str, str, str, str]], connection.execute(
-        "SELECT at, host, slices, zram FROM memory_snapshots WHERE host = ? AND at >= ? AND at < ?",
-        (store.host_name(), left, right),
-    ).fetchall())
-    if not rows:
+    host = store.host_name()
+    bounds = (host, left, right)
+    timestamp = instant.timestamp()
+
+    def nearest_value(column: Literal["slices", "zram"]) -> tuple[str, str] | None:
+        rows = cast(list[tuple[str, str, int]], connection.execute(
+            f"SELECT at, {column}, 0 FROM memory_snapshots "
+            + f"WHERE host = ? AND at >= ? AND at < ? AND {column} IS NOT NULL "
+            + f"UNION ALL SELECT at, {column}, 1 FROM samples "
+            + f"WHERE host = ? AND at >= ? AND at < ? AND {column} IS NOT NULL",
+            (*bounds, *bounds),
+        ).fetchall())
+        if not rows:
+            return None
+        nearest = min(rows, key=lambda row: (
+            abs(datetime.fromisoformat(row[0]).timestamp() - timestamp), row[2], row[0],
+        ))
+        return nearest[0], nearest[1]
+
+    slices_reading = nearest_value("slices")
+    if slices_reading is None:
         return {"kind": "unavailable"}
-    at, host, slices, zram = min(rows, key=lambda row: abs(datetime.fromisoformat(row[0]).timestamp() - instant.timestamp()))
+    at, slices = slices_reading
+    zram_reading = nearest_value("zram")
+    zram: ZramPresent | ZramAbsent = {"state": "absent"}
+    if zram_reading is not None:
+        zram = cast(ZramPresent | ZramAbsent, json.loads(zram_reading[1]))
     return {"kind": "memory_snapshot", "at": at, "host": host,
-            "slices": cast(SliceCollection, json.loads(slices)), "zram": cast(ZramPresent | ZramAbsent, json.loads(zram))}
+            "slices": cast(SliceCollection, json.loads(slices)), "zram": zram}
 
 
 def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: SnapshotNearInstant,
@@ -332,6 +371,12 @@ def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: S
 
 def window_report(connection: sqlite3.Connection, start: datetime, end: datetime) -> str:
     lines = [f"Memory, {local_time(start, with_date=True)} to {local_time(end, with_date=True)}"]
+    recorded = queue_snapshot.read_queue_snapshot(store.root() / "admission")
+    cap_line = ""
+    if isinstance(recorded, queue_snapshot.QueueSnapshot) and start.timestamp() <= recorded.written_at < end.timestamp():
+        cap_line = room_text(gate.head_policy(recorded.inputs, recorded.written_at,
+                            gate.AdmissionLimits(recorded.policy.safety_bytes), recorded.policy).room)
+    lines.append(cap_line or "Cap: no recorded admission pass in this window")
     early = earlyoom_kills(start, end)
     if early is JournalUnavailable.VALUE:
         lines.append("earlyoom kills: journal unavailable")

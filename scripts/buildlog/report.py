@@ -1522,7 +1522,7 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
     if any(isinstance(window.moment, moments.MemoryMoment) for window in windows):
         lines += [
-            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under /target/; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
+            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under a Cargo target folder; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
             "Full memory stall: stall_full_us deltas ÷ sampled elapsed microseconds, natedev's 60 s samples; resets, boot changes and gaps are unknown.",
             "Memory wait p90: nearest-rank 90th percentile of recorded mem_wait_s on natedev steps started in the window, zero waits included.",
             "Memory-kill retries/day: (sum(mem_kills) − sum(mem_kill_stopped)) ÷ window days on natedev calls started in the window; stopped calls are in brackets, per day.", "",
@@ -2269,10 +2269,23 @@ def disk_section() -> list[str]:
     if snapshot is None:
         return []
     rows = [[row["label"], gib(row["bytes"])] for row in snapshot["rows"]]
-    rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
-    floor = snapshot["floor"]
-    free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
-    rows.append([free_label, gib(snapshot["free"])])
+    capacities = snapshot.get("filesystems", [])
+    if capacities:
+        seen: set[str] = set()
+        for capacity in capacities:
+            if capacity["device"] in seen:
+                continue
+            seen.add(capacity["device"])
+            label = f"{capacity['path']} ({capacity['device']}, {capacity['device_name']})"
+            rows.append([f"{label} used", gib(capacity["used"])])
+            rows.append([f"{label} free", gib(capacity["free"])])
+    else:
+        rows.append(["other", gib(max(0, snapshot["used"] - sum(row["bytes"] for row in snapshot["rows"])))])
+        floor = snapshot["floor"]
+        free_label = f"free (floor {gib(floor)})" if floor is not None else "free"
+        rows.append([free_label, gib(snapshot["free"])])
+    rows.extend([f"Cargo outputs unavailable: {reason}", "unavailable"]
+                for reason in snapshot.get("output_unavailable", []))
     measured = sync.sync_time(snapshot["measured_at"], datetime.now())
     return [
         f"### Disk: {snapshot['host']}",

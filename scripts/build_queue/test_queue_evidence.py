@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import admission_policy_fixture
 
 from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.scope_activity import IdleService, RunningServiceJob
 from scripts.build_queue import admission_client as client
 
 from contextlib import redirect_stderr, redirect_stdout
@@ -13,19 +14,24 @@ from dataclasses import replace
 import io
 import json
 import os
-import re
 from pathlib import Path
 import tempfile
 import time
 import unittest
-from typing import TypedDict, Unpack, cast, override
+from typing import TYPE_CHECKING, TypedDict, Unpack, cast, override
 from unittest import mock
 
 from scripts.build_queue import queue_evidence, head_facts, build_queue, queue_card, queue_view
 from scripts.build_queue.queue_lines import Line, plain
-from scripts.build_queue.queue_fixture import write_process, fixture_queue_read, write_recovery_fixture
+from scripts.build_queue.queue_fixture import write_process, fixture_queue_read
 from scripts.build_queue.queue_fixture import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
+
+if TYPE_CHECKING:
+    from scripts.buildlog import store
+else:
+    import store
+
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
 from scripts.lib.user_zone import user_zone
@@ -72,7 +78,6 @@ class QueueEvidenceTests(unittest.TestCase):
             "BUILDLOG_MEMINFO": str(self.root / "meminfo"),
             "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
-            "BUILDLOG_BUILD_BUDGET_GIB": "21",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "USER_ZONE": "America/New_York",
             "CONF_DIR": str(config.parent),
@@ -87,7 +92,8 @@ class QueueEvidenceTests(unittest.TestCase):
         _ = self.running(400, "frame-cost", "clippy", 6.8, 6.1, 60)
         compiler = self.root / "builds.slice/sccache.service"
         compiler.mkdir(parents=True)
-        _ = (compiler / "memory.stat").write_text(f"anon {gib(0.4)}\nfile 0\n")
+        _ = (compiler / "memory.stat").write_text(f"anon {gib(0.4)}\nfile 0\ninactive_file 0\n")
+        _ = (compiler / "memory.current").write_text(str(gib(0.4)))
         self.head_path = self.waiter(500, "inspectors-fix", 11.8, 122)
         self.change_head(need_source="measured", need_runs=7, test_threads=8,
                          test_scope="filtered", package="hana_inspectors",
@@ -98,6 +104,7 @@ class QueueEvidenceTests(unittest.TestCase):
         entries = [self.entry(name) for name in ("widget", "demo", "organon", "frame-cost", "inspectors-fix")]
         labels = roster.unit_labels(entries)
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value=labels))
+        _ = self.enterContext(mock.patch.object(gate, "priority_labels", return_value=labels))
 
     def entry(self, name: str) -> roster.RosterEntry:
         return roster.RosterEntry(
@@ -113,9 +120,16 @@ class QueueEvidenceTests(unittest.TestCase):
                 age: int, *, peak: float = 0) -> Path:
         write_process(self.proc, pid, gib(used))
         folder = "/tmp/p34-merge" if name == "widget" else f"/tmp/{name}"
+        scope = self.root / f"{pid}.scope"
+        scope.mkdir(exist_ok=True)
+        _ = (scope / "memory.current").write_text(str(gib(used)))
+        _ = (scope / "memory.stat").write_text(f"anon {gib(used)}\ninactive_file 0\n")
+        _ = (scope / "cgroup.procs").write_text(str(pid))
+        sidecar = self.root / f"{pid}.scope-name"
+        _ = sidecar.write_text(str(scope))
         row: dict[str, object] = {
             "pid": pid, "start_time": str(pid), "need": gib(need), "repo": "hana", "step": step,
-            "worktree": folder, "sidecar": "", "admitted_at": gate.store.utc_iso(NOW - age),
+            "worktree": folder, "sidecar": str(sidecar), "admitted_at": store.utc_iso(NOW - age),
             "test_threads": 8 if step == "nextest" else None, "call_id": None,
             "session_id": f"id-{name}", "session_name": f"stale-{name}",
         }
@@ -157,10 +171,47 @@ class QueueEvidenceTests(unittest.TestCase):
         for pattern in ("*.reservation", "*.max", "*.wave"):
             for path in self.directory.glob(pattern):
                 path.unlink()
-        _ = (self.root / "builds.slice/sccache.service/memory.stat").write_text("anon 0\nfile 0\n")
+        compiler = self.root / "builds.slice/sccache.service"
+        _ = (compiler / "memory.stat").write_text("anon 0\nfile 0\ninactive_file 0\n")
+        _ = (compiler / "memory.current").write_text("0")
         _ = (self.root / "meminfo").write_text(
             f"MemAvailable: {gib(available) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         self.change_head(need=gib(need))
+
+    def test_unavailable_run_use_names_the_run_without_showing_an_anonymous_sum(self) -> None:
+        self.reset_running(available=20, need=8)
+        for pid, name in ((100, "merge-holder"), (101, "other-holder")):
+            path = self.running(pid, name, "merge-gate", 6, 4, 180)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            row["sidecar"] = ""
+            row["reservation_id"] = name
+            _ = path.write_text(json.dumps(row))
+            _ = (self.proc / str(pid) / "status").write_text("VmRSS: 4194304 kB\nVmSwap: 1048576 kB\n")
+        status = self.proc / "100/status"
+        read_text = Path.read_text
+        for denied in (False, True):
+            with self.subTest(denied=denied):
+                _ = status.write_text("VmRSS: 4194304 kB\nVmSwap: 1048576 kB\n")
+
+                def read_private(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if denied and path == status:
+                        raise PermissionError(13, "Permission denied", str(path))
+                    return read_text(path, encoding=encoding, errors=errors)
+
+                with mock.patch.object(Path, "read_text", read_private):
+                    captured = fixture_queue_read(self.directory, gate.process_table(self.proc), NOW)
+                room = captured.explanation.room
+                assert isinstance(room, gate.MemoryRoom)
+                self.assertIsInstance(room.cap, gate.CapUnavailable)
+                text = queue_evidence.room_text(room)
+                self.assertIn("unavailable", text)
+                self.assertIn("merge-holder", text)
+                self.assertEqual(text.count("merge-holder"), 1)
+                self.assertEqual(text.count("other-holder"), 1)
+                self.assertEqual(text.count("anonymous use unavailable"), 1)
+                self.assertNotIn("anonymous use 0.0", text)
+                self.assertNotIn("anonymous use 4.0", text)
+                self.assertIn("room", text)
 
     def test_pressure_formatters_keep_the_recorded_hold_condition(self) -> None:
         pressure_path = self.root / "pressure"
@@ -179,8 +230,8 @@ class QueueEvidenceTests(unittest.TestCase):
                 assert isinstance(pressure, gate.MemoryPressure)
                 changed = replace(policy, pressure=replace(policy.pressure,
                     full_avg10_limit=100, swap_used_limit=100, some_avg10_limit=100))
-                memory_text = gate.pressure_text(pressure, changed)
-                evidence = queue_evidence.pressure_text(pressure, user_zone(), changed)
+                memory_text = gate.pressure_text(pressure)
+                evidence = queue_evidence.pressure_text(pressure, changed)
                 if detail == "swap":
                     self.assertIn("swap", memory_text)
                     self.assertIn("starts when swap", evidence)
@@ -189,17 +240,6 @@ class QueueEvidenceTests(unittest.TestCase):
                     self.assertIn("full avg10", memory_text)
                     self.assertIn("starts below full", evidence)
 
-    def test_budget_text_preserves_pass_block_and_run_alone_arithmetic(self) -> None:
-        for check, expected in (
-            (gate.BudgetCheck(4 * GIB, 6 * GIB, 12 * GIB, 6 * GIB, True),
-             "Build budget: charged 4.0 + need 6.0 = 10.0 GiB <= 12.0 GiB: pass; starts when charged falls to 6.0 GiB"),
-            (gate.BudgetCheck(8 * GIB, 6 * GIB, 12 * GIB, 6 * GIB, False),
-             "Build budget: charged 8.0 + need 6.0 = 14.0 GiB > 12.0 GiB: blocked; starts when charged falls to 6.0 GiB"),
-            (gate.BudgetCheck(0, 14 * GIB, 12 * GIB, 0, True),
-             "Build budget: charged 0.0 + need 14.0 = 14.0 GiB > 12.0 GiB: pass; run-alone exception; starts when charged falls to 0.0 GiB"),
-        ):
-            with self.subTest(check=check):
-                self.assertEqual(queue_evidence.budget_text(check), expected)
 
     def test_free_text_preserves_pass_and_blocked_arithmetic(self) -> None:
         for available, passes, relation, result in ((12, True, ">=", "pass"), (10, False, "<", "blocked")):
@@ -208,17 +248,16 @@ class QueueEvidenceTests(unittest.TestCase):
                 self.assertEqual(queue_evidence.free_text(check),
                     f"Free memory: free {available:.1f} GiB {relation} need 6.0 + earlyoom 3.0 + promise not yet used 2.0 = 11.0 GiB: {result}")
 
-    def test_capped_need_uses_the_reply_budget_without_configuration_reads(self) -> None:
+    def test_capped_need_uses_the_saved_budget_without_configuration_reads(self) -> None:
+        rule = gate.ReleaseHeadroom(gate.read_memory_config(report=False).release_headroom)
         source = gate.RecordedNeed("shape", 10, 14, "full", "", (), gate.WidthNotRecorded(),
             gate.ShapeP90(10, gate.FailedPeakFloor(16 * GIB, "2026-10-30T01:40:00Z"),
-                          gate.ReleaseHeadroom(), gate.CappedAtBudget(30 * GIB)))
+                          rule, gate.CappedAtBudget(30 * GIB, 19 * GIB)))
         zone = user_zone()
-        with mock.patch.object(gate, "build_budget_bytes", side_effect=AssertionError("live budget")), \
-             mock.patch.object(gate, "memory_config", side_effect=AssertionError("live policy")), \
-             mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("live policy")), \
+        with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("live policy")), \
              mock.patch("conf.read", side_effect=AssertionError("live configuration")):
-            text = queue_evidence.need_text(source, budget=19 * GIB, zone=zone)
-        for value in ("19.0 GiB", "30.0 GiB", "16.0 GiB", "1.314", "14 days"):
+            text = queue_evidence.need_text(source, zone=zone)
+        for value in ("19.0 GiB", "30.0 GiB", "16.0 GiB", str(rule.factor), "14 days"):
             self.assertIn(value, text)
         self.assertNotIn("21.0 GiB", text)
 
@@ -235,12 +274,11 @@ class QueueEvidenceTests(unittest.TestCase):
 
     def test_unknown_admission_time_keeps_the_running_charge_and_basis(self) -> None:
         reading = gate.queue_read()
-        running = replace(reading.explanation.running[0], admitted_at=gate.AdmissionTimeNotRecorded(),
-                          basis=gate.LifetimePromise(6 * GIB), promise=6 * GIB, charged=6 * GIB)
-        text = queue_evidence.running_text(running, reading.explanation, {}, user_zone())
+        running = replace(reading.explanation.running[0], admitted_at=gate.AdmissionTimeNotRecorded())
+        explanation = replace(reading.explanation, running=(running, *reading.explanation.running[1:]))
+        text = queue_evidence.running_text(running, explanation, {}, user_zone())
         self.assertIn("admission time unknown", text)
-        self.assertIn("promise 6.0 GiB, charge 6.0 GiB", text)
-        self.assertIn("holds until the step ends", text)
+        self.assertIn("need 10.8 GiB; anonymous use 0.8 GiB; held slot 0.0 GiB; kept aside 10.0 GiB", text)
         self.assertNotIn("admitted 00:00", text)
 
     def test_optional_load_failure_preserves_evidence_and_release_advice(self) -> None:
@@ -295,48 +333,38 @@ class QueueEvidenceTests(unittest.TestCase):
         self.assertEqual(text.count("Host load: 64.25"), 1)
         self.assertEqual(text.count("#1 of 17"), 1)
 
-    def test_test_phase_charge_explains_the_mark_need_history_width_and_margin(self) -> None:
-        need = gate.TestPhaseNeed(2 * GIB, 7, 8, 12, "wider_unscaled", 1.5)
-        charge = gate.TestPhaseCharge(gib(3), gib(0.4), need, NOW - 60)
-        self.assertEqual(queue_evidence.charge_text(charge, user_zone(), policy=admission_policy_fixture(), step="nextest"),
-                         "tests since 21:50: peak so far 0.4 GiB, need 2.0 GiB "
-                         + "(wider_unscaled, p90 of 7 runs at width 12), × 1.5")
 
     def test_expired_head_explains_refresh_even_when_all_resource_checks_pass(self) -> None:
         self.reset_running(available=60, need=1)
-        self.change_head(estimated_at=NOW - admission_policy_fixture().timing.head_seconds)
+        self.change_head(estimated_at=NOW - admission_policy_fixture().timing.estimate_refresh_seconds)
         text = self.output()
         self.assertIn("the estimate expired at 21:41; the client refreshes it through the admission service", text)
         explanation = gate.explain_queue()
         assert isinstance(explanation.head, gate.HeadExplanation)
-        self.assertTrue(explanation.head.budget.passes)
+        self.assertTrue(explanation.head.room.passes)
         self.assertTrue(explanation.head.free.passes)
 
     def test_expired_head_release_advice_requires_refresh_instead_of_queue_order_or_a_start_time(self) -> None:
         self.reset_running(available=40, need=1)
         _ = self.running(800, "holder", "clippy", 1, 1, 3600)
-        expired_at = NOW - admission_policy_fixture().timing.head_seconds
+        expired_at = NOW - admission_policy_fixture().timing.estimate_refresh_seconds
         self.change_head(estimated_at=expired_at)
-        for recovering in (False, True):
-            with self.subTest(recovering=recovering):
-                if recovering:
-                    write_recovery_fixture(self.directory, gate.RecoveryStarts(NOW + 120, NOW + 37))
-                explanation = gate.explain_queue()
-                assert isinstance(explanation.head, gate.HeadExplanation)
-                self.assertTrue(explanation.head.budget.passes)
-                self.assertTrue(explanation.head.free.passes)
-                for outcome in (gate.head_after_steps_end(explanation, ()),
-                                gate.head_after_steps_end(explanation, (0,)),
-                                gate.smallest_head_release(explanation)):
-                    self.assertEqual(outcome, gate.EstimateExpired(expired_at))
-                final = self.line(self.output(), "Frees when:")
-                frees_when = final.partition("Frees when: ")[2]
-                self.assertIn("the estimate expired at 21:41; the client refreshes it through the admission service", frees_when)
-                self.assertNotIn("queue order", frees_when)
-                self.assertNotIn("recovery spacing starts it at", frees_when)
+        explanation = gate.explain_queue()
+        assert isinstance(explanation.head, gate.HeadExplanation)
+        self.assertTrue(explanation.head.room.passes)
+        self.assertTrue(explanation.head.free.passes)
+        for outcome in (gate.head_after_steps_end(explanation, ()),
+                        gate.head_after_steps_end(explanation, (0,)),
+                        gate.smallest_head_release(explanation)):
+            self.assertEqual(outcome, gate.EstimateExpired(expired_at))
+        final = self.line(self.output(), "Frees when:")
+        frees_when = final.partition("Frees when: ")[2]
+        self.assertIn("the estimate expired at 21:41; the client refreshes it through the admission service", frees_when)
+        self.assertNotIn("queue order", frees_when)
+        self.assertNotIn("recovery spacing starts it at", frees_when)
 
     def test_release_advice_uses_admissions_run_alone_exception(self) -> None:
-        self.reset_running(available=40, need=22)
+        self.reset_running(available=20, need=22)
         _ = self.running(800, "only-holder", "clippy", 1, 1, 3600)
         output = self.output()
         final = self.line(output, "Frees when:")
@@ -350,15 +378,14 @@ class QueueEvidenceTests(unittest.TestCase):
         from dataclasses import replace
         reading = gate.queue_read()
         priority: gate.QueuePriority = {"unit": "resources", "why": "work", "set_at": NOW,
-            "set_by": "showrunner"}
+            "set_by": "showrunner", "transition": gate.SettledPriority()}
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         facts = head_facts.read_head_facts(reading)
         model = queue_view.QueueModel(reading, {}, facts, head_facts.PaceUnavailable(), user_zone(), queue_view.HostLoadUnavailable(),
             gate.smallest_head_release(reading.explanation))
-        self.assertIn("queue priority: resources (the user's bump)",
-                      plain(queue_view.render_view(model, 400)))
+        self.assertIn("queue priority: resources (work)", plain(queue_view.render_view(model, 400)))
 
-    def test_override_free_memory_terms_add_up_to_its_printed_threshold(self) -> None:
+    def test_override_room_uses_the_recorded_head_need_and_safety(self) -> None:
         self.reset_running(available=23, need=12)
         _ = self.running(800, "growing", "clippy", 20, 1, 30)
         head_path, head = gate.queue_read().ordered[0]
@@ -368,26 +395,67 @@ class QueueEvidenceTests(unittest.TestCase):
             "set_by": "showrunner-id", "need": head["need"], "free": 23 * GIB, "reserve": 3 * GIB,
         }
         _ = gate.head_override_path(self.directory).write_text(json.dumps(override))
-        output = self.output()
-        free = self.line(output, "Free memory:")
-        match = re.search(r"need ([0-9.]+) \+ earlyoom ([0-9.]+) \+ promise not yet used ([0-9.]+) = ([0-9.]+) GiB: pass", free)
-        self.assertIsNotNone(match, free)
-        if match is not None:
-            need, reserve, growth, threshold = (float(value) for value in match.groups())
-            self.assertEqual((need, reserve, threshold), (12.0, 3.0, 15.0))
-            self.assertEqual(need + reserve + growth, threshold, free)
+        reading = gate.queue_read()
+        assert isinstance(reading.explanation.head, gate.HeadExplanation)
+        self.assertEqual(reading.explanation.head.room, gate.RoomCheck(12 * GIB, 20 * GIB, True, basis=gate.OverrideRoom()))
+        self.assertEqual(self.line(self.output(), "Room:"), "Room: need 12.0 GiB <= room 20.0 GiB: pass; head override")
+        self.assertNotIn("starts alone", self.output())
+
+    def test_card_shows_the_keep_aside_captured_by_the_admission_pass(self) -> None:
+        self.reset_running(available=10, need=12)
+        _ = self.running(800, "captured", "clippy", 8, 3, 3600)
+        reading = gate.queue_read()
+        room = reading.explanation.room
+        assert isinstance(room, gate.MemoryRoom)
+        hold, = room.runs
+        self.assertEqual(hold.bytes, 5 * GIB)
+        self.assertEqual(hold.use, gate.AnonymousRunUse(3 * GIB))
+        self.assertEqual(hold.need, 8 * GIB)
+        running, = (row for row in reading.explanation.running if gate.running_has_reservation(row.step))
+        self.assertEqual(running.charged, 8 * GIB)
+        model = queue_view.QueueModel(reading, {}, head_facts.read_head_facts(reading),
+            head_facts.PaceUnavailable(), user_zone(), queue_view.HostLoadUnavailable(),
+            gate.smallest_head_release(reading.explanation))
+        with mock.patch.object(gate, "read_meminfo", side_effect=AssertionError("use captured host memory")), \
+             mock.patch.object(gate, "reservation_memory", side_effect=AssertionError("use captured run memory")):
+            card = plain(queue_card.render_card(model, [1], 400))
+        self.assertIn("need 8.0 GiB; anonymous use 3.0 GiB; held slot 0.0 GiB; kept aside 5.0 GiB", card)
+        self.assertNotIn("kept aside 8.0 GiB", card)
+        head = reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        self.assertIn(queue_evidence.room_check_text(head.room), card)
 
     def test_release_advice_names_only_the_smaller_step_that_frees_enough_memory(self) -> None:
-        self.reset_running(available=3, need=8)
+        self.reset_running(available=13, need=8)
         _ = self.running(800, "large-peak", "clippy", 10, 0.1, 3600, peak=10)
         _ = self.running(801, "useful-release", "clippy", 9, 9, 3600)
         final = self.line(self.output(), "Frees when:")
         self.assertIn("stale-useful-release clippy end", final)
         self.assertNotIn("large-peak", final)
-        self.assertIn("budget charge drops 9.0 GiB", final)
+        self.assertIn("keep-aside drops 0.0 GiB; free memory rises 9.0 GiB", final)
+
+    def test_release_advice_retains_the_running_ci_keep_aside(self) -> None:
+        self.reset_running(available=15, need=11)
+        _ = self.running(800, "ending", "clippy", 8, 3, 3600)
+        _ = self.running(801, "remaining", "clippy", 1, 1, 3600)
+        inputs = gate.queue_read().explanation.decided_from
+        ending = next(index for index, step in enumerate(inputs.running) if step.session_id == "id-ending")
+        config = gate.read_memory_config()
+        for job, expected in ((IdleService(), gate.HeadAdmitsAfterEnd),
+                              (RunningServiceJob(NOW - 120), gate.HeadStillHeld)):
+            with self.subTest(job=job):
+                ci = gate.RunningStep("ci", "ci", "service", "/ci", 0,
+                    gate.UnownedSliceMemory(4 * GIB, owner="hana-ci.slice", job_state=job, pid=gate.PidNotRecorded()), pid=gate.PidNotRecorded())
+                captured = replace(inputs, running=(*inputs.running, ci))
+                explanation = gate.queue_read_from(captured, gate.resolve_admission_limits(config), config.policy).explanation
+                outcome = gate.head_after_steps_end(explanation, (ending,))
+                self.assertIsInstance(outcome, expected)
+                assert isinstance(outcome, (gate.HeadAdmitsAfterEnd, gate.HeadStillHeld))
+                expected_room = 8 * GIB if isinstance(job, RunningServiceJob) else 15 * GIB
+                self.assertEqual(outcome.decision.room.room, expected_room)
 
     def test_release_ties_choose_least_charge_then_running_table_order(self) -> None:
-        self.reset_running(available=40, need=14)
+        self.reset_running(available=4, need=14)
         for pid, name, charge in ((800, "larger", 8), (801, "first-small", 6), (802, "second-small", 6)):
             _ = self.running(pid, name, "clippy", charge, charge, 3600)
         final = self.line(self.output(), "Frees when:")
@@ -395,7 +463,7 @@ class QueueEvidenceTests(unittest.TestCase):
         self.assertNotIn("second-small", final)
 
     def test_equal_size_releases_choose_the_least_charge_even_later_in_the_table(self) -> None:
-        self.reset_running(available=40, need=6)
+        self.reset_running(available=0, need=6)
         for pid, name, charge in ((800, "largest", 8), (801, "medium", 7),
                                   (802, "small-a", 6), (803, "small-b", 6)):
             _ = self.running(pid, name, "clippy", charge, charge, 3600)
@@ -403,47 +471,12 @@ class QueueEvidenceTests(unittest.TestCase):
         self.assertIn("stale-small-a clippy + stale-small-b clippy end", final)
         self.assertNotIn("largest", final)
         self.assertNotIn("medium", final)
-        self.assertIn("budget charge drops 12.0 GiB", final)
+        self.assertIn("keep-aside drops 0.0 GiB; free memory rises 12.0 GiB", final)
 
-    def test_recovery_spacing_names_its_start_in_the_display_zone_without_endings(self) -> None:
-        self.reset_running(available=40, need=4)
-        _ = self.running(800, "holder", "clippy", 6, 6, 3600)
-        write_recovery_fixture(self.directory, gate.RecoveryStarts(NOW + 120, NOW + 37))
-        for zone, expected in (("America/New_York", "21:51:37 EDT"), ("UTC", "01:51:37 UTC")):
-            with self.subTest(zone=zone), mock.patch.dict(os.environ, {"USER_ZONE": zone}):
-                final = self.line(self.output(), "Frees when:")
-                self.assertIn("no running step needs to end; recovery spacing starts it at " + expected, final)
-                self.assertNotIn("still leaves pressure", final)
-
-    def test_recovery_spacing_names_the_required_endings_before_its_start(self) -> None:
-        self.reset_running(available=40, need=4)
-        _ = self.running(800, "holder", "clippy", 20, 20, 3600)
-        write_recovery_fixture(self.directory, gate.RecoveryStarts(NOW + 120, NOW + 37))
-        final = self.line(self.output(), "Frees when:")
-        self.assertIn("stale-holder clippy end (budget charge drops 20.0 GiB; "
-                      + "free memory rises 20.0 GiB and promise not yet used drops 0.0 GiB); "
-                      + "then recovery spacing starts it at 21:51:37 EDT", final)
-        self.assertNotIn("no running step needs to end", final)
-        self.assertNotIn("still leaves pressure", final)
-
-    def test_recovery_release_finishes_with_the_start_time(self) -> None:
-        cases = (
-            (6, "no running step needs to end; recovery spacing starts it at 21:51:37 EDT."),
-            (20, "stale-holder clippy end (budget charge drops 20.0 GiB; "
-             + "free memory rises 20.0 GiB and promise not yet used drops 0.0 GiB); "
-             + "then recovery spacing starts it at 21:51:37 EDT."),
-        )
-        for index, (charge, expected) in enumerate(cases):
-            with self.subTest(charge=charge):
-                self.reset_running(available=40, need=4)
-                _ = self.running(800 + index, "holder", "clippy", charge, charge, 3600)
-                write_recovery_fixture(self.directory, gate.RecoveryStarts(NOW + 120, NOW + 37))
-                final = self.line(self.output(), "Frees when:")
-                self.assertEqual(final.partition("Frees when: ")[2], expected)
 
     def test_release_keeps_the_snapshot_limits_and_reports_a_pressure_hold(self) -> None:
         explanation = gate.explain_queue()
-        with mock.patch.object(gate, "build_budget_bytes", side_effect=AssertionError("use snapshot budget")), \
+        with mock.patch.object(gate, "read_memory_config", side_effect=AssertionError("use snapshot policy")), \
              mock.patch.object(gate, "read_meminfo", side_effect=AssertionError("no second reading")):
             release = gate.smallest_head_release(explanation)
         self.assertIsInstance(release, gate.HeadAdmitsAfterEnd)
@@ -469,95 +502,55 @@ class QueueEvidenceTests(unittest.TestCase):
         with mock.patch.object(gate, "smallest_head_release",
                                side_effect=AssertionError("the card must reuse the release result")):
             lines = plain(queue_card.render_selection(model, "1", 400)).splitlines()
-        self.assertEqual(len(explanation.running), 20)
+        self.assertEqual(len(explanation.running), 21)
+        compiler, = (row for row in explanation.running
+                     if isinstance(row.step.measured, gate.CompilerServiceMemory))
+        self.assertEqual(compiler.charged, 0)
+        self.assertEqual(sum(gate.running_has_reservation(row.step) for row in explanation.running), 20)
         final = " ".join("\n".join(lines).partition("Frees when:")[2].split())
         self.assertNotIn("still leaves", final)
-        self.assertIn("end (budget charge drops", final)
+        self.assertIn("end (keep-aside drops", final)
 
-    def test_tonight_arithmetic_matches_the_actual_admission_decision(self) -> None:
+    def test_recorded_room_matches_the_actual_admission_decision(self) -> None:
         reading = gate.queue_read()
         inputs = reading.explanation.decided_from
         assert isinstance(inputs, gate.QueueInputs)
-        view, ordered = reading.view, inputs.ordered
-        reason = view.waiting[0].reason
-        self.assertIsInstance(reason, gate.HeadAdmissionStatus)
-        if not isinstance(reason, gate.HeadAdmissionStatus):
-            self.fail(f"expected head admission status, got {reason}")
-        running = [row.measured for row in view.running]
-        head = gate.head_priority([row for _, row in ordered], view.available, 60 * GIB, running, NOW, policy=admission_policy_fixture())
-        decision = gate.admission_walk(view.available, 60 * GIB, [row for _, row in ordered], running, head,
-                                      gate.NoPressureHold(), recovery=gate.NoRecoverySpacing(), now=NOW, policy=admission_policy_fixture())[0].decision
-        self.assertEqual(reason.decision, decision)
-        self.assertEqual(decision.state, "hold")
-        self.assertAlmostEqual(decision.charged / GIB, 18.1, places=5)
-        self.assertAlmostEqual(decision.promised / GIB, 5.5, places=5)
-        self.assertAlmostEqual(decision.threshold / GIB, 20.3, places=5)
-
+        head = reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        result = gate.admission_pass(inputs, NOW, reading.explanation.limits,
+                                     reading.explanation.policy)
+        self.assertEqual(head.decision, result.rows[0].decision)
+        self.assertEqual(head.decision.state, "hold")
+        self.assertEqual(head.room.need, head.waiter.need)
+        self.assertEqual(head.room.room,
+                         reading.view.available - head.decision.reserve - head.decision.promised)
         output = self.output()
-        for section in ("Running", "#1 of 17", "Build budget:", "Free memory:", "Frees when:"):
+        self.assertIn(queue_evidence.room_check_text(head.room), output)
+        self.assertNotIn("Build budget:", output)
+        for section in ("Running", "#1 of 17", "Room:", "Frees when:"):
             self.assertIn(section, output)
-        budget = self.line(output, "Build budget:")
-        for term in ("18.1", "11.8", "29.9", "21.0", "9.2", "blocked"):
-            self.assertIn(term, budget)
-        free = self.line(output, "Free memory:")
-        for term in ("16.3", "11.8", "earlyoom", "3.0", "promise not yet used", "5.5", "20.3", "blocked"):
-            self.assertIn(term, free)
-        self.assertIn("122 min", output)
-        self.assertIn("21:51", output)
-        self.assertIn("60.0 GiB", output)
-        self.assertIn("64.25", output)
-        self.assertIn("32", output)
-        self.assertIn("Total current use: 12.4 GiB", output)
-        self.assertIn("charged 18.1", output)
-        self.assertRegex(output, r"younger steps may use 9\.2 GiB of the budget until 21:59.*8 min 0 s left")
-        self.assertRegex(output, r"Followers: 16 waiting;\s*2 fit now")
-        self.assertRegex(output, r"needs from 1\.0 GiB to 16\.0 GiB.*oldest waiting 20 min")
-        final = self.line(output, "Frees when:").lower()
-        self.assertIn("budget charge drops", final)
-        self.assertIn("free memory rises", final)
-        self.assertIn("frees when:", final)
 
     def test_running_records_keep_every_identity_time_and_memory_value(self) -> None:
         output = self.output()
         running_section = output[output.index("Running:"):output.index("Total current use:")]
-        rows = [line for line in running_section.splitlines() if "; promise " in line]
+        rows = [line for line in running_section.splitlines() if "; need " in line or "sccache.service:" in line]
         self.assertEqual(len(rows), 5)
         expected = (
-            ("widget", "nextest", "20:51 (60 min ago)", "10.8", "1.0", "0.8", "compiling"),
-            ("demo", "nextest", "21:31 (20 min ago)", "1.0", "3.8", "3.8", "compiling"),
-            ("organon", "clippy", "21:50 (0 min ago)", "6.1", "6.1", "1.3", "ramp promise"),
-            ("frame-cost", "clippy", "21:50 (1 min ago)", "6.8", "6.8", "6.1", "ramp promise"),
+            ("widget", "nextest", "20:51 (60 min ago)", "10.8", "0.8", "10.0"),
+            ("demo", "nextest", "21:31 (20 min ago)", "1.0", "3.8", "0.0"),
+            ("organon", "clippy", "21:50 (0 min ago)", "6.1", "1.3", "4.8"),
+            ("frame-cost", "clippy", "21:50 (1 min ago)", "6.8", "6.1", "0.7"),
         )
-        for name, step, admitted, promise, charge, used, basis in expected:
+        for name, step, admitted, need, used, kept in expected:
             row, = [line for line in rows if f"{name}-session," in line]
             self.assertIn(f"hana / {name} / {name}-session, {step}: admitted {admitted}", row)
-            self.assertIn(f"promise {promise} GiB, charge {charge} GiB, using now {used} GiB", row)
-            self.assertIn(basis, row)
+            self.assertIn(f"need {need} GiB; anonymous use {used} GiB; held slot 0.0 GiB; kept aside {kept} GiB", row)
         compiler, = [line for line in rows if "sccache.service" in line]
-        self.assertIn("admission time unknown", compiler)
-        self.assertIn("promise 0.0 GiB, charge 0.4 GiB, using now 0.4 GiB", compiler)
+        self.assertIn("sccache.service: idle; 0.4 GiB RAM; 0.0 GiB swapped", compiler)
+        self.assertNotIn("admission time unknown", compiler)
         self.assertNotIn("stale-widget", output)
         self.assertNotIn("p34-merge", running_section)
 
-    def test_peak_decay_shows_the_promise_charge_gap_and_decay_time(self) -> None:
-        _ = self.widget_path.with_suffix(".max").write_text(str(gib(10.8)))
-        _ = self.widget_path.with_suffix(".wave").write_text(f"{gib(10.8)} {int(NOW - 1800)}")
-        output = self.output()
-        widget = next(line for line in output.splitlines() if "widget-session" in line and "promise" in line)
-        self.assertIn("10.8 GiB", widget)
-        self.assertIn("0.8 GiB", widget)
-        self.assertRegex(widget.lower(), r"peak decayed.*21:46")
-
-    def test_old_sampler_decay_explains_the_twenty_five_minute_rule(self) -> None:
-        _ = self.widget_path.with_suffix(".max").write_text(str(gib(10.8)))
-        self.widget_path.with_suffix(".wave").unlink()
-        peak_at = NOW - 1800
-        os.utime(self.widget_path.with_suffix(".max"), (peak_at, peak_at))
-        widget = next(line for line in self.output().splitlines() if "widget-session" in line and "promise" in line)
-        self.assertIn("old-sampler rule", widget)
-        self.assertIn("25 min", widget)
-        self.assertIn("10.8 GiB", widget)
-        self.assertIn("0.8 GiB", widget)
 
     def test_need_source_records_explain_sample_window_filter_and_width(self) -> None:
         output = self.output()
@@ -585,7 +578,7 @@ class QueueEvidenceTests(unittest.TestCase):
             with self.subTest(basis=basis):
                 source = gate.RecordedNeed("shape", 12 if isinstance(basis, gate.ShapeP90) else 3,
                                            14, "full", "", (), gate.WidthNotRecorded(), basis)
-                text = queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone())
+                text = queue_evidence.need_text(source, zone=user_zone())
                 for word in (*words, "14 days"):
                     self.assertIn(word, text)
                 if not isinstance(basis, gate.ShapeP90):
@@ -594,26 +587,45 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_shape_need_text_names_floor_release_factor_and_budget_cap(self) -> None:
         ended_at = "2026-10-29T09:09:52Z"
         floor = gate.FailedPeakFloor(gib(15.76), ended_at)
+        rule = gate.ReleaseHeadroom(gate.read_memory_config(report=False).release_headroom)
         for tier in (
-            gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24))),
-            gate.ShapeLargest(2, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24))),
-            gate.ShapeFallback(gate.CappedAtBudget(gib(24))),
+            gate.ShapeP90(10, floor, rule, gate.CappedAtBudget(gib(24), 21 * GIB)),
+            gate.ShapeLargest(2, floor, rule, gate.CappedAtBudget(gib(24), 21 * GIB)),
+            gate.ShapeFallback(gate.CappedAtBudget(gib(24), 21 * GIB)),
         ):
             with self.subTest(tier=tier):
                 text = queue_evidence.need_text(gate.RecordedNeed(
-                    "shape", 10, 14, "full", "", (), gate.WidthNotRecorded(), tier), budget=21 * GIB, zone=user_zone())
-                words = (("cap", "21.0 GiB", "24.0 GiB", "no headroom factor")
+                    "shape", 10, 14, "full", "", (), gate.WidthNotRecorded(), tier), zone=user_zone())
+                words = (("limited to", "21.0 GiB", "24.0 GiB", "no headroom factor")
                          if isinstance(tier, gate.ShapeFallback) else
-                         ("floor", "15.8 GiB", "05:09", "1.314", "cap", "21.0 GiB", "24.0 GiB"))
+                         ("floor", "15.8 GiB", "05:09", str(rule.factor), "limited to", "21.0 GiB", "24.0 GiB"))
                 for word in words:
                     self.assertIn(word, text)
 
     def test_fallback_need_text_names_its_base_and_cap_without_a_floor_or_factor(self) -> None:
-        basis = gate.ShapeFallback(cap=gate.CappedAtBudget(gib(24)))
+        basis = gate.ShapeFallback(cap=gate.CappedAtBudget(gib(24), 21 * GIB))
         source = gate.RecordedNeed("shape", 0, 14, "full", "", (), gate.WidthNotRecorded(), basis)
-        self.assertEqual(queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone()),
+        self.assertEqual(queue_evidence.need_text(source, zone=user_zone()),
                          "same-shape fallback: no runs; heavier of fallback and same-profile builds, last 14 days"
-                         + "; no headroom factor; capped at 21.0 GiB (uncapped 24.0 GiB)")
+                         + "; no headroom factor; limited to 21.0 GiB at that time (uncut 24.0 GiB)")
+
+    def test_need_text_names_saved_caps_and_dev_size_headroom(self) -> None:
+        for basis, words in (
+            (gate.ShapeFallback(gate.CappedAtBudget(22 * GIB, 21 * GIB)),
+             ("limited to 21.0 GiB at that time (uncut 22.0 GiB)",)),
+            (gate.ShapeFallback(gate.CappedAtBudget(22 * GIB, gate.CapNotRecorded())),
+             ("limited to an unrecorded amount at that time (uncut 22.0 GiB)",)),
+            (gate.ShapeLargest(2, factor=gate.DevSizeHeadroom(1.25, 2 * GIB)),
+             ("dev", "1.25", "margin", "2.0 GiB", "uncut estimate")),
+        ):
+            with self.subTest(basis=basis):
+                source = gate.RecordedNeed("shape", 2, 14, "full", "", (), gate.WidthNotRecorded(), basis)
+                text = queue_evidence.need_text(source, zone=user_zone())
+                for word in words:
+                    self.assertIn(word, text)
+                self.assertNotIn("4.203", text)
+                if isinstance(basis, gate.ShapeFallback):
+                    self.assertEqual(text.split("; ")[-1], words[0])
 
     def test_cap_need_text_uses_the_program_in_the_recorded_basis(self) -> None:
         for program, words in (("merge-gate", "the merge gate's memory cap"),
@@ -621,26 +633,28 @@ class QueueEvidenceTests(unittest.TestCase):
             with self.subTest(program=program):
                 basis = gate.read_need_basis(gate.need_basis_record(gate.ProgramMemoryCap(program)))
                 source = gate.RecordedNeed("cap", 0, 14, "full", "", (), gate.WidthNotRecorded(), basis)
-                self.assertEqual(queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone()), words)
+                self.assertEqual(queue_evidence.need_text(source, zone=user_zone()), words)
 
     def test_gate_cap_need_and_charge_text_stay_the_same_after_head_seconds(self) -> None:
         self.reset_running(available=40, need=20)
         path = self.running(700, "gate", "merge-gate", 6, 1,
-                            int(admission_policy_fixture().timing.ramp_seconds + 1), peak=5)
+                            int(121), peak=5)
         row = cast(dict[str, object], json.loads(path.read_text()))
         row["queue_waiter"] = {"need_source": "cap"}
         _ = path.write_text(json.dumps(row))
         self.change_head(step="merge-gate", need_source="cap", need_runs=0,
                          need_basis=gate.need_basis_record(gate.ProgramMemoryCap("merge-gate")))
         lines: list[tuple[str, str]] = []
-        for elapsed in (0, admission_policy_fixture().timing.head_seconds + 1):
+        for elapsed in (0, admission_policy_fixture().timing.estimate_refresh_seconds + 1):
             with mock.patch.object(time, "time", return_value=NOW + elapsed):
                 reading = gate.queue_read()
             assert isinstance(reading, gate.QueueRead)
             head = reading.explanation.head
             assert isinstance(head, gate.HeadExplanation)
-            running, = reading.explanation.running
-            lines.append((queue_evidence.need_text(head.need_source, budget=reading.explanation.limits.budget, zone=user_zone()), queue_evidence.charge_text(
+            self.assertEqual(len(reading.explanation.running), 2)
+            running, = (row for row in reading.explanation.running
+                        if gate.running_has_reservation(row.step))
+            lines.append((queue_evidence.need_text(head.need_source, zone=user_zone()), queue_evidence.charge_text(
                 running.basis, user_zone(), reading.explanation.policy, running.step.step)))
             self.assertEqual(running.charged, 6 * GIB)
         self.assertEqual(lines[0], lines[1])
@@ -654,7 +668,7 @@ class QueueEvidenceTests(unittest.TestCase):
                 self.assertEqual(text, f"{name} promise: holds until the step ends")
 
     def test_aged_cap_waiter_has_no_refresh_text_but_history_waiter_does(self) -> None:
-        expired_at = NOW - admission_policy_fixture().timing.head_seconds - 1
+        expired_at = NOW - admission_policy_fixture().timing.estimate_refresh_seconds - 1
         for sizing in (gate.FixedCapSizing(6 * GIB),
                        gate.HistoryPeakSizing(6 * GIB, gate.MeasuredProgramPeak(6 * GIB, 10), expired_at)):
             with self.subTest(sizing=sizing):
@@ -670,43 +684,17 @@ class QueueEvidenceTests(unittest.TestCase):
                 need_line = self.line(text, "Need source:")
                 self.assertIn("6.0 GiB", text)
                 if isinstance(sizing, gate.FixedCapSizing):
-                    self.assertNotIsInstance(head.waiter.reason, gate.EstimateExpired)
+                    self.assertNotIsInstance(head.cause, gate.EstimateExpired)
                     self.assertIn("the merge gate's memory cap", need_line)
                     self.assertNotIn("refresh", text)
                     self.assertNotIn("estimate expired", text)
                 else:
-                    self.assertEqual(head.waiter.reason, gate.EstimateExpired(expired_at))
+                    self.assertEqual(head.cause, gate.EstimateExpired(expired_at))
                     self.assertIn("p90 of 10", need_line)
                     self.assertIn("the estimate expired at", text)
                     self.assertIn("the client refreshes it through the admission service", text)
 
-    def test_ramp_text_uses_the_explanations_policy_after_config_changes(self) -> None:
-        config = self.root / "build_admission.conf"
-        write_memory_config(config, ramp_seconds="420")
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
-            policy = gate.read_memory_config().policy
-            write_memory_config(config, ramp_seconds="60")
-            reading = gate.queue_read()
-        assert isinstance(reading, gate.QueueRead)
-        explanation = replace(reading.explanation, policy=policy)
-        with mock.patch.object(gate, "memory_config", side_effect=AssertionError("render read config")):
-            model = queue_view.QueueModel(replace(reading, explanation=explanation), {}, gate.NoWaiter(),
-                head_facts.PaceUnavailable(), user_zone(), queue_view.HostLoadUnavailable(),
-            gate.smallest_head_release(reading.explanation))
-            output = plain(queue_card.render_selection(model, "1", 400))
-        self.assertIn("ramp promise: first 7 min after admission", output)
-        self.assertNotIn("ramp promise: first 1 min", output)
 
-    def test_running_peak_rows_label_cargo_compiles_and_other_programs(self) -> None:
-        _ = self.running(700, "gate", "merge-gate", 8, 1, 1800, peak=8)
-        entries = [self.entry(name) for name in ("widget", "demo", "organon", "frame-cost", "inspectors-fix", "gate")]
-        with mock.patch.object(unit_labels, "unit_labels_for", return_value=roster.unit_labels(entries)):
-            output = self.output()
-        cargo = next(line for line in output.splitlines() if "widget-session" in line and "promise" in line)
-        program = next(line for line in output.splitlines() if "gate-session" in line and "promise" in line)
-        self.assertIn("compiling, peak so far", cargo)
-        self.assertIn("running, peak so far", program)
-        self.assertNotIn("compiling", program)
 
     def test_old_sampler_peak_text_uses_the_kinds_hold_and_activity(self) -> None:
         config = self.root / "build_admission.conf"
@@ -728,7 +716,7 @@ class QueueEvidenceTests(unittest.TestCase):
         config = self.root / "build_admission.conf"
         write_memory_config(config)
         commit_config_fixture(config)
-        write_memory_config(config, head_seconds="abc")
+        write_memory_config(config, estimate_refresh_seconds="abc")
         with AdmissionFixture() as admission:
             with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
                 _ = admission.server.run_pass()
@@ -740,27 +728,25 @@ class QueueEvidenceTests(unittest.TestCase):
                 self.assertEqual(build_queue.main(), 0)
                 self.assertEqual(build_queue.main(), 0)
             self.assertEqual(errors.getvalue().count(
-                "head_seconds='abc'"), 1)
+                "estimate_refresh_seconds='abc'"), 1)
 
     def test_lifetime_charge_text_says_the_promise_holds_until_the_step_ends(self) -> None:
         text = queue_evidence.charge_text(gate.LifetimePromise(16 * GIB), user_zone(), policy=admission_policy_fixture(), step="nextest")
         self.assertIn("promise", text)
         self.assertIn("until the step ends", text)
         self.assertNotIn("first 2 min", text)
-        self.assertEqual(queue_evidence.charge_text(gate.RampPromise(16 * GIB), user_zone(), policy=admission_policy_fixture(), step="nextest"),
-                         "ramp promise: first 2 min after admission")
 
     def test_failed_floor_clause_uses_the_users_local_clock(self) -> None:
         basis = gate.ShapeLargest(1, gate.FailedPeakFloor(gib(15.76), "2026-10-29T02:09:52Z"))
         source = gate.RecordedNeed("shape", 1, 14, "full", "", (), gate.WidthNotRecorded(), basis)
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
-            text = queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone())
+            text = queue_evidence.need_text(source, zone=user_zone())
         self.assertEqual(text.split("; ")[1], "failed-build floor 15.8 GiB from 22:09")
 
     def test_dev_shape_names_its_measured_promise_factor(self) -> None:
         source = gate.RecordedNeed("shape", 2, 14, "full", "", (), gate.WidthNotRecorded(),
-                                   gate.ShapeLargest(2, factor=gate.DevHeadroom()))
-        text = queue_evidence.need_text(source, budget=21 * GIB, zone=user_zone())
+                                   gate.ShapeLargest(2, factor=gate.LegacyDevMultiplierHeadroom()))
+        text = queue_evidence.need_text(source, zone=user_zone())
         self.assertEqual(text.split("; ")[2], "dev promise factor × 4.203")
         self.assertNotIn("release headroom", text)
 
@@ -786,12 +772,36 @@ class QueueEvidenceTests(unittest.TestCase):
             path.unlink()
         self.assertTrue(self.output("id-widget").rstrip().endswith("Nothing waits."))
 
+    def test_all_token_waiters_remain_waiting_in_the_snapshot_and_explanation(self) -> None:
+        from scripts.build_queue import queue_snapshot
+        from scripts.build_queue.queue_fixture import fixture_queue_inputs
+        paths = sorted(self.directory.glob("*.waiting"))
+        for path in paths:
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            row["token_left_at"] = NOW - 10
+            _ = path.write_text(json.dumps(row))
+        inputs = fixture_queue_inputs(self.directory, gate.process_table(self.proc), NOW,
+                                      admission_policy_fixture())
+        queue_snapshot.write_queue_snapshot(self.directory, inputs, admission_policy_fixture())
+        snapshot = queue_snapshot.read_queue_snapshot(self.directory)
+        assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+        reading = gate.queue_read_from(snapshot.inputs, gate.resolve_admission_limits(gate.read_memory_config()), snapshot.policy)
+        self.assertEqual(len(reading.view.waiting), len(paths))
+        self.assertTrue(all(isinstance(step.reason, gate.TokenWaitingWaiter) for step in reading.view.waiting))
+        self.assertIsInstance(reading.explanation.head, gate.TokenWaitersOnly)
+        with mock.patch.object(gate, "queue_read", return_value=reading):
+            text = self.output()
+        self.assertNotIn("Nothing waits.", text)
+        self.assertIn("All waiting steps are waiting for the cargo token.", text)
+        self.assertIn("Frees when: all waiting steps are waiting for the cargo token.", text)
+
     def check_waiting_head(self, at: float, **token_times: Unpack[FinishedTokenGapTimes]) -> gate.AdmissionDecision:
         self.reset_running(available=0, need=11.8)
         _ = self.running(800, "holder", "clippy", 1, 1, 3600)
         self.head_path = self.head_path.rename(self.directory / "500-500.waiting")
         waiter = gate.read_waiter(self.head_path)
         waiter["token_left_at"] = token_times["token_left_at"]
+        waiter["token_back_at"] = token_times["token_back_at"]
         _ = self.head_path.write_text(json.dumps(waiter))
         gate.append_queue_time(self.directory, {"kind": "token_gap", "episode": "returned-head",
             "pid": 500, "start_time": "500", "step": "nextest", "session_id": "id-inspectors-fix",
@@ -899,42 +909,14 @@ class QueueEvidenceTests(unittest.TestCase):
         facts.assert_called_once()
 
     def test_bump_read_failure_prints_unknown_and_preserves_success_exit(self) -> None:
-        gate.store.host_file(gate.store.host_name(), NOW).mkdir(parents=True)
+        store.host_file(store.host_name(), NOW).mkdir(parents=True)
         output = self.output()
         self.assertRegex(self.line(output, "Bumps since it joined:"),
                          r"^Bumps since it joined: unknown \(.+\)$")
         self.assertNotIn("the admission state could not be read", output)
         self.assertIn("#1 of 17", output)
 
-    def test_order_rule_names_no_room_when_head_uses_all_the_budget(self) -> None:
-        for need in (21, 22):
-            with self.subTest(need=need):
-                self.change_head(need=need * GIB)
-                line = self.line(self.output(), "Order rule:")
-                self.assertIn("younger steps wait until 21:59", line)
-                self.assertNotIn("may use", line)
 
-    def test_backfill_and_position_bump_report_the_admission_deadlines(self) -> None:
-        self.change_head(priority_since=NOW - 630)
-        priority: gate.QueuePriority = {"unit": "inspectors-fix", "why": "user work", "set_at": NOW - 630,
-            "set_by": "showrunner"}
-        _ = (self.directory / "queue_priority.json").write_text(json.dumps(priority))
-        output = self.output()
-        self.assertRegex(output, r"younger steps may start until 21:52.*1 min 30 s left")
-        self.assertIn("queue priority: inspectors-fix (the user's bump)", output)
-
-    def test_pressure_hold_and_recovery_spacing_are_explicit(self) -> None:
-        _ = (self.root / "pressure").write_text("full avg10=11.00 avg60=0.00 avg300=0.00 total=0\n")
-        pressure = self.output()
-        self.assertRegex(pressure.lower(), r"pressure.*11(?:\.0)?")
-        self.assertIn("pressure", self.line(pressure, "Frees when:").lower())
-        _ = (self.root / "pressure").write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
-        _ = (self.directory / "pressure-recovery").write_text(json.dumps({
-            "state": "recovering", "ends_at": NOW + 120, "next_start_at": NOW + 30,
-        }))
-        recovery = self.output().lower()
-        self.assertIn("recovery", recovery)
-        self.assertIn("21:51", recovery)
 
 
     def test_read_failure_is_one_fixed_line_with_exit_two(self) -> None:

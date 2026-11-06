@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.lib.test_models_registry import write_registry
+from scripts.direct.assign_launcher_test_support import backend_fixture_command
 
 import json
 import os
@@ -14,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.message import sessions
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id, source_environment
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami.account_test_support import write_codex_auth
@@ -110,7 +111,11 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notes = self.home / "notes"
         notes.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(notes)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
+            "AGENT_NOTES_DIR": str(notes), "STAFF_FILE": str(self.home / "staff.json"),
+            "STAFF_CONFIG": str(SCRIPTS.parent / "config/staff.conf"),
+            "CONF_DIR": str(SCRIPTS.parent / "config"),
+            **source_environment(self.home / "sources")}, clear=True)))
         shim = self.home / ".claude/scripts/lib/py"
         shim.parent.mkdir(parents=True)
         shim.symlink_to(SCRIPTS / "lib/py")
@@ -158,7 +163,8 @@ class ClaudeLauncherTests(unittest.TestCase):
                     command = ["bash", str(SCRIPTS / "cli_agent/cli_agent.sh")]
                     log = self.home / "launch.log"
                     if launcher == "exec":
-                        command = ["bash", str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
+                        command = ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
+                                   str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
                                    str(self.home), str(prompt), str(self.home / "result"), str(log)]
                     result = subprocess.run(command, capture_output=True, text=True, check=True,
                                             env=environment, cwd=self.home)
@@ -176,7 +182,8 @@ class ClaudeLauncherTests(unittest.TestCase):
             with self.subTest(launcher=launcher):
                 log = self.home / "legacy.log"
                 command = (["bash", str(SCRIPTS / "cli_agent/cli_agent.sh")] if launcher == "cli" else
-                           ["bash", str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
+                           ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
+                                   str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
                             str(self.home), str(prompt), str(self.home / "result"), str(log)])
                 result = subprocess.run(command, capture_output=True, text=True, check=True,
                                         env=self.environment, cwd=self.home)
@@ -187,11 +194,6 @@ class ClaudeLauncherTests(unittest.TestCase):
         prompt = self.home / "background-prompt"
         _ = prompt.write_text("fixture task")
         captured = self.home / "background-environment.json"
-        private_env: dict[str, str] = {}
-        _ = self.enterContext(isolated_staff_file(self.home / "staff.json", private_env))
-        owner = unit_membership("fixture", "account-selection")
-        registry = self.home / "private-sessions"
-        registry.mkdir()
         sender = self.home / "send.py"
         _ = sender.write_text("print('SENT: fixture')\n")
         native = fixture_runtime_id("background-account-selection")
@@ -199,22 +201,53 @@ class ClaudeLauncherTests(unittest.TestCase):
                   "sessionId": native, "name": "fixture-worker", "entrypoint": "cli",
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
         for caller, expected in (("claude1", "claude1"), ("", "claude3")):
-            with self.subTest(caller=caller):
-                (self.home / "id").unlink(missing_ok=True)
+            private = self.home / f"background-{expected}"
+            private_env = source_environment(private / "sources")
+            for folder in private_env.values():
+                Path(folder).mkdir(parents=True, exist_ok=True)
+            with (self.subTest(caller=caller),
+                  isolated_staff_file(private / "staff.json", private_env),
+                  patch.dict(os.environ, private_env)):
+                owner = unit_membership("fixture", "account-selection")
+                registry = Path(private_env["NOTIFIER_SESSIONS_DIR"])
                 environment = {**self.environment, **private_env, "AGENT_BG_ROLE": "impl", "AGENT_BG_DETACH": "1", "BACKGROUND_LAUNCH_FILE": str(captured),
                                "CODEX_THREAD_ID": owner.id, "NOTIFIER_SESSIONS_DIR": str(registry),
                                "FIXTURE_REGISTRY_PATH": str(registry / f"{os.getpid()}.json"),
                                "FIXTURE_REGISTRY_RECORD": json.dumps(record), "FIXTURE_NATIVE_ID": native,
                                "AGENT_BG_SEND_SCRIPT": str(sender)}
+                _ = environment.pop("CLAUDE_CONFIG_DIR", None)
                 if caller:
                     environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
-                result = subprocess.run(["bash", str(SCRIPTS / "agents/agent_bg.sh"), "fixture-worker", str(self.home),
-                                         str(prompt), str(self.home / "summary"), str(self.home / "log"), str(self.home / "id")],
-                                        capture_output=True, text=True, check=True, env=environment, cwd=self.home)
+                command, environment = backend_fixture_command(
+                    private / "assign-parent",
+                    ["bash", str(SCRIPTS / "agents/agent_bg.sh"), "--run", str(private / "run"),
+                     "fixture-worker", str(self.home), str(prompt), str(self.home / "summary"), str(self.home / "log")],
+                    environment)
+                result = subprocess.run(command, capture_output=True, text=True, check=True,
+                                        env=environment, cwd=self.home)
                 self.assertIn("launched fixture-worker", result.stdout)
                 self.assertEqual(json.loads(captured.read_text()), {
                     "CLAUDE_CONFIG_DIR": str(accounts.account_dir(expected)),
                     "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.home / ".claude")})
+
+    def test_shell_fixture_cannot_use_the_parent_session_state(self) -> None:
+        parent = self.home / "parent-session"
+        parent.mkdir()
+        paths = (parent / "mesh_roster.json", parent / "staff.json", parent / "impl_worker_impl.json")
+        for path in paths:
+            _ = path.write_text('{"parent": "must remain unchanged"}\n')
+        before = {path.name: path.read_bytes() for path in paths}
+        environment = {**self.environment, "UNIT_RUN_DIR": str(parent),
+            "PLAN_DELEGATE_BOARD_DIR": str(parent), "MESH_SESSION_DIR": str(parent),
+            "STAFF_FILE": str(paths[1]), "STAFF_ID": "parent-worker",
+            "WORKER_STAFF_ID": "parent-worker", "CODEX_THREAD_ID": "parent-thread",
+            "CLAUDE_CODE_SESSION_ID": "parent-session", "ROSTER_RUN_ROOT": str(parent),
+            "NOTIFIER_SESSIONS_DIR": str(parent), "UNIT_WORKERS_STATE": str(parent)}
+        result = subprocess.run(["bash", str(SCRIPTS / "agents/test_agent_exec.sh")],
+                                env=environment, cwd=self.home, capture_output=True, text=True, check=False)
+        self.assertEqual({path.name: path.read_bytes() for path in parent.iterdir()}, before)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("agent_exec tests passed", result.stdout)
 
     def test_berth_fixer_account_selection_reaches_here_and_existing_window_launches(self) -> None:
         worktree = self.home / "rust/berth-fix"

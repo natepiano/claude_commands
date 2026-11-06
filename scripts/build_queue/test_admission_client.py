@@ -4,13 +4,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+import errno
 import io
 import os
 from pathlib import Path
 import sys
 import unittest
 from unittest import mock
-from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
 from typing import TYPE_CHECKING, cast
@@ -92,12 +92,12 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             config = fixture.root / "build_admission.conf"
-            write_memory_config(config, head_seconds="invalid")
+            write_memory_config(config, estimate_refresh_seconds="invalid")
             with fixture.serving(), redirect_stderr(io.StringIO()) as errors:
                 status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
             self.assertEqual(status, 2)
             self.assertIn(str(config), errors.getvalue())
-            self.assertIn("head_seconds", errors.getvalue())
+            self.assertIn("estimate_refresh_seconds", errors.getvalue())
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
             self.assertFalse(fixture.server.reservations)
 
@@ -152,10 +152,10 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(waits[0].reason, pressure)
             self.assertEqual([step.measured.bytes for step in waits[0].snapshot.running
                               if isinstance(step.measured, gate.MeasuredMemory)], [4 * GIB, GIB])
-            self.assertEqual(gate.pressure_text(pressure, waits[0].snapshot.policy),
+            self.assertEqual(gate.pressure_text(pressure),
                              "memory pressure: condition not recorded by service; full avg10 8.0; "
                              + "some avg10 15.0; swap 80.0% used")
-            self.assertEqual(queue_evidence.pressure_text(pressure, ZoneInfo("UTC"), waits[0].snapshot.policy),
+            self.assertEqual(queue_evidence.pressure_text(pressure, waits[0].snapshot.policy),
                              "memory pressure: full avg10 8.0%, some avg10 15.0%, swap used 80.0%; "
                              + "condition not recorded by service")
 
@@ -291,7 +291,7 @@ class ClientTests(unittest.TestCase):
                 if expired_cache:
                     assert isinstance(owner.profile, gate.StepProfile)
                     profile = replace(owner.profile, step="build", build_history_generation=gate.BuildHistoryGeneration(6),
-                        estimated_at=fixture.clock.now() - gate.read_memory_config().policy.timing.head_seconds - 1)
+                        estimated_at=fixture.clock.now() - gate.read_memory_config().policy.timing.estimate_refresh_seconds - 1)
                 transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))),
                     Exchange(reply_bytes(WAIT), b""), Exchange(reply_bytes(GRANTED)))
                 def history_peak(*_args: object, **_kwargs: object) -> gate.ExpectedPeak:
@@ -389,6 +389,31 @@ class ClientTests(unittest.TestCase):
                     (admissions[0].owner, admissions[0].episode, admissions[0].since) for item in admissions))
                 self.doCleanups()
 
+    def test_unreachable_generation_refresh_stops_the_cli_without_checker_retries(self) -> None:
+        for command in ("admit", "launch"):
+            for generation_failure in (b"", b"invalid generation reply\n"):
+                with self.subTest(command=command, failure=generation_failure), AdmissionFixture() as fixture:
+                    fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
+                    original = fixture.request(step="build")
+                    transport = self.use_transport(fixture,
+                        Exchange(reply_bytes(wire.BuildHistoryReply(0))),
+                        Exchange(reply_bytes(EXPIRED), generation_failure),
+                        *(Exchange(connect_error=FileNotFoundError()) for _ in range(3)))
+                    with mock.patch.object(gate, "process_start_time", return_value=original.owner.start_time), \
+                            mock.patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), str(fixture.root))), \
+                            mock.patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(12 * GIB, "fallback", 0)), \
+                            redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
+                        status = client.main([command, "--pid", str(original.owner.pid), "--", "cargo", "build"])
+                    self.assertEqual(status, 2)
+                    self.assertEqual(fixture.clock.monotonic(), 5 if not generation_failure else 8)
+                    self.assertEqual(sum(isinstance(request, wire.BuildHistoryRequest)
+                                         for request in transport.requests), 2)
+                    self.assertEqual(errors.getvalue().count("build queue not reachable; trying for 5 s"), 1)
+                    self.assertEqual(errors.getvalue().count(
+                        "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
+                    self.assertNotIn("step refused", errors.getvalue())
+                    self.doCleanups()
+
     def test_generation_retries_cannot_extend_the_original_launch_deadline(self) -> None:
         for stage in ("initial", "refresh"):
             for failure in ("connect", "silent"):
@@ -413,6 +438,31 @@ class ClientTests(unittest.TestCase):
                     self.assertTrue(all(attempt < 6 for attempt in transport.attempts))
                     self.assertEqual(output.getvalue(), "")
                     self.doCleanups()
+
+    def test_grant_sent_during_a_slow_leave_hook_is_read_before_the_next_hook(self) -> None:
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", running_pass_seconds="5")
+            interval = gate.read_memory_config().running_pass_seconds
+            request = fixture.request()
+            exchange = Exchange(reply_bytes(WAIT), TimeoutError())
+            transport = self.use_transport(fixture, exchange)
+            hooks: list[float] = []
+
+            def decline_after_grant() -> bool:
+                hooks.append(fixture.clock.monotonic())
+                self.assertEqual(len(hooks), 1, "the client must read the grant before another hook")
+                fixture.clock.advance(interval)
+                exchange.events.append(reply_bytes(GRANTED))
+                fixture.clock.advance(interval)
+                return False
+
+            with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "slow-decline"}), \
+                    mock.patch.object(client, "_leave_queue", side_effect=decline_after_grant):
+                result = client.admit(request, lambda _reply: None, lambda: request)
+            self.assertEqual(result, GRANTED)
+            self.assertEqual(hooks, [interval])
+            self.assertEqual(transport.requests, [request])
+            self.assertEqual(exchange.events, [])
 
     def test_split_grant_survives_a_declined_leave_hook(self) -> None:
         for kind, partial_at_deadline in (("admit", False), ("launch", False), ("admit", True), ("launch", True)):
@@ -549,9 +599,9 @@ class ClientTests(unittest.TestCase):
     def test_recovered_key_with_an_unavailable_key_prints_only_the_refusal(self) -> None:
         with AdmissionFixture() as fixture:
             config = fixture.root / "build_admission.conf"
-            write_memory_config(config, head_seconds="321", **{"program_first_peak_gib.cargo": None})
+            write_memory_config(config, estimate_refresh_seconds="321", **{"program_first_peak_gib.cargo": None})
             commit_config_fixture(config)
-            write_memory_config(config, head_seconds="invalid", **{"program_first_peak_gib.cargo": "invalid"})
+            write_memory_config(config, estimate_refresh_seconds="invalid", **{"program_first_peak_gib.cargo": "invalid"})
             original = fixture.request()
             with redirect_stderr(io.StringIO()) as errors:
                 status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "clippy"])
@@ -714,6 +764,35 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(transport.attempts, [0, 3, 6, 9])
             self.assertEqual(output.getvalue().count("admission service unavailable:"), 2)
 
+    def test_unreachable_limit_stops_missing_and_refused_connections(self) -> None:
+        for error in (FileNotFoundError(), ConnectionRefusedError()):
+            with self.subTest(error=type(error).__name__), AdmissionFixture() as fixture:
+                fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
+                request = fixture.request()
+                transport = self.use_transport(fixture, *(Exchange(connect_error=error) for _ in range(3)))
+                with redirect_stderr(io.StringIO()) as output:
+                    result = client.admit(request, lambda _wait: None, lambda: request)
+                self.assertIsInstance(result, wire.Refused)
+                self.assertEqual(fixture.clock.monotonic(), 5)
+                self.assertEqual(transport.attempts, [0, 3])
+                self.assertEqual(output.getvalue().count("build queue not reachable; trying for 5 s"), 1)
+                self.assertEqual(output.getvalue().count(
+                    "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
+                self.doCleanups()
+
+    def test_a_connection_resets_the_unreachable_limit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
+            request = fixture.request()
+            transport = self.use_transport(fixture, Exchange(connect_error=FileNotFoundError()),
+                Exchange(ConnectionResetError(errno.ECONNRESET, "reset")), Exchange(connect_error=FileNotFoundError()),
+                Exchange(reply_bytes(GRANTED)))
+            with redirect_stderr(io.StringIO()) as output:
+                self.assertEqual(client.admit(request, lambda _wait: None, lambda: request), GRANTED)
+            self.assertEqual(transport.attempts, [0, 3, 3, 6])
+            self.assertEqual(output.getvalue().count("build queue not reachable; trying for 5 s"), 2)
+            self.assertNotIn("step stopped", output.getvalue())
+
     def test_silence_notice_uses_the_configured_interval(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.configure(silence_seconds=7)
@@ -743,9 +822,9 @@ class ClientTests(unittest.TestCase):
     def test_recovered_service_setting_warns_once_at_the_client_boundary(self) -> None:
         with AdmissionFixture() as fixture:
             config = fixture.root / "build_admission.conf"
-            write_memory_config(config, head_seconds="321")
+            write_memory_config(config, estimate_refresh_seconds="321")
             commit_config_fixture(config)
-            write_memory_config(config, head_seconds="invalid")
+            write_memory_config(config, estimate_refresh_seconds="invalid")
             request = fixture.request()
             with fixture.serving(), mock.patch.object(gate, "_warned_configuration_diagnostics", set[gate.ConfigurationDiagnostic]()), \
                     mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as errors:
@@ -755,9 +834,9 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(second, first)
             policy = fixture.server.last_policy
             assert isinstance(policy, gate.AdmissionPolicy)
-            self.assertEqual(policy.timing.head_seconds, 321)
+            self.assertEqual(policy.timing.estimate_refresh_seconds, 321)
             self.assertIn(str(config), errors.getvalue())
-            self.assertIn("head_seconds='invalid'", errors.getvalue())
+            self.assertIn("estimate_refresh_seconds='invalid'", errors.getvalue())
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
     def test_wait_callback_then_admission_accepts_new_source_names(self) -> None:
@@ -784,6 +863,7 @@ class ClientTests(unittest.TestCase):
     def test_no_socket_and_refused_connect_retry_every_two_seconds_from_first_call(self) -> None:
         for error in (FileNotFoundError("missing"), ConnectionRefusedError("refused")):
             with self.subTest(error=type(error).__name__), AdmissionFixture() as fixture:
+                fixture.configure(unreachable_limit_seconds=120)
                 request = fixture.request()
                 failures = [Exchange(connect_error=error) for _ in range(31)]
                 transport = self.use_transport(fixture, *failures, Exchange(reply_bytes(wire.Refused("test stop"))))

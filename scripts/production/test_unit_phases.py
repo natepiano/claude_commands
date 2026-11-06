@@ -17,6 +17,7 @@ from unittest.mock import patch
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import live_units
 from scripts.production import showrunners
@@ -27,7 +28,7 @@ import style_units
 import style_ledger
 import display_cells
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, fixture_member
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id
 
 # Importable once unit_phases has put scripts/direct on the path.
 import phase_table
@@ -37,7 +38,7 @@ from scripts.direct import plan_history
 def unit(name: str, claude: unit_lookup.Claude | None) -> live_units.LiveUnit:
     if claude is None:
         return live_units.LiveUnit(name, None)
-    return live_units.LiveUnit(name, unit_lookup.MarkedUnit(name, claude, HerdrPlace(f"label-of-{name}", "w1:p1")))
+    return live_units.LiveUnit(name, unit_lookup.LabeledSession(name, claude, HerdrPlace(f"label-of-{name}", "w1:p1")))
 
 
 def live(name: str) -> unit_lookup.LiveClaude:
@@ -220,7 +221,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(unit_phases, "table") as phases,
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", str(doc)]), 0)
-        tickets.assert_called_once_with(units, records, ledger_paths={"names-unit": self.root / "ledger.sqlite"})
+        tickets.assert_called_once_with(units, records, doc=doc, ledger_paths={"names-unit": self.root / "ledger.sqlite"})
         locate.assert_called_once_with(self.root)
         phases.assert_not_called()
         self.assertEqual(output.getvalue(), "ticket table\n")
@@ -250,19 +251,21 @@ class UnitPhasesTests(unittest.TestCase):
                                worktree=staff.PresentWorktree("natedev", folder))
         decision = self.root / "decision.md"
         _ = decision.write_text("---\nstatus: open\nunit: names-unit\nplan: approved\n---\n")
+        names = next(row for row in staff.initial_snapshot().find(kind="unit", parent=owner.id) if row.name == "names")
         database = style_ledger.ledger_location(self.root).database
         database.parent.mkdir(parents=True)
         with contextlib.closing(sqlite3.connect(database)) as connection, connection:
             _ = connection.executescript("""
+                CREATE TABLE rule_texts(blob TEXT, text BLOB);
                 CREATE TABLE tickets(id TEXT,unit TEXT,kind TEXT,family TEXT,rule TEXT,crate TEXT,
                     files TEXT,sites TEXT,rules TEXT,finding_ids TEXT,state TEXT,created_at TEXT);
                 CREATE TABLE held_findings(proposal TEXT,state TEXT,build_ticket TEXT,built_at TEXT);
                 CREATE TABLE refill_results(unit TEXT,at TEXT,outcome TEXT,split_at TEXT,
                     ready INTEGER,changed INTEGER,structure INTEGER,other INTEGER);
-                INSERT INTO tickets VALUES ('names-unit-12','names-unit','proposal','names',
-                    'global:rust/read.md','alpha','[]','[]','[]','["one"]','assigned','2026-10-01');
             """)
-            _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','names-unit-12','')", (str(decision),))
+            _ = connection.execute("INSERT INTO tickets VALUES ('12',?,'proposal','names',"
+                + "'global:rust/read.md','alpha','[]','[]','[]','[\"one\"]','assigned','2026-10-01')", (str(names.id),))
+            _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','12','')", (str(decision),))
         output = io.StringIO()
         with (patch.object(live_units, "units_of_doc", return_value=[unit("names-unit", live("names")),
                                                                         unit("types-unit", live("types"))]),
@@ -274,14 +277,16 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIn("| names | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
         self.assertIn("| types | idle | idle | — | 0 | 0 | 0 |", output.getvalue())
 
-    def test_production_of_reads_the_timer_addressed_to_the_session(self) -> None:
+    def test_production_of_reads_the_staff_row_addressed_to_the_session(self) -> None:
         doc = self.root / "show-production.md"
         for name, target in (("showrunner-other", "session:someone-else"), ("showrunner-show", "session:caller")):
             directory = self.root / name
             directory.mkdir()
             _ = (directory / "conf").write_text(
                 f"TARGET={target}\nCHECK=zsh /opt/production_check.sh {doc}\n", encoding="utf-8")
-        self.assertEqual(showrunners.production_of("caller", self.root), doc)
+        caller = fixture_runtime_id("unit-phases-caller")
+        _ = fixture_member("showrunner", name="show", runtime_id=caller, doc=staff.LiveDoc("natedev", doc))
+        self.assertEqual(showrunners.production_of(caller, self.root), doc)
         self.assertIsNone(showrunners.production_of("nobody", self.root))
         self.assertIsNone(showrunners.production_of("", self.root))
 

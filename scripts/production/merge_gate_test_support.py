@@ -281,7 +281,7 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        directory = tempfile.TemporaryDirectory(prefix="merge-gate-test-")
+        directory = tempfile.TemporaryDirectory(dir="/dev/shm", prefix="merge-gate-test-")
         cls.addClassCleanup(directory.cleanup)
         cls.fixture_root = Path(directory.name) / "case"
         cls.fixture_snapshot = Path(directory.name) / "snapshot"
@@ -412,7 +412,8 @@ class MergeGateFixture(unittest.TestCase):
 
     def occupy_memory_queue(self) -> wire.Admitted:
         request = self.admission.request(need=21 * memory_admit.GIB, step="build")
-        return only_admitted(self.admission.server.handle_request(request))
+        with self.admission.loop_turn():
+            return only_admitted(self.admission.server.handle_request(request))
 
     def assert_gate_released(self) -> None:
         self.assertEqual(self.admission.server.reservations, {})
@@ -469,6 +470,8 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "settings.json", '{"fixture": true}\n')
         self.write(self.checkout / "subject.txt", "base\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
+        self.write(self.checkout / "scripts/test_times/module_run.py",
+                   (SCRIPT.parents[1] / "test_times/module_run.py").read_text())
         for suite in self.suites:
             self.write(self.checkout / "scripts" / suite / "test_first.py", SUITE_MODULE)
         if "lib" in self.suites:

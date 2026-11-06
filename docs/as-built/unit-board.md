@@ -6,7 +6,7 @@ The mod in `mods/unit-board/` draws three panes on demand.
 `/showrunner:unit_board` shows the production, its child productions, or one unit.
 It shows phases, ETAs, gates, finish times, and workers.
 `/showrunner:accounts` shows stored account readings without login addresses.
-`/build:queue` shows the memory budget and waiting steps.
+`/build:queue` shows the memory cap, room, running steps, and waiting steps.
 The recorder keeps each phase's stated ETA and predicts later phases from it.
 `/unit:report` prints a short report; `tables` adds the recorder's round table.
 
@@ -58,7 +58,9 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 ~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--session <id> | --production <slug>)
 ```
 
-[`board_json.py`](../../scripts/direct/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. An unreadable staff file also gives no boards and prints one line on stderr with the cause.
+[`board_json.py`](../../scripts/direct/board_json.py) reads the staff file to resolve each production. It writes each board atomically to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<showrunner-staff-id>.json`. It prints one line: `{"files": [...], "watch": [...]}`. The plugin reads these returned paths directly. A rename, transfer, or session replacement preserves the cache path. An unresolved production returns `"files": []` and exits 0. An unreadable staff file also prints its cause to stderr.
+
+Run `scripts/lib/py scripts/direct/board_json.py --migrate-cache` to migrate the board cache. The command maps each old slug through its recorded timer owner. It preserves cache contents and lists files without a recorded owner. It exits 1 when an owner is missing. A conflicting destination stops the migration without replacing either file. A repeated migration preserves completed files. The command also resumes after an interruption between the destination creation and the source removal.
 
 - Resolve: read one staff snapshot and use it for every board’s unit rows. Join the session to its newest pane launch’s `STAFF_ID`, then follow its staff parents to the first showrunner. Unit and worker sessions see that showrunner’s production and every showrunner production below it, nearest level first. `--production <slug>` selects the same subtree by its mapped staff row and takes precedence if both selectors are supplied. The shared `MemberSources.showrunner_members` mapping joins each showrunner row to its production; `showrunners.registered_showrunners()` supplies the doc and zone. Unmapped productions are left out. A session with no staff row or no showrunner above it gives no files.
 - `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
@@ -86,7 +88,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 ### The mod
 
-`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`.
+`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`. Claude Code 2.1.316 and later reads the mod in place from `~/.claude/mods/unit-board`, because `nate-local` is a local folder marketplace and lists the mod by a relative path. `claude plugin list` shows `Read from: ~/.claude/mods/unit-board`. A promoted change takes effect at the next session start or `/reload-plugins`, and no copy exists in `~/.claude/plugins/cache`. A session started on an older Claude Code loads a copy from that cache instead. Restart such a session on the current Claude Code.
 
 | File | Role |
 | --- | --- |
@@ -117,8 +119,26 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
   It replies `Accounts opened.`; `close` replies `Accounts closed.`.
 - `/build:queue [<position|session|folder>]` is intercepted by `command.run` without a model turn. It opens `build-queue` (title `Build queue`, Escape closes), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/build_queue/build_queue.py, "--json", "--columns", <last bodyColumns>, "--you", <session id>, <optional selector>]` and replies `Build queue opened.`. The width starts at 100. A pane-width change requests one forced refresh; the shared busy guard joins repeated requests. A selector shows the full queue, one blank line, and the matching cards on one page. `mine` uses the same layout. The selection survives the 10 s refresh and reload. `close` replies `Build queue closed.`. Bump retains its existing refusal handling and refreshes an open pane. Bump is off; nothing can move a waiting step.
 - `queue_lines.py` defines `Span {text, tone, bold, background, until?}`, terminal-cell widths, padding, clipping, hanging-indent wrap, text output and `QueueLines {columns, as_of, lines}` JSON. Tone names include blue `suggestion`. JSON omits fields at their `Span` defaults: `tone` and `background` `default`, `bold` false, and no `until`. The pane accepts missing fields as those defaults; older explicit fields remain valid. An `until` span contains only the countdown text and its epoch deadline; the pane computes `max(0, until − now)` on every draw. One `$.clock.every(1000, …)` timer invalidates the drawing while a countdown is active, without a script run; it stops on expiry, a page without a countdown, or close. The 10 s script refresh stays.
-- `build_queue.py` reads admission with the lock-free, bounded `queue_read()`, then resolves labels through one file-only `unit_labels_for` lookup. The no-selector view skips bump/token history and pace reads. It draws a budget bar from admission’s charged total and budget, then aligned waiting rows with showrunner, unit (without its showrunner prefix), step, minutes and need bars at one cell per GiB. Plain output uses `░` for free budget and `█` for taken; colour uses green and blue with an eighth-block boundary. Name columns grow above 60 cells, shrink together when needed, then clip at the edge. `--you` carries `$.session.id()`; inline falls back to the calling session environment. Matching rows have a blue `▸`. Row 1 ends with `↑` for backfill, `↑ ≤N.N` for positive strict-window room or `⊘` when no room remains, a recorded window countdown when known, and red host-hold words. The view has no running rows, moves or start estimates.
-- Selector cards retain their order, checks and history behavior. An older fitting step fails the queue-order check with `behind #<k>, an older step that fits`, or `behind an older step that fits` when it is absent from the reading. `queue_view.render_view` and `queue_card.render_card` share a model and admission check formatter. Every waiting step's card shows its recorded budget and free checks from admission. A failed refresh or malformed reply keeps the last successful page. A failed first query shows only `Build queue could not be read.`. Times use the user’s zone; `as_of` is the admission reading’s epoch.
+- `build_queue.py` reads one captured admission pass through the bounded `queue_read()` query.
+  `unit_labels_for` supplies the labels through one file read.
+  The memory bar shows the cap, anonymous use, keep-aside, room, safety, and other programs.
+  Running rows show each run and its held slot.
+  Waiting rows show the showrunner, unit, step, waiting minutes, pid, and need.
+  Every process row shows its captured `pid N`, or `pid —` when no pid was recorded.
+  The pid column takes space from the row bar while names keep their allocated widths.
+  The first eligible row has an `↑` marker and a recorded hold cause.
+  Head protection keeps its full need available before a younger run starts.
+  Held slots give the same run priority for its next step.
+  New starts use the recorded start-spacing deadline.
+  Service rows retain RAM and swap amounts through marked continuation lines.
+  `--you` selects the session through `$.session.id()`.
+  A blue `▸` marks matching rows.
+- Selector cards share the queue model and the admission check formatter.
+  Each card shows the captured room check, start basis, head cause, and run keep-aside.
+  The evidence uses the same pass as the queue view.
+  A failed refresh retains the last successful view.
+  A failed first query shows only `Build queue could not be read.`.
+  Times use the user’s zone; `as_of` is the admission reading’s epoch.
 - `session.start` restores refresh timers for open panes. Command files supply the colon names; mod hooks open the panes without a model turn. Without the mod, `/showrunner:accounts` names the required plugin. `/build:queue` runs its script. Run `/reload-plugins` in sessions that need the updated hooks.
 
 **State.** Plugin state `unit-board` holds the board and accounts records, each keyed by pane id; a missing entry is a closed pane.
@@ -195,7 +215,9 @@ The build queue reads process memory every ten seconds while open.
   Each role has a separate row with its own counts.
   The first row shows all account values.
   Later rows show only the role and its counts.
-  The view sums the available entries in `role_counts_by_machine` without changing their separate JSON representation.
+  Python combines available machine counts once in `role_counts`, in role order.
+  The view reads these counts directly; `role_counts_by_machine` keeps the separate machine records.
+  A role with no reported members has zero counts; `spare` has no count.
   A totals row sums the known activity counts.
   Codex shell counts remain unknown; they do not become zero.
   The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
@@ -290,7 +312,7 @@ The accounts view uses `accounts.py status --json --stored` to read saved usage 
 It watches usage, group selection, worker selection, role-map cache, peer-count cache, and reported session inputs.
 When the generator reports session inputs, each open-pane tick refreshes local liveness counts.
 The stored read uses an existing peer-count cache without waiting for its refresh.
-The separate machine counts let the view sum available observations without hiding a missing peer.
+Python combines available observations in `role_counts`; the separate machine records and problem lines identify a missing peer.
 Aligned headers and complete facts keep the same contract readable in wide and narrow panes.
 
 

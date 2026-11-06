@@ -22,10 +22,12 @@ restores print `<unit> restore launched: ` and the same place. Every unit is a t
 herdr session, `agents`.
 A name may be given with or without its `-unit` ending; `feature-log` and
 `feature-log-unit` both make unit `feature-log-unit`.
-An existing live staff row is adopted; its `.unit.toml` port and duties stand when omitted.
+The launcher adopts an existing live staff row. It keeps the saved `.unit.toml` responsibilities and the port when omitted.
 A retired name stays reserved: resume the unit or remove it for good before reusing the name.
-Repeat `--responsibility <name>` for standing duties. Admission writes the worktree to the staff
-row and the plan, port and duties to untracked `.unit.toml`; `--resume` keeps that file.
+Repeat `--responsibility <name>` for short duty names in a new configuration.
+Admission writes the worktree to the staff row.
+It writes the plan, port and responsibilities to untracked `.unit.toml`.
+`--resume` keeps that file.
 Add `--check` to run preflight without launching or writing anything.
 An untrusted session folder refuses before any stub, staff row, or worktree is
 written. Show the refusal's `Run:` command; the user runs it on the launch

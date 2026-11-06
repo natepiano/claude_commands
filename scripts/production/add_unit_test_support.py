@@ -10,8 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_models_registry import write_registry
 
 from scripts.lib import names
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_names import fixture_names
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import sessions as runtime_sessions
 from scripts.message.process_identity import process_start as REAL_PROCESS_START
 
@@ -20,6 +22,7 @@ import io
 import json
 import os
 import shlex
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -58,7 +61,7 @@ REAL_KILL = os.kill
 FAKE_CLAUDE_PID = 991003
 MARKED_HERDR_PLACE = HerdrPlace("marked-herdr", "w7:p1")
 SHARED = herdr.SHARED_SESSION
-NO_LAUNCH_FIXTURE = add_unit.NoMarkedUnit()
+NO_LAUNCH_FIXTURE = add_unit.NoLabeledSession()
 SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime(2026, 10, 17, tzinfo=timezone.utc))
 
 
@@ -105,9 +108,15 @@ def fixture_agent_started(arguments: list[str]) -> None:
     directory = Path(os.environ["HERDR_PROC"]) / str(shell) / "cwd"
     write_process(os.environ, FAKE_CLAUDE_PID, shell, ["claude"], marks, cwd=directory.resolve())
     with patch.object(runtime_sessions, "process_start", side_effect=fixture_process_start):
-        record_fixture_claude_start(arguments)
+        record_fixture_claude_start(arguments, remote_control=(Path(os.environ["STUB_STATE"]) / "ready").exists(),
+                                   messaging_socket=os.environ["FAKE_CLAUDE_SOCKET"])
     registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{FAKE_CLAUDE_PID}.json"
-    identity = cast(dict[str, str], json.loads(registry.read_text()))["sessionId"]
+    record = cast(dict[str, str], json.loads(registry.read_text()))
+    identity = record["sessionId"]
+    record["messagingSocketPath"] = os.environ["FAKE_CLAUDE_SOCKET"]
+    _ = registry.write_text(json.dumps(record))
+    marks["CLAUDE_CODE_SESSION_ID"] = identity
+    write_process(os.environ, FAKE_CLAUDE_PID, shell, ["claude"], marks, cwd=directory.resolve())
     path = Path(os.environ["FAKE_HERDR_RESPONSES"])
     responses = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(path.read_text()))
     pane_reply = responses[f"--session {session} pane list"]
@@ -119,7 +128,7 @@ def fixture_agent_started(arguments: list[str]) -> None:
             row["agent_session"] = {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": identity}
     responses[f"--session {session} pane list"] = CommandResponse(code=0, stdout=json.dumps({"result": panes}))
     responses[f"--session {session} pane process-info --pane {pane}"] = fixture_foreground(shell)
-    _ = path.write_text(json.dumps(responses))
+    write_text_atomic(path, json.dumps(responses))
 
 
 STUB = r'''#!/usr/bin/env python3
@@ -161,7 +170,7 @@ def configure_test_zone() -> None:
 
 
 from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, unit_membership,
+    StaffTestCase, fixture_runtime_id, fixture_showrunner_name, recorded_showrunner, unit_membership,
 )
 
 
@@ -273,6 +282,8 @@ class AddUnitTestCase(ShutdownTestCase):
         )
         registry = home / ".claude/sessions"
         registry.mkdir()
+        listener = self.enterContext(socket.socket(socket.AF_UNIX))
+        listener.bind(str(self.root / "claude.sock"))
         self.state = self.root / "stub-state"
         _ = self.state.mkdir()
         _ = (self.state / "ready").touch()
@@ -292,6 +303,7 @@ class AddUnitTestCase(ShutdownTestCase):
         self.env = {**os.environ, "HOME": str(self.root / "home"),
                     "HERDR_PLATFORM": "linux",
                     "NOTIFIER_SESSIONS_DIR": str(registry),
+                    "FAKE_CLAUDE_SOCKET": str(self.root / "claude.sock"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "STUB_STATE": str(self.state),
                     "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",
@@ -303,7 +315,13 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
+        socket_path = Path(self.enterContext(short_socket_directory())) / "claude.sock"
+        messaging = socket.socket(socket.AF_UNIX)
+        self.addCleanup(messaging.close)
+        messaging.bind(str(socket_path))
+        self.env["FAKE_CLAUDE_SOCKET"] = str(socket_path)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
+        _ = recorded_showrunner("director", self.doc)
         _ = self.staff.record_production("build-followups", self.doc)
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"
@@ -316,10 +334,11 @@ class AddUnitTestCase(ShutdownTestCase):
     if argv[2:4] == ["pane", "process-info"] and "FAKE_SHELL_PID" in os.environ:
         sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
         from scripts.production.add_unit_test_support import fixture_foreground
+        from scripts.lib.atomic_file import write_text_atomic
         path = Path(os.environ["FAKE_HERDR_RESPONSES"])
         responses = json.loads(path.read_text())
         responses[" ".join(argv)] = fixture_foreground(int(os.environ["FAKE_SHELL_PID"]))
-        path.write_text(json.dumps(responses))
+        write_text_atomic(path, json.dumps(responses))
     result = main(argv)
     if result == 0 and argv[2:4] == ["workspace", "create"]:
         shell = Path(os.environ["HERDR_PROC"]) / os.environ["FAKE_SHELL_PID"]
@@ -426,7 +445,7 @@ class AddUnitTestCase(ShutdownTestCase):
         import pane_record
         with patch.object(pane_record, "RECORD_DIR", Path(self.env["HERDR_PANE_RECORD_DIR"])):
             pane_record.write(session, pane_record.launch("w1:p1", "62ccbd64-f22e-5647-b20e-7899aa39d766", str(self.root),
-                {"CLAUDE_CONFIG_DIR": str(directory), "SHOWRUNNER_UNIT_ID": "alpha-unit"},
+                {"CLAUDE_CONFIG_DIR": str(directory)},
                 ["claude", "-n", "alpha", "--model", model]))
         transcript = Path(self.env["HOME"]) / ".claude/projects/project/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
@@ -448,8 +467,7 @@ class AddUnitTestCase(ShutdownTestCase):
                 f"- **Showrunner checkout:** `{self.checkout}`\n"
                 "- **Showrunner session:** director\n"
                 "- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n"
-                "- **User zone:** America/Los_Angeles — reports use PDT\n\n"
-                "## Gates\n")
+                "- **User zone:** America/Los_Angeles — reports use PDT\n")
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
@@ -469,7 +487,7 @@ class AddUnitTestCase(ShutdownTestCase):
         (server / "fd/3").unlink(missing_ok=True)
         (server / "fd/3").symlink_to(f"socket:[{server.name}]")
 
-    def configure_herdr(self, request: add_unit.UnitLaunch | add_unit.NoMarkedUnit = NO_LAUNCH_FIXTURE) -> None:
+    def configure_herdr(self, request: add_unit.UnitLaunch | add_unit.NoLabeledSession = NO_LAUNCH_FIXTURE) -> None:
         """Fake herdr answers a launch as a tab of the shared session, whose server has a boot unit."""
         responses: dict[str, CommandResponse | list[CommandResponse]] = {
             "--session default session list --json": CommandResponse(code=0, stdout='{"sessions": []}'),
@@ -488,6 +506,11 @@ class AddUnitTestCase(ShutdownTestCase):
         if isinstance(request, add_unit.UnitLaunch):
             self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
             self.env["FAKE_CLAUDE_PID"] = str(FAKE_CLAUDE_PID)
+            registry = Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{FAKE_CLAUDE_PID}.json"
+            if registry.exists():
+                record = cast(dict[str, object], json.loads(registry.read_text()))
+                record["bridgeSessionId"] = "session_bridge" if (self.state / "ready").exists() else ""
+                _ = registry.write_text(json.dumps(record))
             parent = fixture_runtime_id("showrunner::" + fixture_showrunner_name(request.production.slug, request.production.doc))
             self.env["FAKE_CLAUDE_SESSION_ID"] = fixture_runtime_id("unit:" + parent + ":" + request.identity.session)
             name = SHARED
@@ -500,9 +523,6 @@ class AddUnitTestCase(ShutdownTestCase):
                 code=0, stdout=json.dumps({"result": {"workspaces": []}}))
             responses[f"--session {name} pane list"] = CommandResponse(code=0, stdout=json.dumps({
                 "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": title}]}}))
-            screen = "/remote-control is active" if (self.state / "ready").exists() else "Waiting for remote control"
-            responses[f"--session {name} pane read w1:p1 --source recent --lines 60"] = CommandResponse(
-                code=0, stdout=screen)
             responses[f"--session {name} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
                 code=0, stdout="────────\n❯ \n────────")
             process = self.root / "proc/102"
@@ -520,8 +540,6 @@ class AddUnitTestCase(ShutdownTestCase):
                     {}, cwd=request.session_cwd)
             self.env["FAKE_SHELL_PID"] = process.name
             self.server_listener(server, name)
-            environment = {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": request.production.slug,
-                           "SHOWRUNNER_UNIT_ID": request.identity.unit}
             running = CommandResponse(code=0, stdout=json.dumps(herdr.SessionListResult(sessions=[
                 *[session for session in sessions if session["name"] != name],
                 herdr.SessionEntry(name=name, running=True, default=False,
@@ -534,8 +552,7 @@ class AddUnitTestCase(ShutdownTestCase):
                         else self.env["FAKE_CLAUDE_SESSION_ID"]}}]}})),
                 }
             responses[f"--session {name} agent prompt w1:p1 {script_prompt(add_unit.prompt_for(request))}"] = CommandResponse(
-                code=0, stdout="", write_files={str(process / "environ"): "\0".join(f"{key}={value}" for key, value in environment.items()),
-                    str(self.state / f"herdr-live-{name}"): "",
+                code=0, stdout="", write_files={str(self.state / f"herdr-live-{name}"): "",
                     self.env["FAKE_HERDR_RESPONSES"]: json.dumps(after)})
         responses.update(self.herdr_overrides)
         if isinstance(request, add_unit.UnitLaunch):
@@ -654,11 +671,12 @@ class AddUnitTestCase(ShutdownTestCase):
         return (self.doc.read_text(), self.git("for-each-ref", "refs/heads"),
                 self.git("worktree", "list", "--porcelain"))
 
-    def commit_row_off_the_naming_pattern(self) -> Path:
+    def commit_row_off_the_naming_pattern(self, *, session_id: str = "62ccbd64-f22e-5647-b20e-7899aa39d766") -> Path:
         """Unit `trunk` as seen live: neither its staff worktree nor its branch is what the naming pattern gives."""
         worktree = self.root / "tool-based-ui-trunk"
         _ = self.git("worktree", "add", str(worktree), "-b", "init/catalyst-trunk")
-        _ = self.prepare_restored_worktree("trunk", worktree)
+        with patch.dict(self.env, {"FAKE_RESTORED_SESSION_ID": session_id}):
+            _ = self.prepare_restored_worktree("trunk", worktree)
         return worktree
 
     def prepare_restored_worktree(self, name: str, worktree: Path, *,
@@ -678,11 +696,11 @@ class AddUnitTestCase(ShutdownTestCase):
             _ = unit_config.write(worktree, unit_config.UnitConfig(config_plan, unit_config.NoAppPort(), ()))
         return row
 
-    def run_with_marked_unit(
+    def run_with_labeled_session(
         self,
         claude: unit_lookup.Claude,
         *,
-        already_marked: bool = True,
+        already_labeled: bool = True,
         place: unit_lookup.Place = MARKED_HERDR_PLACE,
         outcome: herdr.PromptSubmitOutcome = SUBMITTED_PROMPT,
     ) -> tuple[int, str, list[list[str]], int, int]:
@@ -696,13 +714,13 @@ class AddUnitTestCase(ShutdownTestCase):
             session=add_unit.NewSession(),
             timeout=1.0,
         )
-        marked = unit_lookup.MarkedUnit("alpha-unit", claude, place)
-        launched = (marked if already_marked else unit_lookup.MarkedUnit("alpha-unit", claude, HerdrPlace(SHARED, "w1:p1")))
+        marked = unit_lookup.LabeledSession("alpha-unit", claude, place, identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session))
+        launched = (marked if already_labeled else unit_lookup.LabeledSession("alpha-unit", claude, HerdrPlace(SHARED, "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit").current_session)))
         ready = add_unit.ReadyToLaunch(
             request,
             # A rerun or restore reuses a row. Only a fresh launch has no row.
             add_unit.ExistingUnitRow("docs/plans/given.md", request.worktree, request.branch)
-            if already_marked else add_unit.NoUnitRow(),
+            if already_labeled else add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
         # These launcher tests replace worktree creation and preflight. Supply
@@ -740,7 +758,7 @@ class AddUnitTestCase(ShutdownTestCase):
             patch.object(
                 add_unit,
                 "launched_unit",
-                return_value=(add_unit.MarkedUnitFound(marked) if already_marked else add_unit.NoMarkedUnit()),
+                return_value=(add_unit.LabeledSessionFound(marked) if already_labeled else add_unit.NoLabeledSession()),
             ),
             patch.object(herdr, "live_sessions", return_value=[]),
             patch.object(add_unit, "write_stub") as write_stub,
@@ -763,7 +781,8 @@ class AddUnitTestCase(ShutdownTestCase):
         registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
         _ = (registry / f"{os.getpid()}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": "62ccbd64-f22e-5647-b20e-7899aa39d766", "name": "postmaster",
-            "messagingSocketPath": "", "updatedAt": 1, "procStart": proc_start,
+            "messagingSocketPath": self.env["FAKE_CLAUDE_SOCKET"], "updatedAt": 1, "procStart": proc_start,
+            "bridgeSessionId": "session_bridge",
         }))
 
     def prepare_attach(self, *, after_stop: tuple[int, ...] = (), after_launch: tuple[int, ...] = (202,),
@@ -815,12 +834,26 @@ class AddUnitTestCase(ShutdownTestCase):
         return prior, trace
 
     def persist_herdr_unit(self, name: str, cwd: Path) -> None:
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
+        row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
+        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
+        stopped = add_unit.LabeledSessionFound(unit_lookup.LabeledSession(
+            "alpha", unit_lookup.ClaudeNotRunning(), HerdrPlace(name, "w2:p1"),
+            identity=unit_lookup.LiveSession(row.current_session)))
+        launched_unit = add_unit.launched_unit
+
+        def observed(request: add_unit.UnitLaunch | add_unit.RequestedUnitLaunch) -> add_unit.LabeledSessionFound | add_unit.NoLabeledSession:
+            if not (self.root / "proc" / str(FAKE_CLAUDE_PID)).exists():
+                return stopped
+            return launched_unit(request)
+
+        _ = self.enterContext(patch.object(add_unit, "launched_unit", side_effect=observed))
         for pid, parent, arguments in ((201, 1, ["herdr", "--session", name, "server"]), (202, 201, ["zsh"])):
             process = self.root / "proc" / str(pid)
             process.mkdir(parents=True)
             _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0")
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
-            _ = (process / "environ").write_text("HERDR_PANE_ID=w2:p1\0SHOWRUNNER_UNIT=build-followups\0SHOWRUNNER_UNIT_ID=alpha-unit" if pid == 202 else "")
+            _ = (process / "environ").write_text("HERDR_PANE_ID=w2:p1" if pid == 202 else "")
             (process / "cwd").symlink_to(cwd)
         self.server_listener(self.root / "proc/201", name)
         (Path(self.env["HOME"]) / ".claude/sessions").mkdir(exist_ok=True)

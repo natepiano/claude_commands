@@ -6,6 +6,12 @@ Every build on natedev, CI's and the sessions', is admitted so that it fits in m
 
 ## How it works
 
+Linux target steps set `BUILDLOG_CALLER=verify-linux`.
+`memory_gate.sh` grants these steps without a local admission socket or a natedev hold check.
+Target slots and the target build budget provide admission there.
+AWS admission still requires the spending guard.
+Other Linux callers keep the local admission and hold checks.
+
 ### Temporary build folders
 
 `scripts.lib.build_folders.create_build_folder(request) -> Path` allocates temporary build folders.
@@ -99,7 +105,7 @@ Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
 
 The service retains the run's process watch between steps.
-The run holds no memory reservation or CPU token between steps.
+The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
 When the run ends, waiting steps use their own arrival times for order again.
 The service persists run places with waiter places through the generic codec in `state.json`.
 After a restart, the service restores live run places and removes ended run places.
@@ -110,11 +116,31 @@ After a restart, the service restores live run places and removes ended run plac
 `admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
 `memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
 
+Each admitted run keeps aside `max(0, accepted need − anonymous use)`, plus its held slots.
+Room equals host free memory minus the 3 GiB safety minus run keep-asides minus the CI keep-aside.
+The first two minutes use the same calculation. A run never counts its use twice.
+The cap equals admitted anonymous use plus host free memory minus the safety.
+The display shows zero room for a shortfall. The cap explanation shows the shortfall.
+These readings never reduce a promise from history.
+
+Waiting runs follow priority, first run arrival, and PID order.
+A younger run starts only when its need fits after the first run's need remains protected.
+The first run can start despite insufficient room when no admitted run or held slot remains.
+Readable host memory, clear readable pressure, and a current estimate remain necessary.
+New starts have five seconds of spacing through `recovery_start_seconds`.
+
+An ended step retains its slot for `slot_gap_seconds`, currently ten seconds.
+A continuation reuses that slot without start spacing, even under pressure.
+A larger continuation requests only the extra memory before waiting runs.
+That extra requires sufficient room and clear readable pressure.
+The gap deadline or the run's process end releases an unused slot.
+A closed connection ends its wait and releases its claim.
+
 Every pass reads one `MemoryConfig` from `[memory]` in `config/build_admission.conf`.
 `read_admission_configuration()` returns `UsableAdmissionConfiguration` or `UnusableAdmissionConfiguration`.
 `read_memory_config()` resolves each key through `ConfigRead.origin()` once.
 It collects recovery diagnostics and emits them only after a successful read.
-Estimates receive the cargo peak, budget, and test margin from that resolved configuration.
+Estimates receive the cargo peak and history factors from that configuration.
 A recovered setting remains usable and produces one warning per process.
 An unavailable setting stops grants and returns a refusal that names the file and key.
 The service listens during a refusal and watches the nearest existing configuration directory.
@@ -135,11 +161,11 @@ Queries project the stored `PassResult` through `queue_read_from_pass`. A releas
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
 `/build:queue <position|session|folder>` shows the full queue, one blank line, and the selected cards.
 `mine` uses the same layout. The page resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
-`queue_evidence.py` formats the recorded need, charge basis, resource arithmetic, pressure, and release advice.
+`queue_evidence.py` formats the recorded need, run keep-aside, room calculation, head cause, and release advice.
 The card uses the reply's policy and limits. It reads no current admission configuration to reinterpret the reply.
-The evidence includes host RAM, optional load, running promises, charges, current use, and total current use.
-It also includes estimate history, shape tiers, failed-peak floors, factors, caps, package, filters, width, and completed CPU-token waits.
-A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`; the order-window deadline remains separate.
+The evidence includes host RAM, optional load, run needs, anonymous use, held slots, keep-asides, room, and start spacing.
+It also includes estimate history, shape tiers, failed-peak floors, factors, recorded limits, package, filters, width, and completed CPU-token waits.
+A missing optional record remains unknown. Queue arrival and time waiting use `joined_at`. Start spacing has its own deadline.
 Admission and release calculations remain in `memory_admit.py`. An expired estimate requires a client refresh through the service.
 The page prints priority and unowned memory once in the queue view. It prints shared evidence once below the selected cards.
 `build_why.py` and its command are removed. There is no alias.
@@ -151,10 +177,10 @@ A failed first query shows `Build queue could not be read.`
 | `admit` | Wait, refusal, or a durable grant with reservation id, `.max`, `.wave`, and sampling context |
 | `launch` | Wait, refusal, or launch permission without a reservation |
 | `release` | Finalize one reservation |
-| `width` | Change test width and queue a new test-phase estimate |
+| `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
 | `priority_set`, `priority_clear` | Change the one unit priority |
-| `admit_head` | Permit the current head to exceed the budget when free memory permits |
+| `admit_head` | Waive existing keep-asides for the head when free memory permits |
 | `view`, `explain`, `mine` | Read the stored pass |
 
 `/build:queue bump <position|session|folder>` uses the card's selector resolver to select a waiting step.
@@ -173,23 +199,24 @@ Unavailable settings produce refusals rather than replacement policy values.
 
 ### Durable state and lifetime
 
-`admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, recovery spacing, and the replay ledger.
-The service replaces this file atomically. Reservation records include test-phase need, selected charge evidence, and finalization intent.
+`admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, start spacing, and the replay ledger.
+Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
+The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.
 `CallRecord` and `NoCallRecord` describe the call.
 
 `reservation_stem` gives each grant its `.max` and `.wave` paths. `invoke.sh` uses the grant's paths and sampling context.
 The sampler reads no reservation file. It marks the nextest test phase through `record.py test-phase-context`.
-The service watches owner pidfds and scope events. An ended owner retains its charge while its scope remains populated.
+The service watches owner pidfds and scope events. A populated scope retains its accepted need after its owner ends.
 An empty scope and ended owner permit finalization. A reused scope path gets a new watch.
 
 `finalize_reservation` is the one finalizer. `StateIntents.save` persists its evidence before the history append.
 The finalizer matches `reservation_id` to prevent a duplicate history row after a crash.
 `StateIntents.clear` removes the reservation after the append. Startup completes any saved intent.
-The finalizer copies selected test-phase evidence. It never selects new evidence during release.
+The finalizer records completed measurements for history. Release creates the run slot without changing the accepted need.
 
 At the first start without `state.json`, the service imports the old admission files through their existing readers.
-It imports live reservations, saved intents, waiter places, token handoffs, priority, head override, and recovery spacing.
+It imports live reservations, saved intents, waiter places, token handoffs, priority, head override, and start spacing.
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
 There is no admission lock.
@@ -199,7 +226,49 @@ The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.
 Queue views continue to use the service.
 
-### Estimates and charges
+### Queue lifecycle and calibration
+
+The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
+The same record holds Cargo steps and `merge-gate` steps.
+The append function locks the file and removes incomplete rows before an append.
+At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
+
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
+2. `left` records a cancelled waiter or a waiter whose owner is gone.
+3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
+Each admission and end also identifies its reservation interval by `reservation_id`.
+A token wait ends an interval with `TokenReturn`. It does not complete the step.
+A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
+The saved finalization intent retains the facts for the end event across retries.
+The event identity prevents a retry from publishing the same end twice.
+The service saves pending admission and cancellation facts with each durable state transition.
+One lifecycle outbox publishes these facts after the state write and during restart.
+Reservation removal and removal of its non-token place use the same state write.
+
+`read_queue_lifetimes` joins these events into `QueueStepLifetime` records.
+Each record retains its reservation intervals, token gaps, and final end state.
+Memory wait includes the first wait and each wait after a token returns.
+It excludes the token gaps and running time.
+A missing return time gives `MemoryWaitIncomplete`; an unfinished step gives `StepStillOpen`.
+The Phase 16 comparison is due 24 hours after these lifecycle records reach main.
+It compares Cargo waits and pressure holds with and without overlapping gate intervals.
+
+`head_policy` resolves the deployed head rule and ordered walk from one frozen snapshot.
+Admission, queue readers, blocker searches, and release searches use that result.
+The head keeps its accepted need while it waits.
+Younger runs can start only if they leave room for that need.
+The rule applies with and without queue priority.
+
+The Phase 20 calibration has insufficient evidence.
+The calibration requires seven days under the deployed Phase 39 configuration.
+The phase review found no eligible days or cohort budget after that deployment boundary.
+Recorded wait minutes, replayed wait minutes, and their ratio are unavailable.
+The main reference has a 24 GiB build budget; this is not a calibration cohort.
+The comparative replay does not run. The capacity rule is not adopted.
+
+### Estimates and keep-asides
 
 The client calls `step_estimate` before admission and after `EstimateExpired`.
 Before each new build estimate, it reads `build_history` from the service, then reads history.
@@ -212,40 +281,168 @@ A publication retry also advances the generation. The service never prunes or re
 A refresh uses the open admission connection. An unregistered client uses a read-only `build_history` query.
 A pass retries a retained finalization intent even while its owner remains alive.
 It preserves the first `since` and episode across refreshes and reconnects.
-A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `head_seconds`.
+A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A cap-source waiter never expires. A `FixedCapSizing` program holds its cap without a history estimate or refresh.
 The merge gate asks for its own `--memory-cap-mib`, default 6144 MiB.
 Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory cap` in explanations.
-`step_promise` gives fixed-cap rows and release builds `LifetimePromise` until they end.
-Both the budget charge and free-memory growth term use that promise.
+`step_promise` gives every admitted step a `LifetimePromise` until it ends.
+The run calculation uses the accepted need before tests start.
+For nextest, an observed test phase can select the frozen test-phase need instead.
 
 Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
-Build estimates retain same-shape history, failed-build floors, and the configured budget cap.
-`peak_activity` labels cargo compilation as `compiling` and other work as `running`.
-The policy's ramp, pressure, recovery, head-window, and per-kind peak-hold values apply at each pass.
-The merge-gate peak hold is 180 seconds. Other kinds inherit `peak_hold_seconds`, currently 1500 seconds.
-No per-step near-peak timeline is retained; `.wave` holds only the latest pair.
-The 180-second merge-gate hold is a set value, not a measured p95. Fixed-cap lifetime promises supersede peak decay.
+Cargo estimates separate compile history from no-compile history.
+`index_step_evidence` joins each anonymous peak by host, call id, and step.
+`StepEvidence` keeps its shape and compile count independent.
+For a test step (`TEST_STEPS`: `nextest`, `test`, `t`), it also keeps the decoded argv as `arguments`.
+`history_selection` gives each anonymous row its package, scope and filter set.
+A recorded field wins. Only a missing field is parsed from `arguments`, once, through `test_selection`.
+A row with neither keeps the recorder defaults: no package, `full`, no filters.
+Missing argv does not remove a compile count. A saved shape does not prove compilation.
+`CompiledCrates` identifies a compile run. `NoCratesCompiled` identifies known zero-count attempts.
+The join combines repeated attempts. Any positive count keeps the call in compile history.
+An unknown count or a missing join keeps the peak usable until the index supplies a known count.
+The peak's completion time controls its history window, including failed-build floors.
+Merge-gate peaks keep their separate class and remain in the anonymous history.
+The gate uses its own cap, so Cargo estimates do not use those peaks.
 
-Nextest uses `TestPhaseCharge` after its sampler mark, ramp, and recorded test-phase need permit it.
-One estimate worker calls `test_phase_need` through `anonymous_history_rows`.
-Each job carries the reservation, width, revision, and event's resolved `MemoryConfig`.
-The loop accepts results only when the reservation and revision still match. Width changes increment the revision.
-A failed job stores nothing. A frozen need keeps its recorded margin; a later width request reads the margin again.
-A legacy need without a recorded margin decodes as `NoTestPhaseNeed("not_recorded")`. The step measures again.
-The first selected charge evidence is persisted outside the pure pass. A failed optional evidence write does not undo admission.
+Five keyed rows exclude the older unkeyed rows for the same repository.
+With one to four own rows, a non-build estimate uses their largest peak or a lower pool p90.
+A repository without own history keeps the pool and fallback order.
+A full test estimate with a package keeps only rows whose package and scope match.
+Other steps, and requests with no package, keep the recorded scope rule.
+A filtered compile estimate (`filtered_peak`) takes the larger of two anonymous p90 values:
+the exact filter set's rows and the package's filtered rows.
+Indexed peaks times `ANON_SHARE` come next, exact filter first. Check or build compile peaks come last.
+A full-suite estimate does not cap a filtered compile estimate.
+The 1 GiB filtered floor applies when the repository has no usable compile history.
+Fresh nextest estimates retain `fresh_test_peak` and its 1 GiB floor.
+Freshness still requires both Cargo output roots to survive.
 
-Each pass counts `sccache.service` and unowned child scopes under `builds.slice`.
-`ci_memory_slice` in `[memory]` of `config/build_admission.conf` names the system CI slice.
-`systemctl show` supplies its cgroup path. Each pass reads its `memory.current`, `memory.stat`, swap, and `memory.max` through `unowned_slice_memory`.
-Unowned scopes and the CI slice use one working-set rule: `max(0, memory.current - memory.stat inactive_file) + swap`.
-An idle CI slice charges this working set. Inactive file cache holds no build budget.
-A `Runner.Worker` adds `ci_memory_margin_gib` for growth between passes, capped at the live slice limit.
-The charge never falls below the working set. Each pass reads the margin and the limit again.
-The promise reserves free RAM for the added margin. An unavailable reading refuses new grants and retries on the next pass.
-Releases remain available during a reading refusal.
-`UnownedSliceMemory` names each unowned scope and its size. Process-tree charges are subtracted to prevent duplicate charges.
-The held head shows free memory, reserve, and need from `HeadExplanation`.
+#### Phase 11 replay comparison
+
+The replay covers 2026-10-21 through 2026-11-04 with the same frozen inputs.
+It evaluates 15,053 runs and omits 195 runs without an index match.
+Another 617 merge-gate rows retain their separate cap class.
+Each estimate uses its historical budget: 21 GiB or 24 GiB.
+Under-half means below half the measured peak. Over-three means above three times the measured peak.
+
+| Compile class | Budget GiB | Runs | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|---:|---:|
+| compile | 21 | 11,360 | 458 | 402 | 1,162 | 1,152 |
+| compile | 24 | 2,300 | 18 | 12 | 332 | 358 |
+| no compile | 21 | 1,185 | 12 | 12 | 937 | 937 |
+| no compile | 24 | 208 | 3 | 4 | 174 | 173 |
+| **Total** | | **15,053** | **491** | **430** | **2,605** | **2,620** |
+
+These repositories have a higher count. Each row combines their steps, compile classes, and budgets.
+
+| Repository | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|
+| cargo-liner | 27 | 8 | 1,754 | 1,804 |
+| check-only | 1 | 2 | 5 | 3 |
+| clone | 1 | 2 | 15 | 14 |
+| clone85 | 1 | 2 | 0 | 0 |
+| fix | 3 | 3 | 20 | 22 |
+| hana | 71 | 31 | 592 | 595 |
+| lintproof_fix | 0 | 1 | 6 | 1 |
+| p31-gates-834aebb04-8015c7caf3 | 1 | 2 | 3 | 1 |
+| src | 0 | 2 | 46 | 40 |
+| work | 1 | 2 | 0 | 0 |
+
+Bar missed: under-half falls by 61, but over-three rises by 15.
+At least one count rises in 10 repositories and 19 repository, step, and compile-class groups.
+The largest rise is cargo-liner nextest compile runs at 21 GiB: under-half 27 to 7, over-three 101 to 166.
+A filtered compile run takes its estimate from compile history, and the full-run estimate no longer caps it.
+The showrunner accepted the miss (2026-11-04): an under-promise risks an out-of-memory kill; an over-promise only delays parallel starts.
+Phase 60 found the promise source of these over-three runs and fixed it there; see the Phase 60 replay below.
+Run `phases/11/replay.py before` and `after` in the session folder to regenerate the full grouped data for `replay_groups.md`.
+
+#### Phase 60 replay comparison
+
+The Phase 60 replay (`phases/60/replay.py`) rebuilds the Phase 11 replay with the same frozen inputs.
+It classifies each call through `index_step_evidence` and `combine_compile_counts`. The baseline is `82f5c90d4`, the Phase 11 checkpoint.
+The shared classification moves 51 runs from no compile to compile, so its class totals differ from the Phase 11 table.
+
+The cause is in the selection of history rows, not in the tier order:
+1. Anonymous rows recorded before 2026-10-29 have no package, scope or filter fields.
+   `filtered_peak` rejected them, so 90 high promises came from indexed peaks times `ANON_SHARE`.
+   Indexed peaks count memory outside the anonymous peak, so those promises were too high.
+2. A full test estimate with a package mixed every package and older filtered rows: 79 high promises.
+3. Three high promises came from large earlier samples. The fix keeps them.
+
+The fix recovers the missing fields from the indexed argv, selects full test rows by package and scope,
+and takes the larger of the exact-filter and package p90 before any indexed tier.
+
+| Compile class | Budget GiB | Runs | Under-half before | Under-half after | Over-three before | Over-three after |
+|---|---:|---:|---:|---:|---:|---:|
+| compile | 21 | 11,411 | 402 | 367 | 1,171 | 1,071 |
+| compile | 24 | 2,300 | 12 | 12 | 358 | 361 |
+| no compile | 21 | 1,134 | 12 | 12 | 918 | 920 |
+| no compile | 24 | 208 | 4 | 4 | 173 | 173 |
+| **Total** | | **15,053** | **430** | **395** | **2,620** | **2,525** |
+
+Bar met: cargo-liner nextest compile runs at 21 GiB go from under-half 7 to 0 and over-three 166 to 65 (bar: 101 or lower, under-half 7 or lower).
+At 24 GiB, the same group goes from over-three 6 to 2.
+Hana over-three rises 595 to 607 while its under-half falls 31 to 23. Six other repositories rise by one or two runs in one count.
+Run `phases/60/run_after.py` in the session folder to regenerate `after.json`.
+
+#### Phase 17 compile-band measurement (not adopted)
+
+Phase 17 replayed nextest promises split by compile count (bands 1–5, 6–20, 21–50 and more than 50 crates) against checkpoint `e88fb841d`.
+The band chosen from the last compile count of the same worktree and step was right for 54% of compile requests.
+Promises under half the peak rose from 395 to 423, and ten repositories got worse. Promises over three times the peak fell from 2,525 to 2,485.
+The adopt rule needs fewer under-half promises in total and no rise in any repository, so bands are not adopted and the estimate is unchanged.
+
+Build estimates use completed same-shape history from the last 14 days.
+Ten or more earlier runs supply p90. One to nine earlier runs supply their largest peak.
+The newest failed-build floor can raise that base.
+Each new estimate reads `[memory]` in `config/build_admission.conf` through `memory_config()`.
+A dev build uses `ceil(base × dev_size_factor + margin_bytes)`.
+`dev_size_factor` is 1.1. `dev_size_margin_gib` is 1.1 GiB, rounded upward to bytes.
+The Phase 39 replay uses the original 126-build cohort and the 64 measured builds from the latest three days.
+The cargo-berth increase sets the margin. The measured S2 build sets the factor.
+The S2 history peak of 6.3 GiB gives a promise of 8.03 GiB without truncation.
+Release builds use `release_headroom`, currently 1.314. A build without same-shape history retains the same-profile fallback without headroom.
+The retry after a memory kill stays unchanged.
+
+Each estimate stores its history rule, factors, and failed-peak floor.
+`DevSizeHeadroom` stores its factor and margin.
+`LegacyDevMultiplierHeadroom` reads older saved multipliers through the existing `dev` wire tag.
+New estimates remain uncut. Historical `CappedAtBudget` and `CapNotRecorded` values remain readable.
+
+Each pass reads the resident working set and swap for service reports.
+CI RAM and unowned scopes reduce host free memory. They do not create a run promise.
+`ci_memory_slice` names the CI slice. A missing CI reading remains a labelled diagnostic.
+`ci_memory_margin_gib=7` supplies one CI keep-aside while `job_state` is `RunningServiceJob`.
+The service reads that value once with the other policy values.
+`AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
+`MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
+`MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
+Idle CI and unavailable CI readings add no CI keep-aside.
+CI RAM already reduces host free memory. The room calculation never subtracts it again.
+The service does not require `memory.max` for admission.
+The cap remains anonymous use plus free memory minus safety.
+The cap text names the CI keep-aside within kept memory.
+The page shows CI RAM outside the cap and the CI keep-aside beside it, before the cap.
+Neither CI part increases the page's taken total for admitted runs.
+`RunningServiceJob` and `IdleService` retain the CI job state.
+Anonymous scope counters use the same measure as the history peaks.
+Missing anonymous counters keep the full accepted need aside and make the cap unavailable.
+The service freezes `TestPhaseNeed` and its margin when it writes a nextest reservation need.
+A width update selects history again at the recorded width.
+`test_phase_need` uses the existing history selector through `store.locked_rows`.
+The selector uses the p90 test-phase peak from matching repository, scope, package, filters, and width history.
+`test_phase_margin=1.2` has range `1..`. Missing or invalid values use `TEST_PHASE_MARGIN_FALLBACK`, which is 1.2.
+The config reader resolves the margin once. Each reservation retains its selected margin.
+`record.read_test_phase` supplies the observed test window and test peak.
+After tests start, need equals `max(test peak so far, stored test-phase need) × stored margin`.
+Without a stored need or observed test window, need remains the full step estimate.
+The existing keep-aside formula remains `max(0, need − anonymous use)`.
+For a 12 GiB step, 3 GiB test use, and 3 GiB history need, margin 1.2 gives 3.6 GiB need.
+That run keeps 0.6 GiB aside instead of 9 GiB.
+The queue view, card, build-why, and memory page use the keep-aside captured by the last pass.
+Build-why explains the selection: `tests started: need X (test peak Y, history N x 1.2)`.
+No test-phase estimate worker remains.
 
 ### Clients and program places
 
@@ -331,13 +528,47 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 
 `verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. The clock is Bash's `$SECONDS`, or the integer in `UNIT_TOKEN_CLOCK_FILE` when set, so a test advances a file instead of sleeping. A wait that times out exits 1 before any call is recorded, so its time is in no row.
 
+Queue-priority commands accept only unit labels in the local roster. Only sessions with a real unit supply membership; the no-unit display placeholder supplies none. Unknown units, including that placeholder, leave the old priority unchanged and return `build queue: unknown unit <unit>; the queue priority did not change` on stdout with exit 3. The pane shows this through its existing refusal protocol. Callers pass a unit as `--unit=<unit>`, including names that start with `-`. The pane passes its own session id to the command. Each card shows the stored priority reason once and counts priority steps as `N of <unit> (queue priority)`; old per-step bump records are not card reasons. Clearing an unreadable priority file removes it and names the removed file.
+
+Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
+
 ### Cargo token reclaim (`scripts/direct/board.sh`)
 
-`verify.sh` acquires the board's `cargo` token with `--pid $$ --hold 3600` and no time limit: `acquire_token` repeats `--wait 3` (two tries 3 s apart) until the token is held, and adds the wait to the call's `token_wait_s`. The waits form one queue: a call tries only while no older call in the board's `token_waiters` folder still runs `verify.sh` (`count_token_waiters_ahead`, which also removes the files of ended calls), and `try_token_now` makes a wait when an older call waits. A call that gives the token back for a memory or hold wait waits again under its first start, in a file with an `.again` suffix, so it keeps its place and a newer call does not supersede it. The wait prints `waiting for the cargo token since <time>: <holder> holds it; calls ahead of this one: N`, a `still waiting` line every 5 min (`TOKEN_WAIT_NOTE_MIN`), and `took the cargo token after N min`. On 2026-10-22 about 25 calls polled one board's token, any of them took it when it came free, and two calls waited 3 and 3.5 h with logs that ended on "starting anyway", so their unit took them for dead. Each step gives the token back before `buildlog_wait_for_memory` and takes it again when the gate admits the step, so a peer builds while this run waits for memory; a step that leaves the wait for the Mac (`LeftQueue`) does not take it again. After admission the step tries the token once with `--wait 0` (`try_token_now`). When a peer holds it, the step gives its reservation back (`buildlog_release_memory 0`), waits for the token, and passes the gate again with the token held, so a step in the token queue promises no memory. The second pass sets `BUILDLOG_MEM_WAIT_SINCE` to the first pass's `BUILDLOG_MEM_WAIT_FROM`, so the step keeps its place in the waiter queue; `memory_wait` sums both passes. Kept reservations had promised 257 GiB that no build used on 2026-10-20, and every step waited the 15 min limit. The step's build hold wait (`build_hold_wait_local`, wrapped in `verify.sh`) does the same when a hold is present and the step holds the token: it gives the token back, waits out the hold, and takes it again, except after status 75 (left for the Mac). The hold time stays in the hold wait record; only the time to take the token again counts in `token_wait_s`. With no hold present, nothing is given back. The step runs in `run()`'s subshell, so its token wait reaches the call record through `TOKEN_WAIT_FILE`, and a token it gave back without taking it again leaves `TOKEN_WAIT_FILE.given_back`: `release_token` then counts the token as not held, so a call that ends after a Mac trip does not try to release a token a peer now holds (it only frees one a killed step took as its acquire returned). An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `mesh_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release run under an exclusive flock on `locks/<res>.guard`, taken by python3 `fcntl` on descriptor 9 (the Mac has no `flock(1)`) and dropped by the kernel when its holder dies: a reclaimer re-reads the lock under it, so two waiters cannot both reclaim and a release cannot remove a lock a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
+`verify.sh` takes the board's `cargo` token before each local compiling attempt requests memory.
+`acquire_token()` waits in the existing FIFO queue and reuses a token that this call already holds.
+The attempt makes one memory request and retains the token during its memory wait.
+The client's periodic leave hook renews the token with `board.sh renew` while the attempt waits.
+The hook starts before the first connection attempt, so connection retries also renew the token.
+The execution guard still checks the token owner before cargo starts.
+`unreachable_limit_seconds` limits missing-socket and refused-connection retries to 60 seconds by default.
+The client reports the retry interval once when a connection fails.
+A successful connection resets that interval.
+At the limit, the client exits with status 2, and verify releases the token without starting cargo.
+A blocked token caller has no memory waiter or reservation.
+A memory wait can delay peer calls on the same board until memory becomes available.
+
+Admission failure, cancellation, a hold, and departure for the Mac release the token.
+A later local attempt takes the token before its next memory request.
+Each `run()` path releases tokens that it acquired, as required by verify Phase 36.
+Noncompiling local steps retain their existing token path and request no memory.
+The wait log names the holder and its PID, including holder files without a final newline.
+It says `this call holds it` when the recorded PID equals the call's PID.
+
+Old shells can still send `admit`, `token-wait`, and a second `admit` with `BUILDLOG_MEM_TOKEN_BACK_AT`.
+The service keeps this compatibility path and records its token gap.
+New shells generate neither the second request nor a token gap.
+
+A hold releases the token until the hold ends.
+A call that waits again keeps its original FIFO position through its `.again` waiter file.
+The hold wait and token wait retain separate history records.
+`TOKEN_WAIT_FILE` carries a step's token wait to the call record.
+`TOKEN_WAIT_FILE.given_back` records a subshell release for its parent.
+ An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `mesh_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release run under an exclusive flock on `locks/<res>.guard`, taken by python3 `fcntl` on descriptor 9 (the Mac has no `flock(1)`) and dropped by the kernel when its holder dies: a reclaimer re-reads the lock under it, so two waiters cannot both reclaim and a release cannot remove a lock a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
 
 ### Build log: records and schema
 
-Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
+Index `SCHEMA_VERSION = 33` (`scripts/buildlog/index.py`). `open_for_update` rebuilds the index on a version mismatch.
+Memory and coordination columns:
 
 | Table | Column | Meaning |
 | --- | --- | --- |
@@ -347,12 +578,25 @@ Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebu
 | `calls` | `mem_kills`, `mem_kill_stopped` | memory-killed attempts; 1 when a step was killed twice |
 | `samples` | `builds_anon_bytes`, `ci_anon_bytes` | the `anon` line of each slice's `memory.stat` (process memory); NULL when absent |
 | `samples` | `sccache_in_service` | 1 when `builds.slice/sccache.service/cgroup.procs` holds a process, 0 when empty, NULL without `builds.slice` |
+| `samples` | `zram` | JSON zram storage at the sample time; NULL in older rows |
 | `memory_snapshots` | `src, host, at, slices, zram` | JSON slice counters and zram, indexed on `at` |
 | `ci_jobs` | `run_state` | `JobRunState.RAN / SKIPPED / CARRIED_OVER` |
 
 `steps.wait_s` keeps metadata and pass-record lookup time plus the ordinary build wait; `mem_wait_s` is memory admission. `calls.hold_wait_s` records held-target waiting separately, including each declined Mac retry, and `calls.target` names where the call ended. The Waiting table keeps `Held target` apart from `Memory admission`.
 
-**Slice snapshots** (`scripts/buildlog/memory.py`). `buildlog snapshot`, and every `buildlog sample` (via `SampleTaken(at, host)` and `memory.write_snapshot(at, host)`), append a `memory_snapshot` record to the host's monthly samples file. Per slice (`builds`, `ci`, or `{"state": "absent"}`): `memory.events` `high`/`max`/`oom_kill`, `memory.peak`, `memory.swap.peak`, the three limits, and `memory.pressure` `some` total as `stall_some_us` (or `"unavailable"`); plus zram `mm_stat` data and compressed bytes. A snapshot failure prints `memory snapshot unavailable` and never fails the sample. `BUILDLOG_BUILDS_CGROUP`, `BUILDLOG_CI_CGROUP` and `BUILDLOG_ZRAM` point tests at fixture trees.
+### Slice snapshots
+
+`scripts/buildlog/memory.py` supplies the slice snapshots.
+Each `buildlog sample` tick writes one sample row with slices and zram.
+`memory_snapshots` holds standalone snapshots and the zram-only tick rows of older logs, so the memory window reads both tables.
+The standalone `buildlog snapshot` row keeps slices and zram.
+Each slice (`builds` or `ci`) stores its events, peaks, limits, and memory pressure total.
+An absent slice has `state: absent`. An unreadable pressure total has the value `unavailable`.
+The zram reading stores the data and compressed bytes from `mm_stat`.
+It takes the nearest slices value, then the nearest zram value, each from both tables.
+With no slices in range, the result is unavailable.
+Snapshot rows have priority on equal distances.
+`BUILDLOG_BUILDS_CGROUP`, `BUILDLOG_CI_CGROUP`, and `BUILDLOG_ZRAM` select fixture paths for tests.
 
 **CI jobs.** A job is `carried_over` when its attempt is above 1 and `started_at` precedes `created_at`, else `skipped` when its conclusion is `skipped`, else `ran`. Only `ran` rows store `duration_s` and `queued_s`; `queued_s` is `started_at - created_at` when both parse and the result is zero or more, else NULL. `elapsed_seconds(start, end) -> float | None` is unrounded; `seconds_between` rounds to 3 places. `ci_job_days` excludes `carried_over` and keys days by the run attempt's `started_at`.
 
@@ -400,6 +644,14 @@ Slice lines use the snapshots nearest each edge within `SNAPSHOT_DISTANCE_S` (12
 - The Mac note starts `Mac: sync paused since <time> (<why>).` while paused.
 
 ### Mac sync pause (`scripts/buildlog/sync.py`)
+
+The hourly task exchanges records with every configured SSH peer.
+After a completed Linux offload run, natedev releases the slot claim before it calls `sync_target(target)`.
+This exchange contacts only that target and preserves its configured host paths, including `aws-build/`.
+It skips a paused sync and never waits for the sync lock.
+It uses the configured connection, reach, and rsync timeouts.
+A failed exchange prints one line and preserves the step result for the caller.
+The hourly task can retry the exchange.
 
 `buildlog sync pause <why>` writes `<root>/sync_paused.json` `{since, why}`; `resume` removes it. `sync()` holds an flock on `<root>/sync.lock` for its whole run; paused, it contacts nothing, prints `buildlog sync: paused since <time> (<why>); buildlog sync resume ends it`, returns 0 and leaves `sync.json` alone. `pause` takes the same lock (printing `buildlog sync: waiting for the running sync to finish`), so once it returns nothing contacts the Mac. `hourly` still polls CI while paused. `read_pause -> SyncPaused(since, why) | SyncRunning()`; `read_status -> SyncStatus(at, peer, ok, last_good: LastSynced | NeverSynced) | NeverSynced`. The reach check runs `mkdir -p <REMOTE_ROOT>; echo "rc=$?"` and judges the printed `rc=`; nonzero or missing (`reported rc=<n>` / `no rc= line in command output`) writes `sync.json` `ok: false` and exits 1. ssh exit 255 is a peer that did not answer (one line, exit 0). `rsync` keeps its exit-status checks.
 
@@ -478,12 +730,12 @@ After the file is gone, `notify_release` sends one notice to each recorded recip
 
 ### Disk floor: what it removes (`scripts/lint/sweep.py`)
 
-While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf` (300 GiB on natedev), `hold_floor` removes build output from the cargo target directories under `FLOOR_ROOTS` that no build holds. It removes only the shortfall (`budget = total - (floor - scanned_free)`, with `scanned_free` read after the scan that measures the caches, so space another process frees during the scan is not taken again; at or above the floor after the scan it takes nothing), from idle targets in last-use order, oldest first, across all locations (`/tmp` targets have no special priority; `build-targets.md` → Build output retained by the sweep):
+While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf` (300 GiB on natedev), `hold_floor` removes build output from the cargo target directories under `sweep_floor_roots` that no build holds. It removes only the shortfall (`budget = total - (floor - scanned_free)`, with `scanned_free` read after the scan that measures the caches, so space another process frees during the scan is not taken again; at or above the floor after the scan it takes nothing), from idle targets in last-use order, oldest first, across all locations (`/tmp` targets have no special priority; `build-targets.md` → Build output retained by the sweep):
 
 - **What a target is.** `is_cargo_target(directory)`: a directory holding `.rustc_info.json`, or cargo's `CACHEDIR.TAG` (matched on its line `# This file is a cache directory tag created by cargo.`) beside a build tree (`build_trees`). `target_dirs()` and `disk.py`'s `outside_directory_bytes()` both call it. Either marker alone misses targets: into a folder cargo creates, the tag and `debug/` appear at once and `.rustc_info.json` comes when the first build ends, or never; into a folder that already exists (mend's wrapper makes hana worktrees' first) cargo writes `.rustc_info.json` early and no tag.
 - **Targets in use.** A target whose cargo locks a build holds is busy, and so is one a live process uses (`process_uses`, 2026-10-15): its `/proc/<pid>/exe`, `cwd` or a `maps` file lies under the target, or it is a cargo-nextest run (`nextest` as its first argument, or argv[0] `cargo-nextest`) whose `--target-dir`, `CARGO_TARGET_DIR`, or else the directory beside a target that holds its cwd, names it. nextest's run phase holds no cargo lock and executes binaries from `deps/`; a floor sweep at test 2105 of 4072 left 1965 hana tests failing to exec. `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts it with the held targets; `sweep_workspace` prints `… skipped` and sweeps nothing. A running app keeps its target too. An exe or mapped file that reads `(deleted)` is no use (2026-10-21): the sweep can neither take nor break it, so a stale process whose exe and mappings under a target are all deleted, with its `cwd` outside, leaves the target idle (a hung `cargo-berth resolve` had held 26 GiB of cargo-liner-berth's target for three days). One scan of `/proc` covers every target (0.21 s over 110 targets and about 600 readable processes); it runs only below the floor. Without `/proc` (the Mac) nothing counts as in use.
-- **Roots.** `FLOOR_ROOTS` is `~/rust`, `~/.local/state`, `~/.cache` and `/tmp`. `~/.cache` came in on 2026-10-21, after 421 GiB of idle targets under `~/.cache/trace-targets` had stayed unseen; it adds 0.4 s to the walk (21,000 folders). `~/.cache/sccache` holds no `.rustc_info.json` and no cargo tag, so it is never a target.
-- **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`, so idle scratch goes before any build cache. It runs the sweep when `tmp-sweep.stamp` in the lint-sweep state folder is an hour old or more (`RUN_INTERVAL_SECONDS`). The stamp moves before the run, so a failed run also waits an hour. `tmp_sweep.py [--dry-run]` runs it at once. For hand cleanup, run `tmp_sweep.py --plan <new-plan.json>` to list every candidate with `keep` or `remove` and one reason, and save the plan without deleting anything. Then run `tmp_sweep.py --apply <plan.json>`; it judges every candidate again once, at its start, with the timed sweep's ownership and process-use checks, keeps planned paths that gained a keep reason, and logs each removal. It never deletes an unplanned path. Hand cleanup also requires end evidence: all recorded workers ended, an expired scratch task, or a recorded verify run that stopped. Age alone does not permit hand cleanup. On the Mac, which has no disk-floor job, the hourly `tmp-sweep` job (nixos `modules/darwin/tmp-sweep.nix`) runs `tmp_sweep.py`. The roots are the same on both machines, each by its real path, because the Mac's /tmp is a link to /private/tmp and lsof prints real paths. They are `/tmp/claude`, `/tmp/claude/delegate`, `/tmp/claude/unit`, each `-`-prefixed project folder in every `/tmp/claude-<uid>` this user owns (so Claude Code's own `bash-edit-diff/` stays), the scratch root `/tmp/claude/scratch` (one entry per task folder; a change review row's folder stays until its verdict), and the temp folders: /tmp, `$TMPDIR` and the Mac's `CS_DARWIN_USER_TEMP_DIR`. In a temp folder only a tempfile folder and a `lint/invoke.sh` log file (`INVOKE_TEMP_NAME`: `lint_invoke.*.log`, `buildlog.*.log`, `.peak` and `.peak.cgroup`; a killed run leaves them, and natedev /tmp held 1,308 and 1,438 on 2026-10-27) are judged. A tempfile folder (`TEMPFILE_NAME`) is `.tmp` and 6 letters or digits (Rust's tempfile crate), `tmp.` and 8 to 10 letters or digits (mktemp), or `tmp` and 8 lower-case letters, digits or `_` (Python's tempfile), the names test runs leave behind (natedev /tmp held 2,662 Rust ones on 2026-10-26 and the Mac's temp folder 273; the first folder audit that day found 3,917 mktemp and Python ones). In /tmp alone (the wide root; `$TMPDIR` and the Mac's temp folder hold app state, and macOS clears its own) every other empty folder this user owns is judged too, whatever its name, and goes after 7 idle days (`WIDE_IDLE_SECONDS`) with the same in-use check. A folder that holds only folders, however deep, counts as empty (`holds_no_file`; a tree of more than 1,000 folders does not), and its idle time is the newest mtime in the tree (2026-10-27: 155 nix-shell folders of empty `hana-runtime` folders stayed). A `direct/verify.sh` run folder (`VERIFY_TEMP_NAME`: `verify-hold.<pid>.XXXXXX`, with the run's `verify-copy.<pid>.XXXXXX` folders inside it) is judged in every temp folder. Its EXIT trap removes it, but a killed run leaves it (natedev /tmp held 47 hold and 6 copy folders on 2026-10-27). It stays while the named pid runs `verify.sh` (a `verify.sh` argument in `/proc/<pid>/cmdline`, or `ps` on the Mac) and that process started no later than the folder's mtime, so a reused pid does not keep it; otherwise it goes at the next run. An old name with no pid takes the 4-hour rule. A folder there that holds something can hold work, so the folder audit judges it, with a git check first (2026-10-27; until then the sweep took any idle folder, and on 2026-10-26 1,103 month-old ones went by hand, an rm the user had to approve). A folder a system tool owns stays (`SYSTEM_TEMP_NAMES`: `claude`, `.X11-unix` and the other X folders; `SYSTEM_TEMP_PREFIXES`: `systemd-private-`, `tmux-`, `nix-`, `ssh-`, `claude-`, `com.apple.`, `powerlog`), except an empty `nix-` one (`EMPTY_PREFIXES`: nix-shell and nix develop leave theirs, 1,321 in natedev /tmp on 2026-10-27), as do another root and a folder that holds one. The sweep does not judge or log other entries in a temp folder. An entry is one top-level file, folder or link under a root. It goes when nothing in it changed in 4 hours (`IDLE_SECONDS`) and no process has its cwd, an open file or a mapped file in it (one `/proc` scan per run; where there is no `/proc`, one `lsof -n -P -w -F pfn` scan: `cwd`, open files, and `txt`/`mem` mapped files). A change is the newer of mtime and ctime, over everything inside the entry, except a folder's ctime in a temp folder or a session or run temp root (systemd-tmpfiles-clean moves it daily). The entry's own times count only for a file, a link or an empty folder. These stay: the roots and both `active/` run-marker folders with every marker in them; a run folder under `unit/` or `delegate/` named by any active marker, with any `mesh_roster.json` worker not ended (paused included), or whose `progress_history_state.json` worktree belongs to a live session or a paused session in the shutdown mover's records; these runs and their temp entries stay even when their director process stops. A running director recorded in `director` or the opening `run_started` history event also keeps the run. A kept run also keeps any folder that contains a `mesh_runs/*.json` record's `cwd`, or is that working folder, only while that record has status `running`. Finished records do not keep worker folders. Only these records name worker folders; pending files are not read. An empty mesh run file is not a record. Each roster thread whose worker is not ended keeps its `/tmp/claude/session/<thread_id>` parent; old entries inside that parent still take the 4-hour rule. An unreadable non-empty mesh run record keeps scratch entries and top-level `/tmp/claude` entries and prints its path. It does not keep old temp entries in session roots. Before deleting an idle entry under any root, both timed and hand cleanup check for git worktrees down to three folder levels, without following links. Uncommitted changes, untracked files, a stash or commits absent from remote and local clone-source refs keep the entry. Git checks use `GIT_OPTIONAL_LOCKS=0`, a 10-second timeout per command, and never fetch. A failed check keeps the entry. The folder audit uses the same git check. The new reasons `a live worker uses it` and `it holds unsaved git work` include kept paths in the log. Any unreadable marker, roster, session, shutdown or run ownership record keeps the affected runs; a session folder named for a running session, though an entry of 1 GiB or more in its `scratchpad/` and `tasks/` is judged like any other (`SESSION_ENTRY_MIN_BYTES`; showrunner, 2026-10-25: a live session keeps small files there that it only reads, and a read does not move mtime); each of these when a session record cannot be read; an entry that cannot be read; and everything when neither `/proc` nor lsof can show which processes use the entries. Links are never followed, a read-only folder is made writable and deleted, and a project folder left empty goes. Each run appends one JSON line to `~/.local/state/lint-sweep/tmp-sweep.jsonl`: `deleted` (path, GiB, last change), `freed_gib`, `failed`, `kept` (a count per reason), and `kept_paths` (every reason except a recent change and a small entry in a running session's folder; an in-use path names its pid and how it uses the entry). Lines older than 7 days drop off. The sweep is the only remover under its roots: `disk-floor.nix` excludes `/tmp/claude` and `/tmp/claude-*` from systemd-tmpfiles' age cleanup (`x` rules). Its `q /tmp 10d` rule deletes each file in /tmp older than 10 days, and then each empty folder. On 2026-10-26 that rule had removed an idle unit's run folder and its run marker, one file at a time. The run also prints one line per deletion and a summary to the disk-floor journal. History: it replaced `remove_session_scratch` (2026-10-21: ended sessions only, 24 h idle) on 2026-10-25. That day /tmp/claude held 122 GiB and /tmp/claude-1000 held 86 GiB, and a one-time cleanup had deleted both `active/` folders. The first dry run, with the 1 GiB line, would delete 1,891 entries (20.4 GiB) in about 4 s. The rest stayed because processes used the entries (a 70 GiB target) or because running sessions and unit runs held them.
+- **Roots.** `sweep_floor_roots` is `~/rust`, `~/.local/state`, `~/.cache` and `/tmp`. `~/.cache` came in on 2026-10-21, after 421 GiB of idle targets under `~/.cache/trace-targets` had stayed unseen; it adds 0.4 s to the walk (21,000 folders). `~/.cache/sccache` holds no `.rustc_info.json` and no cargo tag, so it is never a target.
+- **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`, so idle scratch goes before any build cache. It runs the sweep when `tmp-sweep.stamp` in the lint-sweep state folder is an hour old or more (`RUN_INTERVAL_SECONDS`). The stamp moves before the run, so a failed run also waits an hour. `tmp_sweep.py [--dry-run]` runs it at once. For hand cleanup, run `tmp_sweep.py --plan <new-plan.json>` to list every candidate with `keep` or `remove` and one reason, and save the plan without deleting anything. Then run `tmp_sweep.py --apply <plan.json>`; it judges every candidate again once, at its start, with the timed sweep's ownership and process-use checks, keeps planned paths that gained a keep reason, and logs each removal. It never deletes an unplanned path. Hand cleanup also requires end evidence: all recorded workers ended, an expired scratch task, or a recorded verify run that stopped. Age alone does not permit hand cleanup. On the Mac, which has no disk-floor job, the hourly `tmp-sweep` job (nixos `modules/darwin/tmp-sweep.nix`) runs `tmp_sweep.py`. The roots are the same on both machines, each by its real path, because the Mac's /tmp is a link to /private/tmp and lsof prints real paths. They are `/tmp/claude`, `/tmp/claude/delegate`, `/tmp/claude/unit`, each `-`-prefixed project folder in every `/tmp/claude-<uid>` this user owns (so Claude Code's own `bash-edit-diff/` stays), the scratch root `/tmp/claude/scratch` (one entry per task folder; a change review row's folder stays until its verdict), and the temp folders: /tmp, `$TMPDIR` and the Mac's `CS_DARWIN_USER_TEMP_DIR`. In a temp folder only a tempfile folder and a `lint/invoke.sh` log file (`INVOKE_TEMP_NAME`: `lint_invoke.*.log`, `buildlog.*.log`, `.peak` and `.peak.cgroup`; a killed run leaves them, and natedev /tmp held 1,308 and 1,438 on 2026-10-27) are judged. A tempfile folder (`TEMPFILE_NAME`) is `.tmp` and 6 letters or digits (Rust's tempfile crate), `tmp.` and 8 to 10 letters or digits (mktemp), or `tmp` and 8 lower-case letters, digits or `_` (Python's tempfile), the names test runs leave behind (natedev /tmp held 2,662 Rust ones on 2026-10-26 and the Mac's temp folder 273; the first folder audit that day found 3,917 mktemp and Python ones). In /tmp alone (the wide root; `$TMPDIR` and the Mac's temp folder hold app state, and macOS clears its own) every other empty folder this user owns is judged too, whatever its name, and uses `lint.conf` `folder_remove_after_seconds` with the same process-use check. A folder that holds only folders, however deep, counts as empty (`holds_no_file`; a tree of more than 1,000 folders does not), and its idle time is the newest mtime in the tree (2026-10-27: 155 nix-shell folders of empty `hana-runtime` folders stayed). A `direct/verify.sh` run folder (`VERIFY_TEMP_NAME`: `verify-hold.<pid>.XXXXXX`, with the run's `verify-copy.<pid>.XXXXXX` folders inside it) is judged in every temp folder. Its EXIT trap removes it, but a killed run leaves it (natedev /tmp held 47 hold and 6 copy folders on 2026-10-27). It stays while the named pid runs `verify.sh` (a `verify.sh` argument in `/proc/<pid>/cmdline`, or `ps` on the Mac) and that process started no later than the folder's mtime, so a reused pid does not keep it; otherwise it goes at the next run. An old name with no pid takes the 4-hour rule. A folder there that holds something can hold work, so the folder audit judges it, with a git check first (2026-10-27; until then the sweep took any idle folder, and on 2026-10-26 1,103 month-old ones went by hand, an rm the user had to approve). A folder a system tool owns stays (`SYSTEM_TEMP_NAMES`: `claude`, `.X11-unix` and the other X folders; `SYSTEM_TEMP_PREFIXES`: `systemd-private-`, `tmux-`, `nix-`, `ssh-`, `claude-`, `com.apple.`, `powerlog`), except an empty `nix-` one (`EMPTY_PREFIXES`: nix-shell and nix develop leave theirs, 1,321 in natedev /tmp on 2026-10-27), as do another root and a folder that holds one. The sweep does not judge or log other entries in a temp folder. An entry is one top-level file, folder or link under a root. It goes when nothing in it changed in 4 hours (`IDLE_SECONDS`) and no process has its cwd, an open file or a mapped file in it (one `/proc` scan per run; where there is no `/proc`, one `lsof -n -P -w -F pfn` scan: `cwd`, open files, and `txt`/`mem` mapped files). A change is the newer of mtime and ctime, over everything inside the entry, except a folder's ctime in a temp folder or a session or run temp root (systemd-tmpfiles-clean moves it daily). The entry's own times count only for a file, a link or an empty folder. These stay: the roots and both `active/` run-marker folders with every marker in them; a run folder under `unit/` or `delegate/` named by any active marker, with any `mesh_roster.json` worker not ended (paused included), or whose `progress_history_state.json` worktree belongs to a live session or a paused session in the shutdown mover's records; these runs and their temp entries stay even when their director process stops. A running director recorded in `director` or the opening `run_started` history event also keeps the run. A kept run also keeps any folder that contains a `mesh_runs/*.json` record's `cwd`, or is that working folder, only while that record has status `running`. Finished records do not keep worker folders. Only these records name worker folders; pending files are not read. An empty mesh run file is not a record. Each roster thread whose worker is not ended keeps its `/tmp/claude/session/<thread_id>` parent; old entries inside that parent still take the 4-hour rule. An unreadable non-empty mesh run record keeps scratch entries and top-level `/tmp/claude` entries and prints its path. It does not keep old temp entries in session roots. Before deleting an idle entry under any root, both timed and hand cleanup check for git worktrees down to three folder levels, without following links. Uncommitted changes, untracked files, a stash or commits absent from remote and local clone-source refs keep the entry. Git checks use `GIT_OPTIONAL_LOCKS=0`, a 10-second timeout per command, and never fetch. A failed check keeps the entry. The folder audit uses the same git check. The new reasons `a live worker uses it` and `it holds unsaved git work` include kept paths in the log. Any unreadable marker, roster, session, shutdown or run ownership record keeps the affected runs; a session folder named for a running session, though an entry of 1 GiB or more in its `scratchpad/` and `tasks/` is judged like any other (`SESSION_ENTRY_MIN_BYTES`; showrunner, 2026-10-25: a live session keeps small files there that it only reads, and a read does not move mtime); each of these when a session record cannot be read; an entry that cannot be read; and everything when neither `/proc` nor lsof can show which processes use the entries. Links are never followed, a read-only folder is made writable and deleted, and a project folder left empty goes. Each run appends one JSON line to `~/.local/state/lint-sweep/tmp-sweep.jsonl`: `deleted` (path, GiB, last change), `freed_gib`, `failed`, `kept` (a count per reason), and `kept_paths` (every reason except a recent change and a small entry in a running session's folder; an in-use path names its pid and how it uses the entry). Lines older than 7 days drop off. The sweep is the only remover under its roots: `disk-floor.nix` excludes `/tmp/claude` and `/tmp/claude-*` from systemd-tmpfiles' age cleanup (`x` rules). Its `q /tmp 10d` rule deletes each file in /tmp older than 10 days, and then each empty folder. On 2026-10-26 that rule had removed an idle unit's run folder and its run marker, one file at a time. The run also prints one line per deletion and a summary to the disk-floor journal. History: it replaced `remove_session_scratch` (2026-10-21: ended sessions only, 24 h idle) on 2026-10-25. That day /tmp/claude held 122 GiB and /tmp/claude-1000 held 86 GiB, and a one-time cleanup had deleted both `active/` folders. The first dry run, with the 1 GiB line, would delete 1,891 entries (20.4 GiB) in about 4 s. The rest stayed because processes used the entries (a 70 GiB target) or because running sessions and unit runs held them.
 - **Use stamp.** `sweep_workspace()` sets the mtime of `.lint-sweep-used` (`USE_STAMP`) in every root `cargo_roots()` returns, before `lock_trees`, so a step that compiled nothing, or whose sweep was skipped because a build held a lock, still counts as use. A dry run and `--target-dir` (CI) write none; a write failure is ignored.
 - **Target last use.** `target_last_use(root, groups)` is the newest of the stamp's mtime and the target's build units' `last_used`.
 - **Order.** `shrink()` and `choose()` take a `RemovalOrder`, a sort key over `Group`; the smallest key goes first. The workspace budget sweep passes `unit_age` (most whole days unused, then oldest compile). For the floor's target order, see [Build output retained by the sweep](build-targets.md#build-output-retained-by-the-sweep). A scratch target a build holds is left like any held target. Orphaned files (`Scan.orphans`, one group per build tree) go first from any idle target, whatever the order.
@@ -496,6 +748,17 @@ Measured over the 24 h after the target-first order went live (2026-10-06 16:33 
 
 ### Scratch folders (`scripts/lib/scratch.py`, `scripts/hooks/pre-tool-use-scratch-guard.py`)
 
+`scratch.conf` holds the default lifetime, visible root, hold file, repository depth, excluded folders, and random suffix length.
+The scratch code reads those values through `scripts/lib/conf.py` when an operation needs them.
+`CONF_DIR` selects the configuration folder.
+
+The folder audit reads clone age from `hana_instances.conf` and the Mac disk floor from `mac_test.conf`.
+It reads its other limits and default state folder from `lint.conf` through the same reader.
+The audit and temporary sweep share `folder_remove_after_seconds`.
+The audit and repository scan share `scratch.conf` `repo_skip`.
+The audit also keeps the configured `scratch.visible_root()`.
+`rust_roots.txt` remains a list file. All moved values retain their previous defaults.
+
 Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them; sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27). Each scratch folder now belongs to a task, and the task's end removes it. `scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes one and prints its path; `adopt`, `hold`, `release`, `renew`, `end` and `list` do the rest. A task is `run:<run id>`, which `end_session.sh` ends; `phase:<unit>/<phase>`, which `merge_checkpoint.py` ends after it records the phase's code checkpoint; `gate:<id>`, which the gate's caller ends; `row:<showrunner>-C<n>`, which `change_review.py verdict` ends whichever way the verdict goes; or `until:<time>` (`--until YYYY-MM-DD [HH:MM]`), which the hourly tmp sweep ends when the time passes. Creation and hand-over accept a `phase:<unit>/<phase>` task only when the phase id is in that unit's recorded plan. A missing or unreadable plan refuses the new task and names the cause; use a real phase id, `gate:<id>` or `--until <when>`. Existing tasks with an invalid phase id can still update and end. With no task a folder lasts 24 h. The sweep keeps a task's folder while the task is open and removes any after 7 idle days. `scratch.py hold <path> --reason <why>` (or `change_review.py add --hold <path>`) keeps a folder where it is until its task ends, recorded in `~/.local/state/scratch/holds.json`; `end` removes it then, unless a repo in it holds work on no remote (uncommitted changes, a stash, commits on no remote), which stays with its hold marked ended. A folder is `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`; `--visible` (rows only) puts it at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds `.scratch.json` with its task, maker session and times. A git worktree goes through `git worktree remove`. A failed removal warns and never fails the merge or the verdict.
 
 The scratch guard, a `PreToolUse` hook on `Bash` for Claude Code (`settings.json`) and Codex (`codex_hooks.py`), refuses a command that makes a new folder directly in /tmp, `$TMPDIR`, /tmp/claude, ~/rust or ~/rust/scratch (and judges a Write or NotebookEdit file path where its matcher names them): mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/-a, rsync, cargo new/init, and tar extraction into a root. Allowed there: the session scratchpads (`/tmp/claude-<uid>`), `/tmp/claude/unit`, `/tmp/claude/delegate`, `/tmp/claude/session` and both scratch roots; ~/worktrees is no root, and a `make_a_worktree` command is never judged. A heredoc body, a quoted argument and a comment are data. A path the hook cannot follow (a variable other than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed, and the hourly tmp sweep is the backstop. A `TMPDIR` inside a session scratchpad, a session temp root or a run folder is no root.
@@ -503,14 +766,14 @@ Before its checks, the scratch guard uses the session-start path helper to resto
 
 Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/session-start-temp-root.py` makes it at start, resume, clear and compact, and writes `export TMPDIR=...` to `$CLAUDE_ENV_FILE`. A run's workers, its codex app-server (`codex_mesh.py`) and `verify.sh --session-dir` use `<run folder>/tmp`. So mktemp, tempfile and Rust `.tmpXXXXXX` folders land there, and the hourly tmp sweep judges each entry with its 4 h rule; the root goes only once its session or director stops, and nothing waits on that. In /tmp and the other temp folders a folder's ctime is no change, since `systemd-tmpfiles-clean` moves it every day (its 26 Oct run kept month-old folders such as `cargo-installQOkrzS` looking fresh to the 7-day rule).
 
-The daily folder audit (`scripts/lint/folder_audit.py --send`, a `nate.jobs` job on natedev and on the Mac) is the backstop for loose folders that can hold work: ~/rust, ~/rust/scratch, and the /tmp, /tmp/claude and `$TMPDIR` folders the sweep leaves. A folder in ~/rust is loose when its name is not in `config/rust_roots.txt` (one list for both machines) and it is not `repro` or `scratch`; every folder in ~/rust/scratch is loose, since `scratch.py` never makes one there; a folder in /tmp, /tmp/claude or `$TMPDIR` is loose when it is no session scratchpad, scratch root, run folder root, tempfile folder, `verify.sh` run folder or folder that holds only folders (the sweep judges those) or name a system tool owns. When `config/rust_roots.txt` cannot be read (an old checkout), nothing in ~/rust is judged. Only folders this user owns that did not change for a day count. Idle time comes from the newest mtime of the folder and of what is in it down to 3 folders (`target/`, `node_modules/` and `.git/` passed over), and of each git repo's `HEAD`, `index` and `logs/HEAD`, so a commit counts; ctime never counts. A folder with more than 50,000 entries in that depth stays and is named. A loose folder idle 7 days (`REMOVE_AFTER_SECONDS`) is removed when no open hold names it, a folder in it or a folder that holds it; no process works in it or has a file in it open or mapped (the sweep's `/proc` or lsof scan); no socket in it is bound by a live process (`/proc/net/unix`; on the Mac any socket keeps it); and no git repo in it holds work on no remote (`scratch.unsaved_work`: uncommitted changes, a stash, commits on no remote, or a repo git cannot read). A removed linked worktree is pruned from its source repo, and each removal appends a line to `~/.local/state/folder-sweep/removed.jsonl`. It removes only once armed: `folder_audit.py arm` writes `~/.local/state/folder-sweep/armed` and `disarm` removes it; until then each line says `would remove`. Its first dry runs (2026-10-27) found 106 loose folders on natedev, 36 to remove (all old /tmp leftovers), and 13 on the Mac, 8 to remove (mostly ~/rust/scratch). The maker is the earliest-started session whose transcript holds a command (a JSON `"command"` string) that names the folder, since a listing in a command's output names every folder it shows, found in one ripgrep pass over all transcripts (about 6 s over 22 GB; a Python scan took 4 h 24 min); the name must end at a path boundary. Each maker gets one message that lists its folders with what happened to each and names `scratch.py adopt` and `scratch.py hold`; a folder no transcript names is printed only.
+The daily folder audit (`scripts/lint/folder_audit.py --send`, a `nate.jobs` job on natedev and on the Mac) is the backstop for loose folders that can hold work: ~/rust, ~/rust/scratch, and the /tmp, /tmp/claude and `$TMPDIR` folders the sweep leaves. A folder in ~/rust is loose when its name is not in `config/rust_roots.txt` (one list for both machines) and it is not `repro` or `scratch`; every folder in ~/rust/scratch is loose, since `scratch.py` never makes one there; a folder in /tmp, /tmp/claude or `$TMPDIR` is loose when it is no session scratchpad, scratch root, run folder root, tempfile folder, `verify.sh` run folder or folder that holds only folders (the sweep judges those) or name a system tool owns. When `config/rust_roots.txt` cannot be read (an old checkout), nothing in ~/rust is judged. Only folders this user owns that did not change for a day count. Idle time comes from the newest mtime of the folder and of what is in it down to 3 folders (`target/`, `node_modules/` and `.git/` passed over), and of each git repo's `HEAD`, `index` and `logs/HEAD`, so a commit counts; ctime never counts. A folder with more than 50,000 entries in that depth stays and is named. A loose folder idle 7 days (`folder_remove_after_seconds`) is removed when no open hold names it, a folder in it or a folder that holds it; no process works in it or has a file in it open or mapped (the sweep's `/proc` or lsof scan); no socket in it is bound by a live process (`/proc/net/unix`; on the Mac any socket keeps it); and no git repo in it holds work on no remote (`scratch.unsaved_work`: uncommitted changes, a stash, commits on no remote, or a repo git cannot read). A removed linked worktree is pruned from its source repo, and each removal appends a line to `~/.local/state/folder-sweep/removed.jsonl`. It removes only once armed: `folder_audit.py arm` writes `~/.local/state/folder-sweep/armed` and `disarm` removes it; until then each line says `would remove`. Its first dry runs (2026-10-27) found 106 loose folders on natedev, 36 to remove (all old /tmp leftovers), and 13 on the Mac, 8 to remove (mostly ~/rust/scratch). The maker is the earliest-started session whose transcript holds a command (a JSON `"command"` string) that names the folder, since a listing in a command's output names every folder it shows, found in one ripgrep pass over all transcripts (about 6 s over 22 GB; a Python scan took 4 h 24 min); the name must end at a path boundary. Each maker gets one message that lists its folders with what happened to each and names `scratch.py adopt` and `scratch.py hold`; a folder no transcript names is printed only.
 
 ### Disk-floor alerts (`scripts/lint/sweep.py`, `scripts/buildlog/disk.py`)
 
 `hold_floor` writes `floor.json` in `${LINT_SWEEP_STATE_DIR:-~/.local/state/lint-sweep}` under `FLOOR_LOCK` after each floor sweep: time, free bytes, build-cache bytes (idle and busy target dirs plus both CI runner trees), `last_alert_at` and `last_push_at`. After a non-dry sweep it sends at most one alert:
 
-- **Floor out of reach** (every removable unit chosen, still `left > budget`, and free space under the floor after removals), on its own hour (`push_history`). It never asks the user to free space by hand (2026-10-21). `floor_holders` names each busy target with its size, the pid that holds it (`process_uses`, or for a held cargo lock `lock_holder` from `/proc/locks`, read up to `PROC_LOCKS_READS` (3) times before it answers no holder, because under load one read can skip a line) and that pid's Claude session (`holder_sessions`: the nearest ancestor a live session record names, through `process_table.nearest_named`). Each session found gets `holder_message_text` through `send_holder_message` (`send.py --to <session> --from disk_floor`). natedev gets `floor_out_of_reach_text`, one line per busy target and who was told. Only when no session was told does the phone get a page too (catalog entry `sweep.disk_floor`, sent through `push_texts.user_send_argv` as `send.py --to user --text-id sweep.disk_floor`; `docs/as-built/message-clarity.md`): `page_paths` lists exact paths, busy targets first, then the deepest measured folders outside build caches by size, as many as fit under 500 characters (`PAGE_PATHS` at most), and the action asks the natedev session which paths it may remove.
-- **Growth** (free space fell more than `UNEXPLAINED_FALL_BYTES` 10 GiB beyond build-cache growth since a floor sweep at most `GROWTH_WINDOW_SECONDS` 30 min earlier; this sweep's free is read after the scan that measures its caches (`scanned_free`), and the record's free before its caches walk, so a target another process deletes during either walk cannot read as a fall. On 2026-10-25 a free read from before the scan reported a 122.6 GiB fall while 123 GiB was freed. A target held by a build hold counts 0 bytes, so the growth check runs only when the previous record's `held_roots` equals this pass's held set; an older record without it skips the check. The sweeper records its own last delete per target in `target-deletes.json` beside `floor.json`, and a directory mtime no later than that time plus 2 s does not make a target held. On 2026-10-29 its own deletes made a 34.7 GiB target look written during a hold, and a false 36.4 GiB fall was reported) and **large removal** (more than `LARGE_REMOVAL_BYTES` 32 GiB): natedev alone (`send.py --to natedev --from disk_floor`), at most one per `ALERT_INTERVAL_SECONDS` (1 h) counted from the last delivered alert.
+- **Floor out of reach** (every removable unit chosen, still `left > budget`, and free space under the floor after removals), on its own hour (`push_history`). It never asks the user to free space by hand (2026-10-21). `floor_holders` names each busy target with its size, the pid that holds it (`process_uses`, or for a held cargo lock `lock_holder` from `/proc/locks`, read up to `sweep_proc_locks_reads` (3) times before it answers no holder, because under load one read can skip a line) and that pid's Claude session (`holder_sessions`: the nearest ancestor a live session record names, through `process_table.nearest_named`). Each session found gets `holder_message_text` through `send_holder_message` (`send.py --to <session> --from disk_floor`). natedev gets `floor_out_of_reach_text`, one line per busy target and who was told. Only when no session was told does the phone get a page too (catalog entry `sweep.disk_floor`, sent through `push_texts.user_send_argv` as `send.py --to user --text-id sweep.disk_floor`; `docs/as-built/message-clarity.md`): `page_paths` lists exact paths, busy targets first, then the deepest measured folders outside build caches by size, as many as fit under 500 characters (`sweep_page_paths` at most), and the action asks the natedev session which paths it may remove.
+- **Growth** (free space fell more than `sweep_unexplained_fall_bytes` 10 GiB beyond build-cache growth since a floor sweep at most `sweep_growth_window_seconds` 30 min earlier; this sweep's free is read after the scan that measures its caches (`scanned_free`), and the record's free before its caches walk, so a target another process deletes during either walk cannot read as a fall. On 2026-10-25 a free read from before the scan reported a 122.6 GiB fall while 123 GiB was freed. A target held by a build hold counts 0 bytes, so the growth check runs only when the previous record's `held_roots` equals this pass's held set; an older record without it skips the check. The sweeper records its own last delete per target in `target-deletes.json` beside `floor.json`, and a directory mtime no later than that time plus 2 s does not make a target held. On 2026-10-29 its own deletes made a 34.7 GiB target look written during a hold, and a false 36.4 GiB fall was reported) and **large removal** (more than `sweep_large_removal_bytes` 32 GiB): natedev alone (`send.py --to natedev --from disk_floor`), at most one per `sweep_alert_interval_seconds` (1 h) counted from the last delivered alert.
 
 `send_floor_alert(message, channels: FloorAlertChannels.NATEDEV | NATEDEV_AND_PHONE)` returns whether either `send.py` call delivered: exit 0 or 1 counts for the natedev message, while only exit 0 counts for the user channel. The texts name what fell, what grew and the largest directories outside the caches, read from `disk.json` as `AvailableDiskMeasurement | UnavailableDiskMeasurement`. `buildlog disk` adds `outside_build_caches` (directories one and two levels under each measured folder holding at least 1 GiB outside cargo target dirs as `sweep.is_cargo_target` decides them, with growth and largest child, so a scratch target is never listed as unexplained growth), `outside_build_cache_totals` and `previous_measured_at`. `send.py`'s `log.jsonl` lines carry `text`.
 
@@ -542,7 +805,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - Holder files supply current hold state. Old cycles distinguish files still in force from completed holds. A release removes its holder file at once. Historical log rows never decide whether a build can start.
 - Releases go by session id, never by name. A session that cannot be messaged is never recorded as a recipient.
 - Hold changes use `release.lock`. Release delivery uses the ended cycle after the holder file is gone. A damaged record is set aside by a changing command, never by `status` or the dailies.
-- `steps.mem_wait_s` is the memory wait and `steps.wait_s` the call's lookup and token wait; any column change bumps `SCHEMA_VERSION`.
+- `steps.mem_wait_s` is the memory wait. `steps.wait_s` is the call's lookup and token wait. The file name hashes the schema SQL. Bump `SCHEMA_VERSION` only when the way rows are derived changes.
 - Only `ran` CI jobs carry duration and queue time. CI days key on the run attempt's `started_at` everywhere.
 - The window report is host-scoped; the daily report aggregates hosts. A run's own peak comes from `ci_anon_bytes` / `builds_anon_bytes` samples, never from `memory.peak`.
 - Only the floor-out-of-reach alert reaches the phone; diagnostics go to natedev.
@@ -556,7 +819,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - **Unfaked memory pressure.** On 2026-10-29, `test_brp_launch_gate.py` took 169 s against a 6 s median because its pressure reading was unfaked.
 
 - **Memory gate sizes.** The first need comes from `program_first_peak_gib.cargo` in `config/build_admission.conf`. Build steps use shape tiers. Other steps retain measured, build-log, and pooled tiers. The service reads process memory before host memory during each pass.
-- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Lifetime promises retain the full need until the step ends. Other steps use the configured ramp and peak rules. Simultaneous callers cannot reserve the same room.
+- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Each step retains its accepted need unless an observed test phase selects its frozen test-phase need. Anonymous use reduces its keep-aside. Simultaneous callers cannot reserve the same room.
 - **Release outcomes vanish with the last holder file**; set-aside `*.damaged-*` files are never cleaned up. A holder joining a no-cycle hold learns nothing until the final release line tells it to broadcast.
 - **earlyoom never logs "killed";** its line is `sending SIGTERM to process <pid> uid ... "<comm>": ...`.
 - **zram is invisible to slice limits.** earlyoom counts zram's virtual size as swap; `MemoryMax` counts RAM only, and compressed pages are charged to no slice.
@@ -590,7 +853,7 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 - **One slice for every session build, sccache included.** Every compile reaches the sccache server, so the server's cgroup is where compiles are charged; a limit on the step scopes alone would bound nothing.
 - **CI in its own pool, a smaller slice and a lower kill order.** Shared steve slots alone did not stop kills (a CI run lost both Linux jobs after it). Its own 14-slot pool keeps CI from starving sessions and the reverse; `PIPELINE_JOB_OOMSCOREADJ` is the only setting that reaches job processes, because the runner sets every job to 500 itself. At 100 a CI job goes after a build step (500) or a session process (200) of the same size.
 - **Build steps at 500, and no `--prefer`.** The level sets the order and size decides within it. A `--prefer` for compiler names (+300) let two hung hana tests (11.4 GB, 15.5 GB) outlive 26 smaller processes, six CI compilers among them; without it, a hung 15 GB test scores about 1100 against a 2 GB CI compiler's 750, and a session's rust-analyzer at 200 stays behind every build step of similar size. The adj is set inside the step's scope, so every process the step starts inherits it.
-- **Every session at once, through reserving gates.** The 11:12 PDT episode on 2026-10-04 (21 kills) came from a release into a gate that read memory before compilers grew. Release-profile builds keep their full promise until they end. Other steps keep a start promise, then charge the greater of current use and their observed peak. Every build starts through the memory gate after a release.
+- **Admission after a hold release.** The 2026-10-04 incident had 21 kills after compilers grew beyond the admission readings. Each admitted step keeps its selected need. Its anonymous use reduces its keep-aside. Every local build requests memory admission after a hold release.
 - **A damaged record releases everyone, not no one.** Setting it aside and falling back to a broadcast cannot strand held sessions; each still passes its own memory gate.
 - **Broadcast by id.** Names can belong to two sessions, and `top_level.py` once deduped them, so one of two same-named sessions never heard the hold.
 - **A memory kill re-runs once.** The kill says nothing about the tree; a second kill stops the call so a starved machine does not loop.
@@ -620,7 +883,9 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 
 A second promise rule is measured and declined (showrunner, 2026-10-28: simple wins). The rule: a running build whose need is above a limit keeps its full promise; the running builds at or under it are promised the largest gap in full plus `max(0, 0.6 x need - anon)` each. The replay used 4 h of 5 s admission samples (2026-10-28 03:27-07:27Z, 240 waits, 1863 wait minutes), and "short" counts admitting ticks where the running builds' real growth after the tick passes `MemAvailable` minus the reserve. With a 6 GiB limit the rule saves 331 of 1863 minutes against 249 for the current rule, with the short rate at 0.8% against 0% (5 GiB: 326 min, 0.9%; 8 GiB: 501 min, 1.4%). The same rule limited by the waiting step's need never gets below 6.9% short. At about 4% of the wait for a second rule and a nonzero short rate, it is not built; a shortfall is the 2026-09-30 freeze. Do not measure it again unless the mix of steps changes.
 
-A scoped reservation stays charged and visible after its owner shell stops while its scope still holds a process; admission, queue and blocker reads use that same rule and keep `.max` and `.wave` until both the owner and scope have ended.
+A scoped reservation retains its accepted need while its scope contains a process.
+Admission and queue views use the same lifetime rule.
+The service retains `.max` and `.wave` until the owner and scope both end.
 
 A test-width update persists the reservation in `state.json` through `os.replace`. A stopped write leaves the previous state intact.
 
@@ -628,7 +893,7 @@ A cleanup plan is written to a temporary file and linked into place only when no
 
 Python queue layouts, evidence tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
 
-**One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, head marks, and recovery outcomes.
+**One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, the head cause, run keep-asides, and start spacing.
 The service commits proposals and stores the pass. Queries project that pass through `queue_read_from_pass`.
 `QueueExplanation.decided_from` keeps the inputs for release calculations. Those calculations admit nothing and write nothing.
 `apply_queue_priority` supplies the priority order. The generic codec stores domain records for replies and service state.
@@ -640,3 +905,91 @@ Requests carry `code_version`; the service records it by process identity in `Se
 Persistence removes dead caller identities, including reused PIDs, and retains live callers without reservations.
 The shell retains its version in `BUILDLOG_ADMISSION_CODE_VERSION` before admission starts.
 The drain check requires matching entry content and a matching recorded version; an unknown version prevents a completed drain.
+
+### Priority and token waits after the service switch
+
+The service owns the durable admission state and the socket.
+`RankedWaiter` adds `PriorityUnit` or `NormalOrder` to a resolved row through `rank_waiter`.
+A durable waiter has no `priority_rank` or resolved `order` field.
+The order is priority, the step's original order time, then pid.
+Token waiters keep their clocks and places but cannot protect room as the head.
+`TokenWaitersOnly` distinguishes a token-only queue from an empty queue.
+The renderers use the eligible head's position and token history.
+
+Priority accepts real roster units, including units without a waiting step.
+The no-unit display placeholder is not a unit.
+Unassigned sessions retain `NormalOrder`, including with an old placeholder priority record.
+The pane passes its session id explicitly.
+Unknown units return exit 3 with a stdout line starting `build queue: `.
+Cards show `N of <unit> (queue priority)` once and use the saved reason.
+Legacy move rows do not replace that reason.
+
+`SettledPriority` and `PendingPriorityTransition` name the priority publication states.
+A pending transition saves its log offset before the service publishes state.
+Retries retain the transition id and read only the saved log tail.
+The service imports old files once.
+A failed cleanup logs its path and retains its record.
+Each later finalization attempt uses the same guard, so other admissions continue.
+
+### Mac disk floor
+
+`sweep.py --floor-only --host mac` uses the existing floor scan and deletion order.
+It reads `mac_test.conf` once for `sweep_floor_gib` and `sweep_floor_roots`.
+The floor is 150 GiB. A missing floor or a floor below `free_floor_gib` refuses the pass.
+The roots are `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
+Only targets with our use stamp, mirror mark, or a registered copy ancestor are eligible.
+Resolved paths must stay inside these roots. The scan does not follow directory symlinks.
+
+The sweep reads the local and natedev Mac claims under their existing admission locks.
+It keeps these locks until deletion ends. A live or kept claim protects its mirror.
+An unreadable claim reply or a lost lock process protects every target.
+The Mac uses `lsof` for other process use. Unreadable process use protects every target.
+The sweep checks protection again before each target deletion.
+It takes only the shortfall, in the existing least recently used order.
+The result line reports removed bytes, free bytes before and after, and skipped busy targets.
+`--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
+The nix-darwin job is a separate deployment step.
+
+
+### Free memory, head protection, and step slots
+
+`memory_room` calculates room from one captured admission pass.
+For each admitted run, kept bytes equal `max(0, selected need − anonymous use)` plus held slot bytes.
+Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
+The cap equals our anonymous use plus free memory minus safety. It does not limit an estimate.
+The first two minutes use the same formula. Use and kept bytes never count the need twice.
+
+The first eligible run follows queue priority, first run arrival, and PID.
+A younger run starts only if its need fits room minus the first run's need.
+Pressure or unreadable pressure holds new starts and extra memory only while it lasts.
+An unreadable pressure file shows `pressure unreadable: <path>` with a short error or `incomplete` when available.
+The client, card, and queue explanation retain that reason. The queue marker says `pressure unreadable`.
+An unreadable host memory reading retains its recorded reason too.
+If an unreadable reading holds queued starts for `reading_alert_seconds`, currently 300 seconds, the service sends one message to `natedev`.
+The message names the path and the hold time. `natedev` owns machine recovery and any later phone alert.
+The service measures the hold with its clock. A daemon thread sends the message without delaying admission.
+The sender reuses `scripts.message.session_send.session_send_argv` with sender `build-admission` and sends the text through stdin.
+The `build-admission-reading` claim prevents repeated delivery during the same unreadable stretch.
+Failed delivery releases the claim for retry. Restored readings clear the claim.
+The first run can start without sufficient room when no admission or held slot remains.
+It still needs readable host memory, clear pressure, a current estimate, and due spacing.
+CI and ownerless scopes do not count as admitted runs for this exception.
+
+Each new start sets the next start time through `start_spacing_after`.
+The interval is `recovery_start_seconds`, currently 5 seconds, for launches and build steps alike.
+A completed step leaves its run a slot for `slot_gap_seconds`, currently 10 seconds.
+A continuation within the slot bypasses order, spacing, and pressure.
+A larger continuation holds the slot and requests only its extra memory before new runs.
+A closed connection frees its claim. An idle slot expires or ends with its verified run owner.
+Repeated release cannot recreate a slot. A standalone request has no reusable slot.
+Slots are not saved. Restart keeps active reservations and run order, but drops handoffs and waiting extras.
+
+`queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
+The view shows zero room during a shortfall and records that shortfall in the cap explanation.
+The queue view and cards show captured process ids as `pid N` for each process row.
+`keep_aside_text` explains each admitted run's need, anonymous use, slot bytes, and kept bytes.
+`RoomCheck.basis` records `Fits`, `StartsAlone`, `WithinSlot`, `OverrideRoom`, or `DoesNotFit` in the admission walk.
+`admission_pass` records one `HeadCause` on `HeadAdmissionStatus`.
+`HeadExplanation` retains that cause for the view and release advice.
+The formatters read the captured cause and room without a second room calculation.
+No adaptive controller, fixed admission limit, order window, CI growth promise, or test-phase estimate worker remains.

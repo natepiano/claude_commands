@@ -5,7 +5,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import cache_file_name
 
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
 import json
 import os
@@ -106,8 +106,11 @@ class ExampleWorkspaceFixture(unittest.TestCase):
         cargo = stubs / "cargo"
         _ = cargo.write_text(r'''#!/bin/sh
 if [ "$1" = metadata ]; then
-    printf "metadata\n" >> "$METADATA_CALLS"
-    [ "$*" = "metadata --no-deps --format-version 1" ] || { echo "Unexpected cargo metadata call: $*" >&2; exit 99; }
+    case "$*" in
+        "metadata --no-deps --format-version 1") printf "example-scan\n" >> "$METADATA_CALLS" ;;
+        "metadata --format-version 1 --no-deps") printf "tree-key\n" >> "$METADATA_CALLS" ;;
+        *) echo "Unexpected cargo metadata call: $*" >&2; exit 99 ;;
+    esac
     printf "%s\n" "$TEST_METADATA"
     exit 0
 fi
@@ -135,6 +138,10 @@ fi
 if [ "$1 $2" = "nextest run" ] && [ -n "$EDIT_DURING_TEST" ]; then
     printf "// changed during the test run\n" >> "$PACKAGE_ROOT/${EDIT_DURING_TEST_PATH:-src/lib.rs}"
 fi
+case "$1 $2" in
+    "mend --version"|"clippy --version"|"+nightly fmt")
+        case " $* " in *" --version "*) printf 'cargo fixture 1.0\n'; exit 0 ;; esac ;;
+esac
 case "$1 $2" in
     "check --workspace") exit "$FAKE_CHECK_EXIT" ;;
     "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
@@ -166,7 +173,7 @@ esac
             (self.root / name).mkdir()
         # This workspace's memory fixture must not inherit the host's PSI.
         pressure = self.root / "memory-pressure"
-        _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        write_pressure_reading(pressure)
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
@@ -249,7 +256,8 @@ esac
         return self.calls.read_text().splitlines() if self.calls.exists() else []
 
     def metadata_count(self) -> int:
-        return len(self.metadata_calls.read_text().splitlines()) if self.metadata_calls.exists() else 0
+        # Count example scans; the tree-key read resolves Cargo output roots separately.
+        return self.metadata_calls.read_text().splitlines().count("example-scan") if self.metadata_calls.exists() else 0
 
     def refusal(self, name: str, source: Path, line: int, attribute: str, package: str = "sample") -> str:
         return (

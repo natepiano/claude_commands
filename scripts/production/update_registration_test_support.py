@@ -129,7 +129,7 @@ class RegistrationFixture(unittest.TestCase):
         self.config = self.root / "showrunners.json"
         self.doc = self.checkout / "docs/plans/example-production.md"
         bin_dir = self.root / "bin"
-        self.env = {**os.environ, "HOME": str(self.home), "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        self.env = {**os.environ, "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles", "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
@@ -172,7 +172,7 @@ class RegistrationFixture(unittest.TestCase):
             "- **Merge branch:** `production`", f"- **Showrunner checkout:** `{self.checkout}`",
             "- **Showrunner session:** first-showrunner", "- **Log:** `production.log`",
             "- **User zone:** America/Los_Angeles", "- **Updates:** every 15 minutes",
-            f"- **Proposals:** `{self.root / 'issues'}`", "", "## Gates", "",
+            f"- **Proposals:** `{self.root / 'issues'}`", "",
         )), encoding="utf-8")
         runner = recorded_showrunner(fixture_showrunner_name("example", self.doc), self.doc)
         _ = fixture_member("unit", name="alpha", parent=runner.id,
@@ -216,7 +216,9 @@ class RegistrationFixture(unittest.TestCase):
                 if path.exists() else [])
 
     def outstanding(self) -> Path:
-        path = self.state / "showrunner/outstanding/example.json"
+        owner = next(row for row in staff.snapshot().find(kind="showrunner")
+                     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path == self.doc)
+        path = self.state / "showrunner/outstanding" / f"{owner.id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -317,7 +319,7 @@ class RegistrationFixture(unittest.TestCase):
                     + f"asked_by: {fields['asked_by']}\nregistration: {json.dumps(fields)}\n---\n"
                     + f"# {fields['text']}\n\n{fields['question']}\n")
             _ = (folder / f"question-fixture-{owner}-{index}.md").write_text(text)
-        _ = self.outstanding().with_name(f"{slug}.json").write_text(json.dumps(reminders), encoding="utf-8")
+        _ = self.outstanding().with_name(f"{owner}.json").write_text(json.dumps(reminders), encoding="utf-8")
 
     def open_rows(self) -> list[dict[str, str]]:
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):

@@ -9,6 +9,7 @@ from dataclasses import replace
 import io
 import json
 import os
+import socket
 import sys
 import unittest
 from pathlib import Path
@@ -16,12 +17,12 @@ from typing import final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
 import production_lifecycle
 from scripts.production import showrunners
 import showrunner_tree
-import showrunner_parent
 from fake_unit_host import HostedUnit
 
 
@@ -29,6 +30,7 @@ from scripts.production import production_doc, staff, unit_config
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
+from scripts.lib.socket_test_support import short_socket_directory
 
 
 @final
@@ -127,10 +129,9 @@ class LifecycleTests(LifecycleFixture):
 
     @override
     def reports_to(self, child: str, parent: str) -> Path:
-        path = super().reports_to(child, parent)
         if "example" in (child, parent):
             self.write(self.state / "notifier/showrunner-example/conf",
-                       f"TARGET=session:example-session\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+                       f"TARGET=session:{self.owner_id()}\nCHECK=zsh /x/production_check.sh {self.doc}\n")
         rows = {row.name: row for row in staff.find(kind="showrunner")}
         parent_name = "old-showrunner" if parent == "example" else parent
         child_name = "old-showrunner" if child == "example" else child
@@ -140,25 +141,25 @@ class LifecycleTests(LifecycleFixture):
         below = rows.get(child_name)
         if below is None:
             _ = fixture_member("showrunner", name=child_name, parent=above.id)
-        elif below.parent != above.id:
-            _ = staff.move(below.id, above.id)
-        return path
+        elif below.parent != staff.ReportsTo(above.id):
+            _ = staff.move(below.id, staff.ReportsTo(above.id))
+        return super().reports_to(child, parent)
 
     def test_wrap_child_check_follows_staff_parent_despite_stale_parent_file(self) -> None:
         self.merged_units()
         self.showrunner("kid", live=True)
         _ = self.reports_to("kid", "example")
         child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
-        _ = staff.move(child.id, None)
+        _ = staff.move(child.id, staff.StaffRoot())
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertEqual((self.state / "showrunner/kid/parent").read_text(), "example\n")
+        self.assertEqual((self.state / "showrunner" / self.owner_id("kid") / "parent").read_text(), "example\n")
 
     def staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         self.merged_units()
         top = fixture_member("showrunner", name="top")
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
-        runner = staff.move(runner.id, top.id)
+        runner = staff.move(runner.id, staff.ReportsTo(top.id))
         alpha = fixture_member("unit", name="alpha", parent=runner.id)
         beta = fixture_member("unit", name="beta", parent=runner.id)
         child = fixture_member("showrunner", name="kid", parent=runner.id)
@@ -166,7 +167,9 @@ class LifecycleTests(LifecycleFixture):
             self.showrunner(slug, live=slug == "top")
         _ = self.reports_to("example", "top")
         _ = self.reports_to("kid", "example")
-        return runner, alpha, beta, child
+        published_child = staff.by_id(child.id)
+        assert published_child is not None
+        return runner, alpha, beta, published_child
 
     def finish_interrupted_wrap(self, retire_showrunner: bool) -> None:
         runner, alpha, beta, child = self.staff_tree()
@@ -192,7 +195,7 @@ class LifecycleTests(LifecycleFixture):
                                side_effect=interrupted_doc if retire_showrunner else interrupted_worktree):
             first = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
-        self.assertTrue((self.state / "showrunner/example/wrap_release.json").exists())
+        self.assertTrue((self.state / "showrunner" / self.owner_id("example") / "wrap_release.json").exists())
         with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
             result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -285,6 +288,8 @@ class LifecycleTests(LifecycleFixture):
 
     def assert_release_notice_retry(self, *, reported_failure: bool) -> None:
         _ = self.staff_tree()
+        for child in ("example", "kid"):
+            (self.state / "showrunner" / self.owner_id(child) / "parent").unlink()
         calls: list[str] = []
         def tell(texts: dict[str, str], key: str) -> showrunners.NoticeDelivery:
             target, = texts
@@ -307,8 +312,8 @@ class LifecycleTests(LifecycleFixture):
             production_lifecycle.release_edges("example")
             production_lifecycle.release_edges("example")
         self.assertEqual(calls, ["top", "kid", "kid"])
-        self.assertFalse((self.state / "showrunner/example/parent").exists())
-        self.assertFalse((self.state / "showrunner/kid/parent").exists())
+        self.assertFalse((self.state / "showrunner" / self.owner_id("example") / "parent").exists())
+        self.assertFalse((self.state / "showrunner" / self.owner_id("kid") / "parent").exists())
 
     def test_in_process_cli_matches_process_output_and_status(self) -> None:
         for arguments in (("load", "--no-ci", "--resume"), ("wrap", "--no-ci"),
@@ -338,7 +343,7 @@ class LifecycleTests(LifecycleFixture):
         with (self.checkout / common_dir / "info/exclude").open("a", encoding="utf-8") as output:
             _ = output.write("production.log\n")
         self.write(self.log, "# Production log — example\n\n### STATE\nNext: old next item\n")
-        self.write(self.state / "showrunner" / "example" / "session" / "showrunner_state.json",
+        self.write(self.state / "showrunner" / self.owner_id() / "session" / "showrunner_state.json",
                    json.dumps({"next": ["merge alpha", "check beta"]}))
 
         ordinary = self.run_lifecycle("load", "--no-ci")
@@ -353,13 +358,14 @@ class LifecycleTests(LifecycleFixture):
     def test_load_copies_the_scratchpad_state_once_and_never_replaces_it(self) -> None:
         scratch = self.root / "scratch"
         self.write(scratch / "showrunner_state.json", '{"merges_held": ["old"]}\n')
-        self.write(scratch / "unit_status" / "decisions_seen", "alpha-unit|1\n")
-        target = self.state / "showrunner" / "example" / "session"
+        alpha_id = next(row.id for row in staff.find(kind="unit") if row.name == "alpha")
+        self.write(scratch / "unit_status" / "decisions_seen", f"{alpha_id}|1\n")
+        target = self.state / "showrunner" / self.owner_id() / "session"
 
         first = self.run_lifecycle("load", "--no-ci", "--scratch", str(scratch))
         self.assert_step(first, "ok")
         self.assertIn("copied unit_status, showrunner_state.json", first.stdout)
-        self.assertEqual((target / "unit_status" / "decisions_seen").read_text(), "alpha-unit|1\n")
+        self.assertEqual((target / "unit_status" / "decisions_seen").read_text(), f"{alpha_id}|1\n")
 
         self.write(target / "showrunner_state.json", '{"merges_held": ["new"]}\n')
         again = self.run_lifecycle("load", "--no-ci", "--scratch", str(scratch))
@@ -385,14 +391,23 @@ class LifecycleTests(LifecycleFixture):
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
-        with mock.patch.dict(os.environ, self.env):
-            self.staff.register_production("example", self.doc)
-        _ = unit_membership("old-showrunner", "beta-unit")
+        beta = unit_membership("old-showrunner", "beta-unit")
         fake_unit_host.write(self.env, [
             HostedUnit("alpha", "w1:p1", {}),
-            HostedUnit("renamed-since-launch", "w2:p1", {
-                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
+            HostedUnit("renamed-since-launch", "w2:p1", {"CODEX_THREAD_ID": beta.current_session}),
         ])
+        pid = fake_unit_host.live_pid(self)
+        address = Path(self.enterContext(short_socket_directory())) / "beta.sock"
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(address))
+        self.addCleanup(listener.close)
+        records = Path(self.env["NOTIFIER_SESSIONS_DIR"])
+        records.mkdir(parents=True, exist_ok=True)
+        _ = (records / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "sessionId": beta.current_session, "name": "renamed-since-launch",
+            "messagingSocketPath": str(address), "updatedAt": 1, "tmux": "", "formerNames": [],
+        }))
+        fake_unit_host.place_process(self.env, pid, "w2:p1", exec_shell=True)
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
         self.assertIn("alpha-unit: gone", result.stdout)
@@ -723,14 +738,14 @@ class LifecycleTests(LifecycleFixture):
         production = read_production(self.doc)
         with (mock.patch.object(showrunner_tree, "stored_children", return_value=("kid",)),
               mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([child])),
-              mock.patch.object(showrunner_parent, "detach") as detach,
+              mock.patch.object(staff, "move") as move,
               mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery()) as tell,
               contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaises(production_lifecycle.LifecycleStop) as stopped:
                 _ = production_lifecycle.wrap(production, self.doc.read_text().splitlines(), True,
                                           production_lifecycle.VerdictMissing(),
                                           production_lifecycle.VerdictMissing(), ())
-            detach.assert_not_called()
+            move.assert_not_called()
             tell.assert_not_called()
         self.assertEqual(stopped.exception.step, "close-out")
         self.assertEqual(stopped.exception.state, "held")
@@ -943,6 +958,8 @@ class LifecycleTests(LifecycleFixture):
 
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+        self.write(self.state / "notifier/showrunner-example/conf",
+                   f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
 
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
@@ -969,6 +986,8 @@ class LifecycleTests(LifecycleFixture):
         self.doc = kept
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", kept))
+        self.write(self.state / "notifier/showrunner-example/conf",
+                   f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
         real_checked = production_lifecycle.checked
 
         def stop_at_commit(checkout: Path, step: str, *arguments: str) -> str:
@@ -993,18 +1012,15 @@ class LifecycleTests(LifecycleFixture):
         self.assert_step(result, "ok")
         self.assertIn("| Next | close herdr sessions |", result.stdout)
 
-    def test_wrap_detaches_from_its_parent_and_leaves_each_child_a_root(self) -> None:
+    def test_wrap_preserves_staff_parents_and_tells_each_former_neighbor(self) -> None:
         self.merged_units()
         for slug in ("top", "kid", "other"):
             self.showrunner(slug, live=slug == "top")
-        own = self.reports_to("example", "top")
-        kid = self.reports_to("kid", "example")
-        other = self.reports_to("other", "top")
+        _ = self.reports_to("example", "top")
+        _ = self.reports_to("kid", "example")
+        _ = self.reports_to("other", "top")
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertFalse(own.exists())
-        self.assertFalse(kid.exists())
-        self.assertEqual(other.read_text(encoding="utf-8"), "top\n")
         self.assertRegex(result.stdout, r"(?m)^tree: ok — retained parent top; retained children kid; told top; "
                          + r"kid is not running: tell it when it starts$")
         [sent] = self.sent()
@@ -1053,17 +1069,20 @@ class LifecycleTests(LifecycleFixture):
     def test_wrap_deletes_its_own_state_files_and_keeps_other_productions(self) -> None:
         self.merged_units()
         state = self.state / "showrunner"
-        own = (state / "footers-off/example", state / "review-paused/example.json",
-               state / "outstanding/example.json", state / "example/prompt.txt")
+        owner = staff.snapshot().by_doc("natedev", self.doc)
+        assert owner is not None
+        owner_id = owner.id
+        own = (state / "footers-off" / owner_id, state / "review-paused" / f"{owner_id}.json",
+               state / "outstanding" / f"{owner_id}.json", state / owner_id / "prompt.txt")
         other = (state / "footers-off/other", state / "outstanding/other.json", state / "other/prompt.txt")
         for path in (*own, *other):
             self.write(path, "[]\n")
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertRegex(result.stdout, r"(?m)^tidy: ok — removed footers-off/example, review-paused/example.json, "
-                         + r"outstanding/example.json, example/$")
+        self.assertRegex(result.stdout, rf"(?m)^tidy: ok — removed footers-off/{owner_id}, review-paused/{owner_id}\.json, "
+                         + rf"outstanding/{owner_id}\.json, {owner_id}/$")
         self.assertFalse(any(path.exists() for path in own))
-        self.assertFalse((state / "example").exists())
+        self.assertFalse((state / owner_id).exists())
         self.assertTrue(all(path.exists() for path in other))
 
     def test_wrap_holds_while_a_child_showrunner_runs(self) -> None:
@@ -1106,9 +1125,10 @@ class LifecycleTests(LifecycleFixture):
         self.write(ledger, "saved ledger and pending hand-offs\n")
         self.showrunner("kid", live=True)
         timer = self.state / "notifier/showrunner-kid/conf"
-        self.write(timer, f"TARGET=session:kid-session\nCHECK=zsh /x/production_check.sh {style_doc}\n")
-        parent = self.reports_to("kid", "example")
-        child_state = self.state / "showrunner/kid/prompt.txt"
+        self.write(timer, f"TARGET=session:{self.owner_id("kid")}\nCHECK=zsh /x/production_check.sh {style_doc}\n")
+        _ = staff.set_doc(self.owner_id("kid"), staff.LiveDoc("natedev", style_doc))
+        _ = self.reports_to("kid", "example")
+        child_state = self.state / "showrunner" / self.owner_id("kid") / "prompt.txt"
         self.write(child_state, "standing work remains\n")
         preserved = {path: path.read_bytes() for path in (style_doc, plan, pinned, ledger, timer, child_state)}
         style_tip = self.git("rev-parse", "HEAD", cwd=style)
@@ -1117,10 +1137,9 @@ class LifecycleTests(LifecycleFixture):
         result = self.run_lifecycle("wrap", "--no-ci")
 
         self.assert_step(result, "ok")
-        self.assertFalse(parent.exists())
         child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
-        self.assertEqual(child.parent, runner.id)
+        self.assertEqual(child.parent, staff.ReportsTo(runner.id))
         self.assertIsInstance(runner.doc, staff.WrappedDoc)
         self.assertIn("retained children kid", result.stdout)
         [sent] = self.sent()
@@ -1140,9 +1159,9 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
         _ = self.git("push", "origin", "production")
-        owned = self.write_phase_note("alpha", "example", "alpha-unit")
+        owned = self.write_phase_note("alpha", "example", next(row.id for row in staff.find(kind="unit") if row.name == "alpha"))
         owned_bytes = owned.read_bytes()
-        other = self.write_phase_note("other", "other", "alpha-unit")
+        other = self.write_phase_note("other", "other", unit_membership("other", "alpha-unit").id)
         other_bytes = other.read_bytes()
         handwritten = self.phase_table_vault / "showrunner" / "notes.md"
         self.write(handwritten, "kept by a person\n")
@@ -1168,7 +1187,7 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
         _ = self.git("push", "origin", "production")
-        note = self.write_phase_note("alpha", "example", "alpha-unit")
+        note = self.write_phase_note("alpha", "example", next(row.id for row in staff.find(kind="unit") if row.name == "alpha"))
         archive = self.phase_table_vault.parent / "archive"
         self.write(archive, "blocks the archive directory\n")
 
@@ -1179,7 +1198,8 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("cannot archive phase note", result.stdout)
         self.assertTrue(note.is_file())
         self.assertIn("**Status: PRODUCTION — running.**", self.doc.read_text())
-        self.assertIn("notifier.sh remove", self.calls())
+        self.assertNotIn("notifier.sh remove", self.calls())
+        self.assertTrue((self.state / "notifier/showrunner-example/conf").is_file())
 
 
 if __name__ == "__main__":

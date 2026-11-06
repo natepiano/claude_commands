@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.fake_unit_host import labeled as labeled_host
+
 import fcntl
 import io
 import json
@@ -43,7 +45,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("waiting.py")
-CI_POINTS = SCRIPT.with_name("ci_points.py")
 ALPHA = "alpha-unit"
 BETA = "beta-unit"
 GAMMA = "gamma-unit"
@@ -157,7 +158,7 @@ class WaitingTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
         self.host_pids = {}
         fake_unit_host.write(os.environ, [
-            fake_unit_host.HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit})
+            labeled_host(unit, f"w{index}:p1", unit, slug="showrunner-example")
             for index, unit in enumerate((ALPHA, BETA), start=1)])
         for index, unit in enumerate((ALPHA, BETA), start=1):
             self.claude(unit, f"w{index}:p1")
@@ -244,7 +245,9 @@ class WaitingTests(unittest.TestCase):
         if pane not in self.host_pids:
             self.host_pids[pane] = fake_unit_host.live_pid(self)
         pid = self.host_pids[pane]
-        fake_unit_host.place_process(os.environ, pid, pane)
+        process = Path(os.environ["HERDR_PROC"]) / str(pid) / "environ"
+        if not process.exists():
+            fake_unit_host.place_process(os.environ, pid, pane, exec_shell=True)
         self.write(self.root / "sessions" / f"{pane.removeprefix("w").split(":")[0]}.json", json.dumps({
             "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
             "updatedAt": 1, "tmux": ""}))
@@ -255,9 +258,7 @@ class WaitingTests(unittest.TestCase):
             "", "## Production Context", "", "- **Merge branch:** `production`",
             f"- **Showrunner checkout:** `{self.checkout}`", "- **Showrunner session:** showrunner-example",
             "- **Log:** `production.log`", "- **User zone:** America/Los_Angeles",
-            "- **Updates:** every 15 minutes", "", "## Gates", "", "| Gate | Waiting | Waits on | Clears when |",
-            "| --- | --- | --- | --- |",
-            f"| G1 | {ALPHA} phase 2 | {BETA} phase 1 | beta code merged |",
+            "- **Updates:** every 15 minutes", "",
             "", "## Production rules", "", "- Merge each phase and push the merge branch.", "",
         )))
 
@@ -348,11 +349,11 @@ class WaitingTests(unittest.TestCase):
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
-                                     "alpha-branch", ("shared.txt",))
+                                     "alpha-branch")
         request = merge_checkpoint.MergeRequest(
-            production._replace(log=producer_log), unit, phase, unit_tip, (),
+            production._replace(log=producer_log), unit, phase, unit_tip,
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with redirect_stdout(io.StringIO()):
@@ -362,7 +363,8 @@ class WaitingTests(unittest.TestCase):
 
     def producer_state_block(self, moment: datetime, phases: dict[str, str]) -> str:
         production = production_doc.read_production(self.doc)
-        judgments = tuple(update_registration.UnitJudgment(session, phase, "none")
+        judgments = tuple(update_registration.UnitJudgment(
+                              unit_membership("showrunner-example", session).id, phase, "none")
                           for session, phase in phases.items())
         state = update_registration.ShowrunnerState(judgments, (), update_registration.KeepOutstanding())
         return update_registration.state_block(production, state, moment.strftime("%H:%M %Z"))
@@ -433,7 +435,7 @@ class WaitingTests(unittest.TestCase):
         return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
 
 
-    def test_scratch_green_uses_detached_unit_tip_and_lift_accepts_its_log(self) -> None:
+    def test_scratch_green_uses_detached_unit_tip_and_preserves_its_log(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "unit work\n")
         merge_tip = self.commit(self.checkout, "merged.txt", "merge branch work\n")
         _ = self.commit(self.beta, "other-unit.txt", "unmerged work\n")
@@ -448,12 +450,6 @@ class WaitingTests(unittest.TestCase):
         log = self.scratch_log(result.stdout)
         self.assertIn("scratch green marker", log.read_text(encoding="utf-8"))
         self.assert_scratch_clean(before, unit_tip, merge_tip, local_refs, origin_refs)
-        lift = subprocess.run([sys.executable, str(CI_POINTS), "notice", "lift", "G1",
-                               "--production", str(self.doc), "--log", str(log)],
-                              cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
-        self.assertEqual(lift.returncode, 0, lift.stdout + lift.stderr)
-        self.assertIn(str(log), lift.stdout)
-        self.assertIn("G1 lifted", lift.stdout)
 
     def test_scratch_red_keeps_full_log_and_cleans_worktree_without_claiming_block(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "unit work\n")
@@ -645,7 +641,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
     def test_eta_request_records_requested_alone_once_per_phase(self) -> None:
         seen_path = self.state / "eta_seen.json"
         original = json.dumps({
-            f"{ALPHA}|{PHASE}": {
+            f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {
                 "text": "ETA 14:00",
                 "first_seen": "2026-10-07T01:00",
                 "requested": False,
@@ -657,7 +653,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", first.stdout)
         seen = cast(dict[str, dict[str, object]], json.loads(seen_path.read_text()))
-        self.assertEqual(seen, {f"{ALPHA}|{PHASE}": {"requested": True}})
+        self.assertEqual(seen, {f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {"requested": True}})
         requested_bytes = seen_path.read_bytes()
         repeated = self.run_waiting("eta-request", ALPHA, "--phase", PHASE,
                                     "--state-dir", str(self.state))
@@ -683,7 +679,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
-        self.assertEqual(set(seen), {f"{ALPHA}|{phase}" for phase in phases})
+        self.assertEqual(set(seen), {f"{unit_membership('showrunner-example', ALPHA).id}|{phase}" for phase in phases})
         self.assertFalse([path for path in self.state.iterdir() if path.suffix == ".tmp"])
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
@@ -694,7 +690,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")
                              for stdout, _ in outputs), 1)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
-        self.assertEqual(seen, {f"{ALPHA}|{PHASE}": {"requested": True}})
+        self.assertEqual(seen, {f"{unit_membership('showrunner-example', ALPHA).id}|{PHASE}": {"requested": True}})
 
     def test_eta_request_waits_for_its_state_lock(self) -> None:
         # The child proves it reached the held lock, rather than racing startup

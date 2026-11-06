@@ -187,6 +187,9 @@ class StaffRouting:
     def _staff_owner(self, row: dict[str, str], review_list: Path) -> ChangeOwner:
         list_owner = self.list_owner(review_list)
         identity = row.get(PRODUCER, "").strip()
+        recorded_owner = row.get("Production", "").strip()
+        if not identity and not row.get("Verdict") and self.record.by_id(staff.StaffId(recorded_owner)) is not None:
+            identity = recorded_owner
         if not identity:
             runner = self.runners_by_name.get(list_owner)
             if runner is not None and runner.kind == "showrunner":
@@ -201,9 +204,9 @@ class StaffRouting:
             return self.unrouted(review_list, row, f"Producer {identity} is not a staff unit or showrunner", identity)
         parent = producer
         seen: set[staff.StaffId] = set()
-        while parent.kind != "showrunner" and parent.parent is not None and parent.id not in seen:
+        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
             seen.add(parent.id)
-            ancestor = self.record.by_id(parent.parent)
+            ancestor = self.record.by_id(parent.parent.id)
             if ancestor is None:
                 break
             parent = ancestor
@@ -226,7 +229,8 @@ class StaffRouting:
             if root is not None:
                 root_document = document if document is not None else self.production_by_runner.get(root.id)
                 if root_document is not None:
-                    return ChangeAssignment(ShowrunnerOwnChange(root.id, root.name), root_document)
+                    return ChangeAssignment(owner if isinstance(owner, UnroutedChange)
+                                            else ShowrunnerOwnChange(root.id, root.name), root_document)
         return ChangeAssignment(owner, document if document is not None else UnavailableProduction(review_list))
 
     def unrouted(self, review_list: Path, row: dict[str, str], note: str, producer: str) -> UnroutedChange:

@@ -13,9 +13,9 @@ Consult a peer session of your own family about a design or debugging question, 
 - `SESSION_DIR`: last line of `prepare_session.sh` output (`Session ready at <path>`).
 - `WORKING_DIR`: invocation directory.
 - `FRIEND`: the friend's name, from the `Friend name:` line (also `${SESSION_DIR}/friend_name`).
-- `FAMILY`: `claude` or `codex`, from the `family=` field of `launch_friend.sh` output.
-- `FRIEND_ID` (claude): the background session id, `id=` in the launch output.
-- `FRIEND_TERMINAL` (codex): the managed terminal `session_id` running `launch_friend.sh`.
+- `FAMILY`: `claude` or `codex`, from `AGENT_FAMILY`.
+- `FRIEND_ID` (claude): the session ID in `${SESSION_DIR}/friend_id`.
+- `FRIEND_TERMINAL` (codex): the managed terminal `session_id` that runs `assign.sh`.
 - `SELF_NAME` (claude): this session's name, from the first line of `ListAgents` (`This session is <name>`).
 - `ROUND`: 1-based message counter. `HISTORY_FILE`: `${SESSION_DIR}/history.md`.
 
@@ -44,11 +44,26 @@ Append the question to `HISTORY_FILE` under `## Round 1 — question`.
 
 ### 3. LaunchFriend
 
-`bash ~/.claude/scripts/ask_a_friend/launch_friend.sh "${SESSION_DIR}" "${WORKING_DIR}"`
+Resolve the consultation model for the caller's family:
 
-- claude: run in the foreground; it returns at once. Read `family=` and `id=` into `FAMILY` and `FRIEND_ID`. Tell the user in one line who was asked (agent and effort) and that the answer arrives as a message.
-- codex: launch in a managed unified-exec terminal with `tty: true` and a short initial yield; keep its `session_id` as `FRIEND_TERMINAL`. It blocks for the friend's lifetime and prints each reply between `=== reply from <FRIEND> (N) ===` and `=== end reply ===`.
-- An `error` status: read `${SESSION_DIR}/agent.log`, report the cause plainly, stop.
+```sh
+source ~/.claude/scripts/agents/models_config.sh
+agents_resolve ask_a_friend.consultation
+FAMILY="${AGENT_FAMILY}"
+QUESTION_FILE="${SESSION_DIR}/question.md"
+ANSWER_FILE="${SESSION_DIR}/answer.txt"
+LOG_FILE="${SESSION_DIR}/agent.log"
+```
+
+Use this form for both families. Omit `--phase` for a new consultation.
+
+```sh
+bash ~/.claude/scripts/direct/assign.sh --role review --operation resident --session-dir "${SESSION_DIR}" --new-worker "${FRIEND}" --cwd "${WORKING_DIR}" --prompt "${QUESTION_FILE}" --summary "${ANSWER_FILE}" --log "${LOG_FILE}" --id-file "${SESSION_DIR}/friend_id" --family "${AGENT_FAMILY}" --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT}"
+```
+
+- claude: Run the command in the foreground. Read `FRIEND_ID` from `${SESSION_DIR}/friend_id`. Tell the user the agent and effort. The answer arrives as a message.
+- codex: Run the command in a managed unified-exec terminal with `tty: true` and a short initial yield. Save its `session_id` as `FRIEND_TERMINAL`. The command runs for the friend's lifetime. Each reply appears between `=== reply from <FRIEND> (N) ===` and `=== end reply ===`.
+- If the command fails, read `${SESSION_DIR}/agent.log`. Report the cause and stop.
 
 ### 4. AwaitReply
 
@@ -106,7 +121,9 @@ One short section: the question, the friend's position, your position, and what 
 
 ### EndFriend
 
-`bash ~/.claude/scripts/ask_a_friend/end_friend.sh "${SESSION_DIR}"` — foreground on both families; on codex, `FRIEND_TERMINAL` then exits on its own. Run it on every exit path, including errors and user cancellation: a friend left running keeps a session or an app-server alive for nothing.
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/worker_fill.py end-friend --run "${SESSION_DIR}"`
+
+Run this command on every exit path, including errors and user cancellation. It stops the friend and records the ended status.
 
 ## Rules
 

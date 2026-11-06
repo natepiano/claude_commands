@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
 if __package__:
-    from . import parse, store
+    from . import parse
 else:
     import parse
-    import store
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,8 @@ def metadata_target_folder(metadata: str, argv: list[str], cwd: str) -> StepTarg
     """Accept metadata only for the selected manifest or working folder."""
     if not metadata.strip():
         return UnresolvedTargetFolder()
+    import json
+
     try:
         decoded = cast(object, json.loads(metadata))
     except ValueError:
@@ -85,13 +87,25 @@ def metadata_target_folder(metadata: str, argv: list[str], cwd: str) -> StepTarg
     return CargoTargetFolder(Path(target))
 
 
+def cargo_command_context(argv: list[str], cwd: str, environment: Mapping[str, str]
+                          ) -> tuple[list[str], list[str], str, Mapping[str, str]]:
+    """Split Cargo inputs for start capture and output discovery."""
+    words, directory, effective = parse.command_context(argv, cwd, environment)
+    program = words[:2] if parse.toolchain(words) else words[:1]
+    if not program or Path(program[0]).name != "cargo":
+        return [], [], directory, effective
+    arguments = words[len(program):]
+    arguments = arguments[:arguments.index("--")] if "--" in arguments else arguments
+    return program, arguments, directory, effective
+
+
 def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, str], metadata: str = "") -> StepTargetFolder:
     """Resolve the folder from the command's environment, config, and manifests."""
-    words, directory, effective = parse.command_context(argv, cwd, environment)
-    if not words or Path(words[0]).name != "cargo" or parse.step_name(words) == "fmt":
+    program, arguments, directory, effective = cargo_command_context(argv, cwd, environment)
+    if not program or parse.step_name([*program, *arguments]) == "fmt":
         return NoTargetFolder()
-    arguments = words[2:] if parse.toolchain(words) else words[1:]
-    arguments = arguments[:arguments.index("--")] if "--" in arguments else arguments
+    from cargo_target_config import CargoConfigPolicy, cargo_folder_settings, cargo_home_folder, cargo_workspace_manifest
+
     try:
         settings = cargo_folder_settings(arguments, directory, effective, policy=CargoConfigPolicy.CURRENT_STRICT)
         if chosen := settings.get("target-dir"):
@@ -108,8 +122,36 @@ def resolve_target_folder(argv: list[str], cwd: str, environment: Mapping[str, s
         workspace = cargo_workspace_manifest(arguments, directory, cargo_home_folder(directory, effective))
         return CargoTargetFolder(workspace.resolve().parent / "target")
     except (OSError, ValueError) as error:
+        if __package__:
+            from . import store
+        else:
+            import store
+
         store.note_error(f"target folder: {error}")
         return UnresolvedTargetFolder()
+
+
+def step_output_roots(argv: list[str], cwd: str) -> CargoOutputRoots | CargoOutputUnavailable:
+    """Read output folders with the step command's Cargo inputs."""
+    import json
+    from cargo_target_config import cargo_path_argument
+    if not TYPE_CHECKING:
+        from scripts.lib.cargo_output import read_cargo_output_roots
+
+    program, arguments, directory, environment = cargo_command_context(argv, cwd, os.environ)
+    options: list[str] = []
+    words = iter(arguments)
+    for word in words:
+        if word in ("--manifest-path", "--config"):
+            options.extend([word, next(words, "")])
+        elif word.startswith(("--manifest-path=", "--config=")):
+            options.append(word)
+    target = cargo_path_argument(arguments, "--target-dir")
+    if target:
+        absolute = str((Path(directory) / target).resolve())
+        options.extend(["--config", "build.target-dir=" + json.dumps(absolute)])
+    return read_cargo_output_roots(Path(directory), cargo=program or ("cargo",),
+                                   options=options, environment=environment)
 
 
 def step_context(argv: list[str], metadata: str) -> None:

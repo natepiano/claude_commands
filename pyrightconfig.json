@@ -12,10 +12,6 @@
       "extraPaths": [".", "scripts/direct", "scripts/lib", "scripts/history", "scripts/agents", "scripts/astra", "scripts/production", "scripts/message"]
     },
     {
-      "root": "scripts/hierarchies",
-      "extraPaths": [".", "scripts/hierarchies", "scripts/lib", "scripts/production", "scripts/message", "scripts/direct", "scripts/nightly_review"]
-    },
-    {
       "root": "scripts/herdr",
       "extraPaths": [
         ".",
@@ -125,6 +121,7 @@
     {
       "root": "scripts/buildlog",
       "extraPaths": [
+        ".",
         "scripts/buildlog",
         "scripts/build_hold",
         "scripts/lint",
@@ -146,6 +143,7 @@
     {
       "root": "scripts/build_targets",
       "extraPaths": [
+        ".",
         "scripts/build_targets",
         "scripts/build_hold",
         "scripts/mac_test",

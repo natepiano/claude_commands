@@ -24,17 +24,18 @@ When `PRODUCTION_DOC` carries `**Kind:** style`, read
 
 State:
 
-- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
-  After a `/showrunner:rename apply` succeeds, read them again from the
-  renamed doc, along with `UPDATES` and `PROMPT_FILE`, which come from its
-  slug: apply moves the doc, the update timer and the state directory, and
-  switches `CHECKOUT` to the new merge branch.
+- `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG` — read these from the production document.
+  After a rename, read these values again.
+- `STAFF_ID` — the fixed showrunner id from staff.
+  Read the row through `session_staff.RowResolver` or `staff.snapshot()`.
+  Keep this id after a rename or a new current session.
+- `UNITS` — the production's staff rows with a present worktree. A retired row has a `RemovedWorktree`.
 - `ZONE` — the user's zone setting, which
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
 - `CHECKOUT` — this session's checkout, which must be on `MERGE_BRANCH`.
 - `SCRATCH` — this session's scratchpad directory, for files that only this session needs.
-- `STATE_DIR` — `~/.local/state/showrunner/<slug>/session`, the showrunner's own state.
+- `STATE_DIR` — `~/.local/state/showrunner/<staff id>/session`, the showrunner's own state.
   It lasts across a new session id, a restart and a reboot, which a scratchpad does not.
 - `DAILIES_STATE_DIR` — `<STATE_DIR>/dailies_input_state`, the dailies builder's
   `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
@@ -44,11 +45,10 @@ State:
   `chore(<slug>): rename unit <old> to <new>` commit carries the merges under
   `<old>` before it over to `<new>`.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
-- `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
-  name less `-production.md`.
-- `PROMPT_FILE` — `~/.local/state/showrunner/<slug>/prompt.txt`.
+- `UPDATES` — `showrunner-<staff id>`, where `<staff id>` is the showrunner row id.
+- `PROMPT_FILE` — `~/.local/state/showrunner/<staff id>/prompt.txt`.
 - `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
-  optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
+  optional `units` rows (`{"unit": "<unit staff id>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
   (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`; an
   object may add `urgency`: `blocks`, `soon` with `due`, or `later`, and
@@ -57,12 +57,12 @@ State:
   the user asked to be told about, such as "tell me when hanadocs is back";
   remove an item once it is reported; it needs no review), and `next` (a list
   of one-line text: each action you owe and what sets it off; see Compaction). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that asks it carries the printed `reviewed question` text.
-- `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
+- `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<staff id>.json`, written
   by `update_registration.py questions --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
   `report_to_user` is kept the same way in
-  `~/.local/state/showrunner/reports/<slug>.json`.
-- `LOG` backups — `~/.local/state/showrunner/<slug>/log-backups/log-<YYYYmmddTHHMM>.md`,
+  `~/.local/state/showrunner/reports/<staff id>.json`.
+- `LOG` backups — `~/.local/state/showrunner/<staff id>/log-backups/log-<YYYYmmddTHHMM>.md`,
   one copy per update tick, the newest 48 kept (`log_backup.py`). To restore
   `LOG`, copy the wanted file back over it.
 
@@ -86,11 +86,12 @@ State:
   and the `next` list.
 - **Compaction.** Keep `next` in `SHOWRUNNER_STATE` current: each action you owe,
   with what sets it off ("merge alpha phase 2 when its gate is green"). Write no
-  handoff doc. Before a compaction, a PreCompact hook writes the `### STATE`
-  block from that file. After it, a SessionStart hook tells you to run
+  handoff doc. No hook writes at compaction: `/showrunner:produce PRODUCTION_DOC
+  resume` reads `next` from that file and prints it. After it, a SessionStart hook tells you to run
   `/showrunner:produce PRODUCTION_DOC resume` and act first on what was in
   flight and the `Next:` line. The production doc, `LOG` and `STATE_DIR` are
   the whole state.
+  Compaction runs by itself during work. The per-call context message is off in `config/context_usage.conf`.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
 - **A unit's pane** is looked up each time it is needed, never remembered:
@@ -129,10 +130,8 @@ State:
   - packaging;
   - cargo-berth overlap answers, incursion resolves, orphan retirement and
     releases (<Dependencies/> rule 3);
-  - whether a unit edits files outside its `.unit.toml` duties, another unit's crate
-    included: settle it by who holds the files on the berth board and when
-    each holder merges, as <Dependencies/> rule 3 settles a file wait. No
-    rule needs the user's OK for this (user, 2026-10-04).
+  - which unit edits a file, including another unit's crate. Use berth reservations
+    and merge order, as <Dependencies/> rule 3 specifies (user, 2026-10-04).
 - **As-built close-out** is the unit director's: it decides, reports what moved,
   and never asks (user, 2026-10-06). A scope change to the main plan is a
   product choice, not an as-built one.
@@ -272,8 +271,11 @@ State:
   reply: file it with `/showrunner:question` for that unit, and say nothing of
   it to the user. A unit can also file its own with `/unit:question`. The count
   and `/next question` show it, and its answer goes back to the unit through
-  `update_registration.py answer` (`/next` → question). A filed item stays on
-  the list when `open_for_user` leaves it out; it leaves only through `answer`.
+  `update_registration.py answer` (`/next` → question).
+  A filed item stays on the list when `open_for_user` omits it.
+  It leaves only through `answer` or `withdraw`.
+  Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
+  It records no answer and relays nothing.
   User, 2026-10-28: "i asked it to add it to your question list not to bring
   it directly to my attention".
   A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone.
@@ -403,7 +405,8 @@ When the production doc's **Production rules** say CI does not apply, pass
 For a planned production, run
 `python3 ~/.claude/scripts/production/production_lifecycle.py open
 --production PRODUCTION_DOC`. The command creates and pushes the merge
-branch, records the running doc and plans, and initializes `LOG`. Rerun it
+branch, records the running doc, finds the plans from staff rows and
+`.unit.toml`, and initializes `LOG`. Rerun it
 after a failed step; it resumes at the first unfinished step.
 </OpenMergeBranch>
 
@@ -539,7 +542,7 @@ whatever arrived:
 | an update tick (a message starting `Scheduled update`) | the schedule prompt only, plus any merge whose shots are viewed and any BLOCK past its limit |
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
-| a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
+| a unit blocked on the showrunner | <LandingCall/> or answer it |
 | a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
 | a unit director's decision only the user can settle | file it for that unit with `/showrunner:question`, never in a reply; relay the answer that `answer` names (<Throughout/> → Open questions) |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
@@ -614,8 +617,7 @@ notice to the unit director before any merge command runs:
    --review-trial "<the complete review trial: line>"
    --parallel "<the notice's Parallel: line>"
    --delivers "<one line of what the phase delivers>"`.
-   Add one `--also <path>` per approved outside path, one `--trailer <line>`
-   per attribution line this session requires, `--regime trial` if the broad
+   Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
    review used the craft lens, `--holds <K>` (this phase's held checkpoints)
    and `--merge-defects <D>` (the defect rows its merge design checks found in
    its own work, moved ones included and rows the check calls older left out),
@@ -673,13 +675,12 @@ message.
 
 5. **Report where it landed.** Include every `into:` line from the script in
    the user update. Each names the checkout, why it received the merge and
-   what gate it unblocks. If the showrunner then merges the merge branch into
+   what work it enables. If the showrunner then merges the merge branch into
    a unit worktree, add an `into:` line for that worktree with the same why
    and unblocks fields. A failed promote still reports each place already
    reached. A rerun of the same hash resumes promotion.
 
-6. **After the push.** Run <ClearGate/> for a code checkpoint's first merge;
-   run <CrossUnitChange/> when public items were renamed or removed or files
+6. **After the push.** Run <CrossUnitChange/> when public items were renamed or removed or files
    restructured. Run `python3 ~/.claude/scripts/production/ci_points.py due
    --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR` after each code
    merge; when it says due, run <CIPoint/>. Run `python3
@@ -812,15 +813,17 @@ files for a small fix checkpoint. Log each point and its result. Pass
 `--no-ci` to both calls when the production rules say CI does not apply.
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
-in the background: `zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
+in the background: `HANA_TEST_PURPOSE="CI promotion smoke" zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
 It builds, checks hana stays up 60 s, and stops it, then builds and runs each
 demo example (list in the script) for 20 s with the command you would type, so
-each starts at once from the clone `~/rust/hana_catalyst_mac`. Exit 3 means the
+each starts from a task-owned scratch clone. The script ends its `gate:` task
+and removes the clone when the run ends. Exit 3 means the
 Mac is unreachable: skip it. Exit 9 means the Mac is blocked, busy with a test,
 or its coordination state cannot be read: skip the run; it is not an outage.
 It never gates a merge; a failure (7 hana, 8 an example) goes to the unit whose
-merge it was. Never skip it: the user demos
-from that clone. User, 2026-10-04, 2026-10-05 and 2026-10-06.
+merge it was. Never skip it. For a separate test clone on either machine,
+use `copies.py clone <source> --task gate:<id>` and `scratch.py end --task gate:<id>`
+when the test ends; a phase task must name a real phase.
 </CIPoint>
 
 ---
@@ -833,7 +836,7 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    background with `dangerouslyDisableSandbox: true`:
 
    ```sh
-   bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
+   HANA_TEST_PURPOSE="promotion smoke" bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
    ```
 
    It builds `hana`, starts it on port 15790 with an empty config directory,
@@ -870,29 +873,15 @@ Log `- HH:MM <zone>: main promoted to <short sha> (<n> commits)`, or
 
 ---
 
-<ClearGate>
-When a merged checkpoint clears a gate, run `python3
-~/.claude/scripts/production/ci_points.py notice clear G<k> --production
-PRODUCTION_DOC` and SendMessage its `send <unit>:` line. The unit director
-checks the merge in git before continuing.
-
-When a gate's test under <Dependencies/> rule 1 passes without that checkpoint,
-run `python3 ~/.claude/scripts/production/ci_points.py notice lift G<k>
---production PRODUCTION_DOC --log <test log path>` and SendMessage its
-`send <unit>:` line.
-</ClearGate>
-
----
-
 <Dependencies>
-Apply the user's rules (2026-09-29). A unit waits on another unit only for code
-it needs. Every other wait is yours to clear, and fast.
+A unit waits on another unit only for code it needs.
+Record a start-order wait as an owed action in your notes.
+Use `cargo-berth sequence` for merge order.
 
 1. **Only missing code blocks a unit.** When a unit director reports a wait on
    another unit, name in that turn what it needs:
    - **Code:** a function, fix or behavior that exists only in the other unit's
-     unmerged work. Only this is a block. A gate is a code block the producer
-     planned.
+     unmerged work. Only this is a block.
    - **Files:** cargo-berth reservations or shared files, with no code needed.
      Rule 3 clears it.
    - **Preference:** "to avoid conflicts", "to build on their version". Never a
@@ -902,8 +891,7 @@ it needs. Every other wait is yours to clear, and fast.
    <waiting unit> --tests "<command>" --production PRODUCTION_DOC
    --state-dir DAILIES_STATE_DIR`. It tests a detached scratch checkout with
    `MERGE_BRANCH`, without the other unit's unmerged work. Green means it is
-   not blocked: tell it to continue, or lift the gate (<ClearGate/>) using the
-   printed log path. A red test needs your classification; a merge conflict
+   not blocked: tell it to continue with the printed log path. A red test needs your classification; a merge conflict
    is not a red test.
 2. **The unit waited on lands what is needed now.** Send its unit director:
 
@@ -1217,8 +1205,8 @@ condition: wrap neither waits on it nor retires its worktree or branch.
     lock, run fewer at once, never none. User, 2026-10-06, replacing the
     2026-10-01 one-phase rule.
 - **Disk.** Units keep saved run output under a few GB (`/unit:direct` →
-  <ToolingContract/>). When builds turn cold for no reason, run `df -h /` and
-  find the large output before anything else. User, 2026-10-04.
+  <ToolingContract/>). When builds turn cold for no reason, check `df -h /` and, when present, `df -h /build`.
+  Find the large output before any other action. User, 2026-10-04.
 - Never ask the user to review until <DesignCheck/> passed on the shots.
 - Never pass on a unit director's claim without checking it.
 - Updates hold only what the schedule prompt allows.

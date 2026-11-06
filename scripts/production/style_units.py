@@ -19,8 +19,9 @@ import live_units
 import rules
 import style_ledger
 import display_cells
+from scripts.production import staff, session_staff, unit_lookup, unit_names
 from issues import Issue, frontmatter
-from proposal_issue import ApprovedDecision, decision_answer
+from proposal_issue import ApprovedDecision, decision_answer, proposal_unit
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 
@@ -99,14 +100,16 @@ def clock(value: str, zone: tzinfo) -> str:
     return at.astimezone(zone).strftime("%H:%M") if isinstance(at, datetime) else display_cells.NONE
 
 
-def decision_family(path: Path) -> DecisionFamily | DecisionFileMissing:
+def decision_family(path: Path, rule_families: Mapping[str, rules.Family]) -> DecisionFamily | DecisionFileMissing:
     if not path.is_file():
         return DecisionFileMissing()
     try:
         issue = Issue(path, frontmatter(path))
     except (OSError, UnicodeError):
         return DecisionFileMissing()
-    return DecisionFamily(rules.style_family(issue.value("unit")), isinstance(decision_answer(issue), ApprovedDecision))
+    family = (rules.style_family(proposal_unit(issue)) if issue.value("unit")
+              else rule_families.get(issue.value("style_rule_blob"), rules.NotStyleUnit()))
+    return DecisionFamily(family, isinstance(decision_answer(issue), ApprovedDecision))
 
 
 def columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -148,6 +151,11 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
             }
         if not finding_columns:
             return snapshot
+        pinned = cast(list[tuple[str, bytes]], connection.execute("SELECT blob,text FROM rule_texts").fetchall())
+        rule_families: dict[str, rules.Family] = {
+            blob: family for blob, text in pinned
+            if isinstance(family := rules.pinned_family(text.decode(errors="replace")), str)
+        }
         built_at = "h.built_at" if "built_at" in finding_columns else "h.updated_at"
         if "built_at" not in finding_columns and ticket_columns and "build_ticket" in finding_columns:
             built_at = style_ledger.legacy_built_at_sql("h")
@@ -166,7 +174,7 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
                 snapshot.total_filed += finding.findings
             path = (decision_folder / Path(finding.proposal).expanduser()).resolve()
             if path not in decisions:
-                decisions[path] = decision_family(path)
+                decisions[path] = decision_family(path, rule_families)
             decision = decisions[path]
             if isinstance(decision, DecisionFamily):
                 family = decision.family
@@ -272,7 +280,7 @@ def left_cell(approved: int, filed: int, split: style_ledger.RecordedSplit | sty
             + f"structure {split.structure:,} · other {split.other:,} ({age})")
 
 
-def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
+def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: Path,
           ledger_paths: Mapping[str, Path],
           now: datetime | None = None, zone: tzinfo | None = None,
           decision_folder: Path = DECISION_FOLDER) -> str:
@@ -280,6 +288,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     now = now if now is not None else datetime.now(UTC)
     zone = zone if zone is not None else user_zone()
     paths = ledger_paths
+    resolver = session_staff.RowResolver(staff.snapshot())
+    holders = {unit_names.unit_id(row.name): row for row in unit_lookup.doc_units(doc, resolver.record)}
     decisions: dict[Path, DecisionFamily | DecisionFileMissing] = {}
     snapshots: dict[Path, LedgerSnapshot] = {}
     with ThreadPoolExecutor(max_workers=1) as reads:
@@ -295,7 +305,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         snapshot = snapshots[paths[unit.unit].resolve()] if unit.unit in paths else LedgerSnapshot()
         family = rules.style_family(unit.unit)
         counts = snapshot.counts.get(family, FamilyCounts()) if isinstance(family, str) else FamilyCounts()
-        ticket = snapshot.tickets.get(unit.unit, NoTicket())
+        holder = holders.get(unit.unit)
+        if holder is None:
+            print(f"anomaly: {unit.unit}: staff ticket ownership is unavailable under {doc}", file=sys.stderr)
+        ticket = snapshot.tickets.get(str(holder.id), NoTicket()) if holder is not None else NoTicket()
         refill = snapshot.refills.get(unit.unit)
         idle = f"idle ({clock(refill.at, zone)})" if refill else "idle"
         idle_step = f"idle — {refill.outcome}" if refill else "idle"

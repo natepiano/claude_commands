@@ -166,7 +166,7 @@ assert 'send' not in sys.modules
                 send.assert_called_once()
 
     def test_unaccepted_send_outcomes_keep_alerts_pending(self) -> None:
-        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING")):
+        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING"), (6, "RETRY")):
             with self.subTest(header=header):
                 error = StringIO()
                 with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),
@@ -218,7 +218,7 @@ assert 'send' not in sys.modules
         assert runner is not None
         unit = fixture_member("unit", name="orphan", parent=runner.id)
         record = staff.snapshot()
-        broken = replace(record, rows=tuple(replace(row, parent=None) if row.id == unit.id else row for row in record.rows))
+        broken = replace(record, rows=tuple(replace(row, parent=staff.StaffRoot()) if row.id == unit.id else row for row in record.rows))
         return change_routing.StaffRouting(broken, {}), runner, unit
 
     def test_routed_rows_and_saved_unrouted_rows_read_no_alert_record_and_send_nothing(self) -> None:

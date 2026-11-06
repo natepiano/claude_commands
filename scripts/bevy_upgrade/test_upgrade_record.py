@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
 import subprocess
@@ -14,9 +15,15 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import pins
 import upgrade_record
 from scripts.production.production_doc import Production, read_production
+from scripts.production import staff
+from scripts.production.staff_test_support import (
+    fixture_member, fixture_runtime_id, isolated_staff_file,
+)
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -33,6 +40,7 @@ def dependent(name: str, version: str = "1.0.0") -> pins.Dependent:
 @final
 class RecordTests(unittest.TestCase):
     root: Path = Path()
+    owner: staff.StaffRow  # pyright: ignore[reportUninitializedInstanceVariable]
     @override
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -62,26 +70,255 @@ class RecordTests(unittest.TestCase):
         self.current_pins = pins.Pins(("0.19.1",), frozenset({"bevy_ecs"}),
                                       (dependent("alpha"), dependent("zeta")))
         _ = cast(object, self.enterContext(mock.patch.dict(
-            os.environ, {"BEVY_UPGRADE_STATE_DIR": str(self.root / "state")},
+            os.environ, {"BEVY_UPGRADE_STATE_DIR": str(self.root / "state"),
+                         "HERDR_BIN": "/nonexistent/herdr", "HOME": str(self.root)},
         )))
 
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        owner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", doc))
+        self.owner = staff.update_current_session(owner.current_session,
+            staff.native_id(fixture_runtime_id("bevy-current")))
+
     def begin(self) -> upgrade_record.Record:
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             started = upgrade_record.start(self.production, "0.20", self.current_pins, NOW)
             upgrade_record.save(started)
         return started
 
     def test_state_override_and_record_path(self) -> None:
         self.assertEqual(upgrade_record.state_dir(), self.root / "state")
-        self.assertEqual(upgrade_record.record_path("demo"), self.root / "state/demo.json")
+        self.assertEqual(upgrade_record.record_path(self.owner.id), self.root / "state" / f"{self.owner.id}.json")
 
     def test_default_state_directory_uses_the_home(self) -> None:
-        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home")}, clear=True):
+        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "BEVY_UPGRADE_STATE_DIR": ""}):
             self.assertEqual(upgrade_record.state_dir(), self.root / "home/.local/state/bevy-upgrade")
 
+    def test_rename_and_clear_preserve_the_record_key(self) -> None:
+        _ = self.begin()
+        path = self.root / "state" / f"{self.owner.id}.json"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        _ = staff.rename(self.owner.id, "renamed-demo")
+        _ = staff.update_current_session(self.owner.current_session,
+                                        staff.native_id(fixture_runtime_id("bevy-cleared")))
+        self.assertEqual(upgrade_record.record_path(self.owner.id), path)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(sorted(item.name for item in path.parent.glob("*.json")), [path.name])
+
+    def legacy_watch(self) -> tuple[Path, Path]:
+        current = self.begin()
+        legacy = cast(dict[str, object], json.loads(json.dumps(current)))
+        _ = legacy.pop("staff_id")
+        legacy["slug"] = "demo"
+        source = self.root / "state/demo.json"
+        _ = source.write_text(json.dumps(legacy))
+        upgrade_record.record_path(self.owner.id).unlink()
+        job = self.root / "notifier/bevy-upgrade-demo"
+        job.mkdir(parents=True)
+        import shlex
+        words = ["python3", "bevy_upgrade.py", "--production", str(self.production.doc), "check", "--scheduled"]
+        _ = (job / "conf").write_text("FROM=bevy-upgrade-demo\nRUN=" + shlex.join(words) + "\n")
+        _ = (job / "state").write_text("NEXT_DUE=123\n")
+        return source, job
+
+    def test_watch_migration_recovers_job_after_clear_and_preserves_finished_rerun(self) -> None:
+        import migrate_bevy_watch
+
+        source, job = self.legacy_watch()
+        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier")}):
+            self.assertEqual(migrate_bevy_watch.migrate(stop_after=1), 75)
+            self.assertTrue(job.exists())
+            _ = staff.update_current_session(self.owner.current_session,
+                                            staff.native_id(fixture_runtime_id("bevy-migration-clear")))
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            target = job.with_name(f"bevy-upgrade-{self.owner.id}")
+            conf = (target / "conf").read_text()
+            self.assertIn(f"--staff-id {self.owner.id}", conf)
+            self.assertNotIn("--production", conf)
+            self.assertEqual((target / "state").read_text(), "NEXT_DUE=123\n")
+            paths = [upgrade_record.record_path(self.owner.id), target / "conf", target / "state"]
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+        self.assertFalse(source.exists())
+        self.assertFalse(job.exists())
+        self.assertEqual(len(staff.snapshot().rows), 1)
+
+    def rename_production_document(self) -> Path:
+        previous = self.production.doc
+        renamed = previous.with_name("renamed-demo-production.md")
+        _ = previous.rename(renamed)
+        _ = renamed.write_text(renamed.read_text() + "\n## Production Context\n- **Formerly:** `demo`\n")
+        _ = staff.rename(self.owner.id, "renamed-demo")
+        _ = staff.set_doc(self.owner.id, staff.LiveDoc("natedev", renamed))
+        return renamed
+
+    def test_watch_migration_resolves_former_document_for_record_archive_and_job(self) -> None:
+        import migrate_bevy_watch
+
+        source, job = self.legacy_watch()
+        archive = source.with_name("demo.0.20.closed.json")
+        closed = cast(dict[str, object], json.loads(source.read_text()))
+        closed["closed"] = LATER.isoformat()
+        _ = archive.write_text(json.dumps(closed))
+        _ = self.rename_production_document()
+        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertFalse(source.exists())
+            self.assertFalse(archive.exists())
+            self.assertFalse(job.exists())
+            for name in (f"{self.owner.id}.json", f"{self.owner.id}.0.20.closed.json"):
+                fields = cast(dict[str, object], json.loads((source.parent / name).read_text()))
+                self.assertEqual(fields["staff_id"], self.owner.id)
+                self.assertNotIn("slug", fields)
+            target = job.with_name(f"bevy-upgrade-{self.owner.id}")
+            self.assertIn(f"--staff-id {self.owner.id}", (target / "conf").read_text())
+            self.assertNotIn("--production", (target / "conf").read_text())
+            self.assertEqual((target / "state").read_text(), "NEXT_DUE=123\n")
+            paths = [*source.parent.glob("*.json"), *target.iterdir()]
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_finished_watch_migration_after_rename_needs_no_document_resolution(self) -> None:
+        import migrate_bevy_watch
+
+        current = self.begin()
+        archive = upgrade_record.record_path(self.owner.id).with_name(f"{self.owner.id}.0.20.closed.json")
+        closed = {**current, "closed": LATER.isoformat()}
+        _ = archive.write_text(json.dumps(closed))
+        _ = self.rename_production_document()
+        paths = [upgrade_record.record_path(self.owner.id), archive]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        with (mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier")}),
+              mock.patch.object(migrate_bevy_watch, "_owner", side_effect=staff.StaffRefused("old document")) as owner):
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+        owner.assert_not_called()
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_watch_migration_reports_ambiguous_former_document_and_continues(self) -> None:
+        import migrate_bevy_watch
+
+        source, job = self.legacy_watch()
+        renamed = self.rename_production_document()
+        other_doc = renamed.with_name("other-production.md")
+        _ = other_doc.write_text(renamed.read_text())
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
+        unaffected_doc = renamed.with_name("unaffected-production.md")
+        _ = unaffected_doc.write_text("# Unaffected\n")
+        unaffected = fixture_member("showrunner", name="unaffected", doc=staff.LiveDoc("natedev", unaffected_doc))
+        fields = cast(dict[str, object], json.loads(source.read_text()))
+        fields["production"] = str(unaffected_doc)
+        fields["slug"] = "unaffected"
+        unaffected_source = source.with_name("unaffected.json")
+        _ = unaffected_source.write_text(json.dumps(fields))
+        paths = [source, job / "conf", job / "state"]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        with (mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}),
+              mock.patch("sys.stderr", new_callable=io.StringIO) as errors):
+            self.assertEqual(migrate_bevy_watch.migrate(), 1)
+        self.assertIn("anomaly:", errors.getvalue())
+        self.assertIn("ambiguous", errors.getvalue())
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+        self.assertFalse(unaffected_source.exists())
+        self.assertTrue(upgrade_record.record_path(unaffected.id).exists())
+
+    def test_watch_migration_reconciles_job_created_by_status(self) -> None:
+        import bevy_upgrade
+        import migrate_bevy_watch
+        import upgrade_schedule
+
+        source, job = self.legacy_watch()
+        schedule = "ENABLED=0\nNEXT_DUE=123\nLAST_SENT=45\nLAST_RESTART=67\nLAST_TARGET=\nPAUSED=1\n"
+        _ = (job / "state").write_text(schedule)
+        _ = (job / "run.log").write_text("legacy check\n")
+        with (job / "conf").open("a") as stream:
+            _ = stream.write("EVERY=60\nTIMEOUT=45\n")
+        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
+            self.assertEqual(migrate_bevy_watch.migrate(stop_after=1), 75)
+            with mock.patch("builtins.print"):
+                self.assertEqual(bevy_upgrade.main(["--production", str(self.production.doc), "status"]), 0)
+            target = job.with_name(upgrade_schedule.instance(self.owner.id))
+            self.assertTrue((target / "state").exists())
+            self.assertNotEqual((target / "state").read_text(), schedule)
+            _ = (target / "run.log").write_text("fixed check\n")
+            lock = (target / "lock").stat().st_ino
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertEqual((target / "state").read_text(), schedule)
+            self.assertEqual((target / "run.log").read_text(), "fixed check\nlegacy check\n")
+            self.assertEqual((target / "lock").stat().st_ino, lock)
+            self.assertIn("EVERY=60\nTIMEOUT=45\n", (target / "conf").read_text())
+            self.assertIn(f"--staff-id {self.owner.id}", (target / "conf").read_text())
+            self.assertFalse(source.exists())
+            self.assertFalse(job.exists())
+            paths = sorted(target.iterdir())
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_watch_migration_finishes_cleanup_after_conf_delete(self) -> None:
+        import bevy_upgrade
+        import migrate_bevy_watch
+        import upgrade_schedule
+
+        _, job = self.legacy_watch()
+        remove_directory = Path.rmdir
+
+        def interrupt(path: Path) -> None:
+            if path == job:
+                raise OSError("interrupted after conf delete")
+            remove_directory(path)
+
+        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
+            self.assertEqual(migrate_bevy_watch.migrate(stop_after=1), 75)
+            with mock.patch("builtins.print"):
+                self.assertEqual(bevy_upgrade.main(["--production", str(self.production.doc), "status"]), 0)
+            with mock.patch.object(Path, "rmdir", autospec=True, side_effect=interrupt):
+                self.assertEqual(migrate_bevy_watch.migrate(), 1)
+            self.assertTrue(job.is_dir())
+            self.assertEqual(list(job.iterdir()), [])
+            target = job.with_name(upgrade_schedule.instance(self.owner.id))
+            paths = sorted(target.iterdir())
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertFalse(job.exists())
+            self.assertEqual((target / "state").read_text(), "NEXT_DUE=123\n")
+            self.assertEqual(migrate_bevy_watch.migrate(), 0)
+            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_watch_migration_refuses_job_destination_with_another_owner(self) -> None:
+        import migrate_bevy_watch
+        import upgrade_schedule
+
+        _, job = self.legacy_watch()
+        other = fixture_member("showrunner", name="other-owner")
+        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(job.parent)}):
+            self.assertEqual(migrate_bevy_watch.migrate(stop_after=1), 75)
+            target = job.with_name(upgrade_schedule.instance(self.owner.id))
+            target.mkdir()
+            _ = (target / "conf").write_text(f"RUN={upgrade_schedule.command(other.id)}\n")
+            _ = (target / "state").write_text("NEXT_DUE=456\n")
+            paths = [job / "conf", job / "state", target / "conf", target / "state"]
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+            self.assertEqual(migrate_bevy_watch.migrate(), 1)
+            self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_watch_migration_refuses_unavailable_owner_without_changing_files(self) -> None:
+        import migrate_bevy_watch
+
+        source, job = self.legacy_watch()
+        value = cast(dict[str, object], json.loads(source.read_text()))
+        value["production"] = str(self.root / "unowned-production.md")
+        _ = source.write_text(json.dumps(value))
+        paths = (source, job / "conf", job / "state")
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        with mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.root / "notifier")}):
+            self.assertEqual(migrate_bevy_watch.migrate(), 1)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
     def test_missing_record_loads_as_none(self) -> None:
-        with upgrade_record.locked("demo"):
-            self.assertIsNone(upgrade_record.load("demo"))
+        with upgrade_record.locked(self.owner.id):
+            self.assertIsNone(upgrade_record.load(self.owner.id))
 
     def test_unique_module_names_load_with_shutdown_first_on_the_path(self) -> None:
         directory = Path(__file__).resolve().parent
@@ -102,7 +339,7 @@ class RecordTests(unittest.TestCase):
     def test_start_builds_the_specified_record_without_default_answers(self) -> None:
         started = self.begin()
         self.assertEqual(started, {
-            "slug": "demo", "production": str(self.production.doc), "checkout": str(self.production.checkout),
+            "staff_id": self.owner.id, "production": str(self.production.doc), "checkout": str(self.production.checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1"], "pins_read": NOW.isoformat(),
             "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,
@@ -116,24 +353,24 @@ class RecordTests(unittest.TestCase):
 
     def test_record_round_trips_through_json(self) -> None:
         started = self.begin()
-        with upgrade_record.locked("demo"):
-            self.assertEqual(upgrade_record.load("demo"), started)
-        raw: object = json.loads(upgrade_record.record_path("demo").read_text(encoding="utf-8"))  # pyright: ignore[reportAny]
+        with upgrade_record.locked(self.owner.id):
+            self.assertEqual(upgrade_record.load(self.owner.id), started)
+        raw: object = json.loads(upgrade_record.record_path(self.owner.id).read_text(encoding="utf-8"))  # pyright: ignore[reportAny]
         self.assertEqual(raw, started)
-        self.assertEqual(list(upgrade_record.state_dir().glob("*.json")), [upgrade_record.record_path("demo")])
+        self.assertEqual(list(upgrade_record.state_dir().glob("*.json")), [upgrade_record.record_path(self.owner.id)])
 
     def test_unreadable_record_refuses_with_its_path(self) -> None:
         for content in (b"{bad json", b"\xff"):
-            with self.subTest(content=content), upgrade_record.locked("demo"):
-                path = upgrade_record.record_path("demo")
+            with self.subTest(content=content), upgrade_record.locked(self.owner.id):
+                path = upgrade_record.record_path(self.owner.id)
                 _ = path.write_bytes(content)
                 with self.assertRaises(upgrade_record.RecordFailure) as caught:
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
                 self.assertIn(str(path), str(caught.exception))
 
     def test_locked_holds_an_exclusive_flock_and_releases_it(self) -> None:
-        with upgrade_record.locked("demo"):
-            lock_path = upgrade_record.state_dir() / "demo.lock"
+        with upgrade_record.locked(self.owner.id):
+            lock_path = upgrade_record.state_dir() / f"{self.owner.id}.lock"
             self.assertTrue(lock_path.is_file())
             with lock_path.open("a") as competitor:
                 with self.assertRaises(BlockingIOError):
@@ -144,20 +381,20 @@ class RecordTests(unittest.TestCase):
 
     def test_failed_atomic_replace_keeps_the_previous_record(self) -> None:
         started = self.begin()
-        old_contents = upgrade_record.record_path("demo").read_bytes()
+        old_contents = upgrade_record.record_path(self.owner.id).read_bytes()
         updated = upgrade_record.set_note(started, "alpha", "new note")
-        with upgrade_record.locked("demo"), mock.patch("os.replace", side_effect=OSError("replace failed")):
+        with upgrade_record.locked(self.owner.id), mock.patch("os.replace", side_effect=OSError("replace failed")):
             with self.assertRaises((OSError, upgrade_record.RecordFailure)):
                 upgrade_record.save(updated)
-        self.assertEqual(upgrade_record.record_path("demo").read_bytes(), old_contents)
+        self.assertEqual(upgrade_record.record_path(self.owner.id).read_bytes(), old_contents)
 
     def test_locked_propagates_the_callers_oserror_and_releases_the_lock(self) -> None:
         failure = OSError("caller operation failed")
         with self.assertRaises(OSError) as caught:
-            with upgrade_record.locked("demo"):
+            with upgrade_record.locked(self.owner.id):
                 raise failure
         self.assertIs(caught.exception, failure)
-        with (upgrade_record.state_dir() / "demo.lock").open("a") as competitor:
+        with (upgrade_record.state_dir() / f"{self.owner.id}.lock").open("a") as competitor:
             fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(competitor, fcntl.LOCK_UN)
 
@@ -165,13 +402,13 @@ class RecordTests(unittest.TestCase):
         for operation in ("pathlib.Path.open", "fcntl.flock"):
             with self.subTest(operation=operation), mock.patch(operation, side_effect=OSError("lock failed")):
                 with self.assertRaises(upgrade_record.RecordFailure) as caught:
-                    with upgrade_record.locked("demo"):
+                    with upgrade_record.locked(self.owner.id):
                         self.fail("lock acquisition should have failed")
-            self.assertEqual(str(caught.exception), f"{self.root / 'state/demo.lock'}: lock failed")
+            self.assertEqual(str(caught.exception), f"{self.root / 'state' / f'{self.owner.id}.lock'}: lock failed")
 
     def test_same_target_start_refreshes_pins_and_keeps_answers_and_notes(self) -> None:
         started = self.begin()
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             started = upgrade_record.set_answer(started, "alpha", "approved", "use this crate", "2026-10-12")
             started = upgrade_record.set_note(started, "alpha", "keep the local fix")
             upgrade_record.save(started)
@@ -188,30 +425,30 @@ class RecordTests(unittest.TestCase):
 
     def test_a_second_open_target_is_refused_without_changing_the_record(self) -> None:
         started = self.begin()
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             with self.assertRaises(upgrade_record.RecordFailure) as caught:
                 _ = upgrade_record.start(self.production, "0.21", self.current_pins, LATER)
             self.assertEqual(str(caught.exception), "a watch for 0.20 is open; stop it first")
-            self.assertEqual(upgrade_record.load("demo"), started)
+            self.assertEqual(upgrade_record.load(self.owner.id), started)
 
     def test_start_refuses_targets_other_than_major_minor(self) -> None:
         for target in ("", "0", "0.20.0", "v0.20", "0.20-rc.1", " 0.20", "0.20\n"):
-            with self.subTest(target=target), upgrade_record.locked("demo"):
+            with self.subTest(target=target), upgrade_record.locked(self.owner.id):
                 with self.assertRaises(upgrade_record.RecordFailure) as caught:
                     _ = upgrade_record.start(self.production, target, self.current_pins, NOW)
                 self.assertEqual(str(caught.exception), "target must be major.minor, such as 0.20")
-                self.assertIsNone(upgrade_record.load("demo"))
+                self.assertIsNone(upgrade_record.load(self.owner.id))
 
     def test_start_archives_a_closed_watch_and_resets_answers_and_notes(self) -> None:
         old = self.begin()
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             old = upgrade_record.set_answer(old, "alpha", "declined", "stay on releases", "2026-10-12")
             old = upgrade_record.set_note(old, "alpha", "old upgrade note")
             old["closed"] = LATER.isoformat()
             upgrade_record.save(old)
             fresh = upgrade_record.start(self.production, "0.21", self.current_pins, LATER)
             upgrade_record.save(fresh)
-        archive = upgrade_record.state_dir() / "demo.0.20.closed.json"
+        archive = upgrade_record.state_dir() / f"{self.owner.id}.0.20.closed.json"
         archived: object = json.loads(archive.read_text(encoding="utf-8"))  # pyright: ignore[reportAny]
         self.assertEqual(archived, old)
         self.assertEqual(fresh["target"], "0.21")
@@ -319,9 +556,9 @@ class RecordTests(unittest.TestCase):
         for value in dependencies.values():
             _ = value.pop("crates_io")
             _ = value.pop("error")
-        with upgrade_record.locked("demo"):
-            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
-            loaded = upgrade_record.load("demo")
+        with upgrade_record.locked(self.owner.id):
+            _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
+            loaded = upgrade_record.load(self.owner.id)
         self.assertEqual(loaded, current)
 
     def test_valid_added_fields_round_trip_for_every_target_variant(self) -> None:
@@ -339,10 +576,10 @@ class RecordTests(unittest.TestCase):
         }
         current["dependencies"]["alpha"]["error"] = "crates.io: HTTP 503"
         for target in targets:
-            with self.subTest(target=target), upgrade_record.locked("demo"):
+            with self.subTest(target=target), upgrade_record.locked(self.owner.id):
                 current["target_bevy"] = target
                 upgrade_record.save(current)
-                self.assertEqual(upgrade_record.load("demo"), current)
+                self.assertEqual(upgrade_record.load(self.owner.id), current)
 
     def test_load_validates_each_added_record_field_and_target_variant(self) -> None:
         current = self.begin()
@@ -354,12 +591,12 @@ class RecordTests(unittest.TestCase):
             ("target_bevy", {"status": "released", "version": 1, "date": "2026-10-12", "since": "2026-10-01"}),
         )
         for field, value in cases:
-            with self.subTest(field=field, value=value), upgrade_record.locked("demo"):
+            with self.subTest(field=field, value=value), upgrade_record.locked(self.owner.id):
                 raw = cast(dict[str, object], json.loads(json.dumps(current)))
                 raw[field] = value
-                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
                 with self.assertRaises(upgrade_record.RecordFailure):
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
 
     def test_load_validates_each_added_entry_field_and_read_fact(self) -> None:
         current = self.begin()
@@ -379,13 +616,13 @@ class RecordTests(unittest.TestCase):
         del incomplete["ready"]
         cases.append(("crates_io", incomplete))
         for field, value in cases:
-            with self.subTest(field=field, value=value), upgrade_record.locked("demo"):
+            with self.subTest(field=field, value=value), upgrade_record.locked(self.owner.id):
                 raw = cast(dict[str, object], json.loads(json.dumps(current)))
                 dependencies = cast(dict[str, dict[str, object]], raw["dependencies"])
                 dependencies["alpha"][field] = value
-                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
                 with self.assertRaises(upgrade_record.RecordFailure):
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
 
     def test_apply_pins_retains_facts_errors_and_record_check_times(self) -> None:
         current = self.begin()
@@ -414,9 +651,9 @@ class RecordTests(unittest.TestCase):
         for value in cast(dict[str, dict[str, object]], raw["dependencies"]).values():
             del value["branch"]
             del value["items"]
-        with upgrade_record.locked("demo"):
-            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
-            self.assertEqual(upgrade_record.load("demo"), current)
+        with upgrade_record.locked(self.owner.id):
+            _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(upgrade_record.load(self.owner.id), current)
 
     def test_unlisted_crate_branch_and_items_round_trip_and_survive_pin_refresh(self) -> None:
         current = self.begin()
@@ -430,9 +667,9 @@ class RecordTests(unittest.TestCase):
             {"number": 8, "kind": "issue", "state": "closed", "title": "Track 0.20",
              "updated": NOW.isoformat(), "head": ""},
         ]
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             upgrade_record.save(current)
-            self.assertEqual(upgrade_record.load("demo"), current)
+            self.assertEqual(upgrade_record.load(self.owner.id), current)
         branch, items, facts = value["branch"], value["items"], value["crates_io"]
         merged = upgrade_record.apply_pins(current, self.current_pins, LATER)
         self.assertEqual(merged["dependencies"]["alpha"]["branch"], branch)
@@ -478,13 +715,13 @@ class RecordTests(unittest.TestCase):
             invalid[key] = wrong
             cases.append(("crates_io", invalid))
         for field, invalid in cases:
-            with self.subTest(field=field, invalid=invalid), upgrade_record.locked("demo"):
+            with self.subTest(field=field, invalid=invalid), upgrade_record.locked(self.owner.id):
                 raw = cast(dict[str, object], json.loads(json.dumps(current)))
                 values = cast(dict[str, dict[str, object]], raw["dependencies"])
                 values["alpha"][field] = invalid
-                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
                 with self.assertRaises(upgrade_record.RecordFailure):
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
 
     def test_read_branch_without_repository_is_refused(self) -> None:
         current = self.begin()
@@ -492,27 +729,27 @@ class RecordTests(unittest.TestCase):
         values = cast(dict[str, dict[str, object]], raw["dependencies"])
         values["alpha"]["branch"] = {"status": "read", "name": "main", "rev": "abcdef",
                                      "committed": "2026-10-12", "requirement": "^0.20"}
-        with upgrade_record.locked("demo"):
-            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+        with upgrade_record.locked(self.owner.id):
+            _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
             with self.assertRaises(upgrade_record.RecordFailure):
-                _ = upgrade_record.load("demo")
+                _ = upgrade_record.load(self.owner.id)
 
 
     def test_load_adds_unannounced_baseline_to_previous_phase_record(self) -> None:
         current = self.begin()
         raw = cast(dict[str, object], json.loads(json.dumps(current)))
         del raw["announced"]
-        with upgrade_record.locked("demo"):
-            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
-            self.assertEqual(upgrade_record.load("demo"), current)
+        with upgrade_record.locked(self.owner.id):
+            _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(upgrade_record.load(self.owner.id), current)
 
     def test_announced_round_trips_and_pin_refresh_keeps_what_was_told(self) -> None:
         current = self.begin()
         current["announced"] = {"alpha": {"state": "port in PR", "repository": "owner/adapter",
                                             "items": {"7": "open", "8": "closed"}}}
-        with upgrade_record.locked("demo"):
+        with upgrade_record.locked(self.owner.id):
             upgrade_record.save(current)
-            self.assertEqual(upgrade_record.load("demo"), current)
+            self.assertEqual(upgrade_record.load(self.owner.id), current)
         merged = upgrade_record.apply_pins(current, self.current_pins, LATER)
         self.assertEqual(merged["announced"], current["announced"])
 
@@ -526,12 +763,12 @@ class RecordTests(unittest.TestCase):
             {"alpha": {"state": "done", "repository": "", "items": {"7": 1}}},
         )
         for invalid in cases:
-            with self.subTest(value=invalid), upgrade_record.locked("demo"):
+            with self.subTest(value=invalid), upgrade_record.locked(self.owner.id):
                 raw = cast(dict[str, object], json.loads(json.dumps(current)))
                 raw["announced"] = invalid
-                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                _ = upgrade_record.record_path(self.owner.id).write_text(json.dumps(raw), encoding="utf-8")
                 with self.assertRaises(upgrade_record.RecordFailure):
-                    _ = upgrade_record.load("demo")
+                    _ = upgrade_record.load(self.owner.id)
 
 
 if __name__ == "__main__":

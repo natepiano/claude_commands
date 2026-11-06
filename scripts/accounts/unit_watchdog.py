@@ -157,7 +157,7 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
     for member in staff.active(record, "unit"):
         if not isinstance(member.worktree, staff.PresentWorktree) or member.worktree.machine != local_machine():
             continue
-        parent = record.by_id(member.parent) if member.parent is not None else None
+        parent = record.parent_of(member)
         production = parent.name if parent is not None else ""
         try:
             entry = pane_record.launch_for_session(member.current_session)
@@ -229,12 +229,12 @@ def _start_recovery(source: RecoverySource, job: RecoveryJob, timeout: float) ->
 
 
 @herdr.process_action()
-def _fresh_units() -> unit_lookup.MarkedProductions:
-    return unit_lookup.every_marked_unit()
+def _fresh_units() -> unit_lookup.LabeledProductions:
+    return unit_lookup.every_labeled_session()
 
 
 # Recovery decisions share one fresh observation, independent of earlier reports.
-_recovery_observations: ContextVar[Callable[[], unit_lookup.MarkedProductions]] = ContextVar(
+_recovery_observations: ContextVar[Callable[[], unit_lookup.LabeledProductions]] = ContextVar(
     "watchdog_recovery_observations", default=_fresh_units)
 
 
@@ -301,8 +301,8 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
         observed_at = time.time()
 
         @cache
-        def unit_observations() -> unit_lookup.MarkedProductions:
-            return unit_lookup.every_marked_unit()
+        def unit_observations() -> unit_lookup.LabeledProductions:
+            return unit_lookup.every_labeled_session()
 
         retained = dict(state)
         for runner in runners:

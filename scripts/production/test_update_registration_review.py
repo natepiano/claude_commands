@@ -14,6 +14,7 @@ from typing import cast
 from unittest import mock
 
 from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, dailies_render, read_production, review
+from scripts.production.cli_fixture import production_paths
 import showrunner_tree
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
@@ -135,10 +136,14 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn(unavailable, output.getvalue())
         self.assertIn("Reminder", output.getvalue())
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
-        with mock.patch.dict(os.environ, self.env):
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(full.split()), questions)
             _ = self.run_questions(self.question_state([]))
-            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+            questions = review.registered_questions(cutoff)
+            assert isinstance(questions, list)
+            self.assertIn(" ".join(full.split()), questions)
 
     def test_blank_reviewer_rewrite_stores_original_as_review_unavailable(self) -> None:
         question = "Retry build 42?"

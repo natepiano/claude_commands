@@ -9,7 +9,7 @@ import shutil
 import sys
 import subprocess
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 import unittest
 from unittest import mock
 
@@ -27,6 +27,29 @@ class ControlTests(ControlFixture):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.publications: list[remote.AdmissionEnvelope] = []
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = (self.state / 'deployment.json').write_text(json.dumps({
+            'region': 'us-east-1', 'stack': 'fixture-build', 'outputs': {'InstanceId': 'i-fixture'}}))
+
+    def test_controller_uses_saved_identity_and_ignores_the_old_config_identity(self) -> None:
+        self.replace('instance_id', 'i-unrelated')
+        self.assertEqual(self.controller().start().state, 'starting')
+        instances = [words for words in self.aws.calls if 'describe-instances' in words]
+        self.assertTrue(instances)
+        self.assertTrue(all(words[words.index('--instance-ids') + 1] == 'i-fixture' for words in instances))
+
+    def test_controller_refuses_a_region_change_before_an_aws_call(self) -> None:
+        self.replace('region', 'us-east-2')
+        self.assertEqual(self.controller().start().state, 'refused')
+        self.assertEqual(self.aws.calls, [])
+
+    def test_controller_refuses_a_missing_saved_identity_before_an_aws_call(self) -> None:
+        (self.state / 'deployment.json').unlink()
+        self.assertEqual(self.controller().start().state, 'refused')
+        self.assertEqual(self.aws.calls, [])
 
     def publish(self, envelope: remote.AdmissionEnvelope) -> bool:
         self.publications.append(envelope)

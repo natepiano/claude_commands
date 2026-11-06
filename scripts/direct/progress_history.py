@@ -33,7 +33,7 @@ from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import models_registry, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production import production_doc, session_staff, showrunners, staff  # noqa: E402
+from scripts.production import production_doc, session_staff, showrunners, staff, unit_config  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 
 
@@ -415,7 +415,7 @@ def set_unit(session_dir: Path, production: str, unit: str) -> None:
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         state = _read_state(session_dir)
-        state.update({"production": production, "unit": unit})
+        _set_owner(state, production, unit)
         _write_state(session_dir, state)
 
 
@@ -426,8 +426,28 @@ def _set_unit(args: argparse.Namespace) -> None:
     if any(not value or value in (".", "..") or "/" in value or "\\" in value
            for value in (production, unit)):
         raise SystemExit("invalid production or unit identity")
-    state.update({"production": production, "unit": unit})
+    _set_owner(state, production, unit)
     _write_state(_session_dir(args), state)
+
+
+def _set_owner(state: dict[str, object], production: str, unit: str) -> None:
+    """Resolve the command's names once and store the fixed unit id."""
+    if state.get(unit_runs.OWNER_FIELD):
+        return
+    if state.get("production") and state.get("unit"):
+        state.update(production=production, unit=unit)
+        return
+    record = staff.initial_snapshot()
+    parents = {row.id for row in record.find(kind="showrunner")
+               if row.name == production or (isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
+                   and row.doc.path.name.removesuffix("-production.md") == production)}
+    matches = [row for row in record.find(kind="unit")
+               if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents and row.name.removesuffix("-unit") == unit.removesuffix("-unit")]
+    if len(matches) != 1:
+        raise ValueError(f"{production}/{unit}: no unique unit staff row")
+    state[unit_runs.OWNER_FIELD] = matches[0].id
+    _ = state.pop("production", None)
+    _ = state.pop("unit", None)
 
 
 def _state_path(session_dir: Path) -> Path:
@@ -436,20 +456,16 @@ def _state_path(session_dir: Path) -> Path:
 
 def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> dict[str, object]:
     """Omit folder copies from state, events, and nested wait attribution."""
-    identity = _object_dict(fields.get("main_agent")) or {}
-    session_id = _string(identity.get("session_id")) or _string(fields.get("owner_session"))
-    if not unit_owned and session_id:
-        record = staff.initial_snapshot()
-        row = record.by_member_reference(session_id)
-        if row is not None and row.kind == "worker":
-            row = record.by_id(row.parent) if row.parent else None
-        unit_owned = row is not None and row.kind == "unit"
+    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
+        return dict(fields)
+    if not unit_owned and (fields.get(unit_runs.OWNER_FIELD) or fields.get("main_agent") or fields.get("owner_session")):
+        unit_owned = isinstance(unit_runs.run_owner(fields, staff.initial_snapshot()), staff.StaffRow)
     result: dict[str, object] = {}
     directory = _string(fields.get("working_dir"))
     for key, value in fields.items():
         if unit_owned and key in ("working_dir", "worktree"):
             continue
-        if unit_owned and key in ("plan_doc", "project_plan_doc") and isinstance(value, str) and directory and value.startswith(directory + "/"):
+        if key in ("plan_doc", "project_plan_doc") and isinstance(value, str) and directory and value.startswith(directory + "/"):
             value = str(Path(value).relative_to(directory))
         if isinstance(value, dict):
             value = _stored_fields(cast(dict[str, object], value), unit_owned=unit_owned)
@@ -483,7 +499,11 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
         prefix=f".{plan_history.STATE_FILENAME}.",
         delete=False,
     ) as handle:
-        json.dump(_stored_fields(state), handle, indent=2, sort_keys=True)
+        stored = _stored_fields(state)
+        if state.get(unit_runs.OWNER_FIELD) and state.get("status") == "active":
+            for key in ("production", "unit", "branch"):
+                _ = stored.pop(key, None)
+        json.dump(stored, handle, indent=2, sort_keys=True)
         _ = handle.write("\n")
         temporary = Path(handle.name)
     os.replace(temporary, target)
@@ -497,7 +517,7 @@ SESSION_ROOTS = tuple(
 
 
 def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: str) -> bool:
-    if fields.get("working_dir") not in (str(old), str(new)):
+    if fields.get("status") != "active" or fields.get("working_dir") not in (str(old), str(new)):
         return False
     fields["branch"] = new_branch
     fields.update(_stored_fields(fields))
@@ -508,17 +528,8 @@ def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: s
 
 
 def move_run(history_file: Path, old: Path, new: Path, new_branch: str) -> list[Path]:
-    """Remove legacy folder copies when an older caller requests relocation."""
-    lines: list[str] = []
-    for line in history_file.read_text(encoding="utf-8").splitlines(keepends=True):
-        event = _json_object(line)
-        if event is not None and _moved_fields(event, old, new, new_branch):
-            line = json.dumps(event, separators=(",", ":")) + "\n"
-        lines.append(line)
-    temporary = history_file.with_name(f".{history_file.name}.move")
-    _ = temporary.write_text("".join(lines), encoding="utf-8")
-    os.replace(temporary, history_file)
-    moved = [history_file]
+    """Remove active state folder copies. Keep recorded history unchanged."""
+    moved: list[Path] = []
     for root in SESSION_ROOTS:
         for path in root.glob(f"*/{plan_history.STATE_FILENAME}"):
             try:
@@ -1200,6 +1211,8 @@ def _event(
         "project_plan_doc": _string(state.get("project_plan_doc")),
         "main_agent": state.get("main_agent", {}),
     }
+    if state.get(unit_runs.OWNER_FIELD):
+        event[unit_runs.OWNER_FIELD] = state[unit_runs.OWNER_FIELD]
     # An event that names its phase is that phase's own record, so the pass or
     # activity running in another phase does not belong on it.
     current_pass = pass_record
@@ -1368,7 +1381,8 @@ def _start_run(args: argparse.Namespace) -> None:
         raise SystemExit(
             "Unable to detect the unit director's model and effort; pass explicit --main-* values"
         )
-    current = plan_history.staff_directory({"main_agent": main_agent}, staff.initial_snapshot())
+    record = staff.initial_snapshot()
+    current = plan_history.staff_directory({"main_agent": main_agent}, record)
     working_dir_value = _string(current.get("working_dir")) or working_dir_value
     working_dir = Path(working_dir_value).expanduser().resolve()
     now = plan_history.now_epoch()
@@ -1378,6 +1392,10 @@ def _start_run(args: argparse.Namespace) -> None:
         short_hash = _git_value(working_dir, "rev-parse", "--short", "HEAD")
         branch = f"detached@{short_hash or 'unknown'}"
     plan_doc = _arg_string(args, "plan_doc")
+    member = record.by_member_reference(main_agent["session_id"])
+    if plan_doc and member is not None and member.kind == "unit":
+        plan = plan_history.resolve_plan_path(working_dir, plan_doc).relative_to(working_dir)
+        unit_config.set_plan(working_dir, plan)
     project_timing = _resolve_project_timing(working_dir, branch, plan_doc, now)
     history_file = plan_history.history_root() / "runs" / f"{run_id}.jsonl"
     state: dict[str, object] = {
@@ -1405,6 +1423,9 @@ def _start_run(args: argparse.Namespace) -> None:
         "pending_calibration": None,
         "status": "active",
     }
+    owner = unit_runs.run_owner(state, record)
+    if isinstance(owner, staff.StaffRow):
+        state[unit_runs.OWNER_FIELD] = owner.id
     _write_state(session_dir, state)
     _append_event(state, _event(state, "run_started", now))
     print(history_file)
@@ -1456,11 +1477,10 @@ def _start_phase(args: argparse.Namespace) -> None:
         if same_title and same_start:
             return
         worktree = phase_reservation.phase_worktree(phase_dir)
-        if isinstance(worktree, phase_reservation.KnownPhaseWorktree):
-            root = phase_reservation.repository_root(Path.cwd())
-            if root is not None and root.resolve() != worktree.root.resolve():
-                raise SystemExit(f"Phase {phase_id} is already open in {worktree.root}; "
-                                 + f"finish it before restarting in {root}.")
+        root = phase_reservation.repository_root(Path.cwd())
+        if root is not None and root.resolve() != worktree.root.resolve():
+            raise SystemExit(f"Phase {phase_id} is already open in {worktree.root}; "
+                             + f"finish it before restarting in {root}.")
         return
     # The phase count reads the plan's headings, so a phase the plan lacks makes
     # every later report disagree with its own phase number.
@@ -1780,6 +1800,7 @@ def _arm_review(args: argparse.Namespace) -> None:
     called_task = _arg_string(args, "called_task", "direct.review") or "direct.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
+    worker = _arg_string(args, "worker") or "review"
     # `review.sh --phase` writes its files in the phase's directory, so the marker names the same one.
     artifact_dir = phase_reservation.phase_directory(session_dir, phase_id) if phase_id else session_dir
     armed: dict[str, object] = {
@@ -1790,11 +1811,9 @@ def _arm_review(args: argparse.Namespace) -> None:
         "started_at": now,
         "called_task": called_task,
         "called_agent": _resolve_worker_agent(called_task),
-        # `review.sh` suffixes both files with its lens, so an armed reviewer
-        # must name the same pair the launcher it precedes will write. Empty is
-        # the single-reviewer layout and the unsuffixed names.
-        "status_file": str(artifact_dir / f"review_status{suffix}"),
-        "pid_file": str(artifact_dir / f"review_pid{suffix}"),
+        # Named reviewers use their worker prefix. Legacy reviewers use review.
+        "status_file": str(artifact_dir / f"{worker}_status{suffix}"),
+        "pid_file": str(artifact_dir / f"{worker}_pid{suffix}"),
         "status": "armed",
     }
     state[ARMED_REVIEW_KEY] = armed
@@ -4119,12 +4138,11 @@ class NoReportedWindow:
 
 
 def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
-    """The run's plan counted by phase heading, unavailable without an absolute path."""
+    """Count phase headings after resolving the plan against the run folder."""
     plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
     if plan_doc:
-        candidate = Path(plan_doc).expanduser()
-        if candidate.is_absolute():
-            return _with_unlisted_phase(_count_plan_phases(candidate), state, candidate.resolve())
+        candidate = plan_history.resolve_plan_path(Path(_string(state.get("working_dir"))), plan_doc)
+        return _with_unlisted_phase(_count_plan_phases(candidate), state, candidate)
     return {"available": False, "reason": "no plan doc"}
 
 
@@ -4273,8 +4291,6 @@ def _project_chain_eta(
     except phase_table.NoPlan:
         return "—", "—", "—"
     finish = record.plan_finish
-    if isinstance(finish, phase_table.GateBlockedFinish):
-        return f"after {finish.gate}", "—", "—"
     if not isinstance(finish, phase_table.FinishedAt | phase_table.PredictedFinish):
         return "—", "—", "—"
     target = finish.at.timestamp()
@@ -4322,12 +4338,6 @@ def _phase_eta_line(session_dir: Path, phase_number: str) -> str:
     for row in candidates:
         if row.phase != phase_number:
             continue
-        if isinstance(row, phase_table.TodoPhase):
-            gate = row.gate
-            if isinstance(gate, phase_table.TimedGate) and gate.until.timestamp() > now:
-                return f"gated until {gate.until.astimezone(zone):%a %d %b %H:%M}"
-            if isinstance(gate, phase_table.UntimedGate):
-                return f"gated by {gate.gate}: {gate.waits_on}"
         if not row.eta_trail:
             return "ETA unavailable"
         target = row.eta_trail[-1][0]
@@ -5071,7 +5081,7 @@ class ProductionNotRecorded:
 def resolve_production_unit(state: Mapping[str, object], *, resolver: session_staff.RowResolver | None = None) -> ProductionUnitIdentity | ProductionNotRecorded:
     """Keep recorded history; resolve missing ownership from the current row."""
     production, unit = _string(state.get("production")), _string(state.get("unit"))
-    if production and unit:
+    if production and unit and not state.get(unit_runs.OWNER_FIELD):
         return ProductionUnitIdentity(production, unit)
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
@@ -5080,7 +5090,8 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
         main_agent = state.get("main_agent")
         if not identity and isinstance(main_agent, dict):
             identity = _string(cast(dict[str, object], main_agent).get("session_id"))
-        row = record.by_current_session(identity) if identity else None
+        owner = unit_runs.run_owner(state, record)
+        row = owner if isinstance(owner, staff.StaffRow) else (record.by_current_session(identity) if identity else None)
         if row is None:
             current = plan_history.staff_directory(dict(state), record)
             folder = _string(current.get("working_dir"))
@@ -5097,12 +5108,12 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
                 except (OSError, UnicodeError) as error:
                     return ProductionNotRecorded(f"phase plan cannot be read: {error}")
             return ProductionNotRecorded("the run has no matching unit staff row")
-        parent = record.by_id(row.parent) if row.parent is not None else None
+        parent = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
         timer = showrunners.timer_for(parent, record)
-        slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
-        return ProductionUnitIdentity(production or slug, unit or row.name)
+        slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else parent.name
+        return ProductionUnitIdentity(slug, row.name) if state.get(unit_runs.OWNER_FIELD) else ProductionUnitIdentity(production or slug, unit or row.name)
     except (OSError, ValueError) as error:
         return ProductionNotRecorded(str(error))
 
@@ -5238,11 +5249,12 @@ def resolve_worker_pass(session_dir: Path, state: dict[str, object],
     if not candidates:
         candidates = [_phase_identity(state, phase) for phase in phases if phase.get("status") == "active"]
     try:
-        roster = _json_object((session_dir / "mesh_roster.json").read_text(encoding="utf-8"))
+        roster = session_staff.read_worker_roster(session_dir / "mesh_roster.json")
     except (OSError, ValueError) as error:
         return UnresolvedWaitAttribution(f"worker roster unavailable: {error}", tuple(candidates))
-    names = [name for name, value in (roster or {}).items()
-             if thread_id and (_object_dict(value) or {}).get("thread_id") == thread_id]
+    membership = staff.local_snapshot()
+    names = [name for name, value in roster.items()
+             if thread_id and session_staff.worker_session(_object_dict(value) or {}, membership) == thread_id]
     if len(names) != 1:
         return UnresolvedWaitAttribution(f"worker thread has {len(names)} roster matches", tuple(candidates))
     matching = [candidate for candidate in candidates if candidate.get("worker_name") == names[0]]
@@ -5543,7 +5555,7 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         records = {item["sessionId"]: item for item in sessions.live_sessions()}
         for row in staff.active(resolver.record, "showrunner"):
             timer = showrunners.timer_for(row, resolver.record)
-            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
+            slug = timer.slug if isinstance(timer, showrunners.TimerRegistration) else row.name
             if slug == production and row.current_session in records:
                 return NamedSupplier("uds:" + records[row.current_session]["messagingSocketPath"])
         return NoNamedSupplier("showrunner has no current address")
@@ -5554,10 +5566,11 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         if not separator or run_id in ("", ".", "..") or "/" in name:
             return NoNamedSupplier("worker alias has no run and worker identity")
         threads: set[str] = set()
+        membership = staff.local_snapshot()
         for root in unit_runs.run_roots(os.environ.get("UNIT_RUN_ROOT")):
             try:
-                roster = _json_object((root / run_id / "mesh_roster.json").read_text(encoding="utf-8")) or {}
-                thread = _string((_object_dict(roster.get(name)) or {}).get("thread_id"))
+                roster = session_staff.read_worker_roster(root / run_id / "mesh_roster.json")
+                thread = session_staff.worker_session(_object_dict(roster.get(name)) or {}, membership)
                 if thread:
                     threads.add(thread)
             except (OSError, ValueError):
@@ -6496,6 +6509,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = arm_review.add_argument("--activity", required=True)
     _ = arm_review.add_argument("--called-task", default="direct.review")
     _ = arm_review.add_argument("--lens", default="")
+    _ = arm_review.add_argument("--worker", default="", help="the named assign.sh reviewer; omit for review.sh")
     _ = arm_review.add_argument("--phase-id", default="", help="the open phase the review belongs to, as review.sh --phase names it")
     arm_review.set_defaults(handler=_arm_review)
 
