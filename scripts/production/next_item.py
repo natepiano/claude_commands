@@ -37,7 +37,7 @@ import proposals_folder
 import proposals_table
 from footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
-from scripts.production import showrunners, staff
+from scripts.production import staff
 from scripts.production.production_doc import Refusal, read_production
 from update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
 
@@ -119,11 +119,11 @@ def read_queue(kind: str, production: Path | None, below: bool = False, *,
                 return Queue(urgency.scope_queue(proposals_table.queue(doc, record=record), below), _as_text(waiting, proposals_table.proposal_text))
             case "question":
                 doc = _doc(production)
-                owner = showrunners.owner_for(document_id(doc, record=record), record)
-                found = read_production(owner.name, record)
                 identities = QuestionStaff.read() if record is None else QuestionStaff.for_record(record)
+                owner = identities.owner(doc)
+                found = read_production(owner)
                 due = open_lists(found, below, identities=identities).due
-                return Queue(question_queue(found, below, identities=identities), _as_text(due, lambda entry: entry.item.line()))
+                return Queue(question_queue(found, below), _as_text(due, lambda entry: entry.item.line()))
             case _:
                 return efficiency_queue(_doc(production), below)
     except (change_review.ChangeReviewError, RegistrationFailure, Refusal, OSError, ValueError) as error:

@@ -43,7 +43,7 @@ import sessions
 import unit_runs
 import herdr
 from session_pane import HerdrFailure, read_place, type_place, where_place
-from scripts.production.production_doc import Production, Refusal, read_new_production, read_production
+from scripts.production.production_doc import Production, ProductionDocument, Refusal, read_new_production, read_production
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
 POLL_S = 0.5
@@ -53,7 +53,7 @@ class Promotion(NamedTuple):
     # The unit name comes from its staff row.
     unit: str
     parent: Production
-    child: Production
+    child: ProductionDocument
     marked: unit_lookup.LabeledSession
     claude: unit_lookup.LiveClaude
     worktree: Path
@@ -114,17 +114,16 @@ def checked(name: str, child_name: str, doc: Path, *,
     record = staff.snapshot() if record is None else record
     parent = read_production(parent_name, record=record)
     child = read_new_production(doc, child_name)
-    child_doc = child.doc
     pending = promotion_record(parent, name)
     if pending.exists():
         fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
-        if Path(fields["child_doc"]).resolve() != child_doc.expanduser().resolve():
+        if Path(fields["child_doc"]).resolve() != child.doc.expanduser().resolve():
             raise Refusal(f"{name} has an unfinished promotion to {fields['child_doc']}")
         owner = record.by_current_session(fields["session_id"])
         if owner is None:
             raise Refusal(f"{name}: no staff row for the saved promotion session")
         if (owner.kind == "showrunner" and isinstance(owner.worktree, staff.WorktreeUnfilled)
-                and owner.doc == staff.LiveDoc(remote.local_machine(), child_doc.expanduser().resolve())):
+                and owner.doc == staff.LiveDoc(remote.local_machine(), child.doc.expanduser().resolve())):
             # Promotion clears the location before child registration publishes it.
             worktree = Path(fields["worktree"])
         else:
@@ -295,10 +294,10 @@ def _main(argv: list[str]) -> int:
     except Refusal as refusal:
         print(f"promote_showrunner: {refusal}", file=sys.stderr)
         return 2
-    unit, production_name = promotion.unit, promotion.child.name
+    unit = promotion.unit
     if cast(bool, args.check):
         print(f"check: ok — would stop {unit} (herdr {promotion.marked.place.session}), resume it as the showrunner of "
-              + f"{production_name} in {promotion.worktree} under {promotion.parent.name}, and preserve its native row; {moved}")
+              + f"{promotion.child.name} in {promotion.worktree} under {promotion.parent.name}, and preserve its native row; {moved}")
         return 0
     old_member = staff_sources.member(staff_sources.UnitMember(promotion.parent.name, promotion.unit), record)
     parent_member = staff_sources.member(staff_sources.ShowrunnerMember(promotion.parent.name), record)
@@ -331,21 +330,20 @@ def _main(argv: list[str]) -> int:
               + f"`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read session {promotion.claude.session_id}`.")
         return 1
     native = staff.native_id(promotion.claude.session_id)
-    name = production_name
     document = staff.LiveDoc(remote.local_machine(), promotion.child.doc.resolve())
     retained = record.by_current_session(native)
     if (retained is not None and retained.kind == "showrunner"
-            and (retained.name, retained.parent, retained.doc) == (name, staff.ReportsTo(parent_row.id), document)):
+            and (retained.name, retained.parent, retained.doc) == (promotion.child.name, staff.ReportsTo(parent_row.id), document)):
         print("unchanged", file=sys.stderr)
         new_member = staff_sources.MemberFound(retained)
     else:
         new_member = staff_sources.MemberFound(staff.promote_unit(
-            retained.id if retained is not None else native, name=name, parent=parent_row.id, doc=document))
+            retained.id if retained is not None else native, name=promotion.child.name, parent=parent_row.id, doc=document))
     try:
         import showrunner_parent
-        showrunner_parent.save_notice(production_name, showrunner_parent.PendingParentNotice("attach", promotion.parent.name))
-        if was_pending and showrunners.current_name(production_name):
-            started = showrunners.main(["attach", production_name, promotion.parent.name])
+        showrunner_parent.save_notice(promotion.child.name, showrunner_parent.PendingParentNotice("attach", promotion.parent.name))
+        if was_pending and showrunners.current_name(promotion.child.name):
+            started = showrunners.main(["attach", promotion.child.name, promotion.parent.name])
         else:
             observed = sessions.session_liveness(promotion.claude.session_id) if was_pending else sessions.SessionNotLive()
             if isinstance(observed, sessions.SessionLivenessUnknown):
@@ -381,13 +379,13 @@ def _main(argv: list[str]) -> int:
 
 def finish(promotion: Promotion, started: int, moved: str) -> int:
     """Say what is still owed by a unit that now runs as the child's session."""
-    unit, production_name = promotion.unit, promotion.child.name
+    unit = promotion.unit
     if started == add_showrunner.SESSION_NOT_READY:
-        print(f"{unit} is open as the session {production_name}, but its showrunner prompt is not proven to have run. "
-              + f"Look at it with `{herdr.attach_hint(production_name, production_name)}`; unless it runs the production, type: "
+        print(f"{unit} is open as the session {promotion.child.name}, but its showrunner prompt is not proven to have run. "
+              + f"Look at it with `{herdr.attach_hint(promotion.child.name, promotion.child.name)}`; unless it runs the production, type: "
               + f"/showrunner:produce {promotion.child.doc} resume")
         return 1
-    print(f"{unit} is now the showrunner of {production_name}; {moved}")
+    print(f"{unit} is now the showrunner of {promotion.child.name}; {moved}")
     return started
 
 

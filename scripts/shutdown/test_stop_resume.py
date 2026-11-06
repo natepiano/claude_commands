@@ -449,6 +449,9 @@ class StopResumeTests(unittest.TestCase):
         return self.client_result(*arguments, deadline=deadline)
 
     def pane_run(self, *arguments: str) -> str:
+        if arguments == ("session", "list", "--json"):
+            return json.dumps({"sessions": [{"name": self.client.session, "running": True, "default": False,
+                "session_dir": str(self.root), "socket_path": str(self.root / "herdr.sock")}]})
         if arguments[:2] in (("pane", "rename"), ("tab", "rename")):
             for row in self.client.rows:
                 tab = str(row.get("tab_id", str(row["pane_id"]) + ":tab"))
@@ -659,7 +662,7 @@ class StopResumeTests(unittest.TestCase):
             return "w2:p3"
 
         with (patch.object(staff, "initial_snapshot", return_value=record) as snapshot,
-              patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
               patch.object(self.client, "open_tab", side_effect=open_tab)):
             result = stop_resume.resume(str(fixed), why="recovery")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -676,7 +679,7 @@ class StopResumeTests(unittest.TestCase):
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(identity, "showrunner", "row-name", staff.StaffRoot(), current_session=identity)
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))) as snapshot,
-              patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ()))):
+              patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(()))):
             result = stop_resume.resume(str(identity), why="recovery")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         self.assertEqual(self.client.rows[0]["label"], "row-name")
@@ -705,7 +708,7 @@ class StopResumeTests(unittest.TestCase):
                 state = self.root / case
                 with (patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}),
                       patch.object(staff, "initial_snapshot", return_value=record),
-                      patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+                      patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(())),
                       patch.object(self.client, "retitle", wraps=self.client.retitle) as retitle,
                       patch.object(self.client, "run", wraps=self.client.run) as commands,
                       patch.object(self.client, "order_tabs", return_value={}) as order,
