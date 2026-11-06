@@ -750,7 +750,7 @@ def down_alert() -> int:
             command = push_texts.user_send_argv(push_texts.render("alert.blocked",
                 sender="build-admission", title="Build queue service is down",
                 action=f"On natedev, run: {restart}",
-                body="No session is live to handle it. Builds wait until the service answers."))
+                body="The builds session did not take the message. Builds wait until the service answers."))
             scripts = Path(__file__).resolve().parents[1]
             command.extend(["--clears-when", shlex.join([str(scripts / "lib/py"), str(Path(__file__).resolve()), "view"])])
             phone_outcome = send(command)
