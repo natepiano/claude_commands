@@ -357,7 +357,7 @@ Superseded 2026-11-05 (sdlc showrunner). `review_pool.py` is gone from sdlc thro
 
 **Gotchas:** `~/.claude` main's `merge_gate.py` refuses a tree without `scripts/guilds` until this phase is on main; gate such a tree with its own `merge_gate.py`. `~/.local/state/guilds/` is removed only after this phase is on main.
 
-### Phase 13 — Our scripts are safe to run again after a stop  · status: todo
+### Phase 13 — Our scripts are safe to run again after a stop  · status: done
 **Depends on:** none. It restarts from sdlc 9ba842c60; the old wip 722b01ad3 on origin/sdlc-roles is reference only and is not merged (sdlc showrunner, 2026-11-05).
 
 #### Work Order
