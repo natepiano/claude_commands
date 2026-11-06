@@ -1080,41 +1080,23 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 49 — Every shell script starts Python through `scripts/lib/py`  · status: done
 **Depends on:** Phase 36
 
-#### Work Order
+#### As-built
 
-**Goal:** no shell script starts a bare `python3`, so a Mac with Apple's Python 3.9 first on PATH starts the right interpreter. The showrunner chose this sweep, 2026-11-05 (Phase 38 finding F006).
-
-**Spec:**
-1. The 17 starts: `berth_fix/capture.sh:44`; `berth_fix/launch.sh:44,69,82,101,116`; `bevy_migration_plan/bevy_migration_count_pattern.sh:48`; `direct/board.sh:173,230,287`; `lint/memory_gate.sh:21,124,148`; `production/mac_run.sh:74,96`; `statusline/statusline.sh:66,76`. Find the current line numbers with `git grep`. Also: `agents/test_agent_exec.sh` (7 starts), `agents/test_launcher_tasks.sh:28`, `lib/test_models_registry.sh:7`. `direct/verify.sh:259` and `rust_style/load-rust-style.sh:8` default `CLAUDE_PYTHON` to `python3`: change the default only if the readers can start it. Before the first edit, run the survey `git grep -nE '\bpython3\b' -- '*.sh'` again.
-2. Keep each start's arguments, stdin and exit status. Use the Phase 38 form, so a filename-only start and a symlink start still resolve the launcher.
-3. `statusline.sh` and `board.sh` start often. Measure the time of one start before and after, and put both numbers in the notice.
-4. Workers run `board.sh` in a sandbox, so run one `board.sh post` in a sandboxed worker before the checkpoint.
-5. A script on hold when this phase starts waits for the end of its hold.
-6. Add no ban check, guard or refusal (showrunner, 2026-11-05; user rule, 2026-11-05).
+- Every shell script and shell test starts Python through the adjacent `scripts/lib/py`, so a Mac with Apple's Python 3.9 first on PATH starts the right interpreter. Arguments, stdin and exit status of each start stay the same.
+- `board.sh` resolves its folder with `readlink -f`, so a filename-only start and a symlink start find the launcher. `memory_gate.sh` holds the launcher path in `BUILDLOG_MEM_PY`, so a relative source survives a directory change, and it has no bare-Python fallback.
+- `direct/verify.sh` and `rust_style/load-rust-style.sh` keep `export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"`. That line names a default value and starts nothing.
+- One start costs more on the launcher, same-load pairs: `board.sh read` 14.2 ms to 27.2 ms, `statusline.sh` 200.4 ms to 224.7 ms.
 
 **Files:**
-- `scripts/berth_fix/capture.sh`, `scripts/berth_fix/launch.sh`
-- `scripts/bevy_migration_plan/bevy_migration_count_pattern.sh`
-- `scripts/direct/board.sh`
-- `scripts/lint/memory_gate.sh` — tell the queue unit before the edit; it owns line 160
-- `scripts/production/mac_run.sh`
-- `scripts/statusline/statusline.sh`
-- `scripts/agents/test_agent_exec.sh`, `scripts/agents/test_launcher_tasks.sh`, `scripts/lib/test_models_registry.sh` — shell tests with starts
-- `scripts/direct/verify.sh`, `scripts/rust_style/load-rust-style.sh` — the `CLAUDE_PYTHON` default; tell the verify unit before the `verify.sh` edit
-- `scripts/mac_test/test_offload.py` — with any other test module that copies these scripts into a fixture
+- `scripts/berth_fix/capture.sh`, `scripts/berth_fix/launch.sh`, `scripts/bevy_migration_plan/bevy_migration_count_pattern.sh`, `scripts/direct/board.sh`, `scripts/lint/memory_gate.sh`, `scripts/production/mac_run.sh`, `scripts/statusline/statusline.sh` — start Python through the launcher
+- `scripts/agents/test_agent_exec.sh`, `scripts/agents/test_launcher_tasks.sh`, `scripts/lib/test_models_registry.sh` — shell tests start Python through the launcher
+- `scripts/production/test_mac_run.py`, `scripts/statusline/test_statusline.py`, `scripts/lint/test_memory_gate_wait.py`, `scripts/build_hold/test_hold_shortcut.py`, `scripts/direct/verify_lint_scope_test_support.py` — fixtures carry the launcher, a seeded interpreter cache or the tools it needs
 
-**Workers:** 1 writer on slot `impl3` (one rule across small files)
-- `impl3` — all files above
+**Binds later work:** A fixture that copies a script also needs `scripts/lib/py` and `seed_interpreter_cache`. A narrow-PATH fixture that starts `board.sh` needs `readlink`.
 
-**Constraints from prior phases:**
-- Phase 38: a test fixture that copies a script also needs `scripts/lib/py` and `seed_interpreter_cache`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:** Without `readlink`, `BOARD_DIR` becomes `.`, and the board request fails and retries for 60 s.
 
-**Acceptance gate:**
-- `git grep -nE '^[^#]*\bpython3\b'` on the listed files finds no start outside `scripts/lib/py`
-- each caller module of these scripts green in the gate form
-- the routes of each script on natedev and on the Mac, before and after, with the same exit status, in the notice
-- the full test green on the phase commit merged with `origin/builds`
+**Ruled out:** Starting the `CLAUDE_PYTHON` default through the launcher: the launcher must never receive its own path as `CLAUDE_PYTHON`. A ban check, by the showrunner's word and the user's rule against unasked checks.
 
 ### Phase 50 — One shared wait watches writes, and one file binds inotify  · status: done
 **Depends on:** Phase 43
