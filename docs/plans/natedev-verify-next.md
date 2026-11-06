@@ -43,16 +43,6 @@
 
 **Needed:** fix it in the next phase that touches that module, beside the `verify_hold_wait_test_support.py:327` flake fix.
 
-## Reuse the step-record state
-
-**Source:** natest, approved by builds 2026-11-05. Order: first of the three speed items here.
-
-**Today:** `step_state` (`verify.sh:412-415`) starts Python for each state publication, and the initial record write is at `verify.sh:1944-1954` (`scripts/direct/step_record.py`). `test_verify_lint_judgment.py` measured 3.6 s of process spans per no-repair run and 6.9 s per repair run.
-
-**Baseline:** `direct/test_verify_token_renew.py`: 225 step-record starts take 19.96 process s (natest). `direct/test_verify_lint_cache_versions.py` (natest Phase 45): 135.9 s wall, 94.0 CPU s; 29 `verify.sh lint` calls start `step_record.py` 486 times (23.1 CPU s) and `tree_watch.py` 155 times (7.8 CPU s). One interpreter per `verify.sh` call removes about 21.7 CPU s (natest estimate, not measured).
-
-**Needed:** reuse the state, for a gain of 1-2 s per `verify.sh` call. Put the measured before and after time in the notice, and tell the user the build cost change in one line.
-
 ## A callable repair decision
 
 **Source:** natest, approved by builds 2026-11-05. Order: second of the three speed items.
