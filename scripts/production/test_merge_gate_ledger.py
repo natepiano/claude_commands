@@ -9,7 +9,7 @@ import json
 import io
 import os
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -21,6 +21,11 @@ from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGat
 
 @final
 class MergeGateLedgerTests(MergeGateFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
+
     @gate_suites(*FIXTURE_FOLDERS)
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
         result = self.run_gate("--tests-only")
@@ -243,14 +248,13 @@ class MergeGateLedgerTests(MergeGateFixture):
         marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
-                def suite_run(repo: Path, memory_cap_mib: int, type_dirs: list[str], *, module_time_limit_s: float,
+                def suite_run(repo: Path, type_dirs: list[str], *, module_time_limit_s: float,
                               full: bool) -> merge_gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
                     self.assertTrue((repo / ".git/objects/info/alternates").is_file())
                     self.assertEqual(merge_gate.checked_git(repo, "rev-parse", "HEAD"), self.checkpoint)
                     self.assertEqual(merge_gate.checked_git(repo, "status", "--porcelain"), "")
                     self.assertTrue(full)
-                    self.assertGreater(memory_cap_mib, 0)
                     self.assertGreater(module_time_limit_s, 0)
                     self.assertEqual(type_dirs, ["scripts"])
                     self.write(repo / "subject.txt", "only the copy changes\n")

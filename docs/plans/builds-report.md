@@ -4,7 +4,6 @@
 
 > **As-built disposition: amend** — `docs/as-built/buildlog-memory-stalls.md` (report sections); `docs/as-built/build-followups.md` (rebuild bins and the clone-rebuild count)
 
-> **Production: builds** — unit `report-unit`; production doc `docs/plans/builds-production.md`
 ## Source
 
 2026-10-31 06:5x EDT (the showrunner, the user's request via sdlc)
@@ -595,3 +594,88 @@ Director decision: a record with no pair is unknown for both columns, old record
 - A test through `build_shape.recorded_output_roots` on an index built by `index.update()` proves that such a row adds no `(folder, folder)` pair.
 - `scripts.buildlog.test_index`, `test_step_row`, `test_record`, `test_disk` and `scripts.lint.test_build_shape` green with and without `PYTHONPATH`.
 - `basedpyright scripts/buildlog/index.py scripts/buildlog/test_index.py`: 0 errors, 0 warnings, 0 notes.
+
+### Phase 28 — A verify.sh step takes its output folders from verify.sh's Cargo metadata  · status: done
+
+#### As-built
+
+- `verify.sh` `set_gate_metadata` runs `cargo metadata --no-deps --format-version 1`, sets `GATE_METADATA` and exports `BUILDLOG_OUTPUT_ROOTS` from `step_context.py output-roots` (one line: `<evidence>\t<workspace_root>\t<target_directory>\t<build_directory>`, or empty). `load_metadata` calls it only when `GATE_METADATA` is empty, so a reuse of the saved metadata keeps the export of the real read.
+- `step_context.step_output_roots` reads the export first. When the step's `_output_evidence` equals the exported evidence, it returns the exported folders (resolved); else it reads `cargo metadata` as before. The user kept this folder-match check (2026-11-05).
+- `_output_evidence` hashes the resolved working folder, the `+toolchain` word, each `--manifest-path`/`--config`/`--target-dir` argument as written, the Cargo folder environment values, and the content of `Cargo.toml`, `rust-toolchain(.toml)` in each parent and `config`/`config.toml` in each Cargo config folder.
+- `cargo_output.cargo_metadata_output_roots(text)` is the one metadata decode; `cargo_target_config.cargo_config_folders(cwd, environment)` is the one Cargo config folder list.
+- Recorder CPU per verify.sh step on bevy_brp: terminal 157 → 119 ms, tee 157 → 118 ms.
+
+**Files:**
+- `scripts/buildlog/step_context.py` — evidence, the `output-roots` verb, the export read in `step_output_roots`.
+- `scripts/direct/verify.sh` — `set_gate_metadata` and the export.
+- `scripts/lib/cargo_output.py`, `scripts/lib/cargo_target_config.py` — the shared decode and folder list.
+- `scripts/buildlog/test_step_row.py` (`VerifyOutputEvidenceTests`), `scripts/direct/test_verify_python_starts.py`, `scripts/lib/test_cargo_output.py` — tests.
+
+**Gotchas:**
+- A step with `--manifest-path`, `--config` or `--target-dir` never matches the plain export and reads metadata.
+- Suite tests use a fake `cargo` with fixed answers: `merge_gate.py` puts a Cargo tripwire first on `PATH`. A fake that execs the installed cargo wrapper loops unless it removes its own folder from `PATH`.
+
+**Ruled out:**
+- Reading the test-path metadata without an export, and an export through a `verify_metadata.py` request: routed to verify-unit, which owns `verify.sh`.
+
+### Phase 29 — The Mac's hanadocs vault syncs both ways and asks a question only on a conflict  · status: todo
+**Depends on:** none (urgent, from the user via natedev and the builds showrunner, 2026-11-05)
+
+The Mac copy of `~/rust/hanadocs` stopped at 2026-11-04 17:58 EST, 233 commits behind. Obsidian on the Mac saved column widths in `home-base/vault map.base`, and the hourly fast-forward stops on any uncommitted change.
+
+From the user (via natedev and the showrunner), 2026-11-05: "hanadocs not working should just be an issue you raise as a question with me - it should not be a message sent via pushover." And: "we need a permanent fix for handling synchronization of hanadocs across mac and natedev." And: "it should be just an issue of managing merges and conflicts".
+
+Director decisions:
+- From natedev (not the user), 2026-11-05: design approved as written, with three notes. (a) When the Mac's main is not a fast-forward of GitHub's main, natedev merges it in the same run, with the same rules. (b) The first run commits the Mac's current change in `home-base/vault map.base`; that is the wanted result. (c) The conflict question names the files and says where the user acts (machine and session).
+- natedev merges in the object store (`git merge-tree --write-tree`, then `git commit-tree`), so no uncommitted edit in natedev's vault changes. `hanadocs-push` brings the result into natedev's main, as today.
+- natedev's `hanadocs-push` does not change.
+- From the builds showrunner (from natedev, not the user), 2026-11-05: change row C927 (the Mac's hanadocs vault updates itself each hour, ddf835c4) came back with the user's words "this is an issue that is happening right now". This phase closes it; no separate fix. The checkpoint carries a new Change-Review line for it.
+- The Mac needs no GitHub credentials: natedev carries the Mac's commits to GitHub.
+- From natedev (not the user), 2026-11-05: a good run clears the question with a separate `withdraw` verb that sdlc adds to `update_registration.py`. Do not import its internals; file with the public `ask` command. If this phase lands before `withdraw` is on main, leave the clear out; natedev clears the question by hand until then.
+
+#### Work Order
+
+**Goal:** Each hour, the Mac commits its local vault changes and merges natedev's copy of GitHub's main. natedev carries the Mac's main to GitHub. Only a true conflict (or a Mac that is not on main, unreachable for 24 h, or an unknown git error) stops the sync. A stop files one question on natedev's open-questions list and sends no phone push. The next good run clears that question.
+
+**Spec:**
+- `scripts/buildlog/vault_pull.py`:
+  1. natedev pushes its `refs/remotes/origin/main` to the Mac's `refs/remotes/origin/main`, as today.
+  2. The ssh script on the Mac:
+     1. Stops with `branch` when the vault is not on main.
+     2. Runs `git add -A`. When the index differs from HEAD, it commits once with the message `vault: Mac edits`.
+     3. Runs `git merge --no-edit refs/remotes/origin/main` (a real merge, not `--ff-only`).
+     4. On a conflict, it reads `git diff --name-only --diff-filter=U`, runs `git merge --abort`, and prints the conflict outcome with the file names.
+     5. Keeps the `index.lock` retries (`vault.lock_retries`, `vault.lock_retry_delay_s`) for the commit and the merge.
+     6. Prints the merged count and the Mac's main commit in the `VAULT_OUTCOME=` marker.
+  3. natedev fetches the Mac's main into `refs/remotes/mac/main`. It then runs `git fetch origin main`, after `github-warm-status` exits 0.
+     - Cold credentials: one printed line, exit 0; the next hour tries again. No question.
+  4. When `mac/main` is already in `origin/main`: nothing to push.
+  5. When `mac/main` is a fast-forward of `origin/main`: push it to GitHub `main`.
+  6. Else: `git merge-tree --write-tree origin/main mac/main`. With no conflict, `git commit-tree` with both parents, then push that commit to GitHub `main`. A conflict stops with the file names, machine `natedev`.
+  7. A rejected push (GitHub moved) is not a stop: the next hour tries again.
+- Stop causes after this phase: `conflict` (files, machine), `not_on_main`, `mac_unreachable` (after 24 h), `vault_locked`, `command_failed`. Remove `tracked_files_changed`, `untracked_would_be_overwritten` and `history_diverged`.
+- A stop files one question with `python3 ~/.claude/scripts/production/update_registration.py ask --production ~/.claude/docs/plans/natedev-production.md --text <one line> --question <full text> --urgency soon`, run as a subprocess with a timeout. It is filed once per outage; the state file keeps that it was filed. A failed or held `ask` leaves it not filed, and the next hour tries again. The question names the cause, the files (for a conflict), the machine, where the user acts, and the choices.
+- A good run closes the outage. `withdraw` is not on main at dispatch (2026-11-05 12:50 EST), so the clear is left out; natedev clears the question by hand.
+- Remove the `vault.stopped` push: `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, its test in `scripts/notify/test_push_texts.py`, and the push call in `vault_pull.py`.
+- `scripts/buildlog/cli.py`: the usage line says the job syncs the Mac's vault.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py`, `scripts/buildlog/test_vault_pull.py`
+- `scripts/buildlog/cli.py`
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py`
+
+**Workers:** 1 writer owns all files.
+
+**State:** the vault state file (`store.root()/<STATE_NAME>`) keeps `last_good` and the open outage; `alerted` becomes `asked`. Read an old file with `alerted` as not asked.
+
+**Acceptance gate:**
+- Tests with real git repositories in a temporary folder (a GitHub bare repo, a natedev clone, a Mac clone; ssh replaced at the `run` boundary):
+  1. A Mac with an uncommitted tracked change and an untracked note: the run commits both, merges, and GitHub gets them.
+  2. Both sides changed different files: the run merges on the Mac or on natedev, and GitHub gets both.
+  3. Both sides changed the same lines: no commit is lost, the merge is aborted, one question is filed with the file names, and no push is sent.
+  4. A second stop in the same outage files no second question.
+  5. The next good run closes the outage; a later stop files a new question.
+  6. Not on main and Mac unreachable for 24 h each file one question; unreachable for less than 24 h files none.
+- `scripts.buildlog.test_vault_pull`, `scripts.notify.test_push_texts`, and each module that imports `vault_pull`, with and without `PYTHONPATH`.
+- `basedpyright` over each changed Python file: 0 errors, 0 warnings, 0 notes.
+- After landing: one `buildlog vault` run on natedev commits the Mac's `vault map.base` change and brings the Mac to GitHub's main.

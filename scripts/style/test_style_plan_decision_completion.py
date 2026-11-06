@@ -57,7 +57,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn(f"waiting {issue}: no longer approved\n", output)
         self.assertEqual([(held.finding_id, held.state) for held in self.ledger().proposal_findings(issue)],
                          [(finding.finding_id, style_ledger.Filed(issue))])
-        self.assertNotEqual(self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]["kind"], "proposal")
+        self.assertNotEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["kind"], "proposal")
         self.assertEqual(frontmatter(issue)["status"], ["open"])
 
     def test_decision_refill_after_a_merge_builds_only_the_unbuilt_findings(self) -> None:
@@ -72,13 +72,13 @@ class StylePlanTests(StylePlanFixture):
                               for path in self.sources[:2])
         with mock.patch.object(style_proposals, "proposal_command"):
             self.assertEqual(self.run_next()[0], 0)
-            first = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+            first = ledger.ticket_open(ticket_owner_id("names"))[0]
             self.assertEqual(sorted(first["finding_ids"]), sorted((applied.finding_id, unapplied.finding_id)))
             ledger.ticket_checkpoint(first["id"], self.tip)
             _ = ledger.ticket_merge(first["id"])
             code, _, errors = self.run_next()
         self.assertEqual(code, 0, errors)
-        second = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+        second = ledger.ticket_open(ticket_owner_id("names"))[0]
         self.assertNotEqual(second["id"], first["id"])
         self.assertEqual((second["kind"], second["files"], second["finding_ids"]),
                          ("proposal", [unapplied.path], [unapplied.finding_id]))
@@ -91,7 +91,7 @@ class StylePlanTests(StylePlanFixture):
         finding, = ledger.proposal_findings(issue)
         with mock.patch.object(style_proposals, "proposal_command"):
             self.assertEqual(self.run_next()[0], 0)
-        ticket = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+        ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [finding.finding_id]))
         ledger.ticket_checkpoint(ticket["id"], self.tip)
         self.assertEqual(ledger.ticket_merge(ticket["id"]),
@@ -118,7 +118,7 @@ class StylePlanTests(StylePlanFixture):
         reason = f"nothing left to build: {self.sources[1]} not in synced commit {self.tip}"
         self.assertIn(f"closed {issue}: {reason}\n", output)
         self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], [reason]))
-        self.assertEqual(style_proposals.approved_decisions(issue.parent, "names-unit"), ())
+        self.assertEqual(style_proposals.approved_decisions(issue.parent, "names"), ())
         # No build merged, so complete does not renumber; the refill that closed the decision does, once.
         self.assertEqual(renumbers, 1)
 
@@ -131,7 +131,7 @@ class StylePlanTests(StylePlanFixture):
                        for path in self.sources[:2])
         self.write(built.path, "pub enum Outcome { New }\n")
         self.commit_to_every_checkout()
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [built.path], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [built.path], [rule],
                           proposal=str(issue), finding_ids=(built.finding_id,))
         ledger.ticket_assign("1", "main")
         ledger.ticket_checkpoint("1", self.tip)
@@ -142,7 +142,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(code, 0, errors)
         self.assertIn(f"closed {issue}: built in 1\n", output)
         self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], ["built in 1"]))
-        self.assertEqual(style_proposals.approved_decisions(issue.parent, "names-unit"), ())
+        self.assertEqual(style_proposals.approved_decisions(issue.parent, "names"), ())
         # Complete renumbers for the merged build, and the refill that closed the decision renumbers once.
         self.assertEqual(renumbers, 2)
 
@@ -152,7 +152,7 @@ class StylePlanTests(StylePlanFixture):
         issue = self.approved_decision(rule, (self.sources[0],), "rename")
         ledger = self.ledger()
         finding = ledger.proposal_findings(issue)[0]
-        ledger.ticket_add("1", ticket_owner_id("names-unit"), "proposal", "names", "crates/alpha", [finding.path], [rule],
+        ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [finding.path], [rule],
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE tickets SET finding_ids='[]'")
@@ -162,8 +162,8 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(code, 0, errors)
         self.assertEqual(output.count("waiting 1: made before decisions; "
                                       + "drop it with style_ledger.py ticket drop, then run migrate\n"), 1)
-        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names-unit"))], ["1"])
-        opened = ledger.ticket_open(ticket_owner_id("names-unit"))[0]
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets(ticket_owner_id("names"))], ["1"])
+        opened = ledger.ticket_open(ticket_owner_id("names"))[0]
         self.assertNotEqual(opened["id"], "1")
         self.assertEqual(opened["finding_ids"], [finding.finding_id])
 
@@ -208,13 +208,13 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_plan, "write_phase", wraps=style_plan.write_phase) as write,
               mock.patch.object(style_proposals, "proposal_command") as command,
               mock.patch.object(style_proposals, "renumber") as renumber, redirect_stdout(output)):
-            result = style_plan._select_phase(ledger, ticket_owner_id("names-unit"), "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
+            result = style_plan._select_phase(ledger, ticket_owner_id("names"), "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
                                              self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip), family="names")
         self.assertIsInstance(result, style_plan.PhaseWritten)
         self.assertEqual(read_paths.call_count, len(decisions))
         self.assertIn(f"waiting names: {paths['structure']} has open types work\n", output.getvalue())
         self.assertIn(f"{paths['busy']} busy", output.getvalue())
-        ticket, = ledger.ticket_open(ticket_owner_id("names-unit"))
+        ticket, = ledger.ticket_open(ticket_owner_id("names"))
         selected = {first_finding.finding_id, later[0].finding_id, later[1].finding_id}
         self.assertEqual(set(ticket["finding_ids"]), selected)
         self.assertEqual(set(ticket["files"]), {paths["first"], paths["ready"], paths["judged_changed"]})

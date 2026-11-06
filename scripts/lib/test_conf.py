@@ -342,7 +342,7 @@ class ConfTests(unittest.TestCase):
 
     def test_configuration_import_does_not_load_decimal(self) -> None:
         result = subprocess.run(
-            [sys.executable, '-S', '-c',
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), '-S', '-c',
              "import sys; from scripts.lib import conf; print('decimal' in sys.modules)"],
             cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)

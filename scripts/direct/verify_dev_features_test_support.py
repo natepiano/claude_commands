@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.lint.memory_test_support import write_pressure_reading
 
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
@@ -31,9 +31,7 @@ def add_dev_features(root: Path, value: str = DEV_LIST) -> None:
 
 def isolate_verify_inputs(environment: dict[str, str], root: Path) -> None:
     """Keep interpreter discovery and host pressure outside feature assertions."""
-    cache = Path(environment["XDG_CACHE_HOME"]) / "claude" / cache_file_name()
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    _ = cache.write_text(sys.executable + "\n", encoding="utf-8")
+    seed_interpreter_cache(Path(environment["XDG_CACHE_HOME"]))
     _ = environment.pop("CLAUDE_PYTHON", None)
     pressure = root / "dev-feature-pressure"
     write_pressure_reading(pressure)

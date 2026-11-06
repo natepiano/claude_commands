@@ -100,7 +100,7 @@ def main() -> int:
     try:
         configuration = memory_admit.read_memory_config()
         need = configuration.program_first_peaks["cargo"]
-        required_free = need + memory_admit.resolve_admission_limits(configuration).reserve
+        required_free = need + configuration.policy.safety_bytes
     except conf.Unusable as error:
         print(str(error), file=sys.stderr)
         return 2

@@ -283,6 +283,7 @@ class Controller:
                 state = self._read()
                 api = AwsCli(settings.credentials_profile, settings.region, settings.aws_timeout_s, self.execute)
                 evidence = api.observe(settings.instance_id, now)
+                self._release(evidence)
                 previous_generation = state.get('permitted_generation')
                 state['instance_evidence'] = asdict(evidence)
                 unpublished = UnpublishedPermissionSince.read(state, evidence.generation, now)
@@ -296,12 +297,9 @@ class Controller:
                     return self._stop(api, state, evidence, 'recorded_stop_intent')
                 if action == 'stop':
                     if evidence.state in mac_test.RELEASE_STATES:
-                        self._release(evidence)
                         return self._save(state, ControlResult(evidence.state, 'manual_stop', now, evidence.generation))
                     return self._stop(api, state, evidence, 'manual_stop')
                 ledger.CostLedger(self.directory).observe(ledger.InstanceObservation(now, evidence.state, 'DescribeInstances'))
-                if evidence.state in mac_test.RELEASE_STATES:
-                    self._release(evidence)
                 try:
                     self._prices(api, settings, now)
                 except (AwsUnavailable, OSError, ValueError, KeyError, TypeError) as error:

@@ -6,15 +6,13 @@ Closed questions remain in their question folders.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production import staff, unit_lookup  # noqa: E402
-from scripts.production.store_owner import document_id, showrunner_id  # noqa: E402
+from scripts.production import showrunners, staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
@@ -25,30 +23,14 @@ if TYPE_CHECKING:
 
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
-# The state folder holds these shared folders beside each production's own; a slug never names one.
-SHARED = frozenset(("footers-off", "review-paused", "outstanding", "counts", "reports"))
-SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 class TidyRefused(Exception):
     pass
 
 
-def outstanding_path(slug: str, *, identities: QuestionStaff | None = None) -> Path:
-    if not SLUG.fullmatch(slug) or slug in SHARED:
-        raise TidyRefused(f"{slug!r} is not a production slug")
-    identity = showrunner_id(slug, record=identities.record if identities else None,
-                             sources=identities.sources if identities else None)
-    return STATE_DIR / "outstanding" / f"{identity}.json"
-
-
-def owned_paths(slug: str, *, identities: QuestionStaff | None = None) -> tuple[Path, ...]:
-    from update_registration import QuestionStaff
-
-    if not SLUG.fullmatch(slug) or slug in SHARED:
-        raise TidyRefused(f"{slug!r} is not a production slug")
-    identities = identities if identities is not None else QuestionStaff.read()
-    identity = showrunner_id(slug, record=identities.record, sources=identities.sources)
+def owned_paths(owner: staff.StaffRow) -> tuple[Path, ...]:
+    identity = owner.id
     return (STATE_DIR / "footers-off" / identity, STATE_DIR / "review-paused" / f"{identity}.json",
             STATE_DIR / "outstanding" / f"{identity}.answered.jsonl",
             STATE_DIR / "outstanding" / f"{identity}.history.jsonl",
@@ -65,15 +47,13 @@ def can_hold_questions(document: Path) -> bool:
     )
 
 
-def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
+def tidy(production_name: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
     """Close the production's questions and delete its state files."""
     from update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
 
-    if not SLUG.fullmatch(slug) or slug in SHARED:
-        raise TidyRefused(f"{slug!r} is not a production slug")
     identities = identities if identities is not None else QuestionStaff.read()
-    reference = identities.owner(document).id if document is not None else slug
-    paths = owned_paths(reference, identities=identities)
+    row = identities.owner(document) if document is not None else showrunners.owner_for(production_name, identities.record)
+    paths = owned_paths(row)
     if document is not None and can_hold_questions(document):
         try:
             folder = question_folder(document, identities)
@@ -84,11 +64,13 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
                     paths = (*paths[:-1], *(path for path in directory.iterdir() if path != folder.path))
         except staff.StaffRefused as error:
             raise TidyRefused(str(error)) from error
-    owners = {slug}
+    owners = {production_name}
     if document is not None:
         record = identities.record
         try:
-            owners.update(row.name for row in unit_lookup.doc_units(document, record))
+            for row in unit_lookup.doc_units(document, record):
+                owners.add(row.name)
+                owners.add(copies.unit_owner(row.name))
         except staff.StaffUnreadable:
             pass  # a production with no showrunner row has no units
     try:
@@ -108,23 +90,16 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
     return removed
 
 
-def wrapped_slug(doc: Path) -> str:
-    """The slug of a wrapped production with no update timer; anything else refuses."""
-    slug = doc.name.removesuffix("-production.md")
-    if slug == doc.name:
-        raise TidyRefused(f"{doc}: production doc name must end in -production.md")
-    if not SLUG.fullmatch(slug) or slug in SHARED:
-        raise TidyRefused(f"{slug!r} is not a production slug")
+def wrapped_owner(doc: Path, record: staff.StaffSnapshot) -> staff.StaffRow:
+    """Read the wrapped owner's staff name and require no update timer."""
+    owner = unit_lookup.doc_owner(doc, record)
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
     if not status.startswith(WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
-    record = staff.snapshot()
-    timers = [f"showrunner-{slug}"]
-    timers.append(f"showrunner-{document_id(doc, record=record)}")
-    if any((NOTIFIER_STATE_DIR / name).exists() for name in timers):
-        raise TidyRefused(f"{doc}: {slug} still has an update timer")
-    return slug
+    if (NOTIFIER_STATE_DIR / f"showrunner-{owner.id}").exists():
+        raise TidyRefused(f"{doc}: {owner.name} still has an update timer")
+    return owner
 
 
 def main(argv: list[str]) -> int:
@@ -137,18 +112,18 @@ def main(argv: list[str]) -> int:
     failed = False
     for name in argv:
         try:
-            slug = wrapped_slug(Path(name))
             if identities is None:
                 identities = QuestionStaff.read()
-            removed = tidy(slug, Path(name), identities=identities)
+            owner = wrapped_owner(Path(name), identities.record)
+            removed = tidy(owner.name, Path(name), identities=identities)
         except (TidyRefused, RegistrationFailure, staff.StaffRefused, staff.StaffUnreadable,
                 OSError, UnicodeError, ValueError) as error:
             print(f"kept: {error}", file=sys.stderr)
             failed = True
             continue
         count = len(removed)
-        print(f"{slug}: removed {count} state file{'' if count == 1 else 's'}" if count
-              else f"{slug}: no state files")
+        print(f"{owner.name}: removed {count} state file{'' if count == 1 else 's'}" if count
+              else f"{owner.name}: no state files")
     return 1 if failed else 0
 
 

@@ -1,6 +1,5 @@
 # build-followups review unit
 
-> **Production: build-followups** — unit `review-unit`; production doc `docs/plans/build-followups-production.md`
 
 ## Delegation Context
 

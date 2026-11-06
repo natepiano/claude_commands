@@ -40,8 +40,8 @@ Every action finds the list from its production, written `<production>` below:
 
 - A showrunner passes nothing: the script finds the production from this
   session's update timer, as `/showrunner:proposals` does. A session with no
-  timer passes `--production <doc>`.
-- A unit director passes `--production <doc>` from the parent showrunner row's `doc.path`.
+  timer passes `--production <showrunner name>`.
+- A unit director passes `--production <showrunner name>` from the parent showrunner row's `name`.
 
 The list is named for the production's top-level showrunner while it runs, and
 otherwise is the path the doc's **Change review** line names. `list-path`
@@ -214,7 +214,7 @@ Use the `verdict` command above for both. The row stays out of the user's count 
 3. Save the answer with this command:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <doc> --list <list> --row C<n> --question <id> --text "<answer>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"
 ```
 
 The row returns to the user's count with the question and answer below the change.

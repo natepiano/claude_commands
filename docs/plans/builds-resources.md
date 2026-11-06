@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** Tests fake every memory reading the memory gate makes, and a tripwire fails a test that reads live machine memory.
 
-> **Production: builds** — unit `resources-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 

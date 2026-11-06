@@ -207,15 +207,32 @@ class FindingsLedgerFixture(unittest.TestCase):
         ]
 
     def close_round(self, covers: list[str], *, verdict: str = "accepted") -> None:
-        """Dispatch a batch, land it, and record every closure verdict for it.
-
-        `landed` stands in for the launcher, which is what calls it in a real run
-        once the repair worker exits cleanly.
-        """
+        """Dispatch a batch, record its fix pass, land it, and record each closure verdict."""
         _ = self.run_command("dispatch", "--covers", ",".join(covers))
+        self.record_repair_pass()
         _ = self.run_command("landed")
         for finding_id in covers:
             _ = self.run_command("verdict", "--id", finding_id, "--state", verdict)
+
+    def record_repair_pass(self, *, launch: int = 1, status: str = "completed", seconds: int = 10) -> None:
+        """Record a launch of the current batch in the private history."""
+        state = cast(dict[str, object], json.loads(self.ledger()))
+        batches = cast(list[dict[str, object]], state["rounds"])
+        number = cast(int, batches[-1]["round"])
+        started = 1_000 + number * 100 + launch * 20
+        record = {
+            "event_type": "pass_started", "phase_instance_id": state["phase_instance_id"],
+            "pass_instance_id": f"repair-{state['phase_instance_id']}-{number}-{launch}",
+            "pass_kind": "fix", "fix_pass": 1, "team_slot": f"repair-{number}",
+            "launch_check": {"fix_cause": {"round": number}},
+            "pass_started_at": started, "timestamp_epoch": started,
+        }
+        path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            _ = stream.write(json.dumps(record) + "\n")
+            _ = stream.write(json.dumps({**record, "event_type": "pass_finished", "status": status,
+                                        "timestamp_epoch": started + seconds, "pass_elapsed_seconds": seconds}) + "\n")
 
     def write_two_open_phases(self) -> None:
         """Phase 15 started first and stays open while Phase 16 is the newest."""
@@ -260,7 +277,7 @@ class FindingsLedgerFixture(unittest.TestCase):
 
     def route_finding(self, finding_id: str, *, reason: str = "spec-gap") -> str:
         return self.run_command(
-            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving-unit",
+            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving",
             "--work-order", "docs/follow-up.md — Phase 6 — Specify retry ownership",
             "--due", "Phase 6 checkpoint", "--evidence", "The Work Order has no owner rule",
         )

@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Record each `~/.claude` test run, test module and slow test in the build log, show their history at once with `/test_times`, and make the slowest test modules faster, from the top of a descending sort down.
 
-> **Production: builds** — unit `natest-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 
@@ -227,7 +226,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 #### As-built
 
 - `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary, and starts Git directly where no interruption fixture is needed. Same-load pairs (load 40-73): 304 s to 193 s wall, 202 s to 110 s CPU. Half was not reached; the floor is 55 tests at about 3.5 s each of real Git work. The architecture proposal (one injected Git runner in `fast_track.py`) went to the showrunner.
-- The Git hang guard script forks a watcher that moves to its own process group and stops the Git group through `send_process_group`, loaded by path (the script runs with `-S`).
+- The Git hang guard (`GIT_HANG_GUARD`) runs Git under `timeout -s KILL`, which moves Git to its own process group and kills that group at the deadline. Since Phase 33 only `test_git_wrappers_stop_a_blocked_hook` installs it; the other wrappers start Git directly in the module's process group.
 - `cli_fixture.py` adds the `@process_boundary` mark and `process_boundary_for_case()`. The fixtures that kept one named test as a process now read the mark from the test method.
 
 **Files:**
@@ -747,68 +746,83 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - A manual `allow_next_start()` advance in the verify fixtures: a workaround for the spacing (showrunner ruling).
 
-### Phase 32 — `smoke_launch.sh` reads its settings with no process for each key  · status: todo
+### Phase 32 — `smoke_launch.sh` reads its settings with no process for each key  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/production/smoke_launch.sh` sources `scripts/lib/conf.sh` and reads its 9 settings with no Python start for each key. Each read keeps its key, order, variable name and exit. `user_zone.py` and `process_group.py` still start as before.
+- `conf.sh` gives a read it cannot answer to `conf.py` through the `py` launcher in the same folder, held in one global `_CONF_LIB` (`.` for a bare file name). `py` honors `CLAUDE_PYTHON` and finds Python 3.12 or newer.
+- `py_floor_test_support.seed_interpreter_cache(cache_home, interpreter=sys.executable)` writes the interpreter cache that `py` reads. `test_conf_sh.py` and 8 `scripts/direct` fixtures use it.
+- Settings read of one real smoke launch (median of 3): 0.770 s -> 0.076 s. `test_smoke_launch.py` same-load pairs: 1.1 s -> 1.1 s. The full gate on this phase plus builds was green.
+
+**Files:**
+- `scripts/production/smoke_launch.sh` — one `conf.sh` source for its 9 settings
+- `scripts/lib/conf.sh` — shell settings reader; fallback through `py`
+- `scripts/lib/py_floor_test_support.py` — `seed_interpreter_cache`
+- `scripts/lib/test_conf_sh.py` — fixture with a `bash` link and a seeded cache
+
+**Gotchas:**
+- A fixture whose PATH holds only a stub folder needs a `bash` link, because `py` starts with `#!/usr/bin/env bash`. Without a seeded cache, `py` runs the stub once more to check its version.
+
+**Ruled out:**
+- Starting `scripts/build_hold/cargo`, the BRP launch hook and `scripts/lint/lint` through `py` in this phase: outside its scope; a next item after the PYTHONPATH item.
+
+### Phase 33 — `test_fast_track.py` runs in half its time  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/production/test_fast_track.py` starts no Python watchdog for each Git call. Only `test_git_wrappers_stop_a_blocked_hook` installs `GIT_HANG_GUARD`, which runs Git under `timeout -s KILL`; the other wrappers start Git directly.
+- Same-load pairs (3 runs): 168.5 s -> 97.9 s wall, 106.9 s -> 52.9 s CPU. Half time (84.25 s) is not reached. The full gate on this phase plus builds was green.
+- Floor at that load (about 101 s): production Git 42.9 s, fast-track CLI children 44.0 s, blocked-hook deadlines 10.0 s, promotion retries 4.0 s. Test Git takes 2.7 s.
+- Architecture proposals sent to the showrunner: one injected Git runner in `fast_track.py` (2,937 Git calls, 27.6 s); the repeated `rev-parse` (898), `update-ref` (777) and `cat-file` (283) calls around `fast_track.reconcile`; 403 fetches through the `copies.py` remote refresh.
+
+**Files:**
+- `scripts/production/test_fast_track.py` — Git wrappers and the blocked-hook guard
+
+**Gotchas:**
+- A bash job-control guard (`set -m`) fails three ways: a hook child that keeps stdout open survives Git, Git cannot read terminal input (SIGTTIN), and a signal exit becomes an ordinary exit code. `timeout -s KILL` has none of these faults.
+
+**Ruled out:**
+- Deleting `GIT_HANG_GUARD` and the blocked-hook test (simplify F009): the Work Order keeps every test name, and the test proves the guard stops a blocked hook.
+
+### Phase 34 — Every test module imports from the repo root with no PYTHONPATH  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** `scripts/production/smoke_launch.sh` reads its 9 settings through `scripts/lib/conf.sh` with no Python start for each key, with the same values, exits and read order.
+**Goal:** every `scripts/**/test_*.py` module passes when it runs from the repo root with PYTHONPATH unset, with one layout fix for every folder and every checked behavior kept.
 
-**Spec:** The showrunner approved this phase (2026-11-05). No builds unit holds `smoke_launch.sh`.
+**Spec:** natedev found these modules fail with an import error unless PYTHONPATH names their folder (via the showrunner, 2026-11-05). The showrunner made this the next phase after Phase 33. Claim each file with cargo-berth before the first edit; send any holder to the showrunner.
 
-1. Caller survey (2026-11-05): `smoke_launch.sh:22-31` is the only shell script that still starts `conf.py get` for each key. `scripts/message/notifier.sh` `read_conf` reads its own instance file with no Python. Nine `conf.py get` reads take 0.51 s; nine `conf.sh` reads take 0.02 s.
-2. Replace the local `conf_value()` function (`smoke_launch.sh:22`) with one `source "$LIB/conf.sh"`. Keep each of the 9 reads, its key, its order and its variable name. The script runs under bash with `set -euo pipefail`, so a failed read still stops the script.
-3. Leave the other Python starts as they are: `user_zone.py` (line 36) and `process_group.py` (lines 78, 80).
-4. Measure the config reads of one real `smoke_launch.sh` run before and after, and give the median of 3. Measure `test_smoke_launch.py` and the `test_mac_run.py` smoke test in same-load pairs.
-5. Add no guard, refusal or check that this Work Order does not name.
-
-**Files:**
-- `scripts/production/smoke_launch.sh` — one `conf.sh` source; `conf_value` for each read
-
-**Workers:** 1 writer (one script; the work does not split)
-- `impl` — all files above
-
-**Constraints from prior phases:**
-- Phase 30: `scripts/lib/conf.sh` gives the same value and exit as `conf.py get`, or gives the read to `conf.py`. It runs under bash 3.2 and zsh, and reads the host name once when sourced.
-- Phase 30: `review.sh`, `implement.sh` and `mac_run.sh` source `conf.sh`; a change to it runs their tests. This phase does not change `conf.sh`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_smoke_launch.py'` green, with the same test names and assertions
-- `python3 -m unittest discover -s scripts/production -p 'test_mac_run.py'` green, with `test_smoke_uses_the_shared_refused_port_and_host` unchanged
-- `python3 -m unittest discover -s scripts/lib -p 'test_conf_sh.py'` green
-- config read seconds of one real smoke launch, before and after, and same-load pair medians (`pairs.sh`) of `test_smoke_launch.py`, in the checkpoint notice
-
-### Phase 33 — `test_fast_track.py` runs in half its time  · status: todo
-**Depends on:** none
-
-#### Work Order
-
-**Goal:** `scripts/production/test_fast_track.py` (rank 4 in `test_times top` at 216.9 s median, 108.7 CPU s, 55 tests, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
-
-**Spec:** Follow the Speed method. The showrunner approved this phase (2026-11-05). No builds unit holds `test_fast_track.py` or `fast_track.py`. Claim the files with cargo-berth before the first edit; send any holder to the showrunner.
-
-1. Profile before any edit. Phase 7 took this module from 304 s to 193 s (load 40-73), with a floor of about 3.5 s of real Git work in each of 55 tests. The median is now 216.9 s with 108.7 CPU s, so about half of the wall time has no CPU. Find where it goes: waits (polls, sleeps, timeouts, lock or admission waits), Git process starts, repository setup in each test, and Python starts. Compare against the Phase 7 floor, and name what grew since then. Write the result into this Spec and name the files and changes before the code step.
-2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
-3. A cut in `fast_track.py` or another production file goes to the showrunner as an architecture proposal with the measured gain, unless the showrunner approves it for this phase. The Phase 7 proposal (one injected Git runner in `fast_track.py`) is already with the showrunner.
-4. A change to `merge_checkpoint_test_support.py` or `cli_fixture.py` keeps every importer green; name each one in the final run.
-5. Keep every test name and assertion, and each `@process_boundary` case as a process. Add no guard, refusal or check that this Work Order does not name.
+1. Reproduce before any edit, in a `copies.py` clone with PYTHONPATH unset. Run each named module from the repo root as `python3 -m unittest scripts/<folder>/<module>.py`. Record each import error and the import line that causes it. The named modules: `scripts/production/test_next_item.py`; two `scripts/notify` test modules (`pushover`); `scripts/lib` tests (no package file; needs a module list); `scripts/production/test_production_lifecycle.py` (`fake_unit_host`); `scripts/mac_test/test_offload.py` (`offload`); `scripts/build_hold` tests; `scripts/buildlog/test_width_trial.py` (`store`); `scripts/shutdown` tests (`test_support`).
+2. Run the same form for every other `test_*.py` under `scripts/`, and list each module with the same fault.
+3. Name the one cause and the one layout fix for every folder. Write both into this Spec, with the files to change, before the code step. Fix at the cause. A `sys.path` insert in each module is not one fix.
+4. Keep the gate's form green: `module_run.py` runs `unittest discover -s <folder> -p <module>` from the repo root.
+5. Add no guard, refusal or check, and no test that scans imports (user rule, 2026-11-05).
+6. Do not edit `folder_audit.py`, `build_hold.py`, `mac_idle.py`, `rust_release.py` or `aws_target/ledger.py` until the showrunner sends natedev messaging's main hash. A fix that needs one of them waits; name it in the report.
 
 **Files:**
-- `scripts/production/test_fast_track.py` — the module
-- `scripts/production/merge_checkpoint_test_support.py` — only for a shared cut the profile names
+- `scripts/production/test_next_item.py`, `scripts/production/test_production_lifecycle.py`
+- `scripts/notify/` — its test modules
+- `scripts/lib/` — its test modules and any package file the fix names
+- `scripts/mac_test/test_offload.py`
+- `scripts/build_hold/` — its test modules
+- `scripts/buildlog/test_width_trial.py`
+- `scripts/shutdown/` — its test modules
+- `scripts/` — any other test module that step 2 lists
 
-**Workers:** 1 writer (one module and its fixture; the files do not split)
+**Workers:** 1 writer (one layout fix; step 3 names the files, then they can split by folder)
 - `impl` — all files above
+- `test` — opens as impl
 
 **Constraints from prior phases:**
-- Phase 7: `test_fast_track.py` calls the CLI in-process where a test does not check the process boundary. `cli_fixture.py` `@process_boundary` keeps a named test as a process. The Git hang guard script forks a watcher in its own process group.
 - Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
-- Phase 31: the manual admission clock advance is a workaround (showrunner ruling); queue-unit fixes the start spacing in the shared admission fixture. Do not advance the admission clock by hand.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_fast_track.py'` green, with the same test names and assertions
-- each importer in Spec step 4 green when a support file changes, with its before and after time in same-load pairs
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- each module from steps 1 and 2 green with `env -u PYTHONPATH python3 -m unittest scripts/<folder>/<module>.py` from the repo root of a `copies.py` clone
+- each changed module green in the gate form `python3 -m unittest discover -s scripts/<folder> -p '<module>'`
+- `merge_gate.py --tests-only` green on the phase commit merged with `origin/builds`
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`

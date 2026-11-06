@@ -1013,7 +1013,7 @@ def tested_tree_proof(checkout: Path, tree: str, runner: Runner, times: dict[str
     """Test and lint the exact clean tree, then require its machine-wide final pass record.
 
     Keep all evidence checks here. A zero command exit alone never authorizes publication.
-    The query fails closed until builds-unit's final-pass integration is available.
+    The query fails closed until builds' final-pass integration is available.
     """
     require_test_tree(checkout, tree)
     verify = str(Path.home() / ".claude/scripts/direct/verify.sh")
@@ -1045,7 +1045,7 @@ def require_test_tree(repo: Path, tree: str) -> None:
 
 
 def test_tree(repo: Path, commit: str, tree: str, runner: Runner, times: dict[str, float], *, owner: str = "") -> CommandResult:
-    with copies.standing(owner or style_sync.gate_owner(repo), repo, commit) as checkout:
+    with copies.standing(owner or style_sync.gate_owner(repo), repo, copies.CommittedSource(commit)) as checkout:
         require_test_tree(checkout, tree)
         result = tested_tree_proof(checkout, tree, runner, times)
         require_test_tree(checkout, tree)

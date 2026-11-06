@@ -35,6 +35,7 @@
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
+        "scripts/herdr",
         "scripts/whoami",
         "scripts/lib"
       ]
@@ -163,6 +164,7 @@
     {
       "root": "scripts/notify",
       "extraPaths": [
+        ".",
         "scripts/notify",
         "scripts/lib"
       ]

@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
+
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib import models_registry
 from scripts.lib import unit_runs
 
 import argparse
@@ -25,7 +28,8 @@ from unittest.mock import patch
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.production.staff_test_support import (
-    StaffTestCase, isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id, recorded_showrunner, recorded_unit,
+    StaffTestCase, isolated_staff_file, isolated_source_readers, source_environment,
+    fixture_member, fixture_worker, fixture_runtime_id, recorded_showrunner, recorded_unit,
 )
 from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 # These regressions check the private verifier's semantic result before wait closure.
@@ -85,6 +89,8 @@ class ProgressHistoryTests(unittest.TestCase):
         # Socket fixtures need a short path even when the run's TMPDIR is long.
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.temporary.name)
+        self.enterContext(patch.dict(os.environ, source_environment(self.root / "sources")))
+        self.enterContext(isolated_source_readers())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         _ = fixture_member("showrunner", name="recorder")
@@ -115,6 +121,35 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_config_digest_reads_without_catalog_sync_and_keeps_the_inherited_launch_text(self) -> None:
+        settings = self.root / "digest-settings"
+        settings.mkdir()
+        _ = (settings / "direct.conf").write_text("fixture=1\n")
+        log = self.root / "unexpected-sync"
+        script = self.root / "scripts/agents/sync_codex_catalog.sh"
+        script.parent.mkdir(parents=True)
+        _ = script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(log)!r}).touch()\n")
+        script.chmod(0o755)
+        digest = cast(Callable[[], str], vars(progress_history)["_config_digest"])
+        clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
+        original = self.models_config_file.read_text()
+        configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
+        for inherited in (False, True):
+            with self.subTest(inherited=inherited), patch.object(models_registry, "launch_configuration", wraps=models_registry.launch_configuration) as launches, patch.object(models_registry, "__file__", str(script.parent.parent / "lib/models_registry.py")), patch.dict(os.environ, {
+                "HOME": str(self.root), "CONF_DIR": str(settings), "MODELS_CONFIG_FILE": str(self.models_config_file),
+                "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
+                "MODELS_LAUNCH_CONFIGURATION": configuration.environment({})["MODELS_LAUNCH_CONFIGURATION"] if inherited else "",
+            }):
+                _ = self.models_config_file.write_text(original + "# later edit\n")
+                clear()
+                try:
+                    text = original if inherited else self.models_config_file.read_text()
+                    self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                    self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
+                    self.assertEqual(launches.call_count, int(inherited), "telemetry entered the fresh launch path")
+                finally:
+                    clear()
 
     def test_review_trial_counts_rerun_findings_as_code(self) -> None:
         self.write_full_config()
@@ -156,6 +191,38 @@ class ProgressHistoryTests(unittest.TestCase):
         for key in ("working_dir", "worktree", "branch"):
             _ = before.pop(key, None)
         self.assertEqual(after, before)
+
+    def test_set_unit_selects_the_staff_name_when_another_document_uses_that_name(self) -> None:
+        run = self.start_run("staff-name-owner", 1760658000)
+        hana = fixture_member("showrunner", name="hana",
+                              doc=staff.LiveDoc("natedev", self.root / "tool-based-ui-production.md"))
+        _ = fixture_member("unit", name="alpha", parent=hana.id)
+        owner = fixture_member("showrunner", name="tool-based-ui",
+                               doc=staff.LiveDoc("natedev", self.root / "other-production.md"))
+        unit = fixture_member("unit", name="alpha", parent=owner.id)
+        _ = self.run_command("set-unit", "--session-dir", str(run), "--production", "tool-based-ui",
+                             "--unit", "alpha", at=1760658001)
+        state = cast(dict[str, object], json.loads((run / "progress_history_state.json").read_text()))
+        self.assertEqual(state[unit_runs.OWNER_FIELD], unit.id)
+
+    def test_set_unit_does_not_select_a_showrunner_by_its_document_name(self) -> None:
+        run = self.start_run("document-name-owner", 1760658000)
+        owner = fixture_member("showrunner", name="hana",
+                               doc=staff.LiveDoc("natedev", self.root / "tool-based-ui-production.md"))
+        _ = fixture_member("unit", name="alpha", parent=owner.id)
+        path = run / "progress_history_state.json"
+        before = path.read_bytes()
+        environment = os.environ.copy()
+        self.isolate_recorder_roots(environment)
+        self.isolate_identity(environment)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "set-unit", "--session-dir", str(run),
+             "--production", "tool-based-ui", "--unit", "alpha"],
+            env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tool-based-ui/alpha: no unique unit staff row", result.stderr)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
         append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
@@ -241,7 +308,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 '''
         environment = {**os.environ, "HOME": str(caller),
                        "USER_ZONE_CONF": str(caller / "zone.conf")}
-        result = subprocess.run([sys.executable, "-c", program, str(self.root), str(self.working_dir)],
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, str(self.root), str(self.working_dir)],
                                 env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("two homes isolated; recorder lock retained; caller restored", result.stdout)
@@ -1875,7 +1942,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def wait_worker_roster(self, session: Path, workers: dict[str, str]) -> None:
         owner = fixture_member("showrunner", name="wait-owner")
-        unit = fixture_member("unit", name="wait-unit", parent=owner.id)
+        unit = fixture_member("unit", name="wait", parent=owner.id)
         entries = {name: {"staff_id": fixture_worker(name, unit.id, runtime_id=native).id}
                    for name, native in workers.items()}
         _ = (session / "mesh_roster.json").write_text(json.dumps(entries))
@@ -2084,6 +2151,93 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual((waits[0]["event_type"], waits[0]["wait_started_epoch"], waits[0]["owner_session"]),
                          ("wait_started", 1020, "director"))
         self.assertEqual((session / "turn_wait.json").read_text(), marker)
+
+    def test_turn_wait_rerun_after_event_before_marker_keeps_one_wait(self) -> None:
+        name = "stopped-wait-publication"
+        session = self.covered_wait_phase(name)
+        message = "blocked: waiting on uds:/supplier.sock"
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", message)
+            self.assertTrue(progress_history.record_turn_wait(session, "director", message))
+        waits = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual(len(waits), 1)
+        marker = cast(dict[str, object], json.loads((session / "turn_wait.json").read_text()))
+        self.assertEqual(marker["wait_id"], waits[0]["wait_id"])
+
+    def test_typed_answer_finishes_a_wait_after_event_before_marker_publication(self) -> None:
+        name = "typed-answer-after-wait-stop"
+        session = self.covered_wait_phase(name)
+        marker_path = session / "turn_wait.json"
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", "decision: choose the next phase")
+            marker = cast(dict[str, object], json.loads(marker_path.read_text()))
+            self.assertNotIn("wait_id", marker)
+            starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(marker["declaration_id"], starts[0]["declaration_id"])
+            os.environ["UNIT_NOW_EPOCH"] = "1030"
+            progress_history.finish_turn_wait(session, "director", source="TYPED", prompt="Continue.")
+            progress_history.finish_turn_wait(session, "director", source="TYPED", prompt="Continue.")
+        waits = [event for event in self.read_events(name) if str(event["event_type"]).startswith("wait_")]
+        self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
+        self.assertEqual(waits[1]["wait_id"], starts[0]["wait_id"])
+        self.assertEqual(waits[1]["wait_end"], {"state": "Finished", "at": waits[1]["timestamp"], "epoch": 1030})
+        self.assertFalse(marker_path.exists())
+
+    def test_start_phase_rerun_after_state_before_event_repairs_the_history(self) -> None:
+        name = "stopped-phase-publication"
+        session = self.start_run(name, 1000)
+        arguments = ["start-phase", "--session-dir", str(session), "--phase-id", "13", "--phase-title", "Rerun"]
+        with stop_once(progress_history, "_append_event", when="before",
+                       argument=1, matches=lambda value: isinstance(value, dict)
+                       and cast(dict[str, object], value).get("event_type") == "phase_started"):
+            with self.assertRaises(InjectedStop):
+                _ = self.run_command(*arguments, at=1020)
+        _ = self.run_command(*arguments, at=1020)
+        events = [event for event in self.read_events(name) if event["event_type"] == "phase_started"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["phase_id"], "13")
+
+    def test_turn_wait_rerun_with_stale_marker_recovers_the_replacement(self) -> None:
+        name = "replacement-wait-stop"
+        session = self.covered_wait_phase(name)
+        message = "decision: choose the next phase"
+        marker_path = session / "turn_wait.json"
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            self.assertTrue(progress_history.record_turn_wait(session, "director", message))
+            original = cast(dict[str, object], json.loads(marker_path.read_text()))
+            progress_history.finish_turn_wait(session, "director", source="TYPED", prompt="Continue.")
+            _ = marker_path.write_text(json.dumps(original))
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", message)
+            starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+            self.assertEqual(len(starts), 2)
+            replacement_id = starts[-1]["wait_id"]
+            stale = cast(dict[str, object], json.loads(marker_path.read_text()))
+            stale["wait_id"] = original["wait_id"]
+            _ = marker_path.write_text(json.dumps(stale))
+            self.assertTrue(progress_history.record_turn_wait(session, "director", message))
+        starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual([event["wait_id"] for event in starts], [original["wait_id"], replacement_id])
+        self.assertEqual(cast(dict[str, object], json.loads(marker_path.read_text()))["wait_id"], replacement_id)
+
+    def test_turn_wait_for_another_phase_does_not_adopt_an_orphan(self) -> None:
+        name = "cross-phase-wait-stop"
+        session = self.covered_wait_phase(name)
+        message = "blocked: waiting on uds:/supplier.sock"
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", message)
+            _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "7",
+                                 "--phase-title", "Another phase", at=1030)
+            self.assertTrue(progress_history.record_turn_wait(session, "director", message))
+        starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual(len(starts), 2)
+        self.assertNotEqual(starts[0]["phase_instance_id"], starts[1]["phase_instance_id"])
+        marker = cast(dict[str, object], json.loads((session / "turn_wait.json").read_text()))
+        self.assertEqual(marker["wait_id"], starts[1]["wait_id"])
 
     def test_phase_finish_closes_an_open_declared_supplier_wait_as_unclosed(self) -> None:
         session = self.covered_wait_phase("declared-phase-end")
@@ -2344,7 +2498,7 @@ sys.argv = ["progress_history.py", *sys.argv[1:]]
 with patch.object(fcntl, "flock", admission):
     recorder.main()
 '''
-        finish: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", finish_program, "finish-phase", "--session-dir", str(session),
+        finish: subprocess.Popen[str] = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", finish_program, "finish-phase", "--session-dir", str(session),
                                    "--status", "completed"], env=environment, text=True,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: finish.kill() if finish.poll() is None else None)
@@ -2353,7 +2507,7 @@ with patch.object(fcntl, "flock", admission):
         finish_output = cast(TextIO, finish.stdout)
         self.assertTrue(select.select([finish_output], [], [], TEST_HANG_GUARD_SECS)[0], "finish never reaches publication")
         self.assertEqual(finish_output.readline().strip(), "publishing")
-        start: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", start_program, "start-checkpoint-wait", "--commit", commit,
+        start: subprocess.Popen[str] = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", start_program, "start-checkpoint-wait", "--commit", commit,
                                   "--working-dir", str(self.working_dir), "--phase-id", "6", "--owner-session", "receiver"],
                                  env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: start.kill() if start.poll() is None else None)
@@ -2385,7 +2539,7 @@ with patch.object(fcntl, "flock", admission):
             for first_is_session in (True, False):
                 with self.subTest(kind=kind, first_is_session=first_is_session):
                     owners = (("--holder-session", "other-session", {"state": "SessionHolder", "session_id": "other-session"}),
-                              ("--holder-unit", "other-unit", {"state": "UnitHolder", "unit": "other-unit"}))
+                              ("--holder-unit", "other", {"state": "UnitHolder", "unit": "other"}))
                     first, second = owners if first_is_session else tuple(reversed(owners))
                     wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", kind,
                         "--owner-session", "waiting-session", "--holder-resource-kind", resource_kind,
@@ -2906,15 +3060,15 @@ with patch.object(fcntl, "flock", admission):
         name = "phase-source-explicit"
         session, worktree, plan = self.phase_source_fixture(name, recorded=False)
         owner = fixture_member("showrunner", name="Other production")
-        _ = fixture_member("unit", name="other-unit", parent=owner.id,
+        _ = fixture_member("unit", name="other", parent=owner.id,
                            worktree=staff.PresentWorktree("natedev", worktree))
         _ = self.run_command("set-unit", "--session-dir", str(session), "--production", "Other production",
-                             "--unit", "other-unit", at=1005)
+                             "--unit", "other", at=1005)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
                              "--phase-title", "Phase source", at=1010)
         started = next(event for event in self.read_events(name) if event["event_type"] == "phase_started")
         self.assertEqual((started["production"], started["unit"]),
-                         ({"state": "Recorded", "value": "Other production"}, {"state": "Recorded", "value": "other-unit"}))
+                         ({"state": "Recorded", "value": "Other production"}, {"state": "Recorded", "value": "other"}))
         self.assertNotIn("working_dir", started)
         current = plan_history.staff_directory(dict(started), staff.snapshot())
         self.assertEqual(current["working_dir"], str(worktree))
@@ -2988,92 +3142,13 @@ with patch.object(fcntl, "flock", admission):
         phase, = cast(list[dict[str, object]], report["phases"])
         self.assertEqual(phase["plan_doc"], {"state": "NotRecorded", "reason": "phase has no plan document"})
 
-    def test_production_doc_paths_report_the_heading_name_instead_of_the_path(self) -> None:
-        name = "phase-production-doc-path"
-        session, worktree, plan = self.phase_source_fixture(name, production="tool-based-ui",
-                                                               unit="geometry-material-unit")
-        production_doc = worktree / "docs" / "hana" / "tool-based-ui-production.md"
-        production_doc.parent.mkdir(parents=True)
-        _ = production_doc.write_text("# Production — tool-based-ui\n", encoding="utf-8")
-        for index, reference in enumerate((str(production_doc.relative_to(worktree)), str(production_doc))):
-            with self.subTest(reference=reference):
-                _ = plan.write_text("# Geometry material\n",
-                                    encoding="utf-8")
-                _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
-                                     "--phase-title", "Production document", at=1010 + index)
-                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
-                phase = cast(list[dict[str, object]], report["phases"])[-1]
-                self.assertEqual(phase["production"], {"state": "Recorded", "value": "tool-based-ui"})
-                started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
-                self.assertEqual(started["production"], phase["production"])
-                self.assertEqual(started["unit"], {"state": "Recorded", "value": "geometry-material-unit"})
 
-    def test_stored_production_doc_paths_resolve_for_plain_and_tagged_metadata(self) -> None:
-        name = "phase-stored-production-doc-path"
-        session, worktree, plan = self.phase_source_fixture(name)
-        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
-                             "--phase-title", "Stored production document", at=1010)
-        production_doc = worktree / "docs" / "hana" / "production.md"
-        production_doc.parent.mkdir(parents=True)
-        events = self.read_events(name)
-        started = next(event for event in events if event["event_type"] == "phase_started")
-        history = self.history_dir / "runs" / f"{name}.jsonl"
-        # A stored document reference must not depend on a surviving plan header.
-        plan.unlink()
-        for reference in (str(production_doc.relative_to(worktree)), str(production_doc)):
-            for tagged in (False, True):
-                with self.subTest(reference=reference, tagged=tagged):
-                    started["production"] = {"state": "Recorded", "value": reference} if tagged else reference
-                    _ = history.write_text("\n".join(json.dumps(event) for event in events))
-                    _ = production_doc.write_text("# Production — tool-based-ui\n", encoding="utf-8")
-                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
-                    phase, = cast(list[dict[str, object]], report["phases"])
-                    self.assertEqual(phase["production"], {"state": "Recorded", "value": "tool-based-ui"})
-                    production_doc.unlink()
-                    report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
-                    phase, = cast(list[dict[str, object]], report["phases"])
-                    production = cast(dict[str, object], phase["production"])
-                    self.assertEqual(production["state"], "NotRecorded")
-                    self.assertIn("production document cannot be read:", str(production["reason"]))
-                    self.assertEqual(self.read_events(name), events)
 
-    def test_unreadable_or_unnamed_production_docs_report_missing_metadata_with_a_reason(self) -> None:
-        name = "phase-production-doc-unavailable"
-        session, worktree, plan = self.phase_source_fixture(name, recorded=False)
-        production_doc = worktree / "production.md"
-        _ = plan.write_text("# Geometry material\n",
-                            encoding="utf-8")
-        state_path = session / "progress_history_state.json"
-        state = cast(dict[str, object], json.loads(state_path.read_text()))
-        state.update(production=str(production_doc), unit="geometry-material-unit")
-        _ = state_path.write_text(json.dumps(state))
-        cases = (("missing", "production document cannot be read:"),
-                 ("invalid UTF-8", "production document cannot be read:"),
-                 ("no heading", "production doc lacks its name"),
-                 ("empty name", "production document heading names no production"))
-        for index, (state, reason) in enumerate(cases):
-            with self.subTest(state=state):
-                if state == "invalid UTF-8":
-                    _ = production_doc.write_bytes(b"\xff")
-                elif state == "no heading":
-                    _ = production_doc.write_text("# A document without a production heading\n", encoding="utf-8")
-                elif state == "empty name":
-                    _ = production_doc.write_text("# Production — \n", encoding="utf-8")
-                _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
-                                     "--phase-title", "Unavailable production document", at=1010 + index)
-                report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
-                phase = cast(list[dict[str, object]], report["phases"])[-1]
-                production = cast(dict[str, object], phase["production"])
-                self.assertEqual(production["state"], "NotRecorded")
-                self.assertIn(reason, str(production["reason"]))
-                started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
-                self.assertEqual(started["production"], production)
-                self.assertEqual(started["unit"], {"state": "Recorded", "value": "geometry-material-unit"})
 
     def test_plain_production_names_do_not_require_a_production_doc(self) -> None:
         name = "phase-production-plain-name"
         session, worktree, plan = self.phase_source_fixture(name, production="tool-based-ui",
-                                                               unit="geometry-material-unit")
+                                                               unit="geometry-material")
         _ = plan.write_text("# Geometry material\n",
                             encoding="utf-8")
         self.assertFalse((worktree / "tool-based-ui").exists())
@@ -3120,11 +3195,11 @@ with patch.object(fcntl, "flock", admission):
 
     def test_phase_production_and_unit_each_keep_their_run_state_override(self) -> None:
         name = "phase-partial-source"
-        session, _worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr-unit")
+        session, _worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr")
         state_path = session / "progress_history_state.json"
         for index, (field, value, production, unit) in enumerate((
-            ("unit", "assigned-unit", "natedev", "assigned-unit"),
-            ("production", "assigned-production", "assigned-production", "herdr-unit"),
+            ("unit", "assigned", "natedev", "assigned"),
+            ("production", "assigned-production", "assigned-production", "herdr"),
         )):
             with self.subTest(field=field):
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
@@ -3369,6 +3444,7 @@ with patch.object(fcntl, "flock", admission):
         )
         self.assertNotEqual(failure.returncode, 0)
         self.assertIn("launcher", failure.stderr)
+        self.assertIn("Launch the work through assign.sh.", failure.stderr)
         history = self.history_dir / "runs" / "owned.jsonl"
         self.assertNotIn("pass_started", history.read_text(encoding="utf-8"))
 
@@ -3421,6 +3497,27 @@ with patch.object(fcntl, "flock", admission):
             for event in self.read_events(name)
             if event.get("event_type") == event_type
         ]
+
+    def test_last_dispatch_selects_the_new_open_pass_when_the_same_slot_starts_again(self) -> None:
+        run = self.start_run("dispatch-history", 20_000, unit_owned=True)
+        parent = staff.local_snapshot().unit_by_worktree("natedev", self.working_dir)
+        assert parent is not None
+        worker = fixture_worker("dispatch-worker", parent.id)
+        self.start_phase(run, 20_010)
+        self.start_slot_pass(run, "impl", "impl", 20_020, "gpt-called", 0,
+                             "--worker-id", worker.id, worker_name=worker.name)
+        opened, = self.pass_events("dispatch-history", "pass_started")
+        self.assertEqual(opened["worker_id"], worker.id)
+        self.finish_slot_pass(run, "impl", "completed", 20_030)
+        _ = staff.rename(worker.id, "renamed-worker")
+        self.start_slot_pass(run, "impl", "test", 20_040, "gpt-called", 0,
+                             "--worker-id", worker.id, worker_name="renamed-worker")
+        latest = self.pass_events("dispatch-history", "pass_started")[-1]
+        with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(self.root)}):
+            dispatch = progress_history.last_dispatch(worker.id)
+        self.assertEqual(dispatch, progress_history.RecordedDispatch(
+            "test", "3", progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            str(run / "phases/3/files"), str(latest["pass_instance_id"]), "active"))
 
     def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
         _ = write_registry(self.models_config_file, {"direct.codex": {"impl": "gpt-called:xhigh"}})
@@ -3639,6 +3736,209 @@ with patch.object(fcntl, "flock", admission):
             ["impl", "test"],
         )
         self.assertEqual(self.pass_events("two-slots", "pass_finished"), [])
+
+    def test_all_dispatch_roles_record_launcher_arguments_for_each_parent_kind(self) -> None:
+        showrunner = fixture_member("showrunner", name="role-owner")
+        unit = fixture_member("unit", name="role-unit", parent=showrunner.id)
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.working_dir), expected=unit.worktree)
+        roles = ("impl", "test", "fix", "review", "astra-designer", "astra-reviewer")
+        plan = self.working_dir / "roles.md"
+        _ = (self.working_dir / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
+        _ = plan.write_text("## Delegation Context\n\n- **Project started:** 1970-01-01T00:00:00+00:00\n")
+        for owner in (showrunner, unit):
+            name = f"roles-{owner.kind}"
+            session = self.root / name
+            _ = self.run_command(
+                "start-run", "--session-dir", str(session), "--working-dir", str(self.working_dir),
+                "--plan-doc", plan.name, "--main-family", "codex", "--main-model", "gpt-main",
+                "--main-session-id", str(owner.current_session), at=41_000,
+            )
+            self.start_phase(session, 41_010)
+            for offset, role in enumerate(roles):
+                with self.subTest(parent=owner.kind, role=role):
+                    command = ["bash", "assign.sh", role, "prompt with spaces", "--literal=$HOME"]
+                    _ = self.run_command(
+                        "check-launch", "--session-dir", str(session), "--phase-id", "3",
+                        "--pass-kind", role, "--fix-cause", "fixture failed gate", at=41_020 + offset,
+                    )
+                    self.start_slot_pass(session, "worker", role, 41_030 + offset, "gpt-called", 0,
+                                         "--launcher-command", json.dumps(command), worker_name="worker")
+                    self.assertEqual(self.pass_slots(session)["worker"]["kind"], role)
+                    self.assertEqual(self.pass_slots(session)["worker"]["launcher_command"], command)
+                    self.finish_slot_pass(session, "worker", "completed", 41_040 + offset)
+            finished = self.pass_events(name, "pass_finished")
+            self.assertEqual([event["pass_kind"] for event in finished], list(roles))
+            self.assertEqual([event["launcher_command"] for event in finished],
+                             [["bash", "assign.sh", role, "prompt with spaces", "--literal=$HOME"] for role in roles])
+
+    def test_launcher_recovery_keeps_the_active_pass_and_saved_command(self) -> None:
+        session = self.start_run("launcher-recovery", 41_000)
+        self.start_phase(session, 41_010)
+        command = ["bash", "review.sh", "prompt with spaces", "--phase", "3"]
+        self.start_slot_pass(session, "review", "review", 41_020, "gpt-called", 0,
+                             "--launcher-command", json.dumps(command), worker_name="review2")
+        path = session / "progress_history_state.json"
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        active = self.pass_slots(session)["review"]
+        self.start_slot_pass(session, "review", "review", 41_030, "gpt-new", worker_name="review2")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.pass_slots(session)["review"], active)
+        self.assertEqual(len(self.pass_events("launcher-recovery", "pass_started")), 1)
+        self.assertEqual(self.pass_events("launcher-recovery", "pass_finished"), [])
+        self.finish_slot_pass(session, "review", "completed", 41_040)
+        finished, = self.pass_events("launcher-recovery", "pass_finished")
+        self.assertEqual(finished["pass_instance_id"], active["instance_id"])
+        self.assertEqual(finished["launcher_command"], command)
+        self.start_slot_pass(session, "review", "review", 41_050, worker_name="review2")
+        self.assertNotEqual(self.pass_slots(session)["review"]["instance_id"], active["instance_id"])
+
+    def test_refused_pass_keeps_its_id_for_redispatch_and_finish(self) -> None:
+        session = self.start_run("refused-pass", 41_000)
+        self.start_phase(session, 41_010)
+        self.start_slot_pass(session, "impl", "impl", 41_020, worker_name="implementer")
+        identity = self.pass_slots(session)["impl"]["instance_id"]
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            progress_history.mark_pass_refused(session, "implementer")
+        self.assertEqual(self.pass_slots(session)["impl"]["status"], "refused")
+        self.assertNotIn("finished_at", self.pass_slots(session)["impl"])
+        report = self.run_progress(session, at=41_025)
+        self.assertNotIn("No pass or activity is open.", report)
+        self.assertIn("impl 5s running", report)
+        self.start_slot_pass(session, "impl", "impl", 41_030, worker_name="implementer")
+        self.assertEqual(self.pass_slots(session)["impl"]["instance_id"], identity)
+        self.assertEqual(len(self.pass_events("refused-pass", "pass_started")), 1)
+        self.finish_slot_pass(session, "impl", "completed", 41_040)
+        self.assertEqual(self.pass_slots(session)["impl"]["status"], "completed")
+        self.assertEqual(len(self.pass_events("refused-pass", "pass_finished")), 1)
+
+    def test_invalid_launcher_arguments_leave_the_active_pass_unchanged(self) -> None:
+        session = self.start_run("invalid-launcher", 41_000)
+        self.start_phase(session, 41_010)
+        self.start_slot_pass(session, "impl", "impl", 41_020)
+        path = session / "progress_history_state.json"
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        for command in ('"bash assign.sh"', '["bash", 3]', '{}', '[', '[]'):
+            with self.subTest(command=command):
+                result = self.launch_probe(session, "--phase-id", "3", "--launcher-command", command)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--launcher-command", result.stderr)
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(len(self.pass_events("invalid-launcher", "pass_started")), 1)
+        self.assertEqual(self.pass_events("invalid-launcher", "pass_finished"), [])
+
+    def test_dispatch_api_reuses_active_and_completed_passes_after_launcher_loss(self) -> None:
+        session = self.start_run("dispatch-api", 41_000)
+        self.start_phase(session, 41_010)
+        prompt = self.root / "dispatch-prompt.txt"
+        _ = prompt.write_text("Phase 3 — Retry handling\nRead the requested files.\n")
+        command = ["bash", "assign.sh", "impl", str(prompt)]
+        with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
+                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+            first = progress_history.begin_dispatch(
+                session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
+                launcher_command=command, prompt=prompt, kind="broad", lens="contract",
+            )
+            path = session / "progress_history_state.json"
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            resumed = progress_history.begin_dispatch(
+                session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
+                launcher_command=command, prompt=prompt, kind="broad", lens="contract",
+            )
+            self.assertEqual(resumed, first)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            stage_two = self.root / "stage-two-prompt.txt"
+            _ = stage_two.write_text("Phase 3 — Retry handling\nComplete the second review stage.\n")
+            second_stage = progress_history.begin_dispatch(
+                session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
+                launcher_command=command, prompt=stage_two, kind="broad", lens="contract",
+            )
+            self.assertEqual(second_stage, first)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            self.finish_slot_pass(session, "impl2", "completed", 41_030)
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            finished = progress_history.begin_dispatch(
+                session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
+                launcher_command=command, prompt=prompt, kind="broad", lens="contract",
+            )
+            self.assertEqual(finished, first)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        record = self.pass_slots(session)["impl2"]
+        self.assertEqual((record["kind"], record["worker_name"], record["status"]), ("review", "impl2", "completed"))
+        self.assertEqual(record["launcher_command"], command)
+        self.assertEqual(len(self.pass_events("dispatch-api", "pass_started")), 1)
+        self.assertEqual(len(self.pass_events("dispatch-api", "pass_finished")), 1)
+
+    def test_dispatch_worker_recovers_the_active_and_completed_worker_without_writes(self) -> None:
+        session = self.start_run("dispatch-worker", 41_000)
+        self.start_phase(session, 41_010)
+        prompt = self.root / "retry-prompt.txt"
+        _ = prompt.write_text("Phase 3 — Retry handling\nRead the requested files.\n")
+        command = ["bash", "assign.sh", "review", str(prompt)]
+        with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
+                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+            instance = progress_history.begin_dispatch(
+                session, slot="test", phase="3", role="review", worker_name="impl2",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
+                launcher_command=command, prompt=prompt, kind="broad", lens="contract",
+            )
+            for status in ("active", "completed"):
+                with self.subTest(status=status):
+                    if status == "completed":
+                        self.finish_slot_pass(session, "test", "completed", 41_030)
+                    before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                              for path in session.rglob("*") if path.is_file()}
+                    result = progress_history.dispatch_worker(
+                        session, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command,
+                    )
+                    self.assertEqual(result, progress_history.MatchedDispatch("impl2", instance))
+                    for changed_prompt, changed_command in (
+                        (self.root / "different-prompt.txt", command),
+                        (prompt, [*command, "--new-dispatch"]),
+                    ):
+                        result = progress_history.dispatch_worker(
+                            session, slot="test", phase="3", role="review",
+                            prompt=changed_prompt, launcher_command=changed_command,
+                        )
+                        self.assertIsInstance(result, progress_history.NoMatchedDispatch)
+                    self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                      for path in session.rglob("*") if path.is_file()}, before)
+            missing = self.root / "no-recorder-state"
+            before_paths = set(self.root.rglob("*"))
+            self.assertIsInstance(progress_history.dispatch_worker(
+                missing, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command,
+            ), progress_history.NoMatchedDispatch)
+            self.assertEqual(set(self.root.rglob("*")), before_paths)
+
+    def test_fix_dispatch_requires_and_records_the_launcher_repair_metadata(self) -> None:
+        session = self.start_run("fix-dispatch", 41_000)
+        self.start_phase(session, 41_010)
+        prompt = self.root / "repair-prompt.txt"
+        _ = prompt.write_text("Phase 3 — Retry handling\nRepair the failed gate.\n")
+        command = ["bash", "implement.sh", "--role", "fix", str(prompt)]
+        with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
+                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+            with self.assertRaisesRegex(SystemExit, "Fix launch has no ledger round"):
+                _ = progress_history.begin_dispatch(
+                    session, slot="test", phase="3", role="fix", worker_name="fix",
+                    worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
+                    launcher_command=command, prompt=prompt, kind="implementation", lens="",
+                )
+            self.assertEqual(self.pass_slots(session), {})
+            instance = progress_history.begin_dispatch(
+                session, slot="test", phase="3", role="fix", worker_name="fix",
+                worker_id=staff.StaffId(fixture_runtime_id("dispatch-worker")),
+                launcher_command=command, prompt=prompt, kind="implementation", lens="",
+                fix_cause="The recorder gate failed", fix_pass=2, activity="repair the recorder gate",
+            )
+        record = self.pass_slots(session)["test"]
+        self.assertEqual(record["instance_id"], instance)
+        self.assertEqual((record["fix_pass"], record["activity"]), (2, "repair the recorder gate"))
+        started, = self.pass_events("fix-dispatch", "pass_started")
+        self.assertEqual(cast(dict[str, object], started["launch_check"])["fix_cause"], "The recorder gate failed")
 
     def test_three_slots_each_record_a_start_and_a_finish_of_their_own(self) -> None:
         """The whole team's work reaches the ledger, in the order it happened."""
@@ -4829,6 +5129,37 @@ with patch.object(fcntl, "flock", admission):
             expected,
         )
 
+    def test_the_review_writer_preserves_caller_counts_and_phase_identity(self) -> None:
+        self.write_full_config()
+        session = self.start_run("shared-review-writer", 71_200)
+        self.start_phase(session, 71_210)
+        state = self.read_state(session)
+        phase = cast(dict[str, object], state["phase"])
+        metadata = {"unit": "unit Ω", "phase": phase["id"], "phase_instance_id": phase["instance_id"],
+                    "history_file": state["history_file"]}
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+            for number, lens, status, raised in ((1, "contract", "reviewed", 3), (2, "", "error", 7),
+                                                (1, "ux", "void", 2), (1, "contract", "reviewed", 0)):
+                progress_history.write_review_turn(session, metadata, reviewer="reviewer Ω", thread_id="thread",
+                                                   lens=lens, pass_number=number, started_at=71_220,
+                                                   status=status, raised=raised,
+                                                   details={"pool": "pool", "lease_ordinal": 0, "prime_hash": ""})
+        records = [cast(dict[str, object], json.loads(path.read_text()))
+                   for path in (self.history_dir / "review_turns" / session.name).glob("*.json")]
+        self.assertCountEqual([record["raised"] for record in records], [3, 7, 2, 0])
+        self.assertCountEqual([record["kind"] for record in records], ["broad", "closure", "ux", "broad"])
+        self.assertCountEqual([record["status"] for record in records], ["reviewed", "error", "void", "reviewed"])
+        self.assertTrue(all(record["phase_instance_id"] == phase["instance_id"] for record in records))
+        self.assertTrue(all(record["unit"] == "unit Ω" and record["reviewer"] == "reviewer Ω" for record in records))
+        self.assertTrue(all(record["pool"] == "pool" and record["lease_ordinal"] == 0 and record["prime_hash"] == ""
+                            for record in records))
+        self.assertTrue(all(record["pass"] == 2 for record in records if record["kind"] == "closure"))
+        self.assertTrue(all(cast(float, record["finished_at"]) >= cast(int, record["started_at"]) for record in records))
+        self.assertIn("code 3 findings", self.run_command("review-trial", "--session-dir", str(session), at=71_300))
+        _ = self.run_command("finish-phase", "--session-dir", str(session), "--status", "completed", at=71_310)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "next", "--phase-title", "Next", at=71_320)
+        self.assertIn("code 0 findings", self.run_command("review-trial", "--session-dir", str(session), at=71_330))
+
     def phase_review_records(self, session: Path) -> tuple[str, Path]:
         state = self.read_state(session)
         instance = cast(str, cast(dict[str, object], state["phase"])["instance_id"])
@@ -4849,71 +5180,22 @@ with patch.object(fcntl, "flock", admission):
         return (f"review trial: ux 0 findings, code {code_findings} findings, "
                 f"review-worker minutes {review_minutes}, ux check minutes 0, ux repair minutes 0")
 
-    def test_review_trial_shows_simplify_metrics_only_for_the_phase_with_a_review_record(self) -> None:
-        self.write_full_config()
-        started_at = 71_300
-        session = self.start_run("simplify-review-metrics", started_at)
-        self.start_phase(session, started_at + 10)
-        instance, records = self.phase_review_records(session)
-        legacy = self.trial_line()
-        for name, phase, status, raised, elapsed, expected in (
-            ("other-phase", "other-instance", "reviewed", 9, 600, legacy),
-            ("failed", instance, "error", 7, 60, legacy + ", simplify 0 findings, simplify minutes 1"),
-            ("reviewed", instance, "reviewed", 3, 90, legacy + ", simplify 3 findings, simplify minutes 3"),
-        ):
-            with self.subTest(record=name):
-                self.write_review_record(records, name, phase, lens="simplify", status=status,
-                                         raised=raised, started_at=started_at + 20, elapsed=elapsed)
-                self.assertEqual(self.run_command("review-trial", "--session-dir", str(session), at=started_at + 700),
-                                 expected)
-
-    def test_review_trial_counts_a_simplify_finding_without_a_review_record_separately_from_code(self) -> None:
-        self.write_full_config()
-        started_at = 71_400
-        session = self.start_run("simplify-finding-metrics", started_at)
-        self.start_phase(session, started_at + 10)
-        _ = self.run_findings(session, "open", "--severity", "minor", "--title", "Reuse the phase helper",
-                              "--caught-by", "worker", "--lens", "simplify", at=started_at + 20)
-        self.assertEqual(self.run_command("review-trial", "--session-dir", str(session), at=started_at + 30),
-                         self.trial_line() + ", simplify 1 findings, simplify minutes 0")
-
-    def test_review_trial_reads_one_snapshot_for_code_and_simplify_counts(self) -> None:
+    def test_review_trial_reads_one_snapshot_for_code_counts(self) -> None:
         self.write_full_config()
         session = self.start_run("review-snapshot", 71_500)
         self.start_phase(session, 71_510)
         instance, records = self.phase_review_records(session)
-        _ = self.run_findings(session, "open", "--severity", "minor", "--title", "Director item",
-                              "--caught-by", "worker", "--lens", "simplify", at=71_520)
         for name, lens, status, raised in (
             ("code", "contract", "reviewed", 4),
             ("ux", "ux", "reviewed", 7),
-            ("simplify", "simplify", "reviewed", 0),
-            ("failed", "simplify", "error", 8),
         ):
             self.write_review_record(records, name, instance, lens=lens, status=status,
                                      raised=raised, started_at=71_520, elapsed=60)
         with patch.object(progress_history, "_phase_review_records",
                           wraps=progress_history._phase_review_records) as reads:  # pyright: ignore[reportPrivateUsage]
             trial = self.run_command("review-trial", "--session-dir", str(session), at=71_600)
-        self.assertEqual(trial, self.trial_line(code_findings=4) + ", simplify 0 findings, simplify minutes 2")
+        self.assertEqual(trial, self.trial_line(code_findings=4))
         reads.assert_called_once_with(session, instance)
-
-    def test_simplify_pass_minutes_do_not_count_as_review_worker_minutes(self) -> None:
-        self.write_full_config()
-        session = self.start_run("separate-review-minutes", 71_700)
-        self.start_phase(session, 71_710)
-        instance, records = self.phase_review_records(session)
-        # The slot name must not determine which metric receives the time.
-        for slot, task, elapsed, status in (
-            ("review-simplify", "direct.review", 120, "completed"),
-            ("claude-review", "direct.simplify", 180, "error"),
-        ):
-            self.start_slot_pass(session, slot, "review", 71_720, "gpt-called", 0, "--called-task", task)
-            self.finish_slot_pass(session, slot, status, 71_720 + elapsed)
-        self.write_review_record(records, "simplify", instance, lens="simplify", status="error",
-                                 raised=0, started_at=71_720, elapsed=180)
-        self.assertEqual(self.run_command("review-trial", "--session-dir", str(session), at=72_000),
-                         self.trial_line(review_minutes=2) + ", simplify 0 findings, simplify minutes 3")
 
     def test_review_trial_counts_each_code_finding_once(self) -> None:
         self.write_full_config()
@@ -5471,14 +5753,6 @@ with patch.object(fcntl, "flock", admission):
             at=at,
         )
 
-    def test_an_armed_review_recognizes_the_simplify_status_writer(self) -> None:
-        from scripts.lib.atomic_file import write_text_atomic
-
-        status = self.root / "review_status_simplify"
-        write_text_atomic(status, "reviewing\n")
-        working = cast(Callable[[dict[str, object]], bool], vars(progress_history)["_early_reviewer_working"])
-        self.assertTrue(working({"status_file": str(status), "started_at": 0}))
-
     def test_an_early_review_naming_its_phase_watches_that_phase_directory(self) -> None:
         """`review.sh --phase` writes its status there, so the marker must watch the same file."""
         self.write_models_registry()
@@ -5669,6 +5943,7 @@ with patch.object(fcntl, "flock", admission):
         )
         self.assertNotEqual(failure.returncode, 0)
         self.assertIn("a pass must be open", failure.stderr)
+        self.assertIn("launch it through assign.sh", failure.stderr)
 
     def test_an_activity_records_its_own_identity_not_the_finished_pass(self) -> None:
         """A finished pass stays in state; it used to stamp every later event."""
@@ -5870,7 +6145,7 @@ with patch.object(fcntl, "flock", admission):
         _ = (session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
         native = fixture_runtime_id("main-repaired")
         owner = fixture_member("showrunner", name="repair-owner")
-        unit = fixture_member("unit", name="repair-unit", parent=owner.id, runtime_id=native)
+        unit = fixture_member("unit", name="repair", parent=owner.id, runtime_id=native)
         worker = fixture_worker("repair-worker", unit.id)
         _ = (session_dir / "mesh_roster.json").write_text(json.dumps({worker.name: {"staff_id": worker.id}}))
         self.write_claude_transcript(native, "sonnet-5", "low")
@@ -6997,7 +7272,7 @@ with patch.object(fcntl, "flock", admission):
         sessions_dir = self.root / "notifier-sessions"
         _ = fake_showrunner.write_timer(
             notifier_dir,
-            "example",
+            "Example",
             recorded_showrunner("Example", production_doc).current_session,
             "UTC",
             production_doc,
@@ -7024,19 +7299,19 @@ with patch.object(fcntl, "flock", admission):
         ):
             report = self.run_progress(session_dir, at=started_at + 100)
 
-        note = vault_root / "example-showrunner" / "unit-a-unit.md"
+        note = vault_root / "example-showrunner" / "unit-a.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         unit = staff.snapshot().by_path("Example/unit-a")
         assert unit is not None
         self.assertEqual(note.read_text(encoding="utf-8").splitlines()[:8], [
             "---", "phase_table: true", f"unit: {unit.id}",
-            'now: "Phase 3 of 1 — Retry handling"', "---", "", "# unit-a-unit", "",
+            'now: "Phase 3 of 1 — Retry handling"', "---", "", "# unit-a", "",
         ])
         self.assertIn("**Phase 3 of 1 — Retry handling**", note.read_text(encoding="utf-8"))
         self.assertIn("| Phase 3 |", report)
         self.assertEqual(
             [path.relative_to(vault_root) for path in vault_root.rglob("*.md")],
-            [Path("example-showrunner/unit-a-unit.md")],
+            [Path("example-showrunner/unit-a.md")],
         )
         self.assertEqual(
             {path.relative_to(self.history_dir) for path in self.history_dir.rglob("*")},
@@ -7077,7 +7352,7 @@ with patch.object(fcntl, "flock", admission):
         sessions_dir = self.root / "notifier-sessions"
         _ = fake_showrunner.write_timer(
             notifier_dir,
-            "example",
+            "Example",
             recorded_showrunner("Example", production_doc).current_session,
             "UTC",
             production_doc,
@@ -7103,7 +7378,7 @@ with patch.object(fcntl, "flock", admission):
         )
 
         self.assertEqual(result, "ETA recorded: 13:00 UTC")
-        note = vault_root / "example-showrunner" / "unit-a-unit.md"
+        note = vault_root / "example-showrunner" / "unit-a.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         note_text = note.read_text(encoding="utf-8")
         self.assertIn("phase_table: true", note_text)
@@ -7805,11 +8080,11 @@ class PublicPhaseHelperTests(unittest.TestCase):
                 ["3", "4", "5"],
             ),
             (
-                "phases-unit Phase 11 (the wait-holder field and the phase origin fields) "
+                "phases Phase 11 (the wait-holder field and the phase origin fields) "
                 + "merged into sdlc; sdlc said 2026-10-29 its ETA is 19:00 EDT.",
                 [],
             ),
-            ("Phase 7; postmaster-unit's reply record (main abc8344f)", ["7"]),
+            ("Phase 7; postmaster's reply record (main abc8344f)", ["7"]),
             ("Phase 19 (numbering only)", ["19"]),
             ("Phase 10b, Phase 11", ["10b", "11"]),
             ("none", []),
@@ -7838,9 +8113,9 @@ class PublicPhaseHelperTests(unittest.TestCase):
     def test_plan_dependencies_skip_other_unit_spans_but_keep_local_references(self) -> None:
         plan = self.root / "dependencies.md"
         for external in (
-            "phases-unit Phase 11",
-            "models-unit's phase 4",
-            "models-unit’s Phases 4, 5 and 6",
+            "phases Phase 11",
+            "models's phase 4",
+            "models’s Phases 4, 5 and 6",
         ):
             with self.subTest(external=external):
                 _ = plan.write_text(
@@ -8052,7 +8327,182 @@ class EtaWorkClockTests(unittest.TestCase):
         self.assertAlmostEqual(cast(float, sample["temporal_percent"]), expected, places=3)
 
 
+class LastDispatchTests(StaffTestCase):
+    def dispatch_fixture(self, passes: dict[str, object]) -> tuple[Path, staff.StaffRow]:
+        _, unit, _ = self.tree()
+        worker = fixture_worker("dispatch-worker", unit.id)
+        run = Path(os.environ["ROSTER_RUN_ROOT"]) / "dispatch-run"
+        for value in passes.values() if "instance_id" not in passes else (passes,):
+            if isinstance(value, dict):
+                _ = cast(dict[str, object], value).setdefault("status", "completed")
+        self.write_json(run / unit_runs.STATE_FILE,
+                        {"main_agent": {"session_id": unit.current_session}, "pass": passes})
+        self.enterContext(patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.root / "usage")}))
+        return run, worker
+
+    def test_last_dispatch_returns_the_latest_record_for_the_staff_worker(self) -> None:
+        run, worker = self.dispatch_fixture({
+            "impl": {"instance_id": "first", "worker_name": "former-name", "kind": "impl",
+                     "started_at": 1, "phase": {"id": "3t"}},
+            "test": {"instance_id": "last", "worker_name": "former-name", "kind": "test",
+                     "started_at": 2, "phase": {"id": "3t"}, "paths": "/explicit/paths.txt"},
+            "other": {"instance_id": "peer", "worker_name": "another-worker", "kind": "fix",
+                      "started_at": 3, "phase": {"id": "4"}},
+        })
+        path = run / unit_runs.STATE_FILE
+        state = cast(dict[str, object], json.loads(path.read_text()))
+        passes = cast(dict[str, dict[str, object]], state["pass"])
+        for slot in ("impl", "test"):
+            passes[slot]["worker_id"] = worker.id
+        self.write_json(path, state)
+        _ = staff.rename(worker.id, "renamed-worker")
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        current = staff.native_id(fixture_runtime_id("dispatch-new-session"))
+        _ = staff.update_current_session(worker.id, current)
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "test", "3t", progress_history.DispatchDetailNotRecorded.UNRECORDED, "/explicit/paths.txt", "last", "completed"))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_last_dispatch_reports_no_dispatch_without_a_pass_or_role(self) -> None:
+        run, worker = self.dispatch_fixture({})
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
+        (run / unit_runs.STATE_FILE).unlink()
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
+
+    def test_last_dispatch_keeps_the_role_and_id_of_a_refused_fix_after_a_completed_review(self) -> None:
+        run, worker = self.dispatch_fixture({
+            "review": {"instance_id": "review-pass", "worker_name": "dispatch-worker", "kind": "review",
+                       "started_at": 1, "finished_at": 2, "status": "completed", "phase": {"id": "14f"}},
+            "fix": {"instance_id": "refused-fix", "worker_name": "dispatch-worker", "kind": "fix",
+                    "started_at": 3, "status": "refused", "phase": {"id": "14f"}},
+        })
+        path = run / unit_runs.STATE_FILE
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "fix", "14f", missing, str(run / "phases/14f/files"), "refused-fix", "refused"))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_last_dispatch_reads_the_older_single_pass_shape(self) -> None:
+        run, worker = self.dispatch_fixture({"instance_id": "old", "worker_name": "dispatch-worker",
+                                             "kind": "impl", "phase": {"id": "3t"}})
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "impl", "3t", progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            str(run / "phases/3t/files"), "old", "completed"))
+
+    def test_last_dispatch_uses_the_canonical_directory_for_a_phase_with_spaces(self) -> None:
+        run, worker = self.dispatch_fixture({"instance_id": "ad-hoc", "worker_name": "dispatch-worker",
+                                             "kind": "fix", "phase": {"id": "ad hoc"}})
+        path = phase_reservation.phase_directory(run, "ad hoc") / phase_reservation.FILES_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("src/fix.py\n")
+        dispatch = progress_history.last_dispatch(worker.id)
+        self.assertIsInstance(dispatch, progress_history.RecordedDispatch)
+        assert isinstance(dispatch, progress_history.RecordedDispatch)
+        self.assertEqual(dispatch.paths, str(path))
+        assert isinstance(dispatch.paths, str)
+        self.assertEqual(Path(dispatch.paths).read_text(), "src/fix.py\n")
+
+    def test_last_dispatch_has_no_phase_when_the_worker_has_two_phases(self) -> None:
+        worker = self.dispatch_fixture({
+            "impl": {"instance_id": "first", "worker_name": "dispatch-worker", "kind": "impl",
+                     "started_at": 1, "phase": {"id": "3t"}},
+            "test": {"instance_id": "last", "worker_name": "dispatch-worker", "kind": "test",
+                     "started_at": 2, "phase": {"id": "4"}},
+        })[1]
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "test", progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            progress_history.DispatchDetailNotRecorded.UNRECORDED,
+            progress_history.DispatchDetailNotRecorded.UNRECORDED, "last", "completed"))
+
+    def test_last_dispatch_reads_the_review_lens_from_the_shared_role_log(self) -> None:
+        from scripts.usage import agents_log
+
+        worker = self.dispatch_fixture({"review": {
+            "instance_id": "review", "worker_name": "dispatch-worker", "kind": "review", "phase": {"id": "3t"}}})[1]
+        agents_log.append(worker.current_session, "review", "contract", datetime.now(UTC))
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "review", "3t", "contract", progress_history.DispatchDetailNotRecorded.UNRECORDED, "review", "completed"))
+
+    def test_last_dispatch_matches_a_name_only_when_the_pass_has_no_worker_id(self) -> None:
+        worker = self.dispatch_fixture({
+            "old": {"instance_id": "legacy", "worker_name": "dispatch-worker", "kind": "test", "started_at": 1},
+            "peer": {"instance_id": "peer", "worker_id": fixture_runtime_id("another-worker"),
+                     "worker_name": "dispatch-worker", "kind": "fix", "started_at": 2},
+        })[1]
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "test", missing, missing, missing, "legacy", "completed"))
+        _ = staff.rename(worker.id, "renamed-worker")
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.NoDispatchRecorded())
+
+    def test_last_dispatch_finds_the_newest_open_pass_in_another_parent_run(self) -> None:
+        run, worker = self.dispatch_fixture({"first": {
+            "instance_id": "first", "worker_name": "dispatch-worker", "kind": "impl", "started_at": 1}})
+        owner = cast(dict[str, object], json.loads((run / unit_runs.STATE_FILE).read_text()))["main_agent"]
+        second = run.with_name("second-run")
+        self.write_json(second / unit_runs.STATE_FILE, {"main_agent": owner, "pass": {
+            "finished": {"instance_id": "second", "worker_id": worker.id, "kind": "review",
+                         "started_at": 2, "finished_at": 4, "status": "error", "lens": "contract"},
+            "open": {"instance_id": "open", "worker_id": worker.id, "kind": "fix",
+                     "started_at": 5, "status": "active"}}})
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(progress_history.last_dispatch(worker.id), progress_history.RecordedDispatch(
+            "fix", missing, missing, missing, "open", "active"))
+
+    def test_last_dispatch_filters_another_parent_before_directory_and_history_reads(self) -> None:
+        run, worker = self.dispatch_fixture({"finished": {
+            "instance_id": "finished", "worker_id": "", "worker_name": "dispatch-worker", "kind": "test"}})
+        parent = fixture_member("unit", name="other-parent", parent=fixture_member("showrunner", name="other-owner").id,
+                                worktree=staff.PresentWorktree("natedev", self.root))
+        history = self.root / "unreadable-history.jsonl"
+        _ = history.write_bytes(b"\xff\n")
+        self.write_json(run.with_name("other-run") / unit_runs.STATE_FILE, {
+            "owner_staff_id": parent.id, "main_agent": {"session_id": parent.current_session},
+            "status": "active", "history_file": str(history)})
+        self.write_json(run.with_name("unavailable-owner") / unit_runs.STATE_FILE, {
+            "owner_staff_id": fixture_runtime_id("unavailable-dispatch-owner"), "history_file": str(history)})
+        calls = self.root / "git-calls"
+        _ = calls.write_text("")
+        binaries = self.root / "dispatch-bin"
+        binaries.mkdir()
+        git = binaries / "git"
+        _ = git.write_text('#!/bin/sh\nprintf "git\\n" >> "$DISPATCH_GIT_CALLS"\nexit 1\n')
+        git.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": str(binaries), "DISPATCH_GIT_CALLS": str(calls)}):
+            dispatch = progress_history.last_dispatch(worker.id)
+        missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
+        self.assertEqual(dispatch, progress_history.RecordedDispatch("test", missing, missing, missing, "finished", "completed"))
+        self.assertEqual(calls.read_text(), "")
+
+
 class StaffProgressHistoryTests(StaffTestCase):
+    def test_selected_events_follow_staff_for_multiple_worktrees_without_parsing_other_events(self) -> None:
+        owner = fixture_member("showrunner", name="records")
+        first, second = self.root / "first", self.root / "second"
+        row = fixture_member("unit", name="first", parent=owner.id,
+                             worktree=staff.PresentWorktree("natedev", first))
+        runs = self.root / "history/runs"
+        runs.mkdir(parents=True)
+        events = [
+            {"schema_version": 1, "event_type": "checkpoint", "owner_staff_id": row.id,
+             "checkpoint_commit": "first", "timestamp_epoch": 3},
+            {"schema_version": 1, "event_type": "phase_started", "working_dir": str(second), "timestamp_epoch": 1},
+            {"schema_version": 99, "event_type": "checkpoint", "working_dir": str(second), "timestamp_epoch": 0},
+            {"schema_version": 1, "event_type": "checkpoint", "working_dir": str(self.root / "other"), "timestamp_epoch": 2},
+        ]
+        compact = json.dumps(events[0], separators=(",", ":"))
+        _ = (runs / "a.jsonl").write_text(compact + "\n" + json.dumps(events[1]) + "\n")
+        _ = (runs / "b.jsonl").write_text("\n".join(json.dumps(event) for event in events[2:]) +
+                                            '\n{"event_type":"progress_reported",broken JSON}\n')
+        decode = cast(Callable[[str], dict[str, object] | None], getattr(progress_history, "_json_object"))
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(runs.parent)}), \
+             patch.object(progress_history, "_json_object", wraps=decode) as parsed:
+            found = progress_history.events_for_worktrees((first, second), frozenset({"checkpoint", "phase_started"}))
+        self.assertEqual([event["timestamp_epoch"] for event in found], [1, 3])
+        self.assertEqual([event["working_dir"] for event in found], [str(second), str(first)])
+        self.assertEqual(parsed.call_count, 4)
+
     def test_fixed_run_owner_survives_clear_and_uses_the_current_staff_folder_and_git_branch(self) -> None:
         owner = fixture_member("showrunner", name="progress")
         first, second = self.root / "first", self.root / "second"

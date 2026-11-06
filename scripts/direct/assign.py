@@ -5,10 +5,10 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
-import itertools
 import os
 import re
 import signal
+import shlex
 import socket
 import subprocess
 import sys
@@ -21,16 +21,17 @@ from types import FrameType
 from typing import NoReturn, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.astra import design_roles
+from scripts.astra import astra_roles
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
-from scripts.direct import phase_reservation, workers
-from scripts.direct.worker_state import worker_claim_lock, worker_record_path
+from scripts.direct import phase_reservation, progress_history, simplify_daily, workers
+from scripts.direct.worker_state import worker_claim_lock, worker_record_path, worker_status_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import style_review
-from scripts.usage.agents_log import LENSES
+from scripts.usage.agents_log import PHASE_REVIEW_LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
 PYTHON = str(SCRIPTS / "../lib/py")
@@ -47,40 +48,12 @@ We believe in three gods, Simple, Fast and Beautiful, with correctness as the fl
 
 class AssignmentOperation(StrEnum):
     DISPATCH = "dispatch"
-    PRIME = "prime"
-    FOLLOW = "follow"
-    RESIDENT = "resident"
     ADOPT = "adopt"
     RESUME_ACCOUNT_MOVE = "resume-account-move"
+    ASTRA_REVIEW = "astra-review"
 
 
 RECOVERY_OPERATIONS = (AssignmentOperation.ADOPT, AssignmentOperation.RESUME_ACCOUNT_MOVE)
-
-
-@dataclass(frozen=True)
-class NoHeldAssignment:
-    """The assignment uses the normal worker policy."""
-
-
-@dataclass(frozen=True)
-class ReservedHeldCreation:
-    """The holder reserved this token before thread creation."""
-    token: str
-
-
-@dataclass(frozen=True)
-class ExistingHeldThread:
-    """The holder retains this recorded thread identity."""
-    thread_id: str
-
-
-@dataclass(frozen=True)
-class HeldAssignment:
-    """The design store supplies the identity, claim, and access policy."""
-    design: design_roles.HeldDesign
-    member: design_roles.RoleInstance
-    claim: ReservedHeldCreation | ExistingHeldThread
-    access: design_roles.ThreadAccessPolicy
 
 
 @final
@@ -91,6 +64,7 @@ class Arguments(argparse.Namespace):
     model: str = ""
     effort: str = ""
     summary: str = ""
+    log: str = ""
     fix_cause: str = ""
     paths: str = ""
     phase: str = ""
@@ -101,15 +75,9 @@ class Arguments(argparse.Namespace):
     prompt: str = ""
     cwd: str = ""
     lens: str = ""
-    diff: str = ""
     pass_number: int = 1
     image: list[str] = []
     operation: AssignmentOperation = AssignmentOperation.DISPATCH
-    held_design: str = ""
-    held_role: str = ""
-    family: str = ""
-    log: str = ""
-    id_file: str = ""
     from_session_dir: str = ""
 
 
@@ -149,48 +117,41 @@ def call(command: list[str], env: dict[str, str], *, capture: bool = False,
 def parse_arguments() -> Arguments:
     parser = argparse.ArgumentParser(prog="assign.sh", allow_abbrev=False)
     _ = parser.add_argument("--role", required=True,
-                            choices=("implement", "test", "fix", "review", "research", "propose"))
+                            choices=("implement", "test", "fix", "review", "research", "propose", "simplify"))
     _ = parser.add_argument("--operation", type=AssignmentOperation, choices=tuple(AssignmentOperation),
                             default=AssignmentOperation.DISPATCH)
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
     _ = choice.add_argument("--new-worker", default="")
-    for option in ("model", "effort", "summary", "fix-cause", "paths", "phase", "early-ready", "session-dir",
-                   "style-since", "style-until", "held-design", "log", "id-file", "from-session-dir"):
+    for option in ("model", "effort", "summary", "log", "fix-cause", "paths", "phase", "early-ready", "session-dir",
+                   "style-since", "style-until", "from-session-dir"):
         _ = parser.add_argument("--" + option, default="")
-    _ = parser.add_argument("--held-role", choices=("designer", "reviewer"), default="")
-    _ = parser.add_argument("--family", choices=("codex", "claude"), default="")
     _ = parser.add_argument("--prompt", default="")
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
-    _ = parser.add_argument("--lens", choices=LENSES, default="")
-    _ = parser.add_argument("--diff", default="", help="saved phase diff for the simplify lens")
+    _ = parser.add_argument("--lens", choices=PHASE_REVIEW_LENSES, default="")
     _ = parser.add_argument("--pass", dest="pass_number", type=int, default=1)
     _ = parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args(namespace=Arguments())
+    if args.role == "simplify":
+        if not args.session_dir:
+            parser.error("simplify requires --session-dir")
+        return args
     if args.role in ("research", "propose"):
         parser.error(f"{args.role} is not available until Phase 6")
     if not args.prompt and args.operation not in RECOVERY_OPERATIONS:
         parser.error("--prompt is required")
-    if bool(args.held_design) != bool(args.held_role):
-        parser.error("--held-design and --held-role are required together")
-    if args.operation in (AssignmentOperation.PRIME, AssignmentOperation.FOLLOW) and not args.held_design:
-        parser.error("prime and follow require a held design")
-    if args.held_design and args.operation not in (AssignmentOperation.PRIME, AssignmentOperation.FOLLOW):
-        parser.error("held designs require prime or follow")
-    if args.operation in (AssignmentOperation.PRIME, AssignmentOperation.RESIDENT) and not args.new_worker:
-        parser.error("prime and resident require --new-worker")
-    if args.operation in (*RECOVERY_OPERATIONS, AssignmentOperation.FOLLOW) and not args.to:
-        parser.error("follow and recovery require --to")
-    if args.operation == AssignmentOperation.RESIDENT and args.role != "review":
-        parser.error("resident requires --role review")
-    if args.operation != AssignmentOperation.RESIDENT and (args.family or args.id_file):
-        parser.error("--family and --id-file require resident")
+    if args.operation == AssignmentOperation.ASTRA_REVIEW and not args.new_worker:
+        parser.error("astra-review requires --new-worker")
+    if args.operation == AssignmentOperation.ASTRA_REVIEW and args.role != "review":
+        parser.error("astra-review requires --role review")
+    if args.operation in RECOVERY_OPERATIONS and not args.to:
+        parser.error("recovery requires --to")
     if args.operation == AssignmentOperation.ADOPT and not args.from_session_dir:
         parser.error("adopt requires --from-session-dir")
     if args.from_session_dir and args.operation != AssignmentOperation.ADOPT:
         parser.error("--from-session-dir requires adopt")
-    if args.operation in RECOVERY_OPERATIONS and not args.session_dir:
-        parser.error("recovery requires --session-dir")
+    if args.operation in (*RECOVERY_OPERATIONS, AssignmentOperation.ASTRA_REVIEW) and not args.session_dir:
+        parser.error("recovery and astra-review require --session-dir")
     if args.operation != AssignmentOperation.DISPATCH and (args.lens or args.early_ready or args.style_since):
         parser.error("review stages require the dispatch operation")
     for address in (args.to, args.new_worker):
@@ -204,12 +165,6 @@ def parse_arguments() -> Arguments:
         parser.error("--style-since requires a final-diff review")
     if args.style_until and not args.style_since:
         parser.error("--style-until requires --style-since")
-    if args.lens == "simplify" and (args.role != "review" or args.early_ready or args.style_since):
-        parser.error("simplify requires a broad review of the completed phase diff")
-    if args.lens == "simplify" and not args.diff:
-        parser.error("--diff is required with --lens simplify")
-    if args.diff and args.lens != "simplify":
-        parser.error("--diff requires --lens simplify")
     return args
 
 
@@ -232,76 +187,6 @@ def authorized_paths(args: Arguments, cwd: Path) -> list[str]:
     if not paths:
         refuse("--paths must contain at least one path")
     return paths
-
-
-def held_assignment(args: Arguments) -> NoHeldAssignment | HeldAssignment:
-    if not args.held_design:
-        return NoHeldAssignment()
-    try:
-        design = design_roles.read_design(args.held_design)
-    except (OSError, ValueError) as error:
-        refuse(str(error))
-    if design.placement.host != design_roles.local_host():
-        refuse("the held design belongs to another host")
-    member = next((member for member in design.roles if member.role == args.held_role), None)
-    if member is None or member.name != (args.to or args.new_worker):
-        refuse("the held design does not reserve this worker")
-    if not isinstance(member.lifecycle, design_roles.RoleNotOpened):
-        try:
-            record = staff.snapshot()
-            owner = design_roles.worker_parent(design, member.role, record)
-            caller = worker_admission.parent(record, staff_id=staff.runtime_id())
-        except (OSError, ValueError) as error:
-            refuse(str(error))
-        if owner.id != caller.id:
-            refuse("only the current design worker parent may assign a held worker")
-    if args.role != ("implement" if member.role == "designer" else "review"):
-        refuse("--role differs from the held role")
-    if (Path(args.cwd).resolve() != Path(design.repository).resolve()
-            or Path(args.session_dir).resolve() != design_roles.mesh_directory(args.held_design).resolve()):
-        refuse("the held design requires its recorded worktree and mesh")
-    if args.paths:
-        refuse("the held design supplies its access policy; --paths is refused")
-    claim: ReservedHeldCreation | ExistingHeldThread
-    if args.operation == AssignmentOperation.PRIME:
-        if not isinstance(member.lifecycle, design_roles.RoleNotOpened) or not member.lifecycle.claim:
-            refuse("held thread creation requires its reserved creation claim")
-        claim = ReservedHeldCreation(member.lifecycle.claim)
-    else:
-        if isinstance(member.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
-            refuse("the held design has no active thread")
-        claim = ExistingHeldThread(member.lifecycle.thread_id)
-        if session_staff.worker_session(read_roster(Path(args.session_dir), member.name)) != claim.thread_id:
-            refuse("the held thread differs from the mesh identity")
-    return HeldAssignment(design, member, claim, design_roles.access_policy(design, member.role))
-
-
-def recover_arguments(args: Arguments) -> None:
-    """Use the recorded worker context for lifecycle recovery."""
-    if args.operation not in RECOVERY_OPERATIONS:
-        return
-    source = Path(args.from_session_dir or args.session_dir).expanduser().resolve()
-    record = read_roster(source, args.to)
-    role = "impl" if args.role == "implement" else args.role
-    session = session_staff.worker_session(record)
-    task = codex_mesh.task_role(session, codex_mesh.task_assignments())
-    if not session or not isinstance(task, codex_mesh.AssignedWorkerRole) or task.role != role:
-        refuse("recovery requires an existing worker with the recorded role")
-    if not args.prompt:
-        saved = text(record.get("instructions_file"))
-        if saved and Path(saved).is_file():
-            args.prompt = saved
-        else:
-            run = Path(args.session_dir).expanduser().resolve()
-            run.mkdir(parents=True, exist_ok=True)
-            prompt = run / f"{args.to}.assign-recovery.txt"
-            _ = prompt.write_text(codex_mesh.ACCOUNT_MOVE_CONTINUATION, encoding="utf-8")
-            args.prompt = str(prompt)
-    state = read_object(source / "progress_history_state.json")
-    if args.cwd == str(Path.cwd()):
-        args.cwd = text(record.get("cwd")) or text(state.get("working_dir")) or args.cwd
-    if not args.phase:
-        args.phase = text(object_map(state.get("phase")).get("id"))
 
 
 def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> tuple[Path, str]:
@@ -338,18 +223,18 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
 
 
 def resolve_model(args: Arguments, role: str, env: dict[str, str]) -> tuple[str, str, str, str]:
-    task = (f"design_roles.{args.held_role}" if args.held_design else
-            "ask_a_friend.consultation" if args.operation == AssignmentOperation.RESIDENT else f"direct.{role}")
-    result = call(["bash", "-c", '''source "$1"; agents_resolve "$2" || exit 2
+    task = f"direct.{role}"
+    result = call(["bash", "-c", '''source "$1"; models_launch_configuration || exit 2; agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_MODEL}"
  [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
  [[ -z "$4" ]] || pair="${pair%%:*}:$4"
  _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
-printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"
+printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}" "$MODELS_LAUNCH_CONFIGURATION"
 ''', "assign", str(SCRIPTS / "../agents/models_config.sh"), task, args.model, args.effort], env, capture=True)
-    family, model, effort, tier = result.stdout.strip().splitlines()[-4:]
+    family, model, effort, tier, configuration = result.stdout.strip().splitlines()[-5:]
+    env["MODELS_LAUNCH_CONFIGURATION"] = configuration
     return family, model, effort, tier
 
 
@@ -389,6 +274,7 @@ class Dispatch:
     tier: str
     env: dict[str, str]
     reservation: dict[str, object]
+    switching: staff.StaffRow | None = None
     claim: WorkerClaim | None = None
     pass_open: bool = False
     agent: subprocess.Popen[str] | None = None
@@ -426,9 +312,16 @@ class Dispatch:
         _ = call([PYTHON, PROGRESS, "start-pass", "--session-dir", str(self.run), "--pass-kind", self.role,
                   "--phase-id", self.phase, "--prompt-file", str(self.prompt), "--fix-cause", self.args.fix_cause,
                   "--fix-pass", str(self.args.pass_number if self.role == "fix" else 0), "--activity", shown,
-                  "--called-task", f"direct.{self.role}", "--worker-name", self.worker, "--called-family", self.family,
-                  "--called-model", self.model, "--called-effort", self.effort or "unset"], self.env)
+                  "--called-task", f"direct.{self.role}", "--worker-name", self.worker,
+                  "--worker-id", self.switching.id if self.switching else text(read_roster(self.run, self.worker)["staff_id"]),
+                  "--called-family", self.family,
+                  "--called-model", self.model, "--called-effort", self.effort or "unset",
+                  "--launcher-command", json.dumps(["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])], self.env)
         self.pass_open = True
+
+    def finish_pass_command(self, status: str) -> list[str]:
+        return [PYTHON, PROGRESS, "finish-pass", "--session-dir", str(self.run),
+                "--status", status]
 
     def watch_stage_two(self, shown: str) -> None:
         ready = Path(self.args.early_ready).resolve()
@@ -493,8 +386,7 @@ class Dispatch:
         if self.stage_thread is not None:
             self.stage_thread.join()
         if self.pass_open:
-            _ = call([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(self.run), "--status", "interrupted"],
-                     self.env, check=False, capture=True)
+            _ = call(self.finish_pass_command("interrupted"), self.env, check=False, capture=True)
         if self.claim is not None:
             _ = self.mesh_call("release-follow", "--claim-pid", str(os.getpid()), check=False, capture=True)
             with worker_claim_lock(self.run):
@@ -535,7 +427,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 claim_path.unlink(missing_ok=True)
             else:
                 refuse(f"{dispatch.worker} is claimed by launcher {pid}")
-        status_path = dispatch.run / f"impl_status_{slot}"
+        status_path = worker_status_path(dispatch.run, slot)
         if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
             launcher = record.get("launcher_pid")
             if isinstance(launcher, int) and launcher > 0:
@@ -571,7 +463,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if record.get("status") == "ended":
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
-        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
+        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker}))
         # Each turn runs at the caller's model:effort (models.conf default or explicit override).
         return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 
@@ -587,41 +479,46 @@ def stage_two_submitted(receipts: Path, message: str) -> bool:
     return False
 
 
+def recorded_phase(run: Path, phase_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    state = read_object(run / "progress_history_state.json")
+    phase = next((object_map(candidate) for candidate in cast(list[object], state.get("open_phases", []))
+                  if object_map(candidate).get("id") == phase_id), object_map(state.get("phase")))
+    return state, phase
+
+
 def record_review(dispatch: Dispatch, completed: bool, summary: Path) -> None:
     """Keep each launcher's review evidence, including a recorded zero."""
     if dispatch.role != "review":
         return
-    state = object_map(cast(object, json.loads((dispatch.run / "progress_history_state.json").read_text())))
-    phase = object_map(state.get("phase"))
-    for candidate in cast(list[object], state.get("open_phases", [])):
-        item = object_map(candidate)
-        if item.get("id") == dispatch.phase:
-            phase = item
-            break
+    state, phase = recorded_phase(dispatch.run, dispatch.phase)
     record = read_roster(dispatch.run, dispatch.worker)
     raised = len(re.findall(r"^\s*\d+[.)]\s+", summary.read_text(), re.MULTILINE))
     store = workers.ledger_for_run(dispatch.run)
-    evidence: dict[str, object] = {
-        "arm": "own", "pool": store.path.parent.name, "unit": store.path.stem,
-        "phase": dispatch.phase, "phase_instance_id": phase.get("instance_id", ""),
-        "history_file": state.get("history_file", ""), "reviewer": dispatch.worker,
-        "thread_id": session_staff.worker_session(record), "lens": dispatch.args.lens,
-        "kind": "ux" if dispatch.args.lens == "ux" else "broad" if dispatch.args.pass_number == 1 and dispatch.args.lens else "closure",
-        "pass": dispatch.args.pass_number, "started_at": int(dispatch.started_at),
-        "finished_at": time.time(), "status": "reviewed" if completed else "error",
-        "raised": raised, "lease_ordinal": 0, "prime_hash": "",
-    }
-    root = unit_runs.history_root() / "review_turns" / dispatch.run.name
-    root.mkdir(parents=True, exist_ok=True)
-    for sequence in itertools.count():
-        try:
-            output = (root / f"{int(dispatch.started_at)}-{os.getpid()}-{sequence}.json").open("x", encoding="utf-8")
-        except FileExistsError:
-            continue
-        with output:
-            json.dump(evidence, output)
-            _ = output.write("\n")
-        break
+    progress_history.write_review_turn(dispatch.run, {
+        "unit": store.path.stem, "phase": dispatch.phase,
+        "phase_instance_id": phase.get("instance_id", ""), "history_file": state.get("history_file", ""),
+    }, reviewer=dispatch.worker, thread_id=session_staff.worker_session(record), lens=dispatch.args.lens,
+       pass_number=dispatch.args.pass_number, started_at=int(dispatch.started_at),
+       status="reviewed" if completed else "error", raised=raised,
+       details={"pool": store.path.parent.name, "lease_ordinal": 0, "prime_hash": ""})
+
+
+def finish_repair(dispatch: Dispatch, code: int) -> bool:
+    ledger = [PYTHON, str(SCRIPTS / "findings.py"), "landed" if code == 0 else "abandon",
+              "--session-dir", str(dispatch.run), "--phase", dispatch.phase]
+    if code:
+        ledger += ["--edits-landed", "--reason", f"the fix worker exited with code {code}"]
+    failed = call(ledger, dispatch.env, check=False).returncode != 0
+    commands = [ledger]
+    if dispatch.pass_open:
+        commands.append(dispatch.finish_pass_command("error" if code or failed else "completed"))
+        failed = call(commands[-1], dispatch.env, check=False).returncode != 0 or failed
+    if failed:
+        print("assign.sh: repair resolution failed; run these commands:", file=sys.stderr)
+        for command in commands:
+            print(shlex.join(["env", f"UNIT_TEAM_ROLE={dispatch.worker}", "UNIT_PASS_OWNER=launcher", *command]), file=sys.stderr)
+    dispatch.pass_open = False
+    return not failed
 
 
 def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
@@ -642,18 +539,30 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
     if dispatch.args.summary:
         _ = Path(dispatch.args.summary).write_text(summary.read_text())
     outcome = "completed" if completed else "error"
-    _ = status.write_text("done\n" if completed else "error\n")
-    if dispatch.pass_open:
-        _ = call([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(dispatch.run), "--status", outcome], dispatch.env)
+    if dispatch.role == "fix" and dispatch.env.get("UNIT_RESOLVES_ROUND") == "1":
+        if not finish_repair(dispatch, 0 if completed else code or 1):
+            completed, code, outcome = False, 1, "error"
+    elif dispatch.pass_open:
+        _ = call(dispatch.finish_pass_command(outcome), dispatch.env)
         dispatch.pass_open = False
+    _ = status.write_text("done\n" if completed else "error\n")
     if dispatch.claim is not None:
         dispatch.board(dispatch.claim.slot, "done" if completed else "blocked", f"{shown}: {outcome}; summary {summary}")
     return 0 if completed else 2 if code == 2 else 1
 
 
+def image_note(images: list[str]) -> str:
+    """Name each attached image for a worker that cannot receive it as an option."""
+    if not images:
+        return ""
+    return "\nRead these images:\n" + "\n".join(str(Path(image).resolve()) for image in images)
+
+
 def execute(dispatch: Dispatch, paths: list[str]) -> int:
     try:
-        dispatch.claim = claim_worker(dispatch)
+        dispatch.claim = (WorkerClaim(worker_record_path(dispatch.run, dispatch.worker, dispatch.worker), dispatch.worker,
+                                      dispatch.model, dispatch.effort)
+                          if dispatch.switching else claim_worker(dispatch))
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2
     shown = workers.shown_name(dispatch.run, dispatch.worker)
@@ -679,12 +588,15 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
         number = max(numbers, default=0) + 1
         _ = (phase_dir / f"dispatch_{number}_paths.json").write_text(json.dumps(
             {"worker": dispatch.worker, "round": number, "paths": paths}) + "\n")
+    assignment = dispatch.prompt
     message = phase_dir / f"dispatch_{number}_prompt.txt"
     receipts = phase_dir / f"dispatch_{number}_submissions.jsonl"
     output_instruction = ("Return the complete review result in your final reply; the runner saves the artifacts."
                           if dispatch.role == "review" else f"As your last act, write your summary to {summary}.")
+    # `start` has no image option, so a switched worker opens each image by its path.
     _ = message.write_text(dispatch.prompt.read_text() + "\n" + RULES +
-                           f"\nWorker: {shown}\n{output_instruction}\n")
+                           f"\nWorker: {shown}\n{output_instruction}\n" +
+                           (image_note(args.image) if dispatch.switching else ""))
     if args.style_since:
         end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
         try:
@@ -720,7 +632,11 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     if args.early_ready:
         follow += ["--submission-receipt-file", str(receipts)]
         dispatch.watch_stage_two(shown)
-    code = dispatch.follow(follow, shown, log)
+    launch = follow if dispatch.switching is None else mesh_command(
+        args, dispatch.run, dispatch.worker, SwitchStart(
+            dispatch.cwd, message, assignment, str(summary), reply, str(log),
+            dispatch.model, dispatch.effort, dispatch.tier))
+    code = dispatch.follow(launch, shown, log)
     if code == 0 and dispatch.stage_thread is not None:
         # Stage 1 may finish before the sentinel. Keep the dispatch claim while
         # the native file watcher waits, then follow any still-held Stage 2.
@@ -758,18 +674,59 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     return settle_dispatch(dispatch, code, completed, shown, status, summary, reply)
 
 
-def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
-                     env: dict[str, str]) -> int:
-    if conf.read("direct").text("SIMPLIFY_LENS") == "off":
-        print("simplify: off")
-        return 0
-    if args.pass_number != 1:
-        print("simplify: skipped; broad review only")
-        return 0
-    command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, "--diff", args.diff,
-               "--summary", str(Path(args.summary).resolve()) if args.summary else "", str(run), str(cwd),
-               str(source_prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
-    return subprocess.run(command, env=env, check=False).returncode
+def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
+                  role: str, paths: list[str], env: dict[str, str]) -> int:
+    """Send the assignment through the shared worker command."""
+    directory = phase_reservation.phase_directory(run, phase)
+    directory.mkdir(parents=True, exist_ok=True)
+    slot = args.to or args.new_worker or role
+    suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
+    summary = directory / f"{slot}_summary{suffix}.txt"
+    status = directory / f"{slot}_status{suffix}"
+    message = directory / f"{slot}_prompt{suffix}.txt"
+    reply = directory / f"{slot}_reply{suffix}.txt"
+    log = directory / f"{slot}_agent{suffix}.log"
+    content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
+    content += image_note(args.image)
+    if not message.is_file() or message.read_text() != content:
+        write_text_atomic(message, content)
+    end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
+    style: NoStyleAssignment | StyleAssignment = NoStyleAssignment()
+    if args.style_since:
+        style = StyleAssignment(style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end), summary)
+        message = style.directory / "prompt.md"
+    env["UNIT_RUN_DIR"] = str(run)
+    env["UNIT_TEAM_ROLE"] = slot
+    command = [PYTHON, str(SCRIPTS / "../production/worker.py"), "assign", role, str(message),
+               "--session-dir", str(run), "--phase", phase, "--slot", slot, "--kind", "assign", "--reply", str(reply),
+               "--lens", args.lens, "--fix-cause", args.fix_cause,
+               "--fix-pass", str(args.pass_number if role == "fix" else 0)]
+    if args.to or args.new_worker:
+        command += ["--name", args.to or args.new_worker]
+    if args.early_ready:
+        command += ["--early-ready", str(Path(args.early_ready).resolve())]
+    command += ["--launcher-command", json.dumps(["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])]
+    write_text_atomic(status, "running\n")
+    _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "register",
+              f"role={role}; transport=herdr; status in {status}"], env)
+    _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
+              "header", slot, role], env, check=False)
+    with log.open("a") as output:
+        result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
+    if result.returncode == 0:
+        env["UNIT_PASS_OWNER"] = "launcher"
+        _ = call([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run), "--status", "completed"], env)
+        write_text_atomic(summary, reply.read_text())
+        if args.summary:
+            write_text_atomic(Path(args.summary), summary.read_text())
+    write_text_atomic(status, "done\n" if result.returncode == 0 else "error\n")
+    if isinstance(style, StyleAssignment):
+        style_review.finish(style.directory, style.summary, result.returncode)
+    _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot,
+              "done" if result.returncode == 0 else "blocked",
+              f"role={role}; exit {result.returncode}; summary {summary}"], env)
+    return result.returncode
+
 
 
 def require_live_director() -> None:
@@ -797,8 +754,6 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
                    env: dict[str, str]) -> int:
     """Use the Claude launcher under the same assign parent."""
     options = ["--phase", phase]
-    if args.to:
-        options += ["--to", args.to]
     role = "impl" if args.role == "implement" else args.role
     slot = args.to or args.new_worker or role
     if args.role == "review":
@@ -809,6 +764,8 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
         command = ["bash", str(SCRIPTS / "review.sh"), *options, str(run), str(cwd), str(prompt),
                    "review", "review", "review", str(args.pass_number), args.lens, args.early_ready]
     else:
+        if args.to:
+            options += ["--to", args.to]
         if args.fix_cause:
             options += ["--fix-cause", args.fix_cause]
         command = ["bash", str(SCRIPTS / "implement.sh"), *options, str(run), str(cwd), str(prompt),
@@ -821,75 +778,150 @@ def execute_claude(args: Arguments, run: Path, phase: str, cwd: Path, prompt: Pa
     return result
 
 
-def admit_assignment(worker: str, run: Path, role: str,
-                     held: NoHeldAssignment | HeldAssignment) -> worker_admission.WorkerStartAllowed:
-    """Apply the same admission rule to every assignment operation."""
-    if isinstance(held, HeldAssignment):
-        lifecycle = held.member.lifecycle
-        return worker_admission.admit(
-            worker, run, role=held.member.role,
-            reference=str(lifecycle.staff_id) if isinstance(lifecycle, design_roles.HeldWorker) else "")
-    return worker_admission.admit(worker, run, role=role)
+@dataclass(frozen=True)
+class SwitchStart:
+    """The values that only the start of a family switch reads."""
+    cwd: Path
+    prompt: Path
+    assignment: Path
+    summary: str
+    reply: Path
+    log: str
+    model: str
+    effort: str
+    tier: str
+
+
+def mesh_command(args: Arguments, run: Path, worker: str, switch: SwitchStart | None = None) -> list[str]:
+    """Build the one codex_mesh command of an admitted assignment."""
+    command = [PYTHON, MESH]
+    context = ["--session-dir", str(run)]
+    if switch is not None:
+        role = "impl" if args.role == "implement" else args.role
+        command += ["start", *context, "--name", worker, "--role", role, "--cwd", str(switch.cwd),
+                    "--prompt-file", str(switch.prompt), "--assignment-file", str(switch.assignment),
+                    "--summary-file", switch.summary, "--reply-file", str(switch.reply), "--log-file", switch.log,
+                    "--task", f"direct.{role}", "--model", switch.model, "--effort", switch.effort,
+                    "--service-tier", switch.tier]
+        if role == "review":
+            command += ["--sandbox", "read-only"]
+        if args.lens:
+            command += ["--lens", args.lens]
+    elif args.operation == AssignmentOperation.ADOPT:
+        command += ["adopt", *context, "--name", worker, "--from", str(Path(args.from_session_dir).resolve())]
+    else:
+        command += ["resume-account-move", *context, "--to", worker]
+    return command
 
 
 def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAllowed,
-                      held: NoHeldAssignment | HeldAssignment, cwd: Path, prompt: Path,
-                      family: str, model: str, effort: str, tier: str, env: dict[str, str]) -> int:
-    """Translate a checked assignment into its backend operation."""
-    run, worker = admitted.run, admitted.name
-    summary = str(Path(args.summary).resolve()) if args.summary else str(run / f"{worker}.reply.txt")
-    log = str(Path(args.log).resolve()) if args.log else str(run / f"{worker}.log")
-    if family == "claude":
-        if args.operation != AssignmentOperation.RESIDENT:
-            refuse("this operation requires a Codex worker")
-        env.update(AGENT_BG_ROLE="review", AGENT_BG_DETACH="1", AGENT_BG_EFFORT=effort)
-        return call(["bash", str(SCRIPTS / "../agents/agent_bg.sh"), "--run", str(run), worker, str(cwd), str(prompt), summary, log,
-                     str(Path(args.id_file).resolve()) if args.id_file else str(run / "friend_id"), model],
-                    env, check=False).returncode
-    command = [PYTHON, MESH]
+                      env: dict[str, str]) -> int:
+    """Translate an admitted assignment into its recovery operation."""
+    return call(mesh_command(args, admitted.run, admitted.name), env, check=False).returncode
+
+
+def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Path,
+                              env: dict[str, str]) -> int:
+    """Hold one pane reviewer until the worker command confirms its end."""
+    for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
+                      ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
+                       "--phase-title", "Astra review"]):
+        recorded = subprocess.run([PYTHON, PROGRESS, *arguments], env=env, text=True,
+                                  stderr=subprocess.STDOUT, check=False)
+        if recorded.returncode:
+            return recorded.returncode
+    command = [PYTHON, str(SCRIPTS / "../production/worker.py")]
+    added = call([*command, "add", "astra-reviewer", "--name", args.new_worker, "--json"],
+                 env, capture=True, check=False)
+    print(added.stdout + added.stderr, end="", flush=True)
+    if added.returncode:
+        return added.returncode
+    held, result = "", 1
+    try:
+        member = cast(dict[str, str], json.loads(added.stdout))
+        role = astra_roles.hold("reviewer", member["id"], pid=os.getpid())
+        held = role["staff_id"] if role is not None else ""
+        result = subprocess.run([*command, "assign", "astra-reviewer", str(prompt), "--name", args.new_worker,
+                       "--session-dir", str(run), "--slot", args.new_worker, "--phase", "astra-review",
+                       "--kind", "astra", "--reply", args.summary, "--launcher-command",
+                       json.dumps(["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]])],
+                      env=env, text=True, stderr=subprocess.STDOUT, check=False).returncode
+        env.update(UNIT_PASS_OWNER="launcher", UNIT_TEAM_ROLE=args.new_worker)
+        finished = subprocess.run([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(run),
+                       "--status", "error" if result else "completed"], env=env, text=True,
+                       stderr=subprocess.STDOUT, check=False).returncode
+        if result:
+            print(f"assign.sh: reviewer dispatch exited {result}; pending input is retained", flush=True)
+        else:
+            result = finished
+    except (OSError, ValueError) as error:
+        print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
+        result = 1
+    finally:
+        ended = subprocess.run([*command, "end", args.new_worker, "--session-dir", str(run)],
+                               env=env, text=True, stderr=subprocess.STDOUT, check=False).returncode
+        if ended:
+            result = 1
+        elif held:
+            astra_roles.release(held)
+    return result
+
+
+def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> int:
+    """Publish, hold, review, and close one managed Astra worker."""
+    run = Path(args.session_dir).expanduser().resolve()
+    if unit_runs.worker_transport(run) == "herdr":
+        return execute_astra_review_herdr(args, run, cwd, prompt, env)
     context = ["--session-dir", str(run)]
-    settings = ["--model", model, "--effort", effort, "--service-tier", tier]
-    role = "impl" if args.role == "implement" else args.role
-    if args.operation == AssignmentOperation.PRIME:
-        if not isinstance(held, HeldAssignment) or not isinstance(held.claim, ReservedHeldCreation):
-            refuse("prime requires the holder's reserved creation claim")
-        sandbox = "read-only" if isinstance(held.access, design_roles.ReadOnlyReviewer) else held.access.launch_sandbox
-        command += ["prime", *context, "--name", worker, "--cwd", str(cwd), "--instructions-file", str(prompt),
-                    *settings, "--sandbox", sandbox, "--held-design", held.design.placement.design_id,
-                    "--held-role", held.member.role]
-    elif args.operation == AssignmentOperation.FOLLOW:
-        if not isinstance(held, HeldAssignment) or not isinstance(held.claim, ExistingHeldThread):
-            refuse("follow requires the holder's existing thread identity")
-        command += ["follow", *context, "--to", worker, "--role", role, "--cwd", str(cwd),
-                    "--message-file", str(prompt), "--summary-file", summary, "--log-file", log, *settings]
-        if isinstance(held.access, design_roles.ReadOnlyReviewer):
-            command += ["--read-only"]
-    elif args.operation == AssignmentOperation.RESIDENT:
-        command += ["start", "--resident", *context, "--name", worker, "--role", role,
-                    "--cwd", str(cwd), "--prompt-file", str(prompt), "--summary-file", summary,
-                    "--log-file", log, "--task", "ask_a_friend.consultation", *settings]
-    elif args.operation == AssignmentOperation.ADOPT:
-        command += ["adopt", *context, "--name", worker, "--from", str(Path(args.from_session_dir).resolve())]
-    elif args.operation == AssignmentOperation.RESUME_ACCOUNT_MOVE:
-        command += ["resume-account-move", *context, "--to", worker]
-    else:
-        refuse("the dispatch operation requires the normal worker coordinator")
-    return call(command, env, check=False).returncode
+    settings = ["--model", args.model, "--effort", args.effort, "--cwd", str(cwd)]
+    opened, held, result = False, "", 1
+    try:
+        result = call([PYTHON, MESH, "prime", *context, "--name", args.new_worker,
+                       "--instructions-file", str(prompt),
+                       "--sandbox", "read-only", *settings], env, check=False).returncode
+        if result:
+            return result
+        opened = True
+        role = astra_roles.hold("reviewer", session_dir=run, worker=args.new_worker)
+        held = role["staff_id"] if role is not None else ""
+        result = call([PYTHON, MESH, "follow", *context, "--to", args.new_worker, "--role", "review",
+                       "--message-file", str(prompt), "--summary-file", args.summary,
+                       "--log-file", args.log, "--read-only", *settings], env, check=False).returncode
+    except (OSError, ValueError) as error:
+        print(f"assign.sh: reviewer role unavailable: {error}", file=sys.stderr)
+        result = 1
+    finally:
+        if opened:
+            ended = call([PYTHON, MESH, "end", *context, "--to", args.new_worker], env, check=False).returncode
+            if ended:
+                result = 1
+            elif held:
+                astra_roles.release(held)
+    return result
 
 
 def main() -> int:
     require_live_director()
     args = parse_arguments()
-    recover_arguments(args)
-    held = held_assignment(args)
+    if args.role == "simplify":
+        return simplify_daily.main(["--session-dir", args.session_dir, "--cwd", args.cwd])
+    env = dict(os.environ)
+    if args.operation in RECOVERY_OPERATIONS:
+        try:
+            admitted = worker_admission.admit(args.to, Path(args.session_dir).expanduser().resolve())
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        env.update(UNIT_TEAM_ROLE=admitted.name, UNIT_PASS_OWNER="launcher")
+        return execute_operation(args, admitted, env)
     cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
     if not cwd.is_dir() or not prompt.is_file():
         refuse("--cwd must be a directory and --prompt must be a readable file")
-    paths = [] if isinstance(held, HeldAssignment) or args.operation in RECOVERY_OPERATIONS else authorized_paths(args, cwd)
-    env = dict(os.environ)
+    if args.operation == AssignmentOperation.ASTRA_REVIEW:
+        return execute_astra_review(args, cwd, prompt, env)
+    paths = authorized_paths(args, cwd)
     run, phase = prepare_run(args, cwd, prompt, env)
-    if args.lens == "simplify":
-        return execute_simplify(args, run, phase, cwd, prompt, env)
+    transport = unit_runs.worker_transport(run)
     role = "impl" if args.role == "implement" else args.role
     check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
@@ -898,15 +930,12 @@ def main() -> int:
     checked = call(check, env, check=False)
     if checked.returncode:
         return 3 if checked.returncode == 3 else 2
-    family, model, effort, tier = (("codex", "", "", "") if args.operation in RECOVERY_OPERATIONS
-                                   else resolve_model(args, role, env))
-    if args.family and args.family != family:
-        refuse("the resident family differs from the caller's configured family")
-    if isinstance(held, HeldAssignment) and family != "codex":
-        refuse("held designs require Codex")
+    if transport == "herdr":
+        return execute_herdr(args, run, phase, prompt, role, paths, env)
+    family, model, effort, tier = resolve_model(args, role, env)
     worker = args.to
     reservation: dict[str, object] = {}
-    if args.operation != AssignmentOperation.DISPATCH or family == "claude":
+    if family == "claude":
         worker = args.to or args.new_worker or role
     elif not worker:
         command = [PYTHON, str(SCRIPTS / "workers.py"), "resolve", "--session-dir", str(run), "--role", role,
@@ -922,18 +951,26 @@ def main() -> int:
         worker = resolved.stdout.strip()
         reservation = workers.allocation_for_follow(run, worker)
     try:
-        admitted = admit_assignment(worker, run, role, held)
+        _ = worker_admission.admit(worker, run)
     except ValueError as error:
         workers.release_allocation(run, worker, reservation)
         print(str(error), file=sys.stderr)
         return 2
     env["UNIT_TEAM_ROLE"] = worker
     env["UNIT_PASS_OWNER"] = "launcher"
-    if args.operation != AssignmentOperation.DISPATCH:
-        return execute_operation(args, admitted, held, cwd, prompt, family, model, effort, tier, env)
+    membership = staff.local_snapshot()
+    member = worker_admission.member(run, worker, membership)
+    switches = member is not None and (session_staff.worker_family(membership, member.id) != family
+        or (family == "codex" and worker_admission.dispatch_pending(run, worker, prompt)))
     if family == "claude":
-        return execute_claude(args, run, phase, cwd, prompt, env)
-    dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation)
+        if switches:
+            args.to = worker
+        try:
+            return execute_claude(args, run, phase, cwd, prompt, env)
+        finally:
+            workers.release_allocation(run, worker, reservation)
+    dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation,
+                        switching=member if switches else None)
     try:
         return execute(dispatch, paths)
     finally:

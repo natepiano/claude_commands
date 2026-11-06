@@ -32,8 +32,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
 
 if TYPE_CHECKING:
     from ..buildlog import store
+    from ..lib.boot_identity import boot_identity
 else:
     import store
+    from scripts.lib.boot_identity import boot_identity
+
 
 
 @dataclass(frozen=True)
@@ -293,8 +296,8 @@ def record_build(
 ) -> None:
     """Audit and enforcement use the same permanent log and append writer."""
     try:
-        boot = (proc_root / "sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
+        boot = boot_identity(proc_root)
+    except (OSError, ValueError):
         boot = ""
     identity = build.process.identity
     hold_id = hashlib.sha256(json.dumps([holder.key, holder.since.isoformat()]).encode()).hexdigest()

@@ -20,6 +20,8 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.lib import process_start as process_identity
 
+from scripts.lib.boot_identity import boot_identity
+
 
 KINDS = ("check", "lint", "doc", "test", "build", "example", "final")
 STATES = ("waiting_hold", "waiting_mac", "waiting_ssh", "on_ssh", "on_mac", "on_natedev", "local_noncompiling")
@@ -30,8 +32,6 @@ COMMAND_ARGUMENTS: dict[str, tuple[tuple[str, bool, str, tuple[str, ...]], ...]]
         + (("--repo", False, os.getcwd(), ()),)
         + tuple(("--" + name, False, "", ()) for name in
                 ("package", "reason", "eligible-targets", "mac-targets", "pinned-target")),
-    "state": (("--call-id", True, "", ()), ("--target", False, "", ()), ("state", True, "", STATES)),
-    "remove": (("--call-id", True, "", ()),),
     "stopped": (("--call-id", True, "", ()), ("--consumed", True, "", ())),
 }
 
@@ -41,7 +41,7 @@ class UseArgumentParser:
 
 
 def parse_light_cli(arguments: list[str]) -> dict[str, str] | UseArgumentParser:
-    if not arguments or arguments[0] not in ("write", "state", "remove", "stopped"):
+    if not arguments or arguments[0] not in ("write", "stopped"):
         return UseArgumentParser()
     verb = arguments[0]
     rules = COMMAND_ARGUMENTS[verb]
@@ -53,8 +53,8 @@ def parse_light_cli(arguments: list[str]) -> dict[str, str] | UseArgumentParser:
     index = 1
     while index < len(arguments):
         token = arguments[index]
-        if verb == "write" and token == "--clock-offset":
-            values["clock_offset"] = "1"
+        if verb == "write" and token == "--report":
+            values["report"] = "1"
             index += 1
             continue
         if token.startswith("--"):
@@ -86,12 +86,8 @@ def execute_cli(args: dict[str, str]) -> int:
             print(process_start(int(args["pid"])))
             return 0
         call_id = args["call_id"]
-        if command == "remove":
-            remove(call_id)
-        elif command == "stopped":
+        if command == "stopped":
             return 0 if consume_stopped_build(call_id, Path(args["consumed"])) else 1
-        elif command == "state":
-            state_fields(call_id, args["state"], args["target"])
         else:
             pid, kind, location = int(args["pid"]), args["kind"], args["runs_on"]
             if kind not in KINDS or location not in ("mac_allowed", "natedev_only", "ssh_allowed"):
@@ -114,8 +110,10 @@ def execute_cli(args: dict[str, str]) -> int:
             if args["pinned_target"]:
                 row["pinned_target"] = args["pinned_target"]
             write_fields(call_id, row)
-            if args.get("clock_offset"):
+            if args.get("report"):
                 print((time.time_ns() - time.monotonic_ns()) // 1000)
+                print(record_path(call_id))
+                print(state_path(call_id))
     except (OSError, ValueError, IndexError) as error:
         print(f"step record: {error}; step refused", file=sys.stderr)
         return 2
@@ -130,6 +128,10 @@ def record_path(call_id: str) -> Path:
     if not call_id or Path(call_id).name != call_id or call_id in (".", ".."):
         raise ValueError("invalid call id")
     return record_directory() / f"{call_id}.json"
+
+
+def state_path(call_id: str) -> Path:
+    return record_path(call_id).with_suffix(".state")
 
 
 def process_start(pid: int) -> str:
@@ -193,10 +195,6 @@ def validated_fields(value: object, call_id: str) -> dict[str, object]:
     return {**row, "eligible_targets": eligible, "selected_target": selected, "package": package or None}
 
 
-def read_fields(call_id: str) -> dict[str, object]:
-    return validated_fields(cast(object, json.loads(record_path(call_id).read_text())), call_id)
-
-
 def write_fields(call_id: str, row: Mapping[str, object]) -> None:
     path = record_path(call_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,22 +213,6 @@ def write_fields(call_id: str, row: Mapping[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def state_fields(call_id: str, next_state: str, target: str = "") -> None:
-    try:
-        row = read_fields(call_id)
-        if process_start(cast(int, row["pid"])) != row["proc_start"]:
-            raise ValueError("stale step record")
-    except (OSError, ValueError, IndexError) as error:
-        raise ValueError(f"cannot update step record: {error}") from error
-    selected = target or ("mac" if next_state == "on_mac" else "natedev" if next_state == "on_natedev" else "")
-    write_fields(call_id, {**row, "state": next_state, "selected_target": selected,
-                           "updated": datetime.now(timezone.utc).isoformat()})
-
-
-def remove(call_id: str) -> None:
-    record_path(call_id).unlink(missing_ok=True)
-
-
 def consume_stopped_build(call_id: str, consumed: Path) -> bool:
     """Read this call's new enforcer stops, including stops before a release."""
     root = Path(os.environ.get("BUILDLOG_DIR", str(Path.home() / ".local/state/buildlog")))
@@ -238,7 +220,7 @@ def consume_stopped_build(call_id: str, consumed: Path) -> bool:
     proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
     if sys.platform == "darwin":
         return False  # The Linux build enforcer does not run on Darwin.
-    boot_id = (proc / "sys/kernel/random/boot_id").read_text().strip()
+    boot_id = boot_identity(proc)
     seen: set[str]
     try:
         seen = set(consumed.read_text().splitlines())
@@ -413,16 +395,38 @@ def _decode(value: object, call_id: str) -> StepRecord:
 
 def read(call_id: str) -> ReadResult:
     try:
-        path = record_path(call_id)
-        value = cast(object, json.loads(path.read_text()))
+        state_file = state_path(call_id).open()
     except FileNotFoundError:
-        return MissingRecord(call_id)
+        state_file = None
     except (OSError, ValueError) as error:
         return UnreadableRecord(call_id, str(error))
     try:
-        record = _decode(value, call_id)
-    except (ValueError, TypeError) as error:
-        return UnreadableRecord(call_id, str(error))
+        try:
+            value = cast(object, json.loads(record_path(call_id).read_text()))
+        except FileNotFoundError:
+            return MissingRecord(call_id)
+        except (OSError, ValueError) as error:
+            return UnreadableRecord(call_id, str(error))
+        try:
+            if state_file is not None:
+                words = state_file.read().split()
+                updated = datetime.fromtimestamp(os.fstat(state_file.fileno()).st_mtime, timezone.utc).isoformat()
+                if not isinstance(value, dict):
+                    raise ValueError("record must be an object")
+                row = cast(dict[str, object], value)
+                value = row
+                if words and words[0] == "writes_tree":
+                    row["runs_on"] = {"kind": "natedev_only", "reason": "step writes the tree"}
+                    words = words[1:]
+                word = words[0] if words else ""
+                selected = words[1] if len(words) > 1 else "mac" if word == "on_mac" else "natedev" if word == "on_natedev" else ""
+                row.update(state=word, selected_target=selected, updated=updated)
+            record = _decode(value, call_id)
+        except (OSError, ValueError, TypeError) as error:
+            return UnreadableRecord(call_id, str(error))
+    finally:
+        if state_file is not None:
+            state_file.close()
     try:
         start = process_start(record.pid)
     except (FileNotFoundError, ProcessLookupError):
@@ -451,10 +455,6 @@ def write(record: StepRecord) -> None:
     write_fields(record.call_id, row)
 
 
-def state(call_id: str, next_state: StepState, target: str = "") -> None:
-    state_fields(call_id, next_state.value, target)
-
-
 def main() -> int:
     import argparse
 
@@ -468,8 +468,8 @@ def main() -> int:
             else:
                 _ = command.add_argument(name, choices=choices or None)
         if verb == "write":
-            _ = command.add_argument("--clock-offset", action="store_const", const="1", default="",
-                                     help="print the wall-clock offset in microseconds")
+            _ = command.add_argument("--report", action="store_const", const="1", default="",
+                                     help="print the clock offset, record path and state path")
     arguments = vars(parser.parse_args())
     return execute_cli(cast(dict[str, str], arguments))
 

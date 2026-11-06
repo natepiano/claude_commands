@@ -547,7 +547,7 @@ def registered_plan(unit: str) -> Path:
     from scripts.production.production_doc import Refusal
 
     try:
-        parent = unit_lookup.unit_parent(unit, record=staff.snapshot(), sources=unit_lookup.member_sources())
+        parent = unit_lookup.unit_parent(unit, record=staff.snapshot())
         value = cast(object, json.loads(phase_table.show_production(Path(parent.doc))))
     except (OSError, UnicodeError, ValueError, Refusal) as error:
         raise ScratchError(f"{unit}: cannot resolve registered plan: {error}") from error

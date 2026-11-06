@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
@@ -11,7 +11,6 @@ import json
 import os
 import subprocess
 import shutil
-import sys
 import tempfile
 import tomllib
 import unittest
@@ -313,11 +312,9 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         cls.fixture_environment = builder.environment.copy()
         # The fixture supplies the entire toolchain and 64 GiB of free memory.
         # Host Nix discovery and Python version probing are separate contracts.
-        cls.fixture_environment.update({"IN_NIX_SHELL": "pure", "BUILDLOG_BUILD_BUDGET_GIB": "64"})
+        cls.fixture_environment.update({"IN_NIX_SHELL": "pure"})
         _ = cls.fixture_environment.pop("CLAUDE_PYTHON", None)
-        cache = builder.root / "cache/claude" / cache_file_name()
-        cache.parent.mkdir(parents=True)
-        _ = cache.write_text(sys.executable + "\n")
+        seed_interpreter_cache(builder.root / "cache")
         _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(builder.root)
 

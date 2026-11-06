@@ -85,7 +85,7 @@ class OrderWasteTests(unittest.TestCase):
         _ = self.connection.execute(
             "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,"
             + "created_at,updated_at,base) VALUES (?,?,'read',?,'','.','[]','[]',?,'{}',?,'',?,?,?,?)",
-            (id, f"{family}-unit", family, json.dumps(rules), state, checkpoint, at(0), merged_at, base))
+            (id, family, family, json.dumps(rules), state, checkpoint, at(0), merged_at, base))
 
     def judgment(self, rule: str, path: str, verdict: str, ticket: str, recorded_at: str) -> int:
         cursor = self.connection.execute(

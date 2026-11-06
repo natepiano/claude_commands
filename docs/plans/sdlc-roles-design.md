@@ -1,8 +1,8 @@
 # Duties and names in the development process
 
-> **Status: DESIGN — phase 2 proposals.** Q2, Q3 and R5b are answered below; other questions remain open. This phase changes no live duty or name. Phase 1 made only the two approved reporting wording fixes.
+> **Status: RECORD — frozen.** This doc records how the duty and name answers were reached. `docs/as-built/roles-and-names.md` states what is true now.
 
-Scope: `docs/plans/sdlc-roles.md`, Decisions and Phases 1–2. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
+Scope: duties and names as `docs/as-built/roles-and-names.md` records them. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
 
 ## Sources
 
@@ -923,7 +923,7 @@ For lease, first correct PF's phase-only definition against `scripts/direct/revi
 
 All other aliases and related terms stay proposed under the N-A treatment table, with their Other-name file index as one input, not a sufficient source set. Add defined-name and plural matches whenever those spellings would change. Include zero-hit policy entries only with a measured definition task or keep them unbuilt. Every later rename needs a frozen eligible size, kept contexts and an undo of that term's prose/policy together. Meaning IDs and inventory versions must stay beside before/after Definitions; adding a meaning or changing a parser is not source cleanup by itself. No aggregate promise of fewer production names or contacts is made.
 
-After each approved numbered phase, run `~/.claude/scripts/lib/py scripts/production/roles_audit.py baseline`. Record its term-set version, file set, count and window beside the before result. Keep any contact comparison on one fixed window. Run the new source-only check through the unit's tests-only gate after its policy is approved. A step is complete only when its stated measure moves and the functional checks pass. Source-only tests must not read real home-state records or send messages.
+The baseline measure is retired. The retired-name check stays in the merge gate. Run `python3 scripts/production/roles_audit.py check` to check sources. Use `check --prose` to list role words in sentences. Source-only tests must not read real home-state records or send messages.
 
 ## Name config
 
@@ -1028,7 +1028,7 @@ Kept contexts, with reasons:
 - `docs/as-built/build-memory-admission.md`: the sentence beginning `Before this, a seat started one lint run three times` through `build time.` (n=1 singular) records the dated 2026-10-21 hana_catalyst-inspectors incident. Keep the record; the preceding current-role explanation changes.
 - `docs/as-built/message-clarity.md`: the retirement record at `291e1da55`, dated 2026-10-16 by blame (n=1 plural).
 - `docs/as-built/usage-ledger.md`: the old stored `seats` migration value (n=1 plural); `scripts/usage/collect.py`: the two SQL migration input values (n=2 plural). They remain recognized input values.
-- Identifiers, API and JSON fields (`seat`, `codex_seats`, `PausedSeat`), flags, transport addresses, filenames and placeholders documenting them remain unchanged. Raw source uses in `scripts/accounts/worker_names.py`, `scripts/agents/agent_bg.sh`, `scripts/buildlog/index.py`, `scripts/direct/worker_state.py`, `scripts/feature_log/inventory.py`, `scripts/shutdown/inventory.py`, `scripts/shutdown/shutdown_record.py` and `scripts/shutdown/stop.py` are contracts or migration values, not eligible role prose.
+- The stored JSON fields (`seat`, `codex_seats`) and `PausedSeat` remain unchanged. The resume function is `worker_resumes`. Flags, addresses and filenames remain unchanged. Raw source uses in `scripts/accounts/worker_names.py`, `scripts/agents/agent_bg.sh`, `scripts/buildlog/index.py`, `scripts/direct/worker_state.py`, `scripts/feature_log/inventory.py`, `scripts/shutdown/inventory.py`, `scripts/shutdown/shutdown_record.py` and `scripts/shutdown/stop.py` are contracts or migration values, not eligible role prose.
 - Temporary check exceptions at opening: `commands/unit/direct.md` had n=8 eligible singular uses pending phases-unit ownership. Repair round 1 refreshes that count to n=9 and the exact lines below. The old-path `dual_review.md` mismatch at opening is resolved in repair round 1. Only the director-owned request has authorized exact-context check exceptions; do not mask files wholesale.
 
 Pre-edit dependencies read: `commands/showrunner/produce.md` `<Guild>`; `docs/production_format.md` `<GuildHeads>` (there is no `<Guild>` tag in that file); hierarchies Map change via `git -C /home/natepiano/worktrees/claude-build-followups-hierarchies show d14a7368 -- docs/plans/build-followups-hierarchies-design.md`. The Map distinguishes four guild heads from held per-design Astra roles. `produce.md` has no eligible worker-seat spelling; no edit is needed there. The 2026-10-20 replay stands by the Work Order amendment; it is not repeated.

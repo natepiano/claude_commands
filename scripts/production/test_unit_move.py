@@ -18,6 +18,8 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.agents import codex_mesh
 from scripts.direct import progress_history
+from scripts.lib import models_registry
+from scripts.lib.test_models_registry import registry_text
 from scripts.message import sessions
 from scripts.production import session_staff, staff, unit_move
 from scripts.production.add_unit_test_support import AddUnitTestCase
@@ -55,7 +57,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
             FakeClient.close_tab_of(client, arguments[2])
             return subprocess.CompletedProcess(arguments, 0, "", "")
 
-        labeled = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(),
+        labeled = unit_lookup.LabeledSession("alpha", unit_lookup.ClaudeNotRunning(),
             herdr.HerdrPlace("agents", "w7:p1"), identity=unit_lookup.LiveSession(owner.current_session))
 
         def launch(request: add_unit.UnitLaunch, _director: add_unit.DirectorAgent, _prompt: str,
@@ -322,7 +324,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         _ = self.git("init", "-b", "unrelated", cwd=unrelated)
         _ = self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                      "commit", "--allow-empty", "-m", "unrelated", cwd=unrelated)
-        _ = self.git("worktree", "add", "-b", "unrelated-unit", str(self.destination), cwd=unrelated)
+        _ = self.git("worktree", "add", "-b", "unrelated-work", str(self.destination), cwd=unrelated)
         self.assertTrue((self.destination / ".git").is_file())
         self.assertNotEqual(self.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=self.destination),
                             self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -339,7 +341,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         import sessions
 
         worker = fixture_worker("impl1", self.owner.id)
-        other = fixture_member("unit", name="other-unit", parent=self.owner.parent,
+        other = fixture_member("unit", name="other", parent=self.owner.parent,
             worktree=staff.PresentWorktree("natedev", self.root / "other-worktree"))
         other_worker = fixture_worker("other-worker", other.id)
         rows = (self.owner, worker, other, other_worker)
@@ -528,7 +530,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
     def test_unknown_folder_reader_never_proves_stopped_or_authorizes_a_signal(self) -> None:
         client = herdr.Herdr("agents")
         unknown = herdr.UnknownConversation("source (conversation unreadable)")
-        with (mock.patch.object(herdr, "read_conversation", return_value=unknown) as read,
+        codex = herdr.CodexConversations({}, ())
+        with (mock.patch.object(herdr, "codex_conversations", return_value=codex),
+              mock.patch.object(herdr, "read_conversation", return_value=unknown) as read,
               mock.patch.object(sessions, "running_sessions", return_value=[]),
               mock.patch.object(herdr, "running_codex_threads", return_value=set()) as threads,
               mock.patch.object(os, "kill") as killed, redirect_stderr(io.StringIO()) as output):
@@ -705,13 +709,16 @@ class UnitFolderMoveTests(FolderRenameFixture):
             output = "gpt-fixture\nhigh\n" if "mesh-turn" in command else "codex gpt-fixture high default\n"
             return subprocess.CompletedProcess(command, 0, output, "")
 
-        with (mock.patch.object(subprocess, "run", side_effect=model),
+        inherited = models_registry.LaunchModelConfiguration(self.root / "models.conf", registry_text(), ())
+        configuration = models_registry.launch_configuration(inherited.environment(os.environ))
+        with (mock.patch.dict(os.environ, configuration.environment(os.environ)),
+              mock.patch.object(subprocess, "run", side_effect=model),
               mock.patch.object(codex_mesh, "workers_home", return_value=self.root / "home/.codex2"),
               mock.patch.object(codex_mesh, "ensure_server", return_value=(12345, False)) as server,
               mock.patch.object(codex_mesh, "Client", return_value=client),
               mock.patch.object(codex_mesh, "_bind_serving_server"),
               mock.patch.object(codex_mesh, "_serving_request", side_effect=request)):
-            opened = codex_mesh.open_unit_worker(str(run), "impl1", "impl")
+            opened = codex_mesh.open_unit_worker(str(run), "impl1", "impl", configuration=configuration)
             self.assertEqual(session_staff.worker_session(opened, staff.local_snapshot()), native)
             self.assertEqual(server.call_args.kwargs["cwd"], str(self.destination))
             self.assertEqual(requests[0][1]["cwd"], str(self.destination))
@@ -988,8 +995,8 @@ class FolderMoveReviewTests(FolderRenameFixture):
 
         parent = fixture_member("showrunner", name="receiving")
         production = Production(self.checkout / "receiving-production.md", "receiving", "main",
-                                self.checkout, self.checkout / "production.log", ZoneInfo("UTC"))
-        request = transfer_unit.UnitTransfer(self.owner, parent, production, "source-unit")
+                                self.checkout, self.checkout / "production.log", ZoneInfo("UTC"), parent)
+        request = transfer_unit.UnitTransfer(self.owner, parent, production, "source")
         lock = self.staff_file.parent / "rows" / f"{self.owner.id}.lock"
         def move_projection(*_arguments: object, **_options: object) -> None:
             with lock.open("a") as handle:
@@ -999,7 +1006,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
               mock.patch.object(staff, "row_operation", wraps=staff.row_operation) as row_lock,
               mock.patch.object(staff_move, "move_unit", side_effect=move_projection) as projection,
               redirect_stdout(io.StringIO())):
-            self.assertEqual(transfer_unit.apply("folder-production", "source-unit", production.doc), request)
+            self.assertEqual(transfer_unit.apply("folder-production", "source", production.name), request)
         row_lock.assert_called_once_with(str(self.owner.id))
         projection.assert_called_once()
         self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, parent=staff.ReportsTo(parent.id)))
@@ -1121,7 +1128,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
 
     def test_f009_missing_source_refuses_another_worktree_of_the_same_repository(self) -> None:
         _ = self.git("worktree", "remove", str(self.source))
-        _ = self.git("worktree", "add", "-b", "another-unit", str(self.destination))
+        _ = self.git("worktree", "add", "-b", "another", str(self.destination))
         self.assertEqual(self.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=self.destination),
                          self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         before = file_versions(self.root)

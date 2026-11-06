@@ -32,13 +32,14 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Pr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
-from scripts.direct import assign_gate, plan_history
+from scripts.direct.worker_state import ROSTER_LIVE
+from scripts.direct import assign_gate, plan_history, progress_history
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 from scripts.agents import worker_lifecycle
 from scripts.lib.agent_scope import agent_scope_prefix
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
-from scripts.lib import build_folders, nix_env, process_group, unit_runs
+from scripts.lib import build_folders, nix_env, process_group, unit_runs, models_registry
 from scripts.lib.unit_runs import SERVER_FILE as SERVER_FILE
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import staff, worker_admission, session_staff
@@ -655,12 +656,8 @@ def _roster_role(value: object) -> RosterRole:
         return AssignedWorkerRole("review")
     if role == "astra-designer":
         return AssignedWorkerRole("impl")
-    if not role:
-        return RolelessThread()
     if role not in WORKER_ROLES:
-        raise SystemExit(
-            f"codex_mesh: role must be impl, test, fix, or review; got '{role}'"
-        )
+        return RolelessThread()
     return AssignedWorkerRole(cast(WorkerRole, role))
 
 
@@ -1462,25 +1459,6 @@ class RosterAdministrativeWrite:
 
 
 ROSTER_ADMINISTRATIVE_WRITE = RosterAdministrativeWrite()
-
-
-@dataclass(frozen=True)
-class RecordedTurnSettings:
-    """Read run details for display."""
-
-    model: str
-    effort: str
-
-
-def recorded_turn_settings(record: Mapping[str, object]) -> RecordedTurnSettings:
-    """Prefer accepted-turn evidence; older rosters recorded it as model/effort.
-
-    Keep the pair from one generation of fields. These values never select the
-    model or effort of a new turn; that choice belongs to _turn_model_effort.
-    """
-    prefix = "turn_" if _as_str(record.get("turn_model")) else ""
-    return RecordedTurnSettings(_as_str(record.get(prefix + "model")),
-                                _as_str(record.get(prefix + "effort")))
 
 
 @dataclass(frozen=True)
@@ -3065,7 +3043,7 @@ def _start_server(
                     stdout=subprocess.DEVNULL,
                     stderr=log_handle,
                     start_new_session=True,
-                    env=environment,
+                    env=staff.child_environment(environment),
                 )
         except OSError as error:
             if not isinstance(dev_shell, WorktreeDevShell):
@@ -3159,7 +3137,7 @@ def _discard_failed_server_start(
                          + "failed startup process is not confirmed stopped; confirm or stop it before retrying")
     path = _session_path(session_dir, SERVER_FILE)
     if _record_names_server(_read_json_object(path), served["pid"], served["port"]):
-        path.unlink(missing_ok=True)
+        _forget_run_server(Path(session_dir), served["pid"], served["port"])
 
 
 # ---------------------------------------------------------------------------
@@ -3680,7 +3658,7 @@ def command_start(args: argparse.Namespace) -> int:
     name = _as_str(_attr(args, "name"))
     resident = getattr(args, "resident", False) is True
     try:
-        staff_admission = worker_admission.admit(name, Path(session_dir), role=_as_str(_attr(args, "role")) or "impl", reference=_as_str(_attr(args, "staff_id")))
+        staff_admission = worker_admission.admit(name, Path(session_dir), reference=_as_str(_attr(args, "staff_id")))
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -4143,9 +4121,9 @@ def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = Fal
     session_dir = _as_str(_attr(args, "session_dir"))
     name = staff_admission.name
     prompt_path = Path(_as_str(_attr(args, "prompt_file")))
-    request = worker_admission.assignment_id(prompt_path)
+    request = worker_admission.assignment_id(Path(_as_str(_attr(args, "assignment_file")) or prompt_path))
     args.switch_request = request
-    previous = worker_admission.dispatch_record(staff_admission)
+    previous = worker_admission.dispatch_record(staff_admission.run, staff_admission.name)
     if previous.assignment_id == request and previous.state is worker_admission.SwitchState.ASSIGNMENT_ACCEPTED:
         print("unchanged")
         return RunCompleted()
@@ -6021,7 +5999,16 @@ def _start_workers_turn(
         raise
 
 
-def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
+def _registry_shell(name: str, script: str, *arguments: str,
+                    configuration: models_registry.LaunchModelConfiguration, timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; models_launch_configuration || exit 2; ' + script,
+         name, str(Path(__file__).with_name("models_config.sh")), *arguments],
+        capture_output=True, text=True, timeout=timeout, env=configuration.environment(os.environ))
+
+
+def _turn_service_tier(client: Client, args: argparse.Namespace,
+                       configuration: models_registry.LaunchModelConfiguration) -> str:
     """Resolve the current task's tier once for each turn, without a server cache."""
     session_dir = _as_str(_attr(args, "session_dir")) or client.session_dir
     name = _as_str(_attr(args, "to")) or _as_str(_attr(args, "name")) or client.name
@@ -6029,11 +6016,8 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
     try:
         record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)) if session_dir else {}
         task = _as_str(record.get("task"))
-        resolved = subprocess.run(
-            ["bash", "-c", 'MODELS_CONFIG_TIER_ONLY=1; source "$1"; agents_turn_service_tier "$2"',
-             "codex-mesh-tier", str(Path(__file__).with_name("models_config.sh")), task or "delegate"],
-            capture_output=True, text=True, timeout=5,
-        )
+        resolved = _registry_shell("codex-mesh-tier", 'agents_turn_service_tier "$2"', task or "delegate",
+                                   configuration=configuration, timeout=5)
         if resolved.returncode:
             raise ValueError(resolved.stderr.strip() or "agent tier resolver failed")
         if resolved.stderr.strip():
@@ -6050,7 +6034,8 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
         return "default"
 
 
-def _turn_model_effort(args: argparse.Namespace) -> tuple[str, str]:
+def _turn_model_effort(args: argparse.Namespace,
+                       configuration: models_registry.LaunchModelConfiguration) -> tuple[str, str]:
     """Select explicit dispatch settings or the current role default at send time."""
     role = _roster_role(_attr(args, "role"))
     # Freestanding resident threads may omit assignment metadata. Their task
@@ -6059,8 +6044,7 @@ def _turn_model_effort(args: argparse.Namespace) -> tuple[str, str]:
         _as_str(_attr(args, "task")) or "direct.impl")
     model = _as_str(_attr(args, "model"))
     effort = _as_str(_attr(args, "effort"))
-    resolved = subprocess.run([
-        "bash", "-c", '''source "$1"; AGENTS_CALLER_FAMILY=codex agents_resolve "$2" || exit 2
+    resolved = _registry_shell("mesh-turn", '''AGENTS_CALLER_FAMILY=codex agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_MODEL}"
  [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
@@ -6068,8 +6052,7 @@ if [[ -n "$3" || -n "$4" ]]; then
  _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
 printf '%s\\n' "$AGENT_MODEL" "$AGENT_EFFORT"
-''', "mesh-turn", str(Path(__file__).with_name("models_config.sh")), task, model, effort,
-    ], capture_output=True, text=True, timeout=30)
+''', task, model, effort, configuration=configuration, timeout=30)
     if resolved.returncode:
         raise SystemExit(resolved.stderr.strip() or "cannot resolve turn model and effort")
     fields = resolved.stdout.splitlines()
@@ -6117,18 +6100,21 @@ def _start_turn(
         READ_ONLY_SANDBOX if _attr(args, "read_only") is True else worker_sandbox)
     # Resolve at every submission, including continuations and capacity retries.
     # Roster/identity values are display history, never input to this choice.
-    model, effort = _turn_model_effort(args)
+    fresh = isinstance(_attr(args, "launch_configuration"), models_registry.FreshLaunchConfiguration)
+    configuration = models_registry.launch_configuration({} if fresh else os.environ)
+    args.launch_configuration = models_registry.FreshLaunchConfiguration()
+    model, effort = _turn_model_effort(args, configuration)
     params["model"], params["effort"] = model, effort
-    service_tier = _turn_service_tier(client, args)
+    service_tier = _turn_service_tier(client, args, configuration)
     params["serviceTier"] = service_tier
     client.turn_submitted_at = time.time()
     request = _as_str(_attr(args, "switch_request"))
     allowed: WorkerStartAllowed | None = None
     accepted = ""
     if request:
-        allowed = worker_admission.admit(_as_str(_attr(args, "name")), Path(client.session_dir), role="",
-                                        reference=_as_str(_attr(args, "staff_id")))
-        previous = worker_admission.dispatch_record(allowed)
+        allowed = worker_admission.admit(_as_str(_attr(args, "name")), Path(client.session_dir),
+                                         reference=_as_str(_attr(args, "staff_id")))
+        previous = worker_admission.dispatch_record(allowed.run, allowed.name)
         if previous.assignment_id == request:
             if previous.state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
                 accepted = _accepted_assignment(client, thread_id, message)
@@ -6454,9 +6440,6 @@ def end_worker_locked(args: argparse.Namespace) -> int:
                 print(f"codex_mesh: {target}: thread changed; nothing ended", file=sys.stderr)
                 return 2
             status = _as_str(record.get("status")) or "unknown"
-            if _attr(args, "cleanup_only") and status != "ended":
-                print(f"codex_mesh: {target}: worker is {status}, not ended; nothing cleaned", file=sys.stderr)
-                return 2
             if status == "ended" and not thread_id and record.get("staff_id"):
                 print("unchanged")
                 return 0
@@ -6631,7 +6614,7 @@ def command_reopen(args: argparse.Namespace) -> int:
         launcher = _as_int(record.get("launcher_pid"))
         revision = _roster_revision(record)
         reason = ""
-        if status not in ("ended", "running", "starting"):
+        if status not in ROSTER_LIVE | {"ended"}:
             reason = "worker is not ended, running or starting"
         elif not thread_id:
             reason = "missing thread id"
@@ -6647,7 +6630,7 @@ def command_reopen(args: argparse.Namespace) -> int:
             reason = _recovery_idle_reason(session_dir, name, thread_id)
             recovered_idle = not reason
         if reason:
-            prefix = "launcher died; " if status in ("running", "starting") and launcher > 0 and not _pid_alive(launcher) else ""
+            prefix = "launcher died; " if status in ROSTER_LIVE and launcher > 0 and not _pid_alive(launcher) else ""
             print(f"codex_mesh: {name}: {prefix}{reason}; pending work kept; reopen refused", file=sys.stderr)
             return 2
         path = _session_path(session_dir, ROSTER_FILE)
@@ -6810,26 +6793,27 @@ class UnrecordedWorkerThread:
 
 
 def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
-                     effort: str = "", cwd: str = "") -> dict[str, object]:
+                     effort: str = "", cwd: str = "",
+                     configuration: models_registry.LaunchModelConfiguration) -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
     try:
-        admitted = worker_admission.admit(name, Path(session_dir), role=role)
+        admitted = worker_admission.admit(name, Path(session_dir))
     except ValueError as error:
         raise unit_workers.WorkerUnavailable(str(error)) from error
     with worker_admission.worker_operation(admitted):
-        return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort, cwd=cwd)
+        return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort, cwd=cwd, configuration=configuration)
 
 
 def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllowed, *,
-                          model: str, effort: str, cwd: str) -> dict[str, object]:
+                          model: str, effort: str, cwd: str,
+                          configuration: models_registry.LaunchModelConfiguration) -> dict[str, object]:
     name = admitted.name
     with worker_lifecycle.membership_operation(session_dir):
         with contextlib.ExitStack() as lifecycle:
             _ = lifecycle.enter_context(worker_lifecycle.lock_worker(session_dir, name))
-            command = ['bash', '-c',
-                       'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
-                       str(Path(__file__).with_name("models_config.sh")), role]
-            resolved = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+            resolved = _registry_shell("workers",
+                'agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"',
+                role, configuration=configuration, timeout=30)
             fields = resolved.stdout.strip().split()
             if resolved.returncode or len(fields) != 4:
                 raise unit_workers.WorkerUnavailable(resolved.stderr.strip() or "cannot resolve worker model")
@@ -6942,7 +6926,7 @@ def _release_source_servers(session_dir: str, row: staff.StaffRow, *, deadline: 
     if not isinstance(retained, list) or any(not isinstance(item, dict) for item in cast(list[object], retained)):
         return SourceReleaseUnknown("source server records are invalid")
     records = _recorded_run_servers(session_dir)
-    observed = False
+    observed = not records
     for record in records:
         pid = record.get("pid")
         if type(pid) is not int or pid <= 0:
@@ -7088,7 +7072,7 @@ def _pause_roster_locked(session_dir: str, workers: BulkWorkers) -> None:
             continue
         if status != "paused":
             record.update({"status": "paused", "paused_from": status,
-                           "paused_turn": status in ("running", "starting")})
+                           "paused_turn": status in ROSTER_LIVE})
         _advance_roster_revision(record)
         roster[name] = record
     _publish_bulk_records(session_dir, roster, deadline=workers.deadline)
@@ -8287,10 +8271,6 @@ def _forget_run_server(folder: Path, pid: int, port: int) -> None:
         path.unlink(missing_ok=True)
 
 
-def _forget_retired(folder: Path, pid: int, port: int) -> None:
-    _forget_run_server(folder, pid, port)
-
-
 def _roster_threads(folder: Path) -> dict[str, str]:
     """Thread id to worker name for every conversation the run folder's roster lists."""
     roster = _read_json_object(folder / ROSTER_FILE)
@@ -8444,10 +8424,7 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
         return False
     folder = ownership.session_dir
     if folder.is_dir():
-        _forget_retired(folder, pid, port)
-        record = folder / SERVER_FILE
-        if _record_names_server(_read_json_object(record), pid, port):
-            record.unlink(missing_ok=True)
+        _forget_run_server(folder, pid, port)
         pending = folder / SERVER_START_FILE
         if _record_names_server(_read_json_object(pending), pid, port):
             pending.unlink(missing_ok=True)
@@ -8733,11 +8710,23 @@ class WorkerMoveResumed:
 
 
 @dataclass(frozen=True)
-class WorkerMoveFailed:
+class AccountMoveResumeRefused:
+    reason: str
+
+
+@dataclass(frozen=True)
+class WorkerMoveResumeAvailable:
     reason: str
     command: str
 
 
+@dataclass(frozen=True)
+class WorkerMoveResumeRefused:
+    reason: str
+    refusal: AccountMoveResumeRefused
+
+
+WorkerMoveFailed = WorkerMoveResumeAvailable | WorkerMoveResumeRefused
 WorkerSwitchOutcome = WorkerMoveReady | WorkerMoveResumed | WorkerMoveFailed
 
 
@@ -8749,11 +8738,13 @@ class SwitchingWorker:
 
     @property
     def failure(self) -> str:
-        return self.outcome.reason if isinstance(self.outcome, WorkerMoveFailed) else ""
+        return self.outcome.reason if isinstance(self.outcome, (WorkerMoveResumeAvailable, WorkerMoveResumeRefused)) else ""
 
     @property
     def resume_command(self) -> str:
-        return self.outcome.command if isinstance(self.outcome, WorkerMoveFailed) else ""
+        if isinstance(self.outcome, WorkerMoveResumeRefused):
+            return f"resume refused: {self.outcome.refusal.reason}"
+        return self.outcome.command if isinstance(self.outcome, WorkerMoveResumeAvailable) else ""
 
 
 @dataclass(frozen=True)
@@ -8803,19 +8794,46 @@ class WorkersRunMove:
     workers: tuple[SwitchingWorker | InterruptedWorkerMove, ...]
 
 
-def _account_move_command(session_dir: str, name: str, assignments: agents_log.RoleLog) -> str:
-    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    assignment = task_role(session_staff.worker_session(record), assignments)
-    role = assignment.role if isinstance(assignment, AssignedWorkerRole) else ""
-    return shlex.join(["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
-                       "--role", "implement" if role == "impl" else role, "--operation", "resume-account-move",
-                       "--session-dir", session_dir, "--to", name])
+@dataclass(frozen=True)
+class AccountMoveDispatch:
+    role: WorkerRole
+    lens: str | progress_history.DispatchDetailNotRecorded
+
+
+def _account_move_dispatch(record: dict[str, object]) -> AccountMoveDispatch | AccountMoveResumeRefused:
+    worker_id = record.get("staff_id")
+    if not isinstance(worker_id, str) or not worker_id:
+        return AccountMoveResumeRefused("worker has no staff id")
+    dispatch = progress_history.last_dispatch(staff.StaffId(worker_id))
+    if isinstance(dispatch, progress_history.NoDispatchRecorded):
+        return AccountMoveResumeRefused("worker has no recorded dispatch")
+    role = dispatch.role
+    if role not in ("impl", "test", "fix", "review"):
+        return AccountMoveResumeRefused(f"recorded role is not a worker role: {role}")
+    return AccountMoveDispatch(role, dispatch.lens)
+
+
+def _worker_move_failure(reason: str, session_dir: str, name: str) -> WorkerMoveFailed:
+    record = _as_dict(session_staff.read_worker_roster(_session_path(session_dir, ROSTER_FILE)).get(name))
+    dispatch = _account_move_dispatch(record)
+    if isinstance(dispatch, AccountMoveResumeRefused):
+        return WorkerMoveResumeRefused(reason, dispatch)
+    options = [("--role", dispatch.role), ("--operation", "resume-account-move"),
+               ("--session-dir", session_dir), ("--to", name)]
+    return WorkerMoveResumeAvailable(reason, assign_gate.assign_command(session_dir, name, dispatch.role, options))
 
 
 def command_resume_account_move(args: argparse.Namespace) -> int:
     session_dir, name = _as_str(_attr(args, "session_dir")), _as_str(_attr(args, "to"))
-    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    record = _as_dict(session_staff.read_worker_roster(_session_path(session_dir, ROSTER_FILE)).get(name))
+    dispatch = _account_move_dispatch(record)
     marker = _read_account_move(session_dir, name, _as_str(session_staff.worker_session(record)))
+    if isinstance(dispatch, AccountMoveResumeRefused):
+        if isinstance(marker, AccountMoveMarker):
+            _fail_account_move(session_dir, name, marker, f"resume failed: {dispatch.reason}")
+        else:
+            print(f"codex_mesh: {name}: resume refused: {dispatch.reason}", file=sys.stderr)
+        return 1
     if isinstance(marker, NoAccountMove):
         port = record.get("port")
         if not isinstance(port, int) or not _as_str(session_staff.worker_session(record)):
@@ -8825,7 +8843,7 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
             session_dir, name, record, port, codex_home_role_label(workers_home()))
         outcome = (_wait_account_move_resumes((retried,))[(session_dir, name)]
                    if isinstance(retried, InterruptedWorkerMove) else retried.outcome)
-        if isinstance(outcome, WorkerMoveFailed):
+        if isinstance(outcome, (WorkerMoveResumeAvailable, WorkerMoveResumeRefused)):
             print(f"codex_mesh: {name}: {outcome.reason}", file=sys.stderr)
             return 1
         return 0
@@ -8834,10 +8852,7 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
         if current != record:
             print(f"codex_mesh: {name}: worker changed before account move claim", file=sys.stderr)
             return 2
-        role = task_role(session_staff.worker_session(record), task_assignments())
-        if not isinstance(role, AssignedWorkerRole):
-            _fail_account_move(session_dir, name, marker, "resume failed: worker has no recorded role")
-            return 1
+        lens = cast(agents_log.Lens, dispatch.lens) if isinstance(dispatch.lens, str) else None
         launcher_pid = _as_int(record.get("launcher_pid"))
         if launcher_pid > 0 and _pid_alive(launcher_pid):
             _fail_account_move(session_dir, name, marker, "resume failed: existing launcher is still running")
@@ -8852,14 +8867,9 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
                 return 1
             summary = Path(header.reply_path)
             summary.parent.mkdir(parents=True, exist_ok=True)
-        assignment = agents_log.role_at(
-            agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-            marker.thread_id, datetime.now(timezone.utc),
-        )
-        lens = assignment.lens if isinstance(assignment, agents_log.Assignment) and assignment.role == role.role else None
         claimed: StartingRecord = {
             "thread_id": marker.thread_id, "status": "starting", "launcher_pid": os.getpid(),
-            "role": role.role, "previous_task_role": role.role, "previous_status": "failed",
+            "role": dispatch.role, "previous_task_role": dispatch.role, "previous_status": "failed",
             "previous_task_lens": lens,
         }
         if not _update_roster_if_expected(session_dir, name, claimed,
@@ -8869,7 +8879,7 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
         message = _session_path(session_dir, f"{name}.account-move-prompt.txt")
         _ = message.write_text(ACCOUNT_MOVE_CONTINUATION, encoding="utf-8")
         follow_args = argparse.Namespace(
-            session_dir=session_dir, to=name, role=role.role, lens=lens, claim_pid=os.getpid(),
+            session_dir=session_dir, to=name, role=dispatch.role, lens=lens, claim_pid=os.getpid(),
             message_file=str(message), summary_file=str(summary),
             reply_file="", log_file=str(_session_path(session_dir, f"{name}.account-move.log")),
             model="", effort="", service_tier="", turn_cwd="", read_only=False, image=[],
@@ -8891,7 +8901,6 @@ def _wait_account_move_resumes(
     """Await every dispatched move against one deadline, without serial worker waits."""
     pending = {(move.session_dir, move.name): move for move in moves}
     outcomes: dict[tuple[str, str], WorkerSwitchOutcome] = {}
-    assignments = task_assignments()
     deadline = time.monotonic() + ACCOUNT_MOVE_RESUME_TIMEOUT_SECS
     while pending:
         for key, move in tuple(pending.items()):
@@ -8901,23 +8910,23 @@ def _wait_account_move_resumes(
                     if result.get("resumed") is True:
                         outcomes[key] = WorkerMoveResumed()
                     elif reason := _as_str(result.get("error")):
-                        outcomes[key] = WorkerMoveFailed(reason, _account_move_command(*key, assignments))
+                        outcomes[key] = _worker_move_failure(reason, *key)
                 if key in outcomes:
                     del pending[key]
                     continue
                 if move.launcher_pid <= 0 or not _pid_alive(move.launcher_pid):
-                    outcomes[key] = WorkerMoveFailed("the director must resume this worker through assign.sh",
-                                                     _account_move_command(*key, assignments))
+                    outcomes[key] = _worker_move_failure("the director must resume this worker through assign.sh",
+                                                         *key)
                     del pending[key]
             except (ConnectionError, OSError, SystemExit) as error:
-                outcomes[key] = WorkerMoveFailed(f"resume failed: {error}", _account_move_command(*key, assignments))
+                outcomes[key] = _worker_move_failure(f"resume failed: {error}", *key)
                 del pending[key]
         if not pending:
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             for key in pending:
-                outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key, assignments))
+                outcomes[key] = _worker_move_failure("resume not confirmed before timeout", *key)
             break
         # The last poll ends at the deadline: summed 0.05 s steps can fall one rounding short of it.
         time.sleep(min(0.05, remaining))
@@ -8997,7 +9006,7 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             raise RuntimeError("account move requires its passed bulk ownership")
         current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         if current != entry or current.get("status") != "running":
-            return SwitchingWorker(name, False, WorkerMoveFailed("worker ownership changed before account move", _account_move_command(session_dir, name, task_assignments())))
+            return SwitchingWorker(name, False, _worker_move_failure("worker ownership changed before account move", session_dir, name))
         thread_id = _as_str(session_staff.worker_session(entry))
         marker: AccountMoveMarker | NoAccountMove = NoAccountMove()
         client: Client | None = None
@@ -9041,7 +9050,7 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             if isinstance(marker, AccountMoveMarker):
                 with contextlib.suppress(OSError):
                     _fail_account_move(session_dir, name, marker, reason)
-            return SwitchingWorker(name, True, WorkerMoveFailed(reason, _account_move_command(session_dir, name, task_assignments())))
+            return SwitchingWorker(name, True, _worker_move_failure(reason, session_dir, name))
         finally:
             if client is not None:
                 client.close()
@@ -9095,11 +9104,9 @@ def _failure_account_detail(error: BaseException, serving: CodexServingState) ->
     return f"{name} ({codex_home_display(serving.home)}): {error}"
 
 
-def _admit_worker(name: str, session_dir: str, *, held_design: str = "", held_role: str = "",
-                  role: str = "impl") -> WorkerStartAllowed:
+def _admit_worker(name: str, session_dir: str, *, held_design: str = "") -> WorkerStartAllowed:
     """Use the staff parent of an existing worker, or admit a new worker."""
     recorded = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    role = held_role or _as_str(recorded.get("held_role")) or role
     held = held_design or _as_str(recorded.get("held_design_id"))
     if held and recorded.get("staff_id"):
         from scripts.astra import design_roles
@@ -9113,7 +9120,7 @@ def _admit_worker(name: str, session_dir: str, *, held_design: str = "", held_ro
         if row is None or row.parent != staff.ReportsTo(owner.id):
             raise ValueError("design worker membership is unavailable")
         return WorkerStartAllowed(row.name, owner.id, Path(session_dir), worker_admission.ExistingWorkerSlot(row))
-    return worker_admission.admit(name, Path(session_dir), role=role)
+    return worker_admission.admit(name, Path(session_dir))
 
 
 def command_prime(args: argparse.Namespace) -> int:
@@ -9121,9 +9128,7 @@ def command_prime(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     try:
-        admitted = _admit_worker(name, session_dir, held_design=_as_str(_attr(args, "held_design")),
-                                 held_role=_as_str(_attr(args, "held_role")),
-                                 role=_as_str(_attr(args, "role")) or "review")
+        admitted = _admit_worker(name, session_dir, held_design=_as_str(_attr(args, "held_design")))
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -9233,7 +9238,7 @@ def command_fork(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     try:
-        admitted = worker_admission.admit(name, Path(session_dir), role="review")
+        admitted = worker_admission.admit(name, Path(session_dir))
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -9442,34 +9447,33 @@ def command_reset(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in {"start", "follow", "reopen", "fork", "adopt", "prime", "resume-account-move"}:
+        assign_gate.require_assign()
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="verb", required=True)
 
-    serve = subparsers.add_parser("serve", help="start the session app-server")
-    _ = serve.add_argument("--session-dir", required=True)
-    serve.set_defaults(handler=command_serve)
-    release_held = subparsers.add_parser("release-held-server")
-    _ = release_held.add_argument("--session-dir", required=True)
-    release_held.set_defaults(handler=command_release_held_server)
+    def command_parser(verb: str, handler: Callable[[argparse.Namespace], int], help_text: str,
+                       required: tuple[str, ...] = ("session-dir",)) -> argparse.ArgumentParser:
+        command = subparsers.add_parser(verb, help=help_text)
+        command.set_defaults(handler=handler)
+        for option in required:
+            _ = command.add_argument("--" + option, required=True)
+        return command
 
-    start = subparsers.add_parser("start", help="launch a worker and block")
-    _ = start.add_argument("--session-dir", required=True)
-    _ = start.add_argument("--name", required=True)
+    _ = command_parser("serve", command_serve, "start the session app-server")
+    _ = command_parser("release-held-server", command_release_held_server, "")
+
+    start = command_parser("start", command_start, "launch a worker and block", ("session-dir", "name", "prompt-file", "summary-file", "log-file"))
     _ = start.add_argument("--staff-id", default="")
+    _ = start.add_argument("--assignment-file", default="", help="the file that identifies this assignment across retries; default is the prompt file")
     _ = start.add_argument("--role", choices=WORKER_ROLES, default="")
     _ = start.add_argument("--lens", choices=agents_log.LENSES)
-    _ = start.add_argument("--prompt-file", required=True)
-    _ = start.add_argument("--summary-file", required=True)
     _ = start.add_argument(
         "--reply-file",
         default="",
         help="append replies here; the summary file is then the worker's own",
     )
-    _ = start.add_argument("--log-file", required=True)
-    _ = start.add_argument("--model", default="")
-    _ = start.add_argument("--effort", default="")
-    _ = start.add_argument("--service-tier", default="")
-    _ = start.add_argument("--task", default="")
     _ = start.add_argument("--cwd", default="")
     _ = start.add_argument("--sandbox", choices=SANDBOX_MODES, default=WORKER_SANDBOX)
     _ = start.add_argument("--timeout", type=float, default=86400.0)
@@ -9478,89 +9482,44 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="stay attached across turns, delivering each reply, until `end`",
     )
-    start.set_defaults(handler=command_start)
 
-    account_move = subparsers.add_parser("resume-account-move", help="resume an interrupted account move")
-    _ = account_move.add_argument("--session-dir", required=True)
-    _ = account_move.add_argument("--to", required=True)
-    account_move.set_defaults(handler=command_resume_account_move)
+    _ = command_parser("resume-account-move", command_resume_account_move, "resume an interrupted account move", ("session-dir", "to"))
 
-    follow = subparsers.add_parser("follow", help="run one turn on a finished worker")
-    _ = follow.add_argument("--session-dir", required=True)
-    _ = follow.add_argument("--to", required=True)
+    follow = command_parser("follow", command_follow, "run one turn on a finished worker", ("session-dir", "to", "message-file", "summary-file", "log-file"))
     _ = follow.add_argument("--role", choices=WORKER_ROLES, required=True)
     _ = follow.add_argument("--lens", choices=agents_log.LENSES)
     _ = follow.add_argument("--claim-pid", type=int, default=0)
-    _ = follow.add_argument("--message-file", required=True)
-    _ = follow.add_argument("--summary-file", required=True)
     _ = follow.add_argument("--reply-file", default="")
-    _ = follow.add_argument("--log-file", required=True)
     _ = follow.add_argument("--submission-receipt-file", default="", help=argparse.SUPPRESS)
-    _ = follow.add_argument("--model", default="")
-    _ = follow.add_argument("--effort", default="")
-    _ = follow.add_argument("--service-tier", default="")
-    _ = follow.add_argument("--task", default="")
     _ = follow.add_argument("--cwd", dest="turn_cwd", default="")
     _ = follow.add_argument("--read-only", action="store_true")
     _ = follow.add_argument("--image", action="append", default=[])
     _ = follow.add_argument("--timeout", type=float, default=86400.0)
-    follow.set_defaults(handler=command_follow)
 
-    prime = subparsers.add_parser("prime", help="create a read-only reviewer template without a turn")
-    _ = prime.add_argument("--session-dir", required=True)
-    _ = prime.add_argument("--name", required=True)
-    _ = prime.add_argument("--role", choices=WORKER_ROLES, default="review")
-    _ = prime.add_argument("--instructions-file", required=True)
-    _ = prime.add_argument("--model", default="")
-    _ = prime.add_argument("--effort", default="")
-    _ = prime.add_argument("--service-tier", default="")
-    _ = prime.add_argument("--task", default="")
+    prime = command_parser("prime", command_prime, "create a read-only reviewer template without a turn", ("session-dir", "name", "instructions-file"))
     _ = prime.add_argument("--cwd", default="")
     _ = prime.add_argument("--sandbox", choices=SANDBOX_MODES, default=READ_ONLY_SANDBOX)
     _ = prime.add_argument("--held-design", default="")
     _ = prime.add_argument("--held-role", default="")
-    prime.set_defaults(handler=command_prime)
 
-    fork = subparsers.add_parser("fork", help="create a named read-only fork of a template")
-    _ = fork.add_argument("--session-dir", required=True)
+    fork = command_parser("fork", command_fork, "create a named read-only fork of a template", ("session-dir", "name"))
     _ = fork.add_argument("--from", dest="from_name", required=True)
-    _ = fork.add_argument("--name", required=True)
-    fork.set_defaults(handler=command_fork)
 
-    set_instructions = subparsers.add_parser("set-instructions", help="point an idle reviewer at a new standing prompt")
-    _ = set_instructions.add_argument("--session-dir", required=True)
-    _ = set_instructions.add_argument("--to", required=True)
-    _ = set_instructions.add_argument("--instructions-file", required=True)
-    set_instructions.set_defaults(handler=command_set_instructions)
+    _ = command_parser("set-instructions", command_set_instructions, "point an idle reviewer at a new standing prompt", ("session-dir", "to", "instructions-file"))
 
-    reset = subparsers.add_parser("reset", help="remove all turns from an idle reviewer")
-    _ = reset.add_argument("--session-dir", required=True)
-    _ = reset.add_argument("--to", required=True)
-    reset.set_defaults(handler=command_reset)
+    _ = command_parser("reset", command_reset, "remove all turns from an idle reviewer", ("session-dir", "to"))
 
-    compact = subparsers.add_parser("compact", help="compact a finished worker")
-    _ = compact.add_argument("--session-dir", required=True)
-    _ = compact.add_argument("--to", required=True)
-    compact.set_defaults(handler=command_compact)
+    _ = command_parser("compact", command_compact, "compact a finished worker", ("session-dir", "to"))
 
-    can_follow = subparsers.add_parser("can-follow", help="check whether a worker can take a follow-up")
-    _ = can_follow.add_argument("--session-dir", required=True)
-    _ = can_follow.add_argument("--to", required=True)
+    can_follow = command_parser("can-follow", command_can_follow, "check whether a worker can take a follow-up", ("session-dir", "to"))
     _ = can_follow.add_argument("--role", choices=WORKER_ROLES, required=True)
     _ = can_follow.add_argument("--lens", choices=agents_log.LENSES)
     _ = can_follow.add_argument("--claim-pid", type=int, default=0)
-    can_follow.set_defaults(handler=command_can_follow)
 
-    release_follow = subparsers.add_parser("release-follow", help="release an unstarted follow claim")
-    _ = release_follow.add_argument("--session-dir", required=True)
-    _ = release_follow.add_argument("--to", required=True)
+    release_follow = command_parser("release-follow", command_release_follow, "release an unstarted follow claim", ("session-dir", "to"))
     _ = release_follow.add_argument("--claim-pid", type=int, required=True)
-    release_follow.set_defaults(handler=command_release_follow)
 
-    send = subparsers.add_parser(
-        "send", help="queue a message for a worker; without a launcher it waits for the next dispatch")
-    _ = send.add_argument("--session-dir", required=True)
-    _ = send.add_argument("--to", required=True)
+    send = command_parser("send", command_send, "queue a message for a worker; without a launcher it waits for the next dispatch", ("session-dir", "to"))
     _ = send.add_argument("--from", dest="sender", default="codex-mesh")
     _ = send.add_argument("--human", action="store_true")
     _ = send.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
@@ -9570,72 +9529,48 @@ def main(argv: list[str] | None = None) -> int:
     send_body = send.add_mutually_exclusive_group(required=True)
     _ = send_body.add_argument("--message")
     _ = send_body.add_argument("--message-file", help="read the message from this file")
-    send.set_defaults(handler=command_send)
 
-    steer = subparsers.add_parser("steer", help="interrupt a worker's running turn")
-    _ = steer.add_argument("--session-dir", required=True)
-    _ = steer.add_argument("--to", required=True)
+    steer = command_parser("steer", command_steer, "interrupt a worker's running turn", ("session-dir", "to"))
     _ = steer.add_argument("--human", action="store_true")
     steer_body = steer.add_mutually_exclusive_group(required=True)
     _ = steer_body.add_argument("--message")
     _ = steer_body.add_argument("--message-file", help="read the message from this file")
-    steer.set_defaults(handler=command_steer)
 
-    interrupt = subparsers.add_parser("interrupt", help="stop a worker's running turn, keeping the worker")
-    _ = interrupt.add_argument("--session-dir", required=True)
-    _ = interrupt.add_argument("--to", required=True)
+    interrupt = command_parser("interrupt", command_interrupt, "stop a worker's running turn, keeping the worker", ("session-dir", "to"))
     _ = interrupt.add_argument("--human", action="store_true")
     _ = interrupt.add_argument("--from", dest="sender", default="codex-mesh")
     interrupt_body = interrupt.add_mutually_exclusive_group()
     _ = interrupt_body.add_argument("--message", default="")
     _ = interrupt_body.add_argument("--message-file", help="read the message from this file")
-    interrupt.set_defaults(handler=command_interrupt)
 
-    end = subparsers.add_parser("end", help="release a resident worker")
-    _ = end.add_argument("--session-dir", required=True)
-    _ = end.add_argument("--to", required=True)
+    end = command_parser("end", command_end, "release a resident worker", ("session-dir", "to"))
     _ = end.add_argument("--expected-thread-id", default="", help="refuse if this worker now names another thread")
-    end_filter = end.add_mutually_exclusive_group()
-    _ = end_filter.add_argument("--idle-only", action="store_true", help="refuse a running worker without changing it")
-    _ = end_filter.add_argument("--cleanup-only", action="store_true",
-                               help="only retry server cleanup for a worker already ended; refuse any other status without changing it")
-    end.set_defaults(handler=command_end)
+    _ = end.add_argument("--idle-only", action="store_true", help="refuse a running worker without changing it")
 
-    stop = subparsers.add_parser("stop", help="stop the session app-server")
-    _ = stop.add_argument("--session-dir", required=True)
+    stop = command_parser("stop", command_stop, "stop the session app-server")
     _ = stop.add_argument("--pause", action="store_true", help="retain worker threads for a director restart")
-    stop.set_defaults(handler=command_stop)
 
-    adopt = subparsers.add_parser("adopt", help="carry an idle unit worker into this run")
-    _ = adopt.add_argument("--session-dir", required=True)
+    adopt = command_parser("adopt", command_adopt, "carry an idle unit worker into this run", ("session-dir", "name"))
     _ = adopt.add_argument("--from", dest="from_run", required=True)
-    _ = adopt.add_argument("--name", required=True)
-    adopt.set_defaults(handler=command_adopt)
 
-    reopen = subparsers.add_parser("reopen", help="recover an ended or abandoned worker on its recorded thread")
-    _ = reopen.add_argument("--session-dir", required=True)
-    _ = reopen.add_argument("--to", required=True)
-    reopen.set_defaults(handler=command_reopen)
+    _ = command_parser("reopen", command_reopen, "recover an ended or abandoned worker on its recorded thread", ("session-dir", "to"))
 
-    idle_stop = subparsers.add_parser("idle-stop", help="stop this session's app-server if nothing uses it")
-    _ = idle_stop.add_argument("--session-dir", required=True)
+    idle_stop = command_parser("idle-stop", command_idle_stop, "stop this session's app-server if nothing uses it")
     _ = idle_stop.add_argument("--pid", type=int, required=True)
     _ = idle_stop.add_argument("--port", type=int, required=True)
-    idle_stop.set_defaults(handler=command_idle_stop)
 
-    sweep = subparsers.add_parser("sweep", help="report app-servers nothing is using")
+    sweep = command_parser("sweep", command_sweep, "report app-servers nothing is using", ())
     _ = sweep.add_argument("--root", default="")
     _ = sweep.add_argument("--stop", action="store_true", help="stop each server two looks in a row call unused")
-    sweep.set_defaults(handler=command_sweep)
 
-    signin_changed = subparsers.add_parser(
-        "signin-changed", help="move every run off an app-server older than the Codex sign-in")
+    signin_changed = command_parser("signin-changed", command_signin_changed, "move every run off an app-server older than the Codex sign-in", ())
     _ = signin_changed.add_argument("--root", default="")
-    signin_changed.set_defaults(handler=command_signin_changed)
 
-    roster = subparsers.add_parser("list", help="print the worker roster")
-    _ = roster.add_argument("--session-dir", required=True)
-    roster.set_defaults(handler=command_list)
+    _ = command_parser("list", command_list, "print the worker roster")
+
+    for command in (start, follow, prime):
+        for option in ("model", "effort", "service-tier", "task"):
+            _ = command.add_argument("--" + option, default="")
 
     args = parser.parse_args(argv)
     handler = cast("Callable[[argparse.Namespace], int]", _attr(args, "handler"))
@@ -9653,6 +9588,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in {"start", "follow", "reopen", "fork", "adopt", "prime", "resume-account-move"}:
-        assign_gate.require_assign()
     sys.exit(main())

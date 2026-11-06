@@ -23,19 +23,10 @@ class CargoOutputUnavailable:
     reason: str
 
 
-def read_cargo_output_roots(checkout: Path, *, cargo: Sequence[str] = ("cargo",), options: Sequence[str] = (),
-                            environment: Mapping[str, str] | None = None
-                            ) -> CargoOutputRoots | CargoOutputUnavailable:
-    """Keep missing output directories in a valid Cargo mapping."""
+def cargo_metadata_output_roots(text: str) -> CargoOutputRoots | CargoOutputUnavailable:
+    """Decode the workspace and output folders in Cargo metadata."""
     try:
-        result = subprocess.run(
-            [*cargo, "metadata", "--format-version", "1", "--no-deps", *options],
-            cwd=checkout, capture_output=True, text=True, check=False,
-            env=environment,
-        )
-        if result.returncode:
-            return CargoOutputUnavailable(result.stderr.strip() or f"cargo metadata exited {result.returncode}")
-        metadata = cast(object, json.loads(result.stdout))
+        metadata = cast(object, json.loads(text))
         if not isinstance(metadata, dict):
             return CargoOutputUnavailable("cargo metadata did not return an object")
         fields = cast(dict[str, object], metadata)
@@ -48,5 +39,22 @@ def read_cargo_output_roots(checkout: Path, *, cargo: Sequence[str] = ("cargo",)
         if not all(path.is_absolute() for path in paths):
             return CargoOutputUnavailable("cargo metadata has relative output roots")
         return CargoOutputRoots(*(path.resolve() for path in paths))
+    except (OSError, ValueError) as error:
+        return CargoOutputUnavailable(str(error))
+
+
+def read_cargo_output_roots(checkout: Path, *, cargo: Sequence[str] = ("cargo",), options: Sequence[str] = (),
+                            environment: Mapping[str, str] | None = None
+                            ) -> CargoOutputRoots | CargoOutputUnavailable:
+    """Keep missing output directories in a valid Cargo mapping."""
+    try:
+        result = subprocess.run(
+            [*cargo, "metadata", "--format-version", "1", "--no-deps", *options],
+            cwd=checkout, capture_output=True, text=True, check=False,
+            env=environment,
+        )
+        if result.returncode:
+            return CargoOutputUnavailable(result.stderr.strip() or f"cargo metadata exited {result.returncode}")
+        return cargo_metadata_output_roots(result.stdout)
     except (OSError, ValueError) as error:
         return CargoOutputUnavailable(str(error))

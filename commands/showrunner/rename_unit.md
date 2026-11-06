@@ -8,19 +8,18 @@ argument-hint: "<old> <new>"
 Run the command from the owning showrunner session:
 
 ```sh
-python3 ~/.claude/scripts/production/rename_unit.py <plan|apply|verify> <slug> <old> <new>
+python3 ~/.claude/scripts/production/rename_unit.py <plan|apply|verify> <showrunner name> <old> <new>
 ```
 
 The command reads the unit from its staff row.
-A pending rename finishes before the command sets the displays.
-With no pending rename, a same-name request writes nothing.
-It sets the session, tab and pane displays to the staff name.
-A finished rename prints `unchanged`.
+A rerun finishes a pending rename and repairs the displays.
+A same-name request keeps the staff name and repairs stale session, tab, and pane displays.
+A completed rerun prints one `unchanged` line, exits 0, and sends no restart notice.
 
 A new-name rename writes the staff name and sets the displays.
 It reads the current folder from the staff row and the current branch from Git.
 It uses `unit_names.swap_stem` for the folder name and branch.
-It replaces the trailing `-<old name>` with `-<new name>` independently for each name.
+It replaces the trailing `-<old name>` with `-<new name>` independently in the folder and branch.
 The folder keeps its parent folder.
 For example, renaming `port` to `x` moves `~/rust/cargo-liner-port` to `~/rust/cargo-liner-x`.
 The branch `cargo-liner-port` becomes `cargo-liner-x`.
@@ -47,3 +46,6 @@ python3 ~/.claude/scripts/production/unit_move.py move-folder --unit <staff id> 
 
 The command refuses an existing destination or a concurrent row operation.
 The move limits come from `config/production.conf` and respect the current operation deadline.
+A Git timeout prints one `rename_unit: error:` line and exits 1.
+The folder-only command reports the timeout as an anomaly.
+Neither command prints a traceback.

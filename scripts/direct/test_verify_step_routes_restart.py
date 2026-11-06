@@ -14,7 +14,10 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
         original = (self.fixture.bin_directory / "cargo").read_text()
         stub = original.replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 if arguments[:1] == ["check"]:
-    record = json.loads((Path(os.environ["VERIFY_STEPS_DIR"]) / (os.environ["BUILDLOG_CALL_ID"] + ".json")).read_text())
+    import sys
+    sys.path.insert(0, str(Path.home() / ".claude"))
+    from scripts.direct.test_verify_step_state import read_step_row
+    record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["PACKAGE_ROOT"]) / "compiling-state").write_text(record["state"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("new hold")
     raise SystemExit(143)

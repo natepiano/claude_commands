@@ -29,24 +29,22 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
+    from ..copies import copies
     from ..lib import build_folders
+    from ..lib.boot_identity import boot_identity as boot_identity
     from ..lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from ..aws_target import ledger
     from ..build_targets.target_config import SshTarget, is_aws_target
 else:
+    from scripts.copies import copies
     from scripts.lib import build_folders
+    from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
     from scripts.build_targets.target_config import SshTarget, is_aws_target
 
 
+
 PROC_ROOT = Path('/proc')
-
-
-def boot_identity(proc_root: Path = PROC_ROOT) -> str:
-    identity = (proc_root / 'sys/kernel/random/boot_id').read_text().strip()
-    if not identity:
-        raise ValueError('boot identity is missing')
-    return identity
 
 
 class SlotBoot(Enum):
@@ -188,7 +186,7 @@ def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
     """Read Linux disk capacity and the public tool versions."""
     return '\n'.join((
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
-        f'mkdir -p -- "$HOME"/{shlex.quote(mirror)} || exit 1',
+        copies.mirror_probe_setup(mirror),
         f'checkout="$HOME"/{shlex.quote(mirror)}',
         'if [[ -f "$checkout/Cargo.toml" ]]; then',
         "  capacity_code=" + shlex.quote("\n".join((
@@ -320,7 +318,8 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
-            uncertain.add(pid)
+            if not isinstance(lease, UnmarkedSlot):
+                uncertain.add(pid)
     # The checking process and its ancestors cannot be leftovers of a lost run.
     checking_chain: set[int] = set()
     ancestor = own_pid
@@ -376,7 +375,7 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
                 selected.add(pid)
         except (PermissionError, FileNotFoundError, ProcessLookupError):
             denied = True
-        if denied and pid not in selected:
+        if denied and pid not in selected and not isinstance(lease, UnmarkedSlot):
             # Confirm that missing evidence does not belong to an exited process.
             try:
                 if process_fields(pid, proc_root)[0] in ('Z', 'X'):
@@ -615,7 +614,8 @@ def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
                        + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                        + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
-            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False).returncode
+            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
+                                   pass_fds=copies.inherited_mirror_descriptors()).returncode
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
@@ -769,7 +769,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         started = step_directory / 'started'
         command += (f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
-        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False)
+        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
+                                   pass_fds=copies.inherited_mirror_descriptors())
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
     try:
