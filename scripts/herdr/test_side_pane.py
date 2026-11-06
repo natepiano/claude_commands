@@ -18,7 +18,6 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.accounts import accounts
-from scripts.shutdown import stop_resume
 
 import herdr
 import pane_launch
@@ -46,6 +45,7 @@ class SidePaneTests(StaffTestCase):
         config = self.root / "conf"
         config.mkdir()
         write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
+        write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "state"), "CONF_DIR": str(config),
@@ -330,7 +330,8 @@ class SidePaneTests(StaffTestCase):
             send_signal(agent_pid, number)
             self.world.activate(fixture_runtime_id("other-work"), result.pane, "claude")
 
-        with patch.object(os, "kill", side_effect=busy), patch.object(stop_resume, "STOP_GRACE_SECONDS", 0):
+        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nSTOP_GRACE_SECONDS=0\n")
+        with patch.object(os, "kill", side_effect=busy):
             code, _, errors = self.command("close", "friend")
         self.assertEqual(code, 8)
         self.assertIn("agent has not ended", errors)
@@ -426,8 +427,8 @@ class SidePaneTests(StaffTestCase):
         def retained(agent_pid: int, number: int) -> None:
             self.signals.append((agent_pid, number))
 
-        with patch.object(os, "kill", side_effect=retained), patch.object(
-                stop_resume, "STOP_GRACE_SECONDS", 0):
+        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nSTOP_GRACE_SECONDS=0\n")
+        with patch.object(os, "kill", side_effect=retained):
             code, _, errors = self.command("close", "friend")
         self.assertEqual(code, 8)
         self.assertIn("agent has not ended", errors)

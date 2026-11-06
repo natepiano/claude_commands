@@ -169,7 +169,7 @@ def close(label: str) -> SidePane | bool:
         if not herdr.check_target(process, action="signal"):
             return _note(client, current.pane, "agent process is unproved")
         os.kill(process.pid, signal.SIGTERM)
-        deadline = monotonic() + stop_resume.STOP_GRACE_SECONDS
+        deadline = monotonic() + stop_resume.stop_grace_seconds()
         while not isinstance(client.pane_activity(current.pane), herdr.PaneAtShell):
             remaining = deadline - monotonic()
             if remaining <= 0:

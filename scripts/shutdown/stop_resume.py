@@ -245,6 +245,10 @@ def _retire_prompt(session_id: str) -> None:
         print(f"{session_id}: prompt cancellation: {error}", file=sys.stderr)
 
 
+def stop_grace_seconds() -> float:
+    return float(conf.read("shutdown").text("STOP_GRACE_SECONDS"))
+
+
 def _stop(session: str) -> StopResult:
     """Signal only the process that proves the current conversation."""
     identity = session
@@ -255,7 +259,7 @@ def _stop(session: str) -> StopResult:
         from scripts.production import staff
 
         settings = conf.read("shutdown")
-        stop_grace, kill_grace = float(settings.text("STOP_GRACE_SECONDS")), float(settings.text("KILL_GRACE_SECONDS"))
+        stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("KILL_GRACE_SECONDS"))
         try:
             member = staff.initial_snapshot().by_member_reference(session)
         except (OSError, ValueError) as error:

@@ -2469,7 +2469,7 @@ A rerun of a finished move starts no process and changes nothing.
 
 - `dispatch_role` and a closure after a policy change read the holder's run until `progress_history.last_dispatch` arrives. A role recorded by a private dispatch reads as unavailable at restore.
 - The installed Stop hook runs from `~/.claude`, so `herdr_tab_title.py` cannot act on a real friend's Stop until it lands on main.
-- `side_pane.close` reads `stop_resume.STOP_GRACE_SECONDS`.
+- `side_pane.close` reads the configured stop time through `stop_resume.stop_grace_seconds()`.
 - A consultation is a labelled pane. A staff worker is a row. Nothing reads a friend through staff.
 
 **Gotchas:**
