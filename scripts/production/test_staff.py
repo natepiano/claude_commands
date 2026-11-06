@@ -8,7 +8,6 @@ import io
 import json
 import multiprocessing
 import os
-import pwd
 import stat
 import subprocess
 import sys
@@ -527,25 +526,29 @@ class StaffTests(StaffTestCase):
                   mock.patch.object(staff, "_remote", return_value=value)):
                 self.assertTrue(staff.snapshot().production)
 
-    def test_gate_module_writes_keep_the_real_staff_and_launch_folders_unchanged(self) -> None:
+    def test_gate_module_writes_keep_the_inherited_staff_and_launch_folders_unchanged(self) -> None:
         from scripts.herdr import pane_launch
         from scripts.production import merge_gate
 
-        real_state = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state"
-        real_staff = real_state / "staff"
-        real_launches = real_state / "herdr-panes"
+        inherited_state = self.root / "inherited-state"
+        inherited_staff = inherited_state / "staff"
+        inherited_launches = inherited_state / "herdr-panes"
+        inherited_staff.mkdir(parents=True)
+        inherited_launches.mkdir(parents=True)
+        _ = (inherited_staff / "staff.json").write_text('{"rows": []}\n', encoding="utf-8")
+        _ = (inherited_launches / "agents.json").write_text('{}\n', encoding="utf-8")
 
         def folder_bytes(folder: Path) -> dict[Path, bytes]:
             return {path.relative_to(folder): path.read_bytes()
                     for path in folder.rglob("*") if path.is_file()}
 
-        before = folder_bytes(real_staff), folder_bytes(real_launches)
+        before = folder_bytes(inherited_staff), folder_bytes(inherited_launches)
         module_root = self.root / "gate-module"
         module_root.mkdir()
         environment = merge_gate.test_module_environment(module_root, {
             **os.environ,
-            "STAFF_FILE": str(real_staff / "staff.json"),
-            "HERDR_PANE_RECORD_DIR": str(real_launches),
+            "STAFF_FILE": str(inherited_staff / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(inherited_launches),
         })
         self.assertEqual(environment["STAFF_FILE"], str(module_root / "staff.json"))
         self.assertEqual(environment["HERDR_PANE_RECORD_DIR"], str(module_root / "herdr-panes"))
@@ -557,7 +560,7 @@ class StaffTests(StaffTestCase):
             self.assertEqual(staff.snapshot().by_id(owner.id), owner)
             self.assertEqual(pane_launch.read_strict(path)["w1:p1"]["session_id"], owner.id)
         self.assertTrue((module_root / "staff.json").is_file())
-        self.assertEqual((folder_bytes(real_staff), folder_bytes(real_launches)), before)
+        self.assertEqual((folder_bytes(inherited_staff), folder_bytes(inherited_launches)), before)
 
     def test_stopped_test_owner_removal_is_unchanged_on_a_second_run(self) -> None:
         row = fixture_member("showrunner", name="fixture",
