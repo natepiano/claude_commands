@@ -384,30 +384,24 @@ only I can bump
 
 **Ruled out:** a separate `type_gate.py`, a promotion hook or a new timer; a client that sends the gate shape.
 
-### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: todo
+### Phase 14 — A waiting build stops with a clear message when the admission service keeps failing to start  · status: done
 
-**Depends on:** 10k (runs after it; both may touch the client). Source: the 10x deploy check, 2026-11-05. User approval: "fix then" (2026-11-05, answer to the question whether a waiting build may stop with a clear message when the service keeps failing to start).
+#### As-built
 
-#### Work Order
-
-**Goal:** A build that waits for memory never waits forever with no message while the admission service fails to start.
-
-**Spec:**
-1. **Cause (10x deploy check).** systemd keeps `build-admission.socket` active while `build-admission.service` fails at start each second. The client connects, the socket accepts, and the connection closes with no reply. The client treats `ECONNRESET`, `EPIPE` and `TransportUnavailable` as "admission service restarted; waiting again" and retries with no limit (`admission_client.py`, the `except (OSError, TransportUnavailable)` branch). Each connect also sets `retry.unreachable_deadline` back to no limit. Only a missing socket or a refused connect starts the unreachable time limit.
-2. **Fix.** A restart error starts the same unreachable time limit as a missing socket (`unreachable_limit_seconds`, today 60 s). Only a valid reply from the service clears it, not a connect. At the limit the client stops with the existing text: "build queue unreachable for <time>; step stopped; cargo token given back". Add no config key.
-3. **Keep.** A service restart that answers again within the limit keeps the wait, as today. Launch clients keep their launch time limit. `/build:queue` keeps its bounded query.
-4. **Silent connection.** After a restart error, an accepted connection that stays silent can remain in the receive loop (`admission_client.py:342`) and never read the deadline. Check the limit there too. The limit covers acquisition only: release uses `CleanupTiming`, which has no unreachable limit (`admission_protocol.py:177`).
-5. **Proof.** Tests with a fake socket that accepts and closes with no reply: a waiting client stops at the limit with the text above; a service that answers within the limit keeps the wait and its place. A test with a reset, then an accepted silent connection: the client stops at the limit.
+- In `_acquire` (`scripts/build_queue/admission_client.py`), only a parsed reply sets `retry.unreachable_deadline` to no limit. A connect does not clear it. A restart error (`ECONNRESET`, `EPIPE`, `TransportUnavailable`) starts the same limit as a missing socket: `unreachable_limit_seconds`.
+- The receive loop reads `retry.unreachable_deadline`, so an accepted silent connection stops at the limit. On a read timeout the order is: the leave check, the launch deadline, then `check_unreachable()`.
+- At the limit the client stops with "build queue unreachable for <time>; step stopped; cargo token given back".
+- A service that answers within the limit keeps the wait and its place. Launch clients keep their launch limit. Release uses `CleanupTiming`, which has no unreachable limit.
 
 **Files:**
-- `scripts/build_queue/admission_client.py` — the retry loop.
-- `scripts/build_queue/test_admission_client.py` — the tests.
+- `scripts/build_queue/admission_client.py` — the retry loop
+- `scripts/build_queue/test_admission_client.py` — stop at the limit with closed and silent connections, a valid reply after the limit, a reply that keeps the wait
 
-**Workers:** `1 writer + 1 tester`.
+**Gotchas:** the socket tests assert the fixture clock, because elapsed-time bounds fail under load.
 
-**Acceptance gate:** queue and caller suites pass; basedpyright 0/0/0. Change-Review: none (the fault needs a failing service; the tests show it).
+**Ruled out:** a new config key.
 
-### Phase 15 — A queue priority change stops blocking other queue requests while it reads the roster  · status: todo
+### Phase 15 — A queue priority change stops blocking other queue requests while it reads the roster  · status: done
 
 **Depends on:** 14. Source: the 10x architect review; builds ruling, 2026-11-05: one small phase after 14.
 
@@ -423,8 +417,9 @@ only I can bump
 
 **Files:**
 - `scripts/build_queue/admission_service.py` — the priority request path.
-- `scripts/lint/memory_admit.py` — the roster caller, when the change reaches it.
+- `scripts/build_queue/admission_test_support.py` — `completed_queue_change`.
 - `scripts/build_queue/test_admission_service.py` — the tests.
+- `scripts/build_queue/test_queue_view.py`, `scripts/lint/test_memory_admit.py` — callers of a priority change take the socket reply.
 
 **Workers:** `1 writer + 1 tester`.
 

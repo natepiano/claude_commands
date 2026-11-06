@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from collections.abc import Generator, Mapping
+from concurrent.futures import Future
 from contextlib import contextmanager
 import errno
 from dataclasses import dataclass, field, replace
@@ -402,6 +404,38 @@ class Connection:
     finished: bool = False
 
 
+QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest
+
+
+@dataclass
+class OrderedQueueChange:
+    request: QueueChange
+    connections: list[Connection]
+
+
+@dataclass(frozen=True)
+class NoPendingPriorityRoster:
+    """No priority change waits for a roster read."""
+
+
+@dataclass(frozen=True)
+class PendingPriorityRoster:
+    change: OrderedQueueChange
+    result: Future[Mapping[str, gate.UnitMembership]]
+
+
+def read_priority_roster(result: Future[Mapping[str, gate.UnitMembership]], wake: int) -> None:
+    """Read the roster without changing service state."""
+    try:
+        try:
+            result.set_result(gate.priority_labels(gate.RosterUnits()))
+        except Exception as error:
+            result.set_exception(error)
+        os.eventfd_write(wake, 1)
+    finally:
+        os.close(wake)
+
+
 @dataclass
 class WaitingAdmission:
     request: wire.AdmitRequest | wire.LaunchRequest
@@ -519,6 +553,8 @@ class AdmissionServer:
         self.pass_stale: bool = False
         self.pending_configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration | NoPass = NoPass()
         self.priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
+        self.pending_priority: PendingPriorityRoster | NoPendingPriorityRoster = NoPendingPriorityRoster()
+        self.queue_changes: deque[OrderedQueueChange] = deque()
         self.last_diagnostics: tuple[gate.ConfigurationDiagnostic, ...] = ()
         self._pending_replies: dict[str, list[wire.Reply]] = {}
         self._persisted: str = ""
@@ -527,6 +563,8 @@ class AdmissionServer:
         self.connections: dict[int, Connection] = {}
         self.watchers: dict[int, OwnerWatch | ScopeWatch] = {}
         self.epoll: select.epoll = select.epoll()
+        self.priority_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self.epoll.register(self.priority_events, select.EPOLLIN)
         self.listener: socket.socket | NoConnection = NoConnection()
         self.stopped: bool = False
         self.closed: bool = False
@@ -1260,6 +1298,8 @@ class AdmissionServer:
         replay = self.ledger.get(key)
         if replay is not None:
             return [replay.reply]
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest)):
+            return self._submit_queue_change(request, connection)
         configuration = (self.configuration if isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest))
                          else self._take_configuration())
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
@@ -1300,16 +1340,86 @@ class AdmissionServer:
                     self.reservations[episode] = updated
             live = any(record.reservation_id == request.reservation for record in self.reservations.values())
             self.ledger[key] = ReplayEntry(wire.Ok(), LiveGrant() if live else self.clock.now(), request.reservation)
-        elif isinstance(request, wire.TokenWaitRequest):
+        else:
             for episode, record in list(self.reservations.items()):
                 if record.reservation_id == request.reservation:
                     self._end(episode, TokenWaiting(key, self.clock.now()))
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
-        elif isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
+        if isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest)):
+            self.persist()
+            if (isinstance(self.last_inputs, gate.QueueInputs)
+                    and isinstance(self.last_policy, gate.AdmissionPolicy)):
+                self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
+                self.pass_stale = True
+            self.next_pass = self.clock.monotonic()
+            return [self.ledger[key].reply]
+        _ = self._run_pass(configuration)
+        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
+            return self._pending_replies.pop(key, [])
+        return [self.ledger[key].reply]
+
+    def _submit_queue_change(self, request: QueueChange,
+                             connection: Connection | NoConnection) -> list[wire.Reply]:
+        connections = [connection] if isinstance(connection, Connection) else []
+        if isinstance(self.pending_priority, PendingPriorityRoster):
+            for change in (self.pending_priority.change, *self.queue_changes):
+                if change.request.request_id == request.request_id:
+                    for client in connections:
+                        if all(client is not previous for previous in change.connections):
+                            change.connections.append(client)
+                    return []
+            self.queue_changes.append(OrderedQueueChange(request, connections))
+            return []
+        if isinstance(request, wire.PrioritySetRequest) and request.unit.strip():
+            result: Future[Mapping[str, gate.UnitMembership]] = Future()
+            self.pending_priority = PendingPriorityRoster(OrderedQueueChange(request, connections), result)
+            threading.Thread(target=read_priority_roster, args=(result, os.dup(self.priority_events)),
+                             daemon=True, name="priority-roster").start()
+            return []
+        return self._apply_queue_change(request, {})
+
+    def _finish_priority_roster(self) -> None:
+        pending = self.pending_priority
+        if not isinstance(pending, PendingPriorityRoster) or not pending.result.done():
+            return
+        self.pending_priority = NoPendingPriorityRoster()
+        self._complete_queue_change(pending.change,
+            lambda: self._apply_queue_change(pending.change.request, pending.result.result()))
+        self._continue_queue_changes()
+
+    def _continue_queue_changes(self) -> None:
+        while self.queue_changes and isinstance(self.pending_priority, NoPendingPriorityRoster):
+            change = self.queue_changes.popleft()
+            self._complete_queue_change(change,
+                lambda: self._submit_queue_change(change.request, NO_CONNECTION))
+            if isinstance(self.pending_priority, PendingPriorityRoster):
+                self.pending_priority.change.connections.extend(change.connections)
+
+    def _complete_queue_change(self, change: OrderedQueueChange,
+                               apply: Callable[[], list[wire.Reply]]) -> None:
+        try:
+            replies = apply()
+        except (ValueError, TypeError) as error:
+            for connection in change.connections:
+                if connection.socket.fileno() >= 0:
+                    self._refuse_connection(connection, str(error))
+        else:
+            self._reply_to_queue_change(change, replies)
+
+    def _reply_to_queue_change(self, change: OrderedQueueChange, replies: list[wire.Reply]) -> None:
+        for connection in change.connections:
+            if connection.socket.fileno() >= 0:
+                for reply in replies:
+                    self._send(connection, reply)
+
+    def _apply_queue_change(self, request: QueueChange,
+                            labels: Mapping[str, gate.UnitMembership]) -> list[wire.Reply]:
+        key = request.request_id
+        configuration = self._take_configuration()
+        if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
             if isinstance(request, wire.PrioritySetRequest):
                 if not request.unit.strip():
                     return self._mutation_reply(key, wire.Refused("unit is required"))
-                labels = gate.priority_labels(gate.RosterUnits())
                 rows = [waiting.row for waiting in self.waiters.values()]
                 rows.extend(record.queue_waiter for record in self.reservations.values())
                 recorded_sessions = {row.get("session_id", "") for row in rows if row.get("unit", "")}
@@ -1352,17 +1462,7 @@ class AdmissionServer:
                 "why": request.why, "set_by": request.actor}
             gate.head_override_event("set", self.override, row["need"], host.available, reserve, self.clock.now())
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
-        if isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest)):
-            self.persist()
-            if (isinstance(self.last_inputs, gate.QueueInputs)
-                    and isinstance(self.last_policy, gate.AdmissionPolicy)):
-                self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
-                self.pass_stale = True
-            self.next_pass = self.clock.monotonic()
-            return [self.ledger[key].reply]
         _ = self._run_pass(configuration)
-        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
-            return self._pending_replies.pop(key, [])
         return [self.ledger[key].reply]
 
     def _mutation_reply(self, key: str, reply: wire.Ok | wire.Refused, reservation: str = "") -> list[wire.Reply]:
@@ -1629,6 +1729,8 @@ class AdmissionServer:
         now = self.clock.monotonic()
         delay = min(timeout, max(0, min(self.next_pass, self.next_source_check, self.next_config_watch_retry) - now))
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)
+        if any(descriptor == self.priority_events for descriptor, _events in ready):
+            _ = os.eventfd_read(self.priority_events)
         configuration_changed = (any(descriptor == self.config_events for descriptor, _events in ready)
                                  and self._configuration_changed())
         if self.clock.monotonic() >= self.next_config_watch_retry:
@@ -1666,6 +1768,7 @@ class AdmissionServer:
                         del self.waiters[episode]
                 self._prune_watches()
                 self.next_pass = self.clock.monotonic()
+        self._finish_priority_roster()
         if self.clock.monotonic() >= self.next_pass:
             _ = self.run_pass()
         if self.clock.monotonic() >= self.next_source_check:
@@ -1702,6 +1805,7 @@ class AdmissionServer:
         self.closed = True
         self.stopped = True
         os.close(self.config_events)
+        os.close(self.priority_events)
         for connection in list(self.connections.values()):
             connection.socket.close()
         self.connections.clear()

@@ -5,8 +5,8 @@ from scripts.build_queue import snapshot_codec as codec
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
-from collections.abc import Callable
-from contextlib import redirect_stderr
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import replace
 from datetime import datetime
 import io
@@ -89,6 +89,209 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
                             for request in requests}
                 self.assertEqual(fixture.server.caller_versions, expected)
                 self.assertEqual(service.read_state(fixture.state_dir).caller_versions, expected)
+
+
+class PendingPriorityTests(unittest.TestCase):
+    def connect(self, fixture: AdmissionFixture, request: wire.Request) -> socket.socket:
+        peer = self.enterContext(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+        peer.connect(str(fixture.socket_path))
+        peer.sendall(wire.encode_request(request).encode())
+        return peer
+
+    def reply(self, peer: socket.socket) -> wire.Reply:
+        stream = self.enterContext(peer.makefile("rb"))
+        return wire.parse_reply(stream.readline())
+
+    @contextmanager
+    def delayed_roster(self, session_id: str = "worker") -> Generator[tuple[threading.Event, threading.Event]]:
+        entered, finish = threading.Event(), threading.Event()
+
+        def read_roster(sessions: list[str] | gate.RosterUnits) -> dict[str, UnitLabels]:
+            if isinstance(sessions, gate.RosterUnits):
+                entered.set()
+                _ = finish.wait()
+            return {session_id: UnitLabels("worker", unit="chosen")}
+
+        with mock.patch.object(gate, "priority_labels", side_effect=read_roster):
+            try:
+                yield entered, finish
+            finally:
+                finish.set()
+
+    def test_query_and_release_reply_while_a_priority_roster_read_is_pending(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            grant = only_admitted(fixture.server.handle_request(request))
+            with self.delayed_roster() as (entered, finish), fixture.serving():
+                try:
+                    priority = self.connect(fixture, wire.PrioritySetRequest("set", "chosen", "urgent", "director"))
+                    self.assertTrue(entered.wait())
+                    viewed = self.reply(self.connect(fixture, wire.ViewRequest()))
+                    self.assertIsInstance(viewed, wire.ViewReply)
+                    self.assertEqual(self.reply(self.connect(fixture,
+                        wire.ReleaseRequest("release", grant.reservation, 0))), wire.Ok())
+                    with fixture.loop_turn():
+                        self.assertNotIn(request.episode, fixture.server.reservations)
+                        self.assertIsInstance(fixture.server.priority, gate.NoQueuePriority)
+                    self.assertEqual(select.select([priority], [], [], 0)[0], [])
+                    finish.set()
+                    self.assertEqual(self.reply(priority), wire.Ok())
+                    viewed = self.reply(self.connect(fixture, wire.ViewRequest()))
+                    assert isinstance(viewed, wire.ViewReply)
+                    applied = viewed.reading.explanation.priority
+                    assert not isinstance(applied, gate.NoQueuePriority)
+                    self.assertEqual((applied["unit"], applied["why"], applied["set_by"]),
+                                     ("chosen", "urgent", "director"))
+                finally:
+                    finish.set()
+
+    def test_clear_waits_for_a_pending_set_and_leaves_no_priority(self) -> None:
+        with AdmissionFixture() as fixture, self.delayed_roster() as (entered, finish), fixture.serving():
+            try:
+                priority = self.connect(fixture, wire.PrioritySetRequest("set", "chosen", "urgent", "director"))
+                self.assertTrue(entered.wait())
+                cleared = self.connect(fixture, wire.PriorityClearRequest("clear", "director"))
+                self.assertIsInstance(self.reply(self.connect(fixture, wire.ViewRequest())), wire.ViewReply)
+                self.assertEqual(select.select([cleared], [], [], 0)[0], [])
+                finish.set()
+                self.assertEqual(self.reply(priority), wire.Ok())
+                self.assertEqual(self.reply(cleared), wire.Ok())
+                viewed = self.reply(self.connect(fixture, wire.ViewRequest()))
+                assert isinstance(viewed, wire.ViewReply)
+                self.assertIsInstance(viewed.reading.explanation.priority, gate.NoQueuePriority)
+                with fixture.loop_turn():
+                    self.assertIsInstance(service.read_state(fixture.state_dir).priority, gate.NoQueuePriority)
+            finally:
+                finish.set()
+
+    def test_pending_priority_retry_gets_one_reply_and_records_one_transition(self) -> None:
+        with AdmissionFixture() as fixture, self.delayed_roster() as (entered, finish), \
+             mock.patch.object(buildlog_record, "queue_priority", wraps=buildlog_record.queue_priority) as logged, \
+             fixture.serving():
+            try:
+                request = wire.PrioritySetRequest("same-key", "chosen", "urgent", "director")
+                first = self.connect(fixture, request)
+                self.assertTrue(entered.wait())
+                retry = self.connect(fixture, request)
+                self.assertIsInstance(self.reply(self.connect(fixture, wire.ViewRequest())), wire.ViewReply)
+                self.assertEqual(select.select([first, retry], [], [], 0)[0], [])
+                finish.set()
+                for peer in (first, retry):
+                    self.assertEqual(self.reply(peer), wire.Ok())
+                    self.assertEqual(peer.recv(1), b"")
+                self.assertEqual(self.reply(self.connect(fixture, request)), wire.Ok())
+                self.assertEqual(logged.call_count, 1)
+                self.assertEqual(logged.call_args.kwargs["transition_id"], request.request_id)
+            finally:
+                finish.set()
+
+    def test_head_admission_waits_for_the_pending_priority_set(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = fixture.occupy_host()
+            fixture.free(16 * GIB)
+            fixture.hold_starts()
+            older = fixture.request(need=12 * GIB, since=fixture.clock.now() - 60)
+            request = fixture.request(need=12 * GIB)
+            _ = fixture.server.handle_request(older)
+            _ = fixture.server.handle_request(request)
+            with self.delayed_roster(request.identity.session_id) as (entered, finish), fixture.serving():
+                try:
+                    priority = self.connect(fixture, wire.PrioritySetRequest("set", "chosen", "urgent", "director"))
+                    self.assertTrue(entered.wait())
+                    admitted = self.connect(fixture, wire.AdmitHeadRequest("head", "start", "director"))
+                    self.assertIsInstance(self.reply(self.connect(fixture, wire.ViewRequest())), wire.ViewReply)
+                    self.assertEqual(select.select([admitted], [], [], 0)[0], [])
+                    with fixture.loop_turn():
+                        self.assertIsInstance(fixture.server.override, gate.NoHeadAdmissionOverride)
+                    finish.set()
+                    self.assertEqual(self.reply(priority), wire.Ok())
+                    self.assertEqual(self.reply(admitted), wire.Ok())
+                    with fixture.loop_turn():
+                        override = fixture.server.override
+                        assert not isinstance(override, gate.NoHeadAdmissionOverride)
+                        self.assertEqual(override["pid"], request.owner.pid)
+                finally:
+                    finish.set()
+
+    def test_restart_during_a_roster_read_keeps_priority_and_allows_the_same_key_retry(self) -> None:
+        with AdmissionFixture() as fixture:
+            labels = {"worker": UnitLabels("worker", unit="original")}
+            with mock.patch.object(gate, "priority_labels", return_value=labels):
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                    "initial", "original", "keep", "director")), [wire.Ok()])
+            with self.delayed_roster() as (entered, finish), fixture.serving():
+                try:
+                    request = wire.PrioritySetRequest("retry-after-restart", "chosen", "urgent", "director")
+                    pending = self.connect(fixture, request)
+                    self.assertTrue(entered.wait())
+                    with fixture.loop_turn():
+                        saved = service.read_state(fixture.state_dir)
+                        assert not isinstance(saved.priority, gate.NoQueuePriority)
+                        self.assertEqual(saved.priority["unit"], "original")
+                        self.assertNotIn(request.request_id, saved.ledger)
+                        fixture.restart()
+                        restored = fixture.server.priority
+                        assert not isinstance(restored, gate.NoQueuePriority)
+                        self.assertEqual(restored["unit"], "original")
+                    self.assertEqual(pending.recv(1), b"")
+                    finish.set()
+                    self.assertEqual(self.reply(self.connect(fixture, request)), wire.Ok())
+                    viewed = self.reply(self.connect(fixture, wire.ViewRequest()))
+                    assert isinstance(viewed, wire.ViewReply)
+                    applied = viewed.reading.explanation.priority
+                    assert not isinstance(applied, gate.NoQueuePriority)
+                    self.assertEqual(applied["unit"], "chosen")
+                finally:
+                    finish.set()
+
+    def test_roster_error_refuses_without_replay_and_allows_a_same_key_retry(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = wire.PrioritySetRequest("roster-retry", "chosen", "urgent", "director")
+
+            def unreadable_roster(sessions: list[str] | gate.RosterUnits) -> dict[str, UnitLabels]:
+                if isinstance(sessions, gate.RosterUnits):
+                    raise ValueError("roster unreadable")
+                return {}
+
+            with mock.patch.object(gate, "priority_labels", side_effect=unreadable_roster):
+                self.assertEqual(fixture.completed_queue_change(request), [wire.Refused("roster unreadable")])
+            self.assertIsInstance(fixture.completed_queue_change(wire.ViewRequest())[0], wire.ViewReply)
+            self.assertNotIn(request.request_id, service.read_state(fixture.state_dir).ledger)
+            with mock.patch.object(gate, "priority_labels", return_value={
+                    "worker": UnitLabels("worker", unit="chosen")}):
+                self.assertEqual(fixture.completed_queue_change(request), [wire.Ok()])
+            priority = fixture.server.priority
+            assert not isinstance(priority, gate.NoQueuePriority)
+            self.assertEqual(priority["unit"], "chosen")
+
+    def test_apply_errors_refuse_pending_and_queued_changes_and_allow_later_requests(self) -> None:
+        with AdmissionFixture() as fixture, self.delayed_roster() as (entered, finish), fixture.serving():
+            try:
+                request = wire.PrioritySetRequest("apply-set", "chosen", "urgent", "director")
+                clear = wire.PriorityClearRequest("apply-clear", "director")
+                priority = self.connect(fixture, request)
+                self.assertTrue(entered.wait())
+                cleared = self.connect(fixture, clear)
+                following = self.connect(fixture, wire.AdmitHeadRequest("following", "start", "director"))
+                self.assertIsInstance(self.reply(self.connect(fixture, wire.ViewRequest())), wire.ViewReply)
+                self.assertEqual(select.select([priority, cleared, following], [], [], 0)[0], [])
+                with mock.patch.object(store, "read_last_whole_row_end", side_effect=ValueError("history unreadable")):
+                    finish.set()
+                    self.assertEqual(self.reply(priority), wire.Refused("history unreadable"))
+                    self.assertEqual(self.reply(cleared), wire.Refused("history unreadable"))
+                    self.assertEqual(self.reply(following), wire.Refused("nothing waits; no head to admit"))
+                self.assertIsInstance(self.reply(self.connect(fixture, wire.ViewRequest())), wire.ViewReply)
+                with fixture.loop_turn():
+                    saved = service.read_state(fixture.state_dir)
+                    self.assertNotIn(request.request_id, saved.ledger)
+                    self.assertNotIn(clear.request_id, saved.ledger)
+                self.assertEqual(self.reply(self.connect(fixture, request)), wire.Ok())
+                self.assertEqual(self.reply(self.connect(fixture, clear)), wire.Ok())
+                viewed = self.reply(self.connect(fixture, wire.ViewRequest()))
+                assert isinstance(viewed, wire.ViewReply)
+                self.assertIsInstance(viewed.reading.explanation.priority, gate.NoQueuePriority)
+            finally:
+                finish.set()
 
 
 class OutageClaimTests(unittest.TestCase):
@@ -1100,7 +1303,7 @@ class ServiceTests(unittest.TestCase):
             with mock.patch.object(gate, "priority_labels", return_value=labels):
                 _ = fixture.server.handle_request(first)
                 _ = fixture.server.handle_request(second)
-                _ = fixture.server.handle_request(wire.PrioritySetRequest("ranked-snapshot", "urgent", "urgent", "director"))
+                _ = fixture.completed_queue_change(wire.PrioritySetRequest("ranked-snapshot", "urgent", "urgent", "director"))
             snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
             assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
             rows = [row for _, row in snapshot.inputs.ordered]
@@ -2499,7 +2702,7 @@ class CutoverServiceTests(unittest.TestCase):
             with mock.patch.object(gate, "priority_labels", return_value={
                     older.identity.session_id: UnitLabels("old", unit="other"),
                     chosen.identity.session_id: UnitLabels("chosen", unit="chosen")}):
-                self.assertEqual(fixture.server.handle_request(wire.PrioritySetRequest(
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
                     "choose", "chosen", "urgent", "director")), [wire.Ok()])
                 self.assertEqual(fixture.server.handle_request(wire.AdmitHeadRequest(
                     "head", "checked free memory", "director")), [wire.Ok()])
@@ -2582,13 +2785,13 @@ class CutoverServiceTests(unittest.TestCase):
                 with mock.patch.object(gate, "priority_labels", return_value={
                         "unrelated": UnitLabels("other", unit="roster-unit"),
                         request.identity.session_id: UnitLabels("worker", unit="present")}):
-                    refused = fixture.server.handle_request(absent)
+                    refused = fixture.completed_queue_change(absent)
                     self.assertEqual(refused, [wire.Refused(
                         "unknown unit missing; the queue priority did not change")])
                     self.assertIsInstance(fixture.server.priority, gate.NoQueuePriority)
-                    self.assertEqual(fixture.server.handle_request(wire.PrioritySetRequest(
+                    self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
                         "present", "present", "urgent", "director")), [wire.Ok()])
-                    self.assertEqual(fixture.server.handle_request(absent), refused)
+                    self.assertEqual(fixture.completed_queue_change(absent), refused)
                     priority = fixture.server.priority
                     assert not isinstance(priority, gate.NoQueuePriority)
                     self.assertEqual(priority["unit"], "present")
@@ -2639,7 +2842,7 @@ class CutoverServiceTests(unittest.TestCase):
                 _ = fixture.server.handle_request(request)
                 _ = self.enterContext(mock.patch.object(gate, "priority_labels", return_value={
                     request.identity.session_id: UnitLabels("worker", unit="old")}))
-                self.assertEqual(fixture.server.handle_request(
+                self.assertEqual(fixture.completed_queue_change(
                     wire.PrioritySetRequest("initial", "old", "initial", "director")), [wire.Ok()])
                 mutation = (wire.PriorityClearRequest("change", "director") if action == "clear" else
                             wire.PrioritySetRequest("change", "new", "replacement", "director"))
@@ -2649,12 +2852,12 @@ class CutoverServiceTests(unittest.TestCase):
                 with mock.patch.object(buildlog_record, "queue_priority", wraps=buildlog_record.queue_priority) as logged:
                     fixture.fault.stage = "after_state_write"
                     with self.assertRaises(InjectedCrash):
-                        _ = fixture.server.handle_request(mutation)
+                        _ = fixture.completed_queue_change(mutation)
                     logged.assert_not_called()
                     fixture.restart()
-                    self.assertEqual(fixture.server.handle_request(mutation), [wire.Ok()])
+                    self.assertEqual(fixture.completed_queue_change(mutation), [wire.Ok()])
                     fixture.restart()
-                    self.assertEqual(fixture.server.handle_request(mutation), [wire.Ok()])
+                    self.assertEqual(fixture.completed_queue_change(mutation), [wire.Ok()])
                 logged.assert_called_once()
                 self.assertEqual(logged.call_args.kwargs["transition_id"], mutation.request_id)
                 if action == "clear":
@@ -2730,16 +2933,16 @@ class CutoverServiceTests(unittest.TestCase):
                 mutation = wire.PrioritySetRequest("priority-once", "queue", "urgent", "director")
                 fixture.fault.stage = "after_state_write"
                 with self.assertRaises(InjectedCrash):
-                    _ = fixture.server.handle_request(mutation)
+                    _ = fixture.completed_queue_change(mutation)
                 logged.assert_not_called()
                 fixture.restart()
-                self.assertEqual(fixture.server.handle_request(mutation), [wire.Ok()])
+                self.assertEqual(fixture.completed_queue_change(mutation), [wire.Ok()])
                 for request in (first, second):
                     _ = fixture.server.handle_request(request)
                 fixture.restart()
                 for request in (first, second):
                     _ = fixture.server.handle_request(request)
-                self.assertEqual(fixture.server.handle_request(mutation), [wire.Ok()])
+                self.assertEqual(fixture.completed_queue_change(mutation), [wire.Ok()])
             logged.assert_called_once()
             self.assertEqual(logged.call_args.kwargs["transition_id"], mutation.request_id)
             viewed = fixture.server.handle_request(wire.ViewRequest())[0]
@@ -3383,7 +3586,7 @@ class CutoverServiceTests(unittest.TestCase):
             with mock.patch.object(gate, "priority_labels", return_value=labels):
                 for request in (older, chosen):
                     _ = fixture.server.handle_request(request)
-                self.assertEqual(fixture.server.handle_request(wire.PrioritySetRequest("priority", "chosen", "user work", "director")), [wire.Ok()])
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest("priority", "chosen", "user work", "director")), [wire.Ok()])
                 _ = fixture.server.handle_request(newest)
                 view = fixture.server.handle_request(wire.ViewRequest())[0]
                 assert isinstance(view, wire.ViewReply)
