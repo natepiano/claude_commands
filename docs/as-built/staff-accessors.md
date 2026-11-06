@@ -27,7 +27,7 @@ JSON stores `paused: {since, by, why}` only for a paused row.
 `pause(reference, why)` records the time in the user zone and the caller's staff name.
 `resume(reference)` removes the field.
 The commands accept a unit or `--production <showrunner name>`.
-Production pause accepts repeated `--except <unit>` options.
+Production pause accepts repeated `--except <unit>` options with a unit's staff name, its `-unit` form, or its staff id.
 Both commands are safe to repeat. They stop no process.
 Rename, move, retire and restore retain the pause field.
 
