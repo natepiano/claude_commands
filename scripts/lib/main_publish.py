@@ -131,14 +131,12 @@ def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIM
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,
            *, subject_prefix: str, unchanged: str) -> str:
-    """Commit only the named file; restore it if Git fails without moving HEAD."""
+    """Commit only the named file; restore it if Git fails and HEAD lacks its contents."""
     if not message.startswith(subject_prefix):
         raise Refusal(f"commit subject must start with {subject_prefix!r}")
-    head_before = git(checkout, "rev-parse", "HEAD").stdout.strip()
     committed = git(checkout, "commit", "-q", "--only", "-m", message, "--", str(conf))
-    head_after = git(checkout, "rev-parse", "HEAD").stdout.strip()
     if committed.returncode:
-        if head_after != head_before:
+        if git(checkout, "diff", "--quiet", "HEAD", "--", str(conf)).returncode == 0:
             print(f"anomaly: git commit: {first_line(committed)}; the commit exists", file=sys.stderr)
         else:
             if isinstance(before, MissingFile):

@@ -133,6 +133,42 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.head(), head)
         self.assertEqual(repo.remote_tip(), head)
 
+    def test_failed_commit_restores_config_when_another_file_commit_moves_head(self) -> None:
+        repo = self.repository
+        before = repo.change()
+        head = repo.head()
+        other = repo.checkout / "other.txt"
+        _ = other.write_text("concurrent zone change\n")
+        real_git = shutil.which("git")
+        assert real_git is not None
+        lock = repo.checkout / ".git/index.lock"
+        self.addCleanup(lock.unlink, missing_ok=True)
+        wrapper = repo.programs / "git"
+        _ = wrapper.write_text(
+            '#!/bin/sh\nset -e\nif [ "$3" = commit ]; then\n'
+            + f'  {shlex.quote(real_git)} -C "$2" commit -q --only '
+            + '-m "zone(UTC): concurrent change" -- other.txt\n'
+            + f'  touch {shlex.quote(str(lock))}\nfi\n'
+            + f'exec {shlex.quote(real_git)} "$@"\n',
+        )
+        wrapper.chmod(0o755)
+        errors = io.StringIO()
+
+        with redirect_stderr(errors), self.assertRaisesRegex(main_publish.Refusal, r"index\.lock.*unchanged"):
+            _ = main_publish.commit(
+                repo.checkout, repo.config, "tune(example): amount 2 -> 3",
+                main_publish.ExistingFile(before), subject_prefix="tune(", unchanged="unchanged",
+            )
+
+        self.assertNotEqual(repo.head(), head)
+        self.assertEqual(repo.git(repo.checkout, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"),
+                         "other.txt")
+        self.assertEqual(repo.git(repo.checkout, "show", "HEAD:other.txt"), "concurrent zone change")
+        self.assertEqual(repo.config.read_text(), before)
+        self.assertEqual(repo.git(repo.checkout, "diff", "HEAD", "--", str(repo.config)), "")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(repo.remote_tip(), head)
+
     def test_rerere_failure_after_commit_keeps_the_new_file_and_allows_push(self) -> None:
         repo = self.repository
         before = repo.change()
