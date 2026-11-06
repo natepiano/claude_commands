@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import sys
-import fcntl
 import json
+import os
 import shlex
 import subprocess
 import tomllib
@@ -113,6 +113,26 @@ def worker_run_index(record: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[P
     return {identity: tuple(runs) for identity, runs in found.items()}
 
 
+def pane_parents(record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+    """Select local parents whose workers use panes."""
+    from scripts.lib import unit_runs
+
+    parents = {row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo)}
+    found: list[staff.StaffRow] = []
+    for row in record.rows:
+        if row.id not in parents:
+            continue
+        location = row.doc if row.kind == "showrunner" else row.worktree
+        if (isinstance(location, (staff.LiveDoc, staff.WrappedDoc, staff.PresentWorktree, staff.RemovedWorktree))
+                and location.machine == remote.local_machine()):
+            found.append(row)
+    if not found:
+        return []
+    scanned = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record)
+    return [row for row in found
+            if unit_runs.parent_transport(row.current_session, scanned=scanned, record=record) == "herdr"]
+
+
 def worker_name(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
     member = worker_row(entry, record)
     return member.name if member is not None else ""
@@ -137,8 +157,7 @@ def publish_worker_roster(handle: WorkerStateFile, roster: Mapping[str, object])
 
 def read_worker_roster(path: Path) -> dict[str, object]:
     from scripts.agents import worker_lifecycle
-    with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as handle:
-        return handle.read_object()
+    return worker_lifecycle.read_worker_state(path)
 
 
 def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> Path:

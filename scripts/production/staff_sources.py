@@ -319,16 +319,53 @@ def _live_member(row: staff.StaffRow, role: LiveRole, identity: Mapping[str, str
 
 def live() -> dict[str, object]:
     """Read one owner snapshot and project identities without changing any source."""
-    record = staff.snapshot()
-    dependencies = staff.RecordInputs(set(record.inputs))
-    sources = _member_sources(dependencies=dependencies)
+    try:
+        record = staff.snapshot()
+        dependencies = staff.RecordInputs(set(record.inputs))
+        sources = _member_sources(dependencies=dependencies, record=record)
+    except staff.StaffUnreadable as error:
+        _problem("staff membership", error)
+        return {"schema": 3, "complete": False, "problems": [str(error)]}
+    pane_workers: dict[staff.StaffId, dict[str, object]] = {}
+    pane_problems: list[str] = []
+    try:
+        parents = session_staff.pane_parents(record)
+        if parents:
+            from scripts.herdr import worker_panes
+
+            for states in worker_panes.observe_parents(parents, record).values():
+                for state in states:
+                    row = state.row
+                    backend = record.backends.get(row.id)
+                    identity = ({"claude": row.current_session} if isinstance(backend, staff.ClaudeBackend) else
+                                {"codex": row.current_session} if isinstance(backend, staff.CodexBackend) else {})
+                    value = _live_member(row, row.name, identity)
+                    value["pane_state"] = ("open" if isinstance(state, worker_panes.OpenWorker) else
+                                           "stopped" if isinstance(state, worker_panes.StoppedWorker) else
+                                           "closed" if isinstance(state, worker_panes.ClosedWorker) else
+                                           "unknown" if isinstance(state, worker_panes.ProcessUnknownWorker) else "incomplete")
+                    if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+                        reason = f"{row.name}: {state.reason}"
+                        pane_problems.append(reason)
+                        _problem(row.name, state.reason)
+                    pane_workers[row.id] = value
+    except (OSError, ValueError) as error:
+        pane_problems.append(str(error))
+        _problem("pane workers", error)
     scan = _WorkerSources(record, sources, dependencies=dependencies)
     observed = scan.collect()
     members: dict[staff.StaffId, dict[str, object]] = {}
     unregistered = sorted(identity for identity in scan.native_running if record.by_current_session(identity) is None)
     for identity in unregistered:
         _problem(identity, "current native session has no staff row; identity publication is incomplete")
-    incomplete = bool(unregistered) or scan.claude_registry_incomplete or scan.codex_scan_incomplete
+    incomplete = bool(unregistered or pane_problems) or scan.claude_registry_incomplete or scan.codex_scan_incomplete
+    for slug in sources.productions:
+        found = sources.member(ShowrunnerMember(slug), record)
+        if isinstance(found, NoSuchMember):
+            reason = f"{slug}: staff member is unavailable"
+            pane_problems.append(reason)
+            incomplete = True
+            _problem(slug, "staff member is unavailable")
     for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
         for run in sorted({path.parent for path in root.glob("*/*.pending.json")}):
             publications = pending_publication_evidence(run)
@@ -375,6 +412,9 @@ def live() -> dict[str, object]:
         row = entry.row
         if entry.owner.match.id not in active_ids:
             continue
+        if row.id in pane_workers:
+            members[row.id] = pane_workers[row.id]
+            continue
         worker_identity = ({"claude": entry.identity.session_id} if isinstance(entry.identity, ClaudeSession)
                            else {"codex": entry.identity.thread_id} if isinstance(entry.identity, CodexThread) else {})
         if isinstance(entry.identity, BackendUnavailable):
@@ -397,7 +437,8 @@ def live() -> dict[str, object]:
             _problem(parent.id, "parent has no current session evidence")
             members[parent.id] = _live_member(parent, "unit" if parent.kind == "unit" else "showrunner", {})
     return {"schema": 3, "inputs": sorted(scan.inputs), "members": [members[key] for key in sorted(members)],
-            "complete": not incomplete, "unregistered": sorted(set(unregistered))}
+            "complete": not incomplete, "unregistered": sorted(set(unregistered)),
+            **({"problems": pane_problems} if pane_problems else {})}
 
 
 def cli_live() -> int:

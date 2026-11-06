@@ -423,7 +423,7 @@ def live_runs(
     ]
 
 
-def stopped_run_place(run: Path) -> RunPlace:
+def stopped_run_place(run: Path, record: staff.StaffSnapshot) -> RunPlace:
     """Keep a worker's recorded unit without claiming that its director is live."""
     try:
         state = read_object(run / unit_runs.STATE_FILE)
@@ -431,13 +431,13 @@ def stopped_run_place(run: Path) -> RunPlace:
         return RunPlace(NoDirector(), NoShowrunner(), "")
     from scripts.direct import plan_history
     if state.get(unit_runs.OWNER_FIELD):
-        state = plan_history.staff_directory(state, staff.snapshot())
+        state = plan_history.staff_directory(state, record)
     cwd = as_string(state.get("working_dir"))
     # Older runs may keep their identity only in the plan. Import the history
     # reader for that fallback, not for every lookup of recorded labels.
     from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
 
-    identity = resolve_production_unit(state)
+    identity = resolve_production_unit(state, resolver=session_staff.RowResolver(record))
     if isinstance(identity, ProductionUnitIdentity):
         return RunPlace(UnitWithoutRunningDirector(identity.unit),
                          ProductionWithoutRunningShowrunner(identity.production), cwd)

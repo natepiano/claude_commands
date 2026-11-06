@@ -36,7 +36,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - **Project started:** 2026-10-20T20:46:48.678+00:00
 - **Stack:** Python 3.13, standard library only; Markdown.
 - **Layout:**
-  - `scripts/hierarchies/` — `measure.py`, `push_audit.py`, `worker_owners.py`, `log_records.py` (shared log helpers; `measure.py` imports `push_audit.py`, never the reverse) and their tests
+  - `scripts/hierarchies/worker_adoption.py` — the one file left in this folder; `measure.py`, `push_audit.py`, `worker_owners.py` and `log_records.py` are deleted
   - `config/hierarchies/sessions.toml` — keys and display names of top-level sessions
   - `docs/plans/build-followups-hierarchies-design.md` — the design doc (new)
   - read only, outside the repository: `~/.local/state/message/log.jsonl`, `~/.local/state/notify/` (`pushover.jsonl`, `review.jsonl`, `questions/`), `~/.local/state/showrunner/` (`counts`, `outstanding`, `<production>/`), `~/.local/state/unit-board/*.json`, `~/.local/state/nightly-review/ledger.md`, `~/.local/state/plan-backlog/ledger.md`, `~/rust/hanadocs/` (issues, `backlog-rankings.jsonl`, `prioritization goals.md`, `change-review/`)
@@ -583,9 +583,9 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - The unittest module `scripts/production/test_transfer_unit.py` passes, and basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
 - Live, from main after the merge: transfer hierarchies-unit to builds and back to sdlc. Each transfer prints `told hierarchies-unit`, the unit gets the message, its status line names the new production, and its tab is in its A-Z place.
 
-### Phase 22 — Displays read workers through observe  · status: todo
+### Phase 22 — Displays read workers through observe  · status: done
 
-**Depends on:** panes Phases 7, 8 and 9 (herdr 7+8+9 on sdlc, about 17:30 EST 2026-11-05), and style-unit's `scripts/message/roster.py` fix. This is Phase 13 of `docs/plans/herdr-worker-panes.md`, given to this unit by sdlc on 2026-11-05. It shares one gate with panes Phases 10 and 12, over the exact final batch.
+**Depends on:** panes Phases 7, 8 and 9 (herdr 7+8+9 on sdlc), and the `scripts/message/roster.py` fix, which is on sdlc as builds-queue 6f36f4740: `_unit_workers` sets `role_log = _role_log()` before its run loop, and `_worker_assignment` takes `role_log`. This is Phase 13 of `docs/plans/herdr-worker-panes.md`, given to this unit by sdlc on 2026-11-05. It shares one gate with panes Phases 10 and 12, over the exact final batch.
 
 #### Work Order
 
@@ -596,12 +596,12 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `observe` sees only this machine's panes. A worker of the other machine's parent would read as `ClosedWorker`, which is wrong.
 - Every run today is mesh-pinned, and a mesh worker has no pane. `observe` on its row gives `ClosedWorker`, which is wrong.
 - `unit_runs.worker_transport(run)` writes the pin file when it is absent. A display must write nothing.
-- `scripts/hierarchies/` is deleted (Phase 19), so `measure.py` and `worker_owners.py` leave this phase. The `worker_owners.py` retained branches in the panes plan no longer exist.
+- `measure.py` and `worker_owners.py` are deleted (Phase 19), so they leave this phase. The `worker_owners.py` retained branches in the panes plan no longer exist.
 
 **Spec:**
 
 1. **Which parents use panes.** Add `unit_runs.parent_transport(session_id: str) -> Literal["mesh", "herdr"]`. It reads the pin of the session's first held run. With no held run or no pin it reads the configured `WORKER_TRANSPORT`. It writes nothing. Add `session_staff.pane_parents(record) -> list[staff.StaffRow]`: the rows with worker children, whose location is on this machine and whose `parent_transport` is `herdr`.
-2. **One read for many parents.** Add `worker_panes.observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]`. It makes one pane read and gives each parent its states. Split the read out of `_evidence`; `observe` keeps its signature and its behavior. With no parents it makes no herdr call. Import `worker_panes` inside the function that needs it, after `pane_parents` is not empty, so a run with no pane parent pays no import.
+2. **One read for many parents.** Add `worker_panes.observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]`. It makes one pane read and gives each parent its states. Split the read out of `_evidence`; `observe` keeps its signature and its behavior. With no parents it makes no herdr call. Import `worker_panes` inside the function that needs it, after `pane_parents` is not empty, so a run with no pane parent pays no import. One exception: the roster's freestanding pane list reads agent status through `worker_panes.agent_inventory`, so that no display calls `herdr agent list` outside `worker_panes`. This import costs 12 ms after the roster's own imports.
 3. **The five states.** Each converted display shows:
    - `OpenWorker` with its pane and status.
    - `StoppedWorker` as stopped, and `ClosedWorker` as closed.
@@ -620,9 +620,9 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 9. Add no other check, guard or refusal. A check that a worker thinks is needed goes to the unit director, who asks the user.
 
 **Files:**
-- `scripts/lib/unit_runs.py`, `scripts/production/session_staff.py`, `scripts/herdr/worker_panes.py` and their tests — items 1 and 2.
-- `scripts/message/roster.py`, `scripts/production/staff_sources.py` and their tests — first writer.
-- `scripts/direct/board_json.py`, `scripts/production/codex_winddown.py`, `scripts/lint/tmp_sweep.py` and their tests — second writer, after items 1 and 2 are written.
+- `scripts/lib/unit_runs.py`, `scripts/lib/test_unit_runs.py`, `scripts/production/session_staff.py`, `scripts/production/test_session_staff.py`, `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — items 1 and 2.
+- `scripts/message/roster.py`, `scripts/message/test_roster.py`, `scripts/message/unit_labels.py`, `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py` — first writer.
+- `scripts/direct/board_json.py`, `scripts/direct/test_board_json.py`, `scripts/production/codex_winddown.py`, `scripts/production/test_codex_winddown.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py` — second writer, after items 1 and 2 are written.
 
 **Workers:** 2 writers. The first writes items 1 and 2 before the second starts.
 
