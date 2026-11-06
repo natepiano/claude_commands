@@ -102,32 +102,8 @@ sys.exit(3)
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
 
 
-GIT_HANG_GUARD = f'''#!{sys.executable} -S
-import os
-import select
-import signal
-import sys
-
-# Keep the deadline across exec and stop Git hooks in the same process group.
-os.setpgid(0, 0)
-group = os.getpid()
-reader, writer = os.pipe()
-os.set_inheritable(writer, True)
-if os.fork() == 0:
-    # Keep the watcher outside the Git group that it can stop.
-    os.setpgid(0, 0)
-    os.close(writer)
-    if not select.select([reader], [], [], __HANG_GUARD__)[0]:
-        import runpy
-
-        send_process_group = runpy.run_path({str(REPOSITORY / "scripts/lib/process_group.py")!r})["send_process_group"]
-        try:
-            send_process_group(group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    os._exit(0)
-os.close(reader)
-os.execv(sys.argv[1], sys.argv[1:])
+GIT_HANG_GUARD = '''#!/bin/sh
+exec timeout -s KILL __HANG_GUARD__ "$@"
 '''
 
 
@@ -158,7 +134,7 @@ INTERRUPTED_GIT = '''#!/bin/sh
 ''' + GIT_ARGUMENTS + '''
 point=
 marker="$FAST_TRACK_TEST_CONTROL/stop-git"
-if [ -f "$marker" ]; then point=$(cat "$marker"); fi
+if [ -f "$marker" ]; then IFS= read -r point < "$marker" || :; fi
 stop=
 case "$point:$operation:$destination" in
     *-push:push:main|*-restore:restore:*) stop=yes ;;
@@ -173,10 +149,12 @@ fi
 ready=${FAST_TRACK_PAUSE_COMMIT:-}
 pause=
 if [ "$operation" = commit ] && [ -n "$ready" ] && [ ! -f "$ready" ]; then pause=yes; fi
+set -- "$FAST_TRACK_REAL_GIT" "$@"
+if [ -x "$FAST_TRACK_BOUND_GIT" ]; then set -- "$FAST_TRACK_BOUND_GIT" "$@"; fi
 if [ -z "$stop$pause" ]; then
-    exec "$FAST_TRACK_BOUND_GIT" "$FAST_TRACK_REAL_GIT" "$@"
+    exec "$@"
 fi
-"$FAST_TRACK_BOUND_GIT" "$FAST_TRACK_REAL_GIT" "$@" || exit
+"$@" || exit
 if [ -n "$pause" ]; then
     : > "$ready"
     cat "$FAST_TRACK_COMMIT_RELEASE" > /dev/null
@@ -191,7 +169,10 @@ if { [ "$checkout" = "$FAST_TRACK_FETCH_DIRECTOR" ] && [ "$operation" = fetch ] 
    { [ "$operation" = push ] && [ "$destination" = main ]; }; then
     exec "$FAST_TRACK_FETCH_LOGIC" "$@"
 fi
-exec "$FAST_TRACK_BOUND_GIT" "$FAST_TRACK_REAL_GIT" "$@"
+if [ -x "$FAST_TRACK_BOUND_GIT" ]; then
+    exec "$FAST_TRACK_BOUND_GIT" "$FAST_TRACK_REAL_GIT" "$@"
+fi
+exec "$FAST_TRACK_REAL_GIT" "$@"
 '''
 
 
@@ -203,6 +184,9 @@ import subprocess
 import sys
 
 args = sys.argv[1:]
+git = [os.environ["FAST_TRACK_REAL_GIT"]]
+if Path(os.environ["FAST_TRACK_BOUND_GIT"]).is_file():
+    git.insert(0, os.environ["FAST_TRACK_BOUND_GIT"])
 control = Path(os.environ["FAST_TRACK_TEST_CONTROL"])
 director = Path(os.environ["FAST_TRACK_FETCH_DIRECTOR"])
 lock = Path(os.environ["FAST_TRACK_FETCH_LOCK"])
@@ -216,7 +200,7 @@ if is_fetch and (armed.exists() or plan["point"] == "before-push"):
     failure = plan["failures"][len(rows)] if len(rows) < len(plan["failures"]) else ""
     if failure == "lock":
         if plan["point"] == "before-push" and not rows:
-            subprocess.run([os.environ["FAST_TRACK_BOUND_GIT"], os.environ["FAST_TRACK_REAL_GIT"], "-C", str(director),
+            subprocess.run([*git, "-C", str(director),
                             "update-ref", "refs/remotes/origin/main", "HEAD^"],
                            check=True, timeout=__HANG_GUARD__)
         lock.parent.mkdir(parents=True, exist_ok=True)
@@ -224,7 +208,7 @@ if is_fetch and (armed.exists() or plan["point"] == "before-push"):
     if failure == "other":
         result = subprocess.CompletedProcess(args, 128, "", "fatal: fixture fetch transport failed\\n")
     else:
-        result = subprocess.run([os.environ["FAST_TRACK_BOUND_GIT"], os.environ["FAST_TRACK_REAL_GIT"], *args],
+        result = subprocess.run([*git, *args],
                                 capture_output=True, text=True, check=False, timeout=__HANG_GUARD__)
     with events.open("a") as output:
         output.write(json.dumps({"returncode": result.returncode, "stderr": result.stderr}) + "\\n")
@@ -233,7 +217,7 @@ if is_fetch and (armed.exists() or plan["point"] == "before-push"):
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     sys.exit(result.returncode)
-result = subprocess.run([os.environ["FAST_TRACK_BOUND_GIT"], os.environ["FAST_TRACK_REAL_GIT"], *args], check=False, timeout=__HANG_GUARD__)
+result = subprocess.run([*git, *args], check=False, timeout=__HANG_GUARD__)
 if "push" in args and "HEAD:main" in args and result.returncode == 0:
     armed.touch()
 sys.exit(result.returncode)
@@ -286,7 +270,6 @@ class FastTrackTests(MergeCheckpointFixture):
         self.control = self.root / "fast-track-control"
         self.control.mkdir()
         bounded_git = self.bin / "bounded-git"
-        self.executable(bounded_git, GIT_HANG_GUARD.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS)))
         self.env["FAST_TRACK_BOUND_GIT"] = str(bounded_git)
         common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=self.unit))
         self.env.update({
