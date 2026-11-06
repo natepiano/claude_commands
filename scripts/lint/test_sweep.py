@@ -2708,7 +2708,7 @@ class FloorTests(SweepCase):
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
                                        {"source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
-            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
                 output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
                 with (mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
@@ -2732,7 +2732,7 @@ class FloorTests(SweepCase):
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
                                        {"source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
-            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
             output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
             # Cargo may omit rustc-info when its caller made the target directory.
@@ -2770,7 +2770,7 @@ class FloorTests(SweepCase):
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
               mock.patch.object(sweep, "send_holder_message", return_value=sweep.FloorChannelOutcome.FAILED),
               redirect_stdout(io.StringIO())):
-            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
                 output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
                 self.root_row(checkout, target, target)

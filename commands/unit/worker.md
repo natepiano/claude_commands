@@ -36,4 +36,8 @@ Other callers use the pane states.
 A complete restore rerun prints `unchanged`.
 Retire, wrap, and promote retain stopped workers for restore.
 
+When the stop budget is unusable, `worker.py end` prints the configuration refusal and exits 7.
+The worker row stays.
+Correct the named configuration and run `end <name>` again.
+
 Exit codes: `0` complete, `1` check failure, `2` refusal, `3` missing `DONE`, `4` blocked, `5` stalled, `6` busy, `7` kept, `8` uncertain.

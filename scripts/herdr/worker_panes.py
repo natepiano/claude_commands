@@ -218,11 +218,16 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) ->
             hold.active = False
 
 
+class ClaudeCompaction(Enum):
+    NATIVE = "Claude controls compaction"
+
+
 @dataclass(frozen=True)
 class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
+    compact_above_tokens: int | ClaudeCompaction
 
 
 @dataclass(frozen=True)
@@ -361,8 +366,9 @@ def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapsh
     return {parent.id: _parent_evidence(parent.id, record, client, read).states for parent in parents}
 
 
-def worker_run(parent: staff.StaffRow) -> Path:
-    runs = unit_runs.held(str(parent.current_session))
+def worker_run(parent: staff.StaffRow, *,
+               record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL) -> Path:
+    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record)
     if runs:
         return Path(runs[0])
     return Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / parent.id
@@ -471,14 +477,17 @@ def launch_policy(role: WorkerRole) -> LaunchPolicy:
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
-    return LaunchPolicy(settings, sandbox, permission)
+    compact_above_tokens = (conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
+                            if settings.kind == "codex" else ClaudeCompaction.NATIVE)
+    return LaunchPolicy(settings, sandbox, permission, compact_above_tokens)
 
 
 def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     settings = policy.settings
     if settings.kind == "codex":
         arguments = ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
-                      "-c", f'model_reasoning_effort="{settings.effort}"']
+                      "-c", f'model_reasoning_effort="{settings.effort}"',
+                      "-c", f"model_auto_compact_token_limit={policy.compact_above_tokens}"]
         if settings.service_tier:
             arguments += ["-c", f'service_tier="{settings.service_tier}"']
         return arguments
@@ -488,9 +497,11 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     return arguments
 
 
-def launch_arguments(policy: LaunchPolicy, identity: str) -> list[str]:
+def launch_arguments(policy: LaunchPolicy, identity: str, directory: Path | str) -> list[str]:
     if policy.settings.kind == "codex":
         launch = (["resume", identity] if identity else []) + ["--no-daemon"]
+        if identity:
+            launch += ["--cd", str(directory)]
     else:
         launch = ["--resume", identity] if identity else []
     return launch + _policy_arguments(policy)
@@ -742,7 +753,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
     try:
         launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
-            launch_arguments(policy, str(row.current_session) if row else ""), herdr.NoOpeningPrompt(),
+            launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
             int(start_seconds * 1000), agent=name.value)
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
