@@ -292,6 +292,30 @@ class RemoveWorkersTest(unittest.TestCase):
         self.list_rows([row("own1", "p-impl"), row("own2", "p-test")])
         self.assertEqual(self.remove_workers(own), (0, ["own1", "own2"]))
 
+    def test_unreadable_run_owner_does_not_stop_other_worker_removal(self) -> None:
+        for transport in ("mesh", "herdr"):
+            with self.subTest(transport=transport):
+                bad = self.run_dir(f"bad-{transport}", [f"bad-{transport}"])
+                good = self.run_dir(f"good-{transport}", [f"good-{transport}"])
+                missing_owner = fixture_runtime_id(f"missing-owner-{transport}")
+                _ = (bad / "progress_history_state.json").write_text(json.dumps({
+                    "owner_staff_id": missing_owner,
+                    "pass": {"impl": {"instance_id": "dispatch", "worker_name": f"worker-bad-{transport}"}},
+                }))
+                _ = (bad / "worker_transport").write_text(transport + "\n")
+                _ = (bad / "heartbeat.log").write_text("beat\n")
+                self.list_rows([row(f"bad-{transport}", "bad"), row(f"good-{transport}", "good")])
+                selected = [good, bad] if transport == "mesh" else [good]
+                result, removed = self.run_remove_workers(selected)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(removed, [f"good-{transport}"])
+                self.assertIn(
+                    f"anomaly: {bad}: run owner {missing_owner}: unit staff row is unavailable\n", result.stderr,
+                )
+                self.removed.unlink()
+                (bad / "worker_transport").unlink()
+                (bad / "heartbeat.log").unlink()
+
     def test_every_given_run_goes_and_another_live_run_stays(self) -> None:
         """Run end passes each run its director holds; another director's live run is kept."""
         marked = self.run_dir("marked", ["mark1"], orchestrator=ORCHESTRATOR)
@@ -388,7 +412,7 @@ class RemoveWorkersTest(unittest.TestCase):
 
     def test_successful_run_cleanup_does_not_launch_an_implicit_server_sweep(self) -> None:
         own = self.run_dir("own", [], orchestrator=ORCHESTRATOR)
-        arguments = [str(SCRIPT), "--session-dir", str(own)]
+        arguments = [str(SCRIPT), "--run-root", str(self.root), "--session-dir", str(own)]
         with (patch.object(sys, "argv", arguments),
               patch.object(remove_workers, "list_sessions", return_value=[]),
               patch.object(subprocess, "run", side_effect=AssertionError("run cleanup launched a server sweep")) as commands):
