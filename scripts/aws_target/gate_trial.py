@@ -4,7 +4,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 import hashlib
@@ -18,6 +19,7 @@ import statistics
 from types import FrameType
 import subprocess
 import tempfile
+import threading
 import time
 from typing import cast, final
 from urllib.parse import quote
@@ -56,17 +58,31 @@ def presign(method: str, host: str, key: str, region: str, credentials: SigningK
 
 
 # This program runs inside the instance's tool shell, not on natedev.
-GUEST = r'''import contextlib, json, os, pathlib, subprocess, sys, time, traceback, urllib.request
+GUEST = r'''import contextlib, json, os, pathlib, subprocess, sys, threading, time, traceback, urllib.request
 root = pathlib.Path('/var/lib/gate-trial')
 links = json.loads((root / 'links.json').read_text())
 links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
-result = {'nix_ready_at': time.time(), 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': []}
+result = {'nix_ready_at': time.time(), 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
 def put(url, content):
     with urllib.request.urlopen(urllib.request.Request(url, data=content, method='PUT'), timeout=30) as response:
         response.read()
 def publish(name):
     put(links[name], json.dumps(result).encode())
+def sample_memory():
+    try:
+        fields = dict(line.split(':', 1) for line in pathlib.Path('/proc/meminfo').read_text().splitlines())
+        used = (int(fields['MemTotal'].split()[0]) - int(fields['MemAvailable'].split()[0])) * 1024
+        result['memory_peak_bytes'] = max(result['memory_peak_bytes'] or 0, used)
+    except (OSError, ValueError, KeyError):
+        pass
+def monitor_memory(stop):
+    while True:
+        sample_memory()
+        if stop.wait(2):
+            return
+memory_stop = threading.Event()
+memory_thread = None
 try:
     result['tools'] = {}
     for name in ('git', 'python3', 'basedpyright', 'cargo', 'rustc', 'rustdoc', 'rustup', 'cargo-nextest', 'uv'):
@@ -94,6 +110,10 @@ try:
                 raise RuntimeError(preparation)
             result['tools_ready_at'] = time.time()
             result['gate_started_at'] = time.time()
+            # Sample the whole machine because test scopes run outside amazon-init.service.
+            sample_memory()
+            memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
+            memory_thread.start()
             with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
                 with merge_gate.rollback_signals():
                     gate = merge_gate.run_suites(repo, type_dirs=['scripts'], full=True)
@@ -121,6 +141,10 @@ except BaseException:
     with log.open('a') as output:
         output.write(result['error'])
 finally:
+    if memory_thread is not None:
+        memory_stop.set()
+        memory_thread.join()
+        sample_memory()
     if log.exists():
         try:
             put(links['log'], log.read_bytes())
@@ -193,15 +217,19 @@ def blocked_trial_signals() -> Generator[None]:
 
 
 @contextmanager
-def trial_signals() -> Generator[None]:
+def trial_signals(cancel: Callable[[], None]) -> Generator[None]:
     def interrupt(_number: int, _frame: FrameType | None) -> None:
-        raise KeyboardInterrupt
+        cancel()
     previous = {number: signal.signal(number, interrupt) for number in TRIAL_SIGNALS}
     try:
         yield
     finally:
         for number, handler in previous.items():
             _ = signal.signal(number, handler)
+
+
+class TrialCancelled(Exception):
+    """The user stopped the trial."""
 
 
 @dataclass(frozen=True)
@@ -270,6 +298,7 @@ class Attempt:
     subnet: str = ''
     capacity_refusals: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
     log_path: str = ''
+    memory_peak_bytes: int | None = None
     clear_refusal: bool = False
     request_at: float = 0
     running_at: float = 0
@@ -288,6 +317,11 @@ class Attempt:
 class GateTrial:
     def __init__(self, api: AwsCli, settings: TrialSettings, directory: Path, signing: SigningKey, *,
                  clock: Callable[[], float] = time.time, pause: Callable[[float], object] = time.sleep) -> None:
+        self.changed = threading.Condition(threading.RLock())
+        self.reservations: dict[tuple[int, int], float] = {}
+        self.active: dict[tuple[int, int], int] = {}
+        self.recovering: set[tuple[int, int]] = set()
+        self.worker_errors: list[BaseException] = []
         self.api = api
         self.settings = settings
         self.directory = directory
@@ -314,6 +348,129 @@ class GateTrial:
         self.object_bytes = 0
         self.interrupted = False
 
+    def cancel(self) -> None:
+        with self.changed:
+            self.interrupted = True
+            self.changed.notify_all()
+
+    def check_cancelled(self) -> None:
+        with self.changed:
+            if self.interrupted:
+                raise TrialCancelled
+
+    def wait_pause(self, seconds: float, *, cancellable: bool = True) -> None:
+        with self.changed:
+            if cancellable:
+                self.check_cancelled()
+            if self.pause is time.sleep:
+                _ = self.changed.wait(timeout=seconds)
+            else:
+                _ = self.pause(seconds)
+            if cancellable:
+                self.check_cancelled()
+
+    def update_s3_cost(self) -> None:
+        if self.shared_prices:
+            _, _, put, get, _ = self.shared_prices
+            self.s3_cost = put * self.puts + get * self.gets
+
+    def projection(self, prices: Prices, step: str) -> float:
+        lifetime = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes') * 60
+        return (prices.lifetime(lifetime, self.settings.root_gib) * (2 if step == 'start' else 1)
+                + prices.put * 4 + prices.get * (lifetime * 2 / self.option('poll_pause_s') + 100))
+
+    def reserve_attempt(self, identity: tuple[int, int], projected: float, reserve: float) -> bool:
+        with self.changed:
+            _ = self.reservations.pop(identity, None)
+            self.changed.notify_all()
+            while True:
+                self.check_cancelled()
+                if self.spent + self.s3_cost + sum(self.reservations.values()) + projected <= reserve:
+                    self.reservations[identity] = projected
+                    self.changed.notify_all()
+                    return True
+                if not self.reservations:
+                    return False
+                _ = self.changed.wait()
+
+    def record(self, attempt: Attempt, *, ended: bool = False) -> None:
+        with self.changed:
+            peak = attempt.result.get('memory_peak_bytes')
+            attempt.memory_peak_bytes = peak if isinstance(peak, int) else None
+            identity = (attempt.size, attempt.attempt, attempt.method)
+            for index, row in enumerate(self.attempts):
+                if (row.size, row.attempt, row.method) == identity:
+                    self.attempts[index] = deepcopy(attempt)
+                    break
+            else:
+                self.attempts.append(deepcopy(attempt))
+            if ended:
+                print(self.row(attempt), flush=True)
+            self.save()
+
+    def worker(self, attempt: Attempt, step: str, reserve: float) -> None:
+        identity = (attempt.size, attempt.attempt)
+        try:
+            self.measure(attempt, step, reserve)
+        except BaseException as error:
+            with self.changed:
+                self.worker_errors.append(error)
+        finally:
+            with self.changed:
+                _ = self.active.pop(identity, None)
+                _ = self.reservations.pop(identity, None)
+                self.recovering.discard(identity)
+                self.changed.notify_all()
+
+    def schedule(self, step: str, sizes: Sequence[int], runs: int, reserve: float, vcpus: int) -> None:
+        pending = [Attempt(size, number, 'Spot gate' if step == 'size' else 'cold launch')
+                   for number in range(1, runs + 1) for size in dict.fromkeys(sizes)]
+        projected = {size: self.projection(self.prices(size, step, self.subnets[0][1]), step)
+                     for size in sizes if size <= vcpus}
+        threads: list[threading.Thread] = []
+        try:
+            with self.changed:
+                while pending or self.active:
+                    for attempt in list(pending):
+                        reason = ''
+                        if self.interrupted:
+                            reason = 'The user stopped the trial.'
+                        elif self.launch_reply_lost:
+                            reason = 'A launch reply remains lost.'
+                        elif self.remaining_instances or self.instance_query_failed or self.worker_errors:
+                            reason = 'Instance cleanup remains incomplete.'
+                        elif attempt.size > vcpus:
+                            reason = 'The attempt exceeds --vcpus.'
+                        elif self.recovering:
+                            continue
+                        elif sum(self.active.values()) + attempt.size > vcpus:
+                            continue
+                        elif self.spent + self.s3_cost + sum(self.reservations.values()) + projected[attempt.size] > reserve:
+                            if self.active:
+                                continue
+                            reason = 'The next fixed lifetime exceeds the step reserve.'
+                        if reason:
+                            attempt.error = reason
+                            self.record(attempt, ended=True)
+                        else:
+                            identity = (attempt.size, attempt.attempt)
+                            self.active[identity] = attempt.size
+                            self.reservations[identity] = projected[attempt.size]
+                            self.record(attempt)
+                            thread = threading.Thread(target=self.worker, args=(attempt, step, reserve))
+                            threads.append(thread)
+                            # Workers inherit this mask. Only the main thread handles trial signals.
+                            with blocked_trial_signals():
+                                thread.start()
+                        pending.remove(attempt)
+                    if self.active:
+                        _ = self.changed.wait()
+        finally:
+            for thread in threads:
+                thread.join()
+        if self.worker_errors:
+            raise self.worker_errors[0]
+
     def option(self, name: str) -> float:
         return conf.read(self.settings.path).number('gate_trial_' + name)
 
@@ -329,71 +486,78 @@ class GateTrial:
                 self.subnets.append((ledger.text(row, 'SubnetId'), zone))
                 zones.add(zone)
 
-    def tagged_instances(self, *, stopped: bool = False) -> list[str]:
+    def tagged_instances(self, *, stopped: bool = False, attempt: Attempt | None = None) -> list[str]:
         tag = 'Name=tag-key,Values=GateTrial' if stopped else 'Name=tag:GateTrial,Values=' + self.run_id
         states = 'stopping,stopped' if stopped else 'pending,running,stopping,stopped'
-        reply = self.api.call('describe-instances', '--filters', tag, 'Name=instance-state-name,Values=' + states)
+        filters = [tag, 'Name=instance-state-name,Values=' + states]
+        if attempt is not None:
+            filters.append(f'Name=tag:GateTrialAttempt,Values={attempt.size}-{attempt.attempt}')
+        reply = self.api.call('describe-instances', '--filters', *filters)
         return [ledger.text(row, 'InstanceId') for reservation in ledger.rows(reply, 'Reservations')
                 for row in ledger.rows(reservation, 'Instances')]
 
     def sweep(self, *, stopped: bool = False, attempt: Attempt | None = None) -> None:
-        try:
-            instances = self.tagged_instances(stopped=stopped)
-            self.instance_query_failed = False
-        except CLEANUP_ERRORS as error:
-            self.instance_query_failed = True
-            self.cleanup_errors.append('Instance query: ' + str(error))
-            return
-        for instance in instances:
-            if instance not in self.remaining_instances:
-                self.remaining_instances.append(instance)
-            if attempt is not None:
-                attempt.instance_id = instance
+        with self.changed:
             try:
-                if stopped:
-                    print('Terminate stopped trial instance: ' + instance, flush=True)
-                self.terminate(instance)
-                if attempt is not None:
-                    attempt.terminated_at = self.clock()
+                instances = self.tagged_instances(stopped=stopped, attempt=attempt)
+                if attempt is None:
+                    self.instance_query_failed = False
             except CLEANUP_ERRORS as error:
-                self.cleanup_errors.append('Terminate: ' + str(error))
+                self.instance_query_failed = True
+                self.cleanup_errors.append('Instance query: ' + str(error))
+                return
+            for instance in instances:
+                if instance not in self.remaining_instances:
+                    self.remaining_instances.append(instance)
+                if attempt is not None:
+                    attempt.instance_id = instance
+                try:
+                    if stopped:
+                        print('Terminate stopped trial instance: ' + instance, flush=True)
+                    self.terminate(instance)
+                    if attempt is not None:
+                        attempt.terminated_at = self.clock()
+                except CLEANUP_ERRORS as error:
+                    self.cleanup_errors.append('Terminate: ' + str(error))
 
     def prices(self, size: int, step: str, zone: str) -> Prices:
-        pricing = AwsCli(self.api.profile, 'us-east-1', self.api.timeout_s, self.api.execute)
-        region = {'regionCode': self.settings.region}
-        if self.shared_prices is None:
-            disk = product_price(pricing, 'AmazonEC2', {**region, 'volumeApiName': 'gp3'}, 'GB-Mo')
-            ip = product_price(pricing, 'AmazonVPC', {**region, 'group': 'VPCPublicIPv4Address'}, 'Hrs')
-            put = product_price(pricing, 'AmazonS3', {**region, 'group': 'S3-API-Tier1'}, 'Requests')
-            get = product_price(pricing, 'AmazonS3', {**region, 'group': 'S3-API-Tier2'}, 'Requests')
-            storage = product_price(pricing, 'AmazonS3', {**region, 'volumeType': 'Standard'}, 'GB-Mo')
-            self.shared_prices = (disk, ip, put, get, storage)
-        if step == 'size':
-            reply = self.api.call('describe-spot-price-history', '--instance-types', instance_type(self.settings.family, size),
-                                  '--availability-zone', zone, '--product-descriptions', 'Linux/UNIX',
-                                  '--start-time', datetime.fromtimestamp(self.clock(), UTC).isoformat(), '--max-items', '1')
-            compute = float(ledger.text(ledger.rows(reply, 'SpotPriceHistory')[0], 'SpotPrice'))
-        else:
-            compute = product_price(pricing, 'AmazonEC2', {**region, 'instanceType': instance_type(self.settings.family, size),
-                'operatingSystem': 'Linux', 'tenancy': 'Shared', 'preInstalledSw': 'NA', 'capacitystatus': 'Used'}, 'Hrs')
-        return Prices(compute, *self.shared_prices)
+        with self.changed:
+            pricing = AwsCli(self.api.profile, 'us-east-1', self.api.timeout_s, self.api.execute)
+            region = {'regionCode': self.settings.region}
+            if self.shared_prices is None:
+                disk = product_price(pricing, 'AmazonEC2', {**region, 'volumeApiName': 'gp3'}, 'GB-Mo')
+                ip = product_price(pricing, 'AmazonVPC', {**region, 'group': 'VPCPublicIPv4Address'}, 'Hrs')
+                put = product_price(pricing, 'AmazonS3', {**region, 'group': 'S3-API-Tier1'}, 'Requests')
+                get = product_price(pricing, 'AmazonS3', {**region, 'group': 'S3-API-Tier2'}, 'Requests')
+                storage = product_price(pricing, 'AmazonS3', {**region, 'volumeType': 'Standard'}, 'GB-Mo')
+                self.shared_prices = (disk, ip, put, get, storage)
+            if step == 'size':
+                reply = self.api.call('describe-spot-price-history', '--instance-types', instance_type(self.settings.family, size),
+                                      '--availability-zone', zone, '--product-descriptions', 'Linux/UNIX',
+                                      '--start-time', datetime.fromtimestamp(self.clock(), UTC).isoformat(), '--max-items', '1')
+                compute = float(ledger.text(ledger.rows(reply, 'SpotPriceHistory')[0], 'SpotPrice'))
+            else:
+                compute = product_price(pricing, 'AmazonEC2', {**region, 'instanceType': instance_type(self.settings.family, size),
+                    'operatingSystem': 'Linux', 'tenancy': 'Shared', 'preInstalledSw': 'NA', 'capacitystatus': 'Used'}, 'Hrs')
+            return Prices(compute, *self.shared_prices)
 
     def setup(self, bundle: Path) -> None:
-        arguments = ['--bucket', self.bucket]
-        if self.settings.region != 'us-east-1':
-            arguments += ['--create-bucket-configuration', json.dumps({'LocationConstraint': self.settings.region})]
-        self.bucket_created = True
-        _ = self.api.call('create-bucket', *arguments, service='s3api')
-        _ = self.api.call('put-public-access-block', '--bucket', self.bucket, '--public-access-block-configuration',
-            json.dumps(dict.fromkeys(('BlockPublicAcls', 'IgnorePublicAcls', 'BlockPublicPolicy', 'RestrictPublicBuckets'), True)), service='s3api')
-        _ = self.api.call('put-bucket-lifecycle-configuration', '--bucket', self.bucket, '--lifecycle-configuration',
-            json.dumps({'Rules': [{'ID': 'trial-expiry', 'Filter': {'Prefix': ''}, 'Status': 'Enabled', 'Expiration': {'Days': 1}}]}), service='s3api')
-        _ = self.api.call('put-object', '--bucket', self.bucket, '--key', 'source.bundle', '--body', str(bundle), service='s3api')
-        self.puts += 1
-        reply = self.api.call('create-security-group', '--group-name', 'gate-trial-' + self.run_id,
-                             '--description', 'Disposable gate trial; egress only', '--vpc-id', self.settings.vpc)
-        self.group = ledger.text(reply, 'GroupId')
-        # A new VPC group has outbound access and no inbound rules.
+        with self.changed:
+            arguments = ['--bucket', self.bucket]
+            if self.settings.region != 'us-east-1':
+                arguments += ['--create-bucket-configuration', json.dumps({'LocationConstraint': self.settings.region})]
+            self.bucket_created = True
+            _ = self.api.call('create-bucket', *arguments, service='s3api')
+            _ = self.api.call('put-public-access-block', '--bucket', self.bucket, '--public-access-block-configuration',
+                json.dumps(dict.fromkeys(('BlockPublicAcls', 'IgnorePublicAcls', 'BlockPublicPolicy', 'RestrictPublicBuckets'), True)), service='s3api')
+            _ = self.api.call('put-bucket-lifecycle-configuration', '--bucket', self.bucket, '--lifecycle-configuration',
+                json.dumps({'Rules': [{'ID': 'trial-expiry', 'Filter': {'Prefix': ''}, 'Status': 'Enabled', 'Expiration': {'Days': 1}}]}), service='s3api')
+            _ = self.api.call('put-object', '--bucket', self.bucket, '--key', 'source.bundle', '--body', str(bundle), service='s3api')
+            self.puts += 1
+            reply = self.api.call('create-security-group', '--group-name', 'gate-trial-' + self.run_id,
+                                 '--description', 'Disposable gate trial; egress only', '--vpc-id', self.settings.vpc)
+            self.group = ledger.text(reply, 'GroupId')
+            # A new VPC group has outbound access and no inbound rules.
 
     def links(self, key: str, step: str) -> dict[str, str]:
         host = f'{self.bucket}.s3.{self.settings.region}.amazonaws.com'
@@ -408,13 +572,16 @@ class GateTrial:
 
     def wait_state(self, instance: str, wanted: str, deadline: float) -> None:
         while self.clock() < deadline:
+            if wanted != 'terminated':
+                self.check_cancelled()
             if self.state(instance) == wanted:
                 return
-            _ = self.pause(self.option('poll_pause_s'))
+            self.wait_pause(self.option('poll_pause_s'), cancellable=wanted != 'terminated')
         raise TimeoutError(f'Instance did not reach {wanted} before the trial deadline')
 
     def read_object(self, key: str, destination: Path) -> dict[str, object] | None:
-        self.gets += 1
+        with self.changed:
+            self.gets += 1
         try:
             _ = self.api.call('get-object', '--bucket', self.bucket, '--key', key, str(destination), service='s3api')
         except AwsUnavailable as error:
@@ -426,19 +593,22 @@ class GateTrial:
     def wait_result(self, attempt: Attempt, key: str, deadline: float) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as folder:
             while self.clock() < deadline:
+                self.check_cancelled()
                 row = self.read_object(key, Path(folder) / 'result.json')
+                self.check_cancelled()
                 if row is not None:
                     return row
                 if self.state(attempt.instance_id) == 'terminated':
                     raise RuntimeError('Instance terminated before it wrote its result')
-                _ = self.pause(self.option('poll_pause_s'))
+                self.wait_pause(self.option('poll_pause_s'))
         raise TimeoutError('The guest did not publish its result before the trial deadline')
 
     def terminate(self, instance: str) -> None:
         _ = self.api.call('terminate-instances', '--instance-ids', instance)
         self.wait_state(instance, 'terminated', self.clock() + self.settings.timeout_s)
-        if instance in self.remaining_instances:
-            self.remaining_instances.remove(instance)
+        with self.changed:
+            if instance in self.remaining_instances:
+                self.remaining_instances.remove(instance)
 
     def launch(self, attempt: Attempt, data: Path, step: str) -> None:
         request: dict[str, object] = {
@@ -450,28 +620,45 @@ class GateTrial:
             'BlockDeviceMappings': [{'DeviceName': self.settings.root_device, 'Ebs': {
                 'VolumeSize': self.settings.root_gib, 'VolumeType': 'gp3', 'DeleteOnTermination': True}}],
             'TagSpecifications': [{'ResourceType': 'instance', 'Tags': [
-                {'Key': 'GateTrial', 'Value': self.run_id}, {'Key': 'Name', 'Value': 'gate-trial'}]}],
+                {'Key': 'GateTrial', 'Value': self.run_id},
+                {'Key': 'GateTrialAttempt', 'Value': f'{attempt.size}-{attempt.attempt}'},
+                {'Key': 'Name', 'Value': 'gate-trial'}]}],
         }
         if step == 'size':
             request['InstanceMarketOptions'] = {'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time'}}
+        self.check_cancelled()
         attempt.request_at = self.clock()
+        identity = (attempt.size, attempt.attempt)
         with blocked_trial_signals():
             for retry in range(3):
                 try:
                     reply = self.api.call('run-instances', '--cli-input-json', json.dumps(request), '--user-data', 'file://' + str(data))
+                except AwsUnavailable:
+                    with self.changed:
+                        if identity in self.recovering:
+                            self.launch_reply_lost = True
+                        self.changed.notify_all()
+                    raise
                 except subprocess.SubprocessError:
-                    self.launch_reply_lost = True
+                    with self.changed:
+                        self.recovering.add(identity)
+                        if retry == 2:
+                            self.launch_reply_lost = True
+                        self.changed.notify_all()
                     if retry == 2:
                         raise
                 else:
                     attempt.instance_id = ledger.text(ledger.rows(reply, 'Instances')[0], 'InstanceId')
-                    self.launch_reply_lost = False
-                    self.save()
+                    with self.changed:
+                        self.recovering.discard(identity)
+                        self.record(attempt)
+                        self.changed.notify_all()
                     return
 
     def download_log(self, attempt: Attempt, key: str) -> None:
         destination = self.directory / f'{self.run_id}-{key}.log'
-        self.gets += 1
+        with self.changed:
+            self.gets += 1
         try:
             _ = self.api.call('get-object', '--bucket', self.bucket, '--key', key + '/log',
                               str(destination), service='s3api')
@@ -483,6 +670,8 @@ class GateTrial:
     def measure(self, attempt: Attempt, step: str, reserve: float) -> None:
         key = f'{attempt.size}-{attempt.attempt}'
         prices: Prices | None = None
+        identity = (attempt.size, attempt.attempt)
+        rows = [attempt]
         with tempfile.TemporaryDirectory() as folder:
             data = Path(folder) / 'user-data'
             minutes = conf.read(self.settings.path).whole('gate_trial_lifetime_minutes')
@@ -492,9 +681,8 @@ class GateTrial:
                 for subnet, zone in self.subnets:
                     attempt.subnet, attempt.zone = subnet, zone
                     prices = self.prices(attempt.size, step, zone)
-                    projected = prices.lifetime(lifetime, self.settings.root_gib) * (2 if step == 'start' else 1)
-                    transfer_reserve = prices.put * 4 + prices.get * (lifetime * 2 / self.option('poll_pause_s') + 100)
-                    if self.spent + self.s3_cost + projected + transfer_reserve > reserve:
+                    projected = self.projection(prices, step)
+                    if not self.reserve_attempt(identity, projected, reserve):
                         attempt.error = 'The next fixed lifetime exceeds the step reserve.'
                         attempt.verdict = 'not run'
                         return
@@ -504,10 +692,14 @@ class GateTrial:
                         self.launch(attempt, data, step)
                         break
                     except AwsUnavailable as error:
-                        attempt.clear_refusal = 'An error occurred (' in str(error) or 'InsufficientInstanceCapacity' in str(error)
+                        with self.changed:
+                            unresolved = identity in self.recovering
+                        attempt.clear_refusal = not unresolved and (
+                            'An error occurred (' in str(error) or 'InsufficientInstanceCapacity' in str(error))
                         attempt.error = str(error)
-                        print(f'{zone}: {error}', flush=True)
-                        if 'InsufficientInstanceCapacity' not in str(error):
+                        with self.changed:
+                            print(f'{zone}: {error}', flush=True)
+                        if unresolved or 'InsufficientInstanceCapacity' not in str(error):
                             attempt.verdict = 'error'
                             return
                         attempt.capacity_refusals.append({'zone': zone, 'message': str(error)})
@@ -530,13 +722,13 @@ class GateTrial:
                     attempt.stopped_at = stopped_at
                     attempt.dollars = prices.lifetime(stopped_at - attempt.request_at, self.settings.root_gib)
                     self.finish_times(attempt)
-                    self.spent += attempt.dollars
-                    print(self.row(attempt), flush=True)
+                    self.record(attempt)
                     warm = Attempt(attempt.size, attempt.attempt, 'stopped start', instance_id=attempt.instance_id,
                                    zone=attempt.zone, subnet=attempt.subnet)
                     warm.prices = asdict(prices)
-                    self.attempts.append(warm)
+                    rows.append(warm)
                     attempt = warm
+                    self.check_cancelled()
                     attempt.request_at = self.clock()
                     _ = self.api.call('start-instances', '--instance-ids', attempt.instance_id)
                     self.wait_state(attempt.instance_id, 'running', attempt.request_at + lifetime)
@@ -549,9 +741,11 @@ class GateTrial:
             except CLEANUP_ERRORS as error:
                 attempt.verdict = 'error'
                 attempt.error = str(error)
-            except KeyboardInterrupt:
+            except TrialCancelled:
                 attempt.verdict = 'cancelled'
-                raise
+            except KeyboardInterrupt:
+                self.cancel()
+                attempt.verdict = 'cancelled'
             finally:
                 with blocked_trial_signals():
                     if not attempt.ended_at:
@@ -565,21 +759,28 @@ class GateTrial:
                     except CLEANUP_ERRORS as error:
                         attempt.verdict = 'cleanup error'
                         attempt.error += '; ' + str(error)
-                        self.cleanup_errors.append('Attempt cleanup: ' + str(error))
-                        if attempt.instance_id not in self.remaining_instances:
-                            self.remaining_instances.append(attempt.instance_id)
+                        with self.changed:
+                            self.cleanup_errors.append('Attempt cleanup: ' + str(error))
+                            if attempt.instance_id not in self.remaining_instances:
+                                self.remaining_instances.append(attempt.instance_id)
+                            self.changed.notify_all()
                     if attempt.verdict not in ('pass', 'ready'):
                         try:
                             self.download_log(attempt, key)
                         except CLEANUP_ERRORS as error:
                             attempt.error += '; Log: ' + str(error)
-                    if attempt.instance_id and prices:
+                    if attempt.instance_id and attempt.request_at and prices:
                         billed_end = attempt.terminated_at or self.clock()
                         attempt.dollars += prices.lifetime(billed_end - attempt.request_at, self.settings.root_gib)
                     self.finish_times(attempt)
-                    self.spent += attempt.dollars
-                    print(self.row(attempt), flush=True)
-                    self.save()
+                    with self.changed:
+                        self.spent += sum(row.dollars for row in rows)
+                        self.puts += 2 if step == 'size' else 4
+                        _ = self.reservations.pop(identity, None)
+                        self.update_s3_cost()
+                        for row in rows:
+                            self.record(row, ended=True)
+                        self.changed.notify_all()
 
     @staticmethod
     def finish_times(attempt: Attempt) -> None:
@@ -600,109 +801,114 @@ class GateTrial:
         times = ' | '.join('-' if (value := attempt.times.get(key)) is None else f'{value:.2f}' for key in (
             'request_to_running_s', 'running_to_tools_ready_s', 'tools_ready_to_gate_start_s', 'gate_s', 'teardown_s', 'request_to_ready_s'))
         return (f'{attempt.size} | {attempt.attempt} | {attempt.method} | {attempt.zone} | {times} | ${attempt.dollars:.4f} | '
-                + f'{attempt.result.get("tests", "-")} | {attempt.result.get("skips", "-")} | {attempt.verdict} | '
+                + f'{attempt.result.get("tests", "-")} | {attempt.result.get("skips", "-")} | {attempt.memory_peak_bytes} | {attempt.verdict} | '
                 + f'{attempt.result.get("failed_modules", [])} | {attempt.error.replace(chr(10), "; ")} | {attempt.log_path} | '
                 + json.dumps(attempt.capacity_refusals))
 
     def report(self) -> tuple[dict[str, object], str]:
-        medians: dict[str, object] = {}
-        qualified: list[tuple[float, int]] = []
-        for size in sorted({row.size for row in self.attempts}):
-            for method in sorted({row.method for row in self.attempts if row.size == size}):
-                measured = [row for row in self.attempts if row.size == size and row.method == method and row.verdict != 'not run']
-                medians[f'{size} {method}'] = {key: statistics.median(values) for key in (
-                    'request_to_running_s', 'running_to_tools_ready_s', 'tools_ready_to_gate_start_s', 'gate_s', 'teardown_s', 'request_to_ready_s'
-                ) if (values := [value for row in measured if (value := row.times.get(key)) is not None])}
-            size_rows = [row for row in self.attempts if row.size == size and row.method == 'Spot gate']
-            if size_rows and all(row.verdict == 'pass' and (row.times.get('gate_s') or math.inf) <= self.option('target_gate_s') for row in size_rows):
-                qualified.append((statistics.median(row.dollars for row in size_rows), size))
-        report: dict[str, object] = {'commit': self.commit, 'run_id': self.run_id, 'attempts': [asdict(row) for row in self.attempts],
-            'medians': medians, 'cheapest_size': min(qualified)[1] if qualified else None, 'Batch': 'not measured',
-            'dollars': self.spent + self.s3_cost, 'cleanup_errors': self.cleanup_errors, 'interrupted': self.interrupted, 'remaining': self.remaining(),
-            'cost_basis': 'Read prices and observed seconds. Final rows share the S3 cost. Confirm costs with the AWS bill.'}
-        text = ('Commit: ' + self.commit + '\nsize | attempt | method | zone | request to running | running to tools ready | '
-                + 'tools ready to gate start | gate | teardown | request to ready | dollars | tests | skips | verdict | failed modules | error | log | capacity refusals\n'
-                + '\n'.join(self.row(row) for row in self.attempts) + '\nMedians:\n'
-                + '\n'.join(name + ': ' + json.dumps(values, sort_keys=True) for name, values in medians.items())
-                + f'\nCheapest size at most {self.option("target_gate_s"):g} s: {report["cheapest_size"]}\nBatch: not measured\n'
-                + f'Total: ${self.spent + self.s3_cost:.4f}\nCleanup: {self.cleanup_errors}\n'
-                + 'Remaining: ' + (', '.join(self.remaining()) or 'none') + '\n')
-        return report, text
+        with self.changed:
+            medians: dict[str, object] = {}
+            qualified: list[tuple[float, int]] = []
+            for size in sorted({row.size for row in self.attempts}):
+                for method in sorted({row.method for row in self.attempts if row.size == size}):
+                    measured = [row for row in self.attempts if row.size == size and row.method == method and row.verdict != 'not run']
+                    medians[f'{size} {method}'] = {key: statistics.median(values) for key in (
+                        'request_to_running_s', 'running_to_tools_ready_s', 'tools_ready_to_gate_start_s', 'gate_s', 'teardown_s', 'request_to_ready_s'
+                    ) if (values := [value for row in measured if (value := row.times.get(key)) is not None])}
+                size_rows = [row for row in self.attempts if row.size == size and row.method == 'Spot gate']
+                if size_rows and all(row.verdict == 'pass' and (row.times.get('gate_s') or math.inf) <= self.option('target_gate_s') for row in size_rows):
+                    qualified.append((statistics.median(row.dollars for row in size_rows), size))
+            report: dict[str, object] = {'commit': self.commit, 'run_id': self.run_id, 'attempts': [asdict(row) for row in self.attempts],
+                'family': self.settings.family, 'medians': medians, 'cheapest_size': min(qualified)[1] if qualified else None, 'Batch': 'not measured',
+                'dollars': self.spent + self.s3_cost, 'cleanup_errors': self.cleanup_errors, 'interrupted': self.interrupted, 'remaining': self.remaining(),
+                'cost_basis': 'Read prices and observed seconds. Final rows share the S3 cost. Confirm costs with the AWS bill.'}
+            text = ('Commit: ' + self.commit + '\nFamily: ' + self.settings.family + '\nsize | attempt | method | zone | request to running | running to tools ready | '
+                    + 'tools ready to gate start | gate | teardown | request to ready | dollars | tests | skips | peak machine memory bytes | verdict | failed modules | error | log | capacity refusals\n'
+                    + '\n'.join(self.row(row) for row in self.attempts) + '\nMedians:\n'
+                    + '\n'.join(name + ': ' + json.dumps(values, sort_keys=True) for name, values in medians.items())
+                    + f'\nCheapest size at most {self.option("target_gate_s"):g} s: {report["cheapest_size"]}\nBatch: not measured\n'
+                    + f'Total: ${self.spent + self.s3_cost:.4f}\nCleanup: {self.cleanup_errors}\n'
+                    + 'Remaining: ' + (', '.join(self.remaining()) or 'none') + '\n')
+            return report, text
 
     def save(self) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        record, content = self.report()
-        write_text_atomic(self.directory / f'gate-trial-{self.run_id}.json', json.dumps(record, indent=2) + '\n', new_file_mode=0o600)
-        write_text_atomic(self.directory / f'gate-trial-{self.run_id}.txt', content, new_file_mode=0o600)
+        with self.changed:
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            record, content = self.report()
+            write_text_atomic(self.directory / f'gate-trial-{self.run_id}.json', json.dumps(record, indent=2) + '\n', new_file_mode=0o600)
+            write_text_atomic(self.directory / f'gate-trial-{self.run_id}.txt', content, new_file_mode=0o600)
 
     def remaining(self) -> list[str]:
-        return ([f'instance {instance}' for instance in self.remaining_instances]
-                + (['instances unknown'] if self.instance_query_failed else [])
-                + (['launch reply lost; the guest shutdown timer is the protection'] if self.launch_reply_lost else [])
-                + ([f'bucket {self.bucket}'] if self.bucket_created else [])
-                + (['group lookup failed: gate-trial-' + self.run_id] if self.group_query_failed else [])
-                + ([f'group {self.group}'] if self.group else []))
+        with self.changed:
+            return ([f'instance {instance}' for instance in self.remaining_instances]
+                    + (['instances unknown'] if self.instance_query_failed else [])
+                    + (['launch reply lost; the guest shutdown timer is the protection'] if self.launch_reply_lost else [])
+                    + ([f'bucket {self.bucket}'] if self.bucket_created else [])
+                    + (['group lookup failed: gate-trial-' + self.run_id] if self.group_query_failed else [])
+                    + ([f'group {self.group}'] if self.group else []))
 
     def delete_group(self) -> None:
-        deadline = self.clock() + self.option('group_delete_wait_s')
-        while True:
-            try:
-                _ = self.api.call('delete-security-group', '--group-id', self.group)
-                self.group = ''
-                return
-            except AwsUnavailable as error:
-                if 'DependencyViolation' not in str(error) or self.clock() >= deadline:
-                    raise
-                _ = self.pause(min(self.option('poll_pause_s'), max(0, deadline - self.clock())))
+        with self.changed:
+            deadline = self.clock() + self.option('group_delete_wait_s')
+            while True:
+                try:
+                    _ = self.api.call('delete-security-group', '--group-id', self.group)
+                    self.group = ''
+                    return
+                except AwsUnavailable as error:
+                    if 'DependencyViolation' not in str(error) or self.clock() >= deadline:
+                        raise
+                    _ = self.pause(min(self.option('poll_pause_s'), max(0, deadline - self.clock())))
 
     def cleanup(self) -> None:
-        self.sweep()
-        if self.bucket_created:
-            objects: tuple[dict[str, object], ...] = ()
-            try:
-                objects = ledger.rows(self.api.call('list-objects-v2', '--bucket', self.bucket, service='s3api'), 'Contents')
-                self.object_bytes = sum(int(str(row.get('Size', 0))) for row in objects)
-            except CLEANUP_ERRORS as error:
-                if 'NoSuchBucket' in str(error):
-                    self.bucket_created = False
-                else:
-                    self.cleanup_errors.append('List objects: ' + str(error))
-            for offset in range(0, len(objects), 1000):
+        with self.changed:
+            self.sweep()
+            if self.bucket_created:
+                objects: tuple[dict[str, object], ...] = ()
                 try:
-                    _ = self.api.call('delete-objects', '--bucket', self.bucket, '--delete', json.dumps({
-                        'Objects': [{'Key': row['Key']} for row in objects[offset:offset + 1000]]}), service='s3api')
+                    objects = ledger.rows(self.api.call('list-objects-v2', '--bucket', self.bucket, service='s3api'), 'Contents')
+                    self.object_bytes = sum(int(str(row.get('Size', 0))) for row in objects)
                 except CLEANUP_ERRORS as error:
-                    self.cleanup_errors.append('Delete objects: ' + str(error))
-            try:
-                _ = self.api.call('delete-bucket', '--bucket', self.bucket, service='s3api')
-                self.bucket_created = False
-            except CLEANUP_ERRORS as error:
-                if 'NoSuchBucket' in str(error):
+                    if 'NoSuchBucket' in str(error):
+                        self.bucket_created = False
+                    else:
+                        self.cleanup_errors.append('List objects: ' + str(error))
+                for offset in range(0, len(objects), 1000):
+                    try:
+                        _ = self.api.call('delete-objects', '--bucket', self.bucket, '--delete', json.dumps({
+                            'Objects': [{'Key': row['Key']} for row in objects[offset:offset + 1000]]}), service='s3api')
+                    except CLEANUP_ERRORS as error:
+                        self.cleanup_errors.append('Delete objects: ' + str(error))
+                try:
+                    _ = self.api.call('delete-bucket', '--bucket', self.bucket, service='s3api')
                     self.bucket_created = False
-                else:
-                    self.cleanup_errors.append('Bucket: ' + str(error))
-        try:
-            self.group_query_failed = True
-            reply = self.api.call('describe-security-groups', '--filters',
-                                  'Name=group-name,Values=gate-trial-' + self.run_id,
-                                  'Name=vpc-id,Values=' + self.settings.vpc)
-            self.group_query_failed = False
-            groups = ledger.rows(reply, 'SecurityGroups')
-            self.group = ledger.text(groups[0], 'GroupId') if groups else ''
-            if self.group:
-                self.delete_group()
-        except CLEANUP_ERRORS as error:
-            self.cleanup_errors.append('Group: ' + str(error))
-
-    def run(self, repo: Path, step: str, sizes: Sequence[int], runs: int, reserve: float) -> int:
-        with trial_signals():
+                except CLEANUP_ERRORS as error:
+                    if 'NoSuchBucket' in str(error):
+                        self.bucket_created = False
+                    else:
+                        self.cleanup_errors.append('Bucket: ' + str(error))
             try:
-                return self.run_step(repo, step, sizes, runs, reserve)
+                self.group_query_failed = True
+                reply = self.api.call('describe-security-groups', '--filters',
+                                      'Name=group-name,Values=gate-trial-' + self.run_id,
+                                      'Name=vpc-id,Values=' + self.settings.vpc)
+                self.group_query_failed = False
+                groups = ledger.rows(reply, 'SecurityGroups')
+                self.group = ledger.text(groups[0], 'GroupId') if groups else ''
+                if self.group:
+                    self.delete_group()
+            except CLEANUP_ERRORS as error:
+                self.cleanup_errors.append('Group: ' + str(error))
+
+    def run(self, repo: Path, step: str, sizes: Sequence[int], runs: int, reserve: float, vcpus: int) -> int:
+        with trial_signals(self.cancel):
+            try:
+                return self.run_step(repo, step, sizes, runs, reserve, vcpus)
             except KeyboardInterrupt:
-                self.interrupted = True
+                self.cancel()
                 return 130
 
-    def run_step(self, repo: Path, step: str, sizes: Sequence[int], runs: int, reserve: float) -> int:
+    def run_step(self, repo: Path, step: str, sizes: Sequence[int], runs: int, reserve: float, vcpus: int) -> int:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         began = self.clock()
         bundle_bytes = 0
@@ -716,37 +922,25 @@ class GateTrial:
                 self.sweep(stopped=True)
                 self.discover_subnets()
                 self.setup(bundle)
-                for number in range(1, runs + 1):
-                    for size in sizes:
-                        attempt = Attempt(size, number, 'Spot gate' if step == 'size' else 'cold launch')
-                        self.attempts.append(attempt)
-                        if self.remaining_instances or self.instance_query_failed or self.launch_reply_lost:
-                            attempt.error = ('A launch reply remains lost.' if self.launch_reply_lost
-                                             else 'Instance cleanup remains incomplete.')
-                            print(self.row(attempt), flush=True)
-                            continue
-                        self.measure(attempt, step, reserve)
-                        self.puts += 2 if step == 'size' else 4
-                        if self.shared_prices:
-                            _, _, put, get, _ = self.shared_prices
-                            self.s3_cost = put * self.puts + get * self.gets
+                self.schedule(step, sizes, runs, reserve, vcpus)
         except KeyboardInterrupt:
-            self.interrupted = True
+            self.cancel()
         finally:
             with blocked_trial_signals():
-                self.cleanup()
-                if self.shared_prices:
-                    _, _, put, get, storage = self.shared_prices
-                    self.s3_cost = (put * self.puts + get * self.gets + storage * max(bundle_bytes, self.object_bytes) / 2**30
-                                    * max(0, self.clock() - began) / (730 * 3600))
-                charged = [row for row in self.attempts if row.instance_id]
-                for row in charged:
-                    row.dollars += self.s3_cost / len(charged)
-                self.save()
-                _, content = self.report()
-                print(content, flush=True)
-                print(self.directory / f'gate-trial-{self.run_id}.json')
-                print(self.directory / f'gate-trial-{self.run_id}.txt')
+                with self.changed:
+                    self.cleanup()
+                    if self.shared_prices:
+                        _, _, put, get, storage = self.shared_prices
+                        self.s3_cost = (put * self.puts + get * self.gets + storage * max(bundle_bytes, self.object_bytes) / 2**30
+                                        * max(0, self.clock() - began) / (730 * 3600))
+                    charged = [row for row in self.attempts if row.instance_id and row.request_at]
+                    for row in charged:
+                        row.dollars += self.s3_cost / len(charged)
+                    self.save()
+                    _, content = self.report()
+                    print(content, flush=True)
+                    print(self.directory / f'gate-trial-{self.run_id}.json')
+                    print(self.directory / f'gate-trial-{self.run_id}.txt')
         return 130 if self.interrupted else 1 if self.cleanup_errors else 0
 
 
@@ -758,21 +952,25 @@ def main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
     _ = parser.add_argument('--sizes')
     _ = parser.add_argument('--size', type=int)
     _ = parser.add_argument('--runs', type=int)
+    _ = parser.add_argument('--vcpus', type=int)
+    _ = parser.add_argument('--family')
     class Arguments(argparse.Namespace):
         step: str = ''
         repo: Path = Path()
         sizes: str | None = None
         size: int | None = None
         runs: int | None = None
+        vcpus: int | None = None
+        family: str | None = None
     args = parser.parse_args(list(argv), namespace=Arguments())
     if args.step == 'start' and args.size is None:
         parser.error('--step start requires --size')
     options = conf.read(settings_path)
     size_list = args.sizes if args.sizes is not None else options.text('gate_trial_default_sizes')
-    sizes = [args.size] if args.size is not None else [int(value) for value in size_list.split(',')]
+    sizes = list(dict.fromkeys([args.size] if args.size is not None else [int(value) for value in size_list.split(',')]))
     runs = args.runs if args.runs is not None else options.whole('gate_trial_' + args.step + '_runs')
-    if any(size not in (8, 16, 32, 64) for size in sizes) or runs <= 0:
-        parser.error('Use sizes 8, 16, 32, or 64 and a positive run count.')
+    if any(size not in (8, 16, 32, 64) for size in sizes) or runs <= 0 or (args.vcpus is not None and args.vcpus <= 0):
+        parser.error('Use sizes 8, 16, 32, or 64, a positive run count, and positive --vcpus.')
     reserve = options.number('gate_trial_' + args.step + '_reserve_usd')
     policy = read_settings(settings_path)
     costs = ledger.costs_from_evidence(ledger.CostLedger(directory).read_snapshot(), policy, int(time.time()))
@@ -781,12 +979,28 @@ def main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
         print('The remaining cap room is less than the step reserve.')
         return 1
     settings = TrialSettings.read(settings_path)
+    if args.family is not None:
+        settings = replace(settings, family=args.family)
     admin = admin_secrets.AdminSecretSession(settings_path)
     credentials = admin.get()
     api = AwsCli(settings.profile, settings.region, settings.timeout_s, admin.executor(execute_command))
     try:
+        vcpus = args.vcpus
+        if vcpus is None:
+            try:
+                reply = api.call('get-service-quota', '--service-code', 'ec2', '--quota-code', 'L-34B43A08', service='service-quotas')
+                quota = float(str(ledger.mapping(reply.get('Quota'))['Value']))
+            except (AwsUnavailable, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                print('gate-trial: ' + admin.redact(str(error)))
+                print('Pass --vcpus N to set the trial limit.')
+                return 1
+            box_vcpus = int(options.text('instance_type').split('.')[1].removesuffix('xlarge')) * 4
+            vcpus = int(quota) - box_vcpus
+            print(f'Spot quota: {quota:g} vCPUs; trial limit: {vcpus} vCPUs', flush=True)
+        else:
+            print(f'Spot quota: override; trial limit: {vcpus} vCPUs', flush=True)
         return GateTrial(api, settings, directory, SigningKey(credentials.aws_access_key_id, credentials.aws_secret_access_key)).run(
-            args.repo.resolve(), args.step, sizes, runs, reserve)
+            args.repo.resolve(), args.step, sizes, runs, reserve, vcpus)
     except (AwsUnavailable, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print('gate-trial: ' + admin.redact(str(error)))
         return 1

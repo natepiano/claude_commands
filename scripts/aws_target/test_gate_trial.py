@@ -1,19 +1,21 @@
 """Measure trial lifecycles with a fake AWS command and clock."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import BytesIO, StringIO
 import json
 import os
+import pathlib
 import shlex
 import signal
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import cast, final, override
 import unittest
 from unittest import mock
@@ -24,6 +26,7 @@ from scripts.aws_target import admin_secrets, deploy, gate_trial as trial, ledge
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.production import merge_gate
+from scripts.lib import conf
 
 
 def trial_config() -> str:
@@ -34,24 +37,35 @@ def trial_config() -> str:
 @final
 class Clock:
     def __init__(self) -> None:
+        self.lock = threading.Lock()
         self.now: float = 1000
 
     def read(self) -> float:
-        return self.now
+        with self.lock:
+            return self.now
 
     def advance(self, seconds: float) -> None:
-        self.now += seconds
+        with self.lock:
+            self.now += seconds
 
 
 @final
 class FakeAws:
     def __init__(self, clock: Clock) -> None:
+        self.lock = threading.RLock()
+        self.before_result: Callable[[str], None] | None = None
+        self.attempt_tags: dict[str, str] = {}
+        self.instance_sizes: dict[str, int] = {}
+        self.peak_vcpus: int = 0
+        self.lost_tokens: set[str] = set()
+        self.lost_attempts: set[str] = set()
         self.clock: Clock = clock
         self.calls: list[tuple[str, str, list[str]]] = []
         self.states: dict[str, str] = {}
         self.refusals: int = 0
         self.capacity_zones: set[str] = set()
         self.lost_reply: bool = False
+        self.refuse_after_lost_reply: bool = False
         self.lost_replies: int = 0
         self.tokens: dict[str, str] = {}
         self.hide_instances: bool = False
@@ -64,6 +78,7 @@ class FakeAws:
         self.terminate_timeout: bool = False
         self.delete_dependencies: int = 0
         self.signal_number: int = 0
+        self.signal_handled: Callable[[], None] | None = None
         self.missing_log: bool = False
         self.query_timeout: bool = False
         self.zone_prices: dict[str, float] = {}
@@ -81,6 +96,24 @@ class FakeAws:
 
     def __call__(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                  timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        args = list(arguments)
+        if 'get-object' in args:
+            with self.lock:
+                number, self.signal_number = self.signal_number, 0
+            if number:
+                os.kill(os.getpid(), number)
+                if self.signal_handled is not None:
+                    self.signal_handled()
+        if 'get-object' in args and self.before_result is not None:
+            key = args[args.index('--key') + 1]
+            if not key.endswith('/log'):
+                self.before_result(key)
+        with self.lock:
+            return self.command(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+
+    def command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
+                timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        _ = (capture_output, text, check, env)
         assert arguments[0] == 'aws'
         args = list(arguments)
         index = args.index('--region') + 2
@@ -92,6 +125,11 @@ class FakeAws:
             return subprocess.CompletedProcess(args, 0, json.dumps(value), '')
         def error(value: str) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(args, 1, '', value)
+        if operation == 'get-service-quota':
+            assert service == 'service-quotas'
+            assert option('--service-code') == 'ec2'
+            assert option('--quota-code') == 'L-34B43A08'
+            return reply({'Quota': {'Value': 128}})
         if operation == 'get-products':
             filters = cast(list[dict[str, str]], json.loads(option('--filters')))
             fields = {row['Field']: row['Value'] for row in filters}
@@ -134,22 +172,30 @@ class FakeAws:
             assert set(trial.TRIAL_SIGNALS) <= blocked
             if zone in self.capacity_zones:
                 return error('InsufficientInstanceCapacity: ' + zone)
+            if self.refuse_after_lost_reply and self.requests:
+                return error('An error occurred (RequestLimitExceeded): fixture retry refusal')
             if self.refusals:
                 self.refusals -= 1
                 return error('An error occurred (InstanceLimitExceeded): fixture refusal')
             token = ledger.text(request, 'ClientToken')
             if token not in self.tokens:
-                assert not any(state != 'terminated' for state in self.states.values()), 'overlapping attempts'
                 self.launches += 1
                 instance = 'i-fixture-' + str(self.launches)
                 self.tokens[token] = instance
                 self.states[instance] = 'running'
-                self.tags[instance] = ledger.text(ledger.rows(ledger.rows(request, 'TagSpecifications')[0], 'Tags')[0], 'Value')
+                tags = {ledger.text(row, 'Key'): ledger.text(row, 'Value')
+                        for row in ledger.rows(ledger.rows(request, 'TagSpecifications')[0], 'Tags')}
+                self.tags[instance] = tags['GateTrial']
+                self.attempt_tags[instance] = tags['GateTrialAttempt']
+                self.instance_sizes[instance] = int(ledger.text(request, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
+                self.peak_vcpus = max(self.peak_vcpus, sum(size for item, size in self.instance_sizes.items()
+                                                          if self.states[item] != 'terminated'))
             instance = self.tokens[token]
             self.clock.advance(2)
             self.payloads.append(Path(option('--user-data').removeprefix('file://')).read_text())
             self.requests.append(ledger.mapping(cast(object, json.loads(option('--cli-input-json')))))
-            if self.lost_reply or self.lost_replies:
+            if (self.lost_reply or self.lost_replies or ledger.text(request, 'ClientToken') in self.lost_tokens
+                    or self.attempt_tags[instance] in self.lost_attempts):
                 self.lost_reply = False
                 self.lost_replies = max(0, self.lost_replies - 1)
                 raise subprocess.TimeoutExpired(args, timeout)
@@ -163,18 +209,17 @@ class FakeAws:
                 wanted = filters[0].partition('Values=')[2]
                 states = next(value.partition('Values=')[2].split(',') for value in filters
                               if value.startswith('Name=instance-state-name,'))
+                attempt = next((value.partition('Values=')[2] for value in filters
+                                if value.startswith('Name=tag:GateTrialAttempt,')), None)
                 instances = [instance for instance, state in self.states.items()
                              if state in states and (instance in self.tags if old else self.tags.get(instance) == wanted)
-                             and not self.hide_instances]
+                             and not self.hide_instances and (attempt is None or self.attempt_tags.get(instance) == attempt)]
                 return reply({'Reservations': [{'Instances': [{'InstanceId': instance} for instance in instances]}]})
             self.clock.advance(3)
             instance = option('--instance-ids')
             return reply({'Reservations': [{'Instances': [{'InstanceId': instance, 'LaunchTime': 'fixture-boot',
                           'State': {'Name': self.states[instance]}}]}]})
         if operation == 'get-object':
-            if self.signal_number:
-                number, self.signal_number = self.signal_number, 0
-                os.kill(os.getpid(), number)
             if option('--key').endswith('/log') and self.missing_log:
                 return error('NoSuchKey')
             if self.interrupt:
@@ -190,7 +235,7 @@ class FakeAws:
             else:
                 at = self.clock.read()
                 payload = self.guest_payload or {'tools_ready_at': at + 10, 'gate_started_at': at + 13,
-                    'gate_finished_at': at + 23, 'tests': 19, 'skips': 2, 'verdict': self.gate_status,
+                    'gate_finished_at': at + 23, 'memory_peak_bytes': 123456789, 'tests': 19, 'skips': 2, 'verdict': self.gate_status,
                     'failed_modules': [] if self.gate_status == 'pass' else ['fixture/test_failure.py']}
                 if '/ready-' in option('--key') and self.guest_payload is None:
                     payload = {'tools_ready_at': at + 10, 'verdict': self.gate_status}
@@ -233,6 +278,7 @@ class GateTrialTests(unittest.TestCase):
     clock: Clock = Clock()
     fake: FakeAws = FakeAws(Clock())
     command: trial.GateTrial | None = None
+    output: str = ''
 
     @override
     def setUp(self) -> None:
@@ -250,14 +296,23 @@ class GateTrialTests(unittest.TestCase):
         self.fake = FakeAws(self.clock)
         _ = (self.root / 'trial.conf').write_text(trial_config())
 
-    def run_trial(self, *, step: str = 'size', sizes: tuple[int, ...] = (16,), runs: int = 1, reserve: float = 4) -> trial.GateTrial:
+    def run_trial(self, *, step: str = 'size', sizes: tuple[int, ...] = (16,), runs: int = 1, reserve: float = 4,
+                  vcpus: int = 16, family: str = 'm7a') -> trial.GateTrial:
         settings = trial.TrialSettings('us-east-1', 'fixture', 'ami-fixture', '26.05', 'subnet-fixture',
-            'vpc-fixture', 'us-east-1a', '/dev/xvda', 32, 'm7a', 10, self.root / 'trial.conf')
+            'vpc-fixture', 'us-east-1a', '/dev/xvda', 32, family, 10, self.root / 'trial.conf')
         command = trial.GateTrial(AwsCli('fixture', 'us-east-1', 1, self.fake), settings, self.root / 'state',
             trial.SigningKey('fixture-access', 'fixture-secret'), clock=self.clock.read, pause=self.clock.advance)
         self.command = command
-        with redirect_stdout(StringIO()):
-            _ = command.run(self.repo, step, sizes, runs, reserve)
+        def signal_handled() -> None:
+            with command.changed:
+                self.assertTrue(command.changed.wait_for(lambda: command.interrupted, timeout=10))
+        self.fake.signal_handled = signal_handled
+        output = StringIO()
+        try:
+            with redirect_stdout(output):
+                _ = command.run(self.repo, step, sizes, runs, reserve, vcpus)
+        finally:
+            self.output = output.getvalue()
         return command
 
     def operations(self) -> list[str]:
@@ -291,6 +346,161 @@ class GateTrialTests(unittest.TestCase):
         self.assertIn('i-fixture', saved.read_text())
         self.assertNotIn('i-fixture', content)
         self.assert_cleanup()
+
+    def test_lost_launch_then_refusal_keeps_reservation_and_sweeps(self) -> None:
+        self.fake.lost_reply = True
+        self.fake.refuse_after_lost_reply = True
+        sweep = trial.GateTrial.sweep
+        checked: list[bool] = []
+        def check(command: trial.GateTrial, *, stopped: bool = False, attempt: trial.Attempt | None = None) -> None:
+            if attempt is not None:
+                self.assertFalse(attempt.clear_refusal)
+                self.assertIn((attempt.size, attempt.attempt), command.reservations)
+                checked.append(True)
+            sweep(command, stopped=stopped, attempt=attempt)
+        with mock.patch.object(trial.GateTrial, 'sweep', new=check):
+            command = self.run_trial(runs=2)
+        self.assertEqual(checked, [True])
+        self.assertTrue(command.launch_reply_lost)
+        self.assertEqual([row.verdict for row in command.attempts], ['error', 'not run'])
+        self.assertIn('RequestLimitExceeded', command.attempts[0].error)
+        self.assertEqual(self.fake.launches, 1)
+        self.assert_cleanup()
+
+    def test_duplicate_sizes_have_one_identity_per_attempt(self) -> None:
+        command = self.run_trial(sizes=(16, 16, 32), vcpus=32)
+        self.assertEqual([row.size for row in command.attempts], [16, 32])
+        self.assertEqual(self.fake.launches, 2)
+        self.assertTrue(all(row.verdict == 'pass' for row in command.attempts))
+
+    def test_cancel_before_warm_request_bills_no_warm_lifetime(self) -> None:
+        record = trial.GateTrial.record
+        def cancel(command: trial.GateTrial, attempt: trial.Attempt, *, ended: bool = False) -> None:
+            record(command, attempt, ended=ended)
+            if attempt.method == 'cold launch' and attempt.stopped_at:
+                command.cancel()
+        self.fake.gate_status = 'ready'
+        with mock.patch.object(trial.GateTrial, 'record', new=cancel):
+            command = self.run_trial(step='start')
+        warm = next(row for row in command.attempts if row.method == 'stopped start')
+        self.assertEqual(warm.request_at, 0)
+        self.assertEqual(warm.verdict, 'cancelled')
+        self.assertEqual(warm.dollars, 0)
+        self.assertGreater(command.spent, 0)
+        self.assertLess(command.spent, 1)
+        self.assert_cleanup()
+
+    def test_all_sizes_overlap_within_vcpu_limit(self) -> None:
+        barrier = threading.Barrier(4, timeout=10)
+        def result(_key: str) -> None:
+            _ = barrier.wait()
+        self.fake.before_result = result
+        command = self.run_trial(sizes=(8, 16, 32, 64), vcpus=120)
+        self.assertEqual(self.fake.peak_vcpus, 120)
+        self.assertTrue(all(row.verdict == 'pass' for row in command.attempts))
+        self.assertEqual(len(command.attempts), 4)
+        self.assert_cleanup()
+
+    def test_vcpu_limit_holds_for_multiple_waves_and_start_children(self) -> None:
+        for step in ('size', 'start'):
+            with self.subTest(step=step):
+                self.fake = FakeAws(self.clock)
+                if step == 'start':
+                    self.fake.gate_status = 'ready'
+                barrier = threading.Barrier(2, timeout=10)
+                def result(_key: str) -> None:
+                    _ = barrier.wait()
+                self.fake.before_result = result
+                command = self.run_trial(step=step, runs=4, vcpus=32)
+                self.assertEqual(self.fake.peak_vcpus, 32)
+                self.assertTrue(all(row.verdict == ('pass' if step == 'size' else 'ready') for row in command.attempts))
+                self.assertEqual(self.fake.launches, 4)
+                self.assertEqual(len(command.attempts), 4 if step == 'size' else 8)
+                self.assert_cleanup()
+
+    def test_attempt_larger_than_vcpu_limit_is_not_run(self) -> None:
+        command = self.run_trial(sizes=(64,), vcpus=32)
+        self.assertEqual(command.attempts[0].verdict, 'not run')
+        self.assertIn('--vcpus', command.attempts[0].error)
+        self.assertNotIn('run-instances', self.operations())
+
+    def test_reserve_waits_for_running_attempts_before_next_launch(self) -> None:
+        barrier = threading.Barrier(2, timeout=10)
+        def result(key: str) -> None:
+            if key.startswith(('8-', '16-')):
+                _ = barrier.wait()
+                with self.fake.lock:
+                    self.assertEqual(self.fake.launches, 2)
+                _ = barrier.wait()
+            else:
+                with self.fake.lock:
+                    self.assertTrue(any(self.fake.states[item] == 'terminated' for item in ('i-fixture-1', 'i-fixture-2')))
+        self.fake.before_result = result
+        command = self.run_trial(sizes=(8, 16, 32), vcpus=120, reserve=0.45)
+        self.assertTrue(all(row.verdict == 'pass' for row in command.attempts))
+        self.assertEqual(self.fake.launches, 3)
+        self.assertGreaterEqual(self.fake.peak_vcpus, 32)
+        self.assertLessEqual(self.fake.peak_vcpus, 48)
+        self.assertLess(command.spent + command.s3_cost, 0.45)
+
+    def test_signal_cancels_parallel_waits_and_prints_final_report(self) -> None:
+        for number in trial.TRIAL_SIGNALS:
+            with self.subTest(number=number):
+                self.fake = FakeAws(self.clock)
+                barrier = threading.Barrier(2, timeout=10)
+                def result(key: str) -> None:
+                    _ = barrier.wait()
+                    if key.startswith('8-'):
+                        os.kill(os.getpid(), number)
+                    command = self.command
+                    assert command is not None
+                    with command.changed:
+                        self.assertTrue(command.changed.wait_for(lambda: command.interrupted, timeout=10))
+                self.fake.before_result = result
+                command = self.run_trial(sizes=(8, 16, 32), vcpus=24)
+                self.assertEqual(self.fake.launches, 2)
+                self.assertTrue(command.interrupted)
+                self.assertEqual([row.verdict for row in command.attempts].count('cancelled'), 2)
+                self.assertEqual([row.verdict for row in command.attempts].count('not run'), 1)
+                self.assertIn('Remaining: none', self.output)
+                self.assert_cleanup()
+
+    def test_lost_reply_stops_new_attempts_and_preserves_other_worker(self) -> None:
+        self.fake.lost_attempts = {'16-1'}
+        def result(key: str) -> None:
+            if not key.startswith('8-1/'):
+                return
+            command = self.command
+            assert command is not None
+            with command.changed:
+                self.assertTrue(command.changed.wait_for(
+                    lambda: any(row.size == 16 and row.verdict == 'error' for row in command.attempts), timeout=10))
+                self.assertTrue(command.launch_reply_lost)
+            with self.fake.lock:
+                own = next(item for item, name in self.fake.attempt_tags.items() if name == '8-1')
+                self.assertEqual(self.fake.states[own], 'running')
+        self.fake.before_result = result
+        command = self.run_trial(sizes=(8, 16), runs=2, vcpus=24)
+        verdicts = {(row.size, row.attempt): row.verdict for row in command.attempts}
+        self.assertEqual(verdicts[(8, 1)], 'pass')
+        self.assertEqual(verdicts[(16, 1)], 'error')
+        self.assertEqual(verdicts[(8, 2)], 'not run')
+        self.assertEqual(verdicts[(16, 2)], 'not run')
+        self.assertEqual(self.fake.launches, 2)
+        self.assertTrue(any('Name=tag:GateTrialAttempt,Values=16-1' in args
+                            for _, op, args in self.fake.calls if op == 'describe-instances'))
+        self.assert_cleanup()
+
+    def test_family_and_peak_memory_reach_launch_row_and_json(self) -> None:
+        command = self.run_trial(family='c7a')
+        self.assertEqual(self.fake.requests[0]['InstanceType'], 'c7a.4xlarge')
+        row = command.attempts[0]
+        self.assertEqual(row.memory_peak_bytes, 123456789)
+        self.assertIn('123456789', command.row(row))
+        record = ledger.mapping(cast(object, json.loads(
+            (command.directory / f'gate-trial-{command.run_id}.json').read_text())))
+        self.assertEqual(record['family'], 'c7a')
+        self.assertEqual(ledger.rows(record, 'attempts')[0]['memory_peak_bytes'], 123456789)
 
     def test_failure_cleans_all_resources(self) -> None:
         self.fake.failure = 'AccessDenied: fixture'
@@ -390,7 +600,7 @@ class GateTrialTests(unittest.TestCase):
         self.assertEqual(interface['SubnetId'], 'subnet-second')
         zones = [args[args.index('--availability-zone') + 1] for _, op, args in self.fake.calls
                  if op == 'describe-spot-price-history']
-        self.assertEqual(zones, ['us-east-1a', 'us-east-1b'])
+        self.assertEqual(zones, ['us-east-1a', 'us-east-1a', 'us-east-1b'])
         self.assertIn('InsufficientInstanceCapacity', command.report()[1])
         self.assert_cleanup()
 
@@ -649,6 +859,30 @@ class GuestChild:
 
 @final
 class GuestTests(unittest.TestCase):
+    def test_guest_samples_peak_machine_memory_every_two_seconds(self) -> None:
+        for present in (True, False):
+            with self.subTest(present=present), tempfile.TemporaryDirectory() as folder:
+                meminfo = Path(folder) / 'meminfo'
+                def write(available: int) -> None:
+                    if present:
+                        _ = meminfo.write_text(f'MemTotal: 1000000 kB\nMemAvailable: {available} kB\n')
+                write(900000)
+                result: dict[str, object] = {'memory_peak_bytes': None}
+                namespace: dict[str, object] = {'pathlib': pathlib, 'result': result}
+                code = trial.GUEST[trial.GUEST.index('def sample_memory():'):trial.GUEST.index('memory_stop =')]
+                code = code.replace("'/proc/meminfo'", repr(str(meminfo)))
+                exec(compile(code, '<memory sampler>', 'exec'), namespace)
+                waits: list[float] = []
+                def pause(seconds: float) -> bool:
+                    waits.append(seconds)
+                    write(200000 if len(waits) == 1 else 700000)
+                    return len(waits) == 3
+                stop = threading.Event()
+                with mock.patch.object(stop, 'wait', new=pause):
+                    cast(Callable[[threading.Event], None], namespace['monitor_memory'])(stop)
+                self.assertEqual(waits, [2, 2, 2])
+                self.assertEqual(result['memory_peak_bytes'], 800000 * 1024 if present else None)
+
     def test_failed_cold_publish_keeps_marker_absent_and_trap_uses_cold_link(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -661,7 +895,7 @@ class GuestTests(unittest.TestCase):
                 + "args=sys.argv[1:]\nbody=pathlib.Path(args[args.index('--data-binary')+1][1:]).read_text()\n"
                 + "with pathlib.Path(__file__).with_name('uploads').open('a') as out: out.write(json.dumps([args[-1],body])+'\\n')\n")
             curl.chmod(0o700)
-            guest = trial.GUEST.replace("'/var/lib/gate-trial'", repr(str(root)))
+            guest = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
             wrapper = root / 'guest-test.py'
             _ = wrapper.write_text('from unittest import mock\nimport subprocess\n'
                 + 'with (mock.patch("urllib.request.urlopen", side_effect=OSError("publish failed")),\n'
@@ -699,7 +933,8 @@ class GuestTests(unittest.TestCase):
                            'errors': 0, 'skipped': 1, 'tests': []}),
                 merge_gate.GateJobResult('types', 'basedpyright', 0, 1, '0 errors'),
             )
-            code = trial.GUEST.replace("'/var/lib/gate-trial'", repr(str(root))).replace("'/root/.claude'", repr(str(root / 'home'))).replace("'/root/.claude/config'", repr(str(root / 'home/config')))
+            code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root))).replace("'/root/.claude'", repr(str(root / 'home'))).replace("'/root/.claude/config'", repr(str(root / 'home/config')))
+            _ = (root / 'meminfo').write_text('MemTotal: 1000000 kB\nMemAvailable: 200000 kB\n')
             child = GuestChild()
             with (mock.patch.dict(os.environ), mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch('urllib.request.urlopen', side_effect=http),
@@ -714,6 +949,7 @@ class GuestTests(unittest.TestCase):
                 finally:
                     os.chdir(previous)
             payload = ledger.mapping(cast(object, json.loads(uploads[links['result']])))
+            self.assertEqual(payload['memory_peak_bytes'], 800000 * 1024)
             self.assertEqual(payload['verdict'], 'fail')
             self.assertEqual(payload['tests'], 3)
             self.assertEqual(payload['skips'], 1)
@@ -735,7 +971,7 @@ class GuestTests(unittest.TestCase):
                 self.assertEqual(timeout, 30)
                 uploads[request.full_url] = ledger.mapping(cast(object, json.loads(cast(bytes, request.data))))
                 return BytesIO()
-            code = trial.GUEST.replace("'/var/lib/gate-trial'", repr(str(root)))
+            code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
             with (mock.patch('urllib.request.urlopen', side_effect=http),
                   mock.patch('subprocess.run', return_value=subprocess.CompletedProcess(['fixture'], 0, 'version', '')),
                   mock.patch('subprocess.Popen', side_effect=AssertionError('admission during start trial')),
@@ -781,10 +1017,74 @@ class SpendTests(CostFixture):
                       mock.patch.object(admin_secrets.AdminSecretSession, 'get', side_effect=AssertionError('credential read')),
                       mock.patch.object(AwsCli, 'call', side_effect=AssertionError('AWS call')),
                       redirect_stdout(StringIO())):
-                    self.assertEqual(trial.main(['--step', 'size', '--repo', str(self.root), '--approve-resources'], self.settings, self.state), 1)
+                    self.assertEqual(trial.main(['--step', 'size', '--repo', str(self.root), '--approve-resources', '--vcpus', '64'], self.settings, self.state), 1)
+
+    def test_quota_read_sets_limit_before_resources_and_failure_creates_none(self) -> None:
+        lines = self.settings.read_text().splitlines()
+        index = next(index for index, line in enumerate(lines) if line.startswith('deployment_timeout_s='))
+        lines[index - 1] = '# range: 1..'
+        _ = self.settings.write_text('\n'.join(lines) + '\n')
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                costs = ledger.CostEstimate(1000, ledger.DailyTotal('fixture', Decimal(0)),
+                    ledger.MonthlyTotal('fixture', Decimal(0)), (), 0, 0)
+                fake = FakeAws(Clock())
+                limits: list[int] = []
+                def run(command: trial.GateTrial, repo: Path, step: str, sizes: Sequence[int],
+                        runs: int, reserve: float, vcpus: int) -> int:
+                    _ = (command, repo, step, sizes, runs, reserve)
+                    self.assertEqual([op for _, op, _ in fake.calls], ['get-service-quota'])
+                    limits.append(vcpus)
+                    return 0
+                original = fake.command
+                def aws(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                        timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    if failure and 'get-service-quota' in arguments:
+                        return subprocess.CompletedProcess(list(arguments), 1, '', 'AccessDenied: fixture quota')
+                    return original(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+                output = StringIO()
+                with (mock.patch.object(ledger.CostLedger, 'read_snapshot', return_value=ledger.LedgerEvidence()),
+                      mock.patch.object(ledger, 'costs_from_evidence', return_value=costs),
+                      mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=admin_secrets.AdminCredentials(
+                          'fixture-access', 'fixture-secret', 'fixture-client', 'fixture-client-secret')),
+                      mock.patch.object(trial, 'execute_command', new=aws),
+                      mock.patch.object(trial.GateTrial, 'run', new=run), redirect_stdout(output)):
+                    status = trial.main(['--step', 'size', '--repo', str(self.root), '--approve-resources'], self.settings, self.state)
+                if failure:
+                    self.assertEqual(status, 1)
+                    self.assertEqual(limits, [])
+                    self.assertIn('AccessDenied: fixture quota', output.getvalue())
+                    self.assertIn('Pass --vcpus', output.getvalue())
+                else:
+                    self.assertEqual(status, 0)
+                    box = int(conf.read(self.settings).text('instance_type').split('.')[1].removesuffix('xlarge')) * 4
+                    self.assertEqual(limits, [128 - box])
+                    self.assertIn(f'Spot quota: 128 vCPUs; trial limit: {128 - box} vCPUs', output.getvalue())
+
+    def test_main_passes_vcpu_limit_and_family_override(self) -> None:
+        costs = ledger.CostEstimate(1000, ledger.DailyTotal('fixture', Decimal(0)),
+            ledger.MonthlyTotal('fixture', Decimal(0)), (), 0, 0)
+        settings = trial.TrialSettings('us-east-1', 'fixture', 'ami-fixture', '26.05', 'subnet-fixture',
+            'vpc-fixture', 'us-east-1a', '/dev/xvda', 32, 'm7a', 10, self.settings)
+        captured: list[tuple[str, int]] = []
+        def run(command: trial.GateTrial, repo: Path, step: str, sizes: Sequence[int],
+                runs: int, reserve: float, vcpus: int) -> int:
+            self.assertEqual((repo, step, sizes, runs, reserve), (self.root.resolve(), 'size', [16, 32], 1, 4))
+            captured.append((command.settings.family, vcpus))
+            return 0
+        with (mock.patch.object(ledger.CostLedger, 'read_snapshot', return_value=ledger.LedgerEvidence()),
+              mock.patch.object(ledger, 'costs_from_evidence', return_value=costs),
+              mock.patch.object(trial.TrialSettings, 'read', return_value=settings),
+              mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=admin_secrets.AdminCredentials(
+                  'fixture-access', 'fixture-secret', 'fixture-client', 'fixture-client-secret')),
+              mock.patch.object(trial.GateTrial, 'run', new=run),
+              mock.patch.object(AwsCli, 'call', side_effect=AssertionError('quota read during override')), redirect_stdout(StringIO())):
+            self.assertEqual(trial.main(['--step', 'size', '--repo', str(self.root), '--approve-resources',
+                '--vcpus', '24', '--family', 'c7a', '--sizes', '16,16,32', '--runs', '1'], self.settings, self.state), 0)
+        self.assertEqual(captured, [('c7a', 24)])
 
     def test_deploy_only_dispatches_trial(self) -> None:
-        with (mock.patch('sys.argv', ['deploy.py', 'gate-trial', '--step', 'size', '--repo', '.', '--approve-resources']),
+        with (mock.patch('sys.argv', ['deploy.py', 'gate-trial', '--step', 'size', '--repo', '.', '--approve-resources', '--vcpus', '120']),
               mock.patch.object(trial, 'main', return_value=0) as dispatch):
             self.assertEqual(deploy.main(), 0)
-            self.assertEqual(dispatch.call_args.args[0], ['--step', 'size', '--repo', '.', '--approve-resources'])
+            self.assertEqual(dispatch.call_args.args[0], ['--step', 'size', '--repo', '.', '--approve-resources', '--vcpus', '120'])

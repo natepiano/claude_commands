@@ -50,6 +50,9 @@ The supplied CPU seconds came from gates with contention.
 CPU work, scheduling, and memory waits can differ on an idle instance.
 Therefore, dividing 6,600 CPU seconds by the vCPU count does not establish an idle-instance time bound.
 
+The c7a rows below are estimates for a later `--family c7a` run.
+The command defaults to the family in `instance_type`, which is currently m7a.
+These c7a prices do not price the default m7a trial.
 The predictions below only choose trial sizes.
 They use `250 + 6350 / vCPU` seconds, rounded upward.
 The 250-second serial allowance is an estimate, not a measured stage duration.
@@ -211,8 +214,14 @@ The existing queue remains the only work queue.
 The twenty-instance limit is a proposed configuration value, not a new local admission rule.
 AWS refusal returns the affected request to natedev.
 
-A single-gate trial candidate needs up to sixty-four EC2 vCPUs for its gate.
-The existing sixteen-vCPU Rust box raises that need to at least eighty in the same regional Standard quota.
+The trial reads the regional Standard Spot quota before it creates resources.
+It subtracts the configured Rust box vCPUs to set the trial limit.
+`--vcpus N` overrides the limit and skips the quota read.
+One attempt at each size needs 120 vCPUs when all four attempts overlap.
+Three attempts at every size need 360 vCPUs if all twelve overlap.
+The existing sixteen-vCPU Rust box raises those regional Standard Spot totals to 136 and 376.
+An eighty-vCPU quota leaves 64 vCPUs for this trial when the Rust box runs.
+The automatic limit is 64 for that quota. The attempts then run in smaller groups.
 Twenty concurrent gates need `20 × winning vCPU count + 16` when the Rust box also runs.
 That is 336 vCPUs for sixteen-vCPU workers, or 1,296 for sixty-four-vCPU workers.
 Image construction can require additional capacity.
@@ -547,7 +556,8 @@ Use instance-role temporary credentials for object transfer.
 Workers receive no EC2 launch permission, Git credential, or scaler key.
 Use bucket lifecycle rules for log removal. Runtime needs no bucket administration or object deletion grant.
 
-Does Ohio have eighty Standard Spot vCPUs available for the sequential trial while the Rust box runs?
+The trial reads the Standard Spot quota and reserves capacity for the configured Rust box.
+Can the quota support 120 trial vCPUs for one concurrent attempt at every size?
 Can its quota support `20 × winning vCPU count + 16` before fleet routing starts?
 Any required quota increase remains part of the user-run deployment path.
 No new notification, manual approval per gate, or resource check unrelated to this request is proposed.
@@ -619,6 +629,16 @@ Only the user runs these commands against AWS.
 ```
 
 The config defaults are `--sizes 8,16,32,64 --runs 3`.
+`--vcpus N` is optional for both steps. It overrides the automatic concurrent vCPU limit.
+The command reads `GetServiceQuota` for EC2 quota `L-34B43A08` in the trial region.
+It subtracts the vCPUs of the configured `instance_type` and prints the quota and limit.
+A failed read prints the AWS message and requests `--vcpus`. It creates no resources first.
+The command removes duplicate sizes and preserves their order.
+`--family NAME` selects another family. Its default is m7a from `instance_type`.
+Attempts start as soon as both the vCPU limit and the reserve allow them.
+An attempt waits for active attempts to end when the reserve cannot cover it.
+It reports `not run` when no attempt remains and the reserve still cannot cover it.
+An attempt larger than N reports `not run`.
 Start with one small run:
 
 ```sh
@@ -631,7 +651,7 @@ Start with one small run:
 4. Launch one Spot instance from the configured official NixOS image.
 5. Prepare tools through `nix shell`.
 6. Run `merge_gate.run_suites` with `full=True` and all script type checks.
-7. Terminate the instance before the next attempt.
+7. Terminate each instance when its attempt ends.
 
 The bundle excludes uncommitted changes.
 The image has no box Tailscale identity or box idle service.
@@ -648,7 +668,12 @@ An attempt reports `no capacity` when every zone refuses for capacity.
 
 The table shows the zone, five time intervals, request-to-ready time, dollars, counts, skips, verdict, failed modules, and log path.
 The report gives medians and the cheapest size whose gates all pass within the configured target.
+Each instance runs one gate, with no other trial gate on that instance.
 An unfinished attempt prevents that size from qualifying.
+Each gate result records peak machine memory in `memory_peak_bytes`.
+The guest samples `MemTotal - MemAvailable` from `/proc/meminfo` every two seconds during the gate.
+This value includes tmpfs memory and test processes in user scopes. A missing file gives no value.
+Use this measurement before a later run selects a family with less memory.
 Batch remains **not measured**.
 
 #### Step B: start method, without a gate
@@ -662,21 +687,24 @@ Replace `16` with the selected size. The config default is `--runs 5`.
 1. Launch an On-Demand instance and measure tool readiness.
 2. Stop that instance through the EC2 API.
 3. Start that instance and measure tool readiness again.
-4. Terminate that instance before the next attempt.
+4. Terminate that instance when its attempt ends.
 
 Ready means the tools exist and the guest writes its marker to S3.
 The guest creates its local `prepared` marker after the readiness upload succeeds.
 Each boot runs user data directly through `amazon-init`.
 The stopped start reuses the Nix store.
+The cold launch and its stopped start hold one shared vCPU and cost reservation.
+Other start attempts can run at the same time within the limits.
 This step runs no gate, type check, warm pool, or Batch job.
 
 #### Permissions and cleanup
 
-1. Allow instance launch, gate tags, state reads, stop, start, and termination.
-2. Allow `DescribeSubnets` in the configured VPC.
-3. Allow temporary private bucket creation, configuration, object access, and deletion.
-4. Allow an outbound-only security group, `DescribeSecurityGroups`, and group deletion.
-5. Allow current Spot price and public price reads.
+1. Allow `GetServiceQuota` for the regional EC2 Standard Spot quota.
+2. Allow instance launch, gate tags, state reads, stop, start, and termination.
+3. Allow `DescribeSubnets` in the configured VPC.
+4. Allow temporary private bucket creation, configuration, object access, and deletion.
+5. Allow an outbound-only security group, `DescribeSecurityGroups`, and group deletion.
+6. Allow current Spot price and public price reads.
 
 The command uses the existing encrypted administrator credentials and `AwsCli`.
 Only presigned object URLs reach the instance.
@@ -700,8 +728,13 @@ The command first terminates stopping and stopped instances with the `GateTrial`
 Cleanup finds active instances through the current run's tag.
 A lost launch reply causes up to three calls with the same `ClientToken`.
 If all replies remain lost, the command starts no more attempts.
+Attempts already in progress continue to their end.
+An incomplete cleanup also stops new attempts.
+An attempt sweep uses its own tag and cannot terminate another active attempt.
 The report names the lost reply and the guest shutdown timer as the remaining protection.
-Ctrl-C, SIGTERM, and SIGHUP use the same cleanup path.
+Ctrl-C, SIGTERM, and SIGHUP stop new attempts and cancel active waits.
+The main thread handles these signals. Each worker terminates its instance.
+The command joins all workers before final cleanup and the final report.
 The command blocks these signals during launch calls, final cleanup, and the final report.
 Cleanup finds the security group by its fixed name through `DescribeSecurityGroups`.
 Cleanup removes a bucket or group after a lost creation reply.
@@ -725,7 +758,9 @@ The shared caps remain $20 daily and $400 monthly.
 The command stops if either cap has less room than the step reserve.
 It reads prices for compute, volumes, addresses, and S3.
 Each started instance accrues estimated cost from its request time.
-Each new attempt must fit its full lifetime within the remaining reserve.
+The reserve includes spent money and the full projected lifetimes of all attempts in progress.
+Each new attempt must fit within that reserve.
+One lock protects the reservations, costs, request counts, remaining instances, and report rows.
 Step B reserves two lifetimes.
 The report names attempts that the reserve prevents.
 AWS billing must confirm these estimates.
