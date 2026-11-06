@@ -923,7 +923,7 @@ For lease, first correct PF's phase-only definition against `scripts/direct/revi
 
 All other aliases and related terms stay proposed under the N-A treatment table, with their Other-name file index as one input, not a sufficient source set. Add defined-name and plural matches whenever those spellings would change. Include zero-hit policy entries only with a measured definition task or keep them unbuilt. Every later rename needs a frozen eligible size, kept contexts and an undo of that term's prose/policy together. Meaning IDs and inventory versions must stay beside before/after Definitions; adding a meaning or changing a parser is not source cleanup by itself. No aggregate promise of fewer production names or contacts is made.
 
-After each approved numbered phase, run `~/.claude/scripts/lib/py scripts/production/roles_audit.py baseline`. Record its term-set version, file set, count and window beside the before result. Keep any contact comparison on one fixed window. Run the new source-only check through the unit's tests-only gate after its policy is approved. A step is complete only when its stated measure moves and the functional checks pass. Source-only tests must not read real home-state records or send messages.
+The baseline measure is retired. The retired-name check stays in the merge gate. Run `python3 scripts/production/roles_audit.py check` to check sources. Use `check --prose` to list role words in sentences. Source-only tests must not read real home-state records or send messages.
 
 ## Name config
 

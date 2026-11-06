@@ -26,7 +26,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - **Scope beside the other units** (production doc, Scope of each unit; hierarchies-unit plan, Scope beside sdlc): this unit owns who does each duty among the user, producers, showrunners, unit directors, workers and helpers, and the names of roles, documents, steps and records. hierarchies-unit owns the structure and this unit reads its **Map** and does not copy it: the duty matrix here refers to its role rows. guilds-unit owns the designer and reviewer roles and their duties; this unit lists them as guilds-unit defines them. cargo-liner picks the guild head names with the user; this unit uses `astra-designer` and `astra-reviewer` until then. phases-unit owns the steps of a phase and the doc pipeline; this unit owns only who runs each step and what it is called. fix-rounds-unit owns the repair round rules.
 - **Hub files** (production doc, Hub files): this unit owns `docs/production_format.md` and `commands/showrunner/produce.md`, and merges the edits guilds-unit and fix-rounds-unit send for them. An edit to `commands/unit/direct.md` goes to phases-unit, its owner. All three are also build-followups hub files: an edit goes through cargo-berth's normal flow and the checkpoint notice names the build-followups owner.
 - **One design doc** holds the duty matrix, the term table, the baseline, the friction, the candidates and the steps: `docs/plans/sdlc-roles-design.md` (plan author). It becomes the as-built at run end.
-- **One measure script, run again after each step** (plan author): `scripts/production/roles_audit.py`. It sits in `scripts/production`, which the merge gate and `basedpyright scripts/direct scripts/production` already cover, so it needs no new suite or pyright entry. Its term list is data, `scripts/production/role_terms.toml`, so a name the user approves is one line. A step counts as done only when its measure moved.
+- **One retired-name check** (plan author; sdlc showrunner retired the baseline measure, 2026-11-05): `scripts/production/roles_audit.py check`. It sits in `scripts/production`, which the merge gate and `basedpyright scripts/direct scripts/production` already cover, so it needs no new suite or pyright entry. Its term list is data, `scripts/production/role_terms.toml`, so a name the user approves is one line.
 
 ## Delegation Context
 
@@ -34,10 +34,10 @@ For active process redesigns, as we are currently undergoing with promotions and
 - **Project started:** 2026-10-20T20:55:49.927+00:00
 - **Stack:** Python 3.13, standard library only (`tomllib` for the term list); Markdown.
 - **Layout:**
-  - `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py` — the measure script and its tests (new)
+  - `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py` — the retired-name check and its tests
   - `scripts/production/role_terms.toml` — the term list (new)
   - `docs/plans/sdlc-roles-design.md` — the design doc (new)
-  - read only, outside the worktree: every production doc that `scripts/production/showrunners.py list` prints, `~/.local/state/message/log.jsonl`, the memory folders under `~/.claude/projects/*/memory/`, hierarchies-unit's design doc (`git -C /home/natepiano/worktrees/claude-build-followups-hierarchies show HEAD:docs/plans/build-followups-hierarchies-design.md`)
+  - read only, outside the worktree, while the design doc was written: every production doc that `scripts/production/showrunners.py list` prints, `~/.local/state/message/log.jsonl`, the memory folders under `~/.claude/projects/*/memory/`, hierarchies-unit's design doc (`git -C /home/natepiano/worktrees/claude-build-followups-hierarchies show HEAD:docs/plans/build-followups-hierarchies-design.md`)
 - **Key files:**
   - `docs/production_format.md` — **Words** and <ProductionUnit/>: the role words and the unit director's duties to the showrunner
   - `commands/showrunner/produce.md` — the showrunner's duties (<DesignAuthority/>, <Notify/>, <CrossUnitChange/>, **Rules**)
@@ -50,7 +50,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - **Test:** `python3 -m unittest discover -s scripts/production -p 'test_roles_audit.py'`, from the worktree root. Gate: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` from the worktree root (memory `shared-module-full-gate`).
 - **Lint:** `basedpyright scripts/direct scripts/production` passes when its output has the `0 errors, 0 warnings` line; the exit status says nothing.
 - **Invariants:**
-  - Measuring reads every source read-only. It sends no message, push or alert, and starts no session (plan author: a measure must not add traffic).
+  - The check reads every source read-only. It sends no message, push or alert, and starts no session (plan author: a check must not add traffic).
   - Tests use fixtures; they never read the real `~/.local/state`, `~/rust/hanadocs`, memory folders or transcripts.
   - Each number states its window or its file set, and its count.
   - Python is typed throughout, with no `Any` and no file-level type ignores (user, `~/.claude/CLAUDE.md`).
@@ -407,7 +407,7 @@ Superseded 2026-11-05 (sdlc showrunner). `review_pool.py` is gone from sdlc thro
 
 **Acceptance gate:** each live row has its stop-then-rerun test passing. The `astra`, `message`, `direct` and `production` suites pass. basedpyright on the changed files and their caller modules reports 0 errors, 0 warnings, 0 notes. Then the full merge gate.
 
-### Phase 14 — Close-out: the roles measure is gone  · status: todo
+### Phase 14 — Close-out: the roles measure is gone  · status: done
 **Depends on:** Phase 4b
 
 #### Work Order
