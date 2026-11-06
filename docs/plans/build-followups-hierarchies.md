@@ -675,27 +675,9 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 28 — A retired unit leaves no gate copies  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** sdlc's request of 2026-11-06. The user sees many leftover folders in cargo-port. `copies.remove_trees` runs only in `tidy_wrapped`, so `retire_unit` leaves the unit's gate copies in `~/worktrees/gates`. The rename half waits for a gate-only way in `copies.py`: `remove_trees` ends every clean copy of the owner, and a rename does not stop the unit, so a live worker's copy would go.
-
-**Spec:**
-1. natedev-verify phase 41 landed first: `retire_unit` and `tidy_wrapped` remove unit copies through `copies.unit_owner`. Retire refuses on a busy copy, as `docs/as-built/gate-checkouts.md` says. This phase takes that code, with no second owner rule.
-2. Add one test to `scripts/production/test_tidy_wrapped.py`: a wrap removes `alpha-unit` and retired `beta-unit` copies, and a `live-unit` copy stays. No wrap test used the `-unit` form.
-3. Do not change `scripts/copies/copies.py`. Tests never act on a live unit.
-
-**Files:**
-- `scripts/production/test_tidy_wrapped.py`
-
-**Workers:** 1 writer, slot impl2.
-
-**State:** none
-
-**Deploy one-off (the director's, not the writer's):** list each leftover, send sdlc the list, and delete only after sdlc answers. `~/worktrees/gates/.claude` joins the list only after builds says queue 18a is on main.
-
-**Acceptance gate:**
-- basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
-- `scripts/production/test_retire_unit.py` and `scripts/production/test_tidy_wrapped.py` pass.
-- The showrunner's merge test on the merged tree is green.
+- natedev-verify phase 41 landed the removal first: `retire_unit` and `tidy_wrapped` remove unit copies through `copies.unit_owner`. A busy copy refuses the retire. This phase kept that code and added no second owner rule.
+- `test_tidy_wrapped.py` now proves that a wrap removes `alpha-unit` and retired `beta-unit` copies and keeps a `live-unit` copy.
+- A rename removes nothing: `remove_trees` would end a live worker's copy. Queue re-keys copy owners by staff row id, and the rename call joins that work.
+- Copy owners on disk are `<name>-unit`, and staff names are bare.
