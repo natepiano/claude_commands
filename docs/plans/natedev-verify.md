@@ -943,51 +943,23 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 
 ### Phase 39 — The first lint judgment's repair decision has one callable home · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Source:** natest, approved by builds 2026-11-05 (next item "A callable repair decision").
-
-**Goal:** the choice to repair after the first Clippy judgment is one Bash function, so its status table runs as direct tests and `test_verify_lint_judgment.py` costs less.
-
-**Spec:**
-
-1. **Function.** Add `first_judgment_permits_repair <status> <log path>` to `scripts/direct/verify.sh`, before the first command that uses it. It runs the condition now inline at `verify.sh:3756`, with the same four parts and the same text pattern, and starts no process other than `grep`. It returns 0 when a repair is permitted:
-   - `HOLD_LINT` is 0;
-   - the status is 101;
-   - `RUN_LAST_ATTEMPT_KILLED` (default 0) is 0;
-   - `grep -qE "process didn.t exit successfully:.*signal:"` does not match the log.
-2. **Caller.** `verify.sh:3756-3758` calls the function with `"$clippy_status"` and `"$CLIPPY_LOG"`, and sets `clippy_repair=1` when it returns 0. The read of the `lint-held` file at `verify.sh:3755` stays at the call site, because it sets `HOLD_LINT` for later steps. The two comment lines at `verify.sh:3752-3753` move to the function.
-3. **Direct tests.** Add a test class to `scripts/direct/test_verify_lint_judgment.py`. It extracts the function with `shell_functions` from `scripts/lib/shell_test_support.py` and runs it in `bash`, with a log file in a `tempfile.TemporaryDirectory`. It has no `VerifyLintCacheFixture`. Cases:
-   - every status in today's table (1, 2, 3, 10, 75, 76, 77, 125, 130, 137, 143), each with a lint finding in the log: no repair;
-   - status 101 with a lint finding in the log: repair;
-   - status 101 with a compile error in the log: repair;
-   - status 101 with `HOLD_LINT=1`: no repair;
-   - status 101 with `RUN_LAST_ATTEMPT_KILLED=1`: no repair;
-   - status 101 with the signal text in the log: no repair.
-4. **End-to-end runs.** `test_first_judgment_nonlint_status_never_repairs` keeps its assertions and runs two statuses. Status 1 takes the plain failure path. Status 143 also enters `step_stopped_by_hold` in `run_step` in `scripts/direct/verify.sh`, because that check runs only for a status above 128. All other tests in the file stay as they are.
-
-**Invariants:** `verify.sh` output, exit codes, cache records and build-log records stay the same for every verb. Fix, format, final judgment and `clippy_fix_pass_limit` behavior do not change. Add no other guard, refusal or check.
-
-**Test changes approved:** only the reduction of the status table in `test_first_judgment_nonlint_status_never_repairs`, as item 4 says. Also the total in `test_verify_python_starts.py::test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper`, 60 to 24, because Phase 38 removed those starts and its checkpoint left the total stale.
-
-**Acceptance:**
-
-- Observation: wall and CPU seconds of `python3 ~/.claude/scripts/test_times/module_run.py scripts/direct test_verify_lint_judgment.py`. The director runs the same script on the tree before and after this phase. The earlier estimate of 31 s comes from before Phase 38, so the new baseline is the comparison.
-- Comparison: the numbers go in the notice, with one line for the user on the build cost change.
-- Real path: `test_verify_lint_judgment.py` and every `test_verify_lint*.py` module.
+- `first_judgment_permits_repair <status> <log path>` in `verify.sh` returns 0 when a repair is permitted: `HOLD_LINT` is 0, the status is 101, `RUN_LAST_ATTEMPT_KILLED` (default 0) is 0, and the log has no `process didn.t exit successfully:.*signal:` text. It starts no process other than `grep`.
+- The first-judgment step calls the function with `"$clippy_status"` and `"$CLIPPY_LOG"`, and sets `clippy_repair=1` when it returns 0. The read of the `lint-held` file stays at the call site, because it sets `HOLD_LINT` for later steps.
+- `FirstJudgmentRepairTests` in `test_verify_lint_judgment.py` runs the function in `bash` with a log in a temporary directory and no `VerifyLintCacheFixture`. `test_first_judgment_nonlint_status_never_repairs` runs statuses 1 and 143 through the real `verify.sh`.
+- Measured `test_verify_lint_judgment.py` over two paired runs: wall 148.8 to 107.4 s, CPU 95.1 to 83.9 s, with noise from a load of 31 to 77.
 
 **Files:**
-- `scripts/direct/verify.sh` — the function and its caller.
-- `scripts/direct/test_verify_lint_judgment.py` — the direct tests and the reduced table.
+- `scripts/direct/verify.sh` — the function and its call site.
+- `scripts/direct/test_verify_lint_judgment.py` — `FirstJudgmentRepairTests` and the two-status end-to-end test.
+- `scripts/direct/test_verify_python_starts.py` — the lint trace total is 24.
 
-**Workers:** 1 writer
-- `merge16` (impl): both files. The test lane is not real for one function and its table.
+**Gotchas:**
+- A status above 128 enters `step_stopped_by_hold` in `run_step`, so an end-to-end status table needs one such status.
 
-**State:** none.
-
-**Verification:** `test_verify_lint*.py` through `scripts/test_times/module_run.py`; `basedpyright scripts/direct/test_verify_lint_judgment.py`; `bash -n scripts/direct/verify.sh` and `shellcheck scripts/direct/verify.sh`; the merge gate before the checkpoint.
+**Ruled out:**
+- One end-to-end status (1): it drops the only real-path test of the hold-stop checks.
 
 ### Phase 40 — A verify step reads each target's platform from the eligibility answer · status: todo
 
