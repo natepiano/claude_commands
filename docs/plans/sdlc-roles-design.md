@@ -1,8 +1,8 @@
 # Duties and names in the development process
 
-> **Status: DESIGN — phase 2 proposals.** Q2, Q3 and R5b are answered below; other questions remain open. This phase changes no live duty or name. Phase 1 made only the two approved reporting wording fixes.
+> **Status: RECORD — frozen.** This doc records how the duty and name answers were reached. `docs/as-built/roles-and-names.md` states what is true now.
 
-Scope: `docs/plans/sdlc-roles.md`, Decisions and Phases 1–2. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
+Scope: duties and names as `docs/as-built/roles-and-names.md` records them. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
 
 ## Sources
 
