@@ -501,7 +501,8 @@ def read_config(target: str = "") -> MacTestConfig:
     settings = config_path(target)
     config = conf.read(settings)
     values = config.values()
-    idle = idle_config(config)
+    idle_settings = conf.path("mac_test")
+    idle = idle_config(config if settings == idle_settings else conf.read(idle_settings))
     if "ci_repo" not in values:
         ci_repo = config.text("ci_repo")
     else:
