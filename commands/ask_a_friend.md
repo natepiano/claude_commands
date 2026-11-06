@@ -12,6 +12,8 @@ Evaluate the answer before you present it to the user. Continue until you have a
 The friend uses the caller's family. `side_pane.py` reads `ask_a_friend.consultation` through the model registry.
 `[assignments] ask_a_friend=caller` selects the family. `/default_models ask_a_friend` shows both family settings.
 The friend occupies a pane beside the caller. It has no staff row.
+The friend launches with the worker policy, so it can change files.
+The instruction in step 2 holds it back until the user asks for an implementation.
 
 ## State
 
