@@ -133,7 +133,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
    It resolves the natedev and Mac addresses from local Tailscale status.
    The network rule permits only these addresses on port 22.
-   The SSH rule permits `autogroup:member` as `natepiano`; the network rule still limits access to these devices.
+   The SSH rule permits `autogroup:member` as `natepiano` and `root`; the network rule still limits access to these devices.
    It changes only `tag:build-aws` owners and destination rules.
    It prints each proposed change and uses the policy ETag to prevent concurrent overwrites.
    It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
@@ -147,6 +147,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 3. `box-configuration` reads the clean `main` checkout named by `nixos_configuration_directory`.
    It compares `/run/current-system` with the `aws-build` output.
    It builds the output locally and copies the closure with destination substitutes.
+   It copies the closure and runs the box configuration commands as `root` without `sudo`.
    It holds the controller lock and stops the remote idle service during the copy.
    A bounded poweroff timer protects a failed reconnect.
    A transient systemd unit runs the switch independently of SSH.

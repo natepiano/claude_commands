@@ -522,6 +522,8 @@ class AdmissionServer:
         self.reading_hold: UnreadableReadingHold | NoReadingHold = NoReadingHold()
         self.reading_alert_delivery: ReadingAlertDelivery | NoReadingAlertDelivery = NoReadingAlertDelivery()
         self.reading_alert_needs_clear: bool = True
+        self.outage_alert_needs_clear: bool = True
+        self.listener_started_at: float = float("inf")
         self.configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration = gate.UnusableAdmissionConfiguration("configuration not read")
         self.last_usable_configuration: gate.MemoryConfig | NoPass = NoPass()
         self.caller_versions: dict[str, str] = {}
@@ -1475,7 +1477,7 @@ class AdmissionServer:
         self.epoll.register(listener.fileno(), select.EPOLLIN)
         if isinstance(self.last_usable_configuration, gate.MemoryConfig):
             self._arm_override_reconnect(self.last_usable_configuration)
-        _ = outage_alerts.clear("build-admission", self.clock.now())
+        self.listener_started_at = self.clock.monotonic()
         _notify("READY=1")
 
     def _disconnect(self, connection: Connection) -> None:
@@ -1670,6 +1672,18 @@ class AdmissionServer:
             self._arm_config_watch()
         return changed
 
+    def _check_outage_alert(self) -> None:
+        configuration = self.last_usable_configuration
+        if (not self.outage_alert_needs_clear or not isinstance(configuration, gate.MemoryConfig)
+                or self.clock.monotonic() - self.listener_started_at < configuration.silence_seconds):
+            return
+        try:
+            self.outage_alert_needs_clear = not outage_alerts.clear("build-admission", self.clock.now())
+            if self.outage_alert_needs_clear:
+                print("memory admission: cannot clear outage alert; will retry", file=sys.stderr)
+        except (OSError, ValueError) as error:
+            print(f"memory admission: cannot clear outage alert: {error}", file=sys.stderr)
+
     def run_once(self, timeout: float = 0) -> None:
         self.start()
         now = self.clock.monotonic()
@@ -1719,6 +1733,7 @@ class AdmissionServer:
             _ = self.run_pass()
         if self.clock.monotonic() >= self.next_source_check:
             self._check_sources()
+        self._check_outage_alert()
         _notify("WATCHDOG=1")
 
     def _receive_requests(self, ready: list[tuple[int, int]]) -> None:
