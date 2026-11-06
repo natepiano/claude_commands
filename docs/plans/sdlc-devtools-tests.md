@@ -1360,3 +1360,46 @@ Source: the user via builds, natedev and sdlc [c4e2eefc]: "a change cannot be in
 - `test` — the test files.
 
 **State:** none. The phase writes no new lasting record. Rows go in the existing lists.
+
+### Phase 8i — A Claude worker starts only through assign  · status: todo
+
+Source: the user approved on C1119, through sdlc [b8646245]: fold `scripts/direct/implement.sh` into assign. `assign.py` runs it as its inner step. Move that code into assign, delete `implement.sh`, its second start path and its refusal, and update each caller, doc and test that names it. The order "It must be impossible to start a worker in more than one way" also applies.
+
+**Depends on:** 3z, 8f
+
+#### Work Order
+
+**Goal:** the Claude worker start runs inside the assign process. `scripts/direct/implement.sh` does not exist. No shell or program can start a Claude worker except `assign.sh`.
+
+**Spec:**
+1. **One module, no door.** New `scripts/direct/assign_claude.py` holds the moved code. It has no `__main__` and no argument parser. `assign.py` `execute_claude` calls it in the same process and passes a frozen dataclass, not positional text.
+2. **Same behavior.** These stay byte for byte: the file names and contents of `impl_status_<slot>`, `impl_summary_<slot>.txt`, `impl_agent_<slot>.log` and `impl_agent_<slot>`; each board line; each heartbeat line; each recorder call and its order; the exit codes; the order admit, `worker_state.py`, switch check, claim, `phase_reservation.py claim`, status, pass start, heartbeat, board, `TMPDIR`, worker start, worker wait, heartbeat watch, finish. `UNIT_RESOLVES_ROUND`, `UNIT_WORKER_WAIT_ATTEMPTS`, `UNIT_WORKER_POLL_SECS`, `UNIT_TEAM_ROLE`, `UNIT_RUN_DIR` and `AGENT_BG_*` keep their meaning.
+3. **Real functions.** The `worker_record` heredoc becomes typed functions with no `sys.path` line. The claim holds `os.getpid()`. Remove `FOLLOW_LAUNCHER_PID` when no other reader exists. The release runs in `finally`. The heartbeat watch stops in `finally`.
+4. **One model answer.** Use the family, model and effort that `resolve_model` already returned. Remove the second resolve. `execute_claude` runs only for the Claude family, so the refusal `implement.sh: Codex workers must use assign.sh.` goes. `agents_resolve_claude_launcher` stays for `review.sh`, without the second argument only if that is simpler.
+5. **What assign cannot reach goes.** Remove the positional parser, the option parser, the tenth argument and the role checks that assign already makes. Remove the old board-prefix read only if no record of a live run needs it, and state the answer.
+6. **Recorded command.** `--launcher-command` holds the `assign.sh` command of this launch, so a replay runs assign.
+7. **The gate.** Remove `implement.sh` from `WORKER_LAUNCHERS` and `LAUNCHERS` in `scripts/direct/assign_gate.py`. `agent_bg.sh` now has assign as its direct parent: its gate accepts that and refuses everything else as before.
+8. **Stall watch.** Remove the name from `WORK` in `scripts/production/stall_watch.py`. A Claude worker under assign still counts as work: read how the set is used and keep that true.
+9. **Names.** Update each comment, doc and sample that names the file. Correct the as-built docs to state the assign form. Rename the test files to `test_assign_claude*.py` and the support files to `assign_claude*_test_support.py`.
+10. **Out of scope.** `review.sh` keeps its form. `settings.json` is a permission file and this phase does not edit it; the director reports its two stale lines. `docs/plans/` other plans are history and stay.
+
+**Acceptance:**
+- Real-path tests through `bash scripts/direct/assign.sh` with a fixture Claude binary: a new worker and a `--to` follow-up, for implement, test and fix. Each reads the status, summary, log, board lines and recorder events. Existing assertions hold. Approved changes: a direct start of `implement.sh` no longer exists, so its refusal tests go, and the recorded launcher command names assign.
+- A failed launch still ends through the 8f path: a run with no other worker ends, and the worker row stays.
+- `test_one_launch_path` passes with the new names and finds no second start path.
+- A fix round: `landed` on a clean exit, `abandon --edits-landed` on a failed exit.
+- Live check by the director: one real Claude worker on a small prompt through `assign.sh` with a copy of the models file that sets `direct=claude`. Register and done appear on the board.
+- `git grep -n "implement\.sh"` prints only `docs/plans/`, `settings.json` and any dated record.
+
+**Files:**
+- `scripts/direct/assign.py`, `scripts/direct/assign_claude.py`, `scripts/direct/implement.sh`, `scripts/direct/assign_gate.py`, `scripts/production/stall_watch.py`, `scripts/agents/models_config.sh` — the move.
+- `scripts/direct/test_implement_launcher.py`, `scripts/direct/test_implement_launcher_claims.py`, `scripts/direct/test_implement_launcher_claude.py`, `scripts/direct/test_implement_launcher_claude_accounts.py`, `scripts/direct/test_implement_launcher_claude_effort.py`, `scripts/direct/test_implement_launcher_claude_follow.py`, `scripts/direct/test_implement_launcher_claude_panes.py`, `scripts/direct/test_implement_launcher_compaction.py`, `scripts/direct/test_implement_launcher_follow.py`, `scripts/direct/test_implement_launcher_probes.py`, `scripts/direct/test_implement_launcher_records.py`, `scripts/direct/implement_launcher_test_support.py`, `scripts/direct/implement_launcher_claude_test_support.py`, `scripts/direct/test_assign_claude_door.py`, `scripts/direct/test_assign_gate.py`, `scripts/direct/test_one_launch_path.py`, `scripts/direct/recorder_fixture.py`, `scripts/direct/test_progress_history.py`, `scripts/production/test_stall_watch.py`, `scripts/production/test_roles_audit.py` — the tests.
+- `docs/as-built/agent-registry.md`, `docs/as-built/build-followups-fn-length-hook.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/staff-accessors.md`, `docs/as-built/unit-progress-history.md`, `docs/as-built/usage-ledger.md`, `docs/direct_footprint_review.md`, `commands/history.md`, `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`, `scripts/direct/findings.py`, `scripts/direct/progress_history.py`, `scripts/direct/worker_name.sh`, `scripts/direct/review.sh`, `scripts/history/history.py`, `scripts/message/test_rca.py`, `scripts/message/test_send.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py`, `scripts/production/test_codex_winddown.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_stop_resume.py`, `scripts/accounts/test_launch_accounts.py` — names only.
+
+**Workers:** `3 writers`. Three concerns.
+- `impl` — the move.
+- `test` — the tests.
+- `names` — comments, docs and samples.
+
+**State:** none. The phase writes no new lasting record.
+

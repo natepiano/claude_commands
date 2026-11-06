@@ -127,7 +127,7 @@ def open(label: str, *, question: str = "", cwd: Path | str = ".") -> SidePane:
         ratio = config.number("WORKER_SPLIT_RATIO")
         destination = herdr.SplitPane(caller.pane, "right", ratio, label)
     launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
-        worker_panes.launch_arguments(policy, ""), herdr.NoOpeningPrompt(),
+        worker_panes.launch_arguments(policy, "", cwd), herdr.NoOpeningPrompt(),
         int(config.number("PANE_AGENT_START_SECONDS") * 1000), agent=label)
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return _note(client, launched.pane, launched.outcome.reason)
@@ -141,8 +141,10 @@ def open(label: str, *, question: str = "", cwd: Path | str = ".") -> SidePane:
 
 def _policy() -> worker_panes.LaunchPolicy:
     settings = models_registry.launch_settings("ask_a_friend", "consultation")
-    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
-    return worker_panes.LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan")
+    try:
+        return worker_panes.worker_policy(settings)
+    except conf.Unusable as error:
+        raise SidePaneRefused(str(error)) from error
 
 
 def send(label: str, text: str) -> SidePane:

@@ -323,6 +323,16 @@ class GroupTests(SweepCase):
 
 
 class LastUseTests(SweepCase):
+    def test_stamp_newer_handles_missing_older_and_newer_stamps(self) -> None:
+        root = self.target().root
+        moment = time.time()
+        self.assertFalse(sweep.stamp_newer(str(root), moment))
+        stamp = write(root / sweep.USE_STAMP)
+        os.utime(stamp, (moment - 1, moment - 1))
+        self.assertFalse(sweep.stamp_newer(str(root), moment))
+        os.utime(stamp, (moment + 1, moment + 1))
+        self.assertTrue(sweep.stamp_newer(str(root), moment))
+
     def test_listing_a_fingerprint_dir_is_not_a_use(self) -> None:
         target = self.target()
         fingerprint = target.tree / ".fingerprint" / f"app-{APP}"
@@ -1404,6 +1414,84 @@ class FloorTests(SweepCase):
         self.assertEqual(saved.workspaces, (pairs[1],))
         self.assertEqual(set(saved.history), {pairs[0], pairs[2]})
 
+    def test_a_target_removed_during_shrink_does_not_fail_the_floor_pass(self) -> None:
+        base = self.base()
+        tree, _ = cargo_target(base, "idle", APP, time.time() - DAY)
+        shrink = sweep.shrink_floor
+
+        def device(path: str) -> int:
+            """Report one filesystem wherever TMPDIR is. A missing path still raises."""
+            _ = os.stat(path)
+            return base.stat().st_dev
+
+        def remove_target(
+            scan: sweep.Scan, total: int, budget: int, dry_run: bool,
+            tree_targets: dict[str, str], trees: dict[str, list[str]],
+            busy: dict[str, sweep.TargetUse | sweep.LockHeld | sweep.BuildHoldTarget | sweep.NoRecordedEvidence],
+            removal_order: sweep.RemovalOrder, planned_at: float, owners: sweep.TargetOwnerIndex, *,
+            lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+            policy: sweep.MacFloor | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+        ) -> tuple[int, int, list[tuple[sweep.FloorTake, int]]]:
+            result = shrink(scan, total, budget, dry_run, tree_targets, trees, busy, removal_order,
+                            planned_at, owners, lint_settings=lint_settings, policy=policy)
+            shutil.rmtree(tree.parent)
+            return result
+
+        errors = io.StringIO()
+        with (mock.patch.object(sweep, "output_device", side_effect=device),
+              mock.patch.object(sweep, "shrink_floor", side_effect=remove_target),
+              mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+              redirect_stderr(errors)):
+            status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], recorded=True)
+        self.assertEqual(status, 0, errors.getvalue())
+        self.assertNotIn("Errno", errors.getvalue())
+        saved = self.saved_record()
+        self.assertEqual(saved.free_bytes, 11 * GIB)
+        self.assertEqual(saved.build_cache_bytes, 0)
+
+    def test_the_removal_alert_excludes_a_target_removed_by_another_process(self) -> None:
+        base = self.base()
+        taken_tree, taken_output = cargo_target(base, "taken", APP, time.time() - 2 * DAY)
+        other_tree, other_output = cargo_target(base, "other", DEMO, time.time() - DAY)
+        _ = write(taken_output, GIB // 8)
+        _ = write(other_output, GIB // 8)
+        taken_bytes = sweep.directory_blocks(str(taken_tree.parent))
+        other_bytes = sweep.directory_blocks(str(other_tree.parent))
+        _ = write_config_fixture(conf.path("lint"), "sweep_large_removal_bytes=1\n")
+        shrink = sweep.shrink_floor
+
+        def device(path: str) -> int:
+            """Report one filesystem wherever TMPDIR is. A missing path still raises."""
+            _ = os.stat(path)
+            return base.stat().st_dev
+
+        def remove_other_target(
+            scan: sweep.Scan, total: int, budget: int, dry_run: bool,
+            tree_targets: dict[str, str], trees: dict[str, list[str]],
+            busy: dict[str, sweep.TargetUse | sweep.LockHeld | sweep.BuildHoldTarget | sweep.NoRecordedEvidence],
+            removal_order: sweep.RemovalOrder, planned_at: float, owners: sweep.TargetOwnerIndex, *,
+            lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+            policy: sweep.MacFloor | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+        ) -> tuple[int, int, list[tuple[sweep.FloorTake, int]]]:
+            result = shrink(scan, total, budget, dry_run, tree_targets, trees, busy, removal_order,
+                            planned_at, owners, lint_settings=lint_settings, policy=policy)
+            shutil.rmtree(other_tree.parent)
+            return result
+
+        with (mock.patch.object(sweep, "output_device", side_effect=device),
+              mock.patch.object(sweep, "shrink_floor", side_effect=remove_other_target),
+              mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send):
+            status, _ = self.hold(base, 10 * GIB, [10 * GIB - GIB // 16, 11 * GIB], recorded=True)
+        self.assertEqual(status, 0)
+        self.assertFalse(taken_output.exists())
+        message = cast(str, send.call_args.args[0])
+        self.assertIn(f"removed {sweep.gib(taken_bytes)} of build caches", message)
+        self.assertNotIn(f"removed {sweep.gib(taken_bytes + other_bytes)} of build caches", message)
+        self.assertIn("removed more than", message)
+        saved = self.saved_record()
+        self.assertEqual(saved.free_bytes, 11 * GIB)
+        self.assertEqual(saved.build_cache_bytes, sweep.directory_blocks(str(taken_tree.parent)))
+
     def test_a_dry_floor_pass_reports_an_unreadable_recorded_root_index(self) -> None:
         base = self.base()
         tree, payload = cargo_target(base, "protected", APP, time.time() - DAY)
@@ -1811,6 +1899,26 @@ class FloorTests(SweepCase):
                     lines = [line for line in text.splitlines() if "the floor " in line and " from " in line]
                     self.assertEqual(len(lines), 1)
                     self.assertIn(str(idle.parents[2]), lines[0])
+
+    def test_filesystem_floors_skips_a_target_removed_after_the_directory_check(self) -> None:
+        base = self.base()
+        target = base / "target"
+        target.mkdir()
+        isdir = os.path.isdir
+
+        def remove_after_check(path: str) -> bool:
+            result = isdir(path)
+            if path == str(target):
+                target.rmdir()
+            return result
+
+        def device(path: str) -> int:
+            return os.stat(path).st_dev
+
+        with (mock.patch.object(os.path, "isdir", side_effect=remove_after_check),
+              mock.patch.object(sweep, "output_device", side_effect=device)):
+            floors = sweep.filesystem_floors(10 * GIB, [str(target)], lint_settings=conf.read("lint"))
+        self.assertTrue(all(str(target) not in floor.targets for floor in floors))
 
     def test_secondary_floor_uses_configured_percent_and_groups_each_device(self) -> None:
         base = self.base()
@@ -2594,7 +2702,7 @@ class FloorTests(SweepCase):
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
                                        {"source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
-            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
                 output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
                 with (mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()),
@@ -2618,7 +2726,7 @@ class FloorTests(SweepCase):
         seed = ImmutableGitSeed.create(base, "main", "Sweep tests", "sweep@example.invalid",
                                        {"source.txt": "style source\n"})
         with mock.patch.dict(os.environ, {"HOME": str(base), scratch.HOLDS_ENV: str(base / "holds.json")}):
-            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
             output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
             # Cargo may omit rustc-info when its caller made the target directory.
@@ -2656,7 +2764,7 @@ class FloorTests(SweepCase):
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
               mock.patch.object(sweep, "send_holder_message", return_value=sweep.FloorChannelOutcome.FAILED),
               redirect_stdout(io.StringIO())):
-            with copies.standing("style-unit", seed.checkout, "HEAD") as checkout:
+            with copies.standing("style-unit", seed.checkout, copies.CommittedSource("HEAD")) as checkout:
                 target = checkout / "target"
                 output = unit(target / "debug", "deps", "style", APP, time.time() - DAY)
                 self.root_row(checkout, target, target)

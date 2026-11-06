@@ -213,11 +213,16 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) ->
             hold.active = False
 
 
+class ClaudeCompaction(Enum):
+    NATIVE = "Claude controls compaction"
+
+
 @dataclass(frozen=True)
 class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
+    compact_above_tokens: int | ClaudeCompaction
 
 
 @dataclass(frozen=True)
@@ -356,8 +361,9 @@ def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapsh
     return {parent.id: _parent_evidence(parent.id, record, client, read).states for parent in parents}
 
 
-def worker_run(parent: staff.StaffRow) -> Path:
-    runs = unit_runs.held(str(parent.current_session))
+def worker_run(parent: staff.StaffRow, *,
+               record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL) -> Path:
+    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record)
     if runs:
         return Path(runs[0])
     return Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / parent.id
@@ -424,6 +430,8 @@ def stage_two_completion_id(dispatch_id: str) -> str:
 def can_close(worker: OpenWorker | StoppedWorker, *,
               run: DispatchRun | HolderRun = HolderRun.CURRENT,
               lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+    from scripts.direct import progress_history
+
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
@@ -435,7 +443,13 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         return Kept(f"agent state is {worker.status.value}")
     passed = worker_pass(worker.row, directory)
-    if passed.get("status") != "completed":
+    if passed:
+        status, dispatch = passed.get("status"), passed.get("instance_id")
+    else:
+        latest = progress_history.last_dispatch(worker.row.id)
+        status, dispatch = ((latest.status, latest.instance_id)
+                            if isinstance(latest, progress_history.RecordedDispatch) else ("", ""))
+    if status != "completed":
         return Kept("launcher has not recorded a completed pass")
     try:
         backend = staff.backend(worker.row)
@@ -446,7 +460,6 @@ def can_close(worker: OpenWorker | StoppedWorker, *,
         if any(isinstance(entry, worker_admission.TornTranscriptRecord) for entry in entries):
             return Kept("worker transcript has incomplete records")
         messages = [entry for entry in entries if isinstance(entry, str) and entry]
-        dispatch = passed.get("dispatch_id", passed.get("instance_id"))
         if (not isinstance(dispatch, str) or not dispatch or not messages
                 or not messages[-1].startswith("assistant:\n")
                 or messages[-1].rstrip().splitlines()[-1] not in
@@ -465,15 +478,31 @@ def launch_policy(role: WorkerRole) -> LaunchPolicy:
     sandbox = READ_ONLY_SANDBOX if role in ("review", "astra-reviewer") else WORKER_SANDBOX
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
+    return _launch_policy(settings, sandbox)
+
+
+def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
+    """Use the worker's file permissions with the supplied model settings."""
+    from scripts.agents.codex_mesh import WORKER_SANDBOX
+
+    return _launch_policy(settings, WORKER_SANDBOX)
+
+
+def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> LaunchPolicy:
+    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
+
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
-    return LaunchPolicy(settings, sandbox, permission)
+    compact_above_tokens = (conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
+                            if settings.kind == "codex" else ClaudeCompaction.NATIVE)
+    return LaunchPolicy(settings, sandbox, permission, compact_above_tokens)
 
 
 def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     settings = policy.settings
     if settings.kind == "codex":
         arguments = ["--model", settings.model, "--sandbox", policy.sandbox, "--ask-for-approval", "never",
-                      "-c", f'model_reasoning_effort="{settings.effort}"']
+                      "-c", f'model_reasoning_effort="{settings.effort}"',
+                      "-c", f"model_auto_compact_token_limit={policy.compact_above_tokens}"]
         if settings.service_tier:
             arguments += ["-c", f'service_tier="{settings.service_tier}"']
         return arguments
@@ -483,9 +512,11 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     return arguments
 
 
-def launch_arguments(policy: LaunchPolicy, identity: str) -> list[str]:
+def launch_arguments(policy: LaunchPolicy, identity: str, directory: Path | str) -> list[str]:
     if policy.settings.kind == "codex":
         launch = (["resume", identity] if identity else []) + ["--no-daemon"]
+        if identity:
+            launch += ["--cd", str(directory)]
     else:
         launch = ["--resume", identity] if identity else []
     return launch + _policy_arguments(policy)
@@ -737,7 +768,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane has foreground work")
     try:
         launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
-            launch_arguments(policy, str(row.current_session) if row else ""), herdr.NoOpeningPrompt(),
+            launch_arguments(policy, str(row.current_session) if row else "", directory), herdr.NoOpeningPrompt(),
             int(start_seconds * 1000), agent=name.value)
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")

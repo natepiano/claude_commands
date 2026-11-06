@@ -29,11 +29,18 @@ Every command checks holds through `target_state`. The sole holder may run its o
 | Command | Role |
 | --- | --- |
 | `status [--probe]` | One line per target through `format_state`, in the user's zone: `natedev: free`, `mac: held by <holder> since <HH:MM> until <HH:MM> — <why>`, `release expected <HH:MM>` for an eta, `mac: running <what> since <HH:MM>` (with `, idle since <HH:MM>` while the claim watcher has seen the Mac idle, from the claim's `idle_since`), one `running ...` part per job joined by `; `; a held or running part whose holder session resolves adds ` (showrunner <name>, unit <name>)` after `since <HH:MM>`, `<name>: unreachable — <reason>`, `<name>: state unreadable — <error>`. `--probe` adds a read-only `ssh true` per `ssh` target (`offload.probe_reachability`). `/build:status` runs it. |
-| `eligible --repo-root <p> --package <n> [--local <why>]` | One tab-separated line per target: name, `eligible`/`excluded`, reason (`-` when eligible), settings path (`-` for a local target). Errors print `build targets: <error>`, exit 2. |
+| `eligible --repo-root <p> --package <n> [--local <why>] [--kind <kind>] [--target <name>]` | Each target row has five tab-separated fields: name, eligibility, reason, settings path and platform. Eligibility is `eligible` or `excluded`. An eligible target has reason `-`. An SSH target has its settings path and platform (`macos` or `linux`). A local target has `-` for settings and platform. Errors print `build targets: <error>` and exit 2. |
 | `register-local --call-id <id> --pid <pid>` | A nonblocking hold check for routing. Stores no call record. |
 | `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force; release events wake it at once, with 15 s polling as a fallback. Prints the holder once and the 2 h notice once. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
 | `check-local [--caller <name>]` | A nonblocking hold check. Without a caller, records a refused launch session for its release notice. |
 | `interrupt-local --call-id <id> [--signal INT\|TERM]` | Signals a running `wait-local` for that call, checked by pid and process-start identity. |
+
+`eligible` uses the same five fields for plain, `--kind` and `--target` answers.
+`verify.sh` reads platforms from this table in Bash.
+Each loop uses its row's platform directly.
+`target_platform` scans the saved table for other callers and starts no process.
+Without a matching platform, it retains the `mac_allowed` fallback for the target named `mac`.
+The separate `build_targets.py platform` command is removed.
 
 - `status` names who holds each target: `command_status` collects every `HolderSession` from the states, calls `roster.unit_labels_for` once for all of them ([session-roster.md](session-roster.md), "Unit labels"), and `format_state` / `running_job_text` add the suffix through `unit_label_suffix`. Showrunner and unit are short names, `—` for a missing relationship. No holder session, an unknown holder or a lookup that raises keeps the line without the suffix. A status run costs about 0.10 s more for the lookup (median 0.204 → 0.307 s); under machine load status timings vary from 0.3 to 2 s, so measure on a quiet machine. The suffix joins a claim to its holder by the recorded holder session, never by `what` and `since`, which can match a stale claim.
 - `BUILD_TARGETS_POLL_S` and `BUILD_TARGETS_ESCALATE_S` replace the 15 s re-check interval and the 2 h escalation; `BUILD_TARGETS_NOW` replaces the clock. All three are test overrides.
