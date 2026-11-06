@@ -1,8 +1,8 @@
 # Showrunner automation: unit start, checkpoint merge, lifecycle, updates, dailies and waits
 
-Code reviews now use the unit's persistent `review` and `review2` workers
-through `assign.sh --role review`. Any pool maintenance paths described below
-remain only for the pending archive cleanup; they do not dispatch new reviews.
+Codex code reviews use the unit's persistent `review` and `review2` workers through `assign.sh --role review`.
+The [simplify lens](simplify-lens.md) uses a fresh Claude review.
+Pool maintenance paths do not dispatch new reviews.
 
 ## What it is
 
@@ -86,9 +86,18 @@ Resume restores the folder from the merge branch and resumes `current_session`.
 
 - **Origin ancestry:** the checkpoint must be on an origin branch. The Units-row Branch is fetched and checked first. If it is absent or does not contain the checkpoint, all origin heads are fetched with stale tracking refs pruned, including when the checkout normally fetches only one branch. The ancestry line names the branch that contains the checkpoint; no containing branch keeps `commit is not on origin`. Scope, conflict checking and merging use the submitted checkpoint hash, not that branch's later tip. The other-units overlap report still checks the other units' Branch rows and dirty worktrees; it skips the submitting unit.
 - **Doc fields read:** `Merge branch`, `Showrunner checkout`, `Log`, the unit staff rows (branch from the worktree, plan from `.unit.toml`), **Merge tests**, **Known flakes** (package names), **Known flaky tests** (nextest test names, as `` `<path::test>`, `<path::test>` ``), **Push:** (`validate_and_push` default, or `git`) and **Promote:** (`<checkout>[, mac <path>]`, read as `NoPromotion | PromoteTo(checkouts, MacCheckout | NoMac)`). An absent field and `none` (any case) are both `NoPromotion`; at load every local Promote checkout must exist, so a bad destination is refused before anything is pushed.
-- **Input rules.** A code checkpoint needs `--review-trial` (exactly `review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>`) and a one-line `--delivers`; a shrink refuses `--delivers`. It also needs `--parallel` matching `Parallel: Phase <N>[, Phase <M>…] could start` or `Parallel: none — <reason>`; `Parallel: unknown` is refused with the instruction to add the plan's `**Depends on:**` lines and rerun (`check_parallel`). `--cancel-prior` is refused with `Push: git`. `MergeRequest.delivers` and `excluded` are `str`, `""` for absent.
+- **Input rules.** A code checkpoint needs a `--review-trial` line and a one-line `--delivers`; a shrink refuses `--delivers`.
+  [Review regime records](review-regime-trial.md) define the line, including its optional simplify suffix.
+  The checkpoint also needs `--parallel` matching `Parallel: Phase <N>[, Phase <M>…] could start` or `Parallel: none — <reason>`.
+  `Parallel: unknown` is refused with instructions to add the plan's `**Depends on:**` lines and rerun `check_parallel`.
+  `--cancel-prior` is refused with `Push: git`.
+  `MergeRequest.delivers` and `excluded` use `str`, with `""` for an absent value.
 - **User bump.** `--bump` accepts only a code checkpoint; it refuses `--shrink`, `--as-built` and `--from-child`. Scope, conflict and overlap checks stay. It skips tests before the push, records “gate after push”, starts `bump_gate.py --record <step record>` after the push and before promotion, and returns without waiting. The runner makes a shared Git clone, checks out the pushed tip detached, and uses the same checkpoint steps, pass rule, flake rule and named-test retries as a normal merge. It removes the clone when the run ends. The `bump-gate` record from `checkpoint_step_record` keeps the test plan, tip, start time, process identity, result and `bump-gate.log` path. A rerun reuses a live gate or a completed result for the same tip; a dead gate with no result starts again, checked with the existing session process identity functions. Red sends the failed step, known failing test names, tip and log path to the owning unit and showrunner through `send.py`; green sends one line to the showrunner. A failed send is logged and retried once. `MERGE_CHECKPOINT_SEND` selects the sender in fixtures.
-- **Review numbers.** The unit takes the `--review-trial` line from `progress_history.py review-trial`, which reports the phase in state, active or just closed by `finish-phase`. The code number is what the reviewers raised: the sum of `raised` over the phase's `reviewed` code turns in `review_turns/<session>/` (`_raised_code_findings`), matched by phase instance. Both review launchers stamp each turn with the named phase. `RecordedCodeFindings(0)` records a zero; `NoRecordedCodeReview` means no review record. Earlier `pool` and current `own` turns both count, including several files of one launcher. A phase with no such turn falls back to the `finding_opened` events: an event is a code finding when it names any lens other than `ux`, or no lens. The ux number always comes from `finding_opened`. An event naming `ux` and a code lens adds one to each number; the legacy lens word `both` reads as `adversary,contract` through `_finding_lenses` and adds one to the code number. `merge_checkpoint.py` parses the printed line, so its form is fixed. In the review ledger (`review_regime.py`) the code number is every code finding the phase's review raised from 2026-10-07, and the `craft` lens alone before that date; `report` prints its mean per regime as `code findings per phase (mean)`.
+- **Review numbers.** The unit obtains `--review-trial` from `progress_history.py review-trial`.
+  [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
+  Simplify findings and minutes remain separate from code findings and review-worker minutes.
+- **Held simplify items.** The checkpoint notice carries each held item and its ledger reference.
+  The [simplify lens](simplify-lens.md#findings-and-decisions) defines which items require user questions and which items the director settles.
 - **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands.
 - **Steps:**
   1. *ancestry*: the commit exists; it descends from `LAST_MERGED` (skipped on `FirstMerge`); it is on `origin/<unit branch>` after a fetch, else held with "push your branch". A shrink is held here until `has_code_merge(unit, phase)`. A hash already on the merge branch skips steps 2–7.

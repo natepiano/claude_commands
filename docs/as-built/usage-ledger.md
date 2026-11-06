@@ -11,7 +11,7 @@ The usage ledger is one SQLite store, on natedev, of every model request made on
 The code that assigns a role records it when it assigns it, in an append-only `<state_dir>/agents.jsonl` on each machine. `state_dir()` is `USAGE_STATE_DIR` when set, else `~/.local/state/usage-model`.
 
 - A line is `{"id", "role", "at"}`, plus `"lens"` when known and `"approximate": true` for a backfilled line. `id` is a Claude session id, a Claude subagent id (`a` + 16 hex), a Codex thread id, or the 8-hex prefix of a worker's transcript uuid.
-- `Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent"]`; `Lens = Literal["adversary", "contract", "craft", "ux"]`. The CLI refuses any other value with exit 2.
+- `Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent"]`; `Lens = Literal["adversary", "contract", "craft", "ux", "rerun", "simplify"]`. The CLI refuses any other value with exit 2.
 - `append(agent_id, role, lens, at, approximate=False)` writes under an exclusive `fcntl.flock` and starts a new line after a truncated tail.
 - `register_default(agent_id, role, at) -> bool` reads the log and appends under the same lock, only when no line already names the agent. A line names it when its id equals `agent_id`, or when its id is 8 hex characters and a prefix of `agent_id`. Concurrent deliveries write one line.
 - `assignments(path) -> RoleLog(assignments, problems)` reads the file as bytes and decodes each line inside its own handler. A malformed or undecodable line is a counted `problems` entry; the reader never raises.
@@ -26,7 +26,7 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
 | `scripts/agents/agent_bg.sh` | `worker`, under the 8-hex id |
 | `scripts/agents/codex_mesh.py` | the worker's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
-| `scripts/direct/review.sh` | passes `--lens` to `codex_mesh.py` |
+| `scripts/direct/review.sh` | Passes `--lens` to `codex_mesh.py`; records each fresh simplify session as `review` with lens `simplify`. |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
 
 The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives only in `agents.jsonl`, never in `mesh_roster.json`.
