@@ -177,7 +177,8 @@ class FolderMoveBackend:
                                  "foreground_process_group_id": self.pid if self.live else self.shell_pid,
                                  "foreground_processes": foreground}}
 
-    def saved_row_tab(self, row_id: str, title: str) -> herdr.ExistingPane:
+    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str) -> herdr.ExistingPane:
+        _ = fallback_workspace
         self.fixture.assertEqual((row_id, title), (str(self.fixture.owner.id), self.fixture.owner.name))
         return herdr.ExistingPane("w1:p1", "kept-terminal")
 

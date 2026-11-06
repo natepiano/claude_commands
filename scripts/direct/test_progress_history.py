@@ -122,6 +122,25 @@ class ProgressHistoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_active_dispatch_returns_saved_launcher(self) -> None:
+        from scripts.lib.atomic_file import write_text_atomic
+
+        parent = fixture_member("unit", name="active-holder", parent=fixture_member("showrunner", name="active-owner").id)
+        worker = fixture_worker("impl", parent.id)
+        run = self.root / "active-run"
+        path = run / "progress_history_state.json"
+        command = ["bash", "assign.sh", "a path with spaces"]
+        fields = {"pass": {"impl": {"status": "active", "instance_id": "same-pass", "worker_name": "impl", "launcher_command": command}}}
+        write_text_atomic(path, json.dumps(fields))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertEqual(progress_history.active_dispatch(worker.id, run), progress_history.ActiveDispatch("same-pass", tuple(command)))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        fields["pass"]["impl"]["status"] = "completed"
+        write_text_atomic(path, json.dumps(fields))
+        self.assertIsInstance(progress_history.active_dispatch(worker.id, run), progress_history.NoActiveDispatch)
+        write_text_atomic(path, "{broken")
+        self.assertIsInstance(progress_history.active_dispatch(worker.id, run), progress_history.ActiveDispatchUnavailable)
+
     def test_config_digest_reads_without_catalog_sync_and_keeps_the_inherited_launch_text(self) -> None:
         settings = self.root / "digest-settings"
         settings.mkdir()
@@ -7933,6 +7952,8 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(self.read_state(session_dir)["open_phases"], [])
 
 
+
+
 class PhaseCountTests(unittest.TestCase):
     """A plan's phase headings take three forms; all three must be counted.
 
@@ -8509,6 +8530,8 @@ class LastDispatchTests(StaffTestCase):
         missing = progress_history.DispatchDetailNotRecorded.UNRECORDED
         self.assertEqual(dispatch, progress_history.RecordedDispatch("test", missing, missing, missing, "finished", "completed"))
         self.assertEqual(calls.read_text(), "")
+
+
 
 
 class StaffProgressHistoryTests(StaffTestCase):

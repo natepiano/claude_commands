@@ -2213,14 +2213,15 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
    Read configuration through `conf.read("shutdown")` at each stop or resume.
    Move `STOP_GRACE_SECONDS=2` and `KILL_GRACE_SECONDS=5` from `stop_resume.py` into `config/shutdown.conf`.
    Update `side_pane.close` to read `STOP_GRACE_SECONDS` through `conf.read("shutdown")`; convert its tests to private configuration.
-   Move `START_SECONDS=20`, `STAY_SECONDS=10`, and `RESUME_ATTEMPTS=3` into the same file.
-   Use `.number(...)` for durations and `.whole("RESUME_ATTEMPTS")` for attempts.
-   Keep matching `# range:` and `# whole:` limits; check effective positive values before any signal or start.
+   The file also holds `MOVE_STOP_MARGIN_SECONDS=3`, `START_SECONDS=20`, and `STAY_SECONDS=10`.
+   Read stop values through `conf.read("shutdown").text(...)` and `float` because they carry `# whole:` limits and tests use fractional values.
+   Read start and stay durations through `.number(...)` with their `# range:` limits.
+   Check effective positive values before any signal or start.
    Use `CONF_DIR` for private test configuration.
    Preserve committed-value recovery and its warning; report `conf.Unusable` before acting when recovery cannot supply a usable value.
    Add no reader or code default.
    Limit each wait to the smaller configured time and remaining operation deadline.
-   Stop one director's workers concurrently within one stop grace plus one kill grace and the final observation.
+   Stop one director's workers concurrently. After the reads before the signal, the batch takes one stop grace plus one kill grace and the final observation. The reads do not use the grace limits.
    On rerun, stop only agents still alive and keep one record entry per worker.
 2. **Restore.** Use Phase 6's environment-preservation probe to choose the existing restore path.
    If herdr preserves each pane's environment, reuse its restored panes.
@@ -2244,27 +2245,26 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
    Add no second resume-text builder.
    Reuse `Herdr.sort_tabs` for multi-pane tab order.
 5. **Resumable worker stop.** `stop_resume.stop_unit_workers(unit: StaffId, record: staff.StaffSnapshot) -> list[str]` uses the shared per-member stop, proves each agent stopped or reports its uncertainty, and keeps every worker row and native backend identity. A stopped pane can stay at its shell; a pane may close only after fresh terminal and shell proof. Retire, wrap and promote call this resumable operation, so unit resume or the surviving holder can call `worker.py restore` on the same sessions. They never call worker end or `staff.retire` on these workers. A proved live target or structural fault blocks destructive worktree removal; unknown process evidence prints the named note.
-6. **Permanent ending.** Only `worker.py end` and permanent unit removal stop and delete worker rows. They share the end operation, preserve history outside staff and never delete a proved live worker or bypass a structural fault. A rerun finishes remaining workers once. Restore callers (`restart.py` `up_result` and `restart`, which serve agents up/restart and shutdown restart, and `resume_unit.py`) call `worker.restore(parent)` after proving the parent session. A finished restore prints `unchanged`, exits 0 and keeps ids, panes and terminals.
+6. **Permanent ending.** Only `worker.py end` and permanent unit removal stop and delete worker rows. They share the end operation, preserve history outside staff and never delete a proved live worker or bypass a structural fault. A rerun finishes remaining workers once. Restore callers (`restart.py` `start_row` and `restart`, which serve agents up/restart and shutdown restart, and `resume_unit.py`) call `worker.restore(parent)` after proving the parent session. A finished restore prints `unchanged`, exits 0 and keeps ids, panes and terminals.
 
 7. **Delete replaced paths.** Delete superseded pane-worker inventory, stop, restore, and resume-message code from the changed shutdown and lifecycle files.
    Route pane workers through the shared observation, stop, restore, and resume-message APIs.
    Retain `inventory.codex_seats`, `CodexServer`, `PausedSeat`, mesh pause, and their callers only for mesh-pinned runs until Phase 18.
-   Retain `retire_unit.py`'s `workers.end_unit` branch under the same pin.
    Only these retained branches join the group ending at Phase 18.
 
 **Files:**
 
-- `scripts/shutdown/inventory.py`, `scripts/shutdown/stop_resume.py`, `scripts/shutdown/shutdown_record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/pane_restore.py` — stop, record, restart and restore; delete their superseded pane-worker paths; `stop_unit_workers` (new) and the config read of `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, `START_SECONDS`, `STAY_SECONDS` and `RESUME_ATTEMPTS` in `stop_resume.py`.
-- `scripts/shutdown/session_types.py` — retain only the mesh-pinned server and paused-worker types until Phase 18.
-- `scripts/lib/resume_message.py`, `scripts/lib/test_resume_message.py` — the shared builder, with shutdown and restore through the existing pane-worker and account-move types; delete superseded pane resume-text branches.
-- `config/shutdown.conf` — update the existing file. Add `START_SECONDS=20`, `STAY_SECONDS=10`, `RESUME_ATTEMPTS=3`, with matching `# range:` and `# whole:` limits. Keep `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS` and `MOVE_STOP_MARGIN_SECONDS` and their limits: `scripts/accounts/pane_moves.py` requires the last key, and the account-move tests stay green.
+- `scripts/shutdown/inventory.py`, `scripts/shutdown/stop_resume.py`, `scripts/shutdown/shutdown_record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/pane_restore.py` — stop, record, restart and restore; delete their superseded pane-worker paths; `stop_unit_workers` (new) and the config read of `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, `START_SECONDS` and `STAY_SECONDS` in `stop_resume.py`.
+- `scripts/shutdown/session_types.py` — retain the mesh-pinned server and paused-worker types until Phase 18, and the status types that `inventory.py` uses.
+- `scripts/lib/resume_message.py`, `scripts/lib/test_relaunch.py` — the shared builder, pane workers, and complete account-move values; delete superseded pane resume-text branches.
+- `config/shutdown.conf` — holds `STOP_GRACE_SECONDS=2`, `KILL_GRACE_SECONDS=5`, `START_SECONDS=20`, `STAY_SECONDS=10`, with matching `# range:` limits. Keep `MOVE_STOP_MARGIN_SECONDS`: `scripts/accounts/pane_moves.py` requires it.
 - `scripts/production/retire_unit.py`, `scripts/production/production_lifecycle.py`, `scripts/production/promote_showrunner.py` — resumable worker stop; delete replaced pane lifecycle branches.
 - `scripts/production/resume_unit.py`, `scripts/production/worker.py`, `scripts/production/test_resume_unit.py`, `scripts/production/test_worker.py` — shared restore and permanent-end integration.
 - `scripts/production/test_retire_unit.py`, `scripts/production/test_production_lifecycle.py`, `scripts/production/test_promote_showrunner.py` — their tests.
 - `scripts/direct/progress_history.py`, `scripts/direct/recorder_state.py` — consume the last dispatch role, active pass identity, and saved launcher arguments; this phase leaves their writer unchanged.
 - `scripts/lib/unit_runs.py`, `scripts/lib/conf.py`, `scripts/production/staff.py`, `scripts/herdr/worker_panes.py`, `scripts/lib/atomic_file.py` — read only.
 - `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_stop_resume.py`, `scripts/shutdown/test_shutdown_record.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_pane_restore.py` — the tests.
-- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — tab sort (`sort_tabs` :1380).
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — tab sort (`sort_tabs`).
 
 **Workers:** `2 writers` — split by stop and restore.
 - `impl` — stop and record (`inventory.py`, `stop_resume.py`, `shutdown_record.py`, `config/shutdown.conf`, `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py`).
@@ -2340,10 +2340,10 @@ Test restore from a finished last dispatch and missing-role output without staff
 
 - Record-free recovery (sdlc, 2026-11-04): a crashed Claude worker or director with no launch record resumes from its transcript; a worker not proved stopped, or still running, is named in the shutdown report. The record holds only live row ids, and a test reads it back.
 - basedpyright 0/0 on changed files and every caller module.
-- Shutdown tests with worker panes inside the configured bound (one `STOP_GRACE_SECONDS + KILL_GRACE_SECONDS` plus the observation); a changed `STOP_GRACE_SECONDS` and `KILL_GRACE_SECONDS` in a test `shutdown.conf` (`CONF_DIR`) change the bound with no code change, and committed-value recovery keeps its warning.
-  An unusable effective value stops before any signal with the file and key in the line; a changed `START_SECONDS`, `STAY_SECONDS` or `RESUME_ATTEMPTS` in that file changes the resume wait or attempt count with no code change; an `UncertainWorker` is reported as not stopped; restore tests for both probe branches; a restored director takes its row's name; a restore with a worker pane still at its shell reuses that pane and its terminal.
+- Shutdown tests with worker panes inside the configured bound (the reads before the signal, one `STOP_GRACE_SECONDS + KILL_GRACE_SECONDS`, and the observation); a changed `STOP_GRACE_SECONDS` and `KILL_GRACE_SECONDS` in a test `shutdown.conf` (`CONF_DIR`) change the bound with no code change, and committed-value recovery keeps its warning.
+  An unusable effective value stops before any signal with the file and key in the line; a changed `START_SECONDS` or `STAY_SECONDS` in that file changes the resume wait with no code change; an `UncertainWorker` is reported as not stopped; restore tests for both probe branches; a restored director takes its row's name; a restore with a worker pane still at its shell reuses that pane and its terminal.
 - Real proofs (Invariants → Lifecycle reruns keep the pane), in a probe tab of `agents` with real worker panes: a rerun of a finished stop, down and restart each changes nothing, keeps the same tab, pane id and `terminal_id`, and exits 0; one real shutdown stopped after its first worker stop finishes on rerun, with each pane listed once.
-- The worker stop test: a crashed director, no shutdown record, and a Codex worker whose working folder is outside the unit's worktree; `retire_unit.py` stops the worker through `stop_unit_workers`, proves the agent stopped, keeps the worker row and native id, and marks the retained unit RemovedWorktree. A mesh-pinned run still calls `workers.end_unit`. `wrap` and promote stop each unit's workers the same way before their staff step.
+- The worker stop test: a crashed director, no shutdown record, and a Codex worker whose working folder is outside the unit's worktree; `retire_unit.py` stops the worker through `stop_unit_workers`, proves the agent stopped, keeps the worker row and native id, and marks the retained unit RemovedWorktree. Retirement skips Codex rows and retains their rows and native threads. `wrap` and promote stop each unit's workers the same way before their staff step.
 - Rerun tests (Invariants → Rerun-safe tools), each compared with one clean run: `test_shutdown_rerun_after_first_worker_stop` (the rerun stops the rest and the record lists each pane once); `test_restart_rerun_after_director_tab` and `test_restart_rerun_after_first_worker` (one set of panes); `test_restore_rerun_after_agent_resume` (stopped after a busy worker's agent resumes and before its launcher starts: the rerun starts one launcher, which types nothing when the line is in the transcript); `test_stop_unit_workers_rerun_after_pane_stop` (stopped after a pane stops and before recording stop completion: the rerun proves it stopped, keeps its row, and stops the rest); a rerun of a finished restart reports done and changes nothing.
 - Full gate green.
 
@@ -2471,7 +2471,7 @@ A rerun of a finished move starts no process and changes nothing.
 
 - `dispatch_role` and a closure after a policy change read the holder's run until `progress_history.last_dispatch` arrives. A role recorded by a private dispatch reads as unavailable at restore.
 - The installed Stop hook runs from `~/.claude`, so `herdr_tab_title.py` cannot act on a real friend's Stop until it lands on main.
-- `side_pane.close` reads `stop_resume.STOP_GRACE_SECONDS`.
+- `side_pane.close` reads the configured stop time through `stop_resume.stop_grace_seconds()`.
 - A consultation is a labelled pane. A staff worker is a row. Nothing reads a friend through staff.
 
 **Gotchas:**

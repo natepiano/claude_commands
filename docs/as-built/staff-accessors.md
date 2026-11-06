@@ -27,7 +27,7 @@ JSON stores `paused: {since, by, why}` only for a paused row.
 `pause(reference, why)` records the time in the user zone and the caller's staff name.
 `resume(reference)` removes the field.
 The commands accept a unit or `--production <showrunner name>`.
-Production pause accepts repeated `--except <unit>` options.
+Production pause accepts repeated `--except <unit>` options with a unit's staff name, its `-unit` form, or its staff id.
 Both commands are safe to repeat. They stop no process.
 Rename, move, retire and restore retain the pause field.
 
@@ -147,10 +147,9 @@ They also include `set_doc`, `set_worktree`, `update_current_session`, `pause`, 
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
 | `scripts/production/prune_phase_notes.py` | read | snapshot |
-| `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, set_doc, snapshot |
+| `scripts/production/rename.py` | write | by_id, cli_result, operation, rename, row_operation, set_doc, snapshot |
 | `scripts/production/rename_state.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
-| `scripts/production/rename_unit.py` | write | by_id, cli_result, operation, rename, set_worktree, snapshot |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/production/resume_unit.py` | read | cli_result, initial_snapshot, operation, restore_unit |
 | `scripts/production/retire_unit.py` | write | cli_result, operation, operation_fds, set_worktree, snapshot |

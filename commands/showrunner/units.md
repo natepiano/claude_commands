@@ -58,8 +58,10 @@ A failed send adds one anomaly line. It changes neither the table nor the exit c
 Use `staff.py` to record a pause or resume:
 
 1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py pause <unit> --why "<why>"` for one unit.
-2. Use `pause --production <slug> [--except <unit>...] --why "<why>"` for a production.
-3. Use `resume <unit>` or `resume --production <slug>` to remove the pause record.
+2. Use `pause --production <showrunner name> [--except <unit>...] --why "<why>"` for a production.
+3. Use `resume <unit>` or `resume --production <showrunner name>` to remove the pause record.
+
+Each `--except` accepts a unit's staff name, its `-unit` form, or its staff id within that production.
 
 A pause records its time, caller and reason in the staff row. It stops nothing. Both commands are safe to repeat.
 
