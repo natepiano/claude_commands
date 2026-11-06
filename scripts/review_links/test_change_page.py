@@ -195,7 +195,7 @@ class ChangePageTests(unittest.TestCase):
         question = status.ask(self.page, 'C1', 'Which steps?')
         assert isinstance(question, change_page.QuestionDelivery)
         answer = '  \n1. First\n\n2.  Second | <result>\n  '
-        arguments = ['answer-question', '--production', str(self.production), '--list', str(self.review_list),
+        arguments = ['answer-question', '--production', 'page-owner', '--list', str(self.review_list),
                      '--row', 'C1', '--question', question.question_id, '--text', answer]
         self.assertEqual(change_page.main(arguments), 0)
         saved = status.slots(self.page, 'C1').question

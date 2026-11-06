@@ -35,7 +35,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.production import showrunners, staff
 from scripts.production.production_doc import Refusal
-from change_review import production_doc
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress, staff_name
 from proposals_folder import ledger, owners, proposal_issues, proposer, scope_docs
@@ -388,7 +387,9 @@ def main(arguments: list[str]) -> int:
     one = "--next" in arguments
     match [argument for argument in arguments if argument != "--next"]:
         case ["--production", name]:
-            doc: Path | None = production_doc(name)
+            row = showrunners.owner_for(name)
+            if isinstance(row.doc, staff.DocUnfilled): raise Refusal(f"{row.name}: no production document")
+            doc: Path | None = row.doc.path
         case []:
             doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
             if doc is None:

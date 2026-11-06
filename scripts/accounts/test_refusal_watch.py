@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.note_file import note_name
 
-from scripts.production import staff_sources, staff
+from scripts.production import staff_sources, staff, staff_test_support
 from scripts.message import sessions as status_sessions
 import io
 import fcntl
@@ -2237,9 +2237,12 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIn("refused", str(history[0]["why"]))
 
     def test_manual_showrunner_group_command_needs_only_destination(self) -> None:
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        first = staff_test_support.fixture_member("showrunner", name="runner-one")
+        second = staff_test_support.fixture_member("showrunner", name="runner-two")
         path = self.groups(showrunners="claude1")
-        _ = self.owner("runner-one", host="herdr")
-        _ = self.owner("runner-two", host="herdr")
+        _ = self.owner(first.current_session, host="herdr")
+        _ = self.owner(second.current_session, host="herdr")
         _ = self.owner("unit", host="unit")
         output, error = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(error):
@@ -2247,7 +2250,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual((code, error.getvalue()), (0, ""))
         self.assertEqual(stored_group_labels(path), {"units": "claude1", "showrunners": "claude3"})
         self.assertEqual(len(self.moves.calls), 2)
-        self.assertEqual({command.session_id for command in self.moves.calls}, {"runner-one", "runner-two"})
+        self.assertEqual({command.session_id for command in self.moves.calls}, {first.current_session, second.current_session})
 
     def test_refusal_of_one_unit_moves_every_live_unit_and_leaves_showrunners(self) -> None:
         path = self.groups()
@@ -3241,17 +3244,20 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.moves.calls, [])
 
     def test_showrunner_batch_uses_the_same_move_sessions_path_as_watcher(self) -> None:
-        _ = self.owner("first", host="herdr")
-        _ = self.owner("second", host="herdr")
+        _ = self.enterContext(staff_test_support.isolated_staff_file(self.home / "staff.json", {}))
+        first = staff_test_support.fixture_member("showrunner", name="first")
+        second = staff_test_support.fixture_member("showrunner", name="second")
+        _ = self.owner(first.current_session, host="herdr")
+        _ = self.owner(second.current_session, host="herdr")
         _ = self.owner("unit", host="unit")
-        requested = (stop_resume.ClaudeUp("first", "w1:p1", "claude3"),
-                     stop_resume.ClaudeUp("second", "w1:p2", "claude3"))
+        requested = (stop_resume.ClaudeUp(first.current_session, "w1:p1", "claude3"),
+                     stop_resume.ClaudeUp(second.current_session, "w1:p2", "claude3"))
         with patch.object(accounts, "move_sessions", return_value=requested) as move:
             result = accounts.move_group("showrunners", "claude3", why="weekly refusal")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         transition = accounts.group_transition("showrunners")
         assert isinstance(transition, accounts.GroupTransition)
-        move.assert_called_once_with(("first", "second"), "claude3", why="weekly refusal", account_config=ANY)
+        move.assert_called_once_with((first.current_session, second.current_session), "claude3", why="weekly refusal", account_config=ANY)
 
     def test_named_window_without_known_reset_moves(self) -> None:
         _ = self.owner("refused")
