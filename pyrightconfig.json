@@ -133,6 +133,7 @@
     {
       "root": "scripts/mac_test",
       "extraPaths": [
+        ".",
         "scripts/mac_test",
         "scripts/buildlog",
         "scripts/build_hold",
