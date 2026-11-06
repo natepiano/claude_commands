@@ -87,3 +87,5 @@
 1. Measure the baseline first, on one real plain-package run: processes by command name, CPU s and wall s. Name the method. The count above comes from fake tools, so it is not this baseline.
 2. Remove the starts that the measure shows give no needed answer, largest first. Keep each behavior and its tests.
 3. Measure the same run with the same method. Put before and after in the notice.
+4. Cut the cold imports of `build_targets.py` `eligible`, `reserve` and `release-wait`, with no behavior change. natest 4ed0a1d2 measured 128.4 of 249.6 CPU s in four SSH test files, 270 starts, upper bound of the cut 99.9 CPU s. Tables: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/66/slots/impl4/measure/`. Builds placed this here, 2026-11-06.
+5. Get queue-unit's review of the admission import split before the Work Order. `build_hold.py` stays frozen unless builds says otherwise. Send natest the hash. natest measures with same-load pairs.
