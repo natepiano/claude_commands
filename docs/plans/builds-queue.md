@@ -285,35 +285,38 @@ only I can bump
 
 **Ruled out:** a new import test; the `build_hold.py` import, under the builds file freeze.
 
-### Phase 18a — A gate copy's folder comes from the repository's origin  · status: todo
+### Phase 18a — A gate copy's folder comes from the repository's origin  · status: done
 
-**Depends on:** nothing. Source: builds showrunner, 2026-11-06, reported by hierarchies. It goes ahead of 20b and 10v. Phase 18 merges this work later and keeps the same code.
+#### As-built
 
-#### Work Order
+- `repository_name` in `scripts/copies/copies.py` follows local origins to the last one and takes the last URL part without `.git`. A cycle is an error. A source with no origin uses its main checkout's folder name.
+- A standing gate borrows from `final_object_store`, the last store in the source's chain. Only `initialize` follows that chain; other `initialize_git` callers keep their one-step source.
+- A workspace record holds `repository_identity`, and `workspace_repository` reads it.
+- `remove_trees` continues past a busy or failed tree or mirror, removes the rest, and raises one `CopyError` that names each one kept (exit 2). A copy whose objects another workspace borrows stays (`_gate_borrowers`).
 
-**Goal:** A gate on a clone with its own `.git` uses the repository's name, not the clone's folder name. A gate tree still works after the source clone is removed.
+**Files:** `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `scripts/copies/test_remote_copies.py`, `scripts/lib/scratch.py`, `docs/as-built/gate-checkouts.md`.
 
-**Spec:**
+**Binds later work:** Phase 18 merges its `remove_trees` rewrite over this rule and verify's mirrors. A rename must not call `remove_trees` before Phase 18c. Deploy runs the session's `migrate_18a.py --apply` before repository cleanup.
 
-1. **Cause, name.** `repository_name` at `scripts/copies/copies.py:219-227` ends with `common.parent.name`. A clone at `<scratch>/checkout` gives "checkout". Gate copies land in `~/worktrees/gates/checkout/` and `~/worktrees/gates/reload/`.
-2. **Name fix.** `repository_name` reads the origin URL. A remote URL gives its last path part without `.git`. A local origin is followed to its repository, also for `file://` and relative origins. A cycle of local origins is an error. With no origin, the name is the main checkout's folder name. `~/.claude` becomes `claude_commands`; hana and nixos keep their names. Phase 18 holds this code; lift `origin_url`, `main_checkout`, `repository_name` and the `source_origin` change unchanged.
-3. **Workspace identity.** A workspace record saves `repository_identity` when it is registered, and `workspace_repository` reads it, as in phase 18. Repository removal then matches the same name as the gate folders. A conversion program outside the repository, `<phase folder>/migrate_18a.py`, writes the field into existing records, with a dry run.
-4. **Cause, alternates.** `initialize_git` runs `git clone --shared` from the source, so a scratch source leaves `.git/objects/info/alternates` pointing into that scratch folder. When the folder goes, git fails with "unable to normalize alternate object path". Measured on 7 such trees: 4 have a source that itself borrows, 1 has its own store in a scratch folder, and 2 have a source that is gone.
-5. **Alternates fix.** For a standing gate, `initialize_git` follows the source's alternates to the store at the end of the chain and clones from that store. `refresh_remotes` and `prepare` then fetch the source's own objects. When that store's repository is a registered scratch copy, the clone drops `--shared`, so the tree holds no alternates file. A source with its own lasting store keeps today's result: its alternates line names the source's objects.
-6. **Existing copies.** Hierarchies removes the existing copies in its cleanup phase. Touch no tree under `~/worktrees/gates/`.
-7. **Proof.** Tests in `test_copies.py`, each in a tempdir: clone, clone of a clone, worktree and `file://` origin give one name; no origin gives the main checkout's name; a clone of a clone gives alternates at the end store, and `git rev-list --objects --all --quiet` passes in the gate tree after both clones are removed; a registered scratch source with its own store gives no alternates file, and the same git check passes after its removal; repository removal finds a workspace after its source is deleted.
-8. **Removal keeps going.** Source: builds showrunner, 2026-11-06, from hierarchies. `remove_trees(owner)` raises at the first kept scratch copy, before it removes a gate copy, so a unit rename leaves old-name gate copies. `remove_trees` removes every idle tree in scope, gate copies included, then raises one `CopyError` that names each kept tree. It adds no public function.
+**Gotchas:** the 23 trees in `~/worktrees/gates/.claude` go idle after this lands; hierarchies Phase 28 deletes them.
 
-**Files:**
-- `scripts/copies/copies.py`
-- `scripts/copies/test_copies.py`
-- `docs/as-built/` — each doc that names the gate folder layout or `repository_name`.
+**Ruled out:** deleting stale gate folders in this phase; a name list for repositories.
 
-**Workers:** `1 writer` — `impl2`, code, tests and docs.
+### Phase 20c — A merge gate near its end keeps less memory with rerun records in its history  · status: done
 
-**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, adversary and contract reviews.
+#### As-built
 
-**Change-Review:** none. The user sees no change; the gate folder name is internal.
+- The look-ahead window in `window_peak` stops at the end of `suites:1` (`GATE_FIRST_PASS` in `scripts/build_queue/progress_profile.py`).
+- A gate that reads a profile with old `suites:2` records now gets its first pass tail: measured 0.23 GiB at 85-86%, 0.14 GiB at 95%.
+- Crossings between `build:` and `test:` phases, and `build:1` to `build:2`, stay. A `suites:2` counter over measured bins follows the normal window rule.
+
+**Files:** `scripts/build_queue/progress_profile.py`, `scripts/build_queue/test_progress_profile.py`, `scripts/production/test_merge_gate_suites_admission.py`, `docs/as-built/build-memory-admission.md`.
+
+**Binds later work:** the service reads this rule after a restart. The Change-Review row comes after a live gate past 85% shows under 1 GiB.
+
+**Gotchas:** old-code gates still write `suites:2` records until each tree carries 20a; they have no effect on the first pass.
+
+**Ruled out:** removal of live records; a change to `merge_gate.py`.
 
 ### Phase 18b — A repository with no build cache gets a fresh copy for each run  · status: todo
 
