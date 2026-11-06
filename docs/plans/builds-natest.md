@@ -1180,7 +1180,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Green in the gate form: `style/test_git_process.py`, `style/test_style_ledger.py`, `style/test_style_ledger_sites.py`, `style/test_crate_run.py`, `style/test_rules.py`, `production/test_affected_modules.py`, `production/test_full_test.py`, `direct/test_phase_process.py`, `feature_log/test_inventory.py`.
 - The full test green on the phase commit merged with `origin/builds`.
 
-### Phase 53 — `board.sh` starts no process to find its folder  · status: todo
+### Phase 53 — `board.sh` starts no process to find its folder  · status: done
 **Depends on:** Phase 49
 
 #### Work Order

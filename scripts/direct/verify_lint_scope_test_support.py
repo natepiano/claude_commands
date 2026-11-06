@@ -410,7 +410,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
         hash_tool = "sha256sum" if shutil.which("sha256sum") else "shasum"
         for name in (
             "bash", "python3", "awk", "cat", "cut", "date", "dirname", "env", "grep",
-            "head", "mkdir", "mktemp", "mv", "ps", "readlink", "rm", "sed", "sleep",
+            "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep",
             "sort", "tail", "tee", "tr", "uname", "wc", hash_tool,
         ):
             executable = shutil.which(name)

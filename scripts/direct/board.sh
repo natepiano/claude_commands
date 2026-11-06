@@ -51,7 +51,9 @@
 # exactly one of N racing acquirers creates the directory and the rest fail.
 
 set -euo pipefail
-BOARD_DIR=$(dirname "$(readlink -f -- "${BASH_SOURCE[0]}")")
+BOARD_SCRIPT=${BASH_SOURCE[0]}
+[[ ! -L "$BOARD_SCRIPT" && "$BOARD_SCRIPT" == */* ]] || BOARD_SCRIPT=$(readlink -f -- "$BOARD_SCRIPT")
+BOARD_DIR=${BOARD_SCRIPT%/*}
 UNIT_ENV_SHIM="$BOARD_DIR/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
