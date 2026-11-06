@@ -6307,7 +6307,7 @@ class RecordedCodeFindings:
 
 
 CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
-SEPARATE_TRIAL_LENSES = ("ux", "simplify")
+SEPARATE_TRIAL_LENSES = ("ux",)
 
 
 def write_review_turn(session_dir: Path, metadata: Mapping[str, object], *,
@@ -6372,10 +6372,9 @@ def _review_trial(args: argparse.Namespace) -> None:
     A named phase selects its open instance or its latest completed instance.
     An unnamed command selects the current phase, including a completed phase.
     Only events and review records for that instance count.
-    Completed reviews supply the code and simplify counts.
-    Without completed reviews, each count uses the findings that the director opened.
-    Review-worker minutes count finished review passes except `direct.simplify`, plus UX review activities.
-    Simplify minutes count its review records, including failed runs.
+    Completed reviews supply the code count.
+    Without completed reviews, the count uses the findings that the director opened.
+    Review-worker minutes count finished review passes and UX review activities.
     UX check minutes count `UX review` activities.
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
     Each time rounds to the nearest whole minute.
@@ -6409,7 +6408,6 @@ def _review_trial(args: argparse.Namespace) -> None:
     code_findings = 0
     review_seconds = 0
     ux_check_seconds = 0
-    simplify_findings = 0
     ux_finding_ids: set[str] = set()
     dispatched: list[dict[str, object]] = []
     fix_passes: list[dict[str, object]] = []
@@ -6422,15 +6420,12 @@ def _review_trial(args: argparse.Namespace) -> None:
             if "ux" in lenses:
                 ux_findings += 1
                 ux_finding_ids.add(_string(event.get("finding_id")))
-            if "simplify" in lenses:
-                simplify_findings += 1
             if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
                 code_findings += 1
         elif event_type == "finding_batch_dispatched":
             dispatched.append(event)
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
-            if _string(event.get("called_task")) != "direct.simplify":
-                review_seconds += _integer(event.get("pass_elapsed_seconds"))
+            review_seconds += _integer(event.get("pass_elapsed_seconds"))
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":
             fix_passes.append(event)
         elif (
@@ -6456,22 +6451,11 @@ def _review_trial(args: argparse.Namespace) -> None:
     raised = _raised_findings(filter(_is_code_review, records))
     if isinstance(raised, RecordedCodeFindings):
         code_findings = raised.count
-    # Count the Claude run separately, including runs that report an error.
-    simplify_records = [record for record in records if _string(record.get("lens")) == "simplify"]
-    simplify_raised = _raised_findings(simplify_records)
-    simplify_seconds = sum(
-        max(0, int(_number(record.get("finished_at")) - _number(record.get("started_at"))))
-        for record in simplify_records
-    )
-    if isinstance(simplify_raised, RecordedCodeFindings):
-        simplify_findings = simplify_raised.count
-    simplify_line = (f", simplify {simplify_findings} findings, simplify minutes {(simplify_seconds + 30) // 60}"
-                     if simplify_records or simplify_findings else "")
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
-        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}" + simplify_line
+        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
     )
 
 

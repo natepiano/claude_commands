@@ -25,13 +25,13 @@ from scripts.astra import astra_roles, design_roles
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
-from scripts.direct import phase_reservation, progress_history, workers
+from scripts.direct import phase_reservation, progress_history, simplify_daily, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.production import staff, session_staff, worker_admission
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import style_review
-from scripts.usage.agents_log import LENSES
+from scripts.usage.agents_log import PHASE_REVIEW_LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
 PYTHON = str(SCRIPTS / "../lib/py")
@@ -103,7 +103,6 @@ class Arguments(argparse.Namespace):
     prompt: str = ""
     cwd: str = ""
     lens: str = ""
-    diff: str = ""
     pass_number: int = 1
     image: list[str] = []
     operation: AssignmentOperation = AssignmentOperation.DISPATCH
@@ -151,7 +150,7 @@ def call(command: list[str], env: dict[str, str], *, capture: bool = False,
 def parse_arguments() -> Arguments:
     parser = argparse.ArgumentParser(prog="assign.sh", allow_abbrev=False)
     _ = parser.add_argument("--role", required=True,
-                            choices=("implement", "test", "fix", "review", "research", "propose"))
+                            choices=("implement", "test", "fix", "review", "research", "propose", "simplify"))
     _ = parser.add_argument("--operation", type=AssignmentOperation, choices=tuple(AssignmentOperation),
                             default=AssignmentOperation.DISPATCH)
     choice = parser.add_mutually_exclusive_group()
@@ -164,11 +163,14 @@ def parse_arguments() -> Arguments:
     _ = parser.add_argument("--family", choices=("codex", "claude"), default="")
     _ = parser.add_argument("--prompt", default="")
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
-    _ = parser.add_argument("--lens", choices=LENSES, default="")
-    _ = parser.add_argument("--diff", default="", help="saved phase diff for the simplify lens")
+    _ = parser.add_argument("--lens", choices=PHASE_REVIEW_LENSES, default="")
     _ = parser.add_argument("--pass", dest="pass_number", type=int, default=1)
     _ = parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args(namespace=Arguments())
+    if args.role == "simplify":
+        if not args.session_dir:
+            parser.error("simplify requires --session-dir")
+        return args
     if args.role in ("research", "propose"):
         parser.error(f"{args.role} is not available until Phase 6")
     if not args.prompt and args.operation not in RECOVERY_OPERATIONS:
@@ -207,12 +209,6 @@ def parse_arguments() -> Arguments:
         parser.error("--style-since requires a final-diff review")
     if args.style_until and not args.style_since:
         parser.error("--style-until requires --style-since")
-    if args.lens == "simplify" and (args.role != "review" or args.early_ready or args.style_since):
-        parser.error("simplify requires a broad review of the completed phase diff")
-    if args.lens == "simplify" and not args.diff:
-        parser.error("--diff is required with --lens simplify")
-    if args.diff and args.lens != "simplify":
-        parser.error("--diff requires --lens simplify")
     return args
 
 
@@ -746,20 +742,6 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     return settle_dispatch(dispatch, code, completed, shown, status, summary, reply)
 
 
-def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
-                     env: dict[str, str]) -> int:
-    if conf.read("direct").text("SIMPLIFY_LENS") == "off":
-        print("simplify: off")
-        return 0
-    if args.pass_number != 1:
-        print("simplify: skipped; broad review only")
-        return 0
-    command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, "--diff", args.diff,
-               "--summary", str(Path(args.summary).resolve()) if args.summary else "", str(run), str(cwd),
-               str(source_prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
-    return subprocess.run(command, env=env, check=False).returncode
-
-
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: str, paths: list[str], env: dict[str, str]) -> int:
     """Send the assignment through the shared worker command."""
@@ -955,6 +937,8 @@ def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str
 def main() -> int:
     require_live_director()
     args = parse_arguments()
+    if args.role == "simplify":
+        return simplify_daily.main(["--session-dir", args.session_dir, "--cwd", args.cwd])
     held = held_assignment(args)
     env = dict(os.environ)
     if args.operation in RECOVERY_OPERATIONS:
@@ -974,8 +958,6 @@ def main() -> int:
     paths = [] if isinstance(held, HeldAssignment) or args.operation in RECOVERY_OPERATIONS else authorized_paths(args, cwd)
     run, phase = prepare_run(args, cwd, prompt, env)
     transport = unit_runs.worker_transport(run)
-    if args.lens == "simplify":
-        return execute_simplify(args, run, phase, cwd, prompt, env)
     role = "impl" if args.role == "implement" else args.role
     check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
