@@ -110,7 +110,6 @@ Write functions of `staff.py`: ensure, ensure_worker, move, rename, retire, reti
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/production/resume_unit.py` | read | cli_result, initial_snapshot, operation, restore_unit |
 | `scripts/production/retire_unit.py` | write | cli_result, operation, operation_fds, set_worktree, snapshot |
-| `scripts/production/roles_audit.py` | read | snapshot |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
