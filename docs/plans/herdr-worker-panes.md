@@ -2372,6 +2372,8 @@ The stop writer owns `scripts/lib/resume_message.py` and its tests; the restore 
 
 **Goal:** Resume each worker on the destination account in its own pane with the same conversation.
 
+**Status note (herdr-unit, 2026-11-06):** the move code landed at `b3ee5dcaa` with `scripts/accounts/pane_moves.py`. The real proof below stays with accounts-unit. Phase 14f keeps the role of a refused pass in `last_dispatch`.
+
 1. Keep the `accounts.move_workers` signature and its callers.
 2. Check the family through `restart_refusal`.
 3. Read the role through `progress_history.last_dispatch` when available, or `worker_panes.dispatch_role` on this tree.
@@ -2605,11 +2607,15 @@ Preserve historical transcript behavior and safety checks for pinned runs.
    Describe detached results and review Stage 2: a rerun after a stop can type one result twice, and Stage 2 reports through its status and summary.
 8. Use the existing timeout output test in `test_unit_move.py` as behavior evidence.
 9. Keep the existing Hana coverage for empty-owner window titles unchanged.
+10. Phase 14d pilot text. A second review lens at the same time names `--to review2`, because the worker command refuses when all workers are busy. After an incomplete pass, the director reruns the saved launcher command before another role's dispatch, and `findings.py landed` runs when that launcher does not run it. A read-only pane reviewer posts no board line and runs no suite, so the director or a writer runs them. A quiet wait that returns exit 3 has the same recovery.
+11. `worker.py end` prints the configuration refusal and exits 7 when the stop budget is unusable. Tell the director to correct the named configuration and run `end` again; the row stays.
+12. Use `targeted_test` in new text once the builds rename is on the merge branch.
 
 **Files:**
 
 - `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/unit_move.py`, `scripts/production/test_rename.py`, `scripts/production/test_unit_move.py` — inspect accepted rename behavior; this text phase leaves source and tests unchanged.
 - `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md`, `docs/direct/launch_implementation.md`, `docs/direct/dual_review.md`, `docs/direct/phase_end.md`, `docs/direct/run_phase_review.md`, `commands/unit/report.md`, `commands/showrunner/produce.md`, `commands/showrunner/accounts.md`, `commands/showrunner/rename_unit.md`, `commands/showrunner/retire_unit.md`, `commands/showrunner/transfer_unit.md`, `commands/message.md`, `commands/codex_winddown.md`, `commands/shutdown.md`, `commands/ask_a_friend.md`, `commands/astra_review.md`, `commands/shot_report.md`, `docs/quota_alerts.md`, `docs/production_format.md`, `docs/accounts.md` — Reference → Instruction edits.
+- `commands/unit/worker.md` — Spec item 11.
 
 **Workers:** `2 writers` — split by file group.
 - `impl` — `commands/unit/direct.md` and `docs/direct/*`.
@@ -2617,7 +2623,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 8 landed the transport-aware text in `commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerRuns/>`, `<WorkerLaunchFailure/>`, `<FixDispatch/>`, `<PhaseCleanup/>`), branched once on the run's pin. Phase 9 `send.py worker:<unit>/<short name>` and `mesh_runs.py` pane delivery; Phase 10 shutdown and restore of split tabs; Phase 11 account moves of pane workers; Phase 12 converted friend commands to `side_pane.py open|send|close`; held Astra roles use `worker.py`. Managed Astra reviews start through `assign.sh --role review --operation astra-review`, and `/astra_review` prints the saved report. A failed end keeps the row, and `worker.py list` shows it; the exec hold is implementation-only and ends with `assign.sh`. Ad hoc Astra reviews retain `codex exec` until Phase 18; preserve the friend recovery instructions; Phase 13 displays read workers through `observe`. Phase 4f accepted limit (F008): an interrupted multi-pane rebuild can lose the split ratio and leave panes in the source workspace; the anomaly line names the tab and the panes. The instructions tell the user to inspect those panes; a retry does not rebuild the split.
+**Constraints from prior phases:** Phase 14d shipped the mesh list, check and restore text in `commands/unit/worker.md`; do not write it again. Phase 8 landed the transport-aware text in `commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerRuns/>`, `<WorkerLaunchFailure/>`, `<FixDispatch/>`, `<PhaseCleanup/>`), branched once on the run's pin. Phase 9 `send.py worker:<unit>/<short name>` and `mesh_runs.py` pane delivery; Phase 10 shutdown and restore of split tabs; Phase 11 account moves of pane workers; Phase 12 converted friend commands to `side_pane.py open|send|close`; held Astra roles use `worker.py`. Managed Astra reviews start through `assign.sh --role review --operation astra-review`, and `/astra_review` prints the saved report. A failed end keeps the row, and `worker.py list` shows it; the exec hold is implementation-only and ends with `assign.sh`. Ad hoc Astra reviews retain `codex exec` until Phase 18; preserve the friend recovery instructions; Phase 13 displays read workers through `observe`. Phase 4f accepted limit (F008): an interrupted multi-pane rebuild can lose the split ratio and leave panes in the source workspace; the anomaly line names the tab and the panes. The instructions tell the user to inspect those panes; a retry does not rebuild the split.
 - Phase 3h review (2026-11-01): keep the 4b header, Hub files and Gates deletions; do not generate them again.
 
 **Acceptance gate:** Search the listed instructions for unguarded mesh commands and paths.
@@ -2711,50 +2717,72 @@ No Python or new rerun test is required for this text phase.
 
 **Depends on:** Phase 14e
 
-#### Work Order
+#### As-built
 
-**Goal:** `/unit:worker list` shows the true state of a mesh-pinned run's workers, and a worker's role survives a phase change. User fault of 2026-11-06 (change C1112 returned): in builds queue-unit, the list marked all 13 mesh workers `UncertainWorker` while the mesh state was correct (1 running, 12 done), and `review4` and `review5` showed role `unavailable`. The three code items that Phase 15 owed before its pilot land here, because they share these files.
-
-**Spec:**
-1. Cause of the blind list: `worker.list_workers` calls `worker_panes.observe` with no read of the run's pin. A mesh worker has no pane, so every row reads as uncertain or closed. When `unit_runs.parent_transport(caller.current_session, record=record)` is `mesh` and the caller holds a run, `list` reads that run through `board_json.workers(run, sources, record=record)`, the one path Hierarchies Phase 22 gave a mesh-pinned run. Copy no roster reading. Add the worker's full name to each `board_json.workers` mesh row, so that `list` prints name, role, state and activity. `--json` also carries `id` and `current_session` from the staff row of that name. A caller that holds no run keeps the pane read.
-2. `list`, `check` and `restore` read workers through one function in `worker.py` that honors the run pin. Fix the read once there. For a mesh-pinned run, `check` prints each row whose state is `incomplete` and exits 1 only when one exists, and `restore` opens no pane and prints `unchanged`. Add no refusal. Showrunner ruling, 2026-11-06.
-3. Cause of the `unavailable` roles: `dispatch_role` reads `progress_history_state.json`'s `pass` map, and `start-phase` clears that map, so a worker idle since an earlier phase loses its role. `review4` and `review5` last ran in phase 11 and the run is at phase 18. Switch `worker_panes.dispatch_role` to `progress_history.last_dispatch(row.id)`, preserve `WorkerRoleUnavailable`, and delete each by-name reader with no remaining caller. `last_dispatch` reads the newest open or finished dispatch, so a worker on its first pass has its role: `assign` and an account move read it. `worker_pass` stays for the two readers of an open pass, `can_close` and `_start_locked`, which accounts Phase 11 renames.
-4. Pass `deadline=<monotonic>` from `_start_locked` and `close` in `worker_panes.py` to `restart.stop_row`.
-5. An Astra review follows its caller's transport: `astra_review.run_review` writes `unit_runs.parent_transport(caller.current_session)` into the new run folder's `worker_transport` pin, because that folder is a separate run and otherwise pins the configured default. A mesh-pinned caller keeps a mesh review across the default switch.
-6. Pilot defect, 2026-11-06: a pane pass ended with exit 0 while the worker's detached runs were live and no code had changed. A pane pass ends only when the worker is done: the turn has ended, no run is live, and the last reply after the last run result ends with the DONE line. The launcher waits on file changes and reads the worker state at each wake, so a closed worker ends the pass with `NO_DONE`. A run with no result sent to this worker holds nothing. This keeps the mesh behavior that `/unit:direct` `<WorkerRuns>` states. A turn with no live run and no DONE line stays `NO_DONE`: an ended worker with no live run ends the pass after one full bounded wait with no file change, because a delivery can wake the launcher before the pane status changes.
-7. Pilot defect, 2026-11-06: `worker.py list` took 68 s for 54 closed rows, and `assign` uses the same reads. Each run root and the staff record are read once per call, with no new cache file and no new setting.
-8. Pilot defect, 2026-11-06: a check run of this phase's modules hung for 77 minutes in the phase 8 review cases of `scripts/direct/test_assign_launcher.py`. Find and fix the cause.
-9. Change C1114, returned 2026-11-06: on the Mac five `test_add_showrunner` tests fail. `add_showrunner` reads its own `local_machine` name, and the fixture rows say natedev, so the row is not found. `setUp` patches that name. The product code stays.
+- `worker.py _read_workers` is the one worker read for `list`, `check` and `restore`, and it honors the run pin. For a mesh-pinned caller that holds a run, it reads `board_json.workers(run, sources, record=record)`. A caller that holds no run keeps the pane read.
+- A mesh row prints name, role, state and activity. `--json` adds `id` and `current_session` from the staff row of that name. `check` prints each `incomplete` row and exits 1 only when one exists. `restore` opens no pane and prints `unchanged`.
+- `worker_panes.dispatch_role` reads `progress_history.last_dispatch(row.id)`, the newest open or finished dispatch, so a role survives `start-phase`. `worker_pass` stays for the readers of an open pass. `WorkerRoleUnavailable` stays.
+- `progress_history.dispatch_reads` and one read of each run root and the staff record per call give `worker.py list` 2.1 s for 56 rows.
+- `worker_panes._start_locked` and `close` pass `deadline=<monotonic>` to `restart.stop_row`. `close` reads its stop budget under the locks. On `conf.Unusable` it returns `Kept`, the worker command prints the refusal and exits 7, and the row stays.
+- A pane pass ends only when the worker is done. `worker.dispatch_receipt` returns `DispatchWaitingForRuns(runs, has_live_run)` while a run is live or a result was delivered, and `DispatchAwaitingReply` otherwise. `_wait_for_dispatch` waits on file changes, bounded by `herdr.PROGRAM_TIMEOUT_SECONDS`, and reads the worker state at each wake. An ended worker with no reply and no live run returns `NO_DONE` after one bounded wait with no file change and one more state read. A run with no result sent to this worker holds nothing.
+- `astra_review.run_review` writes `unit_runs.parent_transport(caller.current_session)` into the new run folder's `worker_transport`, so a review from a mesh-pinned caller stays on the mesh.
+- `test_add_showrunner.py` `setUp` pins `local_machine` to natedev. The product code stays.
 
 **Files:**
-- `scripts/production/worker.py`, `scripts/production/test_worker.py` — the one worker read for list, check and restore, the private-run restore test, and the end of a pane pass.
-- `scripts/direct/board_json.py`, `scripts/direct/test_board_json.py` — the worker's full name on a mesh row.
-- `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — the deadline, and `dispatch_role` through `last_dispatch(row.id)`.
-- `commands/unit/worker.md` — what `list`, `check` and `restore` do for a mesh-pinned run.
-- `scripts/astra/astra_review.py`, `scripts/astra/test_astra_review.py` — the Astra run's pin follows its caller.
-- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — `last_dispatch` reads the newest open or finished dispatch.
-- `scripts/agents/mesh_runs.py` — the results sent to one worker, for the end of a pane pass.
-- `mods/unit-board/types/board.d.ts` — the optional `name` on a board worker.
-- `scripts/production/test_add_showrunner.py` — the fixture names the machine of its rows.
+- `scripts/production/worker.py`, `scripts/production/test_worker.py` — `_read_workers`, `dispatch_receipt`, `_dispatch_turn`, `_wait_for_dispatch`.
+- `scripts/direct/board_json.py`, `scripts/direct/test_board_json.py`, `mods/unit-board/types/board.d.ts` — the optional `name` on a mesh row, and its role from `task`.
+- `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — `dispatch_role`, the stop deadline and `close`.
+- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — `last_dispatch`, `dispatch_reads`.
+- `scripts/agents/mesh_runs.py` — `worker_runs(since=)`, `delivered_worker_results`.
+- `scripts/astra/astra_review.py`, `scripts/astra/test_astra_review.py` — the Astra run's pin.
+- `commands/unit/worker.md` — `list`, `check` and `restore` for a mesh-pinned run.
+- `scripts/production/test_add_showrunner.py` — the fixture machine name.
 
-**Workers:** `1 writer`
-- `impl`: all items, in the Phase 15 pane run.
+**Binds later work:** `last_dispatch` is the one reader of a worker's role. `NO_DONE` after a quiet wait is exit 3, and the recovery is the saved launcher command. The installed launcher keeps its older pass-end behavior until this phase is on main.
 
-**State:** none. The list writes no pin and no record.
+**Gotchas:** A delivery wakes the launcher before the pane status changes, so a timer alone gives an early `NO_DONE`.
 
-**Constraints from prior phases:** Hierarchies Phase 22: a mesh-pinned run displays as before, and no display writes a pin. `WORKER_TRANSPORT` stays `mesh`.
+**Ruled out:** `UNCERTAIN` for a quiet ended worker, because the recovery is the same saved command.
 
-**Acceptance gate:** A real-path test runs `worker.py list` for a mesh-pinned run with a roster and no herdr, and shows each worker's mesh state and role. A test shows that a worker keeps its role after `start-phase` clears the `pass` map, and that a worker whose only pass is open has its role. Test `deadline=<monotonic>` propagation through `restart.stop_row` for worker policy changes and close. A test shows that an Astra run takes its caller's pin. Live, read only: `list_workers` on builds queue-unit's real run shows its 13 workers with the mesh state, and `review4` and `review5` show `review`. The full gate passes.
+### Phase 14f — Pane workers take every address, and a closed descriptor refuses no delivery  · status: todo
+
+**Depends on:** Phase 9, Phase 14d.
+
+#### Work Order
+
+**Goal:** the pane pilot's remaining send and delivery defects are gone before the default switch, and a refused pass keeps its role.
+
+**Spec:**
+
+1. `send.py --help` and the module usage name `worker:<unit>/<worker>` for a pane worker. They name `worker:<run id>/<worker>` only for a worker in a mesh-pinned run. The cause: `roster.py` publishes pane workers as `worker:<parent>/<row>`, and `membership.by_path` does not match a run id.
+2. A local address that resolves to a staff worker in a pane-pinned run takes `PaneWorkerRecipient`, with or without the `worker:` prefix. The route at `send.py:1996` selects from the resolved row and the run pin, so `codex:<thread id>` reaches the pane. A mesh-pinned worker keeps `CodexWorkerRecipient`, and a named machine scope keeps its route.
+3. `herdr._open_codex_rollouts` skips a descriptor that closes between the listing and `os.readlink`. `codex_rollout_threads` reads the selected rollouts again when one closes, inside the existing deadline. The identity checks stay. An unproved target stays refused. Add no check.
+4. `progress_history.last_dispatch` includes a `refused` pass. A worker whose newest pass is refused keeps that pass's role and id. Phase 11 keeps a refused pass open for recovery; the 14d reader lost its role.
+
+**Files:**
+- `scripts/message/send.py`, `scripts/message/test_send.py` — Spec items 1 and 2.
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — Spec item 3.
+- `scripts/direct/progress_history.py`, `scripts/direct/test_progress_history.py` — Spec item 4.
+
+**Workers:** `2 writers`
+- `impl`: Spec items 3 and 4.
+- `impl2`: Spec items 1 and 2.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 14d: `last_dispatch` is the one reader of a worker's role, and `worker_panes.dispatch_role` reads through it. Pilot defect 9: the saved log reads `target evidence is unknown: [Errno 2] No such file or directory: '/proc/<pid>/fd/36'`. The log does not name the failed operation, so cover both the listing and the read. Pilot defect 3 and 4 probes: a run id address returns `NoStaffRecipient`; a thread address returns `CodexWorkerRecipient` for a pane worker.
+
+**Acceptance gate:** A test sends through `send.py` routing with a `codex:<thread id>` address to a pane-pinned worker and selects `PaneWorkerRecipient`; the same address for a mesh-pinned worker keeps `CodexWorkerRecipient`. A test makes one descriptor disappear during the listing and one during the read, and the session proof still passes; a pane with another session stays refused. A test records a refused `fix` pass after a completed `review` pass, and `last_dispatch` returns `fix` with the refused pass's id. Require basedpyright 0/0 on changed files and caller modules, and the full gate.
 
 ### Phase 15 — Pilot and default switch  · status: todo
 
-**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14e. The pilot does not wait on Phase 14d. The switch waits for Phase 14d item 5, because an Astra review from a mesh-pinned caller stays on the mesh (user and sdlc, 2026-11-06).
+**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14d, Phase 14e, Phase 14f. The switch waits for Phase 14d on main, because an Astra review from a mesh-pinned caller stays on the mesh (user and sdlc, 2026-11-06).
 
 #### Work Order
 
 **Goal:** herdr-unit's own next run works on panes, then the default becomes `herdr` and units switch at their run boundaries, Mac units after a Mac probe of Phases 6-7.
 
-**Spec:** End the mesh run and pilot Phase 14d in a new pane run; it includes a detached result delivery, a review Stage 2 and a launcher recovery. It has no simplify review, because the user turned simplify off on 2026-11-06. Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
+**Spec:** The pane pilot ran Phase 14d (2026-11-06), with a detached result delivery, a review Stage 2, a launcher recovery, a closure review and an Astra review. Its defects are repaired in Phases 14d and 14f, with text in Phase 14. Prove the installed launcher rules live once Phase 14d is on main. Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
 
 **Files:**
 - `config/direct.conf` — `WORKER_TRANSPORT=herdr`.
@@ -2770,6 +2798,7 @@ No Python or new rerun test is required for this text phase.
 **Acceptance gate:** Require shutdown `b76d3b028` on sdlc and its worker-stop integration before the default switch.
 After Phase 12 reaches main, the director runs the installed Stop-hook friend proof for both families.
 Require the pilot run's phases to finish on panes.
+Require a live proof on the installed Phase 14d tree: a live detached result, a delayed pane status, a review Stage 2, a quiet wait that returns `NO_DONE`, and recovery through the saved launcher command.
 Require the pilot's Astra review to take a pane, print and save its reply, and retire its row while an unrelated Codex process is live. Keep `PaneAstraReviewTests` green for the failed end.
 Require the Mac probe and the full gate to pass.
 
@@ -2828,6 +2857,8 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
 
 16. **A worker never types its run folder (hierarchies, via sdlc, 2026-11-06).** Codex workers that retyped the path made 4 wrong folders under `/tmp/claude/unit`. `detached_runs.py start` and `board.sh` read, post and role find the folder from the worker's identity or environment, and take no folder argument from a pane worker. Check that a retained pane does not carry an older run's `UNIT_RUN_DIR`. Worker prompts stop naming the path. Add no new check.
 
+17. **Live detached supervisors at the rename.** `mesh_run_process.supervises` matches the literal file name `mesh_runs.py`, and that also covers a pane worker's supervisor. Before the rename, wait until no such supervisor is live, or keep its recognition until the last one ends. Test that a supervisor from before the rename still blocks a worker close.
+
 **Files:**
 - `scripts/direct/board.sh` — find the run folder from the worker's identity or environment (Spec item 16).
 
@@ -2843,6 +2874,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
   Remove any remaining mesh-pinned phase-lock checks; retain the fixed-id worker lock.
   Test startup without `codex_mesh` and preserve each role's sandbox.
 - `scripts/direct/workers.py`, `scripts/direct/worker_state.py`, `scripts/direct/remove_workers.py`, `scripts/production/retire_unit.py` — delete only the pinned mesh allocation, worker-removal paths, and unit worker ledger; in `retire_unit.py` `stop_rest` (:632-636) the mesh-pinned `workers.end_unit` branch goes.
+- `scripts/production/worker.py`, `scripts/production/test_worker.py` — move their imports of deleted or renamed modules. Keep the Stage 2, detached-result, quiet-wait and closure tests after the helpers move.
 - `scripts/direct/assign.py` — delete the pinned dispatch, follow-claim, wait, Stage 2 branches, and `WORKER_TRANSPORT` switch. Delete the mesh Astra prime, follow and end branch of `execute_astra_review` and its mesh-only tests; retain `ASTRA_REVIEW` and `execute_astra_review_herdr`. `implement.sh` and `review.sh` belong to devtools 3t.
 - `scripts/lib/unit_runs.py`, `scripts/lib/test_unit_runs.py`, `scripts/usage/test_collect_mac.py` — `worker_transport` and the run pin go.
 - `config/models.conf`, `config/direct.conf` — `[direct.options] codex_mesh`, `UNIT_CODEX_MESH`, `UNIT_COMPACT_ABOVE_TOKENS`, `WORKER_TRANSPORT` go. models-unit owns `config/models.conf`: send it the `[direct.options]` change.
@@ -2862,7 +2894,7 @@ Unrelated staff stores and deletions can follow panes without the whole-4g barri
   Phase 13 owns the other display deletions; retain its historical transcript reads.
 - `docs/as-built/long-lived-workers.md`, `docs/as-built/herdr-adoption.md`, `docs/as-built/session-roster.md`, `docs/as-built/agent-registry.md`, `docs/as-built/shutdown-and-restart.md`, `docs/as-built/unit-board.md`, `docs/as-built/usage-ledger.md` — Reference → Cleanup list docs.
 
-**Workers:** `2 writers` — `impl`: Astra and friend routing, callers and tests; `test` (opens as impl): remaining cleanup code, tests and docs.
+**Workers:** `2 writers` — `impl`: Astra and friend routing, callers and tests, with `assign.py` and the launcher tests as one owner; `test` (opens as impl): remaining cleanup code, the detached helpers and their callers, tests and docs.
 
 **State:** deletes state on disk (listed).
 
