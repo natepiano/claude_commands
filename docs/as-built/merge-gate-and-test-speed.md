@@ -116,7 +116,8 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
 - **Shared admission.** After the build hold ends, `gate_reservation` obtains one `merge-gate` reservation through `queue_place`.
   It reads `program_first_peak_gib.merge-gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
   The gate uses the first peak as its full need.
-  A matching anonymous profile uses the progress window after admission.
+  A matching anonymous profile uses the first pass's progress window after admission.
+  Reruns publish no progress counter and keep the full need.
   A missing or legacy profile keeps the full need.
   A wait keeps its gate identity and queue place.
   An admission error refuses the gate with its last reason line.
