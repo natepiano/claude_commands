@@ -68,6 +68,7 @@ Codex review prompts also include section 3's command block.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
    For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
+   For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
    Include these repair rules:
    - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
    - Before a rename or signature change, use LSP `findReferences`. Update all references and reread the changed body.
