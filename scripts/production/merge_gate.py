@@ -12,7 +12,7 @@ Runner-killed jobs and the type check do not run again. Each test module uses a
 builds.slice scope when its probe succeeds, unless disabled or already in that slice.
 --tests-only runs the same suite runner without changing git refs or files.
 Clean trees reuse full passes on the same host. Merge gates run all modules.
-Full tests select affected modules from a certified ancestor. --nightly validates a shared clone.
+Targeted tests select affected modules from a certified ancestor. --nightly validates a shared clone.
 Merge and tests-only runs omit type checks unless --type-dirs names folders.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
@@ -146,7 +146,7 @@ class GateArguments(argparse.Namespace):
 class SuiteMode(Enum):
     """Choose the step and whether the runner selects affected modules."""
     MERGE_GATE = "merge-gate"
-    FULL_TEST = "full-test"
+    TARGETED_TEST = "targeted-test"
 
 
 class GateJobKind(Enum):

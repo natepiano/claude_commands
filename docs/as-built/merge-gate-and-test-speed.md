@@ -8,8 +8,8 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 `scripts/production/merge_gate.py` merges a checkpoint into a production's merge branch and tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
-`scripts/production/full_test.py --checkout TREE [--full]` runs a unit's full tests through the same runner.
-Full tests select modules by direct imports, complete path tokens, changed test modules, and folders of changed Python source files.
+`scripts/production/targeted_test.py --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
+Targeted tests select modules by direct imports, complete path tokens, changed test modules, and folders of changed Python source files.
 Merge gates and nightly runs use all modules.
 Default merge and tests-only runs do not run basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
@@ -45,20 +45,20 @@ On failure, it undoes the merge and prints the failed suites' output.
 
 ## How it works
 
-### Full tests: `scripts/production/full_test.py`
+### Targeted tests: `scripts/production/targeted_test.py`
 
 The entry has its own parser and description.
 It shares the suite arguments, signal wrapper, copy lock, and suite runner with `merge_gate.py`.
-`SuiteMode.FULL_TEST` enables selection and takes the `full-test` admission step.
+`SuiteMode.TARGETED_TEST` enables selection and takes the `targeted-test` admission step.
 `SuiteMode.MERGE_GATE` runs all modules and takes the `merge-gate` step.
 Both modes accept `--full` because existing repository callers use it.
 
 The queue model reads `config/build_steps.conf` once through `read_step_names()`.
 Its `StepNames` value supplies names without file reads during rendering.
-Queue tables and cards use `[names]`; only `full-test` has the shown name `full test`.
+Queue tables and cards use `[names]`; only `targeted-test` has the shown name `targeted test`.
 Other step IDs keep their display text.
 Sentences use `[prose]`, then the shown name as a fallback.
-The step column fits `full test`.
+The step column fits `targeted test`.
 Build holds apply to both entries. Their test children keep the same hold rules.
 Temporary folders use each step's prefix from `config/build_folders.conf`.
 
@@ -111,13 +111,13 @@ Commits and checkout paths may differ.
 The runner prints `tests reused from <short tree> (<user-zone time>, <source>, <checkout>)` and marks each suite `OK reused`.
 Explicit type checks, settings, ancestry, production doc checks, and change-review checks still run.
 A dirty tree records no reusable pass.
-Without exact reuse, a full test selects affected modules as described below.
+Without exact reuse, a targeted test selects affected modules as described below.
 `--full` bypasses reuse.
 A red nightly marker bypasses reuse only in a merge gate.
 
 Recursive discovery changes the ledger key once, so the first gate after this change runs all modules. A later added or removed test folder changes the suite set and also forces a full run. The newly covered modules add about 120 module-seconds (measured 2026-10-30).
 
-**Affected modules for full tests** (`scripts/production/affected_modules.py`).
+**Affected modules for targeted tests** (`scripts/production/affected_modules.py`).
 The base is the newest full record on this host with the complete suite set and a commit that is an ancestor of `HEAD`.
 The changed set includes changes from the base to `HEAD`, plus dirty paths.
 A static Python graph selects a test module under four rules:
@@ -135,9 +135,9 @@ The cache holds imports and complete path tokens for each test-module blob.
 The current and base graphs share one cache read and one cache update.
 A warm selection reads base blobs only when the cache lacks their facts.
 Dirty sources never enter the cache or cause cache writes.
-A full test runs all modules only for `--full`, no certified base, or a graph error.
-The nightly-red marker widens only a merge gate. It does not block full-test reuse or selection.
-A full test leaves the marker in place, including after `--full`.
+A targeted test runs all modules only for `--full`, no certified base, or a graph error.
+The nightly-red marker widens only a merge gate. It does not block targeted test reuse or selection.
+A targeted test leaves the marker in place, including after `--full`.
 `--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
 A passing merge gate removes the marker. An unreadable marker also requires all modules in a merge gate.
 
@@ -174,7 +174,7 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
 - Before any job starts it refuses (and the merge rolls back) if a `--type-dirs` path is absent from the checkout, the test list is empty, or `/dev/shm` is not writable.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <its folder> -p <its file>`, with the checkout as cwd, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
 - **Shared admission.** After the build hold ends, `gate_reservation` obtains one `merge-gate` reservation through `queue_place`.
-  Full tests use step `full-test` through the same reservation path.
+  Targeted tests use step `targeted-test` through the same reservation path.
   It reads `program_first_peak_gib.merge-gate` from `config/build_admission.conf` at use; the initial value is 4 GiB.
   The gate uses the first peak as its full need.
   A matching anonymous profile uses the progress window after admission.
@@ -183,11 +183,12 @@ A failed delivery prints its cause. A test failure keeps its marker after a fail
   An admission error refuses the gate with its last reason line.
   Each new sampled peak updates the reservation's `.max` and `.wave` files through atomic writes.
   The gate releases the reservation on every exit while its private empty-scope sidecar still exists.
-  Release writes the run's `merge-gate` or `full-test` history row for reports.
+  Release writes the run's `merge-gate` or `targeted-test` history row for reports.
   Admission does not use that history to size the gate.
 - **Shared CPU slots.** Every module and the `types` job takes one byte from `/dev/steve` before launch and returns that byte after its process group ends, including on a failure, kill or interruption. The pool accepts a FIFO or a character device, including steve's CUSE device. The launch loop checks readiness with a zero timeout before a non-blocking read, so a token wait still samples memory, reaps jobs and checks holds. An absent pool keeps the existing behavior; `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests. Launch and cleanup registration defer cancellation together; the child restores its signal mask before exec. The per-gate job limit still applies. Admission and token waits stay inside the checkout's shared busy lock. Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
-- Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` and `/dev/shm/full-test-*`; its output is read and its temp root is removed when the job ends.
+- Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
+  The runner reads the output and removes the temporary folder when the job ends.
 - Each test module gets a fresh `BUILDLOG_DIR` inside its temp root, so its log rows cannot reach the real build log.
 - Each test module starts with tripwires for `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH: any call, including lookup commands, exits 99 and fails the module with the tool and arguments; a module can put its own stubs first. Each module also gets a private `BUILDLOG_LIVE_MEMORY_TRIPWIRE` record path: a recorded read of `/proc/meminfo` or `/proc/pressure/memory` fails the module with `a test read live memory`, the path and the arguments, even if its tests pass. Neither kind of tripwire failure runs again, including after a signal during a natedev hold. An incomplete or invalid memory record also fails the module and prints `a test read live memory (unreadable record):` with the raw line. The types job gets no live memory tripwire.
 - Exit 5 with `Ran 0 tests` and `NO TESTS RAN` counts as a pass: Python 3.13's exit for a helper module with no tests.
@@ -268,7 +269,16 @@ The daily rule removes these jobs from default gates.
 - It runs the Mac fast-forward over `ssh -o ConnectTimeout=10` with a 25 s limit. The Mac uses the same tracked edit check before fetch and again before merge; a refusal names each file in the result and keeps its edits. The remote command prints `ff_rc=<status>` and exits 0, so the gate parses `ff_rc=` and needs exactly `["0"]`. Any Mac failure reports `main promoted to <hash>; Mac fast-forward failed: ...; the claude-sync job on the Mac retries within 15 minutes`.
 - **Self-heal (2026-10-27).** `scripts/lib/main_sync.py` is the retry. The nixos job `claude-sync` (`modules/common/claude-sync.nix`) runs it every 15 minutes on both machines with `--notify natedev`. It fetches origin main and fast-forwards `~/.claude` only when the checkout is on main, has no tracked-file changes, has no merge, rebase or cherry-pick in progress, and origin/main holds HEAD. It never resets, stashes or makes a merge commit; untracked files do not count. States: `current`, `advanced`, and the blocked `unreadable`, `not-main`, `in-progress`, `fetch-failed`, `diverged`, `dirty`, `ff-failed` (exit 1). Each run appends a line to `~/.local/state/main-sync/sync.jsonl` (`MAIN_SYNC_STATE_DIR`); `blocked.txt` holds the blocked state, so each new cause sends one message and a sync clears it. Cause: from 2026-10-26 20:10 the Mac missed 12 promotions because the showrunner promoted with plain git and the Mac step never ran.
 
-Tests run on independent scratch repositories: `scripts/production/test_merge_gate.py` (checkpoint and change review), `test_merge_gate_ledger.py` (certified passes), `test_full_test.py` (affected selection), `test_merge_gate_suites.py` (jobs, resources, reruns and types), `test_merge_gate_promotion.py` (local and Mac promotion), and `test_merge_gate_holds.py` (holds and interruptions). `merge_gate_test_support.py` caches one repository seed per class and fixture folder set, then restores a private copy at its original path for each test. Cases declare the folders needed for their contract. The fixture writes test modules in those folders; it does not replace discovery or copy the checkout's suite names. CLI calls run in-process except where signals, child ownership or the executable entry point are under test. The gate discovers all parts through `test_*.py`; the affected-module graph follows their shared-helper imports.
+Tests use independent scratch repositories.
+The modules in `scripts/production/` cover these subjects:
+
+1. `test_merge_gate.py`: checkpoints and change review.
+2. `test_merge_gate_ledger.py`: certified passes.
+3. `test_targeted_test.py`: affected selection.
+4. `test_merge_gate_suites.py`: jobs, resources, reruns and types.
+5. `test_merge_gate_promotion.py`: local and Mac promotion.
+6. `test_merge_gate_holds.py`: holds and interruptions.
+ `merge_gate_test_support.py` caches one repository seed per class and fixture folder set, then restores a private copy at its original path for each test. Cases declare the folders needed for their contract. The fixture writes test modules in those folders; it does not replace discovery or copy the checkout's suite names. CLI calls run in-process except where signals, child ownership or the executable entry point are under test. The gate discovers all parts through `test_*.py`; the affected-module graph follows their shared-helper imports.
 
 Checkpoint integration tests are split into `test_merge_checkpoint.py` (input and scope), `test_merge_checkpoint_receipts.py` (receipts and wait attribution), `test_merge_checkpoint_validation.py` (validation and notifications), `test_merge_checkpoint_promotion.py` (promotion and retries), `test_merge_checkpoint_history.py` (shrink, as-built and history), `test_merge_checkpoint_handoff.py` (child handoffs), and `test_merge_checkpoint_ledger.py` (handoff ledger recovery). `merge_checkpoint_test_support.py` builds one Git seed per class and copies it back to the original paths for each case, including each provenance matrix cell. Synchronous checkpoint, recorder and fake-tool calls run through their real entry points in-process; Git, executable Git stand-ins, and existing unit and child-handoff CLI cases retain real subprocesses. Every original test body and assertion is retained.
 

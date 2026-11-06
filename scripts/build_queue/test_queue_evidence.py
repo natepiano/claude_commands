@@ -312,7 +312,7 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_running_and_release_sentences_use_step_prose(self) -> None:
         reading = gate.queue_read()
         names = read_step_names()
-        for step, prose in (("full-test", "full test"), ("merge-gate", "merge gate")):
+        for step, prose in (("targeted-test", "targeted test"), ("merge-gate", "merge gate")):
             with self.subTest(step=step):
                 running = replace(reading.explanation.running[0],
                                   step=replace(reading.explanation.running[0].step, step=step))

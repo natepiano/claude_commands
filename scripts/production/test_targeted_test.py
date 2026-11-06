@@ -1,4 +1,4 @@
-"""Full tests select affected modules through the shared real runner."""
+"""Targeted tests select affected modules through the shared real runner."""
 from __future__ import annotations
 
 import json
@@ -11,8 +11,8 @@ from scripts.production.affected_modules import NoCertifiedBase
 from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
 
 
-class FullTestTests(MergeGateFixture):
-    suite_mode: ClassVar[merge_gate.SuiteMode] = merge_gate.SuiteMode.FULL_TEST
+class TargetedTestTests(MergeGateFixture):
+    suite_mode: ClassVar[merge_gate.SuiteMode] = merge_gate.SuiteMode.TARGETED_TEST
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()
@@ -58,7 +58,7 @@ class FullTestTests(MergeGateFixture):
             self.assertIn("message: skipped (not affected)", result.stdout)
             self.assertNotIn("tests reused from", result.stdout)
         self.assertEqual([record["kind"] for record in self.pass_records()], ["full", "affected", "affected"])
-        self.assertEqual(self.gate_run_records()[-1]["step"], "full-test")
+        self.assertEqual(self.gate_run_records()[-1]["step"], "targeted-test")
 
     @gate_suites("lib", "hooks", "message")
     def test_a_nightly_red_marker_keeps_selection_by_the_four_rules(self) -> None:

@@ -24,7 +24,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.lib import build_folders
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
-from scripts.production import full_test, merge_gate, staff
+from scripts.production import merge_gate, staff, targeted_test
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
@@ -550,7 +550,7 @@ class MergeGateFixture(unittest.TestCase):
              "--ssh", str(self.bin / "ssh"),
              *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
              *extra]
-        if self.suite_mode is merge_gate.SuiteMode.FULL_TEST:
+        if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST:
             arguments = ["--repo", str(self.checkout),
                          *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
         if own_process or ignored_signals:
@@ -568,7 +568,7 @@ class MergeGateFixture(unittest.TestCase):
                 "SHOWRUNNER_STATE_DIR": home / ".local/state/showrunner",
             }.items():
                 _ = scope.enter_context(mock.patch.object(showrunners, name, value))
-            entry = full_test if self.suite_mode is merge_gate.SuiteMode.FULL_TEST else merge_gate
+            entry = targeted_test if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST else merge_gate
             return invoke_cli(entry, lambda: entry.main(arguments), arguments,
                               self.environment, self.root)
 
@@ -579,8 +579,8 @@ class MergeGateFixture(unittest.TestCase):
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
         source += (f"sys.path.insert(0, {str(SCRIPT.parents[2])!r}); "
                    + "from scripts.production import merge_gate; \n"
-                   + ("from scripts.production import full_test as entry\n"
-                      if self.suite_mode is merge_gate.SuiteMode.FULL_TEST else "entry = merge_gate\n")
+                   + ("from scripts.production import targeted_test as entry\n"
+                      if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST else "entry = merge_gate\n")
                    + preamble + "\n"
                    + "raise SystemExit(entry.main(sys.argv[1:]))")
         return [sys.executable, "-c", source]

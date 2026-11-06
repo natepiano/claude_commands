@@ -45,19 +45,19 @@ class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
 
 class QueueViewTests(QueueFixtureTests):
 
-    def test_full_test_step_uses_its_shown_name(self) -> None:
+    def test_targeted_test_step_uses_its_shown_name(self) -> None:
         model = self.fixture.model()
         waiting = model.reading.view.waiting
         running = model.reading.view.running
         view = replace(model.reading.view,
-            waiting=(replace(waiting[0], step="full-test"), *waiting[1:]),
-            running=(replace(running[0], step="full-test"), *running[1:]))
+            waiting=(replace(waiting[0], step="targeted-test"), *waiting[1:]),
+            running=(replace(running[0], step="targeted-test"), *running[1:]))
         model = replace(model, reading=queue_read_fixture(view, policy=model.reading.explanation.policy))
         text = plain(queue_view.render_view(model, 140))
-        rows = [row for row in text.splitlines() if "full test" in row]
+        rows = [row for row in text.splitlines() if "targeted test" in row]
         self.assertEqual(len(rows), 2)
         self.assertTrue(any(row.startswith("run") for row in rows))
-        self.assertNotIn("full-test", text)
+        self.assertNotIn("targeted-test", text)
 
     def test_ci_reservation_label_comes_from_configuration_and_runner_identity(self) -> None:
         with AdmissionFixture() as admission:

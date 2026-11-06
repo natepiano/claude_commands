@@ -15,7 +15,7 @@ not pause the phase's work.
    (`~/.claude/scripts/direct/progress_history.py`). If it gives an ETA band
    calibrated from measured runs, that is the answer.
 2. **Otherwise, build one.** List the steps left in this phase: repair rounds,
-   lint, the full tests, reviews, the live smoke, screenshots, the checkpoint.
+   lint, the targeted tests, reviews, the live smoke, screenshots, the checkpoint.
    Time each from the durations the recorder holds for the same step, earlier
    in this run or in this project (`timeline`, `aggregate`). Sum them, and give
    a range from the shortest and longest matching records.

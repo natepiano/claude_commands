@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 
-SUITE_RUNNERS = frozenset({"merge_gate.py", "full_test.py"})
+SUITE_RUNNERS = frozenset({"merge_gate.py", "targeted_test.py"})
 SUITE_MODULES = frozenset(("-m", f"scripts.production.{Path(name).stem}") for name in SUITE_RUNNERS)
 
 

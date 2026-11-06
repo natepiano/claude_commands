@@ -286,7 +286,7 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  "$BOARD_DIR/../lib/py" - "$dir/owned" <<'PY'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" "$BOARD_DIR/../lib" <<'PY'
 from __future__ import annotations
 
 import json

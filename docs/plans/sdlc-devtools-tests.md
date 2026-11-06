@@ -18,7 +18,8 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
   - `scripts/production/merge_gate.py` — the merge gate: finds test modules, runs them under a memory cap, keeps the passed-tree ledger (`PassedTreeLedger`)
   - `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate*.py` — its fixture and tests
   - `docs/as-built/merge-gate-and-test-speed.md` — the gate's as-built
-- **Test:** `python3 -m unittest discover -s scripts/production -p 'test_merge_gate*.py'`, from the worktree root. Full test: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/full_test.py --repo . --full`, from the worktree root.
+- **Test:** `python3 -m unittest discover -s scripts/production -p 'test_merge_gate*.py'`, from the worktree root.
+  Targeted test: `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo . --full`, from the worktree root.
 - **Lint:** `basedpyright <changed Python files>` passes when its output has the `0 errors, 0 warnings, 0 notes` line; the exit status says nothing.
 - **Invariants:**
   - Tests use fixtures; they never read live state (`~/.claude` main, `/tmp/claude`, `~/.cargo/bin`).
@@ -980,7 +981,7 @@ The read-only acceptance checks also retain these requirements:
 3. Use different timer and row documents to prove that each changed reader takes the row's document.
 4. Keep `test_checkpoint_uses_the_plan_worktree_when_the_director_runs_elsewhere`, lookup tests, requested-checkpoint tests, and partial-report tests.
 5. Distinguish `ProposalsUnavailable` and `LedgerUnavailable` from confirmed absence.
-6. Verify the director and branch folders with `full_test.py` and `add_unit.py --check`.
+6. Verify the director and branch folders with `targeted_test.py` and `add_unit.py --check`.
 7. Verify `resume_unit.py sdlc guild-process-unit --dry-run`.
 
 The search may retain read-only `session_labels.py`, `production_units.WRAPPED` imports, and Units scope reads owned by Phase 4b.

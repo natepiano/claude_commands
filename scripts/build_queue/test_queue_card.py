@@ -17,15 +17,15 @@ from scripts.message.unit_labels import UnitLabels
 
 class QueueCardTests(QueueFixtureTests):
 
-    def test_full_test_step_uses_its_shown_name(self) -> None:
+    def test_targeted_test_step_uses_its_shown_name(self) -> None:
         model = self.fixture.model()
         waiting = model.reading.view.waiting
-        step = replace(waiting[0], step="full-test")
+        step = replace(waiting[0], step="targeted-test")
         model = replace(model, reading=replace(model.reading,
             view=replace(model.reading.view, waiting=(step, *waiting[1:]))))
         heading = plain(queue_card.render_card(model, [1], 140)).splitlines()[0]
-        self.assertIn(" · full test · ", heading)
-        self.assertNotIn("full-test", heading)
+        self.assertIn(" · targeted test · ", heading)
+        self.assertNotIn("targeted-test", heading)
 
     def test_running_and_release_sentences_use_step_prose(self) -> None:
         _ = (self.fixture.root / "pressure").write_text("full avg10=0\nsome avg10=0\n")

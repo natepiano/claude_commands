@@ -38,7 +38,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **The next test to speed up is chosen by the CPU it saves each day, not by its time in one run.** The showrunner placed it here on 2026-11-06; if the two orders differ, the showrunner takes the rule question to the user.
   - Target: the Introduction of this file and "Select the next speed target"; proposed text: "Choose eligible modules by expected daily CPU saving: observed daily executions × estimated removable CPU per execution. Include merge executions, selected unit executions, and retries; exclude reused results."
   - Why needed: 5 unit runs ran `direct/test_simplify_lens.py` twice (258 CPU s) and `direct/test_verify_mac_only.py` once (194 CPU s). The sample is small.
-  - Completion condition: after a day on builds, report both orders with the count of red merges that a unit full test missed, against the 104-run estimate of 15 (Phase 37).
+  - Completion condition: after a day on builds, report both orders with the count of red merges that a unit targeted test missed, against the 104-run estimate of 15 (Phase 37).
   - Revealed by: Phase 37 architect review, 2026-11-06.
 - [ ] **Architecture proposal: the assign launcher starts fewer child processes**
   - Target: `scripts/direct/assign.py` (owner sdlc; models and herdr change it now)

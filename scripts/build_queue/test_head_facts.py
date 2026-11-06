@@ -39,7 +39,7 @@ def write_bumps_with_block_edge(line: bytes, split_at: int) -> None:
 class HeadFactsTests(AdmissionLogTests):
     def test_head_sentences_use_step_prose(self) -> None:
         names = read_step_names()
-        for step, prose in (("full-test", "full test"), ("merge-gate", "merge gate")):
+        for step, prose in (("targeted-test", "targeted test"), ("merge-gate", "merge gate")):
             with self.subTest(step=step):
                 write_bumps(NOW, [bump_line(NOW - 1, step=step)])
                 write_token_gaps([token_gap_line(NOW - 200, NOW - 46, step=step)])

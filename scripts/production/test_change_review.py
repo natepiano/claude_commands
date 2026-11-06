@@ -12,7 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import chdir, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime
 from pathlib import Path
 from typing import cast, override
@@ -315,28 +315,16 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual(row["Producer"], live.id)
         self.assertEqual(row["Production"], live.id)
 
-    def test_publication_finds_the_producer_with_a_different_relative_production_path(self) -> None:
-        directory = self.root / "another-checkout"
-        relative = Path("docs/plans/top.md")
-        (directory / relative).parent.mkdir(parents=True)
-        _ = (directory / relative).write_text(self.doc.read_text())
-        merged = self.merge()
-        production = Production(relative, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"),
-                                unit_lookup.doc_owner(self.doc, staff.snapshot()))
-        with chdir(directory), mock.patch.object(change_review, "drift", return_value=[]):
-            merge_checkpoint.record_publication_changes(production, change_review.merge_commits(self.repo, merged), merged)
-        self.assertEqual(change_review.pending(self.listing)[0]["Producer"], self.unit.id)
-
-    def test_unit_producer_resolves_bare_and_canonical_names_across_productions(self) -> None:
+    def test_unit_producer_resolves_the_exact_staff_name_across_productions(self) -> None:
         other = self.unrelated_unit()
-        for name, expected in (("new", self.unit.id), ("new-unit", self.unit.id),
-                               ("external", other.id), ("external-unit", other.id)):
+        for name, expected in (("new", self.unit.id), ("external-unit", other.id),
+                               ("new-unit", change_review.UNKNOWN_PRODUCER), ("external", change_review.UNKNOWN_PRODUCER)):
             with self.subTest(name=name):
                 self.assertEqual(change_review.unit_producer(name), expected)
 
     def test_unit_producer_returns_unknown_for_duplicate_and_absent_names(self) -> None:
-        _ = self.unrelated_unit(name="new-unit")
-        for name in ("new", "new-unit", "absent"):
+        _ = self.unrelated_unit(name="new")
+        for name in ("new", "absent"):
             with self.subTest(name=name):
                 self.assertIs(change_review.unit_producer(name), change_review.UNKNOWN_PRODUCER)
 

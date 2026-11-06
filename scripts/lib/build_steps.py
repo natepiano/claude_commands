@@ -1,4 +1,4 @@
-"""Read the display names, prose names and memory-cap labels of build steps."""
+"""Read the display names and prose names of build steps."""
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -15,10 +15,6 @@ class StepNames:
 
     def prose(self, step: str) -> str:
         return self.settings.get(f"prose.{step}", self.shown(step))
-
-    def memory_cap_text(self, step: str) -> str:
-        program = ("the " if step in {"merge-gate", "full-test"} else "") + self.prose(step)
-        return f"{program}'s memory cap"
 
 
 def read_step_names() -> StepNames:

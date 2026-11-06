@@ -528,27 +528,28 @@ only I can bump
    Switch every caller in the same change.
    Name each outside owner in the notice's also-touches line.
    `merge_gate.py` belongs to sdlc devtools-unit.
-5. **Full tests.** The user approved a separate name for the unit's run on 2026-11-04.
-   `full_test.py` runs on the unit's own copy with step `full-test`, shown as "full test".
+5. **Targeted tests.** The unit's run has a separate name.
+   `targeted_test.py` runs on the unit's own copy with step `targeted-test`, shown as "targeted test".
    The showrunner's merge, test and push keeps step `merge-gate`.
-   Extend each `merge-gate` consumer to handle `full-test`, including config keys, build folder prefixes, need history, views, and reports.
+   Extend each `merge-gate` consumer to handle `targeted-test`, including config keys, build folder prefixes, need history, views, and reports.
    `program_peak_estimate` takes the first merge-gate need from config, never from history.
    Phase 10o moved that reader to `step_estimator.py:256`.
    The architect review confirmed this rule for Phases 15 and 10o on 2026-11-06.
-   Extend that first-peak branch for `full-test`.
-   Add `program_first_peak_gib.full-test` at 4 GiB; this new key needs no user approval.
+   Extend that first-peak branch for `targeted-test`.
+   Add `program_first_peak_gib.targeted-test` at 4 GiB; this new key needs no user approval.
    `reservation_profile_key` (`memory_admit.py:1862`) gives `merge-gate` a key with the gate shape.
    `merge_gate_shape` (`memory_admit.py:289`) reads `--type-dirs` from the arguments.
-   Use the same key form for `full-test`.
-   Move no merge-gate profiles to `full-test`, as the director ruled.
-   A full-test run keeps the full need until its own profile has samples.
+   Use the same key form for `targeted-test`.
+   Move no merge-gate profiles to `targeted-test`, as the director ruled.
+   A targeted test keeps the full need until its own profile has samples.
    Test the configured first need, separate profiles for each step, and separate profiles for test-only runs and runs with types.
    Keep `program_first_peak_gib.merge-gate` and `peak_hold_seconds.merge-gate`.
    Renaming or deleting a merge-gate config key needs the user's approval.
    A default gate has no type job; `--nightly` runs it.
    Builds requires sdlc devtools-unit Phase 7p on main before this work starts.
    Trial-merge `origin/sdlc` before the notice.
-
+6. **Nested calls.** Some callers are wrappers around programs that already ask the queue. A nested call reuses the reservation of the call around it: one run gets one charge and never waits on its own request.
+7. **Proof.** Tests: with another admitted run or a held slot present, a run with no room waits in line and shows on the queue (on an empty host an oversized run starts alone, so that case proves nothing); a small run with room starts at once; a nested call gets no second charge and does not block itself; no caller starts a `builds.slice` scope outside the entry point. Live check: the memory page shows no "worker background runs" row that skipped the line.
 
 8. **Service thread rule (architect review of 10s, 2026-11-05).** One loop thread changes admission service state; the service has no lock. Tests call the server only through `fixture.loop_turn()` while it serves: `admission_test_support.py:420` refuses an off-thread `handle_request`, `persist` or `run_pass` (tested at `test_admission_service.py:87`). Do not hold a fixture turn across a client call that needs the service loop.
 

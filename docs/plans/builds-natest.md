@@ -30,9 +30,9 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   - `scripts/<folder>/test_*.py` — the test modules that the speed phases change (natest-unit changes shared test files through cargo-berth's flow; production doc, Units → natest-unit)
 - **Key files:**
   - `scripts/production/merge_gate.py` — line numbers on builds 772ef96a9: `MODULE_HISTORY_RUNS = 5` (103); `SUITE_BOOTSTRAP` (108, execs its argv); `GateJobResult` (159, has `cpu_seconds`); `gate_state_dir()` (510); `start_gate_job` (638); `test_module_environment` (655, gives each module a private `TMPDIR`, `BUILDLOG_DIR` and tool tripwires); `finish_gate_job` (678, finishes every job, the type job included); `PassedTreeLedger` (736, `CleanTestTree.tree` and `.commit`); `discover_test_modules` (864); `run_suites` (878): the module argv at 1003 is `[*scope_prefix, python, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name]`, the type job argv is at 1000-1001, the rerun-alone pass keeps first results in `first_runs`, and the `finally` block (1074-1088) saves `module_seconds.json`, `module_cpu_seconds.json`, `module_peak_mib.json`, `types_peak_mib.json` and `module_history.json`; the summary lines (1093-1127) print each folder suite's time from `suite_started` and `suite_finished` Since Phase 2 (8bc0d5c88): each module job runs `RUNNER` (`scripts/test_times/module_run.py`), not `unittest discover`; `discover_test_modules` (877); `record_gate_run` writes the run record.
-  - `scripts/production/full_test.py` — a unit's run: it selects modules through `scripts/production/affected_modules.py`. `merge_gate.SuiteMode` names the two modes; `run_suites(..., mode=SuiteMode.MERGE_GATE)` runs all modules (Phase 36). The line numbers above are history: find the current lines with `git grep`.
+  - `scripts/production/targeted_test.py` — a unit's run: it selects modules through `scripts/production/affected_modules.py`. `merge_gate.SuiteMode` names the two modes; `run_suites(..., mode=SuiteMode.MERGE_GATE)` runs all modules (Phase 36). The line numbers above are history: find the current lines with `git grep`.
   - `scripts/lib/build_steps.py`, `config/build_steps.conf` — `StepNames.shown` and `StepNames.prose`: the step names that the user reads (Phase 36)
-  - `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate*.py`, `scripts/production/test_full_test.py` — the gate's fixture and tests
+  - `scripts/production/merge_gate_test_support.py`, `scripts/production/test_merge_gate*.py`, `scripts/production/test_targeted_test.py` — the gate's fixture and tests
   - `scripts/buildlog/store.py` — `root()` (honors `BUILDLOG_DIR`), `host_name()`, `utc_iso(epoch)`, `host_file(host, epoch)`, `append_line(path, record)`: the JSON-lines store, one file per host per month
   - `scripts/buildlog/record.py` — `RECORD_VERSION`, `new_id(host, epoch)` (513), `ssh_attempt` (1055): the pattern for a one-line record writer
   - `scripts/buildlog/index.py` — `SCHEMA_VERSION = 34`, with `step`, `dirty_paths` and `dirty_path_count` (was 42); column lists such as `TEST_COLUMNS` (141) and `CALL_COLUMNS`; `TABLES` (452, with the gate tables); `create_schema` (574, adds a `<table>_src` index for each table); `insert`, `pick`; `add_step` (763, the pattern for a nested list that becomes child rows); `ADDERS` (950, `gate_run` maps to `add_gate_run`); `forget` (954, loops `TABLES`); `update()` (1012); `read_only()` (1051)
@@ -47,7 +47,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
   - `~/.local/state/merge-gate/module_history.json` — the gate's last 5 wall times for each module, with no times of day; it seeds the first sort only
 - **Test lanes:** none as `tests/` folders. Each module's tests sit beside it as `scripts/<folder>/test_<name>.py`; the `test` worker writes those files.
 - **Build:** none (Python).
-- **Test:** for each named test file, `python3 -m unittest discover -s scripts/<folder> -p '<file>'` from the worktree root; always also `python3 -m unittest discover -s scripts/lib`. A worker's verification lists every test module that calls a changed function, unchanged callers and subprocess fixtures included (Phase 18: a caller's adjacency test was missed). Checkpoint gate: merge origin's merge branch first, then the full test: `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/full_test.py --checkout <tree>` (main's copy). Until Phase 36 is on main, main has only `merge_gate.py --checkout <tree> --tests-only`, which runs all modules.
+- **Test:** for each named test file, `python3 -m unittest discover -s scripts/<folder> -p '<file>'` from the worktree root; always also `python3 -m unittest discover -s scripts/lib`. A worker's verification lists every test module that calls a changed function, unchanged callers and subprocess fixtures included (Phase 18: a caller's adjacency test was missed). Checkpoint gate: merge origin's merge branch first, then the targeted test: `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/targeted_test.py --checkout <tree>` (main's copy). Until Phase 36 is on main, main has only `merge_gate.py --checkout <tree> --tests-only`, which runs all modules.
 - **Lint:** `basedpyright <changed Python files>` passes when its output has the `0 errors, 0 warnings, 0 notes` line; the exit status says nothing.
 - **Invariants:**
   - Tests use fixtures. They never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `~/.local/state/merge-gate`, `/tmp/claude` (the gate's as-built).
@@ -669,12 +669,12 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Phase 25: `MergeGateFixture.build_fixture` commits the real `module_run.py` into each fixture checkout, and the gate refuses a checkout with no runner.
 - Phase 26: fixture modules that start the real `send.py` fail through the `TEST_SENDER_GUARD` marker.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- Architect review after Phase 41: the module now has 18 tests, and `test_full_test.py` also imports the fixture. Profile the current module after Phase 36, and add `test_full_test.py` to the final run when the fixture changes.
+- Architect review after Phase 41: the module now has 18 tests, and `test_targeted_test.py` also imports the fixture. Profile the current module after Phase 36, and add `test_targeted_test.py` to the final run when the fixture changes.
 - Architect review after Phase 34: `merge_gate_test_support.py:273` casts `None` to `AdmissionFixture`, and `admission_started` tracks its lifetime apart. A change to that lifetime uses named states (for example `AdmissionNotStarted | RunningAdmission`). A change that only measures needs no refactor.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/production -p 'test_merge_gate_ledger.py'` green, with the same test names and assertions
-- all 12 `scripts/production/test_merge_gate*.py` modules and `scripts/production/test_full_test.py` green, with the same test names and assertions; each module's before and after time in same-load pairs
+- all 12 `scripts/production/test_merge_gate*.py` modules and `scripts/production/test_targeted_test.py` green, with the same test names and assertions; each module's before and after time in same-load pairs
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - `basedpyright` on each changed file prints `0 errors, 0 warnings, 0 notes`
 
@@ -952,7 +952,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - Measured CPU before and after in the checkpoint notice: `test_verify_mac_only.py` in same-load pairs (`pairs.sh`), and one real `verify.sh` run.
 - Each caller module of `mac_idle.py` green, with the same test names and assertions.
-- the full test green on the phase commit merged with `origin/builds`.
+- the targeted test green on the phase commit merged with `origin/builds`.
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`.
 
 ### Phase 43 — `direct/test_verify_token_renew.py` runs in half its time  · status: done
@@ -995,7 +995,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - caller suites for `copies.py` green, `style/test_bulk_run.py` included (`bulk_run.test_tree` calls `copies.standing`)
 - measured before and after for `style/test_crate_run.py` and one `copies.py run`, in the checkpoint notice
-- the full test green on the phase commit merged with `origin/builds`
+- the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 45 — `direct/test_verify_lint_cache_versions.py` runs in half its time  · status: done
@@ -1193,7 +1193,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher.py'` green, with the same test names and assertions
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the full test green on the phase commit merged with `origin/builds`
+- the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
 
 ### Phase 56 — The SSH retained and retry tests run in half their time  · status: todo
@@ -1227,10 +1227,10 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets_retained.py'` and the same line for `test_verify_ssh_targets_retry.py` green, with the same test names and assertions
 - every importer of the support file green, if the phase changes it
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the full test green on the phase commit merged with `origin/builds`
+- the targeted test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 57 — The merge tip holds the queue stack, and the unit's narrow run is called targeted test  · status: todo
+### Phase 57 — The merge tip holds the queue stack, and the unit's narrow run is called targeted test  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1242,8 +1242,10 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 2. Rename, from the user's words "Okay let's use targeted tests and not full tests". `full_test.py` becomes `targeted_test.py`. `test_full_test.py` becomes `test_targeted_test.py`. The step id `full-test` becomes `targeted-test`.
 3. Config keys, approved by the user: `names.targeted-test` is `targeted test`, `prefixes.targeted-test` is `targeted-test-`, and `peak_hold_seconds.targeted-test` is `180`.
 4. Change all text that means the unit's narrow run, in code, config, commands, docs and tests. "Merge gate" stays, with its meaning. A worker must leave no reader of the old names in main code.
+   These sites keep their words because they mean another thing: `verify.sh final`'s workspace tests in `commands/unit/direct.md`, `<full test worker name>` in `docs/direct/launch_implementation.md`, a cargo test request with a package in `queue_evidence.py`, `step_estimator.py` and `builds-resources.md`, a rerun of all modules in `merge_gate.py` and `test_merge_gate_suites_types.py`, and the full test id in `module_run.py`.
+   In `docs/plans/`, change Delegation Context lines and `todo` phases. A `done` phase and a quoted word are history and stay.
 5. Stored records and build folders with the old id or prefix get a one-off program at deploy, if any exist. The director checks live state at the merge and reports.
-6. `build_steps.memory_cap_text` has no step set. The text is `f"{prose} memory cap"`. Update its tests.
+6. `build_steps.memory_cap_text` has no caller on the merged tree: the queue stack removed the fixed caps. Delete it.
 7. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:** Every file the merge conflicts in, and every file that holds the old name on the merged tree. The list is in `phases/57/files` of the run.
@@ -1258,7 +1260,39 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Acceptance gate:**
 - no conflict marker on the merged tree
-- `git grep -n -E 'full[-_ ]test|FULL_TEST|Full test'` finds no old name outside history in `docs/plans/`
-- the targeted test green on the tip, and its time beside the old name's last time
+- `git grep -n -E 'full[-_ ]test|FULL_TEST|[Ff]ull [Tt]est'` finds only the sites Spec 4 keeps and history in `docs/plans/`
+- the targeted test reaches admission on the tip with `CONF_DIR` set to the tip's config, because the installed config has `program_first_peak_gib.targeted-test` only after the tip lands
+- the rename's run-time cost: names only, none measured; the first real run's time goes in the notice after landing
 - `merge_gate.py --tests-only` green on the tip
 - `basedpyright` on the changed Python files prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 58 — The hana_shot launch test reads no live build log  · status: todo
+**Depends on:** Phase 57
+
+#### Work Order
+
+**Goal:** `test_launch_and_cleanup_keep_real_buildlog_unchanged` passes while other builds write the shared build log, and it still fails when a launch writes outside its own log folder.
+
+**Spec:**
+1. The test compares the size and time of `~/.local/state/buildlog/<host>/*` before and after a launch. Any other build that writes the log in that window fails it: twice in a full gate, and 1 of 4 single runs.
+2. In this test, set `HOME` to a folder under `self.scratch`. `store.root()` with no `BUILDLOG_DIR` then names a default root inside that folder.
+3. After the launch and the cleanup, assert that this default root does not exist. Keep the assertions on the exit code, the state file, the scratch folder and the rows in `BUILDLOG_DIR`.
+4. The test reads no file under the real home. Rename the test for what it pins.
+5. Prove the test: with `store.root` changed by hand to ignore `BUILDLOG_DIR`, the test fails. Revert that change.
+6. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/hana_shot/test_hana_shot.py` — the one test
+
+**Workers:** 1 writer on slot `impl` (one test in one file)
+- `impl` — the file above, role impl
+
+**Constraints from prior phases:**
+- Phase 20: the module stops its fixture servers at once.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/hana_shot -p 'test_hana_shot.py'` green
+- the test run four times beside a process that appends to the real log, all green
+- the hand change in Spec 5 makes the test fail
+- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
