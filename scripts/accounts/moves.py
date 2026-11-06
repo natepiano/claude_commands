@@ -48,6 +48,7 @@ RequestedFields = TypedDict("RequestedFields", {"from": HistoricalAccountLabel, 
 
 
 class RequestedMove(MoveCommon, RequestedFields):
+    terminal: NotRequired[str]
     kind: Literal["requested"]
     cause: NotRequired[Literal["refusal", "credits off", "by hand", "auto"]]
 

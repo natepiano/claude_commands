@@ -81,7 +81,7 @@ class StopResumeTests(unittest.TestCase):
                       patch.object(staff, "initial_snapshot", return_value=record),
                       patch.object(self.client, "rows", panes),
                       patch.object(restart, "start_row", return_value="w1:p2") as start,
-                      patch.object(stop_resume, "_running_on_account", side_effect=[
+                      patch.object(stop_resume, "running_on_account", side_effect=[
                           sessions.SessionNotLive(), stop_resume.ClaudeUp(identity, "w1:p2", target or "claude3")])):
                     result = stop_resume.resume(str(row.id), to=target)
                 self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", target or "claude3"))
@@ -321,6 +321,21 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_not_called()
         self.detach.assert_not_called()
 
+
+    def test_running_codex_account_uses_its_live_process_home(self) -> None:
+        from scripts.accounts import accounts
+        from scripts.whoami import account
+
+        identity = self.entry["session_id"]
+        home = self.root / ".codex4"
+        with (patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", (987654,))),
+              patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(home)) as read,
+              patch.object(accounts, "codex_home_label", return_value="codex4")):
+            result = stop_resume.running_on_account(identity, "w1:p2", kind="codex")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(result.account, "codex4")
+        read.assert_called_once_with(987654)
 
     def test_resume_by_name_of_a_running_session_reports_success_without_a_launch(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
