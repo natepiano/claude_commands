@@ -278,7 +278,7 @@ CASES
 test_every_claude_print_launch_keeps_agents_and_reports_errors
 
 export CLAUDE_CONFIG_DIR="$HOME/.claude2"
-agents_exec_main direct.simplify readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+run_exec_fixture direct.simplify readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "simplify replaced the caller account with the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 
 # The worker's registry-selected Claude path uses the same account.
