@@ -120,9 +120,7 @@ class BuildFolderSpec:
 def _settings() -> ConfigRead:
     from scripts.lib import conf
 
-    if "CONF_DIR" in os.environ and not conf.path("build_folders").exists():
-        return conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
-    return conf.read("build_folders")
+    return conf.read_or_repository("build_folders")
 
 
 def repository_key(repository: Path) -> str:

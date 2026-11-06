@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from scripts.build_queue import head_facts
 from scripts.build_queue.queue_lines import age, field
 from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NotServiceSlice, RunningServiceJob
+from scripts.lib.build_steps import StepNames
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
@@ -48,19 +49,23 @@ def gib(value: int) -> str:
     return f"{value / gate.GIB:.1f} GiB"
 
 
+def test_phase_text(basis: gate.TestPhaseCharge) -> str:
+    need = basis.need
+    return (f"tests started: need {gib(basis.bytes)} "
+            f"(test peak {gib(basis.peak_so_far)}, history {gib(need.bytes)} x {need.margin:g})")
+
+
 def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo, policy: gate.AdmissionPolicy,
-                step: str) -> str:
+                step: str, *, names: StepNames) -> str:
     if isinstance(basis, gate.PromiseNoReading):
         return "promise: no reading yet"
     if isinstance(basis, gate.RampPromise):
         return "recorded initial promise"
     if isinstance(basis, gate.LifetimePromise):
-        name = "release build" if step == "build" else "merge gate" if step == "merge-gate" else step
+        name = names.prose(step)
         return f"{name} promise: holds until the step ends"
     if isinstance(basis, gate.TestPhaseCharge):
-        need = basis.need
-        return (f"tests started: need {gib(basis.bytes)} "
-                f"(test peak {gib(basis.peak_so_far)}, history {gib(need.bytes)} x {need.margin:g})")
+        return test_phase_text(basis)
     if isinstance(basis, gate.PeakSoFar):
         text = f"{gate.peak_activity(step)}, peak so far {gib(basis.bytes)}"
         if isinstance(basis.peak_at, float):
@@ -85,13 +90,12 @@ def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo, policy: gate.AdmissionP
 
 
 def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded, *,
-              zone: ZoneInfo) -> str:
+              zone: ZoneInfo, names: StepNames) -> str:
     if isinstance(source, gate.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
     if isinstance(basis, gate.ProgramMemoryCap):
-        program = "the merge gate" if basis.program == "merge-gate" else basis.program
-        return f"{program}'s memory cap"
+        return names.memory_cap_text(basis.program)
     if isinstance(basis, (gate.ShapeP90, gate.ShapeLargest, gate.ShapeFallback)):
         if isinstance(basis, gate.ShapeP90):
             text = f"same-shape p90 of {basis.runs} runs"
@@ -290,7 +294,7 @@ def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExpl
     room = explanation.room
     keep = next((entry for entry in room.runs if entry.owner == owner), None) if isinstance(room, gate.MemoryRoom) else None
     evidence = keep_aside_text(keep) if keep is not None else f"anonymous use {using}; no accepted run hold"
-    phase = ("; " + charge_text(running.basis, zone, explanation.policy, running.step.step)
+    phase = ("; " + test_phase_text(running.basis)
              if isinstance(running.basis, gate.TestPhaseCharge) else "")
     return (f"{pid_text(step_pid(running.step))} · {identity.showrunner} / {identity.unit} / {identity.session}, {running.step.step}: {started}; "
             + evidence + phase + swap)

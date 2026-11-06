@@ -21,10 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
-from scripts.lint import memory_admit
+from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import fake_memory_readings
-from scripts.production import merge_gate
+from scripts.production import full_test, merge_gate
 from scripts.production.cli_fixture import invoke_cli
+from scripts.test_times.gate_record import GateRunRecord
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -254,6 +255,8 @@ class GateFixtureSeed:
 
 
 class MergeGateFixture(unittest.TestCase):
+    suite_mode: ClassVar[merge_gate.SuiteMode] = merge_gate.SuiteMode.MERGE_GATE
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -521,6 +524,17 @@ class MergeGateFixture(unittest.TestCase):
         _ = self.git(checkout, "commit", "-m", subject)
         return self.git(checkout, "rev-parse", "HEAD")
 
+    def gate_run_records(self) -> list[GateRunRecord]:
+        paths = sorted(Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl"))
+        return [cast(GateRunRecord, cast(object, row))
+                for row in sweep.build_log_rows(paths) if row.get("kind") == "gate_run"]
+
+    def prepare_affected_subject(self) -> tuple[Path, str]:
+        subject = self.checkout / "scripts/hooks/affected_subject.py"
+        self.write(subject, "VALUE = 1\n")
+        self.write(self.checkout / "scripts/hooks/test_first.py", "import affected_subject\n" + SUITE_MODULE)
+        return subject, self.commit(self.checkout, "dependency fixture")
+
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
                  ignored_signals: bool = False, callers_production: bool = False,
                  own_process: bool = False) -> subprocess.CompletedProcess[str]:
@@ -534,6 +548,9 @@ class MergeGateFixture(unittest.TestCase):
              "--ssh", str(self.bin / "ssh"),
              *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
              *extra]
+        if self.suite_mode is merge_gate.SuiteMode.FULL_TEST:
+            arguments = ["--repo", str(self.checkout), "--type-dirs", "scripts/production",
+                         *extra]
         # The gate measures itself and descendants; cap assertions need their own gate process.
         if own_process or ignored_signals:
             return subprocess.run(
@@ -550,7 +567,8 @@ class MergeGateFixture(unittest.TestCase):
                 "SHOWRUNNER_STATE_DIR": home / ".local/state/showrunner",
             }.items():
                 _ = scope.enter_context(mock.patch.object(showrunners, name, value))
-            return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
+            entry = full_test if self.suite_mode is merge_gate.SuiteMode.FULL_TEST else merge_gate
+            return invoke_cli(entry, lambda: entry.main(arguments), arguments,
                               self.environment, self.root)
 
     def gate_command(self, *, ignored_signals: bool = False) -> list[str]:
@@ -559,8 +577,8 @@ class MergeGateFixture(unittest.TestCase):
             source += ("[signal.signal(sig, signal.SIG_IGN) for sig in "
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
         source += (f"sys.path.insert(0, {str(SCRIPT.parents[2])!r}); "
-                   "from scripts.production import merge_gate; "
-                   "raise SystemExit(merge_gate.main(sys.argv[1:]))")
+                   f"from scripts.production import {'full_test' if self.suite_mode is merge_gate.SuiteMode.FULL_TEST else 'merge_gate'} as entry; "
+                   "raise SystemExit(entry.main(sys.argv[1:]))")
         return [sys.executable, "-c", source]
 
     def run_promote_only(self) -> subprocess.CompletedProcess[str]:

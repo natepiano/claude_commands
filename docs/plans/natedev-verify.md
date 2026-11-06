@@ -35,7 +35,7 @@ i need changes to verify
   - `docs/as-built/rustdoc-once-and-final-targets.md`, `docs/as-built/mac-test-offload.md`, `docs/as-built/build-targets.md` — how verify, its final pass, the Mac offload and build targets work now
 - **Test lanes:** none (no Rust crate); tests sit beside their modules as `test_*.py`.
 - **Build:** none (scripts).
-- **Test:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --tests-only --checkout <tree>` after a merge of `origin/natedev` (memory: merge before a gate). For a quick loop: `python3 -m unittest discover -s scripts/direct -p 'test_verify*.py'` and `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'`.
+- **Test:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/full_test.py --checkout <tree>` after a merge of `origin/natedev` (memory: merge before a gate). For a quick loop: `python3 -m unittest discover -s scripts/direct -p 'test_verify*.py'` and `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'`.
 - **Lint:** `basedpyright scripts/direct scripts/mac_test` plus every caller module of a changed Python file — pass is its `0 errors, 0 warnings` line; `bash -n scripts/direct/verify.sh`; `shellcheck scripts/direct/verify.sh` with no new findings.
 - **Invariants:**
   - `verify.sh` output, exit codes, cache records and build-log records stay the same for every verb (`check`, `test`, `lint`, `doc`, `final`), local and on the Mac.
@@ -376,7 +376,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 - Real-loop tests (real `verify.sh` and the real memory gate loop, fake checker answers) for: one holder per resource kind (slot, memory, build hold); a holder change mid-wait; a holder that goes away; a failed `start-wait` or `wait-holder` and the retry on the next poll; a rejoin, which opens a new interval with its own holder while `mem_wait_s` still counts from the first start; immediate admission, with no interval and no holder call; the no-holder case.
 - These Phase 7 tests pass unchanged: the first-start `mem_wait_s` build-log assertions (`MemoryQueueIdentityTests` in `test_verify_token_renew.py`) and the claim handoff tests that prove a refused Mac claim leaves the run waiting (`MacWaitClaimTests.test_competing_waiters_cannot_leave_without_a_claim_and_runner_adopts_it` and `scripts/mac_test/test_mac_test.py`).
 - Without `BUILDLOG_MEM_BLOCKER=1`, the memory gate's output and decisions are unchanged (`scripts/lint` tests pass).
-- Merge gate `--tests-only` green on a tree merged with origin/builds; basedpyright 0/0 on changed files and callers. A trial merge of `origin/builds-resources` passes the memory gate tests before the notice.
+- Full test green on a tree merged with origin/builds; basedpyright 0/0 on changed files and callers. A trial merge of `origin/builds-resources` passes the memory gate tests before the notice.
 
 ### Phase 9 — Remove Phase 7's new Python starts  · status: done
 
@@ -616,7 +616,7 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 - View tests: `build_queue.py` text and `--json` put the line first with tone `error`; `build_targets.py status` prints it first; a missing file adds nothing; a stale file shows the stale line. `alert_line` on a fixture runs with `subprocess.run` patched to raise and returns in under 50 ms.
 - `scripts.buildlog.test_mac_idle`, `scripts.buildlog.test_index`, `scripts.build_queue.test_build_queue`, `scripts.build_queue.test_queue_view`, `scripts.build_targets.test_build_targets`, `scripts.notify.test_push_texts` and `scripts.notify.test_review` pass; basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers (`scripts/buildlog/cli.py`, the importers of `build_targets.py`, `push_texts.py` and `build_queue.py`).
 - Live proof on natedev: if a block with no natedev job still holds and steps wait, run the worktree's `mac_idle.py watch` with `MAC_IDLE_STATE_DIR` set to a scratch folder whose `idle.json` has `since` 200 s ago; it writes the alert and the builds showrunner gets the message; `build_queue.py` and `build_targets.py status` with that folder show the red line in under a second. Else the same run against a fixture state folder.
-- Merge gate `--tests-only` green on a tree merged with `origin/natedev`. The checkpoint notice names the also-touches paths (`scripts/build_queue/build_queue.py`, `scripts/build_targets/build_targets.py`, `commands/build/queue.md`, `commands/build/status.md`, owner queue-unit; `scripts/notify/push_texts.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, owner per the production doc Units row).
+- Full test green on a tree merged with `origin/natedev`. The checkpoint notice names the also-touches paths (`scripts/build_queue/build_queue.py`, `scripts/build_targets/build_targets.py`, `commands/build/queue.md`, `commands/build/status.md`, owner queue-unit; `scripts/notify/push_texts.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, owner per the production doc Units row).
 
 ### Phase 17 — Move a step to the Mac when a short-term decline clears  · status: todo
 
@@ -695,7 +695,7 @@ Start reasons, by class (evidence at e6f8540f):
 - In `test_build_targets.py`: `disk`, `backoff`, `unreachable` (`probe_mac` gives `UNAVAILABLE_PROBE`) and `state unreadable` (`read_config` raises `OSError`) each answer `mac_allowed` with a `retry` row; `off`, `repo`, `linux_only`, `--local`, `build`, `example` and `final` still answer `natedev_only`; one `retry` Mac and one `off` Mac give `mac_allowed`.
 - `scripts.direct.test_verify_mac_start_decline`, `scripts.build_targets.test_build_targets`, `scripts.build_targets.test_targets`, `scripts.direct.test_verify_mac_only`, `scripts.direct.test_verify_mac_memory_excluded`, `scripts.direct.test_verify_mac_memory_retry`, `scripts.direct.test_verify_mac_memory_retry_clock`, `scripts.direct.test_verify_mac_retry_clock`, `scripts.direct.test_verify_mac_retry_hold`, `scripts.direct.test_verify_mac_routing`, `scripts.direct.test_verify_mac_wait_records`, `scripts.direct.test_verify_step_routes`, `scripts.direct.test_verify_checks_fail_closed` and `scripts.direct.test_verify_python_starts` pass.
 - basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers (`scripts/build_hold/hold_applies.py`, `scripts/direct/local_release_wait.py`, `scripts/production/merge_gate.py`); `bash -n scripts/direct/verify.sh`; `shellcheck scripts/direct/verify.sh` with no new findings.
-- Merge gate `--tests-only` green on a tree merged with `origin/natedev`. The checkpoint notice names the also-touches paths `scripts/build_targets/build_targets.py` and `scripts/build_targets/test_build_targets.py`, owner queue-unit.
+- Full test green on a tree merged with `origin/natedev`. The checkpoint notice names the also-touches paths `scripts/build_targets/build_targets.py` and `scripts/build_targets/test_build_targets.py`, owner queue-unit.
 
 ### Phase 18 — One standing gate checkout per unit, made only by copies.py  · status: done
 
@@ -858,7 +858,7 @@ Checkpoint 23aa6712f on `verify-idle-disk`.
 
 2. The Mac test mirror root is spelled in one place: one key in `config/mac_test.conf` (value `~/.local/state/mac-test/mirror`, no move), read at use by `scripts/mac_test/offload.py` and by resources' `sweep.py`. No other literal of that path stays in code. Builds ruling 2026-11-03 (this replaces the dropped mirror-move phase).
 
-**Acceptance gate:** a test with a fake Mac that is under the minimum before the sweep and over it after, which admits the step; one with a sweep that frees too little, which keeps the step on natedev; a scan that finds the mirror root only in `config/mac_test.conf`; merge gate `--tests-only` green on a tree merged with origin/builds.
+**Acceptance gate:** a test with a fake Mac that is under the minimum before the sweep and over it after, which admits the step; one with a sweep that frees too little, which keeps the step on natedev; a scan that finds the mirror root only in `config/mac_test.conf`; full test green on a tree merged with origin/builds.
 
 ### Phase 27 — A step sent to natedev after a Mac disk decline goes back to a free Mac  · status: done
 

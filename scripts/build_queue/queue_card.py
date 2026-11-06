@@ -46,7 +46,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
         if card:
             add()
         add((Span(f"#{position} of {len(waiting)} · {queue_evidence.pid_text(queue_evidence.step_pid(step))} · ", bold=True), *name_spans(step, model.labels),
-             Span(f" · {step.step} · {step.need / gate.GIB:.1f} GiB", bold=True)))
+             Span(f" · {model.names.shown(step.step)} · {step.need / gate.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Queue arrival {clock(model, step.since)}; waiting {age(step.since, model.reading.explanation.now)} min. "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
         add()
@@ -86,7 +86,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                 if isinstance(priority_order, gate.PriorityUnit):
                     detail += f"; {priority_order.unit} (queue priority)"
                 add((Span(f"  #{place} {queue_evidence.pid_text(queue_evidence.step_pid(ahead))} · "), Span("↑  " if is_moved(model, place) else "   "),
-                     *name_spans(ahead, model.labels), Span(f" {ahead.step}  {detail}")), 6)
+                     *name_spans(ahead, model.labels), Span(f" {model.names.shown(ahead.step)}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
             joined = 1 + sum(other.since < step.since for other in waiting)
@@ -159,11 +159,11 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         return lines
     add()
     if not head_card:
-        add(f"First in line: {queue_evidence.pid_text(queue_evidence.step_pid(head.waiter))} · {name_text(head.waiter, model)} {head.waiter.step}; "
+        add(f"First in line: {queue_evidence.pid_text(queue_evidence.step_pid(head.waiter))} · {name_text(head.waiter, model)} {model.names.shown(head.waiter.step)}; "
             + f"queue arrival {clock(model, head.waiter.since)}; "
             + f"waiting {age(head.waiter.since, explanation.now)} min; "
             + f"need {queue_evidence.gib(head.waiter.need)}")
-    add("Need source: " + queue_evidence.need_text(head.need_source, zone=model.zone))
+    add("Need source: " + queue_evidence.need_text(head.need_source, zone=model.zone, names=model.names))
     add(queue_evidence.need_details(head.need_source))
     if isinstance(model.facts, head_facts.HeadFacts):
         facts = model.facts

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from functools import cache, cached_property
 from typing import assert_never
 from zoneinfo import ZoneInfo
@@ -11,6 +11,7 @@ from scripts.build_queue import head_facts, queue_evidence
 from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, plain, field, wrap
 from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
+from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
@@ -42,6 +43,7 @@ class QueueModel:
     load: HostLoad | HostLoadUnavailable
     release: gate.HeadAfterEnd
     ci_memory_slice: str = ""
+    names: StepNames = dataclass_field(default_factory=read_step_names)
 
     @cached_property
     def moves(self) -> head_facts.QueueMoves:
@@ -374,8 +376,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0),
                         max((len(str(age(row.started_at, explanation.now))) for row in running if row.started_at), default=0))
     step_width = max(7, min(13, max(
-        max((terminal_width(row.step.step) for row in running), default=7),
-        max((terminal_width(step.step) for step in waiting), default=7))))
+        max((terminal_width(model.names.shown(row.step.step)) for row in running), default=7),
+        max((terminal_width(model.names.shown(step.step)) for step in waiting), default=7))))
     pids = [queue_evidence.pid_text(queue_evidence.step_pid(step)) for step in waiting]
     running_pids = [queue_evidence.pid_text(queue_evidence.step_pid(row.step)) for row in running]
     pid_width = max((len(text) for text in [*pids, *running_pids]), default=5)
@@ -442,7 +444,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
                 Span(marker, "suggestion"),
                 Span(column(show, show_width)),
                 *unit_spans,
-                Span(column(field(step), step_width)),
+                Span(column(field(model.names.shown(step)), step_width)),
                 Span(pad_left(minutes, minutes_width) + " ", "inactive"))
 
     def append_row(row: Line) -> None:

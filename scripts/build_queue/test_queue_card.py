@@ -17,6 +17,16 @@ from scripts.message.unit_labels import UnitLabels
 
 class QueueCardTests(QueueFixtureTests):
 
+    def test_full_test_step_uses_its_shown_name(self) -> None:
+        model = self.fixture.model()
+        waiting = model.reading.view.waiting
+        step = replace(waiting[0], step="full-test")
+        model = replace(model, reading=replace(model.reading,
+            view=replace(model.reading.view, waiting=(step, *waiting[1:]))))
+        heading = plain(queue_card.render_card(model, [1], 140)).splitlines()[0]
+        self.assertIn(" · full test · ", heading)
+        self.assertNotIn("full-test", heading)
+
     def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
         model = self.fixture.model()
         for position in (1, 2, 4):

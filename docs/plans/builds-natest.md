@@ -830,7 +830,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - A staff snapshot passed from the gate lookup through `publication_changes` in this phase. The merge of builds at 3145e7df3 brought that `record` keyword. `publication_changes` now takes both `record` and `known_producer`, and `merge_checkpoint.py` passes both.
 
-### Phase 36 — A unit's run is a full test, and only a merge is a merge gate  · status: todo
+### Phase 36 — A unit's run is a full test, and only a merge is a merge gate  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1023,6 +1023,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Files:**
 - `scripts/direct/test_verify_token_renew.py` — the module
+- `scripts/direct/verify_token_wait_test_support.py` — `wait_for_output` accepts either Popen text mode
 
 **Workers:** 1 writer on slot `impl` (one module; the file does not split; slot `test` holds the Phase 36 repair)
 - `impl` — all files above, role impl
@@ -1105,3 +1106,111 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Ruled out:**
 - Moving `module_run.py` to tmpfs as a saving: it times one module for a director, and it is not part of a suite run.
+
+### Phase 48 — The queue's sentences say `full test`, and one file lists the suite runners  · status: todo
+**Depends on:** Phase 36
+
+#### Work Order
+
+**Goal:** every queue sentence shows the shown step name, and one file holds the suite-runner names. Phase 36 left both, under the landing rule.
+
+**Spec:**
+1. `queue_evidence.running_text` (`queue_evidence.py:299`) and `queue_evidence.release_text` (`queue_evidence.py:224`) print the raw step id, so a card can say `full-test`. Print `names.shown(step)` with a required `names: StepNames` keyword, as `need_text` does. `queue_card.py` passes `model.names`.
+2. `hold_enforcer.py`, `scope_activity.py` and `pre-tool-use-build-hold-guard.py` each define `SUITE_RUNNERS` and `SUITE_MODULES`. Add `scripts/lib/suite_runners.py` with these two sets and one `starts_suite_runner(target)`, standard library only. `scope_activity.py` keeps its own scan of every argument and uses the two sets.
+3. If the admission service imports the new file, add it to `admission_code.ADMISSION_CODE_PATHS`.
+4. `build_hold.py:493` stays on hold until the showrunner sends natedev messaging's main hash. When the hash comes, that line uses `SUITE_RUNNERS` in this phase or in a small follow-up.
+5. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_card.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_admission_protocol.py` — item 1 (owner: queue unit)
+- `scripts/lib/suite_runners.py` — new file
+- `scripts/build_hold/hold_enforcer.py`, `scripts/build_queue/scope_activity.py`, `scripts/build_queue/admission_code.py`, `scripts/hooks/pre-tool-use-build-hold-guard.py` — item 2
+
+**Workers:** 1 writer on slot `test` (few lines, and one file set holds the step name work)
+- `test` — all files above
+
+**Constraints from prior phases:**
+- Phase 36: `StepNames` reads config once per queue model, and renderers read no file.
+- The hook starts on every Bash call, so `scripts/lib/suite_runners.py` imports only the standard library.
+
+**Acceptance gate:**
+- A test with a running `full-test` step: `running_text` and `release_text` print `full test` and never `full-test`.
+- `python3 -m unittest discover -s scripts/build_queue -p 'test_*.py'` green, with `scripts/hooks/test_build_hold_guard.py` and the `scripts/build_hold` modules
+- `git grep -n 'SUITE_RUNNERS = '` finds one line
+- the full test green on the phase commit merged with `origin/builds`
+
+### Phase 49 — Every shell script starts Python through `scripts/lib/py`  · status: todo
+**Depends on:** Phase 36
+
+#### Work Order
+
+**Goal:** no shell script starts a bare `python3`, so a Mac with Apple's Python 3.9 first on PATH starts the right interpreter. The showrunner chose this sweep, 2026-11-05 (Phase 38 finding F006).
+
+**Spec:**
+1. The 17 starts: `berth_fix/capture.sh:44`; `berth_fix/launch.sh:44,69,82,101,116`; `bevy_migration_plan/bevy_migration_count_pattern.sh:48`; `direct/board.sh:173,230,287`; `lint/memory_gate.sh:21,124,148`; `production/mac_run.sh:74,96`; `statusline/statusline.sh:66,76`. Find the current line numbers with `git grep`.
+2. Keep each start's arguments, stdin and exit status. Use the Phase 38 form, so a filename-only start and a symlink start still resolve the launcher.
+3. `statusline.sh` and `board.sh` start often. Measure the time of one start before and after, and put both numbers in the notice.
+4. Workers run `board.sh` in a sandbox, so run one `board.sh post` in a sandboxed worker before the checkpoint.
+5. A script on hold when this phase starts waits for the end of its hold.
+6. Add no ban check, guard or refusal (showrunner, 2026-11-05; user rule, 2026-11-05).
+
+**Files:**
+- `scripts/berth_fix/capture.sh`, `scripts/berth_fix/launch.sh`
+- `scripts/bevy_migration_plan/bevy_migration_count_pattern.sh`
+- `scripts/direct/board.sh`
+- `scripts/lint/memory_gate.sh` — tell the queue unit before the edit; it owns line 160
+- `scripts/production/mac_run.sh`
+- `scripts/statusline/statusline.sh`
+- `scripts/mac_test/test_offload.py` — with any other test module that copies these scripts into a fixture
+
+**Workers:** 1 writer on slot `impl3` (one rule across small files)
+- `impl3` — all files above
+
+**Constraints from prior phases:**
+- Phase 38: a test fixture that copies a script also needs `scripts/lib/py` and `seed_interpreter_cache`.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `git grep -nE '^[^#]*\bpython3\b'` on the listed files finds no start outside `scripts/lib/py`
+- each caller module of these scripts green in the gate form
+- the routes of each script on natedev and on the Mac, before and after, with the same exit status, in the notice
+- the full test green on the phase commit merged with `origin/builds`
+
+### Phase 50 — One shared wait watches writes, and one file binds inotify  · status: todo
+**Depends on:** Phase 43
+
+#### Work Order
+
+**Goal:** a test wakes on a line that a live writer adds to an open log, through one shared wait with no raw masks. The Phase 43 simplify review found the copies.
+
+**Spec:**
+1. `scripts/lib/inotify.py` gains `IN_MODIFY`.
+2. `LocalReleaseEvents` and `local_release_waiter` take a `mask` parameter. The default stays `0x00000FC8`, written with the named constants, so production callers keep the same events.
+3. `wait_until` takes a keyword `watch_writes: bool = False`.
+4. `VerifyTokenWaitFixture.wait_for_output` becomes one `wait_until(..., watch_writes=True)` call, then the `assertIn`. A timeout raises `TimeoutError`, not `AssertionError`.
+5. Remove the raw-mask patches in `verify_hold_wait_test_support.py` and `verify_mac_offload_test_support.py`.
+6. `LocalReleaseEvents` calls `inotify.open_watch`, `inotify.add_watch` and `inotify.events`. `arm()` still skips a path that is not a directory.
+7. `scripts/agents/codex_mesh.py` keeps its own copy: it goes within 48 hours (user, 2026-11-05).
+8. Add no guard, refusal or check (user rule, 2026-11-05).
+
+**Files:**
+- `scripts/lib/inotify.py`
+- `scripts/direct/local_release_wait.py`
+- `scripts/direct/wait_for_test_state.py`
+- `scripts/direct/verify_token_wait_test_support.py`
+- `scripts/direct/verify_hold_wait_test_support.py`
+- `scripts/direct/verify_mac_offload_test_support.py`
+
+**Workers:** 1 writer on slot `impl` (one wait, used by every file)
+- `impl` — all files above
+
+**Constraints from prior phases:**
+- Phase 43: the shared mask has no `IN_MODIFY`, so a file that a live writer keeps open sends no event until its last close.
+- Turned on for every caller, a write watch wakes on each write in a busy directory, and predicates can read half-written files. Keep it off by default.
+
+**Acceptance gate:**
+- A test: a live writer adds a line to a file it keeps open, and `wait_until(..., watch_writes=True)` returns before the file closes.
+- `git grep -n '0x00000FC'` finds one definition at most, outside `codex_mesh.py`.
+- Each caller module of the changed files green in the gate form; `merge_gate.py` waits have the same events.
+- Same-load pairs for `direct/test_verify_hold_*` and `direct/test_verify_mac_only.py`, before and after, in the notice.
+- The full test green on the phase commit merged with `origin/builds`.

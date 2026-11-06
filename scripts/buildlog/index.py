@@ -42,7 +42,7 @@ else:
     from scripts.lib import conf
     from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 
 # These indexes support repeated queries over the current schema.
@@ -183,6 +183,7 @@ TEST_COLUMNS: list[Column] = [
 ]
 
 GATE_RUN_COLUMNS: list[Column] = [
+    ("step", "TEXT", "full-test or merge-gate; empty for old records"),
     ("id", "TEXT PRIMARY KEY", "gate run identity"),
     ("src", "TEXT", "source file"),
     ("host", "TEXT", "host"),
@@ -482,7 +483,7 @@ SSH_ATTEMPT_COLUMNS: list[Column] = [
 
 TABLES: dict[str, tuple[list[Column], str, str]] = {
     "gate_runs": (
-        GATE_RUN_COLUMNS, "", "one row per merge-gate test run (scripts/production/merge_gate.py)",
+        GATE_RUN_COLUMNS, "", "one row per full-test or merge-gate run",
     ),
     "gate_suites": (GATE_SUITE_COLUMNS, "PRIMARY KEY (run_id, suite)", "one row per gate suite"),
     "gate_modules": (
@@ -892,6 +893,7 @@ def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src:
         if key != TYPE_CHECK_JOB:
             module_keys.add(key)
     insert(connection, "gate_runs", pick({
+        "step": "",
         **record,
         "src": src,
         "modules_run": len(module_keys),

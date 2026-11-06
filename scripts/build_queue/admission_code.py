@@ -8,11 +8,11 @@ import sys
 
 ADMISSION_CODE_PATHS = (
     "direct/verify.sh", "lint/invoke.sh", "hooks/pre-tool-use-brp-launch-gate.sh",
-    "production/merge_gate.py", "lint/memory_gate.sh", "lint/memory_admit.py",
+    "production/merge_gate.py", "production/full_test.py", "lint/memory_gate.sh", "lint/memory_admit.py",
     "build_queue/admission_code.py", "build_queue/admission_client.py", "build_queue/admission_protocol.py",
     "build_queue/admission_service.py", "build_queue/queue_place.py",
     "build_queue/scope_activity.py", "build_queue/queue_snapshot.py",
-    "lib/inotify.py", "lib/conf.py", "lib/atomic_file.py", "lib/test_phase.py",
+    "lib/build_steps.py", "lib/inotify.py", "lib/conf.py", "lib/atomic_file.py", "lib/test_phase.py",
     "lint/build_shape.py", "buildlog/store.py", "buildlog/record.py", "buildlog/repository.py", "buildlog/parse.py",
 )
 

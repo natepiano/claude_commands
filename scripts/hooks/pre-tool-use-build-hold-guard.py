@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tool_call_text import scan_text
 
-CANDIDATE = re.compile(r"\b(?:cargo|merge_gate\.py)\b")
+SUITE_RUNNERS = frozenset({"merge_gate.py", "full_test.py"})
+SUITE_MODULES = frozenset(("-m", f"scripts.production.{Path(name).stem}") for name in SUITE_RUNNERS)
+CANDIDATE = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted({"cargo", *SUITE_RUNNERS})) + r")\b")
 CARGO_BUILDS = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                           "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri"})
 PREFIXES = frozenset({"env", "sudo", "exec", "command", "nohup", "time", "timeout", "nice",
@@ -53,7 +55,11 @@ def without_literal_heredocs(command: str) -> str:
     return command
 
 
-def builds(words: list[str], *, merge_gate_only: bool = False) -> bool:
+def runs_suite_runner(target: list[str]) -> bool:
+    return tuple(target[:2]) in SUITE_MODULES or bool(target) and Path(target[0]).name in SUITE_RUNNERS
+
+
+def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
     """Test one shell command after its environment and command prefixes."""
     while words:
         if ASSIGNMENT.match(words[0]):
@@ -72,9 +78,9 @@ def builds(words: list[str], *, merge_gate_only: bool = False) -> bool:
     program = Path(words[0]).name
     arguments = words[1:]
     if program in {"bash", "sh", "zsh"}:
-        return any("c" in option and building_command(script, merge_gate_only=merge_gate_only)
+        return any("c" in option and building_command(script, suite_runner_only=suite_runner_only)
                    for option, script in zip(arguments, arguments[1:]) if option.startswith("-"))
-    if program == "merge_gate.py":
+    if runs_suite_runner(words):
         return True
     if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", program) or (program == "py" and Path(words[0]).parent.name == "lib"):
         while arguments and arguments[0].startswith("-"):
@@ -85,8 +91,8 @@ def builds(words: list[str], *, merge_gate_only: bool = False) -> bool:
             if option.startswith(("-c", "-m")):
                 return False
             arguments = arguments[2:] if option in {"-W", "-X", "--check-hash-based-pycs"} else arguments[1:]
-        return bool(arguments and Path(arguments[0]).name == "merge_gate.py")
-    if merge_gate_only:
+        return runs_suite_runner(arguments)
+    if suite_runner_only:
         return False
     if program != "cargo":
         return False
@@ -98,7 +104,7 @@ def builds(words: list[str], *, merge_gate_only: bool = False) -> bool:
     return bool(arguments and arguments[0] in CARGO_BUILDS)
 
 
-def building_command(command: str, *, merge_gate_only: bool = False) -> bool:
+def building_command(command: str, *, suite_runner_only: bool = False) -> bool:
     if not CANDIDATE.search(command):
         return False
     command = scan_text("Bash", {"command": command}).replace("\\\n", "")
@@ -108,12 +114,12 @@ def building_command(command: str, *, merge_gate_only: bool = False) -> bool:
     words: list[str] = []
     for word in lexer:
         if word and all(char in ";&|()\n" for char in word):
-            if builds(words, merge_gate_only=merge_gate_only):
+            if builds(words, suite_runner_only=suite_runner_only):
                 return True
             words = []
         else:
             words.append(word)
-    return builds(words, merge_gate_only=merge_gate_only)
+    return builds(words, suite_runner_only=suite_runner_only)
 
 
 def decide(raw: str) -> str:
@@ -145,8 +151,8 @@ def decide(raw: str) -> str:
         reason = hold_applies()
     except HoldStateReadError as error:
         return f"natedev hold state cannot be read: {' '.join(str(error).split())}"
-    if reason and building_command(command, merge_gate_only=True):
-        return reason + " The merge gate waits for the hold to end. Run it after the release."
+    if reason and building_command(command, suite_runner_only=True):
+        return reason + " This run waits for the hold to end. Run it after the release."
     return reason
 
 

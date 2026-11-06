@@ -21,6 +21,7 @@ def module_times() -> ModuleTimes:
 def gate_run() -> GateRun:
     times = module_times()
     return {
+        "step": "merge-gate", "dirty_paths": [], "dirty_path_count": 0,
         "started_at": "2026-11-03T12:00:00.000Z", "ended_at": "2026-11-03T12:00:05.000Z",
         "wall_s": 5.0, "hold_wait_s": 1.0, "selection": "affected", "reason": "fixture change",
         "status": 1, "max_jobs": 2, "peak_mib": 30.0, "cap_mib": 100.0,

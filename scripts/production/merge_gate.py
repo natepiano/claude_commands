@@ -16,8 +16,8 @@ After the parallel pass, up to eight failed test modules run once more, alone.
 Runner-killed jobs and the type check do not run again. Each test module uses a
 builds.slice scope when its probe succeeds, unless disabled or already in that slice.
 --tests-only runs the same suite runner without changing git refs or files.
-Clean trees reuse full passes on the same host, or select affected modules from a
-certified ancestor. --full forces all modules; --nightly validates a shared clone.
+Clean trees reuse full passes on the same host. Merge gates run all modules.
+Full tests select affected modules from a certified ancestor. --nightly validates a shared clone.
 Type jobs still run as before.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -60,6 +60,7 @@ import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib import build_folders
+from scripts.lib.build_steps import read_step_names
 from scripts.production import change_review, staff  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
@@ -144,6 +145,12 @@ class GateArguments(argparse.Namespace):
     promote_only: bool = False
     full: bool = False
     nightly: bool = False
+
+
+class SuiteMode(Enum):
+    """Choose the step and whether the runner selects affected modules."""
+    MERGE_GATE = "merge-gate"
+    FULL_TEST = "full-test"
 
 
 class GateJobKind(Enum):
@@ -334,12 +341,13 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
 
 
 @contextmanager
-def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldWait) -> Generator[QueuePlace]:
+def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldWait,
+                     mode: SuiteMode = SuiteMode.MERGE_GATE) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
     cap = cap_mib * (1 << 20)
     try:
-        with queue_place("merge-gate", repo,
+        with queue_place(mode.value, repo,
                          sizing=memory_admit.FixedCapSizing(cap),
                          before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
             yield place
@@ -417,7 +425,7 @@ def fetch_branches(repo: Path, *branches: str) -> None:
 def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess[str]:
     with subprocess.Popen(arguments, cwd=repo, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, start_new_session=True) as process:
+                          text=True, errors="replace", start_new_session=True) as process:
         try:
             output, errors = process.communicate()
         except BaseException:
@@ -732,11 +740,22 @@ class CleanTestTree:
 @dataclass(frozen=True)
 class UnrecordableTestTree:
     reason: str
+    dirty_paths: tuple[str, ...] = ()
 
 
 def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
-    if checked_git(repo, "status", "--porcelain", "--untracked-files=all"):
-        return UnrecordableTestTree("checkout is dirty")
+    status = git(repo, "status", "--porcelain", "-z", "--untracked-files=all")
+    if status.returncode:
+        raise GateRefused(f"git status: {failure_detail(status)}")
+    entries = iter(status.stdout.split("\0"))
+    paths: list[str] = []
+    for entry in entries:
+        if entry:
+            paths.append(entry[3:])
+            if "R" in entry[:2] or "C" in entry[:2]:
+                _ = next(entries, "")
+    if paths:
+        return UnrecordableTestTree("checkout is dirty", tuple(paths))
     return CleanTestTree(checked_git(repo, "rev-parse", "HEAD^{tree}"), checked_git(repo, "rev-parse", "HEAD"))
 
 
@@ -874,7 +893,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
                     suite_finished: dict[str, float], *, started_at: float, wall_s: float,
                     hold_wait_s: float, selection: AffectedSelection | FullSuite, reused: bool,
                     reason: str, status: int, max_jobs: int, peak_mib: float, cap_mib: float,
-                    aborted: bool) -> None:
+                    aborted: bool, mode: SuiteMode) -> None:
     """Build one gate record without changing the gate verdict."""
     try:
         slow_test_s = gate_record.slow_test_s()
@@ -898,7 +917,10 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             "status": status, "max_jobs": max_jobs, "peak_mib": peak_mib, "cap_mib": cap_mib,
             "checkout": str(ledger.repo), "branch": branch, "sha": sha,
             "tree": ledger.tree.tree if isinstance(ledger.tree, CleanTestTree) else "",
-            "source": ledger.source, "aborted": aborted, "dirty": isinstance(ledger.tree, UnrecordableTestTree),
+            "source": ledger.source, "step": mode.value, "aborted": aborted,
+            "dirty": isinstance(ledger.tree, UnrecordableTestTree),
+            "dirty_paths": list(ledger.tree.dirty_paths[:50]) if isinstance(ledger.tree, UnrecordableTestTree) else [],
+            "dirty_path_count": len(ledger.tree.dirty_paths) if isinstance(ledger.tree, UnrecordableTestTree) else 0,
             "suites": suites, "modules": modules, "slow_test_s": slow_test_s,
         }
     except Exception as error:
@@ -918,7 +940,8 @@ def module_runner(repo: Path) -> Path:
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
-               source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False) -> GateRun:
+               source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
+               mode: SuiteMode = SuiteMode.MERGE_GATE) -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
     if module_time_limit_s <= 0:
@@ -943,14 +966,22 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     except (GateRefused, OSError) as error:
         tested_tree = UnrecordableTestTree(str(error))
         print(f"Test tree unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
+    if isinstance(tested_tree, UnrecordableTestTree) and tested_tree.dirty_paths:
+        print(f"Dirty checkout: {len(tested_tree.dirty_paths)} paths", flush=True)
     suites = sorted({suite for suite, _ in modules})
     ledger = PassedTreeLedger(repo, source, tested_tree, suites)
     required = full_required()
     reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
     selection: AffectedSelection | FullSuite = FullSuite("passed tree reused")
     if not reused:
-        selection = (required if isinstance(required, FullSuite) else FullSuite("--full") if full else
-                     select_affected(repo, ledger.certified_base(), [path for _, path in modules], state_dir=gate_state_dir()))
+        if isinstance(required, FullSuite):
+            selection = required
+        elif full:
+            selection = FullSuite("--full")
+        elif mode is SuiteMode.MERGE_GATE:
+            selection = FullSuite(f"{read_step_names().prose(mode.value)} runs all modules")
+        else:
+            selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], state_dir=gate_state_dir())
         report_selection(selection, len(modules))
         if isinstance(selection, AffectedSelection):
             selected = set(selection.modules)
@@ -998,7 +1029,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
                         wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
                         reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
-                        cap_mib=memory_cap_mib, aborted=aborted)
+                        cap_mib=memory_cap_mib, aborted=aborted, mode=mode)
 
     @contextmanager
     def record_on_abort() -> Generator[None, None, None]:
@@ -1011,10 +1042,10 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
 
     with (record_on_abort(),
           build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-              build_folders.FOLDER_PREFIXES["merge-gate"], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
-          gate_reservation(repo, memory_cap_mib, temporary, hold) as reservation,
+              build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          gate_reservation(repo, memory_cap_mib, temporary, hold, mode) as reservation,
           shared_cpu_pool() as cpu_pool):
-        environment = {**os.environ, "TMPDIR": str(temporary)}
+        environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
         types_python = typecheck_python() if type_dirs else ""
         types_suite, types_module = gate_record.TYPE_CHECK_JOB
         if isinstance(types_python, Path):
@@ -1060,7 +1091,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     request = pending.popleft()
                     suite, path = request.suite, request.path
                     root = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-                        build_folders.FOLDER_PREFIXES["merge-gate-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary)))
+                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary)))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -1607,27 +1638,41 @@ def nightly(args: GateArguments) -> int:
         return 1
 
 
+def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
+    _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
+    _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
+    _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
+                            help="sampled memory admission cap in MiB (default: 6144); full-tree basedpyright peaked at 4065 MiB on 2026-10-30, reserving 4878 MiB")
+    _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
+                            help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
+    _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
+
+
+def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
+    try:
+        with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
+            return 0 if run_suites(Path(args.repo).resolve(), args.memory_cap_mib, args.type_dirs,
+                                   module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode).passed else 1
+    except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+        return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
+    add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
                             help="the production doc whose header names the list (default: the calling showrunner's)")
-    _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
     _ = parser.add_argument("--promote", action="store_true")
     _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")
     _ = parser.add_argument("--ssh", default="ssh")
     _ = parser.add_argument("--mac-host", default="mac")
     _ = parser.add_argument("--mac-repo", default="~/.claude")
-    _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
-                            help="sampled memory admission cap in MiB (default: 6144); full-tree basedpyright peaked at 4065 MiB on 2026-10-30, reserving 4878 MiB")
-    _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
-                            help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
-    _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
@@ -1643,14 +1688,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
+    if args.tests_only:
+        return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
         with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             if args.nightly:
                 return nightly(args)
-            if args.tests_only:
-                return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
-                                       args.type_dirs,
-                                       module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
             if args.promote_only:
                 promote(args)
                 return 0

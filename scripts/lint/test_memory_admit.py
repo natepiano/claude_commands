@@ -2591,6 +2591,7 @@ class BuildShapePromiseTests(BuildPromiseFixture):
 
     def test_changed_dev_margin_changes_only_the_next_estimate(self) -> None:
         from scripts.build_queue.queue_evidence import need_text
+        from scripts.lib.build_steps import read_step_names
         from scripts.lib.user_zone import user_zone
 
         shape = build_shape(["cargo", "build", "--bin", "hana"])
@@ -2607,12 +2608,14 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.assertEqual(self.same_shape_basis(after).factor, rule)
         self.assertEqual(gate.read_need_basis(saved), before.basis)
         text = need_text(gate.RecordedNeed(after.source, after.count, 14, "full", "", (),
-                                         gate.WidthNotRecorded(), after.basis), zone=user_zone())
+                                         gate.WidthNotRecorded(), after.basis), zone=user_zone(),
+                         names=read_step_names())
         self.assertIn(f"{config.dev_size_margin_bytes / GIB:.1f} GiB", text)
         self.assertIn(f"{config.dev_size_factor:g}", text)
 
     def test_changed_release_headroom_changes_only_the_next_estimate(self) -> None:
         from scripts.build_queue.queue_evidence import need_text
+        from scripts.lib.build_steps import read_step_names
         from scripts.lib.user_zone import user_zone
 
         self.sample(6)
@@ -2628,7 +2631,8 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.assertEqual(self.same_shape_basis(after).factor, rule)
         self.assertEqual(gate.read_need_basis(saved), before.basis)
         text = need_text(gate.RecordedNeed(after.source, after.count, 14, "full", "", (),
-                                         gate.WidthNotRecorded(), after.basis), zone=user_zone())
+                                         gate.WidthNotRecorded(), after.basis), zone=user_zone(),
+                         names=read_step_names())
         self.assertIn(f"release headroom × {config.release_headroom:g}", text)
 
     def test_sparse_build_history_keeps_its_shape_rule_above_a_lower_pool(self) -> None:

@@ -23,6 +23,7 @@ if __package__ in (None, ""):
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_service import SystemClock
+from scripts.lib.build_steps import read_step_names
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit as gate
 
@@ -579,8 +580,7 @@ class WaitOutput:
             "pooled": f"the 90th percentile of {count} measured runs of this step in every repo",
             "shape": ("the same-shape fallback: no earlier builds" if not count else
                       f"a same-shape promise from {count} earlier builds")}
-        program = "the merge gate" if snapshot.step == "merge-gate" else snapshot.step
-        description = (f"{program}'s memory cap ({peak.bytes / gate.GIB:.1f} GiB)" if peak.source == "cap" else
+        description = (f"{read_step_names().memory_cap_text(snapshot.step)} ({peak.bytes / gate.GIB:.1f} GiB)" if peak.source == "cap" else
                        descriptions.get(peak.source, "no history, so the fallback"))
         prefix = ("waiting for memory since " + datetime.fromtimestamp(CLOCK.now(), user_zone()).strftime("%H:%M %Z")
                   if first else f"still waiting for memory ({int(now - self.started) // 60} min)")

@@ -36,6 +36,10 @@ else:
     import store
 
 
+SUITE_RUNNERS = frozenset({"merge_gate.py", "full_test.py"})
+SUITE_MODULES = frozenset(("-m", f"scripts.production.{Path(name).stem}") for name in SUITE_RUNNERS)
+
+
 @dataclass(frozen=True)
 class AllowedBuild:
     process: build_hold.AuditProcess
@@ -141,17 +145,20 @@ def python_target(arguments: tuple[str, ...]) -> tuple[str, ...]:
     return ()
 
 
+def runs_suite_runner(target: tuple[str, ...]) -> bool:
+    return target[:2] in SUITE_MODULES or bool(target) and Path(target[0]).name in SUITE_RUNNERS
+
+
 def is_waiting_gate(process: build_hold.AuditProcess) -> bool:
     # These scripts wait themselves. A quoted mention in a shell command is not a script path.
     if not process.argv:
         return False
     executable = Path(process.argv[0]).name
-    if executable in {"verify.sh", "merge_gate.py"}:
+    if executable == "verify.sh" or runs_suite_runner(process.argv):
         return True
     if executable.startswith("python"):
         target = python_target(process.argv[1:])
-        return (target[:2] == ("-m", "scripts.production.merge_gate")
-                or bool(target) and Path(target[0]).name == "merge_gate.py")
+        return runs_suite_runner(target)
     if executable not in {"bash", "sh", "dash", "zsh"}:
         return False
     for argument in process.argv[1:]:
@@ -172,7 +179,7 @@ def is_build(process: build_hold.AuditProcess) -> bool:
             arguments = arguments[1:]
         if arguments in {("-vV",), ("-V",), ("--version",)}:
             return False
-    if names & ((build_hold.AUDIT_COMMANDS - {"cargo"}) | {"clippy-driver", "pytest", "py.test", "basedpyright", "merge_gate.py"}):
+    if names & ((build_hold.AUDIT_COMMANDS - {"cargo"}) | {"clippy-driver", "pytest", "py.test", "basedpyright"} | SUITE_RUNNERS):
         return True
     if "rust-analyzer" in names:
         # Ownership needs ancestors, so it is checked by decide_builds.
@@ -182,8 +189,8 @@ def is_build(process: build_hold.AuditProcess) -> bool:
             return True
         target = python_target(process.argv[1:])
         return (target[:2] in {("-m", "unittest"), ("-m", "pytest")}
-                or target[:2] == ("-m", "scripts.production.merge_gate")
-                or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "merge_gate.py", "basedpyright"}
+                or runs_suite_runner(target)
+                or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "basedpyright"}
                                      or Path(target[0]).match("test_*.py")))
     if names & {"node", "nodejs"}:
         return any(Path(argument).name in {"basedpyright", "basedpyright.js"} for argument in process.argv[1:])
@@ -230,7 +237,7 @@ def protected_reason(
         # Missing, stale and unreadable records grant no permission.
         return ""
     if is_waiting_gate(process):
-        return "verify.sh or merge_gate.py waits at its own hold gate"
+        return "verify.sh or a suite runner waits at its own hold gate"
     if any(is_sccache_server(item) for item in (process, *ancestors)):
         return "sccache server compiles for the holder too"
     lineage = (process, *ancestors)

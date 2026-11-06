@@ -32,7 +32,7 @@ MERGE_GATE_COMMANDS = (
     "bash -lc 'python3 merge_gate.py --tests-only'",
     "env CHECK=1 python3 -W ignore -X dev -- merge_gate.py --help",
 )
-MERGE_GATE_REFUSAL = REFUSAL + " The merge gate waits for the hold to end. Run it after the release."
+MERGE_GATE_REFUSAL = REFUSAL + " This run waits for the hold to end. Run it after the release."
 
 
 class BuildHoldGuardTest(TemporaryGuardTest):

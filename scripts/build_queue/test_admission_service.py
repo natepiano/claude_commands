@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
+from scripts.lib.build_steps import read_step_names
 from scripts.lint import memory_admit as gate
 
 if TYPE_CHECKING:
@@ -2813,10 +2814,10 @@ class CutoverServiceTests(unittest.TestCase):
                 self.assertEqual(waiter.get("need_source"), "cap")
                 self.assertEqual(gate.read_need_basis(waiter.get("need_basis")), gate.ProgramMemoryCap("merge-gate"))
                 self.assertEqual(queue_evidence.charge_text(running.basis, user_zone(), explained.explanation.policy,
-                    running.step.step), "merge gate promise: holds until the step ends")
+                    running.step.step, names=read_step_names()), "merge gate promise: holds until the step ends")
                 self.assertEqual(queue_evidence.need_text(gate.RecordedNeed("cap", 0, gate.HISTORY_DAYS,
                     "full", "", (), gate.WidthNotRecorded(), gate.read_need_basis(waiter.get("need_basis"))),
-                    zone=user_zone()),
+                    zone=user_zone(), names=read_step_names()),
                     "the merge gate's memory cap")
                 self.assertEqual(fixture.server.reservations[request.episode].need, 6 * GIB)
 

@@ -8,6 +8,15 @@ from pathlib import Path
 from typing import Protocol
 
 
+SUITE_RUNNERS = frozenset({"merge_gate.py", "full_test.py"})
+SUITE_MODULES = frozenset(("-m", f"scripts.production.{Path(name).stem}") for name in SUITE_RUNNERS)
+
+
+def runs_suite_runner(command: tuple[str, ...]) -> bool:
+    names = {Path(argument).name for argument in command}
+    return bool(names & SUITE_RUNNERS) or any(tuple(pair) in SUITE_MODULES for pair in zip(command, command[1:]))
+
+
 class ProcessIdentity(Protocol):
     @property
     def parent(self) -> int: ...
@@ -137,7 +146,7 @@ class ScopeActivityReader:
                 return NoLiveBuildRun()
             command = self.command(ancestor)
             names = {Path(arg).name for arg in command}
-            if (names & {"verify.sh", "merge_gate.py"}
+            if ("verify.sh" in names or runs_suite_runner(command)
                     or "mesh_runs.py" in names and "supervise" in command):
                 return LiveBuildRun(ancestor, self.processes[ancestor].start, self.started_at(ancestor))
         return NoLiveBuildRun()

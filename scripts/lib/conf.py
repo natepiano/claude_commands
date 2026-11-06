@@ -208,6 +208,13 @@ def read(file: str | Path) -> ConfigRead:
     return ConfigRead(file, source, settings, "CONF_DIR" not in os.environ)
 
 
+def read_or_repository(stem: str) -> ConfigRead:
+    """Use the repository file when the fixture has no copy."""
+    if "CONF_DIR" in os.environ and not path(stem).exists():
+        return read(_repository_path(stem))
+    return read(stem)
+
+
 def directory() -> Path:
     """Return the live configuration folder, or the test fixture override."""
     return Path(os.environ.get("CONF_DIR") or "~/.claude/config").expanduser()
