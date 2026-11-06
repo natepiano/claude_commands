@@ -759,7 +759,47 @@ The audit and repository scan share `scratch.conf` `repo_skip`.
 The audit also keeps the configured `scratch.visible_root()`.
 `rust_roots.txt` remains a list file. All moved values retain their previous defaults.
 
-Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them; sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27). Each scratch folder now belongs to a task, and the task's end removes it. `scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes one and prints its path; `adopt`, `hold`, `release`, `renew`, `end` and `list` do the rest. A task is `run:<run id>`, which `end_session.sh` ends; `phase:<unit>/<phase>`, which `merge_checkpoint.py` ends after it records the phase's code checkpoint; `gate:<id>`, which the gate's caller ends; `row:<showrunner>-C<n>`, which `change_review.py verdict` ends whichever way the verdict goes; or `until:<time>` (`--until YYYY-MM-DD [HH:MM]`), which the hourly tmp sweep ends when the time passes. Creation and hand-over accept a `phase:<unit>/<phase>` task only when the phase id is in that unit's recorded plan. A missing or unreadable plan refuses the new task and names the cause; use a real phase id, `gate:<id>` or `--until <when>`. Existing tasks with an invalid phase id can still update and end. With no task a folder lasts 24 h. The sweep keeps a task's folder while the task is open and removes any after 7 idle days. `scratch.py hold <path> --reason <why>` (or `change_review.py add --hold <path>`) keeps a folder where it is until its task ends, recorded in `~/.local/state/scratch/holds.json`; `end` removes it then, unless a repo in it holds work on no remote (uncommitted changes, a stash, commits on no remote), which stays with its hold marked ended. A folder is `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`; `--visible` (rows only) puts it at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds `.scratch.json` with its task, maker session and times. A git worktree goes through `git worktree remove`. A failed removal warns and never fails the merge or the verdict.
+Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them.
+Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
+Each scratch folder belongs to a task. The task's end removes its folders.
+`scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py list` shows each folder's task and last change.
+The other commands are `adopt`, `hold`, `release`, `renew` and `end`.
+
+Tasks use these forms:
+
+- `run:<run id>` ends through `end_session.sh`.
+- `phase:<unit>/<phase>` ends through `merge_checkpoint.py` after the phase's code checkpoint.
+- `gate:<id>` ends through the gate's caller.
+- `row:<showrunner>-C<n>` ends through `change_review.py verdict` after either verdict.
+- `until:<YYYY-MM-DDTHHMMZ>/<id>` ends through the hourly temporary sweep when its time passes.
+
+`--until YYYY-MM-DD [HH:MM]` selects a deadline in the user's time zone.
+Each call creates a random task id from `scratch.conf` `suffix_length` characters.
+Folders with the same deadline have separate tasks.
+The folder name includes the deadline stamp but excludes the task id.
+With no task, each folder gets a separate deadline task that lasts 24 hours.
+The deadline reader also accepts old tasks without an id.
+`scratch.py end --task <task>` selects folders by their exact task.
+
+Creation and transfer accept a `phase:<unit>/<phase>` task only when the phase id appears in that unit's recorded plan.
+A missing or unreadable plan refuses the new task and names the cause.
+Use a recorded phase id, `gate:<id>` or `--until <when>`.
+Existing tasks with an invalid phase id can still update and end.
+The sweep keeps a task's folder while the task remains open.
+It removes folders after seven idle days, even when the task remains open.
+
+`scratch.py hold <path> --reason <why>` keeps a folder at its path until its task ends.
+`change_review.py add --hold <path>` also creates a hold.
+The hold record stays in `~/.local/state/scratch/holds.json`.
+`end` removes the held folder unless a repository in it has uncommitted changes, a stash or commits absent from all remotes.
+The folder stays with its hold marked ended.
+
+A folder uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
+`--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
+Each folder holds `.scratch.json` with its task, maker session and times.
+A Git worktree uses `git worktree remove` for removal.
+A failed removal prints a warning and does not fail the merge or the verdict.
 
 The scratch guard, a `PreToolUse` hook on `Bash` for Claude Code (`settings.json`) and Codex (`codex_hooks.py`), refuses a command that makes a new folder directly in /tmp, `$TMPDIR`, /tmp/claude, ~/rust or ~/rust/scratch (and judges a Write or NotebookEdit file path where its matcher names them): mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/-a, rsync, cargo new/init, and tar extraction into a root. Allowed there: the session scratchpads (`/tmp/claude-<uid>`), `/tmp/claude/unit`, `/tmp/claude/delegate`, `/tmp/claude/session` and both scratch roots; ~/worktrees is no root, and a `make_a_worktree` command is never judged. A heredoc body, a quoted argument and a comment are data. A path the hook cannot follow (a variable other than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed, and the hourly tmp sweep is the backstop. A `TMPDIR` inside a session scratchpad, a session temp root or a run folder is no root.
 Before its checks, the scratch guard uses the session-start path helper to restore only the input session id's missing temp folder with mode `0700`; an existing folder costs one `os.stat`, a missing or invalid id creates nothing, and a repair error allows the tool call to proceed to the checks.
