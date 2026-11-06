@@ -2741,9 +2741,60 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 **Ruled out:** A retry of every changed listing, because a new descriptor must refuse.
 
+### Phase 14g — A worker from an earlier phase can be ended  · status: done
+
+**Depends on:** none. It lands before the switch, because the switch ends each open pane worker (user, 2026-11-06: "you have numerous open panes").
+
+#### Work Order
+
+**Goal:** `worker.py end <name>` ends an idle pane worker whose last pass finished in an earlier phase of the run, or in an earlier run.
+
+**Spec:** `worker_panes.can_close` reads the worker's pass through `worker_pass`, which reads only the recorder's current `pass` map. A phase boundary clears that map. So `can_close` returns `Kept("launcher has not recorded a completed pass")` for each idle worker with no pass in the open phase.
+1. `can_close` reads the resolved run's pass through `worker_pass` first, so an explicit run and a showrunner's worker keep their evidence. With no pass there, it reads `progress_history.last_dispatch(row.id)`, the one reader across the parent's runs. It requires status `completed`, and takes the dispatch id from that pass's `instance_id`.
+2. `can_close` keeps its other checks: the idle checks, the agent status, the transcript's complete records, and a last reply that ends with `DONE <id>` or `DONE <id>-2`.
+3. A newest pass with any other status, or no recorded pass, stays `Kept`.
+
+**Files:**
+- `scripts/herdr/worker_panes.py` — `can_close`.
+- `scripts/herdr/test_worker_panes.py` — the regression tests.
+
+**Workers:** `1 writer` — `impl` owns both files.
+
+**State:** none.
+
+**Acceptance gate:** basedpyright 0/0 on both files and on the callers `scripts/production/worker.py` and `scripts/accounts/pane_moves.py`. `test_worker_panes` and `test_worker` pass. A test with a pass that finished before a phase boundary fails without the repair and passes with it. Live, on the installed tree: `worker.py end review3` exits 0 and closes its pane.
+
+### Phase 14h — A friend launches with the worker policy  · status: done
+
+**Depends on:** Phase 14g, because both phases change `scripts/herdr/worker_panes.py`.
+
+#### Work Order
+
+**Goal:** A friend of either family replies with `send.py` and stops at no permission prompt. `side_pane._policy` reads the worker policy, with no second copy (sdlc, 2026-11-06).
+
+**Spec:** `side_pane._policy` names `READ_ONLY_SANDBOX` and permission mode `plan` and copies the compaction read from `worker_panes.launch_policy`. Live: a Codex friend's `send.py` fails with a socket refusal. A Claude friend stops at a prompt when it writes a plan.
+1. `worker_panes` gets one public function, `worker_policy(settings)`. It returns the `LaunchPolicy` of a worker that writes files, for those model settings.
+2. `launch_policy(role)` and `worker_policy` share one private function for the permission and the compaction read, so each rule has one place.
+3. `side_pane._policy` calls `worker_panes.worker_policy` with the `ask_a_friend.consultation` settings. `side_pane.py` names no sandbox and no permission mode. It still turns `conf.Unusable` into `SidePaneRefused`.
+4. `commands/ask_a_friend.md` keeps step 2's instruction to change files only after an explicit implementation request. It states that the friend has worker permissions, so this instruction is what holds it back.
+5. `docs/as-built/agent-registry.md` states the friend's policy in its `side_pane.py` section.
+
+**Files:**
+- `scripts/herdr/worker_panes.py` — `worker_policy` and the shared private function.
+- `scripts/herdr/side_pane.py` — `_policy`.
+- `scripts/herdr/test_side_pane.py` — the regression tests.
+- `commands/ask_a_friend.md` — the statement of the friend's permissions.
+- `docs/as-built/agent-registry.md` — the friend's policy.
+
+**Workers:** `1 writer` — `impl` owns all files.
+
+**State:** none.
+
+**Acceptance gate:** basedpyright 0/0 on `scripts/herdr/worker_panes.py`, `scripts/herdr/side_pane.py`, `scripts/herdr/test_side_pane.py` and the caller `scripts/production/worker.py`. `test_side_pane` and `test_worker_panes` pass. A test reads the arguments `side_pane.open` gives to the launch, for both families: Codex carries `--sandbox danger-full-access`, Claude carries `--permission-mode bypassPermissions`, and neither carries a read-only mode. That test fails without the repair. Live, from the phase's tree: one friend of each family opens beside the director, replies with `send.py`, stops at no prompt and closes with `side_pane.py close`.
+
 ### Phase 15 — Pilot and default switch  · status: todo
 
-**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14d, Phase 14e, Phase 14f. The switch waits for Phase 14d on main, because an Astra review from a mesh-pinned caller stays on the mesh (user and sdlc, 2026-11-06).
+**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14d, Phase 14e, Phase 14f, Phase 14g, Phase 14h. The switch waits for Phase 14d on main, because an Astra review from a mesh-pinned caller stays on the mesh (user and sdlc, 2026-11-06).
 
 #### Work Order
 
