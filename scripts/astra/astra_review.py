@@ -12,7 +12,6 @@ A failed review exits 1. A missing document or refused admission exits 2.
 from __future__ import annotations
 
 import os
-import json
 import subprocess
 import sys
 import time
@@ -20,7 +19,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.astra import astra_roles  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
@@ -99,51 +97,15 @@ def tail(text: str) -> str:
 
 
 def _managed_review(review: Path, log: Path) -> int:
-    """Use the worker command for a managed one-turn review."""
-    from contextlib import redirect_stderr, redirect_stdout
-    import io
-    from scripts.production import worker
-    from typing import cast
-
+    """Run one managed review through assign.sh."""
     run = log.parent
-    name = f"astra-reviewer{os.getpid()}"
-    opened = False
-    held = ""
-    result = 1
-    with log.open("w", encoding="utf-8") as output, redirect_stdout(output), redirect_stderr(output):
-        try:
-            for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(Path.cwd())],
-                              ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
-                               "--phase-title", "Astra review"]):
-                recorded = subprocess.run([sys.executable, str(SCRIPTS / "direct/progress_history.py"), *arguments],
-                                           stdout=output, stderr=output, text=True, check=False)
-                if recorded.returncode:
-                    return recorded.returncode
-            with redirect_stdout(io.StringIO()) as published:
-                result = worker.main(["add", "astra-reviewer", "--name", name, "--json"])
-            if result:
-                return result
-            opened = True
-            member = cast(dict[str, str], json.loads(published.getvalue()))
-            role = astra_roles.hold("reviewer", member["id"], pid=os.getpid())
-            held = role["staff_id"] if role is not None else ""
-            design_roles.assign_and_finish(["assign", "astra-reviewer", str(run / "prompt.md"),
-                "--name", name, "--session-dir", str(run), "--slot", name, "--phase", "astra-review",
-                "--kind", "astra", "--reply", str(review),
-                "--launcher-command", json.dumps([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])],
-                run=run, name=name)
-            result = 0
-        except (OSError, ValueError, design_roles.RoleRefused) as error:
-            print(f"astra_review: reviewer role unavailable: {error}", file=sys.stderr)
-            result = 1
-        finally:
-            if opened:
-                ended = worker.main(["end", name, "--session-dir", str(run)])
-                if ended:
-                    result = 1
-                elif held:
-                    astra_roles.release(held)
-    return result
+    with log.open("w", encoding="utf-8") as output:
+        return subprocess.run([
+            "bash", str(SCRIPTS / "direct/assign.sh"), "--role", "review", "--operation", "astra-review",
+            "--new-worker", f"astra-reviewer{os.getpid()}", "--session-dir", str(run), "--cwd", str(Path.cwd()),
+            "--prompt", str(run / "prompt.md"), "--summary", str(review), "--log", str(run / "turn.log"),
+            "--model", MODEL, "--effort", REASONING,
+        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False).returncode
 
 
 def run_review(label: str, review: Path, prompt: str, log: Path) -> int:

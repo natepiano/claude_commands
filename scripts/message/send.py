@@ -31,7 +31,7 @@ Staff `worker:` paths deliver through observed panes or their holders.
 Mesh `worker:` addresses keep their existing queues.
 `codex:` addresses queue through the shared Codex daemon.
 One staff snapshot selects each staff recipient.
-Unit names accept the optional `-unit` suffix. Ambiguous staff names stop delivery.
+Unit names use the staff names. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
 A non-staff name uses a unique live roster session, locally before the peer.
 A name without a staff row or live session is refused without a relay or queue.
@@ -125,7 +125,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -139,7 +139,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import process_group
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, unit_names
-from scripts.lib import conf, unit_runs
+from scripts.lib import conf, process_start, unit_runs
+from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
 from scripts.message import send_budget
 from scripts.message.send_result import (
@@ -340,6 +341,9 @@ QueuedMessage = KeyedMessage | UnkeyedMessage
 class PendingDelivery(TypedDict):
     started: str
     limit_seconds: float
+    owner_pid: NotRequired[int]
+    owner_start: NotRequired[str]
+    clearing: NotRequired[Emergency]
 
 
 class KeyState(TypedDict):
@@ -347,6 +351,7 @@ class KeyState(TypedDict):
     last: dict[str, str]
     pending: NotRequired[dict[str, str | PendingDelivery]]
     acknowledged: NotRequired[str]
+    clearing: NotRequired[Emergency]
 
 
 KeyStates = dict[str, KeyState]
@@ -782,12 +787,6 @@ def as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def write_atomic(path: Path, text: str) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    _ = tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
 @contextmanager
 def locked() -> Generator[None]:
     STATE.mkdir(parents=True, exist_ok=True)
@@ -1075,8 +1074,13 @@ def write_emergencies(records: list[Emergency]) -> None:
 def record_emergency(record: Emergency) -> None:
     """Keep a sent emergency push for clear-check; it replaces an older record with its sender and key."""
     with locked():
-        kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
-        write_emergencies([*kept, record])
+        _record_emergency_locked(record)
+
+
+def _record_emergency_locked(record: Emergency) -> None:
+    """Replace one clearing record while the caller holds the state lock."""
+    kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
+    write_emergencies([*kept, record])
 
 
 def check_exit(command: str, timeout: float) -> int | None:
@@ -1270,10 +1274,41 @@ def pending_deliveries(state: KeyState) -> dict[str, PendingDelivery]:
             for recipient, mark in state.get("pending", {}).items()}
 
 
+def _owner_released(record: Mapping[str, object]) -> bool:
+    """Reclaim only a gone process or a confirmed replacement."""
+    pid = record.get("owner_pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return False
+    observed = process_start.process_start(pid)
+    if isinstance(observed, (process_start.Gone, process_start.Zombie)):
+        return True
+    saved = record.get("owner_start")
+    return isinstance(observed, process_start.Started) and isinstance(saved, str) and bool(saved) and observed.start != saved
+
+
+
+def _owns_attempt(record: PendingDelivery) -> bool:
+    """Only the original live process can complete its owned attempt."""
+    if "owner_pid" not in record:
+        return True
+    if record["owner_pid"] != os.getpid():
+        return False
+    observed = process_start.process_start(os.getpid())
+    return isinstance(observed, process_start.Started) and observed.start == record.get("owner_start")
+
+
+def _finish_clearing(state: KeyState) -> None:
+    """Project a clearing record while the caller holds the key lock."""
+    if "clearing" not in state:
+        return
+    _record_emergency_locked(state["clearing"])
+    del state["clearing"]
+
+
 def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
           delivery_limit: float,
           legacy_aliases: tuple[str, ...] = (), live: bool = False,
-          clears_when: str = "", posted_on: str = "") -> ClaimGranted | RepeatAccepted | RepeatPending:
+          clears_when: str = "", posted_on: str = "", emergency: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
     """Check acceptance before recording an attempt under the stable recipient.
 
     The lock prevents overlapping sends with one key from both sending.
@@ -1284,9 +1319,19 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
         return ClaimGranted()
     with key_states() as states:
         state: KeyState = states.get(message.key, {"last": {}})
+        _finish_clearing(state)
         if "acknowledged" in state:
             return RepeatAccepted(acknowledged_skip_reason(message.key, state["acknowledged"]))
         pending = pending_deliveries(state)
+        for alias in (recipient.value, *legacy_aliases):
+            attempt = pending.get(alias)
+            if attempt is None or "owner_pid" not in attempt or attempt["started"] != state["last"].get(alias):
+                continue
+            if not _owner_released(attempt):
+                return RepeatPending(f"key {message.key!r}: an earlier send to {recipient.value} is pending; not yet accepted")
+            del state["last"][alias]
+            if "pending" in state:
+                _ = state["pending"].pop(alias, None)
         # An abandoned delivery must not block a window with no end.
         timestamps = [state["last"][alias] for alias in (recipient.value, *legacy_aliases)
                       if alias in state["last"]
@@ -1308,19 +1353,29 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
                 return RepeatAccepted(still_live(message.key, message.sender, datetime.fromisoformat(last), repeat))
             minutes = repeat.total_seconds() / 60
             return RepeatAccepted(f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window")
+        attempt = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
+        if emergency:
+            owner = process_start.process_start(os.getpid())
+            if not isinstance(owner, process_start.Started):
+                return RepeatPending("emergency owner lifetime is unknown; not yet accepted")
+            attempt.update(owner_pid=os.getpid(), owner_start=owner.start)
         if clears_when:
-            clear_record = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
-                                     sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
-            # Persist recovery before the claim: a crash can leave an extra check, never an orphan claim.
-            kept = [old for old in read_emergencies() if old["key"] != clear_record["key"]]
-            write_emergencies([*kept, clear_record])
+            clearing = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
+                                 sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
+            if message.key.startswith("github.keys_cold:"):
+                # A warm-check command also clears an interrupted cold-key claim.
+                _record_emergency_locked(clearing)
+            elif emergency:
+                attempt["clearing"] = clearing
+            else:
+                _record_emergency_locked(clearing)
         state["last"][recipient.value] = at.isoformat()
-        state.setdefault("pending", {})[recipient.value] = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
+        state.setdefault("pending", {})[recipient.value] = attempt
         states[message.key] = state
     return ClaimGranted()
 
 
-def accept_sent(key: str, to: str, at: datetime) -> None:
+def accept_sent(key: str, to: str, at: datetime, *, delivered: bool = True) -> None:
     """Confirm only the claim owned by this accepted attempt."""
     with key_states() as states:
         state = states.get(key)
@@ -1330,9 +1385,17 @@ def accept_sent(key: str, to: str, at: datetime) -> None:
         owned = pending_deliveries(state).get(to)
         if owned is None or owned["started"] != at.isoformat():
             return
+        if not _owns_attempt(owned):
+            return
+        if delivered and "clearing" in owned:
+            state["clearing"] = owned["clearing"]
         del pending[to]
         if not pending:
             del state["pending"]
+    with key_states() as states:
+        state = states.get(key)
+        if state is not None:
+            _finish_clearing(state)
 
 
 def user_emergency_key(sender: str, title: str) -> str:
@@ -1366,8 +1429,10 @@ def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
         state = states.get(key)
         if state is None or to not in state["last"] or (at is not None and state["last"][to] != at.isoformat()):
             return
-        del state["last"][to]
         owned = pending_deliveries(state).get(to)
+        if at is not None and owned is not None and not _owns_attempt(owned):
+            return
+        del state["last"][to]
         if "pending" in state and (at is None or (owned is not None and owned["started"] == at.isoformat())):
             _ = state["pending"].pop(to, None)
             if not state["pending"]:
@@ -1570,12 +1635,12 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
                               entry.get("shown_sender", entry["from"]),
                               stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")))
-            if not saved:
-                _rewrite_queue(path, remaining)
-                saved = True
             started = now()
             append_record(STATE / "socket-recovery-attempts.jsonl",
                           SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
+            if not saved:
+                _rewrite_queue(path, remaining)
+                saved = True
             result = relay_socket(message, delivery_timeout(), records, metadata, membership=membership)
             log(message, result, started)
             if result.outcome != "sent":
@@ -1593,7 +1658,7 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
     return code, lines
 
 
-def pending(to: str | None) -> str:
+def pending(to: str | None, *, emit: bool = False) -> str:
     """Print and clear queued messages for the selected session.
 
     Current staff owners also receive their messages from queues for previous sessions.
@@ -1643,8 +1708,6 @@ def pending(to: str | None) -> str:
             if selected or path in paths:
                 entries.extend(selected)
                 rewrites.append((path, kept))
-        for path, kept in rewrites:
-            _rewrite_queue(path, kept)
         entries.sort(key=lambda entry: entry["time"])
         newest: dict[tuple[str, str], QueuedMessage] = {}
         unkeyed_or_legacy: list[QueuedMessage] = []
@@ -1660,11 +1723,16 @@ def pending(to: str | None) -> str:
             else:
                 unkeyed_or_legacy.append(entry)
         entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
-    return "\n\n".join(stamped_text(
-        f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
-        + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
-        "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
-        for index, entry in enumerate(entries, 1))
+        text = "\n\n".join(stamped_text(
+            f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
+            + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
+            "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
+            for index, entry in enumerate(entries, 1))
+        if emit and text:
+            print(text, flush=True)
+        for path, kept in rewrites:
+            _rewrite_queue(path, kept)
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -2289,20 +2357,20 @@ def template_fix_notice(record: dict[str, object]) -> None:
                 return
             if stamp.exists():
                 return
-            _ = stamp.write_text(text_id, encoding="utf-8")
-        recipient = "natedev"
-        try:
-            for line in review.NOTIFY_CONFIG.read_text(encoding="utf-8").splitlines():
-                name, separator, value = line.partition("#")[0].partition("=")
-                if separator and name.strip() == "TEMPLATE_FIX_SESSION" and value.strip():
-                    recipient = value.strip()
-        except OSError:
-            pass
-        text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
-        command = [sys.executable, str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
-        # Delivery and its error record run in the detached child.
-        _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            recipient = "natedev"
+            try:
+                for line in review.NOTIFY_CONFIG.read_text(encoding="utf-8").splitlines():
+                    name, separator, value = line.partition("#")[0].partition("=")
+                    if separator and name.strip() == "TEMPLATE_FIX_SESSION" and value.strip():
+                        recipient = value.strip()
+            except OSError:
+                pass
+            text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
+            command = [sys.executable, str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
+            # Delivery and its error record run in the detached child.
+            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            write_atomic(stamp, text_id)
     except OSError as error:
         print(f"send.py: template fix notice failed for {text_id}: {error}", file=sys.stderr)
         log_template_fix_error(text_id, str(error))
@@ -3019,13 +3087,14 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
     identity = replace(message, to=stable.value)
-    if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
         skip = None if refused or held is not None else confirmed_skip(identity, window, started, live=live)
         claim_result = RepeatAccepted(skip) if skip is not None else ClaimGranted()
     else:
         claim_result = ClaimGranted() if refused or held is not None else claim(
-            message, stable, window, started, delivery_limit=options.timeout,
-            legacy_aliases=legacy_aliases, live=live, clears_when=cold_check,
+            message, stable, window, started, delivery_limit=send_budget.seconds(options.timeout) if emergency else options.timeout,
+            legacy_aliases=legacy_aliases, live=live, clears_when=options.clears_when if emergency else cold_check,
+            emergency=emergency,
             posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
@@ -3118,22 +3187,20 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         _ = remove_queued_key(message.to, message.key, recipient=stable, order=order)
         if options.to != message.to:
             _ = remove_queued_key(options.to, message.key, recipient=stable, order=order)
-    if isinstance(options.recipient_identity, LogicalRecipientIdentity):
+    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
         if (not refused and held is None and isinstance(claim_result, ClaimGranted)
                 and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
             record_acceptance(identity, started)
     else:
-        # A failed send can retry. A queue or kept push owns its copy until delivery.
+        # An undelivered emergency releases its claim for a later attempt.
+        # Other queued or kept messages retain their claims until delivery.
         if (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
-                and result.outcome in {"failed", "refused", "held", "pending"}):
+                and ((emergency and result.outcome != "sent")
+                     or result.outcome in {"failed", "refused", "held", "pending"})):
             forget_sent(key, stable.value, started)
         elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
               and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
-            accept_sent(key, stable.value, started)
-    if emergency and options.clears_when and key is not None and not cold_check and result.outcome == "sent":
-        posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
-        record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
-                                   sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))
+            accept_sent(key, stable.value, started, delivered=result.outcome == "sent")
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need, options.text_id)
     if not options.no_accounting:
@@ -3252,11 +3319,9 @@ def main(argv: list[str]) -> int:
             print(reopen(key))
         case ["pending", *named] if len(named) <= 1:
             try:
-                text = pending(named[0] if named else None)
+                _ = pending(named[0] if named else None, emit=True)
             except ValueError as error:
                 usage_error(str(error))
-            if text:
-                print(text)
         case ["ack" | "reopen" | "pending" | "clear-check" | "drain-sockets", *_]:
             usage_error(f"usage: send.py {argv[0]}" + {"pending": " [NAME]", "clear-check": "",
                          "drain-sockets": ""}.get(argv[0], " KEY"))

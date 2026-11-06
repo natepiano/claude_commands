@@ -1,7 +1,7 @@
 """Exercise durable design identity with local stores and a recording mesh transport."""
 from __future__ import annotations
 
-from scripts.production import staff
+from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, fixture_unit_location, fixture_session,
     showrunner_relationship, unit_membership,
@@ -35,7 +35,9 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record, write_mesh_server_record
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.whoami import agent_accounts  # noqa: E402
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 Role = Literal["designer", "reviewer"]
 
@@ -184,6 +186,9 @@ class HeldRolePaneTests(HeldRolePaneCase):
         with self.assertRaisesRegex(design_roles.RoleRefused, "interrupted after split"):
             _ = self.panes.open("designer")
         locations = {pane: value["terminal_id"] for pane, value in self.panes.world.locations.items()}
+        _ = self.panes.command(self.panes.commands[-1])
+        design_path, = design_roles.state_root().glob("*/design.json")
+        _ = design_roles.recover(design_path.parent.name + "/designer")
         opened = self.panes.open("designer")
         repeated = self.panes.open("designer")
         self.assertEqual(repeated, opened)
@@ -270,8 +275,8 @@ class DurableRolesTests(HeldRolePaneCase):
         membership = self.panes.command_case.fixture
         document = membership.production("demo", "design-unit")
         _ = recorded_showrunner("demo", document)
-        production_membership("demo", "design-unit")
-        unit = unit_membership("demo", "design-unit")
+        production_membership("demo", "design")
+        unit = unit_membership("demo", "design")
         _ = staff.update_current_session(unit.current_session, staff.native_id(self.holder_session))
         self.repository = self.root / "checkout"
         self.repository.mkdir()
@@ -359,6 +364,53 @@ class DurableRolesTests(HeldRolePaneCase):
                     _ = worker_lifecycle.validate_worker_state(path, {**fields, field: value})
                 self.assertIn(str(path), str(error.exception))
 
+    def test_rebind_rerun_after_generation_save_finishes_context_publication(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        with stop_once(design_roles, "_save"), self.assertRaises(InjectedStop):
+            _ = design_roles.rebind(identifier, expected_generation=1, reason="next phase",
+                                    binding=self.binding(self.run_b))
+        retried = design_roles.rebind(identifier, expected_generation=1, reason="next phase",
+                                      binding=self.binding(self.run_b))
+        self.assertEqual(retried.binding, self.binding(self.run_b))
+        self.assertEqual(retried.placement.generation, 2)
+        self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
+        _ = self.resume(retried, "designer")
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(self.dispatches[-1][1], self.launches[0][1])
+
+    def test_rebind_rerun_with_current_binding_finishes_the_committed_generation(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        path = self.repository / "next-design.md"
+        _ = path.write_text("# Next design\n")
+        document = str(path)
+        with stop_once(design_roles, "_save"), self.assertRaises(InjectedStop):
+            _ = design_roles.rebind(identifier, expected_generation=1, reason="next document", document=document)
+        retried = design_roles.rebind(identifier, expected_generation=1, reason="next document", document=document)
+        self.assertEqual(retried.binding, design.binding)
+        self.assertEqual(retried.document, document)
+        self.assertEqual(retried.placement.generation, 2)
+        self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
+        _ = self.resume(retried, "designer")
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(self.dispatches[-1][1], self.launches[0][1])
+
+    def test_checkout_move_rerun_after_generation_save_finishes_routes(self) -> None:
+        design = self.open_designer()
+        destination = self.root / "moved-checkout"
+        _ = self.repository.rename(destination)
+        identifier = design.placement.design_id
+        with stop_once(design_roles, "_save"), self.assertRaises(InjectedStop):
+            design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
+        design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
+        moved = design_roles.read_design(identifier)
+        self.assertEqual(moved.repository, str(destination))
+        self.assertEqual(moved.placement.generation, 2)
+        self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
+        _ = self.resume(moved, "designer")
+        self.assertEqual(len(self.launches), 1)
+
     def authority(self, operation: str, payload: dict[str, object]) -> dict[str, object]:
         return design_roles._authority_local(operation, payload)  # pyright: ignore[reportPrivateUsage]
 
@@ -367,7 +419,7 @@ class DurableRolesTests(HeldRolePaneCase):
         directory = self.root / name
         phase = directory / "phases/1"
         phase.mkdir(parents=True)
-        owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repository)
+        owner = fixture_unit_location(showrunner_relationship("demo"), "design", self.repository)
         _ = (phase / "delegated_phase_reservation_state.json").write_text(json.dumps({
             "kind": "enrolled_awaiting_first_touch", "phase": "1"}))
         _ = (phase / "files").write_text("design.md\n")
@@ -422,6 +474,225 @@ class DurableRolesTests(HeldRolePaneCase):
         prompt = self.root / "assignment.md"
         _ = prompt.write_text(text)
         return design_roles.resume(design.placement.design_id + "/" + role, prompt)
+
+    def pane_start(self) -> PaneWorld:
+        return self.panes.world
+
+    def test_pane_open_rerun_before_unknown_save_creates_one_worker(self) -> None:
+        world = self.pane_start()
+        with stop_once(design_roles, "_begin_creation", when="before"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        path, = design_roles.state_root().glob("*/design.json")
+        saved = design_roles.read_design(path.parent.name)
+        self.assertEqual(self.instance(saved, "designer").lifecycle,
+                         design_roles.RoleNotOpened("pane-start", "not_started"))
+        opened = self.open_designer()
+        self.assertIsInstance(self.instance(opened, "designer").lifecycle, design_roles.RoleOpen)
+        self.assertEqual(len(world.launches), 1)
+        self.assertEqual([command[0] for command in self.panes.commands], ["add"])
+
+    def test_pane_open_rerun_after_add_recovers_the_idle_worker_without_another_add(self) -> None:
+        world = self.pane_start()
+        with stop_once(design_roles, "_worker_command"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        with redirect_stderr(io.StringIO()) as errors:
+            saved = self.open_designer()
+        self.assertIn("creation outcome unknown", errors.getvalue())
+        self.assertEqual(self.instance(saved, "designer").lifecycle,
+                         design_roles.RoleNotOpened("pane-start", "outcome_unknown"))
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        row = worker_admission.find_worker(staff.snapshot(), parent.id, self.instance(saved, "designer").name)
+        assert row is not None
+        recovered = design_roles.recover(saved.placement.design_id + "/designer")
+        self.assertEqual(self.instance(recovered, "designer").lifecycle, design_roles.RoleOpen(row.id))
+        self.assertEqual(self.open_designer(), recovered)
+        self.assertEqual(len(world.launches), 1)
+        self.assertEqual(sum(command[0] == "add" for command in self.panes.commands), 1)
+        self.assertTrue((self.root / "holds" / (row.id + ".json")).exists())
+
+    def test_pane_open_rerun_without_worker_evidence_retains_the_unknown_claim(self) -> None:
+        world = self.pane_start()
+        with stop_once(design_roles, "_worker_command", when="before"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        with redirect_stderr(io.StringIO()) as errors:
+            saved = self.open_designer()
+        self.assertIn("creation outcome unknown", errors.getvalue())
+        with self.assertRaisesRegex(design_roles.RoleRefused, "no recorded worker; replacement refused"):
+            _ = design_roles.recover(saved.placement.design_id + "/designer")
+        self.assertEqual(design_roles.read_design(saved.placement.design_id), saved)
+        self.assertEqual(self.instance(saved, "designer").lifecycle,
+                         design_roles.RoleNotOpened("pane-start", "outcome_unknown"))
+        self.assertEqual(self.panes.commands, [])
+        self.assertEqual(world.launches, [])
+
+    def test_pane_open_rerun_with_unknown_process_evidence_retains_the_claim(self) -> None:
+        world = self.pane_start()
+        with stop_once(design_roles, "_worker_command"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        world.unknown["w1:p1"] = "worker process evidence is unreadable"
+        with redirect_stderr(io.StringIO()) as errors:
+            saved = self.open_designer()
+        self.assertIn("creation outcome unknown", errors.getvalue())
+        with self.assertRaisesRegex(design_roles.RoleRefused, "process evidence is unavailable; worker is retained"):
+            _ = design_roles.recover(saved.placement.design_id + "/designer")
+        self.assertEqual(design_roles.read_design(saved.placement.design_id), saved)
+        self.assertEqual(self.instance(saved, "designer").lifecycle,
+                         design_roles.RoleNotOpened("pane-start", "outcome_unknown"))
+        self.assertEqual(len(world.launches), 1)
+        self.assertEqual(sum(command[0] == "add" for command in self.panes.commands), 1)
+
+    def test_pane_end_clears_unknown_creation_before_the_worker_command(self) -> None:
+        world = self.pane_start()
+        with stop_once(design_roles, "_worker_command", when="before"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        path, = design_roles.state_root().glob("*/design.json")
+        identifier = path.parent.name + "/designer"
+        with self.assertRaises(design_roles.RoleRefused) as refused:
+            _ = design_roles.recover(identifier)
+        ended = design_roles.end(identifier)
+        self.assertIsInstance(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded)
+        self.assertEqual(design_roles.end(identifier), ended)
+        self.assertIn("no recorded worker; replacement refused", str(refused.exception))
+        self.assertIn("end", str(refused.exception))
+        self.assertFalse((path.parent / "transition.json").exists())
+        self.assertEqual(self.panes.commands, [["end", self.instance(ended, "designer").name,
+                                                "--session-dir", str(self.run_a)]])
+        self.assertEqual(world.launches, [])
+
+    def test_end_unknown_creation_refuses_another_roles_creation_claim(self) -> None:
+        with stop_once(design_roles, "_worker_command", when="before"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        with stop_once(design_roles, "_worker_command", when="before"), self.assertRaises(InjectedStop):
+            _ = design_roles.open_role("fixture-repo", "design.md", "reviewer", "design",
+                                       binding=self.binding(self.run_a))
+        path, = design_roles.state_root().glob("*/design.json")
+        saved = design_roles.read_design(path.parent.name)
+        with self.assertRaisesRegex(design_roles.RoleRefused, "role is busy; an assignment claim is active"):
+            _ = design_roles.end(path.parent.name + "/designer")
+        self.assertEqual(design_roles.read_design(path.parent.name), saved)
+        self.assertFalse((path.parent / "transition.json").exists())
+        self.assertEqual(self.launches, [])
+
+    def test_pane_end_unknown_creation_finishes_the_existing_worker_cleanup(self) -> None:
+        world = self.pane_start()
+        with stop_once(design_roles, "_worker_command"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        path, = design_roles.state_root().glob("*/design.json")
+        saved = design_roles.read_design(path.parent.name)
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        row = worker_admission.find_worker(staff.snapshot(), parent.id, self.instance(saved, "designer").name)
+        assert row is not None
+        _ = world.foreground.pop("w1:p1")
+        with patch.object(world, "close_tab_confirmed", return_value=False):
+            with self.assertRaisesRegex(design_roles.RoleRefused, "pane close is incomplete"):
+                _ = design_roles.end(path.parent.name + "/designer")
+        self.assertEqual(design_roles.read_design(path.parent.name), saved)
+        self.assertIsNotNone(staff.by_id(row.id))
+        ended = design_roles.end(path.parent.name + "/designer")
+        self.assertEqual(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded(row.id))
+        self.assertEqual(design_roles.end(path.parent.name + "/designer"), ended)
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertFalse((path.parent / "transition.json").exists())
+        self.assertEqual(len(world.launches), 1)
+
+    def test_pane_rebind_rerun_before_transition_clear_finishes_publication(self) -> None:
+        world = self.pane_start()
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        transition = design_roles.design_directory(identifier) / "transition.json"
+        document = self.repository / "next-design.md"
+        _ = document.write_text("# Next design\n")
+
+        def rebind() -> design_roles.HeldDesign:
+            return design_roles.rebind(identifier, expected_generation=1,
+                                       reason="next document", document=str(document))
+
+        with (stop_once(Path, "unlink", when="before", matches=lambda path: path == transition),
+              self.assertRaises(InjectedStop)):
+            _ = rebind()
+        self.assertTrue(transition.exists())
+        saved = design_roles.read_design(identifier)
+        rebound = rebind()
+        self.assertEqual(rebound, saved)
+        self.assertEqual(rebound.document, str(document))
+        self.assertEqual(rebound.placement.generation, 2)
+        self.assertEqual(rebound.roles, design.roles)
+        self.assertFalse(transition.exists())
+        context = cast(dict[str, object], json.loads((design_roles.mesh_directory(identifier) / "design_context.json").read_text()))
+        self.assertEqual(context["generation"], 2)
+        self.assertEqual(len(world.launches), 1)
+
+    def test_pane_end_rerun_after_transport_failure_keeps_then_finishes_its_transition(self) -> None:
+        world = self.pane_start()
+        design = self.open_designer()
+        _ = world.foreground.pop("w1:p1")
+        identifier = design.placement.design_id
+        transition = design_roles.design_directory(identifier) / "transition.json"
+        lifecycle = self.instance(design, "designer").lifecycle
+        assert isinstance(lifecycle, design_roles.RoleOpen)
+        with patch.object(world, "close_tab_confirmed", return_value=False):
+            with self.assertRaisesRegex(design_roles.RoleRefused, "pane close is incomplete"):
+                _ = design_roles.end(identifier + "/designer")
+        self.assertTrue(transition.exists())
+        self.assertEqual(design_roles.read_design(identifier), design)
+        self.assertIsNotNone(staff.by_id(lifecycle.staff_id))
+        ended = design_roles.end(identifier + "/designer")
+        self.assertEqual(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded(lifecycle.staff_id))
+        self.assertFalse(transition.exists())
+        self.assertIsNone(staff.by_id(lifecycle.staff_id))
+        self.assertFalse((self.root / "holds" / (lifecycle.staff_id + ".json")).exists())
+
+    def test_pane_end_rerun_after_terminal_save_finishes_census_and_staff_cleanup(self) -> None:
+        world = self.pane_start()
+        design = self.open_designer()
+        _ = world.foreground.pop("w1:p1")
+        identifier = design.placement.design_id
+        lifecycle = self.instance(design, "designer").lifecycle
+        assert isinstance(lifecycle, design_roles.RoleOpen)
+        transition = design_roles.design_directory(identifier) / "transition.json"
+        census = self.root / "holds" / (lifecycle.staff_id + ".json")
+        with stop_once(astra_roles, "release", when="before"), self.assertRaises(InjectedStop):
+            _ = design_roles.end(identifier + "/designer")
+        self.assertEqual(self.instance(design_roles.read_design(identifier), "designer").lifecycle,
+                         design_roles.RoleEnded(lifecycle.staff_id))
+        self.assertTrue(transition.exists())
+        self.assertTrue(census.exists())
+        ended = design_roles.end(identifier + "/designer")
+        self.assertEqual(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded(lifecycle.staff_id))
+        self.assertFalse(transition.exists())
+        self.assertFalse(census.exists())
+        self.assertIsNone(staff.by_id(lifecycle.staff_id))
+        self.assertEqual(sum(command[0] == "end" for command in self.panes.commands), 1)
+        self.assertEqual(len(world.closed), 1)
+
+    def test_pane_checkout_move_rerun_before_transition_clear_keeps_generation_and_thread(self) -> None:
+        world = self.pane_start()
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        transition = design_roles.design_directory(identifier) / "transition.json"
+        destination = self.root / "moved-checkout"
+        _ = self.repository.rename(destination)
+
+        def move() -> None:
+            design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
+
+        with (stop_once(Path, "unlink", when="before", matches=lambda path: path == transition),
+              self.assertRaises(InjectedStop)):
+            move()
+        saved = design_roles.read_design(identifier)
+        self.assertTrue(transition.exists())
+        move()
+        moved = design_roles.read_design(identifier)
+        self.assertEqual(moved, saved)
+        self.assertEqual(moved.repository, str(destination))
+        self.assertEqual(moved.placement.generation, 2)
+        self.assertEqual(moved.roles, design.roles)
+        self.assertFalse(transition.exists())
+        context = cast(dict[str, object], json.loads((design_roles.mesh_directory(identifier) / "design_context.json").read_text()))
+        self.assertEqual(context["cwd"], str(destination))
+        self.assertEqual(len(world.launches), 1)
 
     def test_sibling_mesh_activity_or_claim_blocks_dispatch_and_keeps_the_binding(self) -> None:
         design = self.open_designer()
@@ -770,6 +1041,9 @@ class DurableRolesTests(HeldRolePaneCase):
         with self.assertRaises(design_roles.RoleRefused):
             _ = self.open_designer()
         count = len(self.panes.world.launches)
+        _ = self.panes.command(self.panes.commands[-1])
+        design_path, = design_roles.state_root().glob("*/design.json")
+        _ = design_roles.recover(design_path.parent.name + "/designer")
         retry = self.open_designer(request_id="another-attempt")
         self.assertEqual(len(self.panes.world.launches), count)
         self.assertIsInstance(self.instance(retry, "designer").lifecycle, design_roles.RoleOpen)
@@ -794,6 +1068,8 @@ class DurableRolesTests(HeldRolePaneCase):
         self.lose_creation_ack = True
         with self.assertRaises(TimeoutError):
             _ = self.open_designer()
+        design_path, = design_roles.state_root().glob("*/design.json")
+        _ = design_roles.recover(design_path.parent.name + "/designer")
         retried = self.open_designer()
         lifecycle = self.instance(retried, "designer").lifecycle
         self.assertIsInstance(lifecycle, design_roles.RoleOpen)
@@ -817,12 +1093,14 @@ class DurableRolesTests(HeldRolePaneCase):
 
     def test_missing_or_disallowed_configured_model_never_uses_a_fallback(self) -> None:
         config = Path(os.environ["MODELS_CONFIG_FILE"])
-        for model in (None, "unlisted-model:xhigh", "gpt-fixture:invalid-effort"):
+        for index, model in enumerate((None, "unlisted-model:xhigh", "gpt-fixture:invalid-effort")):
+            document = f"configuration-{index}.md"
+            write_text_atomic(self.repository / document, "# Private design\n")
             with self.subTest(model=model):
                 _ = write_registry(config, {"design_roles.codex": {"designer": model},
                                             "codex.agents": {"gpt-fixture": "xhigh"}})
                 with self.assertRaisesRegex(design_roles.RoleRefused, "invalid role configuration"):
-                    _ = self.open_designer()
+                    _ = self.open_designer(document=document)
         self.assertEqual(self.launches, [])
 
     def test_showrunner_cannot_open_unbound_writer_but_reviewer_is_read_only(self) -> None:
@@ -1415,6 +1693,24 @@ class DurableRolesTests(HeldRolePaneCase):
         for path, contents in saved.items():
             self.assertEqual(path.read_bytes(), contents)
         self.assertTrue(reply.is_file())
+        self.assertEqual(len(self.launches), 1)
+
+    def test_unbind_run_rerun_with_a_trailing_slash_finishes_the_saved_transition(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        arguments = ["unbind-run", str(self.run_a) + "/"]
+        with stop_once(design_roles, "_save"), self.assertRaises(InjectedStop):
+            _ = design_roles.main(arguments)
+        saved = design_roles.read_design(identifier)
+        self.assertIsInstance(saved.binding, design_roles.DesignUnbound)
+        self.assertEqual(design_roles.main(arguments), 0)
+        self.assertEqual(design_roles.read_design(identifier), saved)
+        self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
+        context = cast(dict[str, object], json.loads(
+            (design_roles.mesh_directory(identifier) / "design_context.json").read_text()))
+        self.assertEqual(context["generation"], saved.placement.generation)
+        self.assertEqual(context["binding"], {"kind": "DesignUnbound"})
+        self.assertEqual(saved.roles, design.roles)
         self.assertEqual(len(self.launches), 1)
 
     def test_end_is_terminal_and_keeps_saved_prompts(self) -> None:

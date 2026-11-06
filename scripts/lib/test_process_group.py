@@ -186,7 +186,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         self.root = Path(directory)
         scripts = Path(__file__).resolve().parents[1]
         for name in ("direct/board.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
-                     "lib/conf.sh", "lib/conf.py"):
+                     "lib/process_start.py", "lib/conf.sh", "lib/conf.py"):
             destination = self.root / "scripts" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(scripts / name, destination)

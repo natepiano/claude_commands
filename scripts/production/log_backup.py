@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keep dated copies of a production's LOG, so a LOG emptied by mistake loses at most one update interval.
 
-Usage: log_backup.py <production doc>
+Usage: log_backup.py <production name>
 
 `production_check.sh` runs this for a running production, and the notifier runs that check once per
 scheduled update tick, so every production is covered with no setup of its own. Copies go to
@@ -55,10 +55,10 @@ def backup(log: Path, directory: Path, now: datetime) -> Path | None:
 
 def main(arguments: list[str]) -> int:
     if len(arguments) != 1:
-        print("usage: log_backup.py <production doc>", file=sys.stderr)
+        print("usage: log_backup.py <production name>", file=sys.stderr)
         return 2
     try:
-        production = read_production(Path(arguments[0]))
+        production = read_production(arguments[0])
         target = backup(production.log, STATE_DIR / document_id(production.doc) / BACKUPS, datetime.now(production.zone))
     except (Refusal, OSError, staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"log_backup: {error}", file=sys.stderr)

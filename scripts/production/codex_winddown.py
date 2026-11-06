@@ -410,8 +410,9 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
 
 def count(session: str) -> int:
     try:
-        runner = showrunners.named(session)
-    except (OSError, ValueError) as error:
+        runner = {runner["session"]: runner for runner in
+                  showrunners.require_complete(showrunners.registered_showrunners())}[session]
+    except (OSError, ValueError, KeyError) as error:
         print(error, file=sys.stderr)
         return 1
     units = live_unit_names(runner)
@@ -449,7 +450,7 @@ def status() -> int:
     rows: dict[str, int] = {name: number for name, number in counts.items() if number}
     discovered = showrunners.registered_showrunners()
     for runner in discovered:
-        rows.update(listed(runner["session"] or runner["slug"], live_unit_names(runner), counts))
+        rows.update(listed(runner["session"] or runner["name"], live_unit_names(runner), counts))
     counting = ", ".join(name.removeprefix(INSTANCE) for name in instances())
     print(f"Wind-down: {'on for ' + counting if counting else 'off'}")
     print(render("Codex agents on this machine", rows, read_projections(), time.time()))

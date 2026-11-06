@@ -62,13 +62,13 @@ class UnitTransferFixture(StaffTestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)},
-                           locations={("demo", "alpha-unit"): self.unit,
-                                      ("demo", "beta-unit"): self.rust / "claude-demo-beta",
-                                      ("other", "gamma-unit"): self.root / "absent-gamma"})
-        row = unit_membership("demo", "alpha-unit")
+        bind_staff_fixture(self, self.env, {"demo": ("alpha", "beta"), "other": ("gamma",)},
+                           locations={("demo", "alpha"): self.unit,
+                                      ("demo", "beta"): self.rust / "claude-demo-beta",
+                                      ("other", "gamma"): self.root / "absent-gamma"})
+        row = unit_membership("demo", "alpha")
         self.pane("w1:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": row.id,
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha", "CLAUDE_CODE_SESSION_ID": row.id,
         })
         self.write(self.root / "state/notifier/showrunner-other/conf",
                    "TARGET=session:cc9c5b71-6f71-5499-a4bb-e6ad5d02930d\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
@@ -157,9 +157,9 @@ class UnitTransferFixture(StaffTestCase):
                    + shlex.join(["zsh", "/scripts/production_check.sh",
                                  str(self.giving / "docs/plans/demo-production.md")]) + "\n")
 
-    def production_doc(self, slug: str, checkout: Path) -> str:
-        return "\n".join(["# Production — " + slug, "", "## Production Context", "",
-                          f"- **Merge branch:** `{slug}`", f"- **Showrunner checkout:** `{checkout}`",
+    def production_doc(self, production_name: str, checkout: Path) -> str:
+        return "\n".join(["# Production — " + production_name, "", "## Production Context", "",
+                          f"- **Merge branch:** `{production_name}`", f"- **Showrunner checkout:** `{checkout}`",
                           "- **Log:** `production.log`", "", "## Production rules", "", "Rules.", ""])
 
     def write(self, path: Path, content: str) -> None:
@@ -176,8 +176,8 @@ class UnitTransferFixture(StaffTestCase):
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def transfer(self, verb: str, unit: str = "alpha-unit", to: Path | None = None) -> subprocess.CompletedProcess[str]:
-        arguments = [verb, "demo", unit, str(to or self.receiving / "docs/plans/other-production.md"),
+    def transfer(self, verb: str, unit: str = "alpha", to: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = [verb, "demo", unit, to or "other",
                      "--scratch", str(self.root / "scratch")]
         return self.invoke(arguments)
 

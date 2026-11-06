@@ -13,15 +13,14 @@ nightly review).
 Run:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_unit.py" --production <PRODUCTION_DOC> <arguments>
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/add_unit.py" --production <showrunner name> <arguments>
 ```
 
 Show the script's output. If it exits nonzero, show its message and stop.
 New launches print `<unit> started: herdr session attach agents, workspace <space>, tab <name>`;
 restores print `<unit> restore launched: ` and the same place. Every unit is a tab of the one
 herdr session, `agents`.
-A name may be given with or without its `-unit` ending; `feature-log` and
-`feature-log-unit` both make unit `feature-log-unit`.
+The unit uses its staff name without an added suffix.
 The launcher adopts an existing live staff row. It keeps the saved `.unit.toml` responsibilities and the port when omitted.
 A retired name stays reserved: resume the unit or remove it for good before reusing the name.
 Repeat `--responsibility <name>` for short duty names in a new configuration.
