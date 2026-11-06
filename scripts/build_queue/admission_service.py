@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Callable, Protocol, cast
+from typing import Callable, Protocol, cast
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -27,10 +27,7 @@ from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-else:
-    import store
+from scripts.buildlog import store
 
 from scripts.build_queue.scope_activity import LiveBuildRun, ScopeActivityReader, ScopeProcesses
 from scripts.lint.build_shape import build_shape, recorded_build_shape

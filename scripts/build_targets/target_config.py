@@ -12,7 +12,7 @@ from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "lib"))
-import conf
+from scripts.lib import conf
 
 
 Platform = Literal["linux", "macos"]

@@ -14,20 +14,12 @@ import time
 import unittest
 from pathlib import Path
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from scripts.lib.nix_env_test_support import NixFixture
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
-if TYPE_CHECKING:
-    from ..buildlog.cgroup_test_support import write_cgroup
-    from ..buildlog.test_memory_window import write_lint_config
-else:
-    from scripts.buildlog.cgroup_test_support import write_cgroup
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
-    from test_memory_window import write_lint_config
+from scripts.buildlog.cgroup_test_support import write_cgroup
+from scripts.buildlog.test_memory_window import write_lint_config
 
 
 INVOKE = Path(__file__).with_name("invoke.sh")

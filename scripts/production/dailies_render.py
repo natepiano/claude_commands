@@ -78,8 +78,8 @@ from scripts.lib.terminal_cells import terminal_width
 from scripts.whoami import run_out
 from scripts.whoami import note_file
 from scripts.whoami.run_out import READINGS_LOG, Reading
-from build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
-from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
+from scripts.build_hold.build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
+from scripts.mac_test.mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
 from update_registration import (
     DueNow as DueNow,
     DeferredUntil as DeferredUntil,

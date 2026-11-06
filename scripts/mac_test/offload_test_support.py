@@ -16,37 +16,24 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
+from typing import Literal, NotRequired, TypedDict, cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, config_environment
-else:
-    from memory_test_support import write_config_fixture, config_environment
+from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
-import offload
-import conf
-import mac_test
-import treekey
-from offload_test_commands import COMMAND_STUB, write_shell
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lib.process_group import send_process_group
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lib.process_group import send_process_group
+from scripts.mac_test import offload
+from scripts.lib import conf
+from scripts.mac_test import mac_test
+from scripts.buildlog import treekey
+from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
+from scripts.lib import test_hang_guard
+from scripts.lib.process_group import send_process_group
 
-if TYPE_CHECKING:
-    from ..production.cli_fixture import invoke_cli
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-    from cli_fixture import invoke_cli
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
+from scripts.production.cli_fixture import invoke_cli
 
 SCRIPT = Path(__file__).with_name("offload.py")
 
@@ -398,8 +385,7 @@ class OffloadCommandFixture(unittest.TestCase):
         program = r'''
 import subprocess
 import sys
-sys.path.insert(0, sys.argv.pop(1))
-import offload
+from scripts.mac_test import offload
 
 clock = [100.0]
 offload.time.monotonic = lambda: clock[0]
@@ -438,10 +424,10 @@ subprocess.run = run
 raise SystemExit(offload.main())
 '''
         return subprocess.run(
-            [sys.executable, "-c", program, str(SCRIPT.parent), "run",
+            [sys.executable, "-c", program, "run",
              "--repo-root", str(self.repository), "--package", "hana",
              "--call-id", "call-17", "--result", str(self.result_path), "--"],
-            cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
+            cwd=Path(__file__).resolve().parents[2], env=self.environment, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )

@@ -22,7 +22,7 @@ from unittest.mock import patch
 import broadcast
 import codex_daemon
 import process_table
-import roster
+from scripts.message import roster
 from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()

@@ -13,7 +13,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import roster
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import roster
 import sessions
 
 USAGE = "usage: top_level.py"

@@ -14,13 +14,13 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-import ci
-import health
-import record
-import store
-import sync
-import vault_pull
-from test_index import point_root_at
+from scripts.buildlog import ci
+from scripts.buildlog import health
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import sync
+from scripts.buildlog import vault_pull
+from scripts.buildlog.test_index import point_root_at
 
 
 class TargetSyncTests(unittest.TestCase):

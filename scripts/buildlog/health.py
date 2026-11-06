@@ -11,6 +11,7 @@ import fcntl
 import json
 import math
 import os
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -19,8 +20,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
-import record
-import store
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.buildlog import record
+from scripts.buildlog import store
 
 SNAPSHOT_NAME = "recorder-health.json"
 SNAPSHOT_MAX_AGE_SECONDS = 2 * 60 * 60

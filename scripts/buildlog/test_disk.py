@@ -18,23 +18,17 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
-import cli
-import disk
-import filesystem
-import report
-import store
-import sweep
-import test_index
+from scripts.buildlog import cli
+from scripts.buildlog import disk
+from scripts.buildlog import filesystem
+from scripts.buildlog import report
+from scripts.buildlog import store
+from scripts.lint import sweep
+from scripts.buildlog import test_index
 from scripts.message.session_send_test_support import forbid_real_sender
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots
-    from ..lint.memory_test_support import config_environment
-    from ..mac_test import linux_runner
-else:
-    from scripts.lib.cargo_output import CargoOutputRoots
-    from scripts.lint.memory_test_support import config_environment
-    from scripts.mac_test import linux_runner
+from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lint.memory_test_support import config_environment
+from scripts.mac_test import linux_runner
 
 
 def setUpModule() -> None:
@@ -216,7 +210,7 @@ class DiskTests(unittest.TestCase):
         self.assertEqual([row["device"] for row in result.get("filesystems", [])], ["1:1", "2:1"])
 
     def test_filesystem_total_preserves_reserved_blocks_and_top_layer_identity(self) -> None:
-        import cgroup_capture
+        from scripts.buildlog import cgroup_capture
 
         base = self.base()
         devices = base / "sys/dev/block"

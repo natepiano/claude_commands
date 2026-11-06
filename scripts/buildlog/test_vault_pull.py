@@ -7,7 +7,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -17,16 +16,14 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
-import ci
-import cli
-import conf
-import sync
-import vault_pull
-from test_index import point_root_at
-from git_test_support import commit_repository
+from scripts.buildlog import ci
+from scripts.buildlog import cli
+from scripts.lib import conf
+from scripts.buildlog import sync
+from scripts.buildlog import vault_pull
+from scripts.buildlog.test_index import point_root_at
+from scripts.lib.git_test_support import commit_repository
 
 
 QUESTION_STAND_IN = '''import json, pathlib, sys

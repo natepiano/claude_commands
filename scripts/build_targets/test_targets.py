@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 
 
 import io
@@ -19,27 +18,19 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from memory_test_support import config_environment, write_config_fixture
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
-import targets
-import build_hold
-import mac_test
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.build_targets import targets
+from scripts.build_hold import build_hold
+from scripts.mac_test import mac_test
+from scripts.lib import process_start as process_identity
 
-import offload
-if TYPE_CHECKING:
-    from . import target_config
-else:
-    import target_config
+from scripts.mac_test import offload
+from scripts.build_targets import target_config
 
 
-from override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 

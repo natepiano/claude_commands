@@ -15,15 +15,15 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import index
-import memory
-import moments
-import report
-import store
-import test_report as report_fixtures
-import test_memory_window as memory_fixtures
-from test_index import Record, call, sample, step
-from test_memory_window import write_lint_config
+from scripts.buildlog import index
+from scripts.buildlog import memory
+from scripts.buildlog import moments
+from scripts.buildlog import report
+from scripts.buildlog import store
+from scripts.buildlog import test_report as report_fixtures
+from scripts.buildlog import test_memory_window as memory_fixtures
+from scripts.buildlog.test_index import Record, call, sample, step
+from scripts.buildlog.test_memory_window import write_lint_config
 
 
 START = datetime(2026, 10, 10, tzinfo=UTC)
@@ -570,7 +570,7 @@ class MemoryMomentTests(unittest.TestCase):
         program = '''
 import json
 from datetime import datetime
-import index, memory, moments, report
+from scripts.buildlog import index, memory, moments, report
 start = datetime.fromisoformat("2026-10-11T00:00:00+00:00")
 end = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
 kills = memory.earlyoom_kills(start, end)
@@ -583,7 +583,7 @@ with index.read_only() as connection:
         result = subprocess.run(
             [sys.executable, "-c", program], capture_output=True, text=True, check=False,
             timeout=60, env={**os.environ, "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
-                             "PYTHONPATH": str(Path(report.__file__).parent)},
+                             "PYTHONPATH": str(Path(report.__file__).resolve().parents[2])},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[0], "[[true, false], [false, false], [true, true]]")

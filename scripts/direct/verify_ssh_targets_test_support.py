@@ -8,16 +8,13 @@ from pathlib import Path
 from decimal import Decimal
 import subprocess
 import time
-from typing import TYPE_CHECKING, Callable, TypedDict, cast, override
+from typing import Callable, TypedDict, cast, override
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 
-if TYPE_CHECKING:
-    from ..aws_target import ledger
-else:
-    from scripts.aws_target import ledger
+from scripts.aws_target import ledger
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -105,10 +102,10 @@ from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 sys.path.insert(0, str(source))
-for name in ("mac_test", "build_targets", "build_hold", "buildlog", "lint", "lib"):
+for name in ("mac_test", "build_targets", "build_hold", "lint", "lib"):
     sys.path.insert(0, str(source / "scripts" / name))
-import offload
-import mac_test
+from scripts.mac_test import offload
+from scripts.mac_test import mac_test
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)

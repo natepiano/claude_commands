@@ -39,7 +39,8 @@ def setUpModule() -> None:
 NOTICE_FIXTURE = r'''import sys,os,json,signal,io
 from pathlib import Path
 from unittest.mock import patch
-import send,repeat_guard as g,roster
+import send,repeat_guard as g
+from scripts.message import roster
 from scripts.message import send_result
 from scripts.production import staff
 staff.snapshot=lambda: staff.StaffSnapshot(())

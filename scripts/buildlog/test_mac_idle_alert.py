@@ -6,27 +6,17 @@ from contextlib import redirect_stderr
 import io
 import json
 import os
-import sys
 from pathlib import Path
 import tempfile
 import unittest
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-if TYPE_CHECKING:
-    from ..lib import conf
-    from . import mac_idle_alert
-    from .test_index import use_test_log
-    from .mac_idle_test_support import write_idle_alert, write_idle_config
-    from ..lint.memory_test_support import commit_config_fixture
-else:
-    import conf
-    from scripts.buildlog import mac_idle_alert
-    from test_index import use_test_log
-    from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-    from scripts.lint.memory_test_support import commit_config_fixture
+from scripts.lib import conf
+from scripts.buildlog import mac_idle_alert
+from scripts.buildlog.test_index import use_test_log
+from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
+from scripts.lint.memory_test_support import commit_config_fixture
 
 
 use_test_log()

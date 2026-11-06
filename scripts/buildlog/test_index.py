@@ -15,25 +15,20 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import index
-from cgroup_test_support import CPU, GIB, ZRAM_READING, slice_reading
-import parse
-import store
-import report
-import record as recorder
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import write_config_fixture
-    from ..test_times.gate_record_test_support import gate_run
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import write_config_fixture
-    from scripts.test_times.gate_record_test_support import gate_run
-from record import TARGET_DIR_UNSET
-from store import UNKNOWN_IDENTITY
+from scripts.buildlog import index
+from scripts.buildlog.cgroup_test_support import CPU, GIB, ZRAM_READING, slice_reading
+from scripts.buildlog import parse
+from scripts.buildlog import store
+from scripts.buildlog import report
+from scripts.buildlog import record as recorder
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.test_times.gate_record_test_support import gate_run
+from scripts.buildlog.record import TARGET_DIR_UNSET
+from scripts.buildlog.store import UNKNOWN_IDENTITY
 
 CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
@@ -221,9 +216,9 @@ class LogIsolationTests(unittest.TestCase):
             _ = environment.pop(name, None)
         result = subprocess.run(
             [sys.executable, "-c",
-             "import os, test_index; print({key: os.environ[key] "
+             "import os; from scripts.buildlog import test_index; print({key: os.environ[key] "
              + "for key in test_index.COORDINATION_VARIABLES if key in os.environ})"],
-            cwd=Path(__file__).parent, env=environment, capture_output=True, text=True,
+            cwd=Path(__file__).resolve().parents[2], env=environment, capture_output=True, text=True,
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -238,12 +233,11 @@ class LogIsolationTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-c",
-                    "import importlib, store, sys; sys.path.insert(0, sys.argv[2]); "
+                    "import importlib, sys; from scripts.buildlog import store; "
                     + "importlib.import_module(sys.argv[1]); print(store.root())",
-                    module.stem,
-                    str(Path(__file__).resolve().parents[2]),
+                    "scripts.buildlog." + module.stem,
                 ],
-                cwd=module.parent,
+                cwd=Path(__file__).resolve().parents[2],
                 env=environment,
                 capture_output=True,
                 text=True,

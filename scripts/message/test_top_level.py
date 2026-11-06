@@ -19,7 +19,7 @@ from unittest import mock
 
 import process_table
 import codex_daemon
-import roster
+from scripts.message import roster
 import herdr
 import sessions
 import top_level

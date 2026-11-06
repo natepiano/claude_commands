@@ -17,23 +17,18 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import Literal, cast
 
-import build_hold
-from hold_applies import BUILDING_CARGO_VERBS, cargo_verb
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-if TYPE_CHECKING:
-    from ..direct import step_record
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
-    import step_record
+from scripts.build_hold import build_hold
+from scripts.build_hold.hold_applies import BUILDING_CARGO_VERBS, cargo_verb
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
+from scripts.direct import step_record
 
-if TYPE_CHECKING:
-    from ..buildlog import store
-else:
-    import store
+
+from scripts.buildlog import store
 
 
 @dataclass(frozen=True)

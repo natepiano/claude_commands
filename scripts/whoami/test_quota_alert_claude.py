@@ -21,7 +21,7 @@ from scripts.whoami import note_file
 from scripts.whoami import account
 from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, next_moves
-from user_action import ActionRequired
+from scripts.notify.user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes
 
 setUpModule = support.setUpModule

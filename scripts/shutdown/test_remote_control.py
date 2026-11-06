@@ -21,7 +21,7 @@ import session_pane
 from scripts.whoami import quota_alert
 import remote
 import detached
-from push_texts import RenderedPush
+from scripts.notify.push_texts import RenderedPush
 from herdr import HerdrPlace
 from herdr import AgentBlocked
 

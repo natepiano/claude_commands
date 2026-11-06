@@ -1794,7 +1794,7 @@ always=natedev
 
     def test_a_helpers_pending_bash_call_names_its_command_cut_to_90_characters(self) -> None:
         import stall_watch
-        import push_texts
+        from scripts.notify import push_texts
         helpers = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee" / "subagents"
         helpers.mkdir(parents=True)
         _ = (self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl").write_text(

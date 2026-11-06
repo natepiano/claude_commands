@@ -20,13 +20,15 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import pushover
-import review
-import reply_asks
-import push_texts
-import push_reference
-from push_test_support import registered_send
-from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.notify import pushover
+from scripts.notify import review
+from scripts.notify import reply_asks
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.notify.push_test_support import registered_send
+from scripts.notify.user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
 REAL_REVIEW = review.review
 

@@ -7,26 +7,22 @@ from decimal import Decimal
 import json
 from pathlib import Path
 import time
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 import unittest
 
-import index
-import mac_outcome
-import report
-import record
-import store
-import sync
-from test_index import use_test_log
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import report
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import sync
+from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
-if TYPE_CHECKING:
-    from ..aws_target import ledger, measurement
-    from ..aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
-else:
-    from scripts.aws_target import ledger, measurement
-    from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
+from scripts.aws_target import ledger, measurement
+from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 
 
 class AwsReportTests(MeasurementFixture):

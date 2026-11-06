@@ -387,8 +387,8 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
                 return
         machine = socket.gethostname()
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-        from push_texts import render, user_send_argv
-        import review
+        from scripts.notify.push_texts import render, user_send_argv
+        from scripts.notify import review
 
         push = render("codex.reset_ready", machine=machine)
         command = user_send_argv(push)

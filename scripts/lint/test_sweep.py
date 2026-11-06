@@ -24,53 +24,39 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
-from typing import TYPE_CHECKING, Literal, cast, override
+from typing import Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import sweep
-import cargo_target_config
+from scripts.lint import sweep
+from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
 from scripts.message import session_send
 from scripts.message.session_send_test_support import forbid_real_sender
-import conf
+from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.mac_test import floor_claims
-from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
-from memory_test_support import config_environment, write_config_fixture
-from test_build_shape import create_step_index, record_root_attempt
+from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.test_build_shape import create_step_index, record_root_attempt
 from scripts.buildlog import index as build_index
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
-if TYPE_CHECKING:
-    from ..copies import copies
-    from ..production.cli_fixture import ImmutableGitSeed
-    from ..build_hold import build_hold
-    from ..buildlog import record, store
-    from ..lib import scratch
-    from ..message import process_table, sessions
-    from ..notify import review
-    from ..notify.push_texts import catalog, render, render_entry
-    from ..notify.user_action import ActionRequired
-else:
-    from scripts.copies import copies
-    from scripts.production.cli_fixture import ImmutableGitSeed
-    import build_hold
-    import record
-    import scratch
-    import store
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    import process_table
-    import sessions
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    import review
-    from push_texts import catalog, render, render_entry
-    from user_action import ActionRequired
+from scripts.lib import test_hang_guard
+from scripts.copies import copies
+from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.build_hold import build_hold
+from scripts.buildlog import record
+from scripts.lib import scratch
+from scripts.buildlog import store
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+from scripts.message import process_table
+from scripts.message import sessions
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+from scripts.notify import review
+from scripts.notify.push_texts import catalog, render, render_entry
+from scripts.notify.user_action import ActionRequired
 
 GIB = 1 << 30
 SIZE = 64 * 1024
@@ -276,7 +262,7 @@ class GroupTests(SweepCase):
         targets = [self.target(), self.target()]
         trees = [str(target.tree) for target in targets]
         scan = sweep.Scan()
-        with mock.patch("sweep.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
+        with mock.patch("scripts.lint.sweep.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
             owners = sweep.group_roots(trees, scan)
         self.assertTrue(all(str(target.app_dep_info) in owners for target in targets))
         self.assertGreater(len(scan.groups), 2)
@@ -404,7 +390,7 @@ class SweepTests(SweepCase):
         without_window = cast(Callable[[list[str], list[str], int, str, bool], int], sweep.sweep)
         workspace_without_window = cast(Callable[[str | None, str, bool], int], sweep.sweep_workspace)
         before = {path: path.read_bytes() for path in target.root.rglob("*") if path.is_file()}
-        with mock.patch("sweep.conf.ConfigRead.number", side_effect=AssertionError("No implicit configuration read expected")):
+        with mock.patch("scripts.lint.sweep.conf.ConfigRead.number", side_effect=AssertionError("No implicit configuration read expected")):
             with self.assertRaisesRegex(TypeError, "recent_minutes"):
                 _ = without_window(roots, trees, 0, "test", False)
             with self.assertRaisesRegex(TypeError, "recent_minutes"):

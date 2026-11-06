@@ -18,14 +18,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import build_hold
-import hold_enforcer
+from scripts.build_hold import build_hold
+from scripts.build_hold import hold_enforcer
 import unit_runs
 from sessions import SessionRecord
 
@@ -33,16 +33,10 @@ from build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
     HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
 )
-if TYPE_CHECKING:
-    from ..direct import step_record
-    from ..build_queue import admission_protocol, admission_service
-    from ..build_queue.admission_test_support import only_admitted
-    from ..lib import test_hang_guard
-else:
-    from scripts.direct import step_record
-    from scripts.build_queue import admission_protocol, admission_service
-    from scripts.build_queue.admission_test_support import only_admitted
-    from scripts.lib import test_hang_guard
+from scripts.direct import step_record
+from scripts.build_queue import admission_protocol, admission_service
+from scripts.build_queue.admission_test_support import only_admitted
+from scripts.lib import test_hang_guard
 
 
 class PrivateReleaseBroadcastTest(IsolatedBuildHoldTest):
@@ -2028,7 +2022,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertEqual(sent, ["one", "two", "two", "three"])
 
     def test_interrupted_old_release_keeps_wait_and_local_checks_held_until_unlink(self) -> None:
-        import build_targets
+        from scripts.build_targets import build_targets
         self.begin()
         cycle = self.cycle()
         cycle["holders"]["holder"]["released_at"] = self.now.isoformat()

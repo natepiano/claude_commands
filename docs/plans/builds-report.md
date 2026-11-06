@@ -724,3 +724,72 @@ A good vault sync closes the question that its outage filed, through the public 
 **Ruled out:**
 - A key argument on the helper: all callers fit plain float pairs.
 - A `sys.path` line in `costs.py` and `vault_pull.py`: each adds one more copy of that line.
+
+### Phase 33 — scripts/buildlog imports from the repo root  · status: done
+**Depends on:** none
+
+From the builds showrunner (not the user), 2026-11-05: "change to Phase 33. Do not add a path module for scripts/buildlog. The repo already has one way: about 880 files import from the repo root (from scripts.x import y). Move scripts/buildlog to that way and delete its sys.path lines. A new per-folder path module is a second way. If a buildlog script that runs by path cannot find the repo root, use what the other repo-root scripts use, not a new module."
+
+From the builds showrunner (not the user), 2026-11-05: "call accepted: the 23 outside callers move in Phase 33 (one owner switches all callers). I tell the owners now. Keep the outside edits to import lines only."
+
+Decided by the director: the outside importers move in this phase. A bare `import record` beside a repo-root `scripts.buildlog.record` loads two copies in one process, and one owner switches all callers. Only `store` had protection against two copies, so that code goes away with its last bare caller.
+
+From the builds showrunner (not the user), 2026-11-05: "accepted. Move every bare importer of scripts/notify modules to the repo-root form, import lines and strings only." The review found that a bare `push_texts` lost its required action text once `catalog()` loaded the root `push_catalog`. So the phase also moves every bare importer of `scripts/notify` modules, and the Files list below grows by those importers. `sessions` and `unit_runs` stay bare: about 36 other files import them bare, and the phase adds no new module pair.
+
+#### Work Order
+
+**Goal:** All of `scripts/buildlog` and every outside importer of its modules use the repository's one import form, `from scripts.x import y`. The per-folder `sys.path` lines and the two-name store code go away. Behavior does not change.
+
+**Spec:**
+- Each module and test module in `scripts/buildlog` imports a sibling as `from scripts.buildlog import y` or `from scripts.buildlog.y import z`. It imports from another script folder as `from scripts.lib.y import z`, in the same way. Collapse each `if __package__:` branch and each `TYPE_CHECKING` split that exists only for the import form into one plain import. A real type-only import stays under `TYPE_CHECKING`, in the repo-root form.
+- Delete every `sys.path.insert` and `sys.path.append` line in `scripts/buildlog`, also the ones inside functions and the loop in `holds.py`.
+- A buildlog module that runs by path keeps one line, before its first project import. It is the line the other repo-root scripts use: `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))`. These modules have a `__main__` block or a by-path runner: `cli.py`, `record.py`, `mac_idle.py`, `step_context.py`, `health.py`, `port_lint.py`, `width_trial.py`. Check each by-path runner in `scripts/buildlog/buildlog`, `scripts/lint/invoke.sh`, `scripts/lint/port-lint`, `scripts/buildlog/sync.py`, `scripts/hana_shot/hana_shot.py` and `scripts/direct/verify.sh`. Library modules and test modules have no path line. Tests run from the repo root.
+- The 23 outside files in the Files field change their bare imports of buildlog modules to the same form, and their `if __package__:` branches collapse. Delete an outside path line whose only use is to find `scripts/buildlog`. An outside module that a by-path entry reaches with no repo root on the path gets the same one line. Other path lines in those files stay.
+- String forms follow the imports: `mock.patch("record.x")` becomes `mock.patch("scripts.buildlog.record.x")`, and `sys.modules["record"]` the same. Code strings that a test runs in a subprocess import through the repo root. Keep what each test proves. The same applies to patches of an outside module that a buildlog module now imports by its repo-root name.
+- No process may load a module with state under both a bare name and its repo-root name where a caller depends on one copy. Where the move makes that happen, move the bare importer as well, and name it in the summary.
+- With no bare caller left, delete the two-name store code: `_register_module_aliases` in `store.py`, `scripts/buildlog/__init__.py`, and `test_store_identity.py`, whose subject is that code.
+- New test module `scripts/buildlog/test_repo_root_imports.py`. It runs each by-path module in the list by its path, in a subprocess with `PYTHONPATH` removed. The working folder is a temporary folder that holds an unrelated `scripts/__init__.py` which raises when imported. In one table with `subTest`, each module must exit without an import error. Use a no-op argument for each one, so that no record is written.
+- Remove each `# noqa: E402` that the deletions leave with no purpose.
+- Add no path module, no new guard and no compatibility layer.
+
+**Files:**
+- `scripts/buildlog/` — every module and test module changes as the Spec says; `__init__.py` and `test_store_identity.py` go away.
+- `scripts/buildlog/test_repo_root_imports.py` — new; the by-path test.
+- `scripts/aws_target/measurement_test_support.py` — bare buildlog imports move to the repo-root form.
+- `scripts/aws_target/test_measurement.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_hold/hold_enforcer.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_queue/admission_client.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_queue/admission_service.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_queue/admission_test_support.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_queue/test_admission_service.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_queue/test_queue_evidence.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_queue/test_queue_place.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_targets/targets.py` — bare buildlog imports move to the repo-root form.
+- `scripts/build_targets/test_build_targets.py` — bare buildlog imports move to the repo-root form.
+- `scripts/lint/memory_admit.py` — bare buildlog imports move to the repo-root form.
+- `scripts/lint/sweep.py` — bare buildlog imports move to the repo-root form.
+- `scripts/lint/test_invoke_scope.py` — bare buildlog imports move to the repo-root form.
+- `scripts/lint/test_memory_admit.py` — bare buildlog imports move to the repo-root form.
+- `scripts/lint/test_sweep.py` — bare buildlog imports move to the repo-root form.
+- `scripts/mac_test/offload.py` — bare buildlog imports move to the repo-root form.
+- `scripts/mac_test/offload_test_support.py` — bare buildlog imports move to the repo-root form.
+- `scripts/mac_test/test_offload.py` — bare buildlog imports move to the repo-root form.
+- `scripts/mac_test/test_offload_lifecycle.py` — bare buildlog imports move to the repo-root form.
+- `scripts/mac_test/test_target_state.py` — bare buildlog imports move to the repo-root form.
+- `scripts/test_times/show.py` — bare buildlog imports move to the repo-root form.
+- `scripts/test_times/test_show.py` — bare buildlog imports move to the repo-root form.
+- `docs/as-built/build-followups.md` — the `disk.py` path line. The director owns this doc.
+- `docs/as-built/build-targets.md` — the rule on shared module names, for the buildlog folder. The director owns this doc.
+
+**Workers:** 1 writer — `rowcpu` owns all code files. The import form and its tests must change together, so nothing splits.
+
+**State:** none.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:**
+- `scripts/buildlog/test_repo_root_imports.py` runs each by-path module, with `PYTHONPATH` removed and an unrelated `scripts` package in the working folder, and each exits without an import error.
+- `grep -nE 'sys\.path\.(insert|append)' scripts/buildlog/*.py` finds only the one root line in each by-path module, and code strings and fixtures in tests.
+- No file in `scripts` outside `scripts/buildlog` imports a buildlog module by its bare name, except a same-named sibling in its own folder.
+- The caller suites pass with no assertion weakened. The merge gate passes in full.
+- `basedpyright` on all changed files: 0 errors, 0 warnings, 0 notes.

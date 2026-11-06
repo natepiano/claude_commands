@@ -28,11 +28,11 @@ from scripts.production.staff_test_support import isolated_staff_file, recorded_
 
 import escalate  # five_hour puts scripts/message on the path
 import quota_alert
-import push_texts
+from scripts.notify import push_texts
 import send
 import sessions
 from quota_alert import Config, Showrunner
-from user_action import NoActionRequired
+from scripts.notify.user_action import NoActionRequired
 
 NOW = datetime(2026, 10, 15, 18, 20, tzinfo=timezone.utc)
 RESETS = NOW.replace(hour=21)

@@ -8,6 +8,7 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
@@ -16,21 +17,19 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, cast, override
+from typing import Literal, cast, override
 from unittest import mock
 
-import build_hold
-import hold_enforcer
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.build_hold import build_hold
+from scripts.build_hold import hold_enforcer
 
-from override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 
 
-if TYPE_CHECKING:
-    from ..direct import step_record
-else:
-    import step_record
+from scripts.direct import step_record
 
 
 EMPTY_PROCESS_ENVIRONMENT: Mapping[str, str] = MappingProxyType({})

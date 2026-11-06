@@ -1,8 +1,6 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
 
-from scripts.production.fake_unit_host import labeled as labeled_host
-
 import json
 import os
 import io
@@ -20,6 +18,7 @@ from typing import cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.production.fake_unit_host import labeled as labeled_host
 from scripts.lib.socket_test_support import short_socket_directory
 import broadcast
 import codex_winddown
@@ -27,7 +26,7 @@ import fake_unit_host
 import fake_showrunner
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
-import roster
+from scripts.message import roster
 from process_table import Process
 from sessions import SessionRecord
 from scripts.production.showrunners import Showrunner
@@ -111,7 +110,7 @@ class NoticeRetryTests(unittest.TestCase):
             codex_winddown.announce_quiet(1)
             return [sys.executable, str(self.state / "fake-send.py")]
 
-        with (mock.patch("push_texts.user_send_argv", side_effect=prepare),
+        with (mock.patch('scripts.notify.push_texts.user_send_argv', side_effect=prepare),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", ""))):
             codex_winddown.announce_quiet(0)
         self.assertFalse((self.state / codex_winddown.QUIET).exists())

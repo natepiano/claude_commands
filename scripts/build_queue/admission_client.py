@@ -14,7 +14,7 @@ import socket
 import shlex
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Callable, Protocol, cast
+from typing import Callable, Protocol, cast
 import uuid
 
 if __package__ in (None, ""):
@@ -26,15 +26,9 @@ from scripts.build_queue.admission_service import SystemClock
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-else:
-    import store
+from scripts.buildlog import store
 
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    import conf
+from scripts.lib import conf
 
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
 LOADED_ADMISSION_CODE_VERSION = os.environ.get("BUILDLOG_ADMISSION_CODE_VERSION") or admission_code.admission_code_version()

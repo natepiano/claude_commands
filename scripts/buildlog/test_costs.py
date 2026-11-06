@@ -10,19 +10,17 @@ import subprocess
 import sys
 from contextlib import closing, redirect_stderr
 from datetime import timedelta
-from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import costs
-import index
-import moments
-import record
-import test_moments as fixtures
-from test_index import Record, call, ci_job, ci_run
-from test_holds import hold_event
+from scripts.buildlog import costs
+from scripts.buildlog import index
+from scripts.buildlog import moments
+from scripts.buildlog import record
+from scripts.buildlog import test_moments as fixtures
+from scripts.buildlog.test_index import Record, call, ci_job, ci_run
+from scripts.buildlog.test_holds import hold_event
 
 
 class CostTests(unittest.TestCase):
@@ -171,15 +169,15 @@ class CostTests(unittest.TestCase):
             hold_event("ended", "held", fixtures.END.isoformat(), "mac"),
         )):
             pass
-        command = ("import sys; sys.path.insert(0, sys.argv[1]); import costs,holds,index; "
+        command = ("import sys; from scripts.buildlog import costs, holds, index; "
                    + "from datetime import UTC,datetime; "
                    + "assert costs.machine_name('mac','replacement',{}) == 'mac'; "
                    + "current=holds.CurrentHolds('',holds.NatedevHoldsNow(()),holds.MacHoldsNow(())); "
                    + "connection=index.read_only(); "
                    + "history=holds.read_hold_history(connection,current,datetime.now(UTC)); "
                    + "connection.close(); assert len(history.intervals) == 1; "
-                   + "assert not any(name in sys.modules for name in ('record','targets','build_hold','mac_test'))")
-        result = subprocess.run([sys.executable, "-c", command, str(Path(__file__).resolve().parent)], env=dict(os.environ),
+                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record','scripts.build_targets.targets','scripts.build_hold.build_hold','scripts.mac_test.mac_test'))")
+        result = subprocess.run([sys.executable, "-c", command], env=dict(os.environ),
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -291,7 +289,7 @@ class CostTests(unittest.TestCase):
         self.assertEqual([row.seconds for row in result.ranked if row.cause == "Reruns after a pass"], [120])
 
     def test_both_window_options_reject_overflow_before_opening_the_index(self) -> None:
-        import mac_report
+        from scripts.buildlog import mac_report
 
         with mock.patch.object(index, "update", side_effect=AssertionError("index updated")):
             self.assertEqual(mac_report.main(["--hours", "1e300"]), 2)
@@ -301,9 +299,9 @@ class CostTests(unittest.TestCase):
         self.assertIn("usage: buildlog costs", errors.getvalue())
 
     def test_cli_help_does_not_import_collectors_or_the_report(self) -> None:
-        command = ("import sys; sys.path.insert(0, sys.argv[1]); import cli; cli.main(['help']); "
-                   + "assert not any(name in sys.modules for name in ('record','report','costs','launches'))")
-        result = subprocess.run([sys.executable, "-c", command, str(Path(__file__).resolve().parent)], env=dict(os.environ),
+        command = ("import sys; from scripts.buildlog import cli; cli.main(['help']); "
+                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record','scripts.buildlog.report','scripts.buildlog.costs','scripts.buildlog.launches'))")
+        result = subprocess.run([sys.executable, "-c", command], env=dict(os.environ),
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 

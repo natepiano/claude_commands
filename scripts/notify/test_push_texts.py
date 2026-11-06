@@ -21,14 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402
 
-import gpu_xid
-import push_texts
+from scripts.notify import gpu_xid
+from scripts.notify import push_texts
 if TYPE_CHECKING:
     from ..message import session_send
 else:
     from scripts.message import session_send
-from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
-from user_action import ActionRequired, NO_SESSION_LINE, SessionLine
+from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
+from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
 ROOT = Path(__file__).resolve().parents[2]
 EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py"}
@@ -151,6 +151,12 @@ class PushTextTests(unittest.TestCase):
         return PushText("test", "test", "decision", "Choose {version}", ActionTemplate("Reply upgrade or wait."),
                         "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
                         purpose="Test.")
+
+    def test_blocked_mac_catalog_keeps_its_required_action(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "mac_idle.blocked")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertIsInstance(push.action, ActionRequired)
+        self.assertEqual(push.action, ActionRequired(cast(ActionTemplate, entry.action).text.format_map(push.values)))
 
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()

@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import BinaryIO, Callable, Literal, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
 from itertools import chain
 from types import UnionType, MappingProxyType
@@ -32,17 +32,16 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
     NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
-from build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
+from scripts.lint.build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
                          StepEvidence, TEST_STEPS, build_shape, index_step_evidence, recorded_build_shape)
-from atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
-import conf
+from scripts.lib import conf
 
 
-from test_phase import (
+from scripts.lib.test_phase import (
     CallRecord as CallRecord,
     NoCallRecord as NoCallRecord,
     TestPhaseChargeUse as TestPhaseChargeUse,
@@ -53,19 +52,11 @@ from test_phase import (
     UnobservedTestPhase,
 )
 
-if TYPE_CHECKING:
-    from ..buildlog import parse
-    from ..buildlog import record as record
-    from ..buildlog import repository as repository
-    from ..buildlog import store as store
-    from ..buildlog import index
-    file_marks = index
-else:
-    import parse
-    import record
-    import repository
-    import store
-    import index as file_marks
+from scripts.buildlog import parse
+from scripts.buildlog import record
+from scripts.buildlog import repository as repository
+from scripts.buildlog import store
+from scripts.buildlog import index as file_marks
 
 GIB = 1 << 30
 # 111 natedev filtered single-test runs with no recompilation in the 14 days

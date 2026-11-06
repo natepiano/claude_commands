@@ -46,15 +46,15 @@ from scripts.message.recipient_test_support import staff_child_command
 from scripts.lib.test_names import fixture_names
 import rca
 
-import review
-import push_texts
-import push_reference
+from scripts.notify import review
+from scripts.notify import push_texts
+from scripts.notify import push_reference
 import postmaster
-import silence
+from scripts.notify import silence
 from test_postmaster import FakeClock
 import codex_daemon
 from codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
-import roster
+from scripts.message import roster
 import sessions
 if TYPE_CHECKING:
     from ..accounts import accounts
@@ -62,7 +62,7 @@ else:
     from scripts.accounts import accounts
 from test_support import ShutdownTestCase
 from user_zone import user_zone
-from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
+from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -4476,7 +4476,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 self.assertEqual(failed.message, "Session: Owner\nAction: stop Owner\nReason: waiting.")
 
     def test_catalog_session_is_kept_when_delivery_fails_before_review(self) -> None:
-        import push_texts
+        from scripts.notify import push_texts
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
             push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
             (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))

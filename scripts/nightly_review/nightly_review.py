@@ -205,10 +205,7 @@ def live_message_counts(path: Path, since: datetime) -> LiveMessageCounts:
 
 def messages(since: datetime) -> list[str]:
     sys.path.insert(0, str(SCRIPTS / "notify"))
-    if TYPE_CHECKING:
-        from scripts.notify import review
-    else:
-        import review
+    from scripts.notify import review
 
     counts = live_message_counts(review.state_path() / "review.jsonl", since)
     lines = [f"Live messages: {counts.messages}; failures: {counts.failures}; Unreviewed: {counts.unreviewed}."]

@@ -120,21 +120,13 @@
     },
     {
       "root": "scripts/buildlog",
-      "extraPaths": [
-        ".",
-        "scripts/buildlog",
-        "scripts/build_hold",
-        "scripts/lint",
-        "scripts/lib",
-        "scripts/build_targets",
-        "scripts/mac_test"
-      ]
+      "extraPaths": ["."]
     },
     {
       "root": "scripts/mac_test",
       "extraPaths": [
+        ".",
         "scripts/mac_test",
-        "scripts/buildlog",
         "scripts/build_hold",
         "scripts/lint",
         "scripts/lib"
@@ -163,6 +155,7 @@
     {
       "root": "scripts/notify",
       "extraPaths": [
+        ".",
         "scripts/notify",
         "scripts/lib"
       ]
@@ -189,6 +182,7 @@
     {
       "root": "scripts/build_hold",
       "extraPaths": [
+        ".",
         "scripts/build_hold",
         "scripts/build_targets",
         "scripts/lint",

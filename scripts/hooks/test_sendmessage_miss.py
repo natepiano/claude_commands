@@ -73,7 +73,7 @@ class SendMessageMissTests(unittest.TestCase):
                                                        current_session=staff.StaffId("peer-thread"))
         with patch.dict(os.environ, self.environment, clear=True):
             import codex_daemon
-            import roster
+            from scripts.message import roster
             from codex_test_support import daemon_session_row
 
             rows = [replace(daemon_session_row(codex_daemon.CodexDaemon(

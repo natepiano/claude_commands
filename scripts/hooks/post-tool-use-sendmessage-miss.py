@@ -42,7 +42,8 @@ def main() -> None:
             return
 
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import roster
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from scripts.message import roster
         import send
         from scripts.production import staff
         import sessions

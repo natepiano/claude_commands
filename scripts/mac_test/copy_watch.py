@@ -29,7 +29,7 @@ import sys
 import tempfile
 import time
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -37,15 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import process_group
-import override_guard
-import mac_test
-import offload
-if TYPE_CHECKING:
-    from ..lib import build_folders, process_start as process_identity
-    from ..direct import step_record
-else:
-    from scripts.lib import build_folders, process_start as process_identity
-    from scripts.direct import step_record
+from scripts.build_hold import override_guard
+from scripts.mac_test import mac_test
+from scripts.mac_test import offload
+from scripts.lib import build_folders, process_start as process_identity
+from scripts.direct import step_record
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")

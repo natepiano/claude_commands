@@ -20,38 +20,29 @@ import sys
 import tempfile
 import time
 import threading
-from typing import TYPE_CHECKING, Literal, NotRequired, TypeGuard, TypedDict, cast
+from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import override_guard
-import build_hold
-import offload
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.build_hold import override_guard
+from scripts.build_hold import build_hold
+from scripts.mac_test import offload
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import conf
-from user_zone import user_zone
+from scripts.lib import conf
+from scripts.lib.user_zone import user_zone
 
-if TYPE_CHECKING:
-    from ..message import session_send
-    from ..lib import process_start as process_identity
-    from ..build_targets import target_config
-    from ..build_targets.target_config import ConfigError
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start as process_identity
-    from scripts.message import session_send
-    import target_config
-    from target_config import ConfigError
+from scripts.lib import process_start as process_identity
+from scripts.message import session_send
+from scripts.build_targets import target_config
+from scripts.build_targets.target_config import ConfigError
 
 
-if TYPE_CHECKING:
-    from ..buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
+from scripts.buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, idle_config
 
 
 MESSAGE_TIMEOUT_S = 30.0

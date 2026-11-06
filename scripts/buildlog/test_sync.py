@@ -16,25 +16,21 @@ from contextlib import ExitStack, redirect_stdout
 from functools import partial
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import ci
-import cli
-import index
-import health
-import record
-import rust_release
-import store
-import sync
-import vault_pull
-from test_index import point_root_at
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import config_environment
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import config_environment
+from scripts.buildlog import ci
+from scripts.buildlog import cli
+from scripts.buildlog import index
+from scripts.buildlog import health
+from scripts.buildlog import record
+from scripts.buildlog import rust_release
+from scripts.buildlog import store
+from scripts.buildlog import sync
+from scripts.buildlog import vault_pull
+from scripts.buildlog.test_index import point_root_at
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
 
 def setUpModule() -> None:

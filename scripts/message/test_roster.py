@@ -45,7 +45,7 @@ sys.path.insert(0, str(SCRIPTS / "direct"))
 import codex_daemon
 from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 import process_table
-import roster
+from scripts.message import roster
 import send
 import unit_lookup
 import unit_runs

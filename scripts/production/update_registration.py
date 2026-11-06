@@ -1449,10 +1449,7 @@ AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
 def review_open_question(slug: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
     # Copied registration trees can run reminder-only commands without notify installed.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-    if TYPE_CHECKING:
-        from ..notify import review
-    else:
-        import review
+    from scripts.notify import review
     outcome = review.review_question(review.QuestionKey(slug, item.text), item.question)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)

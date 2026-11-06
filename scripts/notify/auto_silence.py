@@ -30,12 +30,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import push_texts  # noqa: E402
-import silence  # noqa: E402
-from silence import Deliver, Run  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.notify import push_texts  # noqa: E402
+from scripts.notify import silence  # noqa: E402
+from scripts.notify.silence import Deliver, Run  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+
 if TYPE_CHECKING:
     from ..lib.prompt_activity import PromptActivity, UserTypedPrompt, UnknownPrompt, SOURCES
     from ..lib.session_paths import sessions_directory

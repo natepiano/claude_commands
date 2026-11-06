@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import sqlite3
-import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -12,11 +11,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-# Support both the package-qualified unittest command and directory discovery.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import index
-from test_index import Record, call, encode, point_root_at, rows, step
+from scripts.buildlog import index
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, rows, step
 
 
 class IndexRerunTests(unittest.TestCase):

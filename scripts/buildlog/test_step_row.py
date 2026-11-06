@@ -14,17 +14,16 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import record
-import repository
-import step_context
-import treekey
-import store
+from scripts.buildlog import record
+from scripts.buildlog import repository
+from scripts.buildlog import step_context
+from scripts.buildlog import treekey
+from scripts.buildlog import store
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from test_index import use_test_log
-from test_record import START, NEXTEST
+from scripts.buildlog.test_index import use_test_log
+from scripts.buildlog.test_record import START, NEXTEST
 
 use_test_log()
 
@@ -40,12 +39,8 @@ PHASE_GRANT = json.dumps({
     "test_phase_charge_use": {"kind": "NoTestPhaseChargeUse"},
 })
 
-if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots
-    from ..lib.cargo_output_test_support import fake_cargo_output_roots
-else:
-    from scripts.lib.cargo_output import CargoOutputRoots
-    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 
 class RecorderCompatibilityTests(unittest.TestCase):
@@ -74,36 +69,36 @@ class RecorderCompatibilityTests(unittest.TestCase):
 
     def test_scp_remote_identity_does_not_load_url_parsing(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import repository; "
+            "import sys; from scripts.buildlog import repository; "
             "assert repository.remote_identity('git@EXAMPLE.com:owner/project.git', '/fixture') "
             "== 'https://example.com/owner/project'; assert 'urllib.parse' not in sys.modules; "
-            "assert 'record' not in sys.modules; assert 'scripts.buildlog.record' not in sys.modules"
+            "assert 'scripts.buildlog.record' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent)],
+        result = subprocess.run([sys.executable, "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_plain_phase_context_does_not_load_admission(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import record; "
-            "value = record.test_phase_context(sys.argv[2], ['cargo', 'nextest', 'run', '-j4']); "
+            "import sys; from scripts.buildlog import record; "
+            "value = record.test_phase_context(sys.argv[1], ['cargo', 'nextest', 'run', '-j4']); "
             "assert value['test_threads'] == 4; assert value['call_id'] == 'phase-call'; "
             "assert 'memory_admit' not in sys.modules; assert 'scripts.lint.memory_admit' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent), PHASE_GRANT],
+        result = subprocess.run([sys.executable, "-c", source, PHASE_GRANT],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_row_ids_do_not_load_random_or_temporary_file_modules(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import record; "
+            "import sys; from scripts.buildlog import record; "
             "value = record.new_id('fixture', 0); assert value.startswith('fixture-19700101T000000-'); "
             "assert len(value.rsplit('-', 1)[1]) == 6; "
             "assert 'secrets' not in sys.modules; assert 'tempfile' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent)],
+        result = subprocess.run([sys.executable, "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -118,18 +113,18 @@ class RecorderCompatibilityTests(unittest.TestCase):
 
     def test_empty_metadata_does_not_load_json_or_store(self) -> None:
         source = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import step_context; "
-            "assert 'json' not in sys.modules; assert 'store' not in sys.modules; "
+            "import sys; from scripts.buildlog import step_context; "
+            "assert 'json' not in sys.modules; assert 'scripts.buildlog.store' not in sys.modules; "
             "step_context.metadata_target_folder('  ', [], '/fixture'); "
-            "assert 'json' not in sys.modules; assert 'store' not in sys.modules"
+            "assert 'json' not in sys.modules; assert 'scripts.buildlog.store' not in sys.modules"
         )
-        result = subprocess.run([sys.executable, "-c", source, str(Path(__file__).parent)],
+        result = subprocess.run([sys.executable, "-c", source],
                                 capture_output=True, text=True, env={
                                     key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_invalid_target_configuration_records_the_error(self) -> None:
-        import cargo_target_config
+        from scripts.lib import cargo_target_config
 
         with (
             mock.patch.object(cargo_target_config, "cargo_folder_settings", side_effect=ValueError("invalid")),
@@ -144,14 +139,14 @@ class RecorderCompatibilityTests(unittest.TestCase):
             peak = Path(temporary) / "peak"
             _ = peak.write_text("123456\nsome avg10=0.00 total=1250000\n")
             source = (
-                "import sys; sys.path.insert(0, sys.argv[1]); from scripts.buildlog import record; "
-                "memory = record.peak_and_stall(sys.argv[2]); "
+                "import sys; from scripts.buildlog import record; "
+                "memory = record.peak_and_stall(sys.argv[1]); "
                 "assert memory.peak_bytes == 123456; assert memory.stall_some_s == 1.25; "
                 "assert memory.stall_full_s is record.cgroup_capture.Unmeasured.VALUE"
             )
             result = subprocess.run(
-                [sys.executable, "-c", source, str(Path(__file__).resolve().parents[2]), str(peak)],
-                cwd=temporary, capture_output=True, text=True,
+                [sys.executable, "-c", source, str(peak)],
+                cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
                 env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
             )
         self.assertEqual(result.returncode, 0, result.stderr)

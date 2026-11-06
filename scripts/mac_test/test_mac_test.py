@@ -21,37 +21,24 @@ import threading
 import unittest
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
+from typing import NotRequired, TypedDict, cast, final, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
-else:
-    from memory_test_support import write_config_fixture, commit_config_fixture, config_environment
+from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import mac_test
-import conf
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.mac_test import mac_test
+from scripts.lib import conf
+from scripts.lib import test_hang_guard
 
-if TYPE_CHECKING:
-    from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase
-    from ..production.cli_fixture import invoke_cli
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-    from cli_fixture import invoke_cli
-    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+from scripts.production.cli_fixture import invoke_cli
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
 
 
 SCRIPT = Path(__file__).with_name("mac_test.py")
@@ -1479,8 +1466,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         source = """
 import sys
 from datetime import datetime, timedelta, timezone
-sys.path.insert(0, sys.argv[1])
-import mac_test
+from scripts.mac_test import mac_test
 
 class Clock(datetime):
     tick: int = 0
@@ -1499,7 +1485,7 @@ for arguments in (
     sys.argv = ["mac_test.py", *arguments]
     assert mac_test.main() == 0
 """
-        result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.parent)],
+        result = subprocess.run([sys.executable, "-c", source],
                                 env=self.environment, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                 pass_fds=(self.writer_write_fd,))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

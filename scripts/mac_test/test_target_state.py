@@ -13,36 +13,25 @@ import sys
 import tempfile
 import threading
 import time
-from typing import TYPE_CHECKING, Self, TypedDict, cast, override
+from typing import Self, TypedDict, cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
 
 import unittest
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("mac_test", "build_targets", "build_hold", "buildlog", "lib", "lint"):
+for directory in ("mac_test", "build_targets", "build_hold", "lib", "lint"):
     sys.path.insert(0, str(SCRIPTS / directory))
 
-if TYPE_CHECKING:
-    from . import mac_test, offload
-    from ..build_targets import targets
-    from ..build_hold import build_hold
-    from ..buildlog import record, store
-    from ..lib import conf
-    from ..lint.memory_test_support import write_config_fixture, config_environment
-else:
-    import mac_test
-    import offload
-    import targets
-    import build_hold
-    import record
-    import store
-    import conf
-    from memory_test_support import write_config_fixture, config_environment
+from scripts.mac_test import mac_test
+from scripts.mac_test import offload
+from scripts.build_targets import targets
+from scripts.build_hold import build_hold
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
 TARGET_NAMES = ("mac", "aws", "linux-two")

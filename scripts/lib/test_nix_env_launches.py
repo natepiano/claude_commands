@@ -33,8 +33,8 @@ else:
     import pane_record
     import herdr_sessions
     import pane_launch
-    import review
-    from user_action import NoActionRequired
+    from scripts.notify import review
+    from scripts.notify.user_action import NoActionRequired
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.accounts import accounts
 from scripts.lib import nix_env

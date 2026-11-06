@@ -27,7 +27,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     if not failed.exists():
         failed.touch()
         sys.path.insert(0, {str(hold_scripts)!r})
-        import build_hold
+        from scripts.build_hold import build_hold
         from datetime import datetime
         build_hold.start_hold(
             Path(os.environ["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),

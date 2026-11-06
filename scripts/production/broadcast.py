@@ -23,7 +23,8 @@ from typing import Literal, NamedTuple, cast
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
-import roster  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import roster  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
 from scripts.message import session_send
 

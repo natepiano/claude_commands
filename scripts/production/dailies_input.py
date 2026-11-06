@@ -36,8 +36,8 @@ from update_registration import (QuestionStaff, read_open_items, RegistrationFai
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-from build_hold import ActiveHolders, read_holders
-import override_guard
+from scripts.build_hold.build_hold import ActiveHolders, read_holders
+from scripts.build_hold import override_guard
 
 JsonMap = dict[str, object]
 LAST_REPORT = "dailies_last.json"

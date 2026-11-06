@@ -17,47 +17,29 @@ from contextlib import closing, contextmanager, redirect_stderr
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, final, override
+from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import cli
-import index
-import mac_idle
-import sample
-if TYPE_CHECKING:
-    from ..mac_test import offload
-    from ..build_queue import admission_protocol as wire
-    from ..build_queue import admission_client
-    from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
-    from .mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
-    from ..mac_test import mac_test
-    from ..direct import step_record
-    from ..lib import conf
-    from ..lint.memory_test_support import write_config_fixture, fake_memory_readings
-    from ..notify.push_texts import catalog, render_entry
-    from ..notify.push_catalog import mac_idle_reservation
-    from ..message import send
-else:
-    import offload
-    from scripts.build_queue import admission_protocol as wire
-    from scripts.build_queue import admission_client
-    from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
-    import mac_test
-    from scripts.direct import step_record
-    from scripts.lib import conf
-    from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings
-    from scripts.notify.push_texts import catalog, render_entry
-    from scripts.notify.push_catalog import mac_idle_reservation
-    from scripts.message import send
-from test_index import use_test_log
-if TYPE_CHECKING:
-    from ..lib.process_group import send_process_group
-else:
-    from scripts.lib.process_group import send_process_group
+from scripts.buildlog import cli
+from scripts.buildlog import index
+from scripts.buildlog import mac_idle
+from scripts.buildlog import sample
+from scripts.mac_test import offload
+from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_client
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
+from scripts.mac_test import mac_test
+from scripts.direct import step_record
+from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings
+from scripts.notify.push_texts import catalog, render_entry
+from scripts.notify.push_catalog import mac_idle_reservation
+from scripts.message import send
+from scripts.buildlog.test_index import use_test_log
+from scripts.lib.process_group import send_process_group
 
 use_test_log()
 REAL_NOTIFY_OUTAGE = mac_idle.notify_outage

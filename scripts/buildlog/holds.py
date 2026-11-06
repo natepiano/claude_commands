@@ -3,19 +3,15 @@
 from __future__ import annotations
 
 import sqlite3
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-import store
+from scripts.buildlog import store
 
-for directory in ("build_targets", "build_hold", "mac_test", "lint", "lib"):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / directory))
-from intervals import union_seconds
-from user_zone import user_zone
+from scripts.lib.intervals import union_seconds
+from scripts.lib.user_zone import user_zone
 
 HoldTarget = Literal["mac", "natedev"]
 MICROSECOND = timedelta(microseconds=1)
@@ -53,10 +49,8 @@ class CurrentHolds:
 
 def read_current_holds() -> CurrentHolds:
     # Historical reads need no live coordination modules.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
-    import targets as targets  # Adds the shared script directories to sys.path.
-    import build_hold
-    import mac_test
+    from scripts.build_hold import build_hold
+    from scripts.mac_test import mac_test
 
     natedev: NatedevHoldsNow | HoldStateUnreadable
     mac: MacHoldsNow | HoldStateUnreadable

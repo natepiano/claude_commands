@@ -22,23 +22,16 @@ import threading
 import time
 import subprocess
 import unittest
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from scripts.buildlog import store
-    from scripts.buildlog import record as buildlog_record
-else:
-    import store
-    import record as buildlog_record
+from scripts.buildlog import store
+from scripts.buildlog import record as buildlog_record
 
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    import conf
+from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
@@ -4078,7 +4071,6 @@ class RunPlaceTests(unittest.TestCase):
         from scripts.aws_target.config import ControlSettings, read_control_settings
         from scripts.build_queue import head_facts
         from scripts.build_queue.queue_lines import plain
-        from scripts.lib import conf
 
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()

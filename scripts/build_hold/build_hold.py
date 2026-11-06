@@ -21,29 +21,24 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-from sessions import addressed, live_sessions  # noqa: E402
+from scripts.message.sessions import addressed, live_sessions  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from process_failure import failure_detail
-from user_zone import user_zone
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone
 import unit_runs
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import override_guard
+from scripts.build_hold import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
-from target_config import ConfigError, SshTarget, read_targets
+from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..build_queue import admission_service
-    from ..buildlog import store
-    from ..message import session_send
-else:
-    from scripts.build_queue import admission_service
-    from scripts.buildlog import store
-    from scripts.message import session_send
+from scripts.build_queue import admission_service
+from scripts.buildlog import store
+from scripts.message import session_send
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -592,7 +587,7 @@ class HoldEnforcer(Protocol):
 def hold_enforcer() -> HoldEnforcer:
     # The enforcer uses these audit types; load it after this module is ready.
     import importlib
-    return cast(HoldEnforcer, cast(object, importlib.import_module("hold_enforcer")))
+    return cast(HoldEnforcer, cast(object, importlib.import_module("scripts.build_hold.hold_enforcer")))
 
 
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
@@ -1764,7 +1759,7 @@ def main(arguments: list[str]) -> int:
             # Use the local gate's hold and caller check; recording a notice recipient permits no build.
             import importlib
             check_local_hold = cast(Callable[[], int], getattr(
-                importlib.import_module("build_targets"), "command_check_local"))
+                importlib.import_module("scripts.build_targets.build_targets"), "command_check_local"))
             return check_local_hold()
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
@@ -1798,5 +1793,5 @@ def main(arguments: list[str]) -> int:
 
 if __name__ == "__main__":
     # The enforcer must use this CLI's domain types, not a second module instance.
-    _ = sys.modules.setdefault("build_hold", sys.modules[__name__])
+    _ = sys.modules.setdefault("scripts.build_hold.build_hold", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))

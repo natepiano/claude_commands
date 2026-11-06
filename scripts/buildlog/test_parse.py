@@ -16,22 +16,18 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import index
-import parse
-import repository
-import test_record as record_tests
-from store import UNKNOWN_IDENTITY
-from test_index import use_test_log
+from scripts.buildlog import index
+from scripts.buildlog import parse
+from scripts.buildlog import repository
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog.store import UNKNOWN_IDENTITY
+from scripts.buildlog.test_index import use_test_log
 
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
 
 use_test_log()
 
@@ -314,15 +310,15 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         source = """\
 import json
 from pathlib import Path
+import os
 import runpy
 import sys
 
-mode, script, arguments = sys.argv[1:]
+mode, script, checkout, arguments = sys.argv[1:]
 path = Path(script)
-sys.path.insert(0, str(path.parents[2]))
-sys.path.insert(0, str(path.parent))
 arguments = json.loads(arguments)
 if mode == "script":
+    os.chdir(checkout)
     sys.argv = [script, *arguments]
     try:
         runpy.run_path(script, run_name="__main__")
@@ -330,6 +326,7 @@ if mode == "script":
         assert result.code == 0, result.code
 else:
     from scripts.buildlog import record
+    os.chdir(checkout)
     assert record.main(arguments) == 0
 conf_path = path.parents[1] / "lib/conf.py"
 modules = {name: module for name, module in sys.modules.copy().items()
@@ -343,8 +340,8 @@ assert len({id(module) for module in modules.values()}) == 1, list(modules)
                 arguments = ["step", "0", str(record_tests.START), str(record_tests.START + 1),
                              "0", str(handoff), "", *record_tests.NEXTEST]
                 result = subprocess.run(
-                    [sys.executable, "-c", source, mode, str(record_tests.SCRIPT), json.dumps(arguments)],
-                    cwd=self.fixture.repo, env=self.fixture.environment(), capture_output=True, text=True,
+                    [sys.executable, "-c", source, mode, str(record_tests.SCRIPT), str(self.fixture.repo), json.dumps(arguments)],
+                    cwd=Path(__file__).resolve().parents[2], env=self.fixture.environment(), capture_output=True, text=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)

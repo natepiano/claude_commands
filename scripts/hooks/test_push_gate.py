@@ -20,14 +20,14 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
-    from ..notify import review, pushover
-    from ..notify.push_test_support import registered_send
-    from ..notify.user_action import ActionRequired
+    from scripts.notify import review, pushover
+    from scripts.notify.push_test_support import registered_send
+    from scripts.notify.user_action import ActionRequired
 else:
-    import review
-    import pushover
-    from push_test_support import registered_send
-    from user_action import ActionRequired
+    from scripts.notify import review
+    from scripts.notify import pushover
+    from scripts.notify.push_test_support import registered_send
+    from scripts.notify.user_action import ActionRequired
 
 spec = importlib.util.spec_from_file_location("push_gate", Path(__file__).with_name("pre-tool-use-push-gate.py"))
 assert spec is not None and spec.loader is not None

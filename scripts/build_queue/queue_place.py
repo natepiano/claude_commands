@@ -14,19 +14,13 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
+from typing import BinaryIO, TypedDict, Unpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
 import uuid
-
-if TYPE_CHECKING:
-    from scripts.lib import conf
-else:
-    import conf
-
 
 @dataclass(frozen=True)
 class ConfiguredFirstPeak:

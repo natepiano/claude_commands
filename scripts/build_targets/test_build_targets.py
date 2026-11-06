@@ -12,41 +12,29 @@ from collections.abc import Generator, Iterable
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 from unittest import mock
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import build_targets
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import build_hold
-import offload
-import mac_test
-import targets
-if TYPE_CHECKING:
-    from ..buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
-    from ..message import roster
-    from ..buildlog import record, store
-else:
-    from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
-    from scripts.message import roster
-    import record
-    import store
-from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from memory_test_support import write_config_fixture
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.build_targets import build_targets
+from scripts.lib import process_start as process_identity
+
+from scripts.build_hold import build_hold
+from scripts.mac_test import offload
+from scripts.mac_test import mac_test
+from scripts.build_targets import targets
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
+from scripts.message import roster
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.build_targets.test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib import test_hang_guard
 
 SHIPPED_STATUS = "\n".join((
     "mac: free",

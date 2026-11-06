@@ -20,14 +20,11 @@ import time
 import unittest
 import uuid
 from unittest import mock
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from ..buildlog import store
-else:
-    import store
+from scripts.buildlog import store
 
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading
 from scripts.build_queue import admission_protocol as wire

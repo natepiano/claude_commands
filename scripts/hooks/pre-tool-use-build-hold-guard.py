@@ -9,8 +9,9 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tool_call_text import scan_text
 
@@ -134,10 +135,7 @@ def decide(raw: str) -> str:
         return ""
     # Load the hold reader only for a build call with a possible hold.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_hold"))
-    if TYPE_CHECKING:
-        from ..build_hold.hold_applies import HoldStateReadError, hold_applies
-    else:
-        from hold_applies import HoldStateReadError, hold_applies
+    from scripts.build_hold.hold_applies import HoldStateReadError, hold_applies
 
     if not os.environ.get("CLAUDE_CODE_SESSION_ID"):
         os.environ["CLAUDE_CODE_SESSION_ID"] = payload.get("session_id", "")

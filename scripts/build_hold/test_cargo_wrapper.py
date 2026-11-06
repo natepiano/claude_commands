@@ -11,16 +11,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from typing import TYPE_CHECKING, override
+from typing import override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 

@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from scripts.notify import review as review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-    import review as review
+    from scripts.notify import review as review
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
 

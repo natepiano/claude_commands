@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-import override_guard
-import target_config
+from scripts.build_hold import override_guard
+from scripts.build_targets import target_config
 
 
 class CliArguments(argparse.Namespace):
@@ -107,7 +107,7 @@ if __name__ == "__main__" and sys.argv[1:2] == ["platform"]:
     raise SystemExit(command_platform(platform_arguments.target))
 
 
-from targets import (
+from scripts.build_targets.targets import (
     ANY_ELIGIBLE_TARGET,
     AwsStatusRow,
     RemovalPending,
@@ -134,23 +134,19 @@ from targets import (
     target_state,
     target_eligibility,
 )
-import offload
-import mac_test
-import conf
-from atomic_file import write_text_atomic
-import build_hold
-from user_zone import user_zone
+from scripts.mac_test import offload
+from scripts.mac_test import mac_test
+from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_hold import build_hold
+from scripts.lib.user_zone import user_zone
+from scripts.lib import process_start as process_identity
+from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
+from scripts.buildlog import mac_idle_alert
+from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
+
 if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-    from ..direct.step_record import Pinned, ROUTED, TargetSelection
-    from ..buildlog import mac_idle_alert
-    from ..message import roster
-    from ..aws_target import config as aws_config, ledger as cost_ledger, measurement
-else:
-    from scripts.lib import process_start as process_identity
-    from scripts.direct.step_record import Pinned, ROUTED, TargetSelection
-    from scripts.buildlog import mac_idle_alert
-    from scripts.aws_target import config as aws_config, ledger as cost_ledger, measurement
+    from scripts.message import roster
 
 
 

@@ -21,17 +21,17 @@ import unittest
 from unittest import mock
 
 if TYPE_CHECKING:
-    from ..aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-    from . import linux_runner, mac_test, offload, test_target_slots
-    from ..lint import sweep
-    from ..lint.memory_test_support import write_config_fixture
+    from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
+    from scripts.mac_test import linux_runner, mac_test, offload, test_target_slots
+    from scripts.lint import sweep
+    from scripts.lint.memory_test_support import write_config_fixture
 else:
     from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
     import linux_runner
-    import mac_test
-    import offload
+    from scripts.mac_test import mac_test
+    from scripts.mac_test import offload
     import test_target_slots
-    import sweep
+    from scripts.lint import sweep
     from scripts.lint.memory_test_support import write_config_fixture
 
 

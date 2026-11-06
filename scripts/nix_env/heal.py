@@ -32,8 +32,8 @@ sys.path.insert(0, str(SCRIPTS / "notify"))
 if TYPE_CHECKING:
     from scripts.notify import push_texts, review
 else:
-    import push_texts
-    import review
+    from scripts.notify import push_texts
+    from scripts.notify import review
 
 
 def state_directory() -> Path:
