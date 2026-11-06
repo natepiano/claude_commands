@@ -1,20 +1,27 @@
 # One EC2 instance for each merge gate
 
-Recommend a size trial before selecting a Spot instance type in `us-east-2c`.
-Use a ready NixOS image and a launch template. Terminate the instance after its gate.
-Estimate 60–120 seconds from launch request to tests, when Spot capacity exists.
-Target 420 seconds per gate, alone on its instance. Do not select a size from CPU arithmetic.
-Test eight, sixteen, thirty-two, and sixty-four vCPUs three times each, with no overlapping trial gates.
-Estimate $1.49 for the trial day, including image preparation; reserve at most $7 within the existing caps.
-Select the cheapest measured cost per gate with a median wall time of 420 seconds or less.
+Recommend a fresh Spot instance from a ready image as the first trial candidate.
+This is a provisional recommendation, not a measured efficiency result.
+Run the small size trial first. Then measure cold launch and stopped-instance start without a gate.
+Keep one gate alone on each instance.
+The gate target remains seven minutes, or 420 seconds, as a design requirement.
+Step A costs an estimated $1.49, with a $4 reserve.
+Step B costs an estimated $1.25, including optional Batch, with a $3 reserve.
+The combined estimate is $2.74. The combined reserve remains $7 within the shared caps.
 Natedev takes about 1,030 seconds alone and 2,660 seconds under the supplied morning load.
-Keep the Rust box separate. Share its $20 daily and $400 monthly caps; keep queue and publishing work on natedev.
+Keep the Rust box separate.
+Keep the shared $20 daily and $400 monthly caps.
+Keep queue ownership and publishing on natedev.
 
 ## Status and evidence
 
 This document is a design. The commands and record changes marked **proposed** do not exist yet.
 The source references describe this checkout. The build phases identify the required new work.
 No deployment, host connection, credential read, or state-directory read formed part of this design.
+The launch method and size remain unselected.
+Later EC2-specific sections describe the fresh-Spot candidate.
+Production integration waits for the small trial and the later concurrency trial.
+Exact-tree testing, equal coverage, local publishing, and the shared spending caps remain requirements.
 
 The user supplied these measurements from 191 full passing gates since 2026-11-01:
 
@@ -35,7 +42,7 @@ Full-tree basedpyright reached 4,065 MiB.
 Four concurrent gates showed 3–4.5 GiB combined memory in 75-second maximum samples.
 Those samples do not establish a safe memory size for a fresh instance.
 
-## Size, speed, and price
+## Candidate sizes and unmeasured predictions
 
 The target is seven minutes, or 420 seconds, for one gate alone on its instance.
 The trial measures that target. It does not treat it as a prediction.
@@ -49,7 +56,7 @@ The 250-second serial allowance is an estimate, not a measured stage duration.
 Each price calculation adds 120 estimated seconds for startup and result delivery.
 The calculation treats that whole allowance as billed time, which overstates any unbilled allocation wait.
 
-| Instance | vCPU, sourced | GiB, sourced | On-demand $/hour, sourced | Spot $/hour, sourced | Tests seconds, estimated | On-demand compute $/gate, estimated | Spot compute $/gate, estimated | Spot total $/gate, estimated |
+| Instance | vCPU, sourced | GiB, sourced | On-Demand $/hour, estimated | Spot $/hour, estimated | Tests seconds, estimated | On-demand compute $/gate, estimated | Spot compute $/gate, estimated | Spot total $/gate, estimated |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `c7a.2xlarge` | 8 | 16 | 0.4106 | 0.1256 | 1,100 | 0.139 | 0.043 | 0.052 |
 | `c7a.4xlarge` | 16 | 32 | 0.8211 | 0.2427 | 700 | 0.187 | 0.055 | 0.065 |
@@ -62,12 +69,11 @@ Eight vCPUs provide the low-cost comparison. Sixteen and thirty-two test the mid
 Sixty-four tests whether more dedicated capacity can reach the target.
 The predictions cannot establish which size wins, or whether any size meets 420 seconds.
 
-Prices and specifications come from the [Ohio price table](https://instances.usage.ai/aws/ec2/region/us-east-2), accessed 2026-11-06.
-This secondary source gives indicative regional Spot prices. It does not establish the current `us-east-2c` price or capacity.
-The trial records the actual zone price through the user-run deployment command.
-On-demand prices provide a comparison only. The design uses Spot.
-
-Choice: measure four sizes before selecting one; risk: the gate's serial stages can prevent every size from meeting the target.
+The vCPU and memory specifications are sourced from [AWS compute instance specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/co.html), accessed 2026-11-06.
+The hourly rates remain estimates from the earlier design, not verified AWS Ohio price quotes.
+Record actual Ohio prices and capacity during the user-run trial.
+On-Demand rates price the warm-pool candidate; Spot rates price the other EC2 candidates.
+Step A selects the size. Step B compares startup methods without running gates.
 
 ### Work that does not scale
 
@@ -88,7 +94,7 @@ Keep that default for every trial run. Keep the sampled memory cap at 6 GiB.
 Measure launch request, first test, type completion, last module, result receipt, and confirmed termination separately.
 Record CPU seconds, sampled memory, failed modules, reruns, and the actual price.
 Compare the same full tree with a natedev gate.
-The first build phase defines the repeated size trial and its selection rule.
+The first build phase defines the two small trial steps and their selection rules.
 
 ## Split and owners
 
@@ -122,32 +128,76 @@ Prepare the bundle within the copy lock, then release that copy before the remot
 The result names the immutable commit and tree, so it does not depend on that copy remaining unchanged.
 Otherwise, twenty remote gates could still wait behind two local copies.
 
-Choice: move only test execution; risk: host-dependent tests still require a short local stage.
+## Launch methods and the first decision
 
-## Startup
+All AWS links below have access date **2026-11-06**.
+Times and costs remain **estimated** or **to measure**, unless marked **sourced**.
+Phase 1 compares sizes and basic startup methods. Phase 2 contains the full method table and the concurrency trial.
 
-The selected path uses a ready image **and** a launch template.
-A template stores launch settings. It does not contain installed tools.
-The image contains NixOS, the required store paths, Python, Node, basedpyright, uv, Git, shells, and the pinned type environment.
+### Cold capacity still requires EC2
+
+Batch launches EC2 instances through its managed compute environment.
+EKS Cluster Autoscaler requests nodes through EC2 Auto Scaling when pods cannot fit.
+See [Batch managed capacity](https://docs.aws.amazon.com/batch/latest/userguide/managed_compute_environments.html) and [EKS Cluster Autoscaler](https://docs.aws.amazon.com/eks/latest/best-practices/cas.html), accessed 2026-11-06.
+
+**Inference:** with the same image, type, and capacity, both cold paths require the same EC2 launch work as a direct launch.
+They add scheduling and worker registration before a job can start.
+They cannot remove EC2 launch time; they offer no cold-start speed advantage from their scheduler alone.
+Actual request times can vary with capacity and configuration. Step B measures the Batch difference instead of assuming its duration.
+
+A faster capacity path needs existing running or prepared capacity, which has idle or storage cost.
+A stopped warm pool makes the same trade: preparation before the request, plus retained storage.
+AWS recommends warm pools when initial boot delay matters and warns about unnecessary pool cost.
+See [warm pools](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-warm-pools.html), accessed 2026-11-06.
+The value of Batch or EKS here is less lifecycle code for us to own, rather than faster cold EC2 launches.
+
+### Decision from the small trial
+
+Recommend fresh Spot from our image unless the startup measurements show a material delay beside gate time.
+It preserves the current systemd and cgroup behavior. It retains no idle worker or worker volume.
+If cold overhead is small beside gate time, fresh Spot wins because it has no worker idle cost.
+If cold overhead is large and stopped starts remove it, a stopped warm pool wins the startup comparison.
+Include retained-volume and On-Demand costs before production use; Phase 2 measures the complete pool.
+AWS excludes Spot from mixed-instance warm pools. The later pool candidate uses On-Demand instances.
+See [warm-pool limits](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-warm-pools.html), accessed 2026-11-06.
+
+Report the cold overhead as a fraction of the measured gate time and show the seconds saved by stopped starts.
+Agree whether that delay matters from the measured values; do not invent a threshold before the first answer.
+Choose Batch over our launch code only if Step B shows a start time close to direct cold launch.
+Its reason for selection is less code. A close timing result permits further qualification; it does not prove gate compatibility.
+
+Keep EKS outside the trial unless a later requirement needs Kubernetes.
+Its sourced standard control-plane rate is $0.10/hour; an estimated 730-hour month costs $73 before workers and storage.
+Extended support costs a sourced $0.60/hour, or an estimated $438 for the same month.
+See [EKS pricing](https://aws.amazon.com/eks/pricing/), accessed 2026-11-06.
+
+### Fargate waits for compatibility evidence
+
+Keep Fargate outside the trial until the runner's `/proc`, cgroup v2, and process group use is proven there.
+`merge_gate.py:492` samples descendants. `queue_place.py:284` requires its process group; `:291` refuses a missing memory scope.
+The current gate also needs a user systemd manager and delegated cgroup scopes.
+Fargate's task limits do not prove equivalent module accounting or cancellation.
+
+ECS Fargate Spot supports sourced task sizes from 0.25 to 32 vCPUs and 0.5–244 GiB through permitted pairs.
+The sourced 32-vCPU memory choices are 60, 120, and 244 GiB.
+Fargate supports a shared task PID namespace but does not offer privileged tasks or configurable tmpfs/shared-memory mounts.
+See [task limits](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-tasks-services.html), [Spot support](https://aws.amazon.com/about-aws/whats-new/2026/06/amazon-ecs-fargate-32vcpu/), and [PID namespace settings](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_TaskDefinition.html), accessed 2026-11-06.
+Do not remove coverage or disable the memory scope to qualify Fargate.
+
+## Startup details waiting for the trial
+
+The remaining EC2-specific sections describe the fresh-Spot candidate, not a selected production method.
+Their production launch method waits for Steps A and B, then the concurrency trial.
+Shared requirements remain: exact tree, equal coverage, dedicated gate capacity, bounded cost, result integrity, and confirmed cleanup.
+The ready-image candidate contains NixOS, required store paths, Python, Node, basedpyright, uv, Git, and shells.
 It contains no job tree, host credential, session state, or Rust build output.
-
-All times in this table are estimates. No EC2 startup measurement was available.
-
-| Path | Request and boot | Tools, tree, and service | First test | Decision and risk |
-| --- | ---: | ---: | ---: | --- |
-| Ready image plus launch template | 35–80 s | 25–40 s | 60–120 s | Selected; Spot allocation and snapshot reads can take longer. |
-| Stopped ready instances | 20–50 s | 20–40 s | 40–90 s | Rejected; idle volumes cost money, and stopped Spot reuse complicates ownership. |
-| Launch template with an unprepared image | 35–80 s | 180–900 s | 215–980 s | Rejected; package installation dominates startup. |
-
-These estimates assume available capacity and a small source bundle.
-They are not a launch deadline or an AWS promise.
-The warm-pool estimate describes a comparison, not an alternative Spot policy.
-Use neither a warm pool nor snapshot acceleration in the first implementation.
-
-Choice: install tools before launch; risk: an image update takes longer than a gate launch.
+A launch template stores settings; it does not contain installed tools.
+Containers require the same tool manifest with separately qualified host integration.
+No candidate receives a production startup deadline from the estimates above.
 
 ## Launch, scale, and termination
 
+This section describes production with fresh Spot. Phase 1 uses the smaller cleanup arrangement below.
 Use one launch template for all gates.
 Use one ordinary `RunInstances` request per attempt, with one instance and an idempotency token.
 Use one-time Spot requests with termination on interruption.
@@ -156,12 +206,12 @@ Set the root EBS volume to delete on termination.
 Create no retained home volume for a gate.
 
 Twenty ready requests can issue twenty launches concurrently.
-No shared worker, autoscaling group, or AWS work queue sits between them.
+This candidate has no autoscaling group or AWS work queue between requests and instances.
 The existing queue remains the only work queue.
 The twenty-instance limit is a proposed configuration value, not a new local admission rule.
 AWS refusal returns the affected request to natedev.
 
-The sequential trial needs up to sixty-four Spot vCPUs for its gate.
+A single-gate trial candidate needs up to sixty-four EC2 vCPUs for its gate.
 The existing sixteen-vCPU Rust box raises that need to at least eighty in the same regional Standard quota.
 Twenty concurrent gates need `20 × winning vCPU count + 16` when the Rust box also runs.
 That is 336 vCPUs for sixteen-vCPU workers, or 1,296 for sixty-four-vCPU workers.
@@ -171,9 +221,8 @@ See [Spot quotas](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot
 The current account quota is unknown. Regional quota does not guarantee capacity in zone 2c.
 
 Each launch record contains its absolute expiry time before the launch request.
-Use a sixty-minute lifetime for each trial attempt, as an estimated operational limit.
+Set the absolute lifetime from measured gate time and its cost reservation.
 It includes startup, tests, upload, and termination delay.
-An unusually slow valid gate can exceed this limit and require a local retry.
 All lifetimes and intervals belong in configuration read through `conf.py`.
 
 | Event | End action | Queue result |
@@ -193,11 +242,8 @@ The guest also has an absolute systemd deadline, rather than an inactivity timer
 Normal completion does not wait for the expiry function.
 An AWS control-plane outage can delay termination; no design can promise zero charges during that outage.
 
-The Lambda function and schedule require the user's permission listed below.
-The one-command trial includes independent cleanup after that permission.
-This dependency is necessary to satisfy the requested cleanup after natedev failure.
-
-Choice: terminate each gate instance; risk: an interrupted attempt loses all local progress.
+The Lambda function and schedule need separate production permission.
+Steps A and B install neither resource. They use guest shutdown deadlines and command cleanup.
 
 ## Exact tree delivery
 
@@ -229,9 +275,7 @@ Natedev compares those identities with the returned result before it publishes a
 
 Estimate 5–15 seconds for a 100-MB bundle over the two transfers and checkout.
 Measure the real bundle size and transfer rate in the trial.
-The startup table includes this allowance.
-
-Choice: use object storage for both directions; risk: large logs or history increase transfer time.
+Step A measures this allowance within running-to-gate-start time.
 
 ## Test environment and equal meaning
 
@@ -274,8 +318,6 @@ A new skip cannot substitute for a previously executed test.
 Any additional test that requires natedev remains local until its environment has an equivalent fixture.
 This is the proof of equal coverage, not a claim that Linux hosts behave identically.
 No `scripts/production/full_test.py` exists in this checkout.
-
-Choice: retain host-dependent coverage locally; risk: the local stage limits the best possible gate time.
 
 ## Result and queue record
 
@@ -320,8 +362,6 @@ Remote completion must therefore return the record explicitly, rather than infer
 Do not add short-lived hosts to the build-target registry or the regular peer sync service.
 These jobs are merge gates, not Rust offload attempts.
 
-Choice: use the current result record; risk: its recovery logic needs an EC2 attempt identity as well as a local PID.
-
 ## Reuse and the cache claim
 
 The user's claim is correct for Rust build output in this gate.
@@ -337,7 +377,7 @@ It also saves module times, CPU times, memory peaks, and history at `scripts/pro
 These records improve job ordering, reservations, and reports.
 The image also avoids repeated tool and type-package installation.
 
-Every size-trial run uses `--full` and no pass from another host or earlier attempt.
+Every Step A gate uses `--full` and no pass from another host or earlier attempt.
 Fresh instance names otherwise prevent current pass reuse and ancestor selection.
 Do not pretend that a disposable instance is natedev.
 
@@ -354,12 +394,10 @@ An affected pass must not become a full certificate.
 Keep the current final clean-tree comparison at `scripts/production/merge_gate.py:820`.
 Measure a cold full gate, a repeated full gate, and an affected gate to quantify each form of reuse.
 
-Choice: preserve result and scheduling reuse, not build folders; risk: the certificate-key change requires careful gate-owner review.
-
 ## Spot behavior
 
-Spot is the required purchase mode.
-The on-demand column only shows the cost comparison.
+Fresh EC2, Batch, and EKS gate candidates use Spot.
+The warm-pool comparison uses On-Demand capacity; production purchase mode waits for the trial.
 Short jobs reduce the amount of work lost per interruption, but they do not eliminate interruption risk.
 No measured interruption rate for this type and zone was supplied.
 
@@ -380,6 +418,7 @@ Local fallback avoids repeated demand on an unavailable Spot pool.
 The limits remain $20 per accounting day and $400 per month for the combined AWS workload.
 The Rust box already consumes part of both limits.
 There is no separate $400 allowance for merge gates.
+The examples below price fresh Spot only. The later method comparison includes idle and fixed charges.
 
 The sixteen-vCPU example below uses 820 billed seconds and a 40-GiB gp3 root volume.
 This is a costing example, not a size recommendation.
@@ -415,7 +454,8 @@ Keep EC2 and object storage in the same region.
 Budget result downloads without assuming an unused free transfer allowance.
 AWS's 100-GB monthly free transfer allowance is account-wide.
 See [EC2 on-demand pricing](https://aws.amazon.com/ec2/pricing/on-demand/), accessed 2026-11-06.
-No NAT gateway, load balancer, retained gate volume, or paid snapshot acceleration is part of this design.
+The fresh-Spot candidate uses no NAT gateway, load balancer, retained gate volume, or paid snapshot acceleration.
+Steps A and B give the first startup answer. Phase 2 measures the complete pool cost if needed.
 
 | Limit example | Estimated capacity before Rust costs, retries, and image builds |
 | --- | ---: |
@@ -431,7 +471,7 @@ That implies about 32–38 gates/day, not a measured count for today.
 At that rate, estimated gate spend is $2.08–$2.47/day, plus about $0.10/day shared costs.
 For today's count `N`, the report must show `0.065 × N + shared daily cost + retry cost`.
 These daily estimates use the sixteen-vCPU example. The trial replaces its $0.065 cost with the measured winner's cost.
-The **queue** owner supplies `N` from its existing records during the trial.
+The **queue** owner supplies `N` for the later production cost report. Steps A and B use no build queue.
 No private state was read to invent that number.
 
 ### Ledger change
@@ -469,8 +509,6 @@ Refresh combined charges when either workload needs them, even when Rust offload
 The gate switch must not enable Rust offload or start the Rust box.
 Accounting-day costs still use the configured accounting zone. Performance comparisons use the report's local day.
 
-Choice: extend one cost authority; risk: this is a required ledger change, not an existing multi-instance feature.
-
 ## Access and permission questions
 
 Sessions send queue requests. They make no AWS calls.
@@ -485,7 +523,8 @@ The current scaler policy permits start and stop on the Rust instance.
 It also permits describe calls and Cost Explorer reads.
 See `docs/plans/builds-aws/cloudformation.json:703`.
 It does not permit disposable instance launches.
-The following questions request each additional runtime permission.
+The following questions describe additional permissions for production with fresh Spot.
+They are not the permission list for Steps A and B.
 They are proposed grants, not permissions this design assumes already exist.
 
 | Permission question for the user | Scope and reason |
@@ -510,10 +549,8 @@ Use bucket lifecycle rules for log removal. Runtime needs no bucket administrati
 
 Does Ohio have eighty Standard Spot vCPUs available for the sequential trial while the Rust box runs?
 Can its quota support `20 × winning vCPU count + 16` before fleet routing starts?
-Only the user can authorize an increase if the current quota is lower.
+Any required quota increase remains part of the user-run deployment path.
 No new notification, manual approval per gate, or resource check unrelated to this request is proposed.
-
-Choice: extend the existing machine credential with narrow runtime permissions; risk: the queue daemon can launch paid resources within those permissions.
 
 ## One-command setup and image updates
 
@@ -526,7 +563,7 @@ The **proposed** user command is:
 This command uses the user's existing deployment inputs and administrator access.
 It creates or reconciles the image, bucket, worker role, launch template, expiry service, and scoped queue policy.
 It records priced inventory before the first charged resource.
-It installs the local queue integration after the size trial selects a winner.
+It installs queue integration after the small trial and the later concurrency trial.
 Rerunning it reconciles existing resources rather than creates another fleet.
 It requires no per-instance Tailscale login, SSH setup, console action, or package installation.
 An absent AWS account or unavailable administrator access remains outside a command's ability to create its own authority.
@@ -545,8 +582,6 @@ Keep a separate gate image record and image tags.
 Gate image updates must not delete the Rust image or its snapshots.
 Put gate settings in a proposed `config/merge_gate_instances.conf`, read through `conf.py`.
 Read the existing caps and placement from `config/aws_target.conf`; do not copy their values into another setting.
-
-Choice: use the existing user-run setup workflow; risk: a tool change needs an image build before remote routing resumes.
 
 ## Fallback and separation from Rust
 
@@ -568,137 +603,183 @@ That path removes the box's compute resources at `scripts/aws_target/teardown.py
 Gate cleanup names only the recorded gate instance and its disposable resources.
 No new gate host enters `config/build_targets.conf`.
 
-Choice: preserve local fallback and the Rust lifecycle; risk: fallback returns the gate to natedev's measured load delays.
-
 ## Phased build order
 
-### Phase 1: one command, a sequential size trial
+### Phase 1: two small trial steps
 
-Owners: **aws-unit** and **sdlc devtools**. The **queue** owner does not enable fleet routing yet.
+The user runs each command from the `builds-aws` worktree.
+Neither command uses the natedev build queue or a natedev baseline.
+`deploy.py` dispatches to `scripts/aws_target/gate_trial.py`.
+Only the user runs these commands against AWS.
 
-The **proposed** command is:
+#### Step A: size
 
-`python3 scripts/aws_target/deploy.py gate-trial --repo . --approve-resources`
+```sh
+~/.claude/scripts/lib/py scripts/aws_target/deploy.py gate-trial --step size --repo . --approve-resources
+```
 
-The same command prepares the image and trial resources when they do not exist.
-It records one exact commit, tree, image, tool manifest, suite set, and memory cap for the whole trial.
-It uses the four instance types listed in the prediction table.
-It launches three fresh instances per type, for twelve attempts in total.
-Only one trial instance runs at a time.
-Each instance runs one full gate and then terminates.
+The config defaults are `--sizes 8,16,32,64 --runs 3`.
+Start with one small run:
 
-Three runs give a median and an observed range without a large trial bill.
-They reduce the effect of one unusually fast or slow run.
-They do not establish a reliable tail-latency estimate.
-Rotate through all four sizes once per round, for three rounds.
-This reduces the effect of testing one size only during one period of Spot conditions.
-Use the same runner defaults and 6-GiB cap throughout.
-Start the next trial instance only after the previous instance reaches confirmed termination.
+```sh
+~/.claude/scripts/lib/py scripts/aws_target/deploy.py gate-trial --step size --repo . --approve-resources --sizes 16 --runs 1
+```
 
-1. Reserve the trial cost within the existing shared daily and monthly caps.
-2. Prepare the image, approved expiry service, and priced launch resources through the user-run deployment path.
-3. Run one full natedev baseline for coverage and timing comparison.
-4. Run the twelve sequential full-gate attempts on the recorded tree.
-5. Import every result and its logs.
-6. Confirm termination for every launched instance.
-7. Print the trial table, total cost, and winner or unmet target.
+1. Read the ledger totals without writing them.
+2. Print and bundle the exact commit at `--repo` HEAD.
+3. Upload the bundle to a temporary private bucket.
+4. Launch one Spot instance from the configured official NixOS image.
+5. Prepare tools through `nix shell`.
+6. Run `merge_gate.run_suites` with `full=True` and all script type checks.
+7. Terminate the instance before the next attempt.
 
-Keep every attempt's wall time, failure, rerun, and interruption in the saved report.
-Do not replace an interrupted attempt automatically during this trial.
-Report unavailable capacity as missing trial data, not a zero-second gate.
-A size needs three full passing runs to enter the winner selection.
-The existing coverage comparison includes the required local modules before a run counts as passing.
+The bundle excludes uncommitted changes.
+The image has no box Tailscale identity or box idle service.
+The gate uses its own admission service and the default gate limits.
+A failed suite remains a measured result.
 
-The trial prints one table with these columns:
+The command calls `DescribeSubnets` for the configured VPC.
+It tries the configured subnet first, then one public-address subnet in each other zone.
+Each zone uses its current Spot price and the same reserve rule.
+`InsufficientInstanceCapacity` advances to the next zone.
+The report records each capacity refusal with its zone and AWS message.
+Other AWS refusals end that attempt.
+An attempt reports `no capacity` when every zone refuses for capacity.
 
-| Instance type | vCPU | Memory GiB | Wall seconds | Seconds to start | Peak CPU | Peak memory GiB | Spot $/hour | Dollars per gate | Gates/day under $20 cap |
-| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |
-| `c7a.2xlarge` | 8 | 16 | Three times; median and range | Median and range | Maximum used vCPUs | Maximum RSS plus swap | Observed range | Mean priced cost | Calculated remaining capacity |
-| `c7a.4xlarge` | 16 | 32 | Three times; median and range | Median and range | Maximum used vCPUs | Maximum RSS plus swap | Observed range | Mean priced cost | Calculated remaining capacity |
-| `c7a.8xlarge` | 32 | 64 | Three times; median and range | Median and range | Maximum used vCPUs | Maximum RSS plus swap | Observed range | Mean priced cost | Calculated remaining capacity |
-| `c7a.16xlarge` | 64 | 128 | Three times; median and range | Median and range | Maximum used vCPUs | Maximum RSS plus swap | Observed range | Mean priced cost | Calculated remaining capacity |
+The table shows the zone, five time intervals, request-to-ready time, dollars, counts, skips, verdict, failed modules, and log path.
+The report gives medians and the cheapest size whose gates all pass within the configured target.
+An unfinished attempt prevents that size from qualifying.
+Batch remains **not measured**.
 
-The table above defines the output format. It contains no measured trial results.
-Wall time starts when the worker enters `run_suites` and ends when it returns its final verdict.
-It includes types, module waits, and isolated reruns. It excludes instance startup and artifact delivery.
-The 420-second target applies to that wall time.
-The required local modules must also pass. Report their time and the complete queue wait separately.
-Startup time runs from the launch request to the first test or type job.
-Peak CPU is the largest one-second CPU delta for the gate's cgroup, expressed as used vCPUs.
-One used vCPU means one CPU second in that interval.
-The trial adds this peak measurement. Existing CPU-second totals do not measure a peak.
-The **sdlc devtools** owner adds the sample to the trial result without replacing the existing CPU totals.
-Peak memory uses the gate's existing RSS-plus-swap sampling.
-CPU peaks and elapsed times measure actual execution; dollars use measured resources and observed prices until billing reconciliation arrives.
+#### Step B: start method, without a gate
 
-For each size, calculate mean variable cost across its three attempts, including failed-attempt charges.
-Include compute, EBS, IPv4, requests, and transfer in dollars per gate.
-Report image preparation and shared fixed costs in the trial total.
-Calculate gates/day as `floor((20 - other committed daily spend - shared daily fixed cost) / mean variable cost per gate)`.
-Other committed spend includes the Rust box and outstanding reservations.
-The monthly cap can reduce that daily capacity further.
+```sh
+~/.claude/scripts/lib/py scripts/aws_target/deploy.py gate-trial --step start --repo . --approve-resources --size 16
+```
 
-Select the lowest mean cost per gate among sizes with three passing runs and a median wall time at most 420 seconds.
-Report the full range beside the median. Three runs do not prove that every future gate meets the target.
-Use the smaller vCPU count when measured costs tie.
-Do not select a size from the prediction table.
+Replace `16` with the selected size. The config default is `--runs 5`.
 
-If no size meets 420 seconds, report **no winner** and leave queue routing on natedev.
-Do not raise the time target, select the fastest failure, or silently add another size.
-Report the type-job duration, longest module, isolated-rerun time, and memory-admission wait for every size.
-The longest serial module, full-tree basedpyright, or memory reservation can limit the wall time despite idle CPUs.
-The measured critical path identifies which limit applies; the CPU arithmetic cannot identify it.
-The **sdlc devtools** owner uses that profile for any later gate change.
+1. Launch an On-Demand instance and measure tool readiness.
+2. Stop that instance through the EC2 API.
+3. Start that instance and measure tool readiness again.
+4. Terminate that instance before the next attempt.
 
-#### Trial cost and cleanup
+Ready means the tools exist and the guest writes its marker to S3.
+The guest creates its local `prepared` marker after the readiness upload succeeds.
+Each boot runs user data directly through `amazon-init`.
+The stopped start reuses the Nix store.
+This step runs no gate, type check, warm pool, or Batch job.
 
-The planning estimate for twelve gate attempts is `3 × (0.052 + 0.065 + 0.065 + 0.110)`, or $0.876.
-Allow $0.50 for one bounded image-preparation run and $0.10 for the trial day's shared resources.
-Allow $0.01 for a reconciliation query if the existing schedule needs one.
-The estimated total is **$1.486, rounded to $1.49**, before any applicable taxes.
-This estimate includes the first image preparation. An existing matching image removes that preparation charge.
-Later snapshot and artifact retention remain part of the shared monthly costs described above.
+#### Permissions and cleanup
 
-Reserve **at most $7 for the trial**, including setup, within the existing $20 daily and $400 monthly limits.
-For the cost envelope, assume twelve one-hour attempts at up to 125% of the listed Spot rates.
-That gives $5.49 compute, about $0.18 variable extras, $0.50 preparation, $0.10 shared costs, and $0.01 query cost.
-The resulting $6.28 envelope leaves about $0.72 for termination delay and price rounding.
-The 125% factor describes this estimate. It does not change a configured maximum price.
-The user-run preparation prices the actual configured maximum and all reserved resources before launch.
-If that reservation exceeds $7 or the remaining shared caps, report an incomplete trial without starting another instance.
-Keep completed measurements so the same command can resume unfinished attempts within a later accounting day's remaining budget.
-Do not raise either cap or repeat completed attempts automatically.
+1. Allow instance launch, gate tags, state reads, stop, start, and termination.
+2. Allow `DescribeSubnets` in the configured VPC.
+3. Allow temporary private bucket creation, configuration, object access, and deletion.
+4. Allow an outbound-only security group, `DescribeSecurityGroups`, and group deletion.
+5. Allow current Spot price and public price reads.
 
-Use the same cleanup for pass, red, interruption, cancellation, or controller failure.
-The guest deadline and approved expiry function cover every trial instance and the image-preparation instance.
-The command terminates its current instance in finalization and retains its reservation until termination is confirmed.
-Its report names any termination that remains unconfirmed; it must not report complete cleanup for that instance.
-Report image preparation separately from request-to-test startup.
-Do not describe a fake API test as an EC2 timing measurement.
+The command uses the existing encrypted administrator credentials and `AwsCli`.
+Only presigned object URLs reach the instance.
+No instance role, `iam:PassRole`, inbound rule, or Tailscale credential is required.
+The bucket has public access blocked and a one-day object lifetime.
 
-Choice: select from measured time and cost; risk: a small trial cannot predict all future gates or Spot interruptions.
+User data schedules `shutdown -h +30` before other commands by default.
+It runs the tool shell directly and creates no systemd unit.
+A shell failure uploads `boot.log` and an error result through the image's curl.
+The controller downloads logs for failed attempts in both steps.
+A missing log object is harmless.
 
-### Phase 2: queue delivery and independent cleanup
+The [NixOS 26.05 module](https://github.com/NixOS/nixpkgs/blob/nixos-26.05/nixos/modules/virtualisation/amazon-init.nix)
+defines a oneshot service under `multi-user.target`, without a first-boot condition.
+Its PATH includes Nix, systemd, and `/run/current-system/sw`.
+It executes shell user data through the runtime shell on each boot.
+Source access date: 2026-11-06.
 
-Owners: **queue**, **sdlc devtools**, and **aws-unit** within the split above.
+Guest shutdown terminates the instance and deletes its root volume.
+The command first terminates stopping and stopped instances with the `GateTrial` tag key.
+Cleanup finds active instances through the current run's tag.
+A lost launch reply causes up to three calls with the same `ClientToken`.
+If all replies remain lost, the command starts no more attempts.
+The report names the lost reply and the guest shutdown timer as the remaining protection.
+Ctrl-C, SIGTERM, and SIGHUP use the same cleanup path.
+The command blocks these signals during launch calls, final cleanup, and the final report.
+Cleanup finds the security group by its fixed name through `DescribeSecurityGroups`.
+Cleanup removes a bucket or group after a lost creation reply.
+Cleanup retries security group dependencies for a bounded time.
+The final text and JSON name remaining resources, or report `Remaining: none`.
+No expiry Lambda is required for this trial.
+
+The command saves JSON, text, and failed-attempt logs under the existing AWS state directory.
+The [SigV4 query specification](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sigv4-query-string-auth.html)
+defines the object URL signatures. Source access date: 2026-11-06.
+
+#### Cost and reserve
+
+| Step | Config reserve | Cost before a live trial |
+| --- | ---: | --- |
+| A: size | $4 | **To measure**, including boot tools and failed attempts. |
+| B: start | $3 | **To measure**, including cold and stopped starts. |
+| Combined | $7 | Maximum step reserves; no Batch or concurrent burst. |
+
+The shared caps remain $20 daily and $400 monthly.
+The command stops if either cap has less room than the step reserve.
+It reads prices for compute, volumes, addresses, and S3.
+Each started instance accrues estimated cost from its request time.
+Each new attempt must fit its full lifetime within the remaining reserve.
+Step B reserves two lifetimes.
+The report names attempts that the reserve prevents.
+AWS billing must confirm these estimates.
+
+`config/aws_target.conf` holds all trial tunables, which the command reads at use.
+Defaults are 30 minutes per lifetime, 7200 seconds per URL, and 420 seconds for the target gate.
+The poll pause is 2 seconds. The security group delete wait is 120 seconds.
+Apply the comparison rules after both reports exist.
+Keep the larger comparison and twenty-gate burst in Phase 2.
+
+### Phase 2: later method and concurrency comparison
+
+Start this phase only after Steps A and B produce their reports.
+Use their recommendation to limit implementation work. Obtain a separate trial budget before paid work.
+Do not build five launch harnesses as a condition for the first answer.
+
+1. Measure pool filling, stopped volume retention, replenishment, and depleted starts if stopped capacity wins Step B.
+2. Qualify full gate coverage on Batch only if approved Step B timing justifies its smaller lifecycle code.
+3. Measure twenty simultaneous full gates on the selected method and size, with one gate per instance.
+4. Compare another method in a twenty-gate burst only if its measured benefit justifies that separate work and cost.
+5. Record first, median, and last start and result, plus teardown and all charges.
+
+The complete comparison table belongs to this later phase.
+Its empty cells remain **to measure**. They do not block the small trial or show that an unmeasured method lost.
+
+| Method | One gate: request to start | Twenty gates: request to start | Dollars per gate, including idle | Fixed monthly cost | Lost worker removal | Work and permissions |
+| --- | --- | --- | --- | --- | --- | --- |
+| Fresh Spot | Estimated 60–120 seconds; replace with Step A results. | To measure in the later burst. | Estimated $0.065 at 16 vCPUs; include failed attempts and fixed share. | Estimated $3 for shared images, artifacts, and cleanup; no retained worker. | Guest deadline, command finalizer, and production expiry Lambda. | Image, transfer, launch/result code, accounting; scoped EC2, S3, role attachment, production expiry setup. |
+| Auto Scaling stopped pool, On-Demand | To measure; Step B supplies stopped-start evidence only. | To measure with twenty prepared instances and a depleted pool. | To measure On-Demand runtime, pool preparation, idle storage, and replenishment. | Estimated $3.20 per retained 40-GiB volume plus $3 shared: $6.20 for one, $67 for twenty. | Auto Scaling replaces unhealthy workers; gate deadlines and lifecycle hooks handle job completion. | Pool assignment, clean reset, hooks; group capacity, lifecycle, template, role, and S3 permissions. |
+| Batch EC2 Spot to zero | To measure; optional Step B measures container start only. | To measure after gate compatibility and dedicated-instance placement. | To measure Spot runtime, image pull, failures, and scale-down idle. | Sourced $0 Batch service fee; estimated $3 shared after compute reaches zero. | Batch owns compute and job state; runtime timeout stops jobs; scaling removes idle workers later. | Full gate container and result adapter; Batch submit/read/terminate and setup roles/resources. |
+| Fargate Spot | To measure only after process and memory compatibility. | To measure only after compatibility. | To measure vCPU, memory, image pull, network, and storage. | No running task charge without tasks; artifacts and logs remain. | ECS owns task infrastructure; application deadline stops hung tasks. | Supported scope adapter and coverage proof; ECS task, role, image, log, and S3 permissions. |
+| EKS with node autoscaler | To measure only after a later Kubernetes requirement. | To measure with one gate per node. | To measure nodes, controller, idle, storage, and fixed allocation. | Sourced $0.10/hour; estimated $73/month plus controller and workers. | Auto Scaling replaces unhealthy nodes; autoscaler removes idle nodes; Job deadlines stop hung work. | Cluster, controller, Job adapter, node separation; EKS, Kubernetes, autoscaler, role, image, and S3 permissions. |
+
+The pool storage estimate uses 40 GiB at an example $0.08/GiB-month, not a verified Ohio quote.
+Auto Scaling and Batch have no additional service fee; their underlying resources remain billable.
+See [EBS pricing](https://aws.amazon.com/ebs/pricing/), [Auto Scaling pricing](https://aws.amazon.com/autoscaling/pricing/), and [Batch pricing](https://aws.amazon.com/batch/pricing/), accessed 2026-11-06.
+Fargate bills allocated resources through task termination, including image download.
+See [Fargate pricing](https://aws.amazon.com/fargate/pricing/), accessed 2026-11-06.
+Keep equal coverage, the seven-minute gate target, and the shared caps in every later comparison.
+Keep EKS and Fargate outside implementation until their stated conditions change.
+
+### Phase 3: queue delivery and production cleanup
+
+Owners: **queue**, **sdlc devtools**, and **aws-unit**.
 
 1. Add the backend call and the execution variant to the current queue record.
 2. Import module logs, gate measurements, and buildlog records.
-3. Extend the existing trial cleanup and launch reservations to concurrent attempts.
-4. Prove worker death, supervisor death, lost launch replies, interruption, and cap fallback.
-5. Enable one remote queue request at a time.
+3. Install the production expiry service with separate permission.
+4. Extend reservations to concurrent attempts.
+5. Prove worker death, supervisor death, lost launch replies, interruption, and cap fallback.
+6. Enable remote queue requests within the measured concurrency.
 
-### Phase 3: twenty independent gates
-
-Owners: **queue** for dispatch and **aws-unit** for instances and accounting.
-
-1. Use the type selected by the completed size trial.
-2. Retain its measured time, cost, and image identity in the deployment record.
-3. Raise the configured remote concurrency through two, five, ten, and twenty gates.
-4. Confirm separate results and termination for every attempt.
-5. Report today's actual gate count and combined AWS spend.
-
-The user supplies any required quota authorization. The caps do not change.
+Retain the selected size, method, measurements, and image identity in the deployment record.
+The user supplies any required quota authorization. The shared caps do not change.
 
 ### Phase 4: retain useful test reuse
 
@@ -709,4 +790,4 @@ Owner: **sdlc devtools**. **queue** carries the selected environment identity.
 3. Share scheduling records and certified ancestors across disposable workers.
 4. Compare cold full, repeated full, and affected gates.
 
-This phase changes test-result reuse only. It introduces no retained build cache or stopped worker pool.
+This phase changes result reuse. Worker retention follows the selected method.

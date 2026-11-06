@@ -181,6 +181,7 @@ It prints `present`, `done`, or `refused` for each stage.
 It stops at the first refusal.
 Correct the reported problem and run the same command again.
 A retry uses the completed stages and preserves the ledger.
+If AWS reports `InsufficientInstanceCapacity`, `up` waits `capacity_backoff_s` between start attempts until AWS accepts the start or the user interrupts.
 The command refreshes the price on every run.
 A complete target requires no stack deployment or key creation on a later run.
 The command stores each stage result and its times in `up.json`.

@@ -671,6 +671,21 @@ The routing proof writes its crate from `scripts/aws_target/routing_proof.py` in
 The folder uses task `gate:aws-routing-proof`.
 The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
+
+`deploy.py gate-trial` reads these keys when it uses them:
+
+| Key | Value | Reason |
+| --- | --- | --- |
+| `gate_trial_size_reserve_usd` | `4` | Limit the spend of the size step. |
+| `gate_trial_start_reserve_usd` | `3` | Limit the spend of the start step. |
+| `gate_trial_lifetime_minutes` | `30` | Set the guest shutdown time and the attempt deadline. |
+| `gate_trial_url_lifetime_s` | `7200` | Keep presigned URLs valid through a stop and start. |
+| `gate_trial_target_gate_s` | `420` | Select the cheapest size that meets the 7-minute goal. |
+| `gate_trial_default_sizes` | `8,16,32,64` | Set the vCPU sizes of the size step. |
+| `gate_trial_size_runs` | `3` | Set the attempts for each size. |
+| `gate_trial_start_runs` | `5` | Set the attempts of the start step. |
+| `gate_trial_poll_pause_s` | `2` | Set the pause between state and result reads. |
+| `gate_trial_group_delete_wait_s` | `120` | Limit the security group delete retries. |
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.
 `deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.

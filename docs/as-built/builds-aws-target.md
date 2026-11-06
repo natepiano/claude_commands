@@ -156,6 +156,7 @@ Device names in `config/aws-build-tailscale.json` must equal a machine name (fir
 2. `box-join` checks SSM and the instance's Tailscale identity.
    `box-join` writes the box host keys from Tailscale to `~/.ssh/known_hosts` for the host name and address; box setup refusals show the last stderr line.
    It starts a stopped instance through the existing guarded setup path.
+   If AWS reports `InsufficientInstanceCapacity`, `up` waits `capacity_backoff_s` between start attempts until AWS accepts the start or the user interrupts.
    It creates a single-use, pre-approved key and revokes it after the join attempt.
    SSM disables terminal echo before the helper sends the key through stdin.
    The command reads the key from stdin and writes no key file.

@@ -250,6 +250,11 @@ elif operation == 'stop-instances':
     reply({'StoppingInstances': [{'InstanceId': 'i-fixture', 'CurrentState': {'Name': 'stopped'}}]})
 elif operation == 'start-instances':
     assert args[args.index('--instance-ids') + 1] == state['outputs']['InstanceId']
+    capacity = root / 'capacity-refusals'
+    if capacity.exists() and int(capacity.read_text()) > 0:
+        capacity.write_text(str(int(capacity.read_text()) - 1))
+        print('InsufficientInstanceCapacity: no Spot capacity', file=sys.stderr)
+        sys.exit(1)
     state['instance_state'] = 'pending'
     state_path.write_text(json.dumps(state))
     if os.environ.get('BOX_FIXTURE'):
@@ -2141,6 +2146,48 @@ else: raise AssertionError(args)
         self.notification_file.unlink()
         self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
         self.assertEqual(len(self.commands('start-instances')), 1)
+
+    def test_box_start_waits_for_spot_capacity_until_accepted(self) -> None:
+        waits: list[float] = []
+
+        def pause(seconds: float) -> None:
+            waits.append(seconds)
+            self.set_clock(self.now + int(seconds))
+
+        subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
+                                    pause=pause, notify=lambda _event: True)
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        started = self.now
+        _ = (self.root / 'capacity-refusals').write_text('2')
+        accepted = {'InstanceId': 'i-fixture', 'State': 'pending'}
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(subject._start_box(), accepted)  # pyright: ignore[reportPrivateUsage]
+        delay = read_control_settings(self.settings).capacity_backoff_s
+        self.assertEqual(len(self.commands('start-instances')), 3)
+        self.assertEqual((self.root / 'capacity-refusals').read_text(), '0')
+        self.assertEqual(waits, [delay] * 2)
+        self.assertEqual(self.now, started + int(delay) * 2)
+        self.assertEqual(remote.read_record(self.bundle / 'preflight.json')['at'], self.now)
+        self.assertEqual(output.getvalue().splitlines(), [
+            f'AWS has no Spot capacity for the box now; next try in {delay:g} seconds.'] * 2)
+
+    def test_box_start_raises_other_aws_errors_without_waiting(self) -> None:
+        pause = mock.Mock()
+        subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
+                                    pause=pause, notify=lambda _event: True)
+        _ = subject.prepare()
+        _ = subject.apply(approve_resources=True)
+        error = aws_target.AwsUnavailable('UnauthorizedOperation: start refused')
+        output = StringIO()
+        with (mock.patch.object(subject, 'setup_start', side_effect=error) as start,
+              redirect_stdout(output), self.assertRaises(aws_target.AwsUnavailable) as failure):
+            _ = subject._start_box()  # pyright: ignore[reportPrivateUsage]
+        self.assertIs(failure.exception, error)
+        start.assert_called_once_with(approve_resources=True)
+        pause.assert_not_called()
+        self.assertEqual(output.getvalue(), '')
 
     def test_setup_restart_refuses_a_changed_limit_before_any_resource_request(self) -> None:
         subject = self.deployment()

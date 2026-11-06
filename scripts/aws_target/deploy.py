@@ -102,12 +102,14 @@ def fingerprint(settings: DeploymentSettings, parameters: dict[str, str], templa
 class Deployment:
     def __init__(self, settings_path: Path, directory: Path, output: Path, *,
                  execute: AwsExecutor = execute_command, clock: Callable[[], float] = time.time,
+                 pause: Callable[[float], None] = time.sleep,
                  notify: Callable[[ledger.LimitEvent], bool] = ledger.send_limit_event) -> None:
         self.settings_path = settings_path
         self.directory = directory
         self.output = output
         self.execute = execute
         self.clock = clock
+        self.pause = pause
         self.notify = notify
         self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
 
@@ -979,9 +981,17 @@ class Deployment:
         state = self._api(settings).observe(instance, int(self.clock())).state
         if state in ('running', 'pending'):
             return state
-        _ = self.price()
-        _ = self.prepare()
-        return self.setup_start(approve_resources=True)
+        while True:
+            _ = self.price()
+            _ = self.prepare()
+            try:
+                return self.setup_start(approve_resources=True)
+            except AwsUnavailable as error:
+                if 'InsufficientInstanceCapacity' not in str(error):
+                    raise
+                delay = read_control_settings(self.settings_path).capacity_backoff_s
+                print(f'AWS has no Spot capacity for the box now; next try in {delay:g} seconds.')
+                self.pause(delay)
 
 
 def remote_configuration(path: Path) -> str:
@@ -1049,6 +1059,9 @@ class DeploymentArguments(argparse.Namespace):
 
 
 def main() -> int:
+    if sys.argv[1:2] == ['gate-trial']:
+        from scripts.aws_target import gate_trial
+        return gate_trial.main(sys.argv[2:], conf.path('aws_target'), target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
     _ = parser.add_argument('--settings', type=Path)
