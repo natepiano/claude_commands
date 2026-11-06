@@ -245,7 +245,7 @@ def _main(argv: list[str]) -> int:
                 and isinstance(completed.fields.get("session_id"), str)
                 and resumed_session_proven(unit.production.slug, unit.name,
                     cast(str, completed.fields["session_id"]), completed.owner)):
-            code = worker.restore(completed.owner.id)
+            code = worker.ExitCode.OK if cast(bool, options.dry_run) else worker.restore(completed.owner.id)
             if code != worker.ExitCode.OK:
                 return int(code)
             print(f"{unit.name} already resumed")

@@ -65,6 +65,18 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         restore.assert_called_once()
 
+    def test_completed_resume_dry_run_does_not_restore_workers(self) -> None:
+        from scripts.production import worker
+
+        with mock.patch.object(worker, "restore", return_value=worker.ExitCode.OK) as restore:
+            code, output = self.resume()
+            self.assertEqual(code, 0, output)
+            restore.reset_mock()
+            code, output = self.resume("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output, "alpha-unit already resumed\n")
+        restore.assert_not_called()
+
     def test_resume_restores_the_staff_location(self) -> None:
         code, output = self.resume()
         self.assertEqual(code, 0, output)
@@ -119,8 +131,8 @@ class ResumeUnitTests(unittest.TestCase):
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        write_text_atomic(self.root / "shutdown.conf", (CHECKOUT / "config/shutdown.conf").read_text())
-        _ = (self.root / "production.conf").write_text((CHECKOUT / "config/production.conf").read_text())
+        for name in ("shutdown", "production", "direct"):
+            write_text_atomic(self.root / f"{name}.conf", (CHECKOUT / f"config/{name}.conf").read_text())
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)

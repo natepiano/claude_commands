@@ -50,6 +50,7 @@ else:
     sessions = import_module("sessions")
     unit_lookup = import_module("unit_lookup")
 import quota_alert
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.whoami import agent_accounts
 NOW = fixtures.NOW
 
@@ -93,6 +94,8 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(redirect_stderr(io.StringIO()))
         self.fixture = fixtures.RefusalWatchTests()
         self.fixture.setUp()
+        write_text_atomic(Path(os.environ["CONF_DIR"]) / "shutdown.conf",
+            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
         self.addCleanup(self.fixture.doCleanups)
         self.home = self.fixture.home
         _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
