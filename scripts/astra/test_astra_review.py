@@ -127,9 +127,7 @@ class AstraReviewTests(StaffTestCase):
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:
         assignments: list[tuple[str, design_roles.ThreadAccessPolicy]] = []
 
-        def dispatch(design: design_roles.HeldDesign, role: design_roles.Role, prompt: Path, reply: Path,
-                     model: str, effort: str) -> None:
-            del model, effort
+        def dispatch(design: design_roles.HeldDesign, role: design_roles.Role, prompt: Path, reply: Path) -> None:
             instance = next(item for item in design.roles if item.role == role)
             self.assertIsInstance(instance.lifecycle, design_roles.RoleOpen)
             self.assertTrue(prompt.is_file())
@@ -139,7 +137,6 @@ class AstraReviewTests(StaffTestCase):
 
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
                 patch.object(staff, "runtime_id", return_value="fixture-holder"), \
-                patch.object(design_roles, "resolve_model", return_value=("fixture-model", "xhigh")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=dispatch), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("held review started a fresh exec")), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
@@ -287,6 +284,19 @@ class AstraReviewTests(StaffTestCase):
         during = cast(dict[str, object], json.loads(snapshot.read_text()))
         self.assertEqual(during["records"], [])
         self.assertFalse(list((self.root / "roles").glob("*.json")))
+
+    def test_worker_and_unregistered_callers_keep_the_one_turn_review(self) -> None:
+        parent = unit_membership("demo", "review-unit")
+        caller = fixture_worker("review-caller", parent.id,
+                                backend=staff.CodexBackend(self.root / "codex-home"))
+        for identity in (str(caller.current_session), fixture_runtime_id("unregistered-review-caller")):
+            with self.subTest(identity=identity):
+                self.environment["CODEX_THREAD_ID"] = identity
+                result = self.run_script(str(self.document))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.call()["argv"][:3], ["exec", "codex7", "exec"])
+                self.assertIn("Verdict: clear.", result.stdout)
+                self.assertEqual(staff.snapshot().find(kind="worker", parent=parent.id), [caller])
 
 
 @final

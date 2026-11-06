@@ -830,7 +830,6 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         _ = cases["above floor"].write_text("MemAvailable: 13631488 kB\n")
         for name, meminfo in cases.items():
             with self.subTest(name=name):
-                self.admission.allow_next_start()
                 result = subprocess.run(
                     ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
                     env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),

@@ -1279,7 +1279,7 @@ class LocalReviewTests(unittest.TestCase):
             {"rule": "reader-starts-cold", "quote": "Not in the original"}])), review.Approved)
 
     def test_a_body_that_gives_a_second_action_fails_push_one_action(self) -> None:
-        action = ActionRequired("On natedev, in the tile pane, approve the prompt or add an allow rule")
+        action = ActionRequired("On natedev, in the tile pane, type: Go: run the refused command")
         draft = review.Draft("writer one", "1", "tile waits for you", action,
                              "Auto mode refused 1 command in tile. Type ! kill -TERM -3137969 in the cargo-liner session.", True)
         result = review.validate(verdict(draft), draft, False)
