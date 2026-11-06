@@ -934,9 +934,10 @@ def main() -> int:
         return execute_operation(args, admitted, held, cwd, prompt, family, model, effort, tier, env)
     membership = staff.local_snapshot()
     member = worker_admission.member(run, worker, membership)
-    changing_family = member is not None and session_staff.worker_family(membership, member.id) != family
-    if family == "claude" or changing_family:
-        if changing_family:
+    needs_launcher = member is not None and (session_staff.worker_family(membership, member.id) != family
+        or (family == "codex" and worker_admission.dispatch_pending(run, worker, prompt)))
+    if family == "claude" or needs_launcher:
+        if needs_launcher:
             args.to = worker
         try:
             return execute_worker_launcher(args, run, phase, cwd, prompt, env)

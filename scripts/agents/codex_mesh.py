@@ -4142,7 +4142,7 @@ def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = Fal
     prompt_path = Path(_as_str(_attr(args, "prompt_file")))
     request = worker_admission.assignment_id(prompt_path)
     args.switch_request = request
-    previous = worker_admission.dispatch_record(staff_admission)
+    previous = worker_admission.dispatch_record(staff_admission.run, staff_admission.name)
     if previous.assignment_id == request and previous.state is worker_admission.SwitchState.ASSIGNMENT_ACCEPTED:
         print("unchanged")
         return RunCompleted()
@@ -6133,7 +6133,7 @@ def _start_turn(
     if request:
         allowed = worker_admission.admit(_as_str(_attr(args, "name")), Path(client.session_dir),
                                          reference=_as_str(_attr(args, "staff_id")))
-        previous = worker_admission.dispatch_record(allowed)
+        previous = worker_admission.dispatch_record(allowed.run, allowed.name)
         if previous.assignment_id == request:
             if previous.state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
                 accepted = _accepted_assignment(client, thread_id, message)

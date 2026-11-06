@@ -110,7 +110,7 @@ fi
 worker_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
   "${AGENT_FAMILY}" "${AGENT_MODEL}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
-  "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${PASS_KIND}" <<'PY'
+  "${BOARD_HELPER}" "${COMPACT_ABOVE_TOKENS}" "${PASS_KIND}" "${PROMPT_FILE}" <<'PY'
 import json
 import os
 import subprocess
@@ -119,7 +119,7 @@ from pathlib import Path
 
 (
     action, root_text, slot, name, family, model, mesh_script,
-    board_helper, compact_above_text, pass_kind,
+    board_helper, compact_above_text, pass_kind, prompt_text,
 ) = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
@@ -157,11 +157,16 @@ with worker_claim_lock(root):
     identity_file = worker_record_path(root, name, "fix" if pass_kind == "fix" else slot)
     roster = read(root / "mesh_roster.json")
     entry = roster.get(name, {}) if isinstance(roster, dict) else {}
-    member = worker_admission.member(root, name)
+    snapshot = staff.local_snapshot()
+    member = worker_admission.member(root, name, snapshot)
     reference = member.id if member else ""
     worker_id = member.current_session if member else ""
     if action == "switch":
-        raise SystemExit(0 if member and session_staff.worker_family(staff.local_snapshot(), member.id) != family else 1)
+        if not member:
+            raise SystemExit(1)
+        if session_staff.worker_family(snapshot, member.id) != family:
+            raise SystemExit(0)
+        raise SystemExit(0 if worker_admission.dispatch_pending(root, name, Path(prompt_text)) else 1)
     elif action == "record":
         if not worker_id:
             raise SystemExit(1)

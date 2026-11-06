@@ -101,6 +101,51 @@ class AssignLauncherTests(AssignLauncherFixture):
                     _ = staff.update_current_session(current.current_session, staff.native_id(row.current_session))
                     _ = roster.write_text(json.dumps({row.name: {"staff_id": row.id, "status": "done"}}))
 
+    def test_codex_retry_starts_with_the_saved_handoff_and_accepted_or_unrelated_work_follows(self) -> None:
+        self.commit_project()
+        _ = self.successful("implement", "--new-worker", "retry1")
+        row = worker_admission.member(self.session_dir, "retry1", staff.local_snapshot())
+        assert row is not None
+        roster = self.session_dir / codex_mesh.ROSTER_FILE
+        original = read_object(roster)
+        _ = self.prompt.write_text("Continue the interrupted switch.\n")
+        request = worker_admission.assignment_id(self.prompt)
+        extract = worker_admission.handoff_path(self.session_dir, row)
+        _ = extract.write_text(f"{worker_admission.HANDOFF_SOURCE_PREFIX}{self.session_dir / 'source.jsonl'}\nKeep the source work.\n")
+        commands = self.session_dir.parent / "retry-commands.jsonl"
+        directory = self.session_dir.parent / "retry-observer"
+        directory.mkdir()
+        _ = (directory / "sitecustomize.py").write_text("\n".join((
+            "import json, sys",
+            "from pathlib import Path",
+            "def observe(frame, event, argument):",
+            "    if event == 'call' and frame.f_code.co_name == 'main' and frame.f_code.co_filename.endswith('/agents/codex_mesh.py'):",
+            f"        with Path({str(commands)!r}).open('a') as output: output.write(json.dumps(sys.argv[1:]) + chr(10))",
+            "        sys.setprofile(None)",
+            "sys.setprofile(observe)",
+        )))
+        cases = (("prepared", request, True), ("sending", request, True), ("", request, True),
+                 ("accepted", request, False), ("sending", "another-prompt", False))
+        with patch.dict(os.environ, {"PYTHONPATH": str(directory) + os.pathsep + str(ASSIGN.parents[2])}):
+            for state, identity, pending in cases:
+                with self.subTest(state=state, identity=identity):
+                    entry = cast(dict[str, object], original[row.name]).copy()
+                    entry.update(assignment_id=identity, dispatch_state=state)
+                    _ = roster.write_text(json.dumps({row.name: entry}))
+                    commands.unlink(missing_ok=True)
+                    self.server.requests.clear()
+                    result = self.launch("implement", "--to", row.name)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    called = [cast(list[str], json.loads(line))[0] for line in commands.read_text().splitlines()]
+                    self.assertIn("start" if pending else "follow", called)
+                    self.assertNotIn("can-follow" if pending else "start", called)
+                    if pending:
+                        self.assertNotIn("follow", called)
+                        opening = self.turn_inputs[-1]
+                        self.assertLess(opening.index(str(extract)), opening.index(self.prompt.read_text()))
+                    self.assertEqual(self.methods("thread/start"), [])
+                    self.assertEqual(staff.by_id(row.id), row)
+
     def test_assignment_shares_one_generation_through_allocation_and_refreshes_the_next_launch(self) -> None:
         probe = RegistryReadProbe(self.session_dir.parent, self.registry)
         _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-kept-sol:high"},

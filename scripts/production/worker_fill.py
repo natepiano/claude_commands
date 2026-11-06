@@ -61,7 +61,7 @@ def coordinate_claude(name: str, run: Path, prompt: Path, reference: str = "") -
 
     def dispatch(published: worker_admission.PublishedWorker) -> worker_admission.SwitchState:
         if not started:
-            if worker_admission.dispatch_record(allowed, report_anomaly=False).state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
+            if worker_admission.dispatch_record(allowed.run, allowed.name, report_anomaly=False).state is worker_admission.SwitchState.DISPATCH_IN_FLIGHT:
                 try:
                     source = worker_admission.transcript_source(published.row, staff.ClaudeBackend())
                 except ValueError as error:

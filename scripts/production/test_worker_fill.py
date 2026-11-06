@@ -47,7 +47,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertLess(prepared.index(str(extract)), prepared.index(prompt.read_text()))
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual(staff.by_id(row.id), row)
-        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
 
     def test_claude_retry_reports_one_unknown_dispatch_state_and_completes_dispatch(self) -> None:
         _, unit, row = self.tree()
@@ -68,7 +68,7 @@ class WorkerFillTests(StaffTestCase):
         self.assertEqual(result.stdout.splitlines(),
                          ["attach", str(run / f"{row.id}.opening.md"), f"published {row.current_session}"])
         allowed = worker_admission.WorkerStartAllowed(row.name, unit.id, run, worker_admission.ExistingWorkerSlot(row))
-        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
 
     def test_uncertain_claude_dispatch_requires_readable_evidence_before_resending(self) -> None:
         _, unit, row = self.tree()
@@ -109,7 +109,7 @@ class WorkerFillTests(StaffTestCase):
                     self.assertIn(prompt.read_text(), opening)
                     self.assertLess(opening.index(str(worker_admission.handoff_path(run, row))), opening.index(str(source)))
                 self.assertEqual((self.staff_file.read_bytes(), source.read_bytes()), before)
-                self.assertEqual(worker_admission.dispatch_record(allowed).state,
+                self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state,
                                  worker_admission.SwitchState.DISPATCH_IN_FLIGHT if refused
                                  else worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
 

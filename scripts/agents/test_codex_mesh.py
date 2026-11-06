@@ -2134,6 +2134,29 @@ class StaffAdmissionTests(MeshCommandFixture):
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(len(self.methods("turn/start")), 1)
 
+    def test_same_family_retry_delivers_the_saved_extract_without_creating_a_second_thread(self) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        allowed = worker_admission.admit("worker", self.session_dir)
+        assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
+        row = allowed.slot.row
+        prompt = self.session_dir / "prompt.txt"
+        _ = prompt.write_text("Continue the interrupted switch.\n")
+        extract = worker_admission.handoff_path(self.session_dir, row)
+        _ = extract.write_text(f"{worker_admission.HANDOFF_SOURCE_PREFIX}{self.session_dir / 'source.jsonl'}\nKeep the source work.\n")
+        worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt),
+                                         worker_admission.SwitchState.CREATION_INTENT_RECORDED)
+        self.server.requests.clear()
+        self.assertEqual(self.run_start(), (0, ""))
+        self.assertEqual(self.methods("thread/start"), [])
+        turns = self.methods("turn/start")
+        self.assertEqual(len(turns), 1)
+        params = cast(dict[str, object], turns[0]["params"])
+        self.assertEqual(params["threadId"], row.current_session)
+        opening = json.dumps(params["input"])
+        self.assertLess(opening.index(str(extract)), opening.index(prompt.read_text().strip()))
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state,
+                         worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+
     def test_interrupted_dispatch_uses_delivery_evidence_before_submission(self) -> None:
         self.assertEqual(self.run_start(), (0, ""))
         allowed = worker_admission.admit("worker", self.session_dir)
@@ -2145,7 +2168,7 @@ class StaffAdmissionTests(MeshCommandFixture):
                 _ = self.run_start()
         evidence.assert_called_once()
         self.assertEqual(len(self.methods("turn/start")), 1)
-        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
 
 
     def test_the_worker_row_is_available_while_its_codex_turn_runs(self) -> None:
@@ -2216,7 +2239,7 @@ class StaffAdmissionTests(MeshCommandFixture):
             self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
             self.assertEqual(loaded, {sibling})
             self.assertEqual(staff.by_id(old.id), old)
-            self.assertTrue(worker_admission.dispatch_record(allowed).assignment_id)
+            self.assertTrue(worker_admission.dispatch_record(allowed.run, allowed.name).assignment_id)
             starts.append(identity)
             if len(starts) == 1:
                 raise OSError("destination creation failed after source release")
@@ -2326,7 +2349,7 @@ class StaffAdmissionTests(MeshCommandFixture):
                 cleanup=lambda native: self.fail("published destination was discarded: " + native))
         self.assertEqual(result.row, dataclasses.replace(old, current_session=staff.StaffId(identity)))
         self.assertEqual(dispatched, [result.row])
-        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
         self.assertEqual(self.methods("thread/unsubscribe"), [])
 
     def test_idle_stop_preserves_a_live_retained_server_for_source_release(self) -> None:

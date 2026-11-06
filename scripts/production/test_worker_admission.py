@@ -186,19 +186,34 @@ class FamilyHandoffTests(StaffTestCase):
             worker_admission.record_dispatch(allowed, "old-request",
                 worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request="old-request")
         self.assertEqual(path.read_bytes(), saved[0])
-        self.assertEqual(worker_admission.dispatch_record(allowed), worker_admission.DispatchRecord(
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
             "new-request", worker_admission.SwitchState.CREATION_INTENT_RECORDED))
         worker_admission.record_dispatch(allowed, "new-request",
             worker_admission.SwitchState.ASSIGNMENT_ACCEPTED, expected_request="new-request")
-        self.assertEqual(worker_admission.dispatch_record(allowed), worker_admission.DispatchRecord(
+        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name), worker_admission.DispatchRecord(
             "new-request", worker_admission.SwitchState.ASSIGNMENT_ACCEPTED))
+
+    def test_pending_dispatch_accepts_an_unset_state_and_reports_an_unreadable_roster(self) -> None:
+        allowed, _, _ = self.source("claude")
+        prompt = allowed.run / "assignment.txt"
+        _ = prompt.write_text("Complete this assignment.\n")
+        worker_admission.record_dispatch(allowed, worker_admission.assignment_id(prompt), worker_admission.SwitchState.NO_RECORD)
+        self.assertTrue(worker_admission.dispatch_pending(allowed.run, allowed.name, prompt))
+        path = allowed.run / "mesh_roster.json"
+        _ = path.write_text("{torn")
+        with redirect_stderr(io.StringIO()) as errors:
+            pending = worker_admission.dispatch_pending(allowed.run, allowed.name, prompt)
+        self.assertFalse(pending)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(f"anomaly: {allowed.name}:", errors.getvalue())
+        self.assertIn(str(path), errors.getvalue())
 
     def test_unknown_dispatch_state_reports_an_anomaly_and_allows_admission(self) -> None:
         allowed, _, _ = self.source("claude")
         _ = (allowed.run / "mesh_roster.json").write_text(json.dumps({allowed.name: {"dispatch_state": "invalid"}}))
         before = self.staff_state()
         with redirect_stderr(io.StringIO()) as errors:
-            record = worker_admission.dispatch_record(allowed)
+            record = worker_admission.dispatch_record(allowed.run, allowed.name)
             repeated = worker_admission.admit(allowed.name, allowed.run, reference=allowed.lock_reference)
         self.assertEqual(errors.getvalue().splitlines(),
                          [f"anomaly: {allowed.name}: unknown dispatch_state 'invalid'; using NO_RECORD"])
@@ -332,7 +347,7 @@ class FamilyHandoffTests(StaffTestCase):
 
                 def start(handoff: worker_admission.FamilyHandoff) -> str:
                     locked()
-                    self.assertTrue(worker_admission.dispatch_record(allowed).assignment_id)
+                    self.assertTrue(worker_admission.dispatch_record(allowed.run, allowed.name).assignment_id)
                     self.assertEqual(staff.by_id(old.id), old)
                     assert isinstance(handoff, worker_admission.TranscriptHandoff)
                     self.assertEqual(handoff.source, source)
@@ -354,7 +369,7 @@ class FamilyHandoffTests(StaffTestCase):
                         worker_admission.record_dispatch(allowed, "stable-assignment", worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
                         raise OSError("dispatch interrupted")
                     if interrupted:
-                        self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
+                        self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)
                     return worker_admission.SwitchState.ASSIGNMENT_ACCEPTED
 
                 cleaned: list[str] = []
@@ -414,7 +429,7 @@ class FamilyHandoffTests(StaffTestCase):
                 def start(handoff: worker_admission.FamilyHandoff) -> str:
                     if not created:
                         self.assertIsInstance(handoff, worker_admission.TranscriptHandoff)
-                    intent = worker_admission.dispatch_record(allowed)
+                    intent = worker_admission.dispatch_record(allowed.run, allowed.name)
                     self.assertTrue(intent.assignment_id)
                     self.assertEqual(intent.state, worker_admission.SwitchState.CREATION_INTENT_RECORDED)
                     identity = fixture_runtime_id(f"retry-{family}-{deferred}-{len(created)}")
@@ -438,14 +453,14 @@ class FamilyHandoffTests(StaffTestCase):
                 assert published is not None
                 self.assertEqual(published.current_session, created[0])
                 self.assertEqual(session_staff.worker_family(staff.snapshot(), old.id), destination)
-                intent = worker_admission.dispatch_record(allowed)
+                intent = worker_admission.dispatch_record(allowed.run, allowed.name)
                 allowed = worker_admission.admit(old.name, run, reference=old.id)
                 result = worker_admission.switch_worker(allowed, destination, start=start,
                     dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION if deferred else dispatch, cleanup=cleaned.append)
                 self.assertEqual(created, [published.current_session])
                 self.assertEqual(result.row, published)
-                self.assertEqual(worker_admission.dispatch_record(allowed).assignment_id, intent.assignment_id)
-                self.assertEqual(worker_admission.dispatch_record(allowed).state, worker_admission.SwitchState.CREATION_INTENT_RECORDED if deferred
+                self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).assignment_id, intent.assignment_id)
+                self.assertEqual(worker_admission.dispatch_record(allowed.run, allowed.name).state, worker_admission.SwitchState.CREATION_INTENT_RECORDED if deferred
                                  else worker_admission.SwitchState.ASSIGNMENT_ACCEPTED)
                 self.assertEqual(dispatched, [] if deferred else [published.current_session] * 2)
                 self.assertEqual(cleaned, [])
