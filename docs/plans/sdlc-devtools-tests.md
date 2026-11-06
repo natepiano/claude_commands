@@ -1272,36 +1272,24 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 
 ### Phase 8f — A run whose only worker dies at launch ends itself  · status: done
 
-Source: sdlc [6d2745c7], [68b227b5]. Only `end_session.sh` removes a run's marker, and only a director's run summary or a hand calls it. When a launch fails, `assign.py` records `blocked` and exits. A session that then goes on without the run leaves the marker open. The evidence is run 6a628840: launcher up 08:34:14, worker down 08:34:17, marker still open days later. This phase covers that case only. Hierarchies removes the other cases after its Phase 24.
+#### As-built
 
-**Depends on:** 3z
+A launch that fails with no other work in its run ends the run through its normal end path. `scripts/direct/assign.py` `end_failed_launch(run, slot, env)` runs after a nonzero launch and returns without an action when any of these hold: a recorded pass completed; a pass names another slot; the mesh roster, an `impl_worker_*.json` staff row or a herdr staff row names another worker; or `unit_runs.held` names a run other than this one.
 
-#### Work Order
+The action is `progress_history.py finish-run --status error`, then `end_session.sh`, each through `call` with `check=False`. A failed child prints one line and the launch keeps its exit code. An exception in the check prints one line and changes nothing. A signal to the launcher raises `SystemExit` and never reaches the check. A herdr launch reaches it only for `worker.py assign` exit 2, the no-worker-started exit. The phase reservation stays.
 
-**Goal:** when a launch fails and the run has no other worker, the start path ends the run through its normal end path. The director's next launch starts a new run. No new refusal.
-
-**Spec:**
-1. **The condition.** In `scripts/direct/assign.py` `main`, after a launch returns nonzero, end the run when all of these hold: the launch started its worker command; the worker command exited nonzero by itself (a signal to the launcher raises `SystemExit` and never reaches this step); no pass in the run's recorder state has status `completed`; the run has no worker other than this one; and `unit_runs.held` for this session names this run and no other. The last condition exists because `end_session.sh` ends every run the session directs.
-2. **Herdr.** `execute_herdr` meets the first condition only for a `worker.py assign` exit that says no worker started. Exits 3 to 8 keep a retained, busy or unknown worker, so they leave the run alone.
-3. **The action.** Run the normal end path that `docs/direct/launch_implementation.md` step 7 names: `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`. Both children run through the existing `call` helper with `check=False`. A failed child prints its error and does not change the launcher's exit code. Print one line on stderr that says the run ended and why. Keep the phase reservation: the reservation contract releases it only at a checkpoint.
-4. **Both families.** `scripts/direct/end_session.sh` reads only `CLAUDE_CODE_SESSION_ID`, but a Codex director's marker is named by `staff.runtime_id()`. Make `end_session.sh` find the Codex id the same way, so the end path works for both.
-5. **The exit code stays.** The launcher returns the code of the failed launch. A launch that does not meet the condition behaves as it does now.
-6. **Retry.** A launch after the end with no `--session-dir` starts a new run through `prepare_run`. A launch that names the ended run folder with `--session-dir` still works as it does today.
-7. **Docs.** `docs/direct/launch_implementation.md` step 7 and `docs/as-built/long-lived-workers.md` state this path. `commands/unit/direct.md` <WorkerLaunchFailure/> states that a retry after this end starts a new run.
-
-**Acceptance:** a real-path test starts `assign.py` with a worker command that exits 2 in a run with no other worker. The marker is gone, the recorder state has its finish, and the exit code is 2. A test for each failed condition shows the marker stays: a completed pass, a second worker, a second held run, a herdr exit 7. A test shows a Codex director's marker goes.
+The run marker uses the Codex id first: `prepare_session.sh` and `end_session.sh` both read `CODEX_THREAD_ID`, then `CLAUDE_CODE_SESSION_ID`. A launch with no `--session-dir` after the end starts a new run through `prepare_run`.
 
 **Files:**
-- `scripts/direct/assign.py` — the condition and the action.
-- `scripts/direct/end_session.sh` — the Codex session id.
-- `scripts/direct/test_assign_launcher.py` — the tests, with the overrides `UNIT_ACTIVE_DIR` and `UNIT_RUN_ROOT`.
-- `docs/direct/launch_implementation.md`, `commands/unit/direct.md`, `docs/as-built/long-lived-workers.md` — the docs.
+- `scripts/direct/assign.py` — `end_failed_launch`, `recorded_passes`, and the three calls.
+- `scripts/direct/end_session.sh`, `scripts/direct/prepare_session.sh` — the Codex-first director id.
+- `scripts/direct/test_assign_launcher.py` — the real-path tests for each condition.
+- `scripts/agents/test_codex_mesh.py` — its run-end fixture removes `CODEX_THREAD_ID`.
+- `docs/direct/launch_implementation.md`, `commands/unit/direct.md`, `docs/as-built/long-lived-workers.md` — the end path and the retry forms.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/direct/assign.py`, `scripts/direct/end_session.sh` and the three docs.
-- `test` — `scripts/direct/test_assign_launcher.py`.
+**Gotchas:** a fixture that sets `CODEX_THREAD_ID` beside a different `CLAUDE_CODE_SESSION_ID` makes `end_session.sh` read the Codex marker.
 
-**State:** none. The phase writes no new lasting record. It runs two existing commands.
+**Ruled out:** a new refusal at the next launch; the end is the whole repair. Other open-marker cases belong to hierarchies.
 
 ### Phase 8g — The review links service restarts when its code changes  · status: todo
 
