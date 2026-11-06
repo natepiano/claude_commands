@@ -21,7 +21,7 @@ from scripts.agents import codex_mesh
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.lib import atomic_file, unit_runs
-from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume, ResumeWorkers, launcher_prompt
+from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, launcher_prompt
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import session_staff, staff, worker_admission
 
@@ -358,6 +358,22 @@ def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispa
     client.prompt(pane.pane_id, launcher_prompt(row.id, dispatch.instance_id, dispatch.launcher_command),
                   target=str(parent.current_session))
     return ExitCode.OK
+
+
+def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | NoOwnPass:
+    """Read the worker's active pass through its parent."""
+    try:
+        parent = record.parent_of(row)
+        if parent is None:
+            raise ValueError("worker parent is unavailable")
+        active = progress_history.active_dispatch(row.id, worker_panes.worker_run(parent))
+        if isinstance(active, progress_history.ActiveDispatchUnavailable):
+            print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
+        elif isinstance(active, progress_history.ActiveDispatch):
+            return BusyPass(active.instance_id)
+    except (OSError, ValueError) as error:
+        print(f"anomaly: {row.name}: {error}", file=sys.stderr)
+    return NO_OWN_PASS
 
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:

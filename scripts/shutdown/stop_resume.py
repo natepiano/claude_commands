@@ -39,7 +39,7 @@ from scripts.shutdown.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.shutdown.codex_trust import trust_arguments
 import pane_launch
 from scripts.lib.resume_message import (
-    AccountMove, NO_ACCOUNT_MOVE,
+    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS,
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
     resume_message as resume_message,
@@ -385,7 +385,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
     """Replace the foreground command with the saved account launch."""
     command = _pane_command(tab, entry, account)
     os.chdir(entry["cwd"])
-    os.execvp(command[0], [*command, message])
+    os.execvp(command[0], [*command, *([message] if message else [])])
 
 
 def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
@@ -420,6 +420,8 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
         live = sessions.session_liveness(entry["session_id"])
     if isinstance(live, sessions.SessionLivenessUnknown):
         raise herdr.HerdrFailure(live.reason)
+    if not message:
+        return live
     try:
         identity = _prompt_identity(client, tab.pane_id, deadline)
     except (OSError, ValueError, subprocess.SubprocessError, herdr.HerdrFailure) as error:
@@ -630,12 +632,17 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
         copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         workers = NO_WORKERS
+        own = NO_OWN_PASS
         try:
             from scripts.production import worker
-            workers = worker.resume_workers(row.id, names.tab_record) if row is not None else NO_WORKERS
+            if row is not None and row.kind == "worker":
+                own = worker.own_pass(row, names.tab_record)
+            elif row is not None:
+                workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        message = resume_message(why, move=AccountMove(source_label, label) if to else NO_ACCOUNT_MOVE, workers=workers)
+        message = resume_message(why, move=AccountMove(source_label, label) if to else NO_ACCOUNT_MOVE,
+                                 workers=workers, own_pass=own) if row is None or row.kind != "worker" or isinstance(own, BusyPass) else ""
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             with pane_record.locked(client.session):
                 entries = pane_record.read_strict(client.session)

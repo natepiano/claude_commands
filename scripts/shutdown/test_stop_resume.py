@@ -1968,6 +1968,56 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.clock.elapsed, 0)
         self.detach.assert_called()
 
+    def test_resume_worker_uses_its_own_busy_pass_and_leaves_idle_workers_without_input(self) -> None:
+        from scripts.direct import progress_history
+
+        parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("native-director"))
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "alpha", staff.ReportsTo(parent.id),
+                             current_session=staff.StaffId(self.entry["session_id"]))
+        record = staff.StaffSnapshot((parent, row))
+        for active in (progress_history.ActiveDispatch("own-dispatch", ("assign.sh",)), progress_history.NoActiveDispatch()):
+            with (self.subTest(active=active),
+                  patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(worker_panes, "worker_run", return_value=self.root) as run,
+                  patch.object(progress_history, "active_dispatch", return_value=active) as read):
+                self.launched.clear()
+                self.client.prompts.clear()
+                result = stop_resume.resume(str(row.id), why="maintenance")
+                self.assertIsInstance(result, stop_resume.ClaudeUp)
+                if isinstance(active, progress_history.ActiveDispatch):
+                    self.assertEqual(len(self.client.prompts), 1)
+                    self.assertIn("Continue pass own-dispatch in this conversation", self.client.prompts[0][1].text)
+                    self.assertNotIn("Worker ", self.client.prompts[0][1].text)
+                else:
+                    self.assertEqual(self.client.prompts, [])
+                run.assert_called_once_with(parent)
+                read.assert_called_once_with(row.id, self.root)
+
+    def test_resume_director_submits_an_opening_prompt_with_idle_pane_workers(self) -> None:
+        from scripts.lib.resume_message import IdleWorker, PaneWorkerResume, ResumeWorkers
+        from scripts.production import worker
+
+        row = staff.StaffRow(staff.StaffId("director"), "unit", "alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(self.entry["session_id"]))
+        workers = ResumeWorkers(panes=[PaneWorkerResume(staff.StaffId("idle-worker"), IdleWorker())])
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(worker, "resume_workers", return_value=workers)):
+            result = stop_resume.resume(str(row.id), why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(len(self.client.prompts), 1)
+        text = self.client.prompts[0][1].text
+        self.assertIn("You were stopped and resumed because maintenance.", text)
+        self.assertIn("for messages kept while you were down", text)
+        self.assertIn("Worker idle-worker: idle", text)
+
+    def test_empty_resume_message_adds_no_argument_in_the_current_pane(self) -> None:
+        tab = herdr.TabSession("w1:p2", "alpha", "w1", self.entry["session_id"])
+        with (patch.object(os, "chdir"), patch.object(os, "execvp", side_effect=SystemExit) as execute):
+            with self.assertRaises(SystemExit):
+                stop_resume._exec_in_own_pane(tab, self.entry, "claude3", "")  # pyright: ignore[reportPrivateUsage]
+        self.assertNotIn("", cast(list[str], execute.call_args.args[1]))
+
     def test_resume_runs_account_exec_in_its_own_pane_with_one_message(self) -> None:
         self.entry["environment"].update(HERDR_PANE_ID="w9:p9", HERDR_WORKSPACE_ID="w9")
         pane_record.write("agents", self.entry)

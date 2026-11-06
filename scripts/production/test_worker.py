@@ -152,7 +152,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_restore_rerun_after_agent_resume(self) -> None:
         opened = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
-            worker_name="impl", launcher_command=["bash", "assign.sh", "saved argument"], prompt=self.prompt, kind="impl", lens="")
+            worker_name="impl", worker_id=opened.row.id, launcher_command=["bash", "assign.sh", "saved argument"],
+            prompt=self.prompt, kind="impl", lens="")
         active = progress_history.active_dispatch(opened.row.id, self.run_dir)
         self.assertIsInstance(active, progress_history.ActiveDispatch)
         assert isinstance(active, progress_history.ActiveDispatch)
@@ -237,6 +238,23 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(result.panes, [PaneWorkerResume(busy.row.id, BusyPass("dispatch-impl")),
                                        PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.seats, [])
+
+    def test_own_pass_reads_the_workers_parent_and_names_only_its_dispatch(self) -> None:
+        from scripts.lib.resume_message import BusyPass, NO_OWN_PASS
+
+        opened = self.opened()
+        for active, expected in ((progress_history.ActiveDispatch("own-dispatch", ("assign.sh",)), BusyPass("own-dispatch")),
+                                 (progress_history.NoActiveDispatch(), NO_OWN_PASS),
+                                 (progress_history.ActiveDispatchUnavailable("record unreadable"), NO_OWN_PASS)):
+            with (self.subTest(active=active),
+                  patch.object(worker_panes, "worker_run", return_value=self.run_dir) as run,
+                  patch.object(progress_history, "active_dispatch", return_value=active) as read,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(worker.own_pass(opened.row, staff.snapshot()), expected)
+            run.assert_called_once_with(self.fixture.parent)
+            read.assert_called_once_with(opened.row.id, self.run_dir)
+            self.assertEqual(errors.getvalue(), "anomaly: impl: record unreadable\n"
+                             if isinstance(active, progress_history.ActiveDispatchUnavailable) else "")
 
     def test_later_user_message_keeps_the_submitted_assignment_receipt(self) -> None:
         self.agent.interrupt = "prompt"

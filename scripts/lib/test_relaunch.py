@@ -129,6 +129,41 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(text.count("Worker idle-id: idle"), 1)
         self.assertNotIn("implement.sh", resume_message("a shutdown"))
 
+    def test_resume_message_lists_every_idle_director_worker(self) -> None:
+        from scripts.lib.resume_message import IdleWorker, PaneWorkerResume, ResumeWorkers, resume_message
+        from scripts.production import staff
+
+        text = resume_message("a shutdown", workers=ResumeWorkers(panes=[
+            PaneWorkerResume(staff.StaffId(name), IdleWorker()) for name in ("impl-id", "review-id")]))
+        self.assertIn("You were stopped and resumed because a shutdown.", text)
+        self.assertIn("for messages kept while you were down", text)
+        for name in ("impl-id", "review-id"):
+            self.assertEqual(text.count(f"Worker {name}: idle"), 1)
+        self.assertNotIn("Continue pass", text)
+
+    def test_resume_message_continues_only_the_recipients_own_pass(self) -> None:
+        from scripts.lib.resume_message import AccountMove, BusyPass, resume_message
+
+        text = resume_message("quota", move=AccountMove("source", "destination"), own_pass=BusyPass("own-dispatch"))
+        self.assertIn("You were stopped and resumed because quota.", text)
+        self.assertIn("moved from source to destination", text)
+        self.assertIn("Continue pass own-dispatch in this conversation. Keep the same pass id.", text)
+        self.assertNotIn("Worker ", text)
+        self.assertEqual(text.count('<system-reminder source="script">'), 1)
+
+    def test_resume_message_keeps_busy_and_idle_mesh_seats(self) -> None:
+        from scripts.lib.resume_message import ResumeWorkers, resume_message
+        from scripts.shutdown.inventory import PausedSeat
+
+        seats = [PausedSeat(run_dir=str(self.root), seat=name, role="impl", staff_id=name,
+                            turn_live=busy, launcher_command=[]) for name, busy in (("busy", True), ("idle", False))]
+        with patch("scripts.lib.resume_message.resume_worker_command", return_value="saved assignment") as command:
+            text = resume_message("a shutdown", workers=ResumeWorkers(seats=seats, cwd=str(self.root)))
+        command.assert_called_once_with(seats[0], str(self.root))
+        self.assertIn("busy (impl, was working): saved assignment", text)
+        self.assertIn("idle (impl, idle): paused on its thread", text)
+        self.assertIn("for messages kept while you were down", text)
+
     def test_child_environment_marks_supervision_without_changing_the_parent(self) -> None:
         program = self.root / ".local/bin/claude"
         program.parent.mkdir(parents=True)
