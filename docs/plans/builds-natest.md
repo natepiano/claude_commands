@@ -1379,7 +1379,7 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 
 **Source:** architect review, 2026-11-06. Speed steps 1-2 and Phase 59 need CPU per test, and `module_run.py` records only each test's wall time and the module's CPU. At high load, wall time does not rank tests by CPU.
 
-**Goal:** `module_cost.py --tests 10 --tree <tree> <folder>/<file>` prints the ten tests with the most CPU, with each test's CPU s and wall s.
+**Goal:** `module_cost.py --tests 10 --tree <tree> <folder>/<file>` prints the ten tests with the most CPU, with each test's CPU s and wall s. `--commands 10` prints the ten commands with the most CPU, and states the CPU that no command holds.
 
 **Spec:**
 1. `module_run.py` adds `cpu_s` to each test row in its output: the change in own plus reaped-children CPU across the test.
@@ -1387,14 +1387,21 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 3. `module_cost.py:74` starts `unittest discover`, so its time run writes no `TEST_TIMES_OUT` report and skips the end step of Phase 62. Run both of its runs through `module_run.py`. Each process count then rises by the supervisor, so state one new baseline. `--tests N` reads the rows of the time run, and prints the N rows with the most CPU after the module table.
 4. The build log store and `show.py` do not change. A kept history of per-test CPU is a later proposal, when a reader needs it.
 5. `coverage_overlap.py:245` reads the three-value tuples from `timed_outcomes()`, and its collector uses `TimedResult`. Keep that API. The new types stay in the runner's output.
-6. Add no guard, refusal or check (user rule, 2026-11-05).
+6. **CPU by command (add-on from Phase 61, accepted by the showrunner on 2026-11-06).** Phase 61 cut process starts and not CPU, because a process count does not rank CPU.
+   a. `wait4` usage is not valid for this: most waits in a module request no usage.
+   b. New `scripts/test_times/task_cpu.py` runs a command under `ptrace`, with trace options for fork, vfork, clone, exec and exit. At each exec it reads `/proc/<pid>/cmdline`. At each exit event it reads the first field of `/proc/<pid>/schedstat`, the task's CPU, and `Tgid` from `/proc/<pid>/status`. It stops at no system call. On four SSH modules at Phase 66 this sum was within 2.5% of the `module_cost.py` CPU.
+   c. `module_cost.py --commands N` adds this one run. Without the option, the time run and the strace run do not change.
+   d. It groups task CPU by the process's last exec: the program name, plus the script name for an interpreter. A process with no exec counts under its parent's command. Each row prints the command, its starts and its CPU s, with the most CPU first.
+   e. After the rows, it prints `unassigned`: the CPU of this run from `RUSAGE_CHILDREN`, less the sum of all rows. It prints the number with its sign. A negative number is a result, not an error.
+7. Add no guard, refusal or check (user rule, 2026-11-05).
 
 **Files:**
+- `scripts/test_times/task_cpu.py` — the kernel task counters by command
 - `scripts/test_times/module_run.py` — the `cpu_s` field and the fixture boundaries
 - `scripts/test_times/test_module_run.py` — the case
-- `scripts/test_times/module_cost.py` — `--tests`
-- `scripts/test_times/test_module_cost.py` — the case
-- `commands/test_times.md` — the option
+- `scripts/test_times/module_cost.py` — `--tests`, `--commands`
+- `scripts/test_times/test_module_cost.py` — the cases
+- `commands/test_times.md` — the options
 
 **Workers:** 1 writer on slot `impl3` (one runner and its one reader)
 - `impl3` — all files above, role impl
@@ -1407,50 +1414,36 @@ Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load a
 - A real tempdir module with one test that starts a CPU-heavy child and one that does not: the first test has more `cpu_s`, and `--tests` lists it first. `test_module_cost.py` names this case.
 - A fixture row with a CPU-heavy `setUpClass` shows that cost in its own row. `test_module_run.py` names this case.
 - `module_cost.py` on a real tempdir module with a detached child: the end step of Phase 62 ends the child, and the module status stays. `test_module_cost.py` names this case.
+- `--commands` on a real tempdir module, where one test starts a CPU-heavy script and one test starts a light script: the heavy script is the first row, its CPU is greater than the light script's CPU, and an `unassigned` line prints. `test_module_cost.py` names this case. Report the row sum against the time run's CPU on one real module.
 - Module `wall_s`, `cpu_s` and test status do not change meaning. `test_coverage_overlap.py` passes. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
 
 ### Phase 65 — The first test time list after a gap appears in under a second  · status: done
 **Depends on:** Phase 60
 
-#### Work Order
+#### As-built
 
-**Source:** Phase 60 add-on, accepted by the showrunner on 2026-11-06. Order: first after Phase 62. The showrunner's words: "Measure the cause before the fix."
+`show.py` reads the index first and refreshes after the print. A list holds every gate record that the last complete update read. A newer record appears on a later run.
 
-**Goal:** the first `show.py top` after a gap prints in under 1 s at normal load, or the measured floor is stated.
+- `update_in()` writes the `meta` key `updated_at` inside its transaction. `open_for_update()` sets WAL, so a reader does not wait for a refresh.
+- `open_report_index()` opens the current schema's index when it has `updated_at`. Otherwise `index.py` finds the newest other index with the key and the same `CREATE TABLE` SQL for all four `GATE_TABLES`. When no index qualifies, it updates first. This path can take minutes.
+- One read transaction covers the report rows and the time, so both describe one update.
+- After the output, `show.py` closes its connection, flushes and forks one child, which calls `os.setsid()` and `index.update()`. The parent exits at once.
+- Stderr prints `rows as of <HH:MM zone>`, with `MM-DD` for another day. Stdout does not change.
 
-**Spec:**
-1. Measure first, and change no file. `open_report_index()` at `scripts/test_times/show.py:405` calls `index.update()` on every run. The first run after a gap took 1m58 real and 61 s user at load about 70. A warm run took 0.455 s.
-2. Measure three cases with CPU s and wall s, and with a profile of `update_in()` by function: a full build of a new index, an update after a gap of about 30 minutes, and a run with nothing new. `index_path_in()` names the index by its schema, so a tree with a changed schema builds a new index. Count how often each case occurs from the index files in the build log root.
-3. Measure on a private root, through `BUILDLOG_DIR`. Link the live JSONL files into it, and keep its index on disk, not on tmpfs. Write nothing to the live build log root.
-4. **The measure, 2026-11-06, under `cProfile`.** A new index: 222.0 CPU s, 351.6 wall s. A 30-minute gap: 2.77 CPU s, 14.3 wall s, for eight gate records that expand to 41,253 rows. Nothing new: 0.064 CPU s, 0.065 wall s. A warm report: 0.38 CPU s, 0.66 wall s. So no update before the print reaches 1 s. The cause of the first 1m58 stays unproved; a new index is the strongest CPU explanation.
-5. **The director's cut: read first, and refresh after the print.**
-   a. `update_in()` writes the `meta` key `updated_at`, epoch seconds, inside its transaction. The key means that the index holds one complete update. It does not change the schema hash.
-   b. `open_for_update()` sets `PRAGMA journal_mode = WAL`, so a reader never waits for a refresh. `remove_index()` already handles the sidecars.
-   c. `open_report_index()` no longer updates before the read. It opens the current schema's index when that index has `updated_at`.
-   d. Otherwise it opens the newest other index that has `updated_at` and has the same `CREATE TABLE` SQL for all four `GATE_TABLES` as the current schema. The helper that finds this index goes in `index.py`.
-   e. When no index qualifies, it updates first, as today. This path can take minutes. It is the one remaining slow path.
-   f. After the output, `show.py` closes its connection and flushes, then forks one child. The child calls `os.setsid()`, puts stdin, stdout and stderr on `/dev/null`, calls `index.update()` and ends with `os._exit`. The parent exits at once, so a pipe on the output closes. A child that fails ends with no message; the time line in step g shows the old time.
-   g. `show.py` prints one line to stderr: `rows as of <HH:MM zone>`, from `updated_at`, in the user's zone. Stdout does not change. An index without the key prints no line.
-6. **The rule that replaces "every gate record":** a list holds every gate record that the last complete update read. A newer record appears on a later run, after the refresh ends. Stderr states the time. The cost is that the first list after a gate can omit that gate.
-7. Add no guard, refusal or check (user rule, 2026-11-05). Add no option: no reader needs a forced update.
+Measure: a first list on a scratch history took 0.116 CPU s and 0.166 s wall at load 66. A second list during a refresh took 0.120 and 0.147. An older compatible index took 0.117 and 0.127. Before the phase, a 30-minute gap took 2.77 CPU s and 14.3 s wall under `cProfile`, and a new index took 222.0 CPU s and 351.6 s wall.
 
 **Files:**
 - `scripts/test_times/show.py` — read first, the refresh, the time line
-- `scripts/test_times/test_show.py` — the cases
-- `scripts/buildlog/index.py` — the key, WAL, and the helper that finds a compatible index; owner report-unit
-- `scripts/buildlog/test_index.py` — the cases for the index change
-- `commands/test_times.md` — the time line and the rule in step 6
+- `scripts/test_times/test_show.py` — the real-process cases
+- `scripts/buildlog/index.py` — the key, WAL, the compatible index search; owner report-unit
+- `scripts/buildlog/test_index.py` — the index cases
+- `commands/test_times.md` — the time line and the rule
 
-**Workers:** 1 writer on slot `impl3` (one read path; the fix is small or the floor is stated)
-- `impl3` — all files above, role impl
+**Binds later work:** the first list after a gate can omit that gate. A reader that needs each record reads the records, not this list.
 
-**Constraints from prior phases:**
-- Phase 60: `show.py top` ranks by CPU, and loads only what a command needs. Rows must stay the same.
+**Gotchas:** a refresh child that fails ends with no message, and the time line shows the old time. A burst of lists queues refresh children on `update_lock_in`; each child after the first is cheap. An index with no `updated_at` gets one synchronous update. The original 1m58 is not classified, because no matching lock trace exists.
 
-**Acceptance gate:**
-- Live check on a private root, through `BUILDLOG_DIR`: copy the live index of this schema into it, and link the live JSONL files. Report CPU s, wall s and load, to the parent's exit, for each case: (1) the first `show.py top` with unindexed lines; (2) a second run while that refresh runs; (3) a tree with one more column in a table that is not a gate table, which reads the older index while its new index builds. Each case is under 1 s of wall time, or the measured floor is stated with the load. Also report the refresh child's CPU s for a new index, before and after WAL.
-- `test_show.py` names these real-process cases on a tempdir root: the first run prints the rows of the last update and the time line; a later run after the refresh holds the new record; the output pipe closes before the refresh ends; a tree with changed gate SQL does not read the older index. Removing each step on a tempdir copy makes its test fail. A test ends each process it starts.
-- `test_show.py` and `test_index.py` pass through a clone. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
+**Ruled out:** an update before the print, which cannot reach 1 s after a gap.
 
 ### Phase 66 — The four SSH target test files use half their CPU  · status: todo
 **Depends on:** none
