@@ -1338,45 +1338,28 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 ### Phase 62 — A test runner ends each process its tests leave  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Source:** builds showrunner, queue-unit and verify-unit, 2026-11-06. Three fixture `verify.sh` runs from stopped gates of 11-04 stay alive. Each has its own session and a parent of `systemd --user`, and waits for a fixture hold that never ends. Each stays in its gate's scope in `builds.slice`, so the live queue reads it as a running build. Verify's reading of the cause: `merge_gate` `stop_gate_jobs` sends SIGTERM to each job's process group, `module_run.py` dies with no cleanup, and a fixture in its own session misses the signal.
+On Linux, `module_run.py` marks itself a child subreaper and forks before it imports test code. The child runs the tests. The parent reaps each adopted orphan at once. When the test process ends, or the parent receives SIGTERM, SIGINT or SIGHUP, the parent sends SIGKILL to each direct child and reaps until no child stays. It then ends with the test process's status. A SIGKILL of the parent stops this end step. Where `prctl` does not exist, the runner does not fork.
 
-**Goal:** when a `module_run.py` run ends, by a normal end, a failed test or a signal, no process that its tests started stays alive.
+The merge gate's module time limit now calls `stop_gate_jobs([job])`, so SIGTERM comes first and the end step runs.
 
-**Spec:**
-1. **Two processes on Linux.** `module_run.py` marks itself a child subreaper, then forks before it imports test code. The child runs the tests as today. The parent starts no test. A subreaper in the test process itself would leave each orphan as an unreaped zombie, and a test that waits for an orphan to end would see it alive.
-2. **The parent reaps.** The parent calls `os.waitpid(-1, 0)` in a loop, so an adopted orphan that exits is reaped at once.
-3. **The end.** When the test process ends, or the parent receives SIGTERM, SIGINT or SIGHUP, the parent sends SIGKILL to each direct child, and reaps until `waitpid` reports no child. An orphan of a killed process becomes a direct child, so this loop reaches each descendant, in any session.
-4. **Status.** The parent ends with the status of the test process: the same exit code, or the same signal. When a signal stopped the run, the parent ends by that signal.
-5. **One subreaper function.** One function in a new `scripts/lib/descendants.py` makes the `prctl` call. `module_run.py`, `scripts/lib/build_folders.py`, `scripts/build_queue/ci_cargo_front.py` and `scripts/message/process_test_support.py` call it.
-6. **Other platforms.** Where `prctl` does not exist, `module_run.py` does not fork, and works as it does today.
-7. **Records.** The module's `wall_s`, `cpu_s` and test records keep their meaning.
-8. **Doc.** `docs/as-built/merge-gate-and-test-speed.md` states the rule, and names the one gap: a SIGKILL of the parent stops this end step.
+Measure: runner CPU per module 0.063 to 0.088 s, in 30 same-load pairs at load about 80. That is one more process per module, and about +18 CPU s per gate over 717 modules. `process_memory_mib` sums the root and its descendants, so a module's sampled memory now includes the parent's RSS and any orphan that stays in the tree.
 
 **Files:**
 - `scripts/test_times/module_run.py` — the fork and the end step
 - `scripts/test_times/test_module_run.py` — the cases
-- `scripts/lib/descendants.py` — the subreaper function
-- `scripts/lib/build_folders.py` — caller
-- `scripts/build_queue/ci_cargo_front.py` — caller
-- `scripts/message/process_test_support.py` — caller
+- `scripts/lib/descendants.py` — the one subreaper function
+- `scripts/lib/build_folders.py`, `scripts/build_queue/ci_cargo_front.py`, `scripts/message/process_test_support.py` — its callers
+- `scripts/production/merge_gate.py` — the time limit path
+- `scripts/production/merge_gate_suites_test_support.py`, `merge_gate_test_support.py`, `test_merge_gate_suites.py`, `test_merge_gate_suites_resources.py` — the time limit tests
 - `docs/as-built/merge-gate-and-test-speed.md` — the rule
 
-**Workers:** 1 writer on slot `review3` (one mechanism and its callers)
-- `review3` — all files above, role impl
+**Binds later work:** a process count from before this phase is one lower per module. A test process's own CPU counts do not hold an orphan's CPU, because the parent reaps it.
 
-**Constraints from prior phases:**
-- Add no guard, refusal or check that this Spec does not ask for.
-- Do not stop the three live processes. queue-unit has asked the user about them.
-- `scripts/build_queue/scope_activity.py` belongs to queue-unit. Do not change it.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:** a test run with `&` in a non-interactive shell has SIGINT ignored, so a SIGINT test fails falsely. Run these tests in the foreground. The three old live fixture processes stayed alive: queue-unit asked the user about them.
 
-**Acceptance gate:**
-- A real `module_run.py` run of a tempdir test starts a process in its own session, whose parent exits. The observation is that process's state after each runner end: normal end, failed test, and SIGTERM to the runner's group. In each case the process is gone, and the runner's status is unchanged. `test_module_run.py` names these three cases.
-- A test in a real run sees an orphan that it killed end, with no zombie left. `test_module_run.py` names this case.
-- For each case, removing the step on a tempdir copy makes its test fail.
-- `test_module_run.py`, `scripts/message/test_repeat_guard.py`, `scripts/message/test_process_test_support.py` and the tests of `build_folders.py` and `ci_cargo_front.py` pass; basedpyright 0/0/0 on the changed Python files. No full suite: this is a bumped change, so it runs lint and the tests of the changed files only.
+**Ruled out:** a subreaper in the test process itself, which leaves each orphan as an unreaped zombie.
 
 ### Phase 63 — Three verify test files stop failing at random  · status: todo
 **Depends on:** none
@@ -1462,16 +1445,24 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 1. Measure first, and change no file. `open_report_index()` at `scripts/test_times/show.py:405` calls `index.update()` on every run. The first run after a gap took 1m58 real and 61 s user at load about 70. A warm run took 0.455 s.
 2. Measure three cases with CPU s and wall s, and with a profile of `update_in()` by function: a full build of a new index, an update after a gap of about 30 minutes, and a run with nothing new. `index_path_in()` names the index by its schema, so a tree with a changed schema builds a new index. Count how often each case occurs from the index files in the build log root.
 3. Measure on a private root, through `BUILDLOG_DIR`. Link the live JSONL files into it, and keep its index on disk, not on tmpfs. Write nothing to the live build log root.
-4. The director picks the cut from the measure, and writes it here before any edit.
-5. `show.py` keeps its current results: a test time list holds every gate record that existed when the command started, unless the director's written cut states another rule.
-6. Add no guard, refusal or check (user rule, 2026-11-05).
+4. **The measure, 2026-11-06, under `cProfile`.** A new index: 222.0 CPU s, 351.6 wall s. A 30-minute gap: 2.77 CPU s, 14.3 wall s, for eight gate records that expand to 41,253 rows. Nothing new: 0.064 CPU s, 0.065 wall s. A warm report: 0.38 CPU s, 0.66 wall s. So no update before the print reaches 1 s. The cause of the first 1m58 stays unproved; a new index is the strongest CPU explanation.
+5. **The director's cut: read first, and refresh after the print.**
+   a. `update_in()` writes the `meta` key `updated_at`, epoch seconds, inside its transaction. The key means that the index holds one complete update. It does not change the schema hash.
+   b. `open_for_update()` sets `PRAGMA journal_mode = WAL`, so a reader never waits for a refresh. `remove_index()` already handles the sidecars.
+   c. `open_report_index()` no longer updates before the read. It opens the current schema's index when that index has `updated_at`.
+   d. Otherwise it opens the newest other index that has `updated_at` and has the same `CREATE TABLE` SQL for all four `GATE_TABLES` as the current schema. The helper that finds this index goes in `index.py`.
+   e. When no index qualifies, it updates first, as today. This path can take minutes. It is the one remaining slow path.
+   f. After the output, `show.py` closes its connection and flushes, then forks one child. The child calls `os.setsid()`, puts stdin, stdout and stderr on `/dev/null`, calls `index.update()` and ends with `os._exit`. The parent exits at once, so a pipe on the output closes. A child that fails ends with no message; the time line in step g shows the old time.
+   g. `show.py` prints one line to stderr: `rows as of <HH:MM zone>`, from `updated_at`, in the user's zone. Stdout does not change. An index without the key prints no line.
+6. **The rule that replaces "every gate record":** a list holds every gate record that the last complete update read. A newer record appears on a later run, after the refresh ends. Stderr states the time. The cost is that the first list after a gate can omit that gate.
+7. Add no guard, refusal or check (user rule, 2026-11-05). Add no option: no reader needs a forced update.
 
 **Files:**
-- `scripts/test_times/show.py` — the report index open
-- `scripts/test_times/test_show.py` — the case
-- `scripts/buildlog/index.py` — only if the measure puts the cause here; owner report-unit
-- `scripts/buildlog/test_index.py` — the case for an index change
-- `commands/test_times.md` — only if what a reader sees changes
+- `scripts/test_times/show.py` — read first, the refresh, the time line
+- `scripts/test_times/test_show.py` — the cases
+- `scripts/buildlog/index.py` — the key, WAL, and the helper that finds a compatible index; owner report-unit
+- `scripts/buildlog/test_index.py` — the cases for the index change
+- `commands/test_times.md` — the time line and the rule in step 6
 
 **Workers:** 1 writer on slot `impl3` (one read path; the fix is small or the floor is stated)
 - `impl3` — all files above, role impl
@@ -1480,5 +1471,6 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 - Phase 60: `show.py top` ranks by CPU, and loads only what a command needs. Rows must stay the same.
 
 **Acceptance gate:**
-- Live check: on the private root with about 24 hours of unindexed lines, the first `show.py top` prints in under 1 s of wall time at load under 30. Report CPU s and wall s, before and after.
+- Live check on a private root, through `BUILDLOG_DIR`: copy the live index of this schema into it, and link the live JSONL files. Report CPU s, wall s and load, to the parent's exit, for each case: (1) the first `show.py top` with unindexed lines; (2) a second run while that refresh runs; (3) a tree with one more column in a table that is not a gate table, which reads the older index while its new index builds. Each case is under 1 s of wall time, or the measured floor is stated with the load. Also report the refresh child's CPU s for a new index, before and after WAL.
+- `test_show.py` names these real-process cases on a tempdir root: the first run prints the rows of the last update and the time line; a later run after the refresh holds the new record; the output pipe closes before the refresh ends; a tree with changed gate SQL does not read the older index. Removing each step on a tempdir copy makes its test fail. A test ends each process it starts.
 - `test_show.py` and `test_index.py` pass through a clone. `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`. Lint and the tests of the changed files only.
