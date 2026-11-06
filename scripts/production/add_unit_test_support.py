@@ -600,7 +600,7 @@ class AddUnitTestCase(ShutdownTestCase):
                          "script = sys.argv.pop(1)\n"
                          "with private_process_registry():\n"
                          "    runpy.run_path(script, run_name='__main__')\n")
-            return subprocess.run([sys.executable, "-c", bootstrap, str(SCRIPT), *arguments],
+            return subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", bootstrap, str(SCRIPT), *arguments],
                                   env=self.env, capture_output=True, text=True,
                                   timeout=timeout, check=False)
         return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,

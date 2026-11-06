@@ -314,7 +314,7 @@ for name in ("first", "second"):
     assert sys.path == caller_path
     paths(caller)
 '''
-            result = subprocess.run([sys.executable, "-c", program], env=environment,
+            result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program], env=environment,
                                     cwd=SCRIPT.parent, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

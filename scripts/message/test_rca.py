@@ -285,7 +285,7 @@ subprocess.run([sys.executable, '-c',
                     "OWNER_TEST_RETURN": str(returned), "OWNER_TEST_CASE_DIR": str(rca.STATE),
                     "OWNER_TEST_PIDS": str(descendants)}
                 self.owned.markers.append(descendants)
-                with REAL_POPEN([sys.executable, "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
+                with REAL_POPEN([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
                                 env=self.owned.environment(environment), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True) as process:
                     self.owned.track(process, group=True)

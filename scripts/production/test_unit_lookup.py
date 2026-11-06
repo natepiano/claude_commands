@@ -301,7 +301,7 @@ print(observed.row.id)
 """
         for order in (("unit_lookup", "staff_sources"), ("staff_sources", "unit_lookup")):
             with self.subTest(order=order):
-                result = subprocess.run([sys.executable, "-c", program, str(SCRIPT.parent), *order],
+                result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, str(SCRIPT.parent), *order],
                                         env=self.environment, capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, row.id + "\n")

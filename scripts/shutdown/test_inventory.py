@@ -104,7 +104,7 @@ class InventoryImportTests(unittest.TestCase):
     def test_package_inventory_imports_without_shutdown_on_search_path(self) -> None:
         root = Path(__file__).resolve().parents[2]
         result = subprocess.run(
-            [sys.executable, "-I", "-c", """
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-I", "-c", """
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])

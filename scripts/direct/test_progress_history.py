@@ -13,7 +13,6 @@ import json
 import os
 import select
 import subprocess
-import sys
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -273,7 +272,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 '''
         environment = {**os.environ, "HOME": str(caller),
                        "USER_ZONE_CONF": str(caller / "zone.conf")}
-        result = subprocess.run([sys.executable, "-c", program, str(self.root), str(self.working_dir)],
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, str(self.root), str(self.working_dir)],
                                 env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("two homes isolated; recorder lock retained; caller restored", result.stdout)
@@ -2376,7 +2375,7 @@ sys.argv = ["progress_history.py", *sys.argv[1:]]
 with patch.object(fcntl, "flock", admission):
     recorder.main()
 '''
-        finish: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", finish_program, "finish-phase", "--session-dir", str(session),
+        finish: subprocess.Popen[str] = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", finish_program, "finish-phase", "--session-dir", str(session),
                                    "--status", "completed"], env=environment, text=True,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: finish.kill() if finish.poll() is None else None)
@@ -2385,7 +2384,7 @@ with patch.object(fcntl, "flock", admission):
         finish_output = cast(TextIO, finish.stdout)
         self.assertTrue(select.select([finish_output], [], [], TEST_HANG_GUARD_SECS)[0], "finish never reaches publication")
         self.assertEqual(finish_output.readline().strip(), "publishing")
-        start: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", start_program, "start-checkpoint-wait", "--commit", commit,
+        start: subprocess.Popen[str] = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", start_program, "start-checkpoint-wait", "--commit", commit,
                                   "--working-dir", str(self.working_dir), "--phase-id", "6", "--owner-session", "receiver"],
                                  env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: start.kill() if start.poll() is None else None)

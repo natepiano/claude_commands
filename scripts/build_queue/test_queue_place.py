@@ -149,7 +149,7 @@ def helper_lifeline_owner() -> None:
 
 class HelperLifelineTests(unittest.TestCase):
     def test_helpers_exit_after_the_test_process_is_killed(self) -> None:
-        owner = subprocess.Popen([sys.executable, "-c",
+        owner = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
             "from scripts.build_queue.test_queue_place import helper_lifeline_owner; helper_lifeline_owner()"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         pids: list[int] = []
@@ -249,7 +249,7 @@ class QueuePlaceFixture(ExitStack):
         def start(argv: list[str], **kwargs: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
             if "--scope-start" in argv:
                 index = argv.index("--scope-start") - 2
-                argv = [*argv[:index], sys.executable, "-c",
+                argv = [*argv[:index], str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
                         "from scripts.build_queue.test_queue_place import private_scope_start; private_scope_start()",
                         self.private_slice, *argv[index + 2:]]
             if argv[:1] != ["git"]:
@@ -595,7 +595,7 @@ class QueuePlaceTests(unittest.TestCase):
         unit = f"queue-place-holder-{os.getpid()}-{time.monotonic_ns()}.scope"
         command = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                    "--expand-environment=no", f"--slice={private_slice}", f"--unit={unit}", "--",
-                   sys.executable, "-c", "from scripts.build_queue.test_queue_place import QueuePlaceTests; "
+                   str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.build_queue.test_queue_place import QueuePlaceTests; "
                    + "QueuePlaceTests().assert_nested_scope_stops_unsampled_descendant("
                    + f"fork_during_scope_read={fork_during_scope_read!r}, private_slice={private_slice!r})"]
         try:

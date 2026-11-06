@@ -572,7 +572,7 @@ METRICS['turn_count'] = Metric('turn_count', 'Stored turn count',
                              TurnAggregate('turns', 'count(*)'), format=ReportFormat.COUNT)
 raise SystemExit(main(sys.argv[1:]))
 """
-        result = subprocess.run([sys.executable, "-c", script, "--db", str(self.db_path),
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, "--db", str(self.db_path),
                                  "--production-docs", str(self.production_docs), "turn_count"],
                                 env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)

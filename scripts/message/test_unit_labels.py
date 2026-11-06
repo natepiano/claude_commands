@@ -8,7 +8,6 @@ import os
 from contextlib import redirect_stderr
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 from typing import TYPE_CHECKING, cast
 import unittest
@@ -246,7 +245,7 @@ print(json.dumps({
 """
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
-                [sys.executable, "-c", program, directory], input=json.dumps(record),
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, directory], input=json.dumps(record),
                 cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
                 check=False, timeout=10,
             )
