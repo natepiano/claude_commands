@@ -427,6 +427,7 @@ The service does not require `memory.max` for admission.
 [Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the cap.
 The cap text names the CI keep-aside within kept memory.
 The page shows CI use and the CI keep-aside inside the cap.
+The page and the queue text show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB.
 The page includes both CI amounts in its taken total. Room and admission do not change.
 `RunningServiceJob` and `IdleService` retain the CI job state.
 Anonymous scope counters use the same measure as the history peaks.

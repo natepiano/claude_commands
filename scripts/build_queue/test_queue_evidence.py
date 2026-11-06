@@ -51,6 +51,26 @@ class FinishedTokenGapTimes(TypedDict):
 
 
 class RoomTextTests(unittest.TestCase):
+    def test_ci_amount_shows_mib_only_under_a_tenth_of_a_gib(self) -> None:
+        for value, text in ((47 * GIB // 1024, "47 MiB"), (GIB // 10 - 1, "102 MiB"),
+                            (GIB // 10, "0.1 GiB"), (22 * GIB, "22.0 GiB")):
+            with self.subTest(value=value):
+                self.assertEqual(queue_evidence.ci_amount(value), text)
+
+    def test_cap_text_shows_idle_ci_use_in_mib(self) -> None:
+        room = gate.memory_room(gate.HostMemory(20 * GIB, 64 * GIB),
+            (gate.RunMemory("run", 8 * GIB, gate.AnonymousRunUse(3 * GIB)),),
+            admission_policy_fixture(), ci_use=63 * GIB // 1024)
+        assert isinstance(room, gate.MemoryRoom)
+        self.assertIn("anonymous use 3.0 GiB + CI use 63 MiB + free 20.0 GiB", queue_evidence.room_text(room))
+
+    def test_idle_ci_slice_row_shows_mib_and_sccache_keeps_gib(self) -> None:
+        small = 47 * GIB // 1024
+        ci = gate.UnownedSliceMemory(small, owner="hana-ci.slice", job_state=IdleService(), pid=gate.PidNotRecorded())
+        compiler = gate.CompilerServiceMemory(small, swap_bytes=0, pid=gate.PidNotRecorded())
+        self.assertIn("hana-ci.slice: idle; 47 MiB RAM", queue_evidence.service_text(ci, 0.0))
+        self.assertIn("sccache.service: idle; 0.0 GiB RAM", queue_evidence.service_text(compiler, 0.0))
+
     def test_cap_text_names_ci_use_and_its_printed_terms_sum_to_the_cap(self) -> None:
         for ci_use, text in (
             (0, "Cap 20.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),

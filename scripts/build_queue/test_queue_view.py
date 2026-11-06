@@ -228,7 +228,7 @@ class QueueViewTests(QueueFixtureTests):
                     self.assertEqual(len(rows), 1)
                     row, = rows
                     self.assertIn("idle", row)
-                    self.assertIn("0.1", row)
+                    self.assertIn("92 MiB RAM", row)
                     self.assertIn("swap", row)
                     self.assertIn("2.0", row)
                     self.assertNotIn("min", row)
