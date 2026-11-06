@@ -7606,18 +7606,6 @@ class PickerTests(unittest.TestCase):
         self.assert_picked("claude2", keep=accounts.KeepAccount("claude2"))
         self.assert_picked("claude1")
 
-    def test_claude_launch_with_room_prepares_the_selected_account_and_preserves_refusals(self) -> None:
-        selected = accounts.claude_account_with_room(self.now)
-        self.assertEqual(selected.label, "claude3")
-        self.assertEqual(selected.dir, accounts.account_dir("claude3"))
-        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("fixture account denied")):
-            with self.assertRaisesRegex(accounts.AccountsError, "fixture account denied"):
-                _ = accounts.claude_account_with_room(self.now)
-        for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
-            self.reading("Claude", login, 0, 2)
-        with self.assertRaisesRegex(accounts.AccountsError, "no claude account has room"):
-            _ = accounts.claude_account_with_room(self.now)
-
     def test_picker_prefers_soonest_weekly_reset_over_most_room(self) -> None:
         self.assert_picked("claude3")
 

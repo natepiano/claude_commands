@@ -22,12 +22,11 @@ import merge_checkpoint
 from scripts.production import showrunners
 from scripts.production import production_doc
 from merge_checkpoint import check_parallel
-from scripts.production.production_doc import Refusal
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 import scratch
 
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, REAL_MERGE_TESTS, STUB, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -110,27 +109,6 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     self.assertIn(f"merge={checkout}\n", output)
 
 
-class ReviewNumbersTests(unittest.TestCase):
-    def test_invalid_trial_shows_the_simplify_suffix_as_optional(self) -> None:
-        with self.assertRaises(Refusal) as refused:
-            _ = merge_checkpoint.review_numbers("review trial: invalid")
-        self.assertIn("ux repair minutes <R>[, simplify <N> findings, simplify minutes <S>]",
-                      str(refused.exception))
-        for suffix in (", simplify 1 findings", ", simplify minutes 2", ", simplify -1 findings, simplify minutes 2"):
-            with self.subTest(suffix=suffix), self.assertRaises(Refusal):
-                _ = merge_checkpoint.review_numbers(TRIAL + suffix)
-
-    def test_review_numbers_distinguishes_absent_simplify_from_recorded_zero(self) -> None:
-        for suffix, simplify in (
-            ("", merge_checkpoint.NoSimplifyReview()),
-            (", simplify 0 findings, simplify minutes 0", merge_checkpoint.SimplifyReviewMetrics("0", "0")),
-            (", simplify 3 findings, simplify minutes 2.5", merge_checkpoint.SimplifyReviewMetrics("3", "2.5")),
-        ):
-            with self.subTest(suffix=suffix):
-                self.assertEqual(merge_checkpoint.review_numbers(TRIAL + suffix),
-                                 merge_checkpoint.ReviewTrial("2", "3", "14", "4", "1", simplify))
-
-
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
     def test_merge_uses_the_staff_name_with_a_different_document_name(self) -> None:
@@ -190,16 +168,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(checkpoint)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
-
-    def test_record_passes_separate_simplify_fields_when_the_trial_contains_them(self) -> None:
-        trial = TRIAL + ", simplify 0 findings, simplify minutes 2.5"
-        result = self.run_checkpoint(self.checkpoint(), trial=trial)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        review = self.events("review_regime.py")
-        self.assertEqual(len(review), 1)
-        self.assertEqual(review[0][review[0].index("--simplify-findings") + 1], "0")
-        self.assertEqual(review[0][review[0].index("--simplify-minutes") + 1], "2.5")
-        self.assertNotIn("--note", review[0])
 
     def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
         self.write(self.checkout, "local-only.txt", "local commit must survive\n")
