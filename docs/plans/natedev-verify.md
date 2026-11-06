@@ -946,6 +946,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - Delete the `test_step_record_cli.py` tests that only drive the `state` or `remove` verbs. The new real-path tests below hold their behavior. Name each deleted test in the summary.
 - `test_verify_tree_cancel_lint.py:83` has a `python3` stand-in that waits on `step_record.py state`. Change that setup so the test still interrupts at the same point. Its assertions stay.
 - A test that reads a step's state, target, `updated` or run location straight from the JSON file reads it through `step_record.read` instead. The expected values stay. Name each such test in the summary.
+- `test_step_record.py::test_dead_or_reused_process_is_stale_and_excluded`: delete the `steps.state` refusal assertion, because item 8 deletes `state`. `merge16` deletes it. The stale read and `live_records` assertions stay. Real-path test 4 holds the refusal for a record that another pid rewrote.
 - `test_verify_step_routes.py::test_unreadable_record_refuses_before_local_or_mac_compile` keeps every assertion.
 
 **Tests.** New file `scripts/direct/test_verify_step_state.py`. Each test runs the real `verify.sh` with its usual fixture and a run-time tempdir:
