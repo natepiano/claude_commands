@@ -165,6 +165,7 @@ class ControlSettings:
     credentials_profile: str
     start_after_wait_s: float
     start_min_waiting: int
+    version_decline_hold_s: float
     capacity_backoff_s: float
     drain_max_minutes: float
     idle_stop_minutes: float
@@ -221,7 +222,8 @@ def read_control_settings(path: Path | conf.ConfigRead, directory: Path | None =
     return ControlSettings(enabled, required('instance_type'), required('region') if enabled else values.get('region', ''),
                            values.get('instance_id', '') if remote_identity else deployment_outputs(directory).get('InstanceId', ''),
                            required('credentials_profile'), settings.number('start_after_wait_s'),
-                           settings.whole('start_min_waiting'), settings.number('capacity_backoff_s'),
+                           settings.whole('start_min_waiting'), settings.number('version_decline_hold_s'),
+                           settings.number('capacity_backoff_s'),
                            settings.number('drain_max_minutes'), settings.number('idle_stop_minutes'),
                            settings.number('tick_interval_s'), settings.number('aws_timeout_s'),
                            settings.number('snapshot_max_age_s'), settings.number('permission_ttl_s'),

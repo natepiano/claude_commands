@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from importlib import import_module
 import fcntl
+import json
 import math
 import os
 from pathlib import Path
@@ -1295,6 +1296,47 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
             "mend": expected["mend"], "scripts_commit": expected["scripts_commit"]}
 
 
+def recorded_linux_version_mismatch(controller: ProcessController, config: OffloadConfig,
+                                    target: str) -> str:
+    """Compare the tree with the tools recorded by deployment without contacting the box."""
+    if TYPE_CHECKING:
+        from . import linux_runner
+    else:
+        import linux_runner
+    try:
+        raw = cast(object, json.loads((target_config.ssh_target_state_directory(target) / "box-tools.json").read_text()))
+        if not isinstance(raw, dict):
+            return ""
+        versions = cast(dict[str, object], raw).get("versions")
+        if not isinstance(versions, dict):
+            return ""
+        entries = cast(dict[str, object], versions)
+        if any(not isinstance(value, str) for value in entries.values()):
+            return ""
+        actual = {key: linux_runner.normalize_tool_version(cast(str, value)) for key, value in entries.items()}
+        expected = expected_linux_parity(controller, config)
+        if isinstance(expected, UnavailableToolParity):
+            return ""
+        selected = {key: linux_runner.normalize_tool_version(value) for key, value in (
+            ("rustc", expected["rustc"]), ("nextest", expected["nextest"]), ("mend", expected["mend"])) if key in actual}
+        return linux_runner.version_mismatch(target, actual, selected, config.values.get("version_pin_file", ""))
+    except (OSError, ValueError, UnicodeError):
+        return ""
+
+
+def linux_version_decline_path(target: str, repository_name: str) -> Path:
+    """Use one decline record for each repository name."""
+    return state_directory(target) / f"version-decline-{repository_name}"
+
+
+def linux_version_declined_recently(target: str, repository_name: str, hold_s: float, now: float) -> bool:
+    """Read whether this repository has a decline within the hold duration."""
+    try:
+        return 0 <= now - float(linux_version_decline_path(target, repository_name).read_text()) < hold_s
+    except (OSError, ValueError, UnicodeError):
+        return False
+
+
 def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
     """Send every tracked script and config file without Git metadata."""
     controller.copy_failure_detail = ""
@@ -2209,6 +2251,14 @@ def run_offload(
     linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform)
     if linux and not trusted_linux_source(request.repo_root):
         return declined("repo", started)
+    if linux:
+        detail = recorded_linux_version_mismatch(controller, config, request.target)
+        decline_path = linux_version_decline_path(request.target, repository.name)
+        if detail:
+            decline_path.parent.mkdir(parents=True, exist_ok=True)
+            _ = decline_path.write_text(str(time.time()))
+            return DeclinedMacRun("state", elapsed_seconds(started), detail)
+        decline_path.unlink(missing_ok=True)
     if not linux and isinstance(request.source, StagedDocSnapshot):
         try:
             if workspace_has_linux_only(request.source.root, comma_values(config.values[f"linux_only.{repository.name}"])):

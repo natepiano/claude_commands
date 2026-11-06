@@ -167,6 +167,75 @@ class CompletedRunSyncTests(unittest.TestCase):
             self.assertEqual(output.getvalue().count("exchange failed"), int(fails))
 
 
+class LocalVersionPreflightTests(unittest.TestCase):
+    def test_recorded_versions_decline_before_claim_copy_or_ssh(self) -> None:
+        self.check_record('{"versions":{"rustc":"rustc 1.99.1"}}', declined=True)
+
+    def test_matching_versions_continue_to_claim(self) -> None:
+        self.check_record('{"versions":{"rustc":" rustc 1.99.0 \\n"}}')
+
+    def test_later_match_removes_the_decline_record(self) -> None:
+        self.check_record('{"versions":{"rustc":"rustc 1.99.1"}}', declined=True, later_match=True)
+
+    def test_missing_and_unreadable_records_continue_to_claim(self) -> None:
+        for content in (None, 'invalid json', '{"versions":[]}'):
+            with self.subTest(content=content):
+                self.check_record(content)
+
+    def test_only_recorded_keys_are_compared(self) -> None:
+        self.check_record('{"versions":{"nextest":"nextest fixture","mend":"mend fixture"}}')
+
+    def check_record(self, content: str | None, *, declined: bool = False, later_match: bool = False) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            if content is not None:
+                _ = (root / "box-tools.json").write_text(content)
+            target = target_config.SshTarget("aws", "linux", root / "aws.conf")
+            config = offload.OffloadConfig(True, offload.SshConnectionSettings("dummy", 1, 1),
+                                          1, 1, 1, "1", {"version_pin_file": "box-pins.nix"})
+            request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), target="aws")
+            controller = offload.ProcessController()
+            versions = {"rustc": "rustc 1.99.0", "nextest": "nextest fixture", "mend": "mend fixture", "git": "commit"}
+
+            def capture(arguments: Sequence[str], deadline: offload.CommandDeadline) -> offload.CommandOutput:
+                self.assertIsInstance(deadline, offload.CommandTimeLimit)
+                name = arguments[1] if arguments[0] == "cargo" else arguments[0]
+                return offload.CommandOutput(0, versions[name], "")
+
+            with (
+                mock.patch.object(offload, "mac_step_eligibility", return_value=HANA),
+                mock.patch.object(offload, "configured_ssh_target", return_value=target),
+                mock.patch.object(offload, "trusted_linux_source", return_value=True),
+                mock.patch.object(target_config, "ssh_target_state_directory", return_value=root),
+                mock.patch.object(controller, "capture", side_effect=capture),
+                mock.patch.object(offload, "claim_for_run", return_value=offload.MacClaimNotConfirmed("blocked", "", "")) as claim,
+                mock.patch.object(offload, "copy_tracked_scripts") as scripts_copy,
+                mock.patch.object(offload, "copy_tree_with_key") as tree_copy,
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("No process expected")),
+                mock.patch.object(subprocess, "run", side_effect=AssertionError("No command expected")),
+                mock.patch.object(time, "monotonic", return_value=5),
+                mock.patch.object(time, "time", return_value=100),
+            ):
+                answer = offload.run_offload(controller, config, request, 1)
+                if declined:
+                    self.assertEqual(answer, offload.DeclinedMacRun("state", 4,
+                        "aws version mismatch: rustc box=rustc 1.99.1 natedev=rustc 1.99.0; move the box pins in box-pins.nix"))
+                    claim.assert_not_called()
+                    self.assertEqual(offload.linux_version_decline_path("aws", HANA.name), root / "version-decline-hana")
+                    self.assertTrue(offload.linux_version_declined_recently("aws", HANA.name, 60, 159))
+                    self.assertFalse(offload.linux_version_declined_recently("aws", HANA.name, 60, 160))
+                    if later_match:
+                        _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
+                        _ = offload.run_offload(controller, config, request, 1)
+                        claim.assert_called_once_with(controller, config, request, HANA)
+                        self.assertFalse(offload.linux_version_decline_path("aws", HANA.name).exists())
+                else:
+                    claim.assert_called_once_with(controller, config, request, HANA)
+                    self.assertFalse(offload.linux_version_declined_recently("aws", HANA.name, 60, 100))
+            scripts_copy.assert_not_called()
+            tree_copy.assert_not_called()
+
+
 class OffloadSettingsTests(unittest.TestCase):
     root: Path = Path()
     settings: Path = Path()

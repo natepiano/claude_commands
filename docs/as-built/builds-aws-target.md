@@ -81,6 +81,12 @@ An interruption marker reports the instance generation.
 - `aws_target.py tick|start|stop|serve` runs `Controller` under `control_lock`. `AwsCli` is the one AWS CLI adapter. `controller.json` holds the state (`off`, `refused`, `stopped`, `starting`, `running`, `draining`, `stopping`), `generation`, `permitted_generation`, the drain deadline and the capacity backoff.
 - `tick` starts the box for one live pinned waiting step or enough eligible rows in `admission/queue.json`.
   Both paths require guard permission and an ended backoff. Unpinned steps keep their queue thresholds. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
+- Natedev compares the tree's tool versions with `box-tools.json` before it claims a Linux target slot, so a version decline never reaches the box and does not reset the idle timer.
+  The comparison uses only the keys in the saved `versions` map. A missing or unreadable file leaves the probe and runner checks in control. It does not read the saved `instance_id`.
+  A mismatch writes its time to `version-decline-<repository name>` in the target's local state directory. A later attempt without a mismatch removes that file before the claim.
+- `tick` does not count queued or pinned work of a repository for `version_decline_hold_s=3600` after its decline. The controller only reads the file and runs no tool.
+  A job reaches the comparison only after the box is up. So a repository with other tool versions still gets one paid start each hold, about 15 idle minutes.
+  A corrected repository can wait until the hold ends for its own start. It still runs when the box is up for other work.
 - `remote.py` publishes an `AdmissionEnvelope` (target, purpose, generation, decision time, expiry) only after a confirmed guard write. The runner checks it before and after shell preparation. Other Linux targets use `IndependentLinuxExecution` and need no AWS permission.
 - On the box, `RemoteAgent` stops the instance after `idle_stop_minutes` idle and polls IMDSv2 every `interruption_poll_s`. An interrupted slot prints `aws_interrupted=<generation>` once, after `mac_exit` and `mac_cleanup`, and exits with the child status. Offload reads it as `InterruptedTargetRun` and records `ON_NATEDEV` before local work.
 - The controller also stops a running instance after `idle_stop_minutes` without published permission when no target claim remains.
