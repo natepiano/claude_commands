@@ -45,7 +45,6 @@ class WorkerRestore(Protocol):
 
 class MemberLifecycle(Protocol):
     def stop(self, session: str, *, deadline: float) -> StopResult: ...
-    def stop_deadline(self) -> float: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot) -> list[str]: ...
     def heal_account_trust(self, cwd: Path, destination: Path, source: Path, name: str) -> object: ...
 
@@ -397,13 +396,12 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     if stop_all:
         for holder in tuple(holders.values()):
             try:
-                deadline = stop_resume.stop_deadline()
-                with staff.row_operation(str(holder.id)), operation_deadline.within(deadline):
+                with staff.row_operation(str(holder.id)):
                     shutdown_record.update(started=[], pending=[str(row.id) for row in selected
                         if row.id == holder.id or row.parent == staff.ReportsTo(holder.id)])
                     if holder.kind in ("unit", "showrunner"):
                         _ = stop_resume.stop_unit_workers(holder.id, record)
-                    _ = stop_row(holder, client, deadline=deadline)
+                    _ = stop_row(holder, client)
             except staff.StaffRefused as error:
                 _ = holders.pop(holder.id)
                 _anomaly(holder, error)

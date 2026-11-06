@@ -167,13 +167,6 @@ def release_source(row: StaffRow, runs: Callable[[], tuple[Path, ...]], backend:
     return SourceReleased()
 
 
-def stop_deadline() -> float:
-    """Read both stop limits and cap the batch by the operation deadline."""
-    settings = conf.read("shutdown")
-    duration = settings.number("STOP_GRACE_SECONDS") + settings.number("KILL_GRACE_SECONDS")
-    return monotonic() + operation_deadline.remaining(duration)
-
-
 def stop(session: str, *, deadline: float = math.inf) -> StopResult:
     from scripts.production import staff
 
@@ -272,11 +265,16 @@ def _stop(session: str) -> StopResult:
                 identity = tab.session_id
             else:
                 return SessionNotFound(session)
-        observed = herdr.read_conversation(identity)
+        try:
+            publication = pane_record.publication_for_session(identity)
+            kind = pane_launch.agent_kind(publication.entry) if publication is not None else ""
+        except (OSError, ValueError) as error:
+            print(f"{identity}: launch record anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
+            kind = ""
+        observed = herdr.read_conversation(identity, kind)
         if isinstance(observed, herdr.StoppedConversation):
             return NotRunning(identity)
         if isinstance(observed, herdr.UnknownConversation):
-            herdr.conversation_note(observed)
             return StopFailed(identity, observed.reason)
         if len(observed.pids) != 1:
             return StopFailed(identity, "conversation has no unique signal target; no signal sent")
@@ -330,6 +328,7 @@ def _stop(session: str) -> StopResult:
 
 def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
+    from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
     from scripts.lib import unit_runs
     from scripts.shutdown import restart
@@ -338,7 +337,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
     if not record.find(kind="worker", parent=unit) or holder is not None and unit_runs.worker_transport(worker_panes.worker_run(holder)) == "mesh":
         return []
     try:
-        deadline = stop_deadline()
+        deadline = worker_lifecycle.effective_deadline()
         states = worker_panes.observe(unit, record)
         unresolved = [f"{item.row.name}: {item.reason}" for item in states
                       if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
@@ -350,9 +349,8 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot) -> list[str]:
                 if not future.result():
                     unresolved.append(f"{item.row.name}: not proved stopped")
     except (OSError, ValueError, herdr.HerdrFailure) as error:
-        unresolved = [f"{unit}: {error}"]
-    for line in unresolved:
-        print(f"anomaly: {line}", file=sys.stderr)
+        unresolved = [f"{unit}: {' '.join(str(error).splitlines())}"]
+        print(f"anomaly: {unresolved[0]}", file=sys.stderr)
     return unresolved
 
 

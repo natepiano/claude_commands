@@ -1137,6 +1137,15 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(restart.restart(stop_all=True), 0)
         self.assertEqual(json.loads(shutdown_record.record_path().read_text()), [self.rows[0].id, self.rows[2].id])
 
+    def test_stop_row_reports_one_reason_when_the_target_terminal_is_unknown(self) -> None:
+        pane: herdr.PaneIdentity = {"pane_id": "w1:p0", "workspace_id": "w1", "session_id": str(self.rows[0].current_session)}
+        with (patch.object(herdr.Herdr, "panes", return_value=[pane]),
+              patch.object(stop_resume, "stop") as stopped, redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(restart.stop_row(self.rows[0], herdr.Herdr("agents")))
+        stopped.assert_not_called()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("terminal is unknown", errors.getvalue())
+
     def test_restart_all_skips_a_stop_when_the_pane_runs_another_conversation(self) -> None:
         with (patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
                   herdr.EnvironmentThread("another-conversation"), "fixture-start", {})),

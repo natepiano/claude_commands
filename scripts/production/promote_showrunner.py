@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.shutdown import remote, stop_resume
-from scripts.lib import operation_deadline
 from scripts.herdr import worker_panes
+from scripts.agents import worker_lifecycle
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -201,10 +201,8 @@ def stop(promotion: Promotion) -> bool:
     """Stop the director and retain its workers for the promoted holder."""
     record = staff.snapshot()
     row = record.by_member_reference(promotion.claude.session_id)
-    deadline = stop_resume.stop_deadline()
-    with operation_deadline.within(deadline):
-        unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None else []
-        result = stop_resume.stop(promotion.claude.session_id, deadline=deadline)
+    unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None else []
+    result = stop_resume.stop(promotion.claude.session_id, deadline=worker_lifecycle.effective_deadline())
     stopped = isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning))
     if stopped and not unresolved:
         place = promotion.marked.place

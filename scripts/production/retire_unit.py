@@ -22,7 +22,7 @@ from scripts.production import staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
 from scripts.shutdown import stop_resume
 from scripts.message import sessions
-from scripts.lib import process_group, conf, operation_deadline
+from scripts.lib import process_group, conf
 from scripts.herdr import worker_panes
 from scripts.lib.conf import UseConfiguredValue
 from scripts.agents import worker_lifecycle
@@ -517,17 +517,16 @@ def retire(unit: Unit, *, settings: conf.ConfigRead,
     pane_run = worker_panes.worker_run(row)
     pane_workers = worker_panes.observe(row.id, record) if unit_runs.worker_transport(pane_run) == "herdr" else []
     pane_ids = {item.row.id for item in pane_workers}
-    with operation_deadline.within(stop_resume.stop_deadline()):
-        _ = stop_resume.stop_unit_workers(row.id, record)
-        for member in owned:
-            if member.id in pane_ids or isinstance(record.backends.get(member.id), staff.CodexBackend):
-                continue
-            try:
-                outcome = stop_resume.stop(member.current_session, deadline=worker_lifecycle.effective_deadline())
-                if isinstance(outcome, stop_resume.StopFailed):
-                    print(f"anomaly: {member.name}: {outcome.reason}")
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
-                print(f"anomaly: {member.name}: {' '.join(str(error).splitlines())}")
+    _ = stop_resume.stop_unit_workers(row.id, record)
+    for member in owned:
+        if member.id in pane_ids or isinstance(record.backends.get(member.id), staff.CodexBackend):
+            continue
+        try:
+            outcome = stop_resume.stop(member.current_session, deadline=worker_lifecycle.effective_deadline())
+            if isinstance(outcome, stop_resume.StopFailed):
+                print(f"anomaly: {member.name}: {outcome.reason}")
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            print(f"anomaly: {member.name}: {' '.join(str(error).splitlines())}")
     for key in holds({member.current_session for member in owned}):
         result = run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
         if result.returncode:

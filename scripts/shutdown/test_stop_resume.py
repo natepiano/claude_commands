@@ -13,7 +13,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from threading import Barrier, Lock, local
 from typing import cast, final, override
@@ -23,9 +23,9 @@ from scripts.message import sessions as runtime_sessions
 from scripts.accounts import accounts
 from scripts.whoami import account
 from scripts.shutdown import restart, stop_resume
-from scripts.lib import atomic_file, conf, unit_runs
+from scripts.lib import atomic_file, conf, operation_deadline, unit_runs
 from scripts.herdr import worker_panes
-from scripts.shutdown.stop_results import ClaudeStartState
+from scripts.shutdown.stop_results import ClaudeStartState, StopResult
 from scripts.shutdown.launch_names import LaunchNames
 from scripts.production import showrunners, staff, staff_sources, stall_watch
 from scripts.production.staff_test_support import isolated_staff_file
@@ -61,7 +61,7 @@ class StopResumeTests(unittest.TestCase):
         def finish(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
             del client
             self.assertEqual(row, rows[0])
-            self.assertEqual(deadline, 7)
+            self.assertEqual(deadline, math.inf)
             states[0] = worker_panes.StoppedWorker(rows[0], "p0", "t0")
             return True
         def observed(_parent: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
@@ -71,7 +71,7 @@ class StopResumeTests(unittest.TestCase):
             expected = ["worker-3: unreadable process", "worker-4: duplicate terminal"]
             with redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(stop_resume.stop_unit_workers(parent, record), expected)
-            self.assertEqual(errors.getvalue().splitlines(), [f"anomaly: {line}" for line in expected])
+            self.assertEqual(errors.getvalue(), "")
             self.assertEqual(stop_resume.stop_unit_workers(parent, record), expected)
         self.assertEqual(stop.call_count, 1)
         self.assertEqual(record.rows, tuple(rows))
@@ -89,7 +89,7 @@ class StopResumeTests(unittest.TestCase):
               patch.object(restart, "stop_row", side_effect=stop), redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(stop_resume.stop_unit_workers(parent, staff.StaffSnapshot((row,))), ["impl: not proved stopped"])
         self.assertEqual(errors.getvalue().splitlines(), ["warning: recovered shutdown configuration",
-            "impl: restart anomaly: no shell proof", "anomaly: impl: not proved stopped"])
+            "impl: restart anomaly: no shell proof"])
 
     def test_worker_stop_proves_the_retained_pane_without_a_director_tab(self) -> None:
         parent = staff.StaffId("holder")
@@ -150,7 +150,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("STOP_GRACE_SECONDS='bad'", warnings.getvalue())
         self.assertAlmostEqual(self.clock.elapsed, .2)
 
-    def test_worker_stops_share_the_configured_deadline_concurrently(self) -> None:
+    def test_worker_stops_share_the_outer_deadline_concurrently(self) -> None:
         parent = staff.StaffId("holder")
         rows = tuple(staff.StaffRow(staff.StaffId(f"row-{i}"), "worker", f"worker-{i}", staff.ReportsTo(parent),
                                    current_session=staff.StaffId(f"native-{i}")) for i in range(3))
@@ -160,13 +160,118 @@ class StopResumeTests(unittest.TestCase):
         joined = Barrier(3)
         def stop(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
             del row, client
-            self.assertEqual(deadline, .75)
+            self.assertEqual(deadline, outer_deadline)
             _ = joined.wait(timeout=5)
             return True
-        with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
+        outer_deadline = time.monotonic() + 100
+        with (operation_deadline.within(outer_deadline),
+              patch.dict(os.environ, {"CONF_DIR": str(config)}),
               patch.object(worker_panes, "observe", return_value=states),
               patch.object(restart, "stop_row", side_effect=stop)):
             self.assertEqual(stop_resume.stop_unit_workers(parent, staff.StaffSnapshot(rows)), [])
+
+    def test_slow_reads_preserve_each_concurrent_signal_grace(self) -> None:
+        parent = staff.StaffId("holder")
+        rows = tuple(staff.StaffRow(staff.StaffId(f"row-{i}"), "worker", f"worker-{i}", staff.ReportsTo(parent),
+                                   current_session=staff.StaffId(f"native-{i}")) for i in range(3))
+        states = [worker_panes.OpenWorker(row, row.name, row.name, herdr.AgentStatus.WORKING) for row in rows]
+        for stop_grace, kill_grace in ((.25, .5), (.5, 1)):
+            joined, lock = Barrier(3), Lock()
+            elapsed: list[float] = []
+            self.kill.reset_mock()
+            self.clock.elapsed = 0
+            config = self.root / "config"
+            atomic_file.write_text_atomic(config / "shutdown.conf",
+                f"# range: 5e-324..\nSTOP_GRACE_SECONDS={stop_grace}\n# range: 5e-324..\nKILL_GRACE_SECONDS={kill_grace}\n")
+            def read(identity: str, _kind: str = "") -> herdr.LiveConversation:
+                self.advance(10)
+                _ = joined.wait(timeout=5)
+                return herdr.LiveConversation("claude",  (100 + int(identity.rsplit("-", 1)[1]),))
+            def native(pid: int, _kind: str) -> herdr.NativeAgentProcess:
+                return herdr.NativeAgentProcess(herdr.EnvironmentThread(str(rows[pid - 100].current_session)), "started", {})
+            def send(pid: int, number: int) -> None:
+                operation_deadline.check()
+                self.kill(pid, number)
+            def stopped(session: str) -> StopResult:
+                result = stop_resume._stop(session)  # pyright: ignore[reportPrivateUsage]
+                with lock:
+                    elapsed.append(self.clock.elapsed)
+                return result
+            with (self.subTest(stop_grace=stop_grace, kill_grace=kill_grace),
+                  patch.dict(os.environ, {"CONF_DIR": str(config)}),
+                  patch.object(time, "monotonic", lambda: self.clock.elapsed),
+                  patch.object(staff, "row_operation", return_value=nullcontext()),
+                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
+                  patch.object(worker_panes, "observe", return_value=states),
+                  patch.object(self.client, "panes", return_value=[]),
+                  patch.object(stop_resume, "_stop_recorded", side_effect=stopped),
+                  patch.object(stop_resume, "_same_process", return_value=True),
+                  patch.object(stop_resume, "_signal_process", side_effect=send),
+                  patch.object(herdr, "read_conversation", side_effect=read),
+                  patch.object(herdr, "native_process", side_effect=native),
+                  patch.object(herdr, "check_native_target", return_value=True)):
+                self.assertEqual(len(stop_resume.stop_unit_workers(parent, staff.StaffSnapshot(rows))), 3)
+            self.assertEqual(self.kill.call_count, 6)
+            self.assertEqual(len(elapsed), 3)
+            for duration in elapsed:
+                self.assertAlmostEqual(duration, 10 + stop_grace + kill_grace)
+
+    def test_unknown_stop_reason_prints_once_through_each_caller(self) -> None:
+        parent = staff.StaffId("holder")
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(parent),
+                             current_session=staff.StaffId("native-worker"))
+        for batch in (False, True):
+            with (self.subTest(batch=batch),
+                  patch.object(staff, "row_operation", return_value=nullcontext()),
+                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                  patch.object(self.client, "panes", return_value=[]),
+                  patch.object(stop_resume, "_record_launches"),
+                  patch.object(worker_panes, "observe", return_value=[worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)]),
+                  patch.object(herdr, "read_conversation", return_value=herdr.UnknownConversation("native evidence unavailable")),
+                  redirect_stderr(io.StringIO()) as errors):
+                if batch:
+                    self.assertEqual(stop_resume.stop_unit_workers(parent, staff.StaffSnapshot((row,))), ["impl: not proved stopped"])
+                else:
+                    self.assertFalse(restart.stop_row(row, self.client))
+            self.assertEqual(errors.getvalue().splitlines(), ["impl: restart anomaly: native evidence unavailable"])
+
+    def test_stop_uses_the_runtime_from_an_ended_launch_with_a_fixed_staff_id(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-agent"), "agent", "alpha", staff.StaffRoot(),
+                             current_session=staff.StaffId(identity))
+        for kind in ("claude", "codex"):
+            entry = self.entry.copy()
+            entry.update(session_id=str(row.id), kind=kind, ended=True)
+            pane_record.write("agents", entry)
+            unknown = ("accounts (Codex thread unknown)",) if kind == "claude" else ()
+            with (self.subTest(kind=kind),
+                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                  patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
+                  patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, unknown)),
+                  patch.object(herdr, "read_conversation", wraps=herdr.read_conversation) as read):
+                self.assertEqual(stop_resume.stop(row.id), stop_resume.NotRunning(identity))
+                read.assert_called_once_with(identity, kind)
+        self.kill.assert_not_called()
+
+    def test_stop_without_a_publication_still_finds_a_live_codex_session(self) -> None:
+        identity = self.entry["session_id"]
+        self.process.side_effect = self.alive_until_kill
+        with (patch.object(pane_record, "publication_for_session", return_value=None),
+              patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (123,)}, ("unrelated unknown",))),
+              patch.object(herdr, "read_conversation", wraps=herdr.read_conversation) as read):
+            self.assertEqual(stop_resume.stop(identity), stop_resume.Stopped(identity, 123))
+        read.assert_called_once_with(identity, "")
+
+    def test_launch_read_error_reports_once_and_reads_both_runtimes(self) -> None:
+        identity = self.entry["session_id"]
+        with (patch.object(pane_record, "publication_for_session", side_effect=OSError("record unreadable")),
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()) as read,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(stop_resume.stop(identity), stop_resume.NotRunning(identity))
+        read.assert_called_once_with(identity, "")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("record unreadable", errors.getvalue())
 
     def test_unusable_shutdown_values_send_no_signal_or_start(self) -> None:
         config = self.root / "config"
@@ -1333,11 +1438,14 @@ class StopResumeTests(unittest.TestCase):
                 result = stop_resume.stop(identity)
             self.assertIsInstance(result, stop_resume.StopFailed)
             self.kill.assert_not_called()
-            self.assertEqual(len(output.getvalue().splitlines()), 1)
-            self.assertIn("test-tab", output.getvalue())
+            self.assertEqual(output.getvalue(), "")
+            assert isinstance(result, stop_resume.StopFailed)
+            self.assertIn("test-tab", result.reason)
 
     def test_stop_proves_an_idle_restarted_codex_process_with_the_staff_current_session(self) -> None:
         identity = self.entry["session_id"]
+        self.entry["kind"] = "codex"
+        pane_record.write("agents", self.entry)
         self.client.rows.insert(0, {"pane_id": "w1:p1", "workspace_id": "w1", "label": "unnamed"})
         row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
@@ -1364,6 +1472,8 @@ class StopResumeTests(unittest.TestCase):
 
     def test_stop_finds_an_unnamed_resumed_codex_pane(self) -> None:
         identity = self.entry["session_id"]
+        self.entry["kind"] = "codex"
+        pane_record.write("agents", self.entry)
         row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         _ = self.client.rows[0].pop("agent_session")
@@ -1379,6 +1489,8 @@ class StopResumeTests(unittest.TestCase):
 
     def test_stop_skips_an_unnamed_pane_without_the_selected_codex_conversation(self) -> None:
         identity = self.entry["session_id"]
+        self.entry["kind"] = "codex"
+        pane_record.write("agents", self.entry)
         row = staff.StaffRow(staff.StaffId("stable-row"), "agent", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId(identity))
         _ = self.client.rows[0].pop("agent_session")

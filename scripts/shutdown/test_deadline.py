@@ -61,7 +61,7 @@ class DeadlineTests(unittest.TestCase):
         launch.assert_not_called()
 
     def test_stop_limits_a_blocking_live_read(self) -> None:
-        def read(_identity: str) -> herdr.StoppedConversation:
+        def read(_identity: str, _kind: str = "") -> herdr.StoppedConversation:
             _ = herdr.Herdr("agents").panes()
             return herdr.StoppedConversation()
 
@@ -82,6 +82,21 @@ class DeadlineTests(unittest.TestCase):
                 with self.subTest(number=number):
                     with self.assertRaisesRegex(TimeoutError, "deadline passed"):
                         stop_resume._signal_process(123, number)  # pyright: ignore[reportPrivateUsage]
+        send.assert_not_called()
+
+    def test_stop_returns_failure_without_a_signal_after_the_outer_deadline(self) -> None:
+        with (patch.object(staff, "row_operation", return_value=nullcontext()),
+              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((self.row(),))),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
+              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.EnvironmentThread("session"), "started", {})),
+              patch.object(stop_resume, "_same_process", return_value=True),
+              patch.object(herdr, "check_native_target", return_value=True),
+              patch.dict(os.environ, {}, clear=True), patch.object(os, "kill") as send):
+            result = stop_resume.stop("session", deadline=99)
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        self.assertIn("deadline passed", str(result))
         send.assert_not_called()
 
     def test_term_wait_ends_at_deadline_without_kill(self) -> None:

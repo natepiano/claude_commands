@@ -17,7 +17,6 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "production", "lib"
 
 from scripts.shutdown import restart, shutdown_record, stop_resume
 from scripts.production import staff
-from scripts.lib import operation_deadline
 from scripts.agents import worker_lifecycle
 from scripts.agents import codex_mesh
 import herdr
@@ -252,10 +251,8 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "stop":
             record = staff.initial_snapshot()
             row = record.by_member_reference(options.session)
-            deadline = stop_resume.stop_deadline()
-            with operation_deadline.within(deadline):
-                unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
-                result = stop_resume.stop(options.session, deadline=worker_lifecycle.effective_deadline())
+            unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
+            result = stop_resume.stop(options.session, deadline=worker_lifecycle.effective_deadline())
         else:
             unresolved = []
             result = stop_resume.resume(options.session, why=options.why, to=options.to)
