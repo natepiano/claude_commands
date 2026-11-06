@@ -28,6 +28,8 @@ JSON stores `paused: {since, by, why}` only for a paused row.
 `resume(reference)` removes the field.
 The commands accept a unit or `--production <showrunner name>`.
 Production pause accepts repeated `--except <unit>` options with a unit's staff name, its `-unit` form, or its staff id.
+An unmatched `--except` value refuses the whole command before any write.
+The refusal names the value and the production. A unit of another production does not match.
 Both commands are safe to repeat. They stop no process.
 Rename, move, retire and restore retain the pause field.
 

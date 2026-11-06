@@ -62,6 +62,8 @@ Use `staff.py` to record a pause or resume:
 3. Use `resume <unit>` or `resume --production <showrunner name>` to remove the pause record.
 
 Each `--except` accepts a unit's staff name, its `-unit` form, or its staff id within that production.
+An unmatched value refuses the whole command before any row changes.
+The refusal names the value and the production. A unit of another production does not match.
 
 A pause records its time, caller and reason in the staff row. It stops nothing. Both commands are safe to repeat.
 

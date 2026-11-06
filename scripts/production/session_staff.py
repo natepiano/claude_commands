@@ -622,14 +622,15 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
     return MemberFound(matches[0]) if matches else NoSuchMember(selector)
 
 
-def excluded_unit_ids(members: tuple[staff.StaffRow, ...], values: Iterable[str]) -> set[staff.StaffId]:
+def excluded_unit_ids(members: tuple[staff.StaffRow, ...], values: Iterable[str], production: str) -> set[staff.StaffId]:
     """Resolve exclusions within the supplied production members."""
     record = staff.StaffSnapshot(members)
     excluded: set[staff.StaffId] = set()
     for value in values:
         match = unit_match(ObservedUnit(value), record, UnitExclusion(value))
-        if isinstance(match, MemberFound):
-            excluded.add(match.row.id)
+        if not isinstance(match, MemberFound):
+            raise staff.StaffRefused(f"{value}: no unit of production {production}")
+        excluded.add(match.row.id)
     return excluded
 
 
