@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
@@ -244,9 +244,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
-        interpreter_cache = self.root / "cache" / "claude" / cache_file_name()
-        interpreter_cache.parent.mkdir()
-        _ = interpreter_cache.write_text(sys.executable + "\n", encoding="utf-8")
+        seed_interpreter_cache(self.root / "cache")
         pressure = self.root / "memory-pressure"
         write_pressure_reading(pressure)
         meminfo = self.root / "meminfo"
