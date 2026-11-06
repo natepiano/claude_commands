@@ -10,10 +10,22 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, cargo_metadata_output_roots, read_cargo_output_roots
 
 
 class CargoOutputTests(unittest.TestCase):
+    def test_metadata_decoder_resolves_paths_and_defaults_the_build_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            target = workspace / "target"
+            for build in (None, str(workspace / "build/../intermediates")):
+                with self.subTest(build=build):
+                    payload = {"workspace_root": str(workspace), "target_directory": str(target)}
+                    if build is not None:
+                        payload["build_directory"] = build
+                    self.assertEqual(cargo_metadata_output_roots(json.dumps(payload)), CargoOutputRoots(
+                        workspace, target, workspace / "intermediates" if build else target))
+
     def test_metadata_command_uses_its_environment(self) -> None:
         checkout = Path("/workspace")
         target = checkout / "selected-output"
