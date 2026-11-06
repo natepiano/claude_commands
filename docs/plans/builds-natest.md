@@ -750,38 +750,24 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 32 — `smoke_launch.sh` reads its settings with no process for each key  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/smoke_launch.sh` reads its 9 settings through `scripts/lib/conf.sh` with no Python start for each key, with the same values, exits and read order.
-
-**Spec:** The showrunner approved this phase (2026-11-05). No builds unit holds `smoke_launch.sh`.
-
-1. Caller survey (2026-11-05): `smoke_launch.sh:22-31` is the only shell script that still starts `conf.py get` for each key. `scripts/message/notifier.sh` `read_conf` reads its own instance file with no Python. Nine `conf.py get` reads take 0.51 s; nine `conf.sh` reads take 0.02 s.
-2. Replace the local `conf_value()` function (`smoke_launch.sh:22`) with one `source "$LIB/conf.sh"`. Keep each of the 9 reads, its key, its order and its variable name. The script runs under bash with `set -euo pipefail`, so a failed read still stops the script.
-3. Leave the other Python starts as they are: `user_zone.py` (line 36) and `process_group.py` (lines 78, 80).
-4. `conf.sh` falls back to bare `python3` for a value it gives to `conf.py` (`conf.sh:84`). The old `smoke_launch.sh` reader started `$LIB/py`, which honors `CLAUDE_PYTHON` and finds Python 3.12 or newer. With bare `python3`, both `test_smoke_launch.py` tests exit 127 (their fixture PATH has no `python3`). Fix the fallback at its cause: start `conf.py` through the `py` launcher beside `conf.sh` (director, 2026-11-05).
-5. Measure the config reads of one real `smoke_launch.sh` run before and after, and give the median of 3. Measure `test_smoke_launch.py` and the `test_mac_run.py` smoke test in same-load pairs.
-6. Add no guard, refusal or check that this Work Order does not name.
+- `scripts/production/smoke_launch.sh` sources `scripts/lib/conf.sh` and reads its 9 settings with no Python start for each key. Each read keeps its key, order, variable name and exit. `user_zone.py` and `process_group.py` still start as before.
+- `conf.sh` gives a read it cannot answer to `conf.py` through the `py` launcher in the same folder, held in one global `_CONF_LIB` (`.` for a bare file name). `py` honors `CLAUDE_PYTHON` and finds Python 3.12 or newer.
+- `py_floor_test_support.seed_interpreter_cache(cache_home, interpreter=sys.executable)` writes the interpreter cache that `py` reads. `test_conf_sh.py` and 8 `scripts/direct` fixtures use it.
+- Settings read of one real smoke launch (median of 3): 0.770 s -> 0.076 s. `test_smoke_launch.py` same-load pairs: 1.1 s -> 1.1 s. The full gate on this phase plus builds was green.
 
 **Files:**
-- `scripts/production/smoke_launch.sh` — one `conf.sh` source; `conf_value` for each read
-- `scripts/lib/conf.sh` — the Python fallback starts `conf.py` through `py`
-- `scripts/lib/test_conf_sh.py` — fixture only: `bash` and a seeded `py` interpreter cache beside the `python3` stub; the same assertions
+- `scripts/production/smoke_launch.sh` — one `conf.sh` source for its 9 settings
+- `scripts/lib/conf.sh` — shell settings reader; fallback through `py`
+- `scripts/lib/py_floor_test_support.py` — `seed_interpreter_cache`
+- `scripts/lib/test_conf_sh.py` — fixture with a `bash` link and a seeded cache
 
-**Workers:** 1 writer (one script and its reader; the work does not split)
-- `impl` — all files above
+**Gotchas:**
+- A fixture whose PATH holds only a stub folder needs a `bash` link, because `py` starts with `#!/usr/bin/env bash`. Without a seeded cache, `py` runs the stub once more to check its version.
 
-**Constraints from prior phases:**
-- Phase 30: `scripts/lib/conf.sh` gives the same value and exit as `conf.py get`, or gives the read to `conf.py`. It runs under bash 3.2 and zsh, and reads the host name once when sourced.
-- Phase 30: `review.sh`, `implement.sh` and `mac_run.sh` source `conf.sh`; a change to it runs their tests.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_smoke_launch.py'` green, with the same test names and assertions
-- `python3 -m unittest discover -s scripts/production -p 'test_mac_run.py'` green, with `test_smoke_uses_the_shared_refused_port_and_host` unchanged
-- `python3 -m unittest discover -s scripts/lib -p 'test_conf_sh.py'` green
-- `test_production_lifecycle.py` and `scripts/direct/test_review_launcher.py` green
-- config read seconds of one real smoke launch, before and after, and same-load pair medians (`pairs.sh`) of `test_smoke_launch.py`, in the checkpoint notice
+**Ruled out:**
+- Starting `scripts/build_hold/cargo`, the BRP launch hook and `scripts/lint/lint` through `py` in this phase: outside its scope; a next item after the PYTHONPATH item.
 
 ### Phase 33 — `test_fast_track.py` runs in half its time  · status: todo
 **Depends on:** none
