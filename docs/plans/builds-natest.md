@@ -1269,39 +1269,26 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 ### Phase 60 — `show.py top` ranks by CPU, and `module_cost.py` counts process starts  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the director sees the targets by CPU per gate at once, and measures any module's CPU s, processes, execs and wall s with one command.
+`show.py top` for `~/.claude` ranks gate modules by median CPU. The columns are rank, suite/module, median CPU s, median s, last s, tests run, slowest kept test, and the sum line sums median CPU. The nextest view for another repository is unchanged.
 
-**Spec:**
-1. `show.py top` for `~/.claude` ranks gate modules by median CPU. The columns are: rank, suite/module, median CPU s, median s, last s, tests run, slowest kept test. The sum line sums median CPU. The nextest view for another repository stays as it is.
-2. New `scripts/test_times/module_cost.py --tree <path> <folder>/<file> [<folder>/<file> ...]` prints one table row for each module and a total row: CPU s, processes, execs, wall s, test status.
-3. For each module, one run gives CPU s and wall s: `python3 -m unittest discover -s scripts/<folder> -p <file>` with cwd `<path>`, `HERDR_BIN=/nonexistent/herdr` and `PYTHONDONTWRITEBYTECODE=1`, from `os.wait4` resource use and the clock.
-4. A separate run under `strace -f` gives the counts: processes are `fork`, `vfork`, `clone` and `clone3` calls that succeed without `CLONE_THREAD`, and execs are `execve` calls that succeed. The trace goes in a tempdir, which is removed after. This is verify's Phase 41 method, in one shared place.
-5. A red module prints its status in its row, and the command exits nonzero. No `strace` on PATH prints one error line and exits 2.
-6. Change every text that says `top` ranks by wall time: `commands/test_times.md` and any doc that `git grep` finds.
-7. Add no guard, refusal or check beyond item 5. Add no option that this Spec does not name.
+`module_cost.py --tree <path> <folder>/<file> ...` prints one row for each module and a total row: CPU s, processes, execs, wall s, test status. One run gives CPU s and wall s from `os.wait4` and the clock. A separate `strace -f` run gives the counts: successful `fork`, `vfork`, `clone` and `clone3` calls without `CLONE_THREAD`, and successful `execve` calls. A red module or failed trace start prints `RED (test=<n>, trace=<n>)` in its row, later modules still run, and the command exits nonzero. No `strace` on PATH prints one error line and exits 2.
+
+Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 processes, 1,972 execs and 62.311 wall s; verify's method counts 1,925 processes on the same tree, a 0.6% difference. A warm `show.py top` takes 0.455 s.
 
 **Files:**
-- `scripts/test_times/show.py` — the rank
+- `scripts/test_times/show.py` — the CPU rank
 - `scripts/test_times/test_show.py` — the rank's tests
-- `scripts/test_times/module_cost.py` — new
-- `scripts/test_times/test_module_cost.py` — new
-- `commands/test_times.md` — the text
+- `scripts/test_times/module_cost.py` — module costs
+- `scripts/test_times/test_module_cost.py` — count tests from captured lines, one real two-child run, and the failed trace start
+- `commands/test_times.md`, `config/README.md` — the text
 
-**Workers:** 1 writer on slot `impl3` (one small tool and one query; the tests need both)
-- `impl3` — all files above, role impl
+**Binds later work:** the verify batches measure with `module_cost.py`. Its count matches only a trailing `<unfinished ...>` marker, so a quoted marker in an argument does not hide an exec.
 
-**Constraints from prior phases:**
-- `show.py` loads only what its command needs; it is an instant tool (the user's mission).
-- Phase 16: `top` keeps one view from the root and from a subdirectory, and `--host` selects Mac history.
-- A count test uses captured `strace` lines by direct call. One real run counts a tempdir module that starts two children; it skips when `strace` is absent, as on the Mac.
+**Gotchas:** the first `show.py top` after a gap took 1m58 at load 70, with no explained cause.
 
-**Acceptance gate:**
-- `test_show.py` and `test_module_cost.py` green, with each changed assertion named in the summary
-- `show.py top --repo ~/.claude` prints in under 1 s, ranked by median CPU
-- `module_cost.py` on `direct/test_verify_mac_arguments.py` agrees with verify's method on the same tree: within 5% on processes
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** rewriting done Phase 4's wall-time text; done phases stay byte-identical.
 
 ### Phase 61 — The seven largest verify test files test logic by direct calls  · status: todo
 **Depends on:** none
