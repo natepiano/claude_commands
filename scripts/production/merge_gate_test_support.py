@@ -569,11 +569,13 @@ class MergeGateFixture(unittest.TestCase):
                    + "raise SystemExit(merge_gate.main(sys.argv[1:]))")
         return [sys.executable, "-c", source]
 
-    def run_promote_only(self) -> subprocess.CompletedProcess[str]:
+    def run_promote_only(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(SCRIPT.resolve().parents[1] / "lib" / "py"), str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
              "--promote-only", "--main-repo", str(self.main),
-             "--ssh", str(self.bin / "ssh")], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+             "--ssh", str(self.bin / "ssh"),
+             *([] if "--production" in extra else ["--production", "quiet"]), *extra],
+            cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def calls(self) -> list[ToolCall]:
@@ -624,7 +626,11 @@ class MergeGateFixture(unittest.TestCase):
         self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                    + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
         doc = self.root / "production.md"
-        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n")
+        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n"
+                   + f"- **Repository:** `{self.checkout}`\n- **Showrunner checkout:** `{self.checkout}`\n"
+                   + "- **Merge branch:** `integration`\n")
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
         return review, doc
 
     def publish_for_promotion(self) -> merge_gate.GateArguments:

@@ -103,7 +103,10 @@ The six merge flags are required unless `--tests-only`, `--promote-only`, or `--
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
-After the push, it prints `Change review: N row(s) added to <list>: C25–C27`, then each row.
+After the last promotion step, it adds rows only for merges on `origin/main`.
+It prints `Change review: N row(s) added to <list>: C25–C27`, then each row.
+A line with `after <step>` waits for the completed `live` step.
+The session runs `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`.
 `--type-dirs` (alias `--type-dir`) defaults to no folders.
 A refusal prints `REFUSED: <reason>` to stderr and exits 1.
 `GateArguments(argparse.Namespace)` defines the arguments; each refusal raises `GateRefused`.
