@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fake_unit_host
 import production_lifecycle
 from scripts.production import showrunners
+from scripts.herdr import worker_panes
+from scripts.shutdown import stop_resume
 import showrunner_tree
 from fake_unit_host import HostedUnit
 
@@ -214,11 +216,14 @@ class LifecycleTests(LifecycleFixture):
     def test_wrap_rerun_after_showrunner_retirement_keeps_the_release_capture(self) -> None:
         self.finish_interrupted_wrap(True)
 
-    def test_wrap_with_workers_retires_pending_ids_on_an_already_wrapped_retry(self) -> None:
+    def test_wrap_keeps_stopped_worker_rows(self) -> None:
         runner, alpha, beta, child = self.staff_tree()
         worker = fixture_member("worker", name="impl1", parent=alpha.id)
-        result = self.run_lifecycle("wrap", "--no-ci")
+        with (mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]) as stops,
+              mock.patch.object(worker_panes, "observe", return_value=[worker_panes.StoppedWorker(worker, "pane", "terminal")])):
+            result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(any(call.args[0] == alpha.id for call in stops.call_args_list))
         self.assertIn(worker.id, result.stdout)
         self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree("natedev", self.alpha)))
         self.assertEqual(staff.by_id(worker.id), worker)
