@@ -293,7 +293,7 @@ Devtools 3y `finish_repair` in `scripts/direct/assign.py` resolves the round: `l
 
 ### Phase 9v — A production pause keeps each unit named in --except  · status: done
 
-From the sdlc showrunner, 2026-11-06. `staff.py pause --production hana --except fastest-unit` paused every unit, because the exception compares only the row name and id. Resolve each value through the one unit lookup: the name, the -unit form and the id all match. Add a test for each form. A refusal for an unmatched value is a new check, and it waits for the user's answer.
+From the sdlc showrunner, 2026-11-06. `staff.py pause --production hana --except fastest-unit` paused every unit, because the exception compares only the row name and id. Resolve each value through the one unit lookup: the name, the -unit form and the id all match. Add a test for each form. One matcher, unit_match, limited to the production's own members. A refusal for an unmatched value is a new check, and it waits for the user's answer.
 
 ### Phase 9u — The units hash merges with the staff-name change on sdlc  · status: done
 
