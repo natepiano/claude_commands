@@ -54,7 +54,7 @@ esac
 
 if [[ -n "${UNIT_RESOLVES_ROUND+set}" ]]; then
   RESOLVES_ROUND="${UNIT_RESOLVES_ROUND}"
-elif [[ "${PASS_KIND}" == "fix" && "${TEAM_ROLE}" == "impl" ]]; then
+elif [[ "${PASS_KIND}" == "fix" ]]; then
   RESOLVES_ROUND=1
 else
   RESOLVES_ROUND=0

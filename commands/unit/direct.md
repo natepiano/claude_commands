@@ -1243,17 +1243,16 @@ Apply <PassOwnership/>'s phase and cause check before each launch
 before launching, then:
 
 ```sh
-UNIT_RESOLVES_ROUND=1 bash ~/.claude/scripts/direct/assign.sh --role fix \
+bash ~/.claude/scripts/direct/assign.sh --role fix \
   --to "<full-worker-name>" --phase "<phase id>" --session-dir "${SESSION_DIR}" \
   --cwd "${WORKING_DIR}" --prompt "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" \
   --paths "${SESSION_DIR}/fix_paths_${FIX_ROUND}.txt" \
   --fix-cause "<failed gate or defect>" --pass "${FIX_ROUND}" &
 ```
 
-**`UNIT_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
-only the launcher watches the worker exit, so only it can say a repair landed.
-Each further worker runs the same call with `UNIT_RESOLVES_ROUND=0`, its
-own prompt and its slot; the round is done only once every worker has exited.
+A fix resolves its round by default because the launcher watches the worker exit.
+Each further worker sets `UNIT_RESOLVES_ROUND=0` and uses its own prompt and slot.
+The round is done only after every worker exits.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` and clear
 `${EARLY_REVIEW_SLOT}` at dispatch, and close the

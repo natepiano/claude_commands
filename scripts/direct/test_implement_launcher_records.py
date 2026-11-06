@@ -9,9 +9,37 @@ from typing import cast
 import json
 import subprocess
 import sys
+import os
+from unittest.mock import patch
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    def test_fix_in_a_named_slot_lands_its_round_by_default(self) -> None:
+        session = self.start_phase("named-fix")
+        self.open_repair_round(session)
+        result = self.mesh_launch(session, kind="fix", slot="repair-worker")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.repair_outcome(session), "landed")
+
+    def test_companion_fix_keeps_its_round_in_flight(self) -> None:
+        session = self.start_phase("companion-fix")
+        self.open_repair_round(session)
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "0"}):
+            result = self.mesh_launch(session, kind="fix", slot="repair-worker")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.repair_outcome(session), "in_flight")
+
+    def test_failed_fix_in_a_named_slot_abandons_its_round_by_default(self) -> None:
+        session = self.start_phase("failed-named-fix")
+        first = self.mesh_launch(session, slot="repair-worker")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast(dict[str, object], json.loads((session / "mesh_roster.json").read_text()))
+        name = next(iter(roster))
+        self.open_repair_round(session)
+        result = self.mesh_launch(session, to=name, kind="fix", slot="repair-worker", fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.repair_outcome(session), "abandoned")
+
     def test_a_companion_fix_starts_after_the_resolver_lands_its_round(self) -> None:
         session = self.start_phase("landed-companion")
         self.open_repair_round(session)

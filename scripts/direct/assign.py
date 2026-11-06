@@ -646,6 +646,15 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
     if dispatch.pass_open:
         _ = call([PYTHON, PROGRESS, "finish-pass", "--session-dir", str(dispatch.run), "--status", outcome], dispatch.env)
         dispatch.pass_open = False
+    if dispatch.role == "fix" and dispatch.env.get("UNIT_RESOLVES_ROUND") != "0":
+        ledger = [PYTHON, str(SCRIPTS / "findings.py")]
+        phase = ["--session-dir", str(dispatch.run), "--phase", dispatch.phase]
+        state = object_map(cast(object, json.loads(call([*ledger, "status", *phase], dispatch.env, capture=True).stdout)))
+        if state.get("in_flight"):
+            result = ["landed"] if completed else [
+                "abandon", "--edits-landed", "--reason", f"the {dispatch.worker} worker exited with code {code}",
+            ]
+            _ = call([*ledger, *result, *phase], dispatch.env)
     if dispatch.claim is not None:
         dispatch.board(dispatch.claim.slot, "done" if completed else "blocked", f"{shown}: {outcome}; summary {summary}")
     return 0 if completed else 2 if code == 2 else 1

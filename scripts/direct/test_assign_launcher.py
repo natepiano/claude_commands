@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import cast, final
 from unittest.mock import patch
@@ -11,6 +13,7 @@ from unittest.mock import patch
 from scripts.agents import test_codex_mesh as mesh_fixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, AssignLauncherFixture, LauncherScript, read_object
 from scripts.lint import style_review
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def setUpModule() -> None:
@@ -19,6 +22,71 @@ def setUpModule() -> None:
 
 @final
 class AssignLauncherTests(AssignLauncherFixture):
+    def findings_command(self, command: str, *options: str, phase: str = "7") -> dict[str, object]:
+        result = subprocess.run(
+            [sys.executable, str(ASSIGN.with_name("findings.py")), command,
+             "--session-dir", str(self.session_dir), "--phase", phase, *options],
+            env=os.environ.copy(), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return cast(dict[str, object], json.loads(result.stdout)) if command == "status" else {}
+
+    def open_repair_round(self) -> None:
+        _ = self.findings_command("open", "--severity", "blocker", "--title", "Repair retry", "--caught-by", "worker")
+        _ = self.findings_command("dispatch", "--covers", "F001", "--accepted-checks", "Retry preserves queued data")
+
+    def test_completed_codex_fix_lands_the_named_phases_round(self) -> None:
+        self.open_repair_round()
+        self.record("start-phase", "--phase-id", "8", "--phase-title", "Parallel work")
+        _ = self.findings_command("open", "--severity", "blocker", "--title", "Other repair", "--caught-by", "worker", phase="8")
+        other = (self.session_dir / "findings_state.json").read_bytes()
+
+        result = self.successful("fix")
+
+        rounds = cast(list[dict[str, object]], self.findings_command("status")["rounds"])
+        self.assertEqual(rounds[-1]["outcome"], "landed")
+        self.assertIn("round 1 landed: F001", result.stdout)
+        self.assertEqual((self.session_dir / "findings_state.json").read_bytes(), other)
+        event, = [event for event in self.events() if event.get("event_type") == "finding_batch_landed"]
+        self.assertEqual(event["phase_id"], "7")
+
+    def test_failed_codex_fix_abandons_its_round_and_keeps_the_attempt(self) -> None:
+        self.open_repair_round()
+        self.outcomes = ["failed"]
+
+        result = self.launch("fix")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        state = self.findings_command("status")
+        rounds = cast(list[dict[str, object]], state["rounds"])
+        self.assertEqual(rounds[-1]["outcome"], "abandoned")
+        self.assertIs(rounds[-1]["edits_landed"], True)
+        self.assertTrue(rounds[-1]["abandoned_reason"])
+        finding, = cast(list[dict[str, object]], state["findings"])
+        self.assertEqual(finding["state"], "open")
+        self.assertEqual(finding["fix_attempts"], 1)
+
+    def test_companion_codex_fix_leaves_the_round_in_flight(self) -> None:
+        self.open_repair_round()
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "0"}):
+            result = self.successful("fix")
+        self.assertEqual(self.findings_command("status")["in_flight"], ["F001"])
+        self.assertNotIn("landed", result.stdout)
+        self.assertFalse(any(event.get("event_type") == "finding_batch_landed" for event in self.events()))
+
+    def test_codex_fix_without_an_in_flight_round_stays_quiet(self) -> None:
+        for ledger in ("absent", "open"):
+            with self.subTest(ledger=ledger):
+                if ledger == "open":
+                    _ = self.findings_command("open", "--severity", "blocker", "--title", "Unbatched", "--caught-by", "worker")
+                path = self.session_dir / "findings_state.json"
+                before = path.read_bytes() if path.exists() else b""
+                result = self.successful("fix", "--fix-cause", "repair failed acceptance gate")
+                self.assertNotIn("round", result.stdout + result.stderr)
+                self.assertEqual(path.read_bytes() if path.exists() else b"", before)
+        self.assertFalse(any(event.get("event_type") in ("finding_batch_landed", "finding_batch_abandoned")
+                             for event in self.events()))
+
     def test_only_a_live_claude_or_codex_ancestor_permits_assignment(self) -> None:
         for family in ("claude", "codex"):
             with self.subTest(family=family):
