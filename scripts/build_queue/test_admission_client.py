@@ -115,6 +115,7 @@ class ClientTests(unittest.TestCase):
                 child_environment = dict(os.environ)
                 _ = child_environment.pop("TEST_SENDER_GUARD", None)
                 _ = child_environment.pop("HERDR_BIN", None)
+                child_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
                 message = "The build queue service has not answered. Builds wait."
                 with FakeDaemon(address, receive, repeat=True):
                     result = subprocess.run(command, input=message, text=True, capture_output=True,

@@ -753,6 +753,7 @@ load_metadata() {
         doc) requests+=(target-directory) ;;
     esac
     case "$CMD" in
+        check) requests+=(check-targets) ;;
         test)
             for ((index=0; index<${#words[@]}; index++)); do
                 if [[ "${words[index]}" == --features ]]; then
@@ -850,6 +851,17 @@ take_test_targets() {
             TEST_SELECTION+=("$word")
         fi
     done <<< "$TEST_TARGETS"
+}
+
+CHECK_SELECTION=()
+take_check_targets() {
+    local word
+    load_metadata
+    while IFS= read -r word; do
+        if [[ -n "$word" ]]; then
+            CHECK_SELECTION+=("$word")
+        fi
+    done <<< "$CHECK_TARGETS"
 }
 
 # Qualify each feature name in a comma list with the package, leaving names
@@ -3572,7 +3584,8 @@ case "$CMD" in
         done
         take_features "${CHECK_ARGS[@]}"
         require_member "$PKG"
-        run cargo check --workspace --lib --bins "${KEEP_GOING[@]}" "${FEATURE_FLAGS[@]}"
+        take_check_targets
+        run cargo check --workspace "${CHECK_SELECTION[@]}" "${KEEP_GOING[@]}" "${FEATURE_FLAGS[@]}"
         ;;
     build)
         PKG="${1:?verify.sh build <package> [--bin <name> | --example <name>] [--release] [--features <list>]}"

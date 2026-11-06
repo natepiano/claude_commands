@@ -193,8 +193,8 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 </LongLivedWorkers>
 
 <CoreContract>
-- Never modify unrelated files. The unit director may make a worktree, and its
-  branch, for its own workers. The unit's staff row keeps its one home worktree;
+- Never modify unrelated files. The unit director may make a worktree, and its branch, for its own workers, with `scripts/worktree/make_worktree.sh`.
+  The unit's staff row keeps its one home worktree;
   where a worker works stays in its run record, not in staff. The director
   removes each worktree it made when that work ends. In the home worktree, the
   only branch the run may create is the remote branch <PushCheckpoint/> pushes;
@@ -389,6 +389,14 @@ only to complete a report.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
+`assign.py` ends a failed launch's run when no pass completed, no other worker exists, and the director holds only that run.
+Each recorder slot counts as one worker, even when its pass records no worker name.
+For Claude, this slot must record a new `pass_started` event during the launch.
+The launcher keeps the phase reservation and the launch exit code.
+After this end, omit `--session-dir` to start a new run on retry.
+An explicit `--session-dir` retains the existing retry behavior for that folder.
+For herdr, this end applies only to exit 2. Exits 3 through 8 retain the run.
+
 For `herdr`, inspect `worker.py list` and the named pane.
 Keep incomplete, unpublished, busy, and unknown workers unchanged.
 A failed fresh start prints `publication failed: ...` and retains its pane without a saved pass.

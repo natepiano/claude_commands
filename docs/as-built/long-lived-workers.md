@@ -386,6 +386,14 @@ See [unit rename](unit-rename.md) for explicit worktree moves.
 
 ## Invariants
 
+- `assign.py` ends a failed launch's run when no pass completed, no other worker exists, and the director holds only that run.
+  The worker command must have started and returned an error. A launcher signal does not trigger this path.
+  Each recorder slot counts as one worker, even without a worker name. A Claude launch must add its slot's `pass_started` event.
+  Herdr exit 2 qualifies; exits 3 through 8 retain the run.
+  The launcher calls `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`, through `call(check=False)`.
+  Cleanup errors preserve the launch exit code. The phase reservation stays until a checkpoint releases it.
+  `prepare_session.sh` and `end_session.sh` select `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, as `staff.runtime_id()` does.
+  A retry without `--session-dir` starts a new run. An explicit run folder retains its existing retry behavior.
 - Workers retain their staff identity across runs. Allocation creates a worker only when no available worker can accept the task.
 - Both worker families preserve their fixed staff ids across a family switch.
 - The unit director starts each next worker turn through `assign.sh`.
