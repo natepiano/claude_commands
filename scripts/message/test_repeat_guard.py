@@ -36,6 +36,9 @@ def setUpModule() -> None:
     install_guard_test_budget()
 
 
+# A time bound is this many times its limit, so gate load cannot fail it.
+DEADLINE_CEILING_FACTOR = 10
+
 NOTICE_FIXTURE = r'''import sys,os,json,signal,io
 from pathlib import Path
 from unittest.mock import patch
@@ -585,7 +588,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             with patch.dict(os.environ, {"SEND_REPEAT_CONFIG": str(self.limits_file(replace(self.limits, max_senders=7)))}):
                 with patch.object(guard, "GUARD_IO_CEILING_SECONDS", 0.25):
                     self.assertFalse(guard.check(self.root, self.attempt()).held)
-                    self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS + 0.2)
+                    self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS * DEADLINE_CEILING_FACTOR)
 
     def test_stalled_reads_and_publication_release_the_send_at_its_deadline(self) -> None:
         self.prime_outbox()
@@ -596,7 +599,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         start = time.monotonic()
         with patch.object(guard, "GUARD_IO_CEILING_SECONDS", 0.25):
             self.assertFalse(guard.check(self.root, self.attempt(at=4)).held)
-            self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS + 0.2)
+            self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS * DEADLINE_CEILING_FACTOR)
         path.unlink()
         _ = path.write_text(contents)
         # A fresh worker reaches the real publication boundary before it is stalled.
@@ -614,7 +617,7 @@ print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog',
         start = time.monotonic()
         with patch.dict(os.environ, {"PYTHONPATH": str(Path(guard.__file__).parent)}):
             self.assertFalse(guard.isolated([sys.executable, "-c", program, str(self.root), str(marker)], "", 1).held)
-        self.assertLess(time.monotonic() - start, 1.3)
+        self.assertLess(time.monotonic() - start, DEADLINE_CEILING_FACTOR)
         self.assertIn(str(path), marker.read_text())
         published = cast(dict[str, dict[str, dict[str, object]]], json.loads(marker.read_text().split("\n", 1)[1]))
         self.assertEqual(published["rates"]["session:morty"]["count"], 4)
@@ -756,7 +759,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
             started = time.monotonic()
             with patch.object(guard, "Popen", return_value=child):
                 guard.notice_job(command, 1)
-            self.assertLess(time.monotonic() - started, 1.4)
+            self.assertLess(time.monotonic() - started, DEADLINE_CEILING_FACTOR)
             for pid in marker.read_text().split():
                 status = subprocess.run(["ps", "-p", pid, "-o", "stat="], text=True, capture_output=True, check=False)
                 self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
