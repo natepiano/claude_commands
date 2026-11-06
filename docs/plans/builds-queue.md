@@ -285,6 +285,36 @@ only I can bump
 
 **Ruled out:** a new import test; the `build_hold.py` import, under the builds file freeze.
 
+### Phase 18a — A gate copy's folder comes from the repository's origin  · status: todo
+
+**Depends on:** nothing. Source: builds showrunner, 2026-11-06, reported by hierarchies. It goes ahead of 20b and 10v. Phase 18 merges this work later and keeps the same code.
+
+#### Work Order
+
+**Goal:** A gate on a clone with its own `.git` uses the repository's name, not the clone's folder name. A gate tree still works after the source clone is removed.
+
+**Spec:**
+
+1. **Cause, name.** `repository_name` at `scripts/copies/copies.py:219-227` ends with `common.parent.name`. A clone at `<scratch>/checkout` gives "checkout". Gate copies land in `~/worktrees/gates/checkout/` and `~/worktrees/gates/reload/`.
+2. **Name fix.** `repository_name` reads the origin URL. A remote URL gives its last path part without `.git`. A local origin is followed to its repository, also for `file://` and relative origins. A cycle of local origins is an error. With no origin, the name is the main checkout's folder name. `~/.claude` becomes `claude_commands`; hana and nixos keep their names. Phase 18 holds this code; lift `origin_url`, `main_checkout`, `repository_name` and the `source_origin` change unchanged.
+3. **Workspace identity.** A workspace record saves `repository_identity` when it is registered, and `workspace_repository` reads it, as in phase 18. Repository removal then matches the same name as the gate folders. A conversion program outside the repository, `<phase folder>/migrate_18a.py`, writes the field into existing records, with a dry run.
+4. **Cause, alternates.** `initialize_git` runs `git clone --shared` from the source, so a scratch source leaves `.git/objects/info/alternates` pointing into that scratch folder. When the folder goes, git fails with "unable to normalize alternate object path". Measured on 7 such trees: 4 have a source that itself borrows, 1 has its own store in a scratch folder, and 2 have a source that is gone.
+5. **Alternates fix.** For a standing gate, `initialize_git` follows the source's alternates to the store at the end of the chain and clones from that store. `refresh_remotes` and `prepare` then fetch the source's own objects. When that store's repository is a registered scratch copy, the clone drops `--shared`, so the tree holds no alternates file. A source with its own lasting store keeps today's result: its alternates line names the source's objects.
+6. **Existing copies.** Hierarchies removes the existing copies in its cleanup phase. Touch no tree under `~/worktrees/gates/`.
+7. **Proof.** Tests in `test_copies.py`, each in a tempdir: clone, clone of a clone, worktree and `file://` origin give one name; no origin gives the main checkout's name; a clone of a clone gives alternates at the end store, and `git rev-list --objects --all --quiet` passes in the gate tree after both clones are removed; a registered scratch source with its own store gives no alternates file, and the same git check passes after its removal; repository removal finds a workspace after its source is deleted.
+8. **Removal keeps going.** Source: builds showrunner, 2026-11-06, from hierarchies. `remove_trees(owner)` raises at the first kept scratch copy, before it removes a gate copy, so a unit rename leaves old-name gate copies. `remove_trees` removes every idle tree in scope, gate copies included, then raises one `CopyError` that names each kept tree. It adds no public function.
+
+**Files:**
+- `scripts/copies/copies.py`
+- `scripts/copies/test_copies.py`
+- `docs/as-built/` — each doc that names the gate folder layout or `repository_name`.
+
+**Workers:** `1 writer` — `impl2`, code, tests and docs.
+
+**Gate:** the merge gate, `basedpyright` 0/0/0 on each changed Python file, adversary and contract reviews.
+
+**Change-Review:** none. The user sees no change; the gate folder name is internal.
+
 ### Phase 20a — An outage message reaches the builds session, and a gate near its end keeps its profile's value  · status: done
 
 #### As-built

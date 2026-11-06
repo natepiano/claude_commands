@@ -171,14 +171,15 @@ def exclude_copy_metadata(path: Path) -> None:
 
 def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, source_commit: str,
                   copy_commit: str, target_mode: str, seed_source: str, borrows_from: str,
-                  land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "") -> None:
+                  land_target: str = "", run_dir: str = "", phase_id: str = "", crate_run: str = "",
+                  repository_identity: str = "") -> None:
     scratch_settings = conf.read("scratch")
     if copy_record.copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path}: a copy must be a folder at {copy_record.copies_root()}/<pair>/<copy>")
     def registered(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
         fields: dict[str, object] = dict(owner_unit=owner_unit, source_path=source_path,
             source_commit=source_commit, copy_commit=copy_commit, target_mode=target_mode, seed_source=seed_source,
-            borrows_from=borrows_from,
+            borrows_from=borrows_from, repository_identity=repository_identity,
             maker=maker(), created=time.time(), renewed=time.time())
         if isinstance(record, copy_record.Registered):
             fields["created"] = record.fields.get("created", fields["created"])

@@ -78,6 +78,7 @@ class StandingTests(unittest.TestCase):
              ".gitignore": "target/\nignored.txt\n"},
         )
         self.source = seed.checkout
+        _ = self.git(seed.origin, "remote", "add", "origin", "https://example.invalid/checkout.git")
         self.gates = Path(self.settings["root"]) / self.source.name
         self.published = self.git(self.source, "rev-parse", "HEAD")
         _ = (self.source / "tracked.txt").write_text("source HEAD\n")
@@ -135,6 +136,34 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:camera"), [checkout.parent])
         self.assertFalse(checkout.parent.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
+    def shared_source_commit(self) -> tuple[Path, str]:
+        source = self.base / "shared-source"
+        _ = self.git(self.base, "clone", "--shared", "-q", str(self.source), str(source))
+        for key in ("user.name", "user.email"):
+            _ = self.git(source, "config", key, self.git(self.source, "config", key))
+        _ = self.git(source, "checkout", "-q", "--detach")
+        _ = (source / "tracked.txt").write_text("shared source commit\n")
+        _ = self.git(source, "commit", "-qam", "commit only in shared source")
+        return source, self.git(source, "rev-parse", "HEAD")
+
+    def test_clone_keeps_a_commit_that_exists_only_in_its_shared_source(self) -> None:
+        source, commit = self.shared_source_commit()
+        checkout = copies.clone(source, task="gate:shared-source")
+        self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), commit)
+        self.assertEqual((checkout / "tracked.txt").read_text(), "shared source commit\n")
+        record = scratch.task_of(checkout.parent)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.fields["source_commit"], commit)
+
+    def test_workspace_selects_a_detached_commit_that_exists_only_in_its_shared_source(self) -> None:
+        source, commit = self.shared_source_commit()
+        with copies.workspace("verify-unit", source, commit, name="detached", branch="worker") as tree:
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
+            self.assertEqual((tree / "tracked.txt").read_text(), "shared source commit\n")
+            record = scratch.task_of(tree)
+            assert isinstance(record, copy_record.Registered)
+            self.assertEqual(record.fields["source_commit"], commit)
 
     def test_clone_cli_with_one_until_value_ends_only_the_selected_clone(self) -> None:
         checkouts: list[Path] = []
@@ -424,6 +453,120 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.published)
             self.assertTrue((tree / ".git").is_dir())
 
+    def test_main_worktree_and_local_clones_share_the_upstream_identity(self) -> None:
+        linked = self.base / "worktree"
+        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        checkout = self.base / "clone/checkout"
+        reload = self.base / "clone/reload"
+        for path, origin in ((checkout, self.source), (reload, checkout)):
+            _ = self.git(self.base, "clone", "-q", str(origin), str(path))
+        _ = self.git(self.source, "remote", "set-url", "origin", "git@example.invalid:team/project.git")
+        for source in (self.source, linked, checkout, reload):
+            with self.subTest(source=source):
+                self.assertEqual(copies.repository_name(source), "project")
+        _ = self.git(reload, "remote", "set-url", "origin", checkout.as_uri())
+        self.assertEqual(copies.repository_name(reload), "project")
+
+    def test_repository_without_origin_uses_main_checkout_name(self) -> None:
+        _ = self.git(self.source, "remote", "remove", "origin")
+        linked = self.base / "worktree"
+        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        self.assertEqual(copies.repository_name(linked), self.source.name)
+
+    def test_relative_origin_uses_the_main_checkout_from_each_worktree(self) -> None:
+        _ = self.git(self.source, "remote", "set-url", "origin", "../origin.git")
+        upstream = self.source.parent / "origin.git"
+        _ = self.git(upstream, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
+        linked = self.base / "worktrees" / "unit"
+        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        for source in (self.source, linked):
+            with self.subTest(source=source), copies.standing("verify-unit", source, "HEAD") as tree:
+                self.assertEqual(tree.parent.name, "widget")
+                self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+
+    def test_separate_git_directory_uses_the_main_checkout_without_origin(self) -> None:
+        main = self.base / "widget"
+        metadata = self.base / "state" / "widget-index"
+        metadata.parent.mkdir()
+        _ = self.git(self.base, "clone", "-q", "--separate-git-dir", str(metadata), str(self.source), str(main))
+        _ = self.git(main, "remote", "remove", "origin")
+        self.assertEqual(copies.repository_name(main), "widget")
+        # Linked worktrees need the main path recorded when Git metadata lives elsewhere.
+        _ = self.git(main, "config", "core.worktree", str(main))
+        linked = self.base / "separate-worktree"
+        _ = self.git(main, "worktree", "add", "--detach", str(linked), "HEAD")
+        for source in (main, linked):
+            with self.subTest(source=source), copies.standing("verify-unit", source, "HEAD") as tree:
+                self.assertEqual(tree.parent.name, "widget")
+                self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+
+    def test_gate_borrows_the_last_store_and_keeps_source_commits_after_clones_are_deleted(self) -> None:
+        first, second = self.base / "first", self.base / "second"
+        for checkout, source in ((first, self.source), (second, first)):
+            _ = self.git(self.base, "clone", "--shared", "-q", str(source), str(checkout))
+        # Git resolves a relative alternate from the object store that contains it.
+        _ = (second / ".git/objects/info/alternates").write_text(
+            os.path.relpath(first / ".git/objects", second / ".git/objects") + "\n")
+        _ = (second / "only-in-source.txt").write_text("source-only object\n")
+        _ = self.git(second, "add", "only-in-source.txt")
+        _ = self.git(second, "commit", "-qm", "source-only commit")
+        commit = self.git(second, "rev-parse", "HEAD")
+        linked = self.base / "linked"
+        _ = self.git(second, "worktree", "add", "--detach", str(linked), commit)
+        for source in (second, linked):
+            with self.subTest(source=source), copies.standing("verify-unit", source, commit) as tree:
+                self.assertEqual((tree / ".git/objects/info/alternates").read_text().strip(),
+                                 str(self.source / ".git/objects"))
+                self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
+        shutil.rmtree(first)
+        shutil.rmtree(second)
+        self.assertEqual(self.git(tree, "rev-list", "--objects", "--all", "--quiet"), "")
+        self.assertEqual(self.git(tree, "show", "HEAD:only-in-source.txt"), "source-only object")
+
+    def test_gate_copies_a_registered_scratch_store_without_alternates(self) -> None:
+        source = copies.clone(self.source, task="gate:independent")
+        _ = self.git(source, "repack", "-a", "-d")
+        (source / ".git/objects/info/alternates").unlink()
+        with copies.standing("verify-unit", source, "HEAD") as tree:
+            self.assertFalse((tree / ".git/objects/info/alternates").exists())
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+        shutil.rmtree(source.parent)
+        self.assertEqual(self.git(tree, "rev-list", "--objects", "--all", "--quiet"), "")
+        self.assertEqual(self.git(tree, "show", "HEAD:tracked.txt"), "source HEAD")
+
+    def test_gate_copies_a_registered_store_with_multiple_alternates_without_borrowing(self) -> None:
+        source = copies.clone(self.source, task="gate:multiple-alternates")
+        _ = (source / ".git/objects/info/alternates").write_text(
+            str(self.source / ".git/objects") + "\n" + str(self.base / "origin.git/objects") + "\n")
+        with copies.standing("verify-unit", source, "HEAD") as tree:
+            self.assertFalse((tree / ".git/objects/info/alternates").exists())
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+        shutil.rmtree(source.parent)
+        self.assertEqual(self.git(tree, "rev-list", "--objects", "--all", "--quiet"), "")
+        self.assertEqual(self.git(tree, "show", "HEAD:tracked.txt"), "source HEAD")
+
+    def test_local_origin_cycle_refuses_a_gate(self) -> None:
+        other = self.base / "other-clone"
+        _ = self.git(self.base, "clone", "-q", str(self.source), str(other))
+        _ = self.git(self.source, "remote", "set-url", "origin", str(other))
+        with self.assertRaisesRegex(copies.CopyError, "local origins form a cycle"):
+            with copies.standing("verify-unit", self.source, "HEAD"):
+                self.fail("a local origin cycle started a gate")
+
+    def test_repository_removal_keeps_workspace_identity_after_source_deletion(self) -> None:
+        _ = self.git(self.source, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
+        selector = self.base / "selector"
+        _ = self.git(self.base, "clone", "-q", str(self.source), str(selector))
+        _ = self.git(selector, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
+        with copies.workspace("verify-unit", self.source, "HEAD", name="worker", branch="worker") as tree:
+            pass
+        _ = self.git(tree, "repack", "-a", "-d")
+        (tree / ".git/objects/info/alternates").unlink()
+        shutil.rmtree(self.source)
+        result = self.cli("remove", "--owner", "verify-unit", "--repo", str(selector))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(tree.exists())
+
     def test_workspace_records_ownership_and_preserves_edits_on_resume(self) -> None:
         name = "crate-run-package"
         branch = "style-crate/run/package"
@@ -482,6 +625,7 @@ class StandingTests(unittest.TestCase):
                 record = scratch.task_of(tree)
                 assert isinstance(record, copy_record.Registered)
                 self.assertEqual(record.fields["copy_commit"], "")
+                self.assertEqual(copies.workspace_repository(record), copies.repository_name(self.source))
                 with copies.workspace("verify-unit", self.source, self.head, name=boundary, branch="worker") as resumed:
                     self.assertEqual(self.git(resumed, "rev-parse", "HEAD"), self.head)
                     _ = (resumed / "tracked.txt").write_text("finished workspace edit\n")
@@ -662,6 +806,10 @@ class StandingTests(unittest.TestCase):
                 result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("busy", result.stderr)
+                failures = result.stderr.splitlines()
+                self.assertEqual(len(failures), 2, result.stderr)
+                self.assertIn(str(first), failures[0])
+                self.assertIn(str(second), failures[1])
                 self.assertTrue(first.is_dir())
                 self.assertTrue(second.is_dir())
         result = self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source))
@@ -669,6 +817,133 @@ class StandingTests(unittest.TestCase):
         self.assertFalse(first.exists())
         self.assertFalse(second.exists())
         self.assertEqual(self.cli("remove", "--owner", "verify-unit", "--repo", str(self.source)).returncode, 0)
+
+    def test_owner_removal_deletes_a_gate_while_its_workspace_is_live(self) -> None:
+        with copies.standing("verify-unit", self.source, self.head) as gate:
+            pass
+        with copies.workspace("verify-unit", self.source, self.head, name="live", branch="worker") as tree:
+            with self.assertRaises(copies.CopyError) as refusal:
+                copies.remove_trees("verify-unit")
+            self.assertIn(str(tree), str(refusal.exception))
+            self.assertEqual(len(str(refusal.exception).splitlines()), 1)
+            self.assertFalse(gate.exists())
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+            record = scratch.task_of(tree)
+            assert isinstance(record, copy_record.Registered)
+            self.assertNotIn("ended_task", record.fields)
+
+    def idle_gate_source(self) -> Path:
+        with copies.standing("verify-unit", self.source, self.head) as gate:
+            for key in ("user.name", "user.email"):
+                _ = self.git(gate, "config", key, self.git(self.source, "config", key))
+        return gate
+
+    def test_owner_removal_preserves_a_gate_and_its_busy_workspace_borrower(self) -> None:
+        gate = self.idle_gate_source()
+        with copies.workspace("verify-unit", gate, self.head, name="borrower", branch="worker") as tree:
+            with self.assertRaises(copies.CopyError) as refusal:
+                copies.remove_trees("verify-unit")
+            self.assertIn(f"{gate}: kept: borrowed: {tree} still uses its git objects", str(refusal.exception))
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+            record = scratch.task_of(tree)
+            assert isinstance(record, copy_record.Registered)
+            self.assertNotIn("ended_task", record.fields)
+
+    def test_owner_removal_deletes_an_idle_workspace_before_its_gate_source(self) -> None:
+        gate = self.idle_gate_source()
+        with copies.workspace("verify-unit", gate, self.head, name="borrower", branch="worker") as tree:
+            pass
+        copies.remove_trees("verify-unit")
+        self.assertFalse(tree.exists())
+        self.assertFalse(gate.exists())
+
+    def test_owner_removal_preserves_a_gate_borrowed_by_another_owners_workspace(self) -> None:
+        gate = self.idle_gate_source()
+        with copies.workspace("other-unit", gate, self.head, name="borrower", branch="worker") as tree:
+            pass
+        with self.assertRaises(copies.CopyError) as refusal:
+            copies.remove_trees("verify-unit")
+        self.assertIn(f"{gate}: kept: borrowed: {tree} still uses its git objects", str(refusal.exception))
+        self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+
+    def test_owner_removal_reads_relative_alternates_despite_a_damaged_workspace_record(self) -> None:
+        gate = self.idle_gate_source()
+        with copies.workspace("verify-unit", gate, self.head, name="borrower", branch="worker") as tree:
+            pass
+        objects = tree / ".git/objects"
+        _ = (objects / "info/alternates").write_text(os.path.relpath(gate / ".git/objects", objects) + "\n")
+        record = tree / copy_record.RECORD
+        _ = record.write_text("{invalid")
+        with self.assertRaises(copies.CopyError) as refusal:
+            copies.remove_trees("verify-unit")
+        self.assertIn(str(record), str(refusal.exception))
+        self.assertIn(f"{gate}: kept: borrowed: {tree} still uses its git objects", str(refusal.exception))
+        self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+
+    def test_owner_removal_checks_the_borrowed_path_of_a_gate_tombstone(self) -> None:
+        for borrows_tombstone in (False, True):
+            with self.subTest(borrows_tombstone=borrows_tombstone):
+                gate = self.idle_gate_source()
+                with copies.workspace("other-unit", gate, self.head, name="borrower", branch="worker") as tree:
+                    pass
+                tombstone = copies.removing_path(gate)
+                _ = gate.rename(tombstone)
+                if borrows_tombstone:
+                    _ = (tree / ".git/objects/info/alternates").write_text(str(tombstone / ".git/objects") + "\n")
+                    with self.assertRaises(copies.CopyError) as refusal:
+                        copies.remove_trees("verify-unit")
+                    self.assertIn(f"{tombstone}: kept: borrowed: {tree}", str(refusal.exception))
+                    self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+                    _ = tombstone.rename(gate)
+                    _ = (tree / ".git/objects/info/alternates").write_text(str(gate / ".git/objects") + "\n")
+                    copies.remove_trees("other-unit")
+                    copies.remove_trees("verify-unit")
+                else:
+                    copies.remove_trees("verify-unit")
+                    self.assertFalse(tombstone.exists())
+                    shutil.rmtree(tree)
+
+    def test_owner_removal_deletes_an_idle_repository_while_another_gate_is_busy(self) -> None:
+        other = self.base / "other-repository"
+        _ = self.git(self.base, "clone", "-q", str(self.source), str(other))
+        _ = self.git(other, "remote", "set-url", "origin", "https://example.invalid/other.git")
+        with copies.standing("verify-unit", self.source, self.head) as busy:
+            with copies.standing("verify-unit", other, "HEAD") as idle:
+                pass
+            with self.assertRaises(copies.CopyError) as refusal:
+                copies.remove_trees("verify-unit")
+            self.assertIn(str(busy), str(refusal.exception))
+            self.assertEqual(len(str(refusal.exception).splitlines()), 1)
+            self.assertFalse(idle.exists())
+            self.assertTrue(busy.is_dir())
+        copies.remove_trees("verify-unit")
+        self.assertFalse(busy.exists())
+
+    def test_remove_cli_reports_a_kept_workspace_and_a_removed_gate(self) -> None:
+        with copies.standing("verify-unit", self.source, self.head) as gate:
+            pass
+        with copies.workspace("verify-unit", self.source, self.head, name="live", branch="worker") as tree:
+            result = self.cli("remove", "--owner", "verify-unit")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn(str(tree), result.stderr)
+            self.assertEqual(result.stdout, f"removed {gate}\n")
+            self.assertFalse(gate.exists())
+            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
+
+    def test_owner_removal_reports_each_workspace_with_unsaved_work_on_a_separate_line(self) -> None:
+        trees: list[Path] = []
+        for name in ("first", "second"):
+            with copies.workspace("verify-unit", self.source, self.head, name=name, branch="worker") as tree:
+                _ = (tree / "tracked.txt").write_text(f"unsaved {name}\n")
+                trees.append(tree)
+        with self.assertRaises(copies.CopyError) as refusal:
+            copies.remove_trees("verify-unit")
+        failures = str(refusal.exception).splitlines()
+        self.assertEqual(len(failures), 2, str(refusal.exception))
+        for tree, failure in zip(trees, failures, strict=True):
+            self.assertIn(str(tree), failure)
+            self.assertIn("kept", failure)
+            self.assertEqual((tree / "tracked.txt").read_text(), f"unsaved {tree.name}\n")
 
     def test_owner_removal_covers_repositories_and_editable_copies(self) -> None:
         other = ImmutableGitSeed.create(self.base / "other", "main", "Gate Tests",
@@ -899,6 +1174,8 @@ class StandingTests(unittest.TestCase):
         self.assertTrue(child.exists())
 
     def test_owner_removal_refuses_a_damaged_record_until_repaired(self) -> None:
+        with copies.standing("verify-unit", self.source, self.head) as gate:
+            pass
         with copies.workspace("verify-unit", self.source, self.head, name="damaged", branch="worker") as tree:
             pass
         path = tree / copy_record.RECORD
@@ -908,6 +1185,7 @@ class StandingTests(unittest.TestCase):
             copies.remove_trees("verify-unit")
         self.assertIn(str(path), str(refusal.exception))
         self.assertTrue(tree.exists())
+        self.assertFalse(gate.exists())
         _ = path.write_text(record)
         copies.remove_trees("verify-unit")
         self.assertFalse(tree.exists())

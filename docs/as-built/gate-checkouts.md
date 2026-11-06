@@ -29,10 +29,13 @@ paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
 Trees live at `<root>/<repo>/<owner>-gate` and `<owner>-gate-2`.
-`<repo>` is the repository folder name: `hana`, `.claude`,
-or `cargo-liner`. Linked worktrees use the main repository's name, so a unit
-worktree of `.claude` uses `.claude/verify-unit-gate`. The root under
-`~/worktrees` belongs to the existing trusted direnv root.
+`<repo>` is the repository identity from the last part of its origin URL, without `.git`.
+Local origins, including relative paths and `file://` URLs, lead to the source repository's identity.
+A cycle of local origins is an error.
+A repository without an origin uses its main checkout's folder name.
+Linked worktrees and local clones use the same identity.
+For example, `~/.claude` uses `claude_commands/verify-unit-gate`.
+The root under `~/worktrees` belongs to the existing trusted direnv root.
 
 Owners are unit or production names, such as `verify` or `builds`, and must
 match `[a-z0-9][a-z0-9-]*`. Use no phase, run, or session ids. The caller supplies
@@ -40,10 +43,18 @@ the owner from its existing context; the helper does not consult a roster.
 
 ## Reset and build output
 
-First use makes a shared clone with its own `.git` directory. It never copies a
-linked worktree's `.git` pointer or changes the source's branches. The clone's
-Git metadata is staged inside the already locked directory and then installed,
-so first creation has the same busy protection as reuse.
+The first standing use makes a clone with its own `.git` directory.
+The clone borrows objects from the last available store in the source's single-path alternates chain.
+A missing store, repeated store, or alternates file with multiple lines ends the chain.
+A source with no chain keeps its own objects as the borrowed store.
+When the last store belongs to a registered scratch copy, the clone copies objects without an alternates file.
+The existing refresh fetches the source's own objects.
+Task clones and editable workspaces clone the source with `--shared`.
+They retain commits that exist only in the source, including detached commits.
+The gate then works after intermediate clones or the registered scratch source are removed.
+It never copies a linked worktree's `.git` pointer or changes the source's branches.
+The clone's Git metadata starts inside the locked directory.
+The code then installs this metadata without releasing the lock.
 
 The copy's `origin` URL equals the source repository's `origin` URL.
 Each use refreshes `refs/remotes/origin/*` from the source's matching remote refs.
@@ -93,7 +104,7 @@ Each tree has one `.gate.json` record:
 ```json
 {
   "owner": "verify",
-  "repo": ".claude",
+  "repo": "claude_commands",
   "source": "/home/natepiano/worktrees/claude-build-followups-verify",
   "commit": "1111111111111111111111111111111111111111",
   "last_use": 1793448000.0,
@@ -147,13 +158,18 @@ holder pid, and target size. `remove --owner O` removes the owner's trees
 across all repositories. An optional `--repo R` limits removal to that repository.
 The Python API accepts only a `RepositoryScope` value for `repo`.
 `copies.remove_trees(owner)` uses `AllRepositories()` by default.
-`copies.remove_trees(owner, SelectedRepository(name))` limits removal to one canonical repository name.
+`copies.remove_trees(owner, SelectedRepository(name))` limits removal to one repository identity.
 The API refuses raw strings and paths, including an empty string.
 Removal includes standing checkouts, registered editable copies, and adopted
-legacy workers. Editable copies retain scratch's checks for unsaved work and
-active tasks. A busy tree refuses with exit 2. A retry completes interrupted
-removal, including a standing tree's `.removing` directory. Repeated removal
-succeeds when the trees are gone.
+legacy workers.
+A workspace record saves `repository_identity` during registration.
+Repository removal reads this field without using the source checkout.
+Editable copies retain scratch's checks for unsaved work and active tasks.
+Removal continues after a busy tree, a kept copy, or a removal failure.
+Removal keeps a gate while a registered copy still borrows its Git objects.
+It removes each tree that it can remove, including standing trees' `.removing` directories.
+After it releases the locks, it reports each failure on a separate line and exits 2.
+A retry completes interrupted removal. Repeated removal succeeds when the trees are gone.
 
 `retire_unit.py` removes the unit's checkouts after its processes stop and before
 it writes the retired note. A busy checkout refuses retirement. The refusal
