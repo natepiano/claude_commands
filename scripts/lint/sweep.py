@@ -3305,6 +3305,7 @@ class MacFloor:
     roots: tuple[str, ...]
     claims: floor_claims.LockedClaims
     mirror: Path
+    leased_mirrors: frozenset[Path] = frozenset()
 
     def allows(self, target: str) -> bool:
         path = Path(target)
@@ -3326,7 +3327,9 @@ class MacFloor:
         result: dict[str, TargetUse | LockHeld] = {}
         paths = tmp_sweep.lsof_paths(tuple(str(Path(root).expanduser().resolve()) for root in self.roots))
         for root in targets:
-            if not self.allows(root) or self.claims.holds(root, self.mirror) or isinstance(paths, tmp_sweep.ProcessUsesUnavailable):
+            if (not self.allows(root) or self.claims.holds(root, self.mirror)
+                    or any(Path(root).resolve().is_relative_to(mirror.resolve()) for mirror in self.leased_mirrors)
+                    or isinstance(paths, tmp_sweep.ProcessUsesUnavailable)):
                 result[root] = LockHeld("Mac claim or process use is busy or unreadable")
             else:
                 for path, pid, how in paths.paths:
@@ -3625,6 +3628,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
     protected: tuple[tuple[str, int], ...] = ()
     detail = ""
+    mirror_leases = ExitStack()
     try:
         if isinstance(planned_at, UseConfiguredValue):
             planned_at = time.time()
@@ -3684,6 +3688,11 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
                         if isinstance(policy, NatedevFloor) else {})
         uses: dict[str, TargetUse | LockHeld] = dict(policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners))
+        if isinstance(policy, NatedevFloor):
+            busy_mirrors = mirror_leases.enter_context(copies.target_mirror_leases(targets))
+            for root in targets:
+                if any(Path(root).resolve().is_relative_to(mirror) for mirror in busy_mirrors):
+                    uses[root] = LockHeld("remote mirror lease is busy")
         for root in tuple(hold_targets):
             for paired in paired_roots(root):
                 if paired in targets:
@@ -3892,8 +3901,11 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             if not dry_run and isinstance(policy, NatedevFloor):
                 notify_floor_problem(replace(outcome, protected=protected), lint_settings=lint_settings, detail=detail)
         finally:
-            if guard is not None:
-                os.close(guard)
+            try:
+                if guard is not None:
+                    os.close(guard)
+            finally:
+                mirror_leases.close()
 
 
 def size_bytes(raw: str, unit: int) -> int | None:
@@ -4333,9 +4345,10 @@ def main(argv: list[str]) -> int:
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
-            with floor_claims.locked_claims(timeout) as claims:
-                return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
-                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path()))
+            with copies.mirror_sweep_leases(mirror_root.local_path()) as protected:
+                with floor_claims.locked_claims(timeout) as claims:
+                    return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
+                                      policy=MacFloor(mac_roots, claims, mirror_root.local_path(), protected))
         except conf.Unusable as error:
             print(f"lint sweep: {error}", file=sys.stderr)
             return 2
