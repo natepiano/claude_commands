@@ -361,8 +361,9 @@ def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapsh
     return {parent.id: _parent_evidence(parent.id, record, client, read).states for parent in parents}
 
 
-def worker_run(parent: staff.StaffRow) -> Path:
-    runs = unit_runs.held(str(parent.current_session))
+def worker_run(parent: staff.StaffRow, *,
+               record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL) -> Path:
+    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record)
     if runs:
         return Path(runs[0])
     return Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR") else unit_runs.state_dir() / "staff" / "workers" / parent.id
