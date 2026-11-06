@@ -22,6 +22,7 @@ from scripts.production.staff_test_support import (
 from scripts.production import staff
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
 
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
@@ -43,11 +44,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
-            "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
-            "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
+            **copies_environment(self.root), "HERDR_BIN": "/nonexistent/herdr",
         }))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 
@@ -408,14 +405,7 @@ class TidyWrappedTests(unittest.TestCase):
         doc = self.doc("done", "wrapped")
         mine = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac", "mirror/done", "done-session")
         other = copies.RemoteMirror("live", copies.SelectedRepository("hana"), "mac", "mirror/live", "live-session")
-        for item in (mine, other):
-            copies.register_remote(item)
-            with copies.remote_lease(item):
-                pass
-        def remove_record(item: copies.RemoteMirror) -> None:
-            copies.remote_record_path(item).unlink()
-
-        with mock.patch.object(copies, "remove_remote_mirror", side_effect=remove_record) as remove:
+        with fake_remote_removal((mine, other)) as remove:
             _ = tidy_wrapped.tidy("done", doc)
         remove.assert_called_once_with(mine)
         self.assertEqual(copies.owned_remote_mirrors("live"), [other])
@@ -438,11 +428,7 @@ class TidyWrappedTests(unittest.TestCase):
         mirror = copies.RemoteMirror("done", copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/done"), "done-session")
         with local_remote_transport(self.root):
-            args = copies.CopyArguments()
-            args.action, args.path, args.host = "mirror-probe", mirror.path, mirror.host
-            args.owner, args.repository, args.session = mirror.owner, "hana", mirror.session
-            copies.register_remote(mirror)
-            self.assertEqual(copies.mirror_action(args), 0)
+            self.assertEqual(publish_mirror(mirror), 0)
             _ = tidy_wrapped.tidy("done", doc)
         self.assertFalse(Path(mirror.path).exists())
         self.assertFalse(copies.remote_record_path(mirror).exists())

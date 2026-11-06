@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from importlib import import_module
@@ -14,7 +14,7 @@ import select
 import shlex
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast
 
 
 class ClaimState(Protocol):
@@ -35,21 +35,36 @@ class ClaimReader(Protocol):
     def read_claims(self, paths: ClaimState) -> Sequence[HeldMacClaim]: ...
 
 
-class RegisteredRemoteMirror(Protocol):
-    host: str
-    path: str
-    session: str
-
-
-class RemoteMirrorLeaseRegistry(Protocol):
-    """Read remote owners and their stable lease paths."""
-
-    def remote_mirrors(self) -> Sequence[RegisteredRemoteMirror]: ...
-    def remote_registry(self) -> Path: ...
-    def remote_key(self, mirror: RegisteredRemoteMirror) -> str: ...
-
-
 MIRROR_MARK = ".mac-test-mirror"
+MIRROR_RECORD = ".copy-record.json"
+MIRROR_SESSION = ".copy-session"
+MIRROR_METADATA = (MIRROR_SESSION, MIRROR_MARK, MIRROR_RECORD)
+MIRROR_REMOVAL_SUFFIX = ".copy-removing.json"
+
+
+def read_mirror_record(path: Path) -> dict[str, object]:
+    """Read mirror metadata or removal authority through the same decoder."""
+    return cast(dict[str, object], json.loads(path.read_text()))
+
+
+def mirror_local_path(path: str) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.home() / candidate
+    return candidate.absolute()
+
+
+def mirror_lock_path(tree: Path) -> Path:
+    # A sibling lock survives replacement or removal of the mirror itself.
+    return tree.parent / ("." + tree.name + ".copy-lease")
+
+
+def removal_authority_path(tree: Path) -> Path:
+    return tree.parent / ("." + tree.name + MIRROR_REMOVAL_SUFFIX)
+
+
+def record_lock_path(tree: Path) -> Path:
+    return tree.parent / ("." + tree.name + ".copy-record.lock")
 
 
 @dataclass(frozen=True)
@@ -93,16 +108,14 @@ class LockedClaims:
                     continue
                 if isinstance(exemption, MirrorIdentity) and held.identity.host != exemption.host:
                     continue
-                remote = Path(held.identity.path).expanduser()
-                if not remote.is_absolute():
-                    remote = Path.home() / remote
+                remote = mirror_local_path(held.identity.path)
                 if path.is_relative_to(remote.resolve()):
                     return True
             for parent in (path, *path.parents):
-                record = parent / ".copy-record.json"
+                record = parent / MIRROR_RECORD
                 if record.exists():
                     try:
-                        fields = cast(dict[str, object], json.loads(record.read_text()))
+                        fields = read_mirror_record(record)
                         return fields.get("repo") in self.repositories
                     except (OSError, ValueError):
                         return True
@@ -187,16 +200,10 @@ def serve() -> int:
             with os.scandir(paths.claims) as entries:
                 _ = list(entries)
         names: set[str] = set()
-        if TYPE_CHECKING:
-            from ..lib import file_lock
-        else:
-            from scripts.lib import file_lock
-        registry = cast(RemoteMirrorLeaseRegistry, cast(object, import_module("scripts.copies.copies")))
-        mirrors: list[dict[str, str]] = []
-        for mirror in registry.remote_mirrors():
-            lock = registry.remote_registry() / (registry.remote_key(mirror) + ".lease")
-            if file_lock.lock_holder(str(lock)) is not None:
-                mirrors.append({"host": mirror.host, "path": mirror.path, "session": mirror.session})
+        held_remote_mirrors = cast(Callable[[], tuple[HeldMirror, ...]],
+            import_module("scripts.copies.copies").held_remote_mirrors)
+        mirrors = [{"host": held.identity.host, "path": held.identity.path, "session": held.session}
+                   for held in held_remote_mirrors()]
         for claim in mac_test.read_claims(paths):
             record = claim.record
             # A kept remote job can outlive its owner. Unreadable local liveness also keeps it.

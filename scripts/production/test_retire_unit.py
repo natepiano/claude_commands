@@ -44,6 +44,7 @@ from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.lib.conf import UseConfiguredValue
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
 from scripts.lib import conf
 from scripts.agents import worker_lifecycle
@@ -239,13 +240,7 @@ class RetireUnitTests(unittest.TestCase):
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.limits()
-        self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root),
-            "COPIES_CONFIG": str(Path(copies.__file__).resolve().parents[2] / "config/copies.conf"),
-            "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_HOLDS": str(self.root / "copy-holds.json"),
-        }))
+        self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -576,14 +571,7 @@ class RetireUnitTests(unittest.TestCase):
     def test_retirement_removes_only_its_remote_mirrors(self) -> None:
         mine = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
         other = copies.RemoteMirror("beta-unit", copies.SelectedRepository("hana"), "mac", "mirror/beta", "beta-session")
-        for item in (mine, other):
-            copies.register_remote(item)
-            with copies.remote_lease(item):
-                pass
-        def remove_record(item: copies.RemoteMirror) -> None:
-            copies.remote_record_path(item).unlink()
-
-        with mock.patch.object(copies, "remove_remote_mirror", side_effect=remove_record) as remove:
+        with fake_remote_removal((mine, other)) as remove:
             code, output = self.retire()
         self.assertEqual(code, 0, output)
         remove.assert_called_once_with(mine)
@@ -604,11 +592,7 @@ class RetireUnitTests(unittest.TestCase):
         mirror = copies.RemoteMirror("alpha-unit", copies.SelectedRepository("hana"), "mac",
                                      str(self.root / "mirrors/alpha"), "alpha-session")
         with local_remote_transport(self.root):
-            args = copies.CopyArguments()
-            args.action, args.path, args.host = "mirror-probe", mirror.path, mirror.host
-            args.owner, args.repository, args.session = mirror.owner, "hana", mirror.session
-            copies.register_remote(mirror)
-            self.assertEqual(copies.mirror_action(args), 0)
+            self.assertEqual(publish_mirror(mirror), 0)
             code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertFalse(Path(mirror.path).exists())

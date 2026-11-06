@@ -1492,8 +1492,9 @@ PYDOC
 doc_checkout() {
     local copy_script
     copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
-    coproc DOC_COPY { "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP" --staged-tree "$DOC_TREE"; }
+    coproc DOC_COPY { "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP"; }
     exec 8>&"${DOC_COPY[1]}"
+    IFS= read -r DOC_TREE <&"${DOC_COPY[0]}" || return 1
     IFS= read -r DOC_CHECKOUT <&"${DOC_COPY[0]}" || return 1
 }
 
@@ -3781,7 +3782,6 @@ case "$CMD" in
         fi
         CARGO_TARGET_DIR="$(VERIFY_PY_HELPER=DOC_TARGET_PATH_PY "$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
         export CARGO_TARGET_DIR
-        DOC_TREE="$(doc_tree)"
         doc_checkout
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'

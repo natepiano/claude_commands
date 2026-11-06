@@ -22,6 +22,7 @@ import unittest
 from unittest import mock
 
 from scripts.copies import copies
+from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
 from scripts.lint import sweep
 from scripts.lib import conf
@@ -48,12 +49,6 @@ class RemoteEntryTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
         _ = self.enterContext(mock.patch.object(mac_test, "offload", offload))
-        config = self.root / "copies.conf"
-        _ = config.write_text(f"root={self.root}/gates\nwait_seconds=0.01\ngit_timeout_seconds=5\nguard_timeout_seconds=5\n")
-        self.enterContext(mock.patch.dict(os.environ, {
-            "COPIES_CONFIG": str(config), "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"), "SCRATCH_HOLDS": str(self.root / "holds.json"),
-        }))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
                                              {"source.txt": "content\n"}).checkout
         self.mirror = self.root / "mirrors/repository"
@@ -62,21 +57,11 @@ class RemoteEntryTests(unittest.TestCase):
         return copies.RemoteMirror(owner, copies.SelectedRepository("repository"), "host",
                                    str(self.mirror if path is None else path), "holder-session")
 
-    def action(self, mirror: copies.RemoteMirror, action: str = "mirror-probe") -> copies.CopyArguments:
-        args = copies.CopyArguments()
-        args.path, args.host, args.action = mirror.path, mirror.host, action
-        args.owner, args.repository, args.session = mirror.owner, mirror.repository.name, mirror.session
-        return args
-
-    def publish(self, mirror: copies.RemoteMirror) -> None:
-        copies.register_remote(mirror)
-        self.assertEqual(copies.mirror_action(self.action(mirror)), 0)
-
     def test_idle_removal_exempts_its_lease_and_keeps_a_busy_sibling(self) -> None:
         mine = self.mirror_record()
         other = self.mirror_record("beta", self.mirror.parent / "other")
-        self.publish(mine)
-        self.publish(other)
+        self.assertEqual(publish_mirror(mine), 0)
+        self.assertEqual(publish_mirror(other), 0)
         with copies.remote_lease(other):
             copies.remove_trees("alpha")
             self.assertFalse(self.mirror.exists())
@@ -87,7 +72,7 @@ class RemoteEntryTests(unittest.TestCase):
 
     def test_removal_keeps_a_live_claim_despite_its_lease_exemption(self) -> None:
         mirror = self.mirror_record()
-        self.publish(mirror)
+        self.assertEqual(publish_mirror(mirror), 0)
         with mock.patch.object(mac_test, "state_paths", return_value=mac_test.StatePaths(self.root / "local-claims")):
             paths = mac_test.state_paths()
         start = process_identity.process_start(os.getpid())
@@ -109,11 +94,11 @@ class RemoteEntryTests(unittest.TestCase):
         link = self.root / "linked"
         link.symlink_to(actual, target_is_directory=True)
         mirror = self.mirror_record(path=link / "repository")
-        args = self.action(mirror, "mirror-receive")
+        args = mirror_arguments(mirror, "mirror-receive")
         _ = args.command = [sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('copied')",
                         str(Path(mirror.path) / "payload")]
         copies.register_remote(mirror)
-        self.assertEqual(copies.mirror_action(args), 0)
+        self.assertEqual(copies.mirror_run(args), 0)
         self.assertEqual((actual / "repository/payload").read_text(), "copied")
         copies.remove_trees("alpha")
         self.assertFalse((actual / "repository").exists())
@@ -126,7 +111,7 @@ class RemoteEntryTests(unittest.TestCase):
             request = offload.request_from_arguments(args)
             self.assertEqual(request.owner, "gate-owner")
             mirror = self.mirror_record(request.owner)
-            self.publish(mirror)
+            self.assertEqual(publish_mirror(mirror), 0)
         copies.remove_trees("gate-owner")
         self.assertFalse(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors("gate-owner"), [])
@@ -135,11 +120,11 @@ class RemoteEntryTests(unittest.TestCase):
         for moment in ("payload", "record"):
             with self.subTest(moment=moment):
                 mirror = self.mirror_record()
-                self.publish(mirror)
+                self.assertEqual(publish_mirror(mirror), 0)
                 folder = self.mirror / "payload"
                 folder.mkdir()
                 _ = (folder / "file").write_text("data")
-                args = self.action(mirror, "mirror-remove")
+                args = mirror_arguments(mirror, "mirror-remove")
                 remove = shutil.rmtree
                 unlink = Path.unlink
 
@@ -155,23 +140,39 @@ class RemoteEntryTests(unittest.TestCase):
                 patch = (mock.patch.object(shutil, "rmtree", side_effect=remove_payload) if moment == "payload"
                          else mock.patch.object(Path, "unlink", autospec=True, side_effect=remove_record))
                 with patch, self.assertRaisesRegex(InterruptedError, "removal stopped"):
-                    _ = copies.mirror_action(args)
+                    _ = copies.mirror_remove(args)
                 self.assertTrue(copies.remote_record_path(mirror).exists())
                 with self.assertRaisesRegex(copies.CopyError, "another owner"):
-                    _ = copies.mirror_action(self.action(replace(mirror, owner="other"), "mirror-remove"))
+                    _ = copies.mirror_remove(mirror_arguments(replace(mirror, owner="other"), "mirror-remove"))
                 copies.remove_trees("alpha")
                 self.assertFalse(self.mirror.exists())
                 self.assertFalse(copies.remote_record_path(mirror).exists())
 
     def test_empty_owner_removes_no_remote_mirrors(self) -> None:
         mirror = self.mirror_record()
-        self.publish(mirror)
+        self.assertEqual(publish_mirror(mirror), 0)
         copies.remove_trees("")
         self.assertTrue(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors("alpha"), [mirror])
 
+    def test_unit_owner_keeps_underscore_spelling_and_removes_only_its_mirrors(self) -> None:
+        owner = copies.unit_owner("alpha_unit")
+        self.assertEqual(owner, "alpha_unit-unit")
+        mine = self.mirror_record(owner)
+        other = self.mirror_record("beta-unit", self.mirror.parent / "other")
+        self.assertEqual(publish_mirror(mine), 0)
+        self.assertEqual(publish_mirror(other), 0)
+        with copies.standing(owner, self.source, copies.CommittedSource("HEAD")) as tree:
+            pass
+        copies.remove_trees(owner)
+        self.assertFalse(tree.exists())
+        self.assertFalse(self.mirror.exists())
+        self.assertEqual(copies.owned_remote_mirrors(owner), [])
+        self.assertTrue(Path(other.path).exists())
+        self.assertEqual(copies.owned_remote_mirrors("beta-unit"), [other])
+
     def interrupt_mirror_removal(self, mirror: copies.RemoteMirror, moment: str) -> Path:
-        self.publish(mirror)
+        self.assertEqual(publish_mirror(mirror), 0)
         tree = Path(mirror.path)
         payload = tree / "old-payload"
         payload.mkdir()
@@ -191,7 +192,7 @@ class RemoteEntryTests(unittest.TestCase):
         patch = (mock.patch.object(shutil, "rmtree", side_effect=remove_payload) if moment == "payload"
                  else mock.patch.object(Path, "unlink", autospec=True, side_effect=remove_record))
         with patch, self.assertRaisesRegex(InterruptedError, "removal stopped"):
-            _ = copies.mirror_action(self.action(mirror, "mirror-remove"))
+            _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
         authority = tree.parent / ("." + tree.name + ".copy-removing.json")
         self.assertTrue(authority.exists())
         self.assertEqual((tree / ".copy-record.json").exists(), moment == "payload")
@@ -204,7 +205,7 @@ class RemoteEntryTests(unittest.TestCase):
                 authority = self.interrupt_mirror_removal(original, moment)
                 replacement = replace(original, owner="beta", session="beta-session")
                 tree = Path(original.path)
-                receive = self.action(replacement, "mirror-receive")
+                receive = mirror_arguments(replacement, "mirror-receive")
                 receive.command = [sys.executable, "-c", """
 from pathlib import Path
 import sys
@@ -214,12 +215,12 @@ assert not (tree / 'old-payload').exists()
 assert (tree / '.copy-session').read_text() == 'beta-session\\n'
 (tree / 'source.txt').write_text('complete replacement')
 """, str(tree)]
-                self.assertEqual(copies.mirror_action(receive), 0)
+                self.assertEqual(copies.mirror_run(receive), 0)
                 self.assertFalse(authority.exists())
                 expected_owner = "alpha"
                 self.assertEqual(json.loads((tree / ".copy-record.json").read_text())["owner"], expected_owner)
                 self.assertEqual(copies.owned_remote_mirrors("alpha"), [original])
-                use = self.action(replacement, "mirror-use")
+                use = mirror_arguments(replacement, "mirror-use")
                 use.command = [sys.executable, "-c", """
 from pathlib import Path
 import json, sys
@@ -228,7 +229,7 @@ assert (tree / 'source.txt').read_text() == 'complete replacement'
 assert json.loads((tree / '.copy-record.json').read_text())['owner'] == 'beta'
 """, str(tree)]
                 copies.register_remote(replacement)
-                self.assertEqual(copies.mirror_action(use), 0)
+                self.assertEqual(copies.mirror_run(use), 0)
                 copies.remove_trees("beta")
                 self.assertFalse(tree.exists())
                 self.assertFalse(authority.exists())
@@ -246,20 +247,20 @@ assert json.loads((tree / '.copy-record.json').read_text())['owner'] == 'beta'
                 source = tree / "complete-source"
                 _ = source.write_text("complete replacement")
                 modified = source.stat().st_mtime_ns
-                receive = self.action(replacement, "mirror-receive")
+                receive = mirror_arguments(replacement, "mirror-receive")
                 receive.command = [sys.executable, "-c", """
 from pathlib import Path
 import sys
 assert Path(sys.argv[1]).read_text() == 'complete replacement'
 """, str(source)]
-                self.assertEqual(copies.mirror_action(receive), 0)
+                self.assertEqual(copies.mirror_run(receive), 0)
                 self.assertFalse(authority.exists())
                 self.assertEqual(source.stat().st_mtime_ns, modified)
                 self.assertEqual(json.loads((tree / ".copy-record.json").read_text())["owner"], "beta")
-                use = self.action(replacement, "mirror-use")
+                use = mirror_arguments(replacement, "mirror-use")
                 use.command = receive.command
                 copies.register_remote(replacement)
-                self.assertEqual(copies.mirror_action(use), 0)
+                self.assertEqual(copies.mirror_run(use), 0)
                 copies.remove_trees("beta")
                 self.assertFalse(tree.exists())
 
@@ -276,10 +277,10 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                         self.assertIs(current, controller)
                         self.assertEqual(settings.host, config.host)
                         mirror = offload.request_mirror(settings, selected, repository)
-                        args = self.action(mirror, "mirror-receive")
+                        args = mirror_arguments(mirror, "mirror-receive")
                         args.command = [sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('fresh')",
                                         str(tree / "source.txt")]
-                        self.assertEqual(copies.mirror_action(args), 0)
+                        self.assertEqual(copies.mirror_run(args), 0)
                         self.assertFalse(authority.exists())
                         return offload.CopiedTree(offload.KnownTreeKey("tree"))
 
@@ -296,8 +297,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
     def interrupt_receive_recovery(self, original: copies.RemoteMirror, stage: str) -> None:
         tree = Path(original.path)
         authority = tree.parent / ("." + tree.name + ".copy-removing.json")
-        receive = self.action(replace(original, owner="beta", session="beta-session"), "mirror-receive")
-        receive.command = ["true"]
+        receive = mirror_arguments(replace(original, owner="beta", session="beta-session"), "mirror-receive")
         clear = copies.clear_mirror_content
         unlink = Path.unlink
 
@@ -321,7 +321,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
               mock.patch.object(copies, "write_text_atomic", side_effect=write_metadata),
               mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink_authority),
               self.assertRaisesRegex(InterruptedError, "receive stopped")):
-            _ = copies.mirror_action(receive)
+            _ = copies.mirror_run(receive)
 
     def test_registered_owner_removes_after_each_receive_recovery_interruption(self) -> None:
         for moment in ("payload", "record"):
@@ -342,9 +342,8 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                     original = self.mirror_record(path=self.mirror.parent / f"{moment}-{stage}")
                     authority = self.interrupt_mirror_removal(original, moment)
                     self.interrupt_receive_recovery(original, stage)
-                    receive = self.action(replace(original, owner="beta"), "mirror-receive")
-                    receive.command = ["true"]
-                    self.assertEqual(copies.mirror_action(receive), 0)
+                    receive = mirror_arguments(replace(original, owner="beta"), "mirror-receive")
+                    self.assertEqual(copies.mirror_run(receive), 0)
                     tree = Path(original.path)
                     record = cast(dict[str, object], json.loads((tree / ".copy-record.json").read_text()))
                     self.assertEqual(record["owner"], "alpha")
@@ -373,10 +372,10 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
         record = self.mirror / ".copy-record.json"
         _ = record.write_text(json.dumps({"owner": "beta", "repo": replacement.repository.name}))
         with self.assertRaisesRegex(copies.CopyError, "another owner"):
-            _ = copies.mirror_action(self.action(original, "mirror-remove"))
+            _ = copies.mirror_remove(mirror_arguments(original, "mirror-remove"))
         self.assertTrue(record.exists())
         self.assertTrue(authority.exists())
-        self.assertEqual(copies.mirror_action(self.action(replacement, "mirror-remove")), 0)
+        self.assertEqual(copies.mirror_remove(mirror_arguments(replacement, "mirror-remove")), 0)
         self.assertFalse(self.mirror.exists())
         self.assertFalse(authority.exists())
 
@@ -391,9 +390,8 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                                 repository: offload.KnownRepository) -> offload.CopiedTree:
                         self.assertIs(current, controller)
                         mirror = offload.request_mirror(settings, selected, repository)
-                        args = self.action(mirror, "mirror-receive")
-                        args.command = ["true"]
-                        self.assertEqual(copies.mirror_action(args), 0)
+                        args = mirror_arguments(mirror, "mirror-receive")
+                        self.assertEqual(copies.mirror_run(args), 0)
                         return offload.CopiedTree(offload.KnownTreeKey("tree"))
 
                     with mock.patch.object(offload, "copy_tree_with_key", side_effect=receive):
@@ -407,7 +405,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
 
     def test_slot_shell_child_keeps_the_lease_after_both_parents_end(self) -> None:
         mirror = self.mirror_record()
-        self.publish(mirror)
+        self.assertEqual(publish_mirror(mirror), 0)
         tool_home = self.root / "slot-tools"
         lint = tool_home / ".claude/scripts/lint/lint"
         lint.parent.mkdir(parents=True)
@@ -463,7 +461,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                 finally:
                     os.close(descriptor)
             with self.assertRaisesRegex(copies.CopyError, "holder-session"):
-                _ = copies.mirror_action(self.action(mirror, "mirror-remove"))
+                _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
             self.assertTrue((self.mirror / ".copy-record.json").exists())
         finally:
             send_process_group(owner.pid, signal.SIGKILL)
@@ -472,12 +470,12 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def test_standing_checkout_repairs_a_stale_lock_and_a_damaged_index(self) -> None:
         for damaged in (False, True):
             with self.subTest(damaged=damaged):
-                with copies.standing("alpha", self.source, copies.StagedSource()) as tree:
+                with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as tree:
                     pass
                 _ = (tree / ".git/index.lock").write_text("stopped writer")
                 if damaged:
                     _ = (tree / ".git/index").write_bytes(b"broken")
-                with copies.standing("alpha", self.source, copies.StagedSource()) as reused:
+                with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as reused:
                     self.assertEqual(reused, tree)
                     self.assertEqual((reused / "source.txt").read_text(), "content\n")
                     self.assertFalse((reused / ".git/index.lock").exists())
@@ -512,9 +510,8 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertIn("mirror-use", arguments[-1])
             records = copies.owned_remote_mirrors("new-owner")
             self.assertEqual(len(records), 1)
-            args = self.action(records[0], "mirror-use")
-            args.command = ["true"]
-            self.assertEqual(copies.mirror_action(args), 0)
+            args = mirror_arguments(records[0], "mirror-use")
+            self.assertEqual(copies.mirror_run(args), 0)
             return offload.ReportedMacStatus(0, offload.CleanupKept())
 
         def mirror_path(repository: offload.KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -545,8 +542,8 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def test_admission_selects_a_leased_slot_and_keeps_the_other_owner(self) -> None:
         first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
         second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
-        self.publish(first)
-        self.publish(second)
+        self.assertEqual(publish_mirror(first), 0)
+        self.assertEqual(publish_mirror(second), 0)
         with self.admission() as (controller, config, request), copies.remote_lease(first):
             result = offload.run_offload(controller, config, request, 0)
         self.assertIsInstance(result, offload.PassedOnTarget)
@@ -555,11 +552,63 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")
         self.assertEqual(json.loads((Path(second.path) / ".copy-record.json").read_text())["owner"], "new-owner")
 
+    def test_empty_slot_values_raise_config_error_while_absent_values_use_the_missing_policy(self) -> None:
+        single = target_config.MissingSlotCapacity.SINGLE_SLOT
+        required = target_config.MissingSlotCapacity.REQUIRE_CONFIGURED
+        self.assertEqual(target_config.slot_capacity({}, "repository", missing=single), 1)
+        with self.assertRaises(target_config.ConfigError):
+            _ = target_config.slot_capacity({}, "repository", missing=required)
+        for values in ({"slots.repository": "", "slots": "2"}, {"slots": ""}):
+            with self.subTest(values=values, behavior="capacity reader"):
+                with self.assertRaises(target_config.ConfigError):
+                    _ = target_config.slot_capacity(values, "repository", missing=single)
+            with self.subTest(values=values, behavior="admission"):
+                with self.admission() as (controller, config, request):
+                    settings = self.root / "target.conf"
+                    _ = write_config_fixture(settings, "".join(f"{key}={value}\n" for key, value in values.items()),
+                                             template="mac_test")
+                    empty_config = replace(config, values=values, source=settings)
+                    with self.assertRaises(target_config.ConfigError):
+                        _ = offload.run_offload(controller, empty_config, request, 0)
+
+    def test_bad_slot_capacity_raises_config_error_in_claims_and_admission(self) -> None:
+        with self.admission() as (controller, config, request):
+            settings = self.root / "target.conf"
+            _ = write_config_fixture(settings, "slots=bad\n", template="mac_test")
+            bad_config = replace(config, values={**config.values, "slots": "bad"}, source=settings)
+            with self.assertRaises(target_config.ConfigError):
+                _ = mac_test.slot_capacity(mac_test.state_paths("linux"), mac_test.RepositoryScope("repository", "key"))
+            with self.assertRaises(target_config.ConfigError):
+                _ = offload.run_offload(controller, bad_config, request, 0)
+
+    def test_busy_refusal_names_the_session_from_the_unit_owner_chain(self) -> None:
+        active = self.root / "active"
+        active.mkdir()
+        run = self.root / "unit-run"
+        _ = (active / "director-session").write_text(str(run))
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in {"UNIT_RUN_DIR", "UNIT_SESSION_DIR", "PLAN_DELEGATE_BOARD_DIR",
+                                      "PLAN_DELEGATE_SESSION_DIR", "UNIT_ACTIVE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
+                                      "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"}}
+        environment.update(UNIT_RUN_DIR=str(run), UNIT_ACTIVE_DIR=str(active),
+                           CLAUDE_CODE_SESSION_ID="worker-shell-session")
+        with mock.patch.dict(os.environ, environment, clear=True):
+            args = offload.parser().parse_args([
+                "run", "--repo-root", str(self.source), "--package", "repository", "--call-id", "owner-chain",
+            ], namespace=offload.CliArguments())
+            request = offload.request_from_arguments(args)
+            config = offload.read_config()
+            mirror = offload.request_mirror(config, request, offload.KnownRepository("repository"))
+            with copies.remote_lease(mirror):
+                copies.register_remote(mirror)
+                with self.assertRaisesRegex(copies.CopyError, "busy; held by session director-session"):
+                    copies.remove_trees(mirror.owner)
+
     def test_failed_admission_keeps_both_local_and_remote_owners(self) -> None:
         first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
         second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
-        self.publish(first)
-        self.publish(second)
+        self.assertEqual(publish_mirror(first), 0)
+        self.assertEqual(publish_mirror(second), 0)
         with self.admission(free_gib=0) as (controller, config, request):
             result = offload.run_offload(controller, config, request, 0)
         self.assertIsInstance(result, offload.DeclinedMacRun)
@@ -572,8 +621,8 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def test_successful_admission_keeps_the_unselected_slot_owner(self) -> None:
         first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
         second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
-        self.publish(first)
-        self.publish(second)
+        self.assertEqual(publish_mirror(first), 0)
+        self.assertEqual(publish_mirror(second), 0)
         with self.admission() as (controller, config, request):
             result = offload.run_offload(controller, config, request, 0)
         self.assertIsInstance(result, offload.PassedOnTarget)
@@ -583,10 +632,9 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
 
     def test_refresh_keeps_the_owner_until_the_selected_run_starts(self) -> None:
         mirror = self.mirror_record()
-        self.publish(mirror)
-        args = self.action(replace(mirror, owner="next-owner"), "mirror-receive")
-        args.command = ["true"]
-        self.assertEqual(copies.mirror_action(args), 0)
+        self.assertEqual(publish_mirror(mirror), 0)
+        args = mirror_arguments(replace(mirror, owner="next-owner"), "mirror-receive")
+        self.assertEqual(copies.mirror_run(args), 0)
         self.assertEqual(json.loads((self.mirror / ".copy-record.json").read_text())["owner"], "alpha")
         self.assertEqual(copies.owned_remote_mirrors("alpha"), [mirror])
 
@@ -610,7 +658,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def test_cancelled_sweep_releases_real_locks_for_admission_and_owner_removal(self) -> None:
         from scripts.mac_test.mirror_root import MacMirrorRoot
         mirror = self.mirror_record(path=MacMirrorRoot.read(conf.read("mac_test")).local_path() / "repository")
-        self.publish(mirror)
+        self.assertEqual(publish_mirror(mirror), 0)
         entered, cancel = Event(), Event()
 
         def hold(*arguments: object, **keywords: object) -> int:

@@ -23,6 +23,7 @@ from unittest import mock
 if TYPE_CHECKING:
     from ..aws_target.runner_test_support import interrupt_runner, seed_runner_permission
     from . import linux_runner, mac_test, offload, test_target_slots
+    from .offload_test_support import mirror_use_payload
     from ..lint import sweep
     from ..lint.memory_test_support import write_config_fixture
 else:
@@ -31,6 +32,7 @@ else:
     import mac_test
     import offload
     import test_target_slots
+    from offload_test_support import mirror_use_payload
     import sweep
     from scripts.lint.memory_test_support import write_config_fixture
 
@@ -212,9 +214,8 @@ class LinuxShellTests(unittest.TestCase):
 
     def request(self, verb: offload.MacVerb = "nextest", words: tuple[str, ...] = ()) -> offload.OffloadRequest:
         return offload.OffloadRequest(
-            self.source, "hana", "call with spaces", offload.NO_RESULT_FILE, words,
-            verb=verb, target="aws", slot=2,
-        )
+            self.source, "hana", "call with spaces", offload.NO_RESULT_FILE, words, owner="verify",
+            verb=verb, target="aws", slot=2, holder_session="fixture-session")
 
     def command(self, request: offload.OffloadRequest) -> str:
         return offload.remote_test_command(
@@ -1164,7 +1165,7 @@ class LinuxProcessTests(unittest.TestCase):
         cleanup_replies: list[subprocess.CompletedProcess[str]] = []
 
         def runner(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
-            argv = shlex.split(dispatch.payload_arguments(arguments)[-1])
+            argv = shlex.split(mirror_use_payload(dispatch, arguments)[-1])
             output, errors = io.StringIO(), io.StringIO()
             with mock.patch.object(sys, "argv", argv[1:]), \
                     redirect_stdout(output), redirect_stderr(errors):
@@ -1423,7 +1424,7 @@ class LinuxCopyTests(unittest.TestCase):
                            + 'shift\ncd "$TEST_REMOTE_HOME" || exit 1\nexec bash -c "$*"\n')
         ssh.chmod(0o755)
         controller = offload.ProcessController()
-        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), target="aws")
+        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), owner="verify", target="aws", holder_session="fixture-session")
         identity = offload.KnownRepository("source", "https://example.invalid/team/hana")
         environment = {**os.environ, "PATH": f"{self.root}:{os.environ['PATH']}",
                        "TEST_REMOTE_HOME": str(remote_home), "HOME": str(remote_home)}
@@ -1444,7 +1445,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("add", ".gitignore", "tests/b.rs", "src/lib.rs")
         _ = self.git("commit", "-qm", "Fixture source")
         controller = offload.ProcessController()
-        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), target="aws")
+        request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), owner="verify", target="aws", holder_session="fixture-session")
         identity = offload.KnownRepository("source", "https://example.invalid/team/hana")
         with mock.patch.object(controller, "capture", side_effect=self.capture):
             self.assertTrue(offload.copy_tree(controller, self.config(), request, identity))
@@ -1580,7 +1581,7 @@ class LinuxDispatchTests(unittest.TestCase):
 
     def request(self, verb: offload.MacVerb = "nextest") -> offload.OffloadRequest:
         return offload.OffloadRequest(self.source, "hana", "call", offload.NO_RESULT_FILE,
-                                     ("-p", "hana"), verb=verb, target="aws")
+                                     ("-p", "hana"), owner="verify", verb=verb, target="aws", holder_session="fixture-session")
 
     def state_arguments(self, arguments: Sequence[str]) -> mac_test.CliArguments:
         return mac_test.parser().parse_args(list(arguments[2:]), namespace=mac_test.CliArguments())
@@ -1629,20 +1630,8 @@ class LinuxDispatchTests(unittest.TestCase):
             return offload.CommandOutput(0, self.probe_wire, "")
         self.fail(f"Unexpected command: {argv}")
 
-    def payload_arguments(self, arguments: Sequence[str]) -> list[str]:
-        words = shlex.split(arguments[-1])
-        if "mirror-use" not in words:
-            return list(arguments)
-        boundary = words.index("--")
-        self.assertEqual(words[boundary + 1:boundary + 3], ["sh", "-c"])
-        self.assertEqual(len(words[boundary + 3:]), 1)
-        self.assertIn("--owner", words[:boundary])
-        self.assertIn("--repository", words[:boundary])
-        self.assertIn("--session", words[:boundary])
-        return [*arguments[:-1], words[boundary + 3]]
-
     def stream(self, arguments: Sequence[str]) -> offload.RemoteRunStatus:
-        self.commands.append(self.payload_arguments(arguments))
+        self.commands.append(mirror_use_payload(self, arguments))
         self.actions.append("run")
         return self.stream_status
 
@@ -1771,7 +1760,7 @@ class LinuxDispatchTests(unittest.TestCase):
         ])
         source_copy = next(argv for argv in self.commands if argv[0] == "rsync" and any(word.startswith("--exclude-from=") for word in argv))
         self.assertIn("--delete", source_copy)
-        self.assertEqual(self.filters, ["/.git\n/target/\n/.mac-test-mirror\n/.copy-record.json\n/.copy-session\n/private/\n/.env\n"])
+        self.assertEqual(self.filters, ["/.git\n/target/\n/private/\n/.env\n"])
         self.assertNotIn("--copy-links", source_copy)
         identity = offload.repository_identity(self.source)
         if not isinstance(identity, offload.KnownRepository):

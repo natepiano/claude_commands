@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import fcntl
 import os
 import select
 from pathlib import Path
@@ -12,14 +13,16 @@ import subprocess
 import sys
 import tempfile
 from threading import Event
-from typing import cast, final, override
+from typing import final, override
 import unittest
 from unittest import mock
 
 from scripts.copies import copies
-from scripts.lib import file_lock
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal
+from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import floor_claims
+from scripts.lint import tmp_sweep
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
@@ -34,14 +37,7 @@ class RemoteCopiesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        config = self.root / "copies.conf"
-        _ = config.write_text(f"root={self.root}/gates\nwait_seconds=0.01\ngit_timeout_seconds=10\nguard_timeout_seconds=10\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "COPIES_CONFIG": str(config),
-            "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_HOLDS": str(self.root / "holds.json"),
-        })))
+        self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
                                              {"source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
         self.mirror = self.root / "mirrors/repository"
@@ -57,14 +53,14 @@ class RemoteCopiesTests(unittest.TestCase):
         _ = (self.source / "untracked.txt").write_text("untracked\n")
         index = self.source / ".git/index"
         before = index.read_bytes(), index.stat().st_mtime_ns, original.stat().st_mtime_ns
-        with copies.standing("alpha", self.source, copies.StagedSource()) as tree:
+        with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as tree:
             self.assertEqual((tree / "source.txt").read_text(), "staged\n")
             self.assertFalse((tree / "untracked.txt").exists())
             stable = tree / "stable.txt"
             os.utime(stable, ns=(1_000_000_000, 1_000_000_000))
             target = tree / "target/retained"
             _ = target.write_text("artifact")
-        with copies.standing("alpha", self.source, copies.StagedSource()) as reused:
+        with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as reused:
             self.assertEqual(reused, tree)
             self.assertEqual(stable.stat().st_mtime_ns, 1_000_000_000)
             self.assertEqual(target.read_text(), "artifact")
@@ -83,14 +79,7 @@ class RemoteCopiesTests(unittest.TestCase):
     def test_owner_removal_keeps_another_owner_and_repository(self) -> None:
         mine, other, elsewhere = self.remote(), self.remote("beta", "mirror/beta"), self.remote("alpha", "mirror/else")
         elsewhere = copies.RemoteMirror("alpha", copies.SelectedRepository("another"), "host", elsewhere.path, "another-session")
-        for item in (mine, other, elsewhere):
-            copies.register_remote(item)
-            with copies.remote_lease(item):
-                pass
-        def remove_record(item: copies.RemoteMirror) -> None:
-            copies.remote_record_path(item).unlink()
-
-        with mock.patch.object(copies, "remove_remote_mirror", side_effect=remove_record) as remove:
+        with fake_remote_removal((mine, other, elsewhere)) as remove:
             copies.remove_trees("alpha", copies.SelectedRepository(self.source.name))
         remove.assert_called_once_with(mine)
         self.assertEqual(copies.owned_remote_mirrors("alpha"), [elsewhere])
@@ -141,19 +130,19 @@ class RemoteCopiesTests(unittest.TestCase):
         copies.probe_remote_folder(str(self.mirror))
         idle = self.mirror.parent / "idle"
         copies.probe_remote_folder(str(idle))
-        lock_inode = copies.mirror_lock_path(self.mirror).stat().st_ino
+        lock_inode = floor_claims.mirror_lock_path(self.mirror).stat().st_ino
         with copies.local_mirror_lease(self.mirror, "run-session"):
             with self.assertRaisesRegex(RuntimeError, "cancelled sweep"):
                 with copies.mirror_sweep_leases(self.mirror.parent) as protected:
                     self.assertEqual(protected, frozenset({self.mirror}))
                     with copies.target_mirror_leases([str(self.mirror / "target")]) as linux_protected:
                         self.assertEqual(linux_protected, frozenset({self.mirror}))
-                    with file_lock.exclusive(copies.mirror_lock_path(idle), wait=False) as state:
+                    with file_lock.exclusive(floor_claims.mirror_lock_path(idle), wait=False) as state:
                         self.assertIs(state, file_lock.LockResult.BUSY)
                     raise RuntimeError("cancelled sweep")
         with copies.local_mirror_lease(idle, "after-cancel"):
             pass
-        self.assertEqual(copies.mirror_lock_path(self.mirror).stat().st_ino, lock_inode)
+        self.assertEqual(floor_claims.mirror_lock_path(self.mirror).stat().st_ino, lock_inode)
         self.assertTrue((self.mirror / ".copy-record.json").exists())
 
     def test_live_child_keeps_the_remote_lease_after_owner_exit(self) -> None:
@@ -226,7 +215,7 @@ class RemoteCopiesTests(unittest.TestCase):
 
         @contextmanager
         def claims(_timeout: float) -> Generator[floor_claims.LockedClaims]:
-            with file_lock.exclusive(copies.mirror_lock_path(self.mirror), wait=False) as state:
+            with file_lock.exclusive(floor_claims.mirror_lock_path(self.mirror), wait=False) as state:
                 self.assertIs(state, file_lock.LockResult.BUSY)
             claim_held.set()
             try:
@@ -244,7 +233,7 @@ class RemoteCopiesTests(unittest.TestCase):
 
         with mock.patch.object(floor_claims, "locked_claims", side_effect=claims), \
                 mock.patch.object(copies, "write_text_atomic", side_effect=record):
-            self.assertEqual(copies.mirror_action(args), 0)
+            self.assertEqual(copies.mirror_run(args), 0)
         metadata = self.mirror / ".copy-record.json"
         self.assertIn('"owner": "alpha"', metadata.read_text())
         self.assertTrue((self.mirror / ".mac-test-mirror").exists())
@@ -265,21 +254,175 @@ class RemoteCopiesTests(unittest.TestCase):
                 self.assertEqual(mirror.session, "session")
                 self.assertIn("copies.py mirror-use", copies.remote_use_command(mirror, "true"))
 
+    @contextmanager
+    def open_file_process(self, path: Path) -> Generator[subprocess.Popen[str]]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("held\n")
+        child = subprocess.Popen([
+            sys.executable, "-c",
+            "import signal,sys; held=open(sys.argv[1]); print('ready',flush=True); signal.pause()",
+            str(path),
+        ], cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            if child.stdout is None:
+                self.fail("The child has no readiness stream")
+            self.assertTrue(select.select([child.stdout], [], [], 10)[0])
+            self.assertEqual(child.stdout.readline(), "ready\n")
+            yield child
+        finally:
+            child.kill()
+            _ = child.communicate(timeout=10)
+
+    def test_open_file_below_mirror_keeps_the_mirror_busy(self) -> None:
+        with self.open_file_process(self.mirror / "target/output"):
+            self.assertTrue(copies.mirror_has_process(self.mirror, copies.scan_mirror_processes((self.mirror,))))
+
+    def test_open_file_in_text_prefix_sibling_does_not_keep_the_mirror(self) -> None:
+        self.mirror.mkdir(parents=True)
+        with self.open_file_process(self.mirror.with_name(self.mirror.name + "-other") / "output"):
+            self.assertFalse(copies.mirror_has_process(self.mirror, copies.scan_mirror_processes((self.mirror,))))
+
+    def test_process_below_the_filesystem_root_keeps_a_root_mirror(self) -> None:
+        uses = tmp_sweep.ProcessUsesKnown([("/var/tmp/output", os.getpid() + 1, "cwd")])
+        self.assertTrue(copies.mirror_has_process(Path("/"), copies.MirrorProcessScan(uses, frozenset())))
+
+    def test_unavailable_lsof_scan_keeps_the_mirror_busy(self) -> None:
+        self.mirror.mkdir(parents=True)
+        tools = self.root / "lsof-tools"
+        tools.mkdir()
+        lsof = tools / "lsof"
+        _ = lsof.write_text("#!/bin/sh\nexit 1\n")
+        lsof.chmod(0o755)
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.dict(os.environ, {
+                "PATH": str(tools) + os.pathsep + os.environ["PATH"]}):
+            self.assertTrue(copies.mirror_has_process(self.mirror, copies.scan_mirror_processes((self.mirror,))))
+
+    def test_unreadable_process_in_the_lease_group_keeps_the_mirror(self) -> None:
+        self.mirror.mkdir(parents=True)
+        with self.open_file_process(self.root / "outside/output") as child:
+            copies.mark_mirror(self.mirror, "alpha", "repository", "group-session", process_group=os.getpgid(child.pid))
+            cwd = Path("/proc") / str(child.pid) / "cwd"
+            readlink = os.readlink
+
+            def unreadable_readlink(path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                                    *, dir_fd: int | None = None) -> str:
+                if os.fsdecode(path) == str(cwd):
+                    raise PermissionError(str(path))
+                return readlink(os.fsdecode(path), dir_fd=dir_fd)
+
+            with mock.patch.object(os, "readlink", unreadable_readlink):
+                with self.assertRaisesRegex(copies.CopyError, "busy.*group-session"):
+                    with copies.local_mirror_lease(self.mirror, "remove", create=False):
+                        self.fail("An unreadable process lost its lease group")
+
+    def test_process_started_before_the_first_lease_keeps_the_mirror(self) -> None:
+        self.mirror.mkdir(parents=True)
+        flock = fcntl.flock
+
+        @contextmanager
+        def child_in_mirror() -> Generator[None]:
+            child = subprocess.Popen([
+                sys.executable, "-c",
+                "import signal; print('ready',flush=True); signal.pause()",
+            ], cwd=self.mirror, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                if child.stdout is None:
+                    self.fail("The child has no readiness stream")
+                self.assertTrue(select.select([child.stdout], [], [], 10)[0])
+                self.assertEqual(child.stdout.readline(), "ready\n")
+                yield
+            finally:
+                child.kill()
+                _ = child.communicate(timeout=10)
+
+        with ExitStack() as cleanup:
+            started = False
+
+            def start_before_lease(descriptor: int, operation: int) -> None:
+                nonlocal started
+                if not started and operation & fcntl.LOCK_EX:
+                    started = True
+                    cleanup.enter_context(child_in_mirror())
+                flock(descriptor, operation)
+
+            with mock.patch.object(fcntl, "flock", start_before_lease):
+                with copies.mirror_lease_set({self.mirror}) as protected:
+                    self.assertIn(self.mirror, protected)
+
+    def test_lsof_exit_status_controls_scan_availability_and_mirror_protection(self) -> None:
+        self.mirror.mkdir(parents=True)
+        tools = self.root / "lsof-status-tools"
+        tools.mkdir()
+        lsof = tools / "lsof"
+        for status in (0, 1, 2):
+            _ = lsof.write_text("#!/bin/sh\nprintf 'p999999\\nfcwd\\nn/unrelated\\n'\nexit " + str(status) + "\n")
+            lsof.chmod(0o755)
+            with mock.patch.object(sys, "platform", "darwin"), mock.patch.dict(os.environ, {
+                    "PATH": str(tools) + os.pathsep + os.environ["PATH"]}):
+                with self.subTest(status=status, behavior="scan result"):
+                    result = tmp_sweep.lsof_paths(str(self.mirror))
+                    self.assertIsInstance(result, tmp_sweep.ProcessUsesUnavailable if status == 2 else tmp_sweep.ProcessUsesKnown)
+                with self.subTest(status=status, behavior="mirror protection"):
+                    self.assertEqual(copies.mirror_has_process(self.mirror, copies.scan_mirror_processes((self.mirror,))), status == 2)
+
+    def test_many_mirrors_share_one_process_scan(self) -> None:
+        idle = self.mirror.parent / "idle"
+        idle.mkdir(parents=True)
+        self.mirror.mkdir()
+        with mock.patch.object(tmp_sweep, "process_paths", wraps=tmp_sweep.process_paths) as scan:
+            with copies.mirror_lease_set({self.mirror, idle}) as protected:
+                self.assertEqual(protected, frozenset())
+            self.assertEqual(scan.call_count, 1)
+
+    def probe_command(self) -> subprocess.CompletedProcess[str]:
+        tools = self.root / "probe-tools"
+        tools.mkdir()
+        log = self.root / "probe-calls"
+        _ = log.write_text("")
+        python = tools / "python3"
+        _ = python.write_text(f"#!{sys.executable}\n" + f"""import sys
+from pathlib import Path
+from scripts.copies import copies
+from scripts.mac_test import floor_claims
+log = Path({str(log)!r})
+with log.open('a') as output:
+    output.write('python\\n')
+def trace(frame, event, argument):
+    if event == 'call' and argument is None and frame.f_code.co_filename in (copies.__file__, floor_claims.__file__):
+        if frame.f_code.co_name in ('mirror_local_path', 'mark_mirror'):
+            with log.open('a') as output:
+                output.write(frame.f_code.co_name + '\\n')
+sys.setprofile(trace)
+program = sys.argv[2]
+sys.argv = sys.argv[2:]
+exec(compile(program, '<remote-probe>', 'exec'))
+""")
+        python.chmod(0o755)
+        return subprocess.run(["/bin/sh", "-c", copies.mirror_probe_setup(str(self.mirror))],
+                              env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                                   "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+                              capture_output=True, text=True, timeout=10)
+
+    def test_marked_probe_starts_no_remote_python(self) -> None:
+        with copies.local_mirror_lease(self.mirror, "marked-session"):
+            copies.mark_mirror(self.mirror, "alpha", "repository", "marked-session")
+        result = self.probe_command()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "probe-calls").read_text(), "")
+
+    def test_unmarked_probe_checks_the_local_path_before_marking(self) -> None:
+        result = self.probe_command()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "probe-calls").read_text().splitlines(),
+                         ["python", "mirror_local_path", "mark_mirror"])
+        self.assertEqual(floor_claims.read_mirror_record(self.mirror / floor_claims.MIRROR_RECORD)["kind"], "remote-mirror")
+
     def test_allow_list_keeps_only_original_copy_makers(self) -> None:
-        settings = (Path(__file__).resolve().parents[2] / "config/copies.conf").read_text()
-        entries = {line.split("=", 1)[0].removeprefix("allow.") for line in settings.splitlines() if line.startswith("allow.")}
+        settings = conf.read(Path(__file__).resolve().parents[2] / "config/copies.conf").values()
+        entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
         self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "production/resume_unit.py",
             "style/add_style.py", "worktree/make_worktree.sh", "berth_fix/launch.sh",
             "bevy_migration_plan/bevy_migration_ensure_repo.sh"})
-
-    def test_doc_checkout_uses_the_staged_copy_api(self) -> None:
-        source = (Path(__file__).resolve().parents[1] / "direct/verify.sh").read_text()
-        checkout = source[source.index("doc_checkout() {"):source.index("doc_record() {")]
-        self.assertIn('copies.py', checkout)
-        self.assertIn('hold --repo', checkout)
-        self.assertNotIn('read-tree', checkout)
-        self.assertNotIn('checkout-index', checkout)
-
 
 if __name__ == "__main__":
     _ = unittest.main()

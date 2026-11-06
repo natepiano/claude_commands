@@ -28,8 +28,18 @@ Rustdoc runs once per phase, as the unit director's last command before a Rust c
 
 `verify.sh doc [--features <list>]` does these steps:
 
-1. It reads the repo top (`git rev-parse --show-toplevel`) and the staged tree id (`doc_tree`).
-2. It resolves the original target directory from `CARGO_TARGET_DIR` or `cargo metadata`. It exports this target for rustdoc. It starts `copies.py hold` with `StagedSource` and the staged tree id. The copies owner leases the standing checkout for the whole run. The checkout has its own index. The copies owner updates staged content and preserves unchanged mtimes. It removes a stale index lock before index writes. It repairs a damaged private index under the checkout lease. Source files and the source index stay unchanged.
+1. It reads the repository root through `git rev-parse --show-toplevel`.
+2. It resolves the original target directory from `CARGO_TARGET_DIR` or `cargo metadata` and exports this target for rustdoc.
+   It starts `copies.py hold` without a tree argument.
+   `hold` computes the staged tree and creates `StagedSource(tree)`.
+   It prints the tree identity and standing checkout path on separate lines.
+   `verify.sh` reads both lines.
+   The copies owner leases the standing checkout for the whole run.
+   The checkout has its own index.
+   The copies owner updates staged content and preserves unchanged modification times.
+   It removes a stale index lock before index writes.
+   It repairs a damaged private index under the checkout lease.
+   Source files and the source index stay unchanged.
 3. If `lint.conf` has `doc=off`, it prints one line that says it ignores the switch.
 4. In the standing checkout, it runs `LINT_CONFIG_FORCE=1 invoke_doc --workspace`, through the cargo token and the memory gate. Feature names pass through unchanged.
 5. On exit 0, `doc_record` computes the staged tree id again. If the staged tree changed during the run, it prints a notice and writes no record.

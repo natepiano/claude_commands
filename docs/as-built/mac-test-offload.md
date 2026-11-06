@@ -190,7 +190,9 @@ An interruption marker reports the instance generation.
 - `offload.py run --repo-root DIR [--package PKG] [--verb nextest|check|clippy|mend-check|doc] --call-id ID [--settings FILE] [--last-decline busy|blocked] [--filter-run] [--result FILE] -- <verb arguments>` exits 0 on a Mac pass, 75 for local fallback, and the step's own status on a Mac failure. The default verb is `nextest`. Claims use `--what "<verb> <package or workspace>"`. `lint check` runs Cargo check; `lint mend-check` runs mend with `--fail-on-warn`; remote doc sets `LINT_CONFIG_FORCE=1`. Workspace verbs use the same manifest-based Linux-only check as `eligible --kind`. `--settings` selects that target's config. `--last-decline` suppresses an unchanged retry notice. `write_result` writes `mac=`, `reason=`, `seconds=` from `PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline`. A busy result alone adds `holder=`: the claim's `what`, `leftovers`, or `unreadable`; `KnownMacJob | LostRunLeftovers | UnreadableMacHolder` gives that value its meaning. Missing or contradictory results are unusable. Declined, lost and invalid results return the record to `waiting_mac` before the next wait.
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests (user, 2026-10-18). An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.
-- The copy is `rsync -rlpc --delete --exclude-from` into `~/.local/state/mac-test/mirror/<repo>`, leaving out `/.git`, `/target/` and every ignored path, so the mirror's `target` folder survives the copy.
+- `copies.remote_rsync` builds the refresh command for the configured mirror root.
+  It excludes `/.git`, `/target/`, ignored paths, and the metadata that copies.py owns.
+  The mirror's build output survives the refresh.
 - The run is one ssh call through `lint <verb>`, with `mac_skip.<repo>` applied only to nextest's `-E` filter and `LINT_SWEEP_BUDGET_GIB` from `mac_budget_gib[.<repo>]`. `remote_test_command` sets `MACOSX_DEPLOYMENT_TARGET=14.0` so dependencies build for the supported macOS version; changing it costs one rebuild. It also sets `LINT_SKIP_SWEEP=1`, so `scripts/lint/invoke.sh` `sweep_after_step` returns at once and the Mac's steps start no detached sweep that could outlive the run; runs on natedev keep their sweep. The runner prints `mac_test: running on the Mac (macOS, host <host>); tree copied in <N> s`. Nextest exit 4 is `NoTestMatchedOnMac`: `mac_test: no test matched on the Mac; running on natedev instead`, exit 75.
 - **Cleanup.** After `echo mac_exit=$?` the remote command runs a cleanup step whatever the tests returned. When the verb arguments name `--target-dir` (or `--target-dir=`), it prints `mac_cleanup=skipped`. Otherwise it reads free GiB with `df -g "$HOME"`: below `free_floor_gib` it runs `rm -rf -- "$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` gives no number, it prints `mac_cleanup=kept` and the output stays for the next run. That path is the only thing it removes.
 - **Markers.** Output streams as it arrives. `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
@@ -309,17 +311,36 @@ Both values use the existing configuration reader.
 
 ## Registered remote mirrors
 
-`copies.py` owns mirror creation and refresh for Mac, Linux, and AWS targets.
-`OffloadRequest` carries the copy owner, repository scope, and holder session.
-The receiver excludes copy metadata during rsync deletion.
-The remote command inherits the mirror lease.
-The floor sweep acquires mirror leases before claim locks and skips busy mirrors.
-Owner cleanup names a busy holder and preserves its mirror metadata.
-`mac_run.sh` registers its task-owned remote clone with the same owner cleanup API.
+`OffloadRequest` requires the copy owner and holder session.
+It also carries the repository scope.
+`request_from_arguments` selects the holder through `build_hold.owning_session()` before the shell session fallback.
+`request_mirror` uses this supplied session without another lookup.
+Busy refusals can name the unit director's session.
+
+`offload.py` requests Mac, Linux, and AWS mirrors through `copies.py`.
+It publishes ownership only for the selected slot after admission succeeds.
+Failed admission and unselected slots retain their owners.
+Claims and admission use `target_config.slot_capacity` with an explicit missing-value policy.
+An empty configured capacity raises `ConfigError`.
+The policy supplies a fallback only when both capacity keys are absent.
+The Mac retains its single slot per repository.
+
+`mac_run.sh` creates its task-owned clone through `copies.py`.
+It preserves both registrations until process exit and scratch cleanup succeed.
+It then removes the Mac registration before the natedev registration.
+Failed clone cleanup retains both registrations.
+
+[Gate checkouts](gate-checkouts.md#remote-mirrors) defines the mirror metadata, lock order, recovery, process scans, registry commands, and probe behavior.
+Candidate leases precede the shared scan, so a process that starts before lease acquisition protects its mirror.
+The scan accepts lsof output only with exit status 0 or 1.
 
 ## Documentation copies
 
-`verify.sh doc` uses `copies.standing` with `StagedSource`.
+`verify.sh doc` calls `copies.py hold` without a staged-tree argument.
+`hold` computes the staged tree and passes it to `copies.standing` through `StagedSource(tree)`.
+It prints the tree identity and checkout path on separate lines.
+`verify.sh` reads both lines.
+The private index folder uses the configured `prefixes.copies-index` name through `build_folders.temporary_build_folder`.
 The copy owner holds the lease until the verify shell closes its input descriptor.
 Both routes use the staged copy and keep the existing target directory.
 The source index remains unchanged.

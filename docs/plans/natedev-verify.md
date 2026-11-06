@@ -843,7 +843,7 @@ Checkpoints `f81a7ba55` and `3aea5698d` on `verify-remake-1-24`, landed with the
 
 **Ruled out:** taking the claim lock only in `mirror-remove` and claiming a slot before its lease (both change the lock order that mirror removal safety needs); one lease layer per mirror; one owner spelling written at record time; dropping `OffloadRequest.repository_scope`.
 
-### Phase 35b — Simplify the copies remote mirror code · status: todo
+### Phase 35b — Simplify the copies remote mirror code · status: done
 
 **Depends on:** Phase 35. Queue-unit owns `scripts/copies/` once Phase 35 is on GitHub builds, and it does not take these items. Name each path it owns as `also touches <path> (owner queue-unit)` in the notice.
 

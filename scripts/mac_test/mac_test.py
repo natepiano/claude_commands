@@ -965,12 +965,9 @@ def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
     if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
         return 1
     values = conf.read(config_path(paths.target)).values()
-    value = values.get(f"slots.{scope.name}", values.get("slots", ""))
-    if not value and not scope.key:
-        return 1  # Preserve the legacy claim protocol for records without an origin.
-    if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise ConfigError(f"slots.{scope.name}: expected a positive integer")
-    return int(value)
+    missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key else
+               target_config.MissingSlotCapacity.SINGLE_SLOT)
+    return target_config.slot_capacity(values, scope.name, missing=missing)
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:

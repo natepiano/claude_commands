@@ -87,6 +87,12 @@ release_mac_claim() {
       if ! on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task" >/dev/null; then
         print -u2 "mac_run: scratch cleanup failed; kept task $clone_task"
         cleanup_failed=1
+      elif ! on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" >/dev/null; then
+        print -u2 "mac_run: remote clone registry cleanup failed"
+        cleanup_failed=1
+      elif ! python3 $copies_script unregister-remote --host $host --path $clone; then
+        print -u2 "mac_run: local clone registry cleanup failed"
+        cleanup_failed=1
       fi
     else
       print -u2 "mac_run: process exit not confirmed; kept checkout $clone and task $clone_task${confirmation:+: $confirmation}"
@@ -132,10 +138,11 @@ copy_session_arg=${(q)copy_session}
 clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana --owner $copy_owner_arg --repository hana --session $copy_session_arg") || exit 4
 [[ $clone == /* && $clone != *$'\n'* ]] || { print -u2 'mac_run: scratch clone returned no absolute checkout'; exit 4 }
 clone_arg=${(q)clone}
-mirror_lease=$(python3 $copies_script register-remote --repo $repo --repository hana --owner $copy_owner --host $host --path $clone --session $copy_session --shell-lease) || exit 4
+registry_args=(--repository hana --owner $copy_owner --host $host --path $clone --session $copy_session)
+mirror_lease=$(python3 $copies_script register-remote "${registry_args[@]}" --shell-lease) || exit 4
 exec 8>"$mirror_lease"
 flock 8
-python3 $copies_script register-remote --repo $repo --repository hana --owner $copy_owner --host $host --path $clone --session $copy_session || exit 4
+python3 $copies_script register-remote "${registry_args[@]}" || exit 4
 base=$(ssh $host "git -C $clone_arg rev-parse HEAD")
 if git -C $repo merge-base --is-ancestor $sha $base 2>/dev/null; then
   ssh $host "git -C $clone_arg checkout -q --detach $sha"

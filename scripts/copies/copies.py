@@ -21,22 +21,24 @@ import stat
 import subprocess
 import sys
 import time
-import tempfile
 from threading import Event, Thread
-from typing import NoReturn, cast, override
+from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.lib import conf, copy_record, file_lock, scratch
+from scripts.lib import build_folders, conf, copy_record, file_lock, scratch
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
 from scripts.lib.atomic_file import remove_dead_temporary_files, write_text_atomic
+from scripts.mac_test import floor_claims
+if TYPE_CHECKING:
+    from scripts.lint import tmp_sweep
 
 GATE_RECORD = ".gate.json"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
-OWNER = re.compile(r"[a-z0-9][a-z0-9-]*")
+OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 GATE_SUFFIXES = ("", "-2")
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
@@ -93,9 +95,9 @@ class WorktreeSource:
 
 @dataclass(frozen=True)
 class StagedSource:
-    """Copy only the source index, or its previously judged tree."""
+    """Copy only the specified staged tree."""
 
-    tree: str = ""
+    tree: str
 
 
 @dataclass(frozen=True)
@@ -117,9 +119,10 @@ NO_MERGE = NoMerge()
 
 def staged_tree(source: Path) -> str:
     """Read the staged tree without changing the source index."""
-    with tempfile.TemporaryDirectory(prefix="copies-index-") as temporary:
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+            build_folders.FOLDER_PREFIXES["copies-index"])) as temporary:
         index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
-        private = Path(temporary) / "index"
+        private = temporary / "index"
         if index.exists():
             _ = shutil.copyfile(index, private)
         result = subprocess.run(["git", "-C", str(source), "write-tree"],
@@ -134,7 +137,7 @@ def source_commit(source: Path, policy: SourcePolicy) -> str:
     """Give a staged tree a private commit without changing any source refs."""
     if isinstance(policy, (CommittedSource, WorktreeSource)):
         return commit_at(source, policy.revision)
-    tree = policy.tree or staged_tree(source)
+    tree = policy.tree
     return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                "commit-tree", tree, "-p", commit_at(source, "HEAD"),
                data=b"copies: staged source\n").decode().strip()
@@ -252,6 +255,11 @@ def load_config() -> CopiesConfiguration:
     return CopiesConfiguration(root.resolve(), delay, git_timeout, guard_timeout, allow_list)
 
 
+def unit_owner(name: str) -> str:
+    """Keep the recorded unit name and append one unit suffix."""
+    return name.removesuffix("-unit") + "-unit"
+
+
 def source_owner(source: Path) -> str:
     """Use the standing checkout owner, copy owner or staff owner."""
     if (source / GATE_RECORD).is_file():
@@ -266,10 +274,10 @@ def source_owner(source: Path) -> str:
     try:
         member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
         if member is not None:
-            return checked_owner(member.name.removesuffix("-unit") + "-unit" if member.kind == "unit" else member.name)
+            return checked_owner(unit_owner(member.name) if member.kind == "unit" else member.name)
     except staff.StaffUnreadable:
         pass
-    return "verify"
+    return fallback_owner("verify")
 
 
 def fallback_owner(role: str) -> str:
@@ -318,7 +326,7 @@ def repository_name(source: Path) -> str:
 
 def checked_owner(owner: str) -> str:
     if not OWNER.fullmatch(owner):
-        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9-]*")
+        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9_-]*")
     return owner
 
 
@@ -1025,12 +1033,33 @@ def remote_registry() -> Path:
     return gates_root() / ".remote-mirrors"
 
 
-def remote_key(mirror: RemoteMirror) -> str:
-    return hashlib.sha256(f"{mirror.host}\0{mirror.path}".encode()).hexdigest()
+def remote_key(host: str, path: str) -> str:
+    return hashlib.sha256(f"{host}\0{path}".encode()).hexdigest()
 
 
 def remote_record_path(mirror: RemoteMirror) -> Path:
-    return remote_registry() / (remote_key(mirror) + ".json")
+    return remote_registry() / (remote_key(mirror.host, mirror.path) + ".json")
+
+
+def remote_lease_path(mirror: RemoteMirror) -> Path:
+    return remote_registry() / (remote_key(mirror.host, mirror.path) + ".lease")
+
+
+def held_remote_mirrors() -> tuple[floor_claims.HeldMirror, ...]:
+    """Read the kernel lock table once for all registered mirrors."""
+    try:
+        devices = file_lock.held_flock_keys(file_lock.PROC_LOCKS)
+    except OSError:
+        return ()
+    held: list[floor_claims.HeldMirror] = []
+    for mirror in remote_mirrors():
+        try:
+            device = file_lock.device_key(remote_lease_path(mirror))
+        except OSError:
+            continue
+        if device in devices:
+            held.append(floor_claims.HeldMirror(floor_claims.MirrorIdentity(mirror.host, mirror.path), mirror.session))
+    return tuple(held)
 
 
 def register_remote(mirror: RemoteMirror) -> None:
@@ -1046,22 +1075,35 @@ def register_remote(mirror: RemoteMirror) -> None:
         }) + "\n")
 
 
+def unregister_remote(host: str, path: str) -> None:
+    """Remove the registry record after confirmed mirror cleanup."""
+    with file_lock.exclusive(remote_registry() / "records.lock"):
+        key = remote_key(host, path)
+        (remote_registry() / (key + ".json")).unlink(missing_ok=True)
+
+
+def read_remote_mirror(path: Path) -> RemoteMirror:
+    """Decode one registry record without scanning other records."""
+    try:
+        raw = cast(object, json.loads(path.read_text()))
+        if not isinstance(raw, dict):
+            raise ValueError("expected a remote mirror record")
+        fields = cast(dict[str, object], raw)
+        values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
+        if not all(isinstance(value, str) for value in values):
+            raise ValueError("invalid remote mirror record")
+        unit, repo, host, remote, session = cast(list[str], values)
+        return RemoteMirror(unit, SelectedRepository(repo), host, remote, session)
+    except (OSError, ValueError) as error:
+        raise CopyError(f"{path}: repair remote mirror record: {error}") from error
+
+
 def remote_mirrors(scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirror]:
     found: list[RemoteMirror] = []
     for path in sorted(remote_registry().glob("*.json")):
-        try:
-            raw = cast(object, json.loads(path.read_text()))
-            if not isinstance(raw, dict):
-                raise ValueError("expected a remote mirror record")
-            fields = cast(dict[str, object], raw)
-            values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
-            if not all(isinstance(value, str) for value in values):
-                raise ValueError("invalid remote mirror record")
-            unit, repo, host, remote, session = cast(list[str], values)
-            if isinstance(scope, AllRepositories) or scope.name == repo:
-                found.append(RemoteMirror(unit, SelectedRepository(repo), host, remote, session))
-        except (OSError, ValueError) as error:
-            raise CopyError(f"{path}: repair remote mirror record: {error}") from error
+        mirror = read_remote_mirror(path)
+        if isinstance(scope, AllRepositories) or scope.name == mirror.repository.name:
+            found.append(mirror)
     return found
 
 
@@ -1077,30 +1119,35 @@ class BusyRemoteMirror(CopyError):
 def remote_lease(mirror: RemoteMirror) -> Generator[None]:
     """Take the mirror lease before admission, claims and record locks."""
     remote_registry().mkdir(parents=True, exist_ok=True)
-    with file_lock.exclusive(remote_registry() / (remote_key(mirror) + ".lease"), wait=False) as state:
+    with file_lock.exclusive(remote_lease_path(mirror), wait=False) as state:
         if state is file_lock.LockResult.BUSY:
-            previous = next((item for item in remote_mirrors()
-                             if item.path == mirror.path and item.host == mirror.host), mirror)
-            raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {previous.session}")
+            record = remote_record_path(mirror)
+            session = read_remote_mirror(record).session if record.exists() else mirror.session
+            raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {session}")
         yield
+
+
+def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
+    """Build the remote command with one mirror identity."""
+    return "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py " + shlex.join([
+        action, "--path", mirror.path, "--owner", mirror.owner, "--repository", mirror.repository.name,
+        "--session", mirror.session, *tail,
+    ])
 
 
 def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str]) -> list[str]:
     """Refresh a leased mirror through the remote copy owner."""
-    receiver = "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive " + shlex.join([
-        "--path", mirror.path, "--owner", mirror.owner, "--repository", mirror.repository.name,
-        "--session", mirror.session, "--", "rsync",
-    ])
+    receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
+    # Keep the existing command order while metadata removal keeps the record last.
+    exclusions = floor_claims.MIRROR_METADATA[1:] + floor_claims.MIRROR_METADATA[:1]
     return ["rsync", "-rlpc", "--delete", f"--rsync-path={receiver}",
+            *(f"--exclude=/{name}" for name in exclusions),
             f"--exclude-from={excludes}", "-e", shlex.join(["ssh", *options]),
             f"{source}/", f"{mirror.host}:{shlex.quote(mirror.path)}/"]
 
 
 def remote_use_command(mirror: RemoteMirror, command: str) -> str:
-    return "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-use " + shlex.join([
-        "--path", mirror.path, "--owner", mirror.owner, "--repository", mirror.repository.name,
-        "--session", mirror.session, "--", "sh", "-c", command,
-    ])
+    return remote_copies_command("mirror-use", mirror, "--", "sh", "-c", command)
 
 
 def inherited_mirror_descriptors() -> tuple[int, ...]:
@@ -1117,86 +1164,100 @@ def mirror_probe_setup(path: str) -> str:
         "from scripts.copies import copies",
         "copies.probe_remote_folder(sys.argv[1])",
     ))
-    return "python3 -c " + shlex.quote(program) + " " + shlex.quote(path) + " || exit 1"
+    relative = path.removeprefix("~/")
+    mark = shlex.quote(str(Path(relative) / floor_claims.MIRROR_MARK))
+    shell_mark = mark if Path(relative).is_absolute() else '"$HOME"/' + mark
+    return ("test -f " + shell_mark + " || python3 -c " + shlex.quote(program) + " " +
+            shlex.quote(path) + " || exit 1")
+
+
+def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:
+    """Publish mirror metadata before removal authority can disappear."""
+    write_text_atomic(tree / floor_claims.MIRROR_RECORD, json.dumps({
+        "kind": "remote-mirror", "owner": owner, "repo": repo, "session": session, **extra,
+    }) + "\n")
+    write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")
+    write_text_atomic(tree / floor_claims.MIRROR_MARK, "registered remote mirror\n")
 
 
 def probe_remote_folder(path: str) -> None:
-    tree = mirror_local_path(path)
+    tree = floor_claims.mirror_local_path(path)
     if tree.is_dir():
         return
     with local_mirror_lease(tree, "probe"):
-        write_text_atomic(tree / ".copy-record.json", json.dumps({
-            "kind": "remote-mirror", "owner": "probe", "repo": "probe", "session": "probe",
-        }) + "\n")
-        write_text_atomic(tree / ".mac-test-mirror", "registered remote mirror\n")
+        mark_mirror(tree, "probe", "probe", "probe")
 
 
-def mirror_local_path(path: str) -> Path:
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path.home() / candidate
-    candidate = candidate.absolute()
-    return candidate
+@dataclass(frozen=True)
+class MirrorProcessScan:
+    """Share process paths and unreadable lease groups across mirror checks."""
+
+    uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable
+    unreadable_groups: frozenset[int]
 
 
-def mirror_lock_path(tree: Path) -> Path:
-    # A sibling lock survives replacement or removal of the mirror itself.
-    return tree.parent / ("." + tree.name + ".copy-lease")
+def scan_mirror_processes(mirrors: Sequence[Path]) -> MirrorProcessScan:
+    from scripts.lint import tmp_sweep
 
-
-def mirror_has_process(tree: Path) -> bool:
-    """Keep a mirror when a surviving process or its lease group uses it."""
-    if not tree.exists():
-        return False
+    prefixes = tuple(str(tree.resolve()) for tree in mirrors)
+    if not prefixes:
+        return MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
+    unreadable_groups: set[int] = set()
     if sys.platform == "linux":
-        try:
-            record = cast(dict[str, object], json.loads((tree / ".copy-record.json").read_text()))
-            group = record.get("process_group")
-        except (OSError, ValueError):
-            group = None
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit() or int(entry.name) == os.getpid():
-                continue
-            try:
-                if (entry / "cwd").resolve(strict=True).is_relative_to(tree.resolve()):
-                    return True
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            except PermissionError:
-                # An unreadable unrelated service does not hold this mirror.
+        uses = tmp_sweep.process_paths("/proc", prefixes)
+        if isinstance(uses, tmp_sweep.ProcessUsesKnown):
+            for pid in uses.unreadable_cwd_pids:
+                if pid == os.getpid():
+                    continue
                 try:
-                    if isinstance(group, int) and os.getpgid(int(entry.name)) == group:
-                        return True
+                    unreadable_groups.add(os.getpgid(pid))
                 except ProcessLookupError:
                     continue
+    else:
+        uses = tmp_sweep.lsof_paths(prefixes)
+    return MirrorProcessScan(uses, frozenset(unreadable_groups))
+
+
+def mirror_has_process(tree: Path, processes: MirrorProcessScan) -> bool:
+    """Keep a mirror with an active path, unreadable lease group, or unavailable scan."""
+    from scripts.lint import tmp_sweep
+
+    if not tree.exists():
         return False
-    answer = subprocess.run(["lsof", "-t", "+D", str(tree)], capture_output=True, text=True,
-                            timeout=load_config().git_timeout_seconds)
-    return answer.returncode not in (0, 1) or bool(answer.stdout.strip())
+    tree = tree.resolve()
+    root = str(tree)
+    descendant_prefix = os.path.join(root, "")
+    if isinstance(processes.uses, tmp_sweep.ProcessUsesUnavailable):
+        return True
+    if any(pid != os.getpid() and (path == root or path.startswith(descendant_prefix))
+           for path, pid, _ in processes.uses.paths):
+        return True
+    try:
+        group = floor_claims.read_mirror_record(tree / floor_claims.MIRROR_RECORD).get("process_group")
+    except (OSError, ValueError):
+        return False
+    return isinstance(group, int) and group in processes.unreadable_groups
 
 
 @contextmanager
 def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Generator[None]:
     """Lock the mirror before any claim or record operation."""
     tree.parent.mkdir(parents=True, exist_ok=True)
-    with mirror_lock_path(tree).open("a+") as lock:
+    with floor_claims.mirror_lock_path(tree).open("a+") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
+            busy = mirror_has_process(tree, scan_mirror_processes((tree,)))
+        except BlockingIOError:
+            busy = True
+        if busy:
             try:
-                held = (tree / ".copy-session").read_text().strip()
-            except OSError:
-                held = "unreadable"
-            raise CopyError(f"{tree}: busy; held by session {held}") from error
-        if mirror_has_process(tree):
-            try:
-                held = (tree / ".copy-session").read_text().strip()
+                held = (tree / floor_claims.MIRROR_SESSION).read_text().strip()
             except OSError:
                 held = "unreadable"
             raise CopyError(f"{tree}: busy; held by session {held}")
         if create:
             tree.mkdir(parents=True, exist_ok=True)
-            write_text_atomic(tree / ".copy-session", session + "\n")
+            write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), lock.fileno()))
         try:
             yield
@@ -1210,10 +1271,21 @@ def mirror_lease_set(mirrors: set[Path]) -> Generator[frozenset[Path]]:
     """Hold idle mirror leases and identify mirrors held by live runs."""
     protected: set[Path] = set()
     with ExitStack() as leases:
+        candidates: dict[Path, TextIO] = {}
         for mirror in sorted(mirrors):
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            lock = leases.enter_context(floor_claims.mirror_lock_path(mirror).open("a+"))
             try:
-                leases.enter_context(local_mirror_lease(mirror, "floor-sweep", create=False))
-            except CopyError:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                protected.add(mirror)
+            else:
+                candidates[mirror] = lock
+        processes = scan_mirror_processes(tuple(candidates))
+        for mirror, lock in candidates.items():
+            if mirror_has_process(mirror, processes):
+                lock.close()
                 protected.add(mirror)
         yield frozenset(protected)
 
@@ -1221,11 +1293,13 @@ def mirror_lease_set(mirrors: set[Path]) -> Generator[frozenset[Path]]:
 @contextmanager
 def mirror_sweep_leases(root: Path) -> Generator[frozenset[Path]]:
     """Take idle mirror leases before the floor claim lock."""
-    mirrors: set[Path] = {mark.parent for mark in root.rglob(".mac-test-mirror")} if root.exists() else set()
-    mirrors.update(mirror_local_path(item.path) for item in remote_mirrors() if item.host == "localhost")
-    if root.exists():
-        mirrors.update(path.parent / path.name[1:-len(".copy-removing.json")]
-                       for path in root.rglob(".*.copy-removing.json"))
+    mirrors = {mark.parent for pattern in (f"*/{floor_claims.MIRROR_MARK}", f"*/*/{floor_claims.MIRROR_MARK}")
+               for mark in root.glob(pattern)}
+    mirrors.update(floor_claims.mirror_local_path(item.path) for item in remote_mirrors() if item.host == "localhost")
+    authority_glob = floor_claims.removal_authority_path(Path("*")).name
+    mirrors.update(path.parent / path.name[1:-len(floor_claims.MIRROR_REMOVAL_SUFFIX)]
+                   for pattern in (authority_glob, "*/" + authority_glob)
+                   for path in root.glob(pattern))
     with mirror_lease_set(mirrors) as protected:
         yield protected
 
@@ -1237,7 +1311,7 @@ def target_mirror_leases(targets: Sequence[str]) -> Generator[frozenset[Path]]:
     for target in targets:
         path = Path(target).resolve()
         for parent in (path, *path.parents):
-            if (parent / ".mac-test-mirror").is_file():
+            if (parent / floor_claims.MIRROR_MARK).is_file():
                 mirrors.add(parent)
                 break
     with mirror_lease_set(mirrors) as protected:
@@ -1245,83 +1319,90 @@ def target_mirror_leases(targets: Sequence[str]) -> Generator[frozenset[Path]]:
 
 
 def remove_remote_mirror(mirror: RemoteMirror) -> None:
-    command = "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-remove " + shlex.join([
-        "--path", mirror.path, "--owner", mirror.owner, "--repository", mirror.repository.name,
-        "--session", mirror.session, "--host", mirror.host,
-    ])
+    command = remote_copies_command("mirror-remove", mirror, "--host", mirror.host)
     answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
                             capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
     if answer.returncode:
         raise CopyError(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
-    remote_record_path(mirror).unlink(missing_ok=True)
+    unregister_remote(mirror.host, mirror.path)
 
 
 def clear_mirror_content(tree: Path) -> None:
     """Remove the payload before the mirror metadata."""
     for child in tree.iterdir():
-        if child.name in (".copy-record.json", ".mac-test-mirror", ".copy-session"):
+        if child.name in floor_claims.MIRROR_METADATA:
             continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)
         else:
             child.unlink()
-    for name in (".copy-session", ".mac-test-mirror", ".copy-record.json"):
+    for name in floor_claims.MIRROR_METADATA:
         (tree / name).unlink(missing_ok=True)
 
 
-def mirror_action(args: CopyArguments) -> int:
-    tree = mirror_local_path(args.path)
-    with local_mirror_lease(tree, args.session, create=args.action != "mirror-remove"):
-        if args.action == "mirror-remove" and not tree.exists():
-            authority = tree.parent / ("." + tree.name + ".copy-removing.json")
-            if authority.exists():
-                raw = cast(dict[str, object], json.loads(authority.read_text()))
-                if raw.get("owner") != args.owner or raw.get("repo") != args.repository:
-                    raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
-                authority.unlink()
-            return 0
-        from scripts.mac_test import floor_claims
-        # The lease precedes the floor claim lock and the copy-record lock.
-        with floor_claims.locked_claims(load_config().git_timeout_seconds) as claims:
-            if args.action == "mirror-remove" and claims.holds(
-                    str(tree), tree.parent, exemption=floor_claims.MirrorIdentity(args.host, args.path)):
+@contextmanager
+def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.LockedClaims]:
+    """Take the claim lock, then the record lock, while the caller holds the lease."""
+    with floor_claims.locked_claims(load_config().git_timeout_seconds) as claims:
+        with file_lock.exclusive(floor_claims.record_lock_path(tree)):
+            yield claims
+
+
+def mirror_remove(args: CopyArguments) -> int:
+    tree = floor_claims.mirror_local_path(args.path)
+    authority = floor_claims.removal_authority_path(tree)
+    with local_mirror_lease(tree, args.session, create=False):
+        with mirror_metadata_locks(tree) as claims:
+            if not tree.exists() and not authority.exists():
+                return 0
+            if tree.exists() and claims.holds(str(tree), tree.parent,
+                    exemption=floor_claims.MirrorIdentity(args.host, args.path)):
                 raise CopyError(f"{tree}: busy; held by session {args.session}")
-            with file_lock.exclusive(tree.parent / ("." + tree.name + ".copy-record.lock")):
-                authority = tree.parent / ("." + tree.name + ".copy-removing.json")
-                if args.action == "mirror-remove":
-                    record = tree / ".copy-record.json"
-                    raw = cast(dict[str, object], json.loads((record if record.exists() else authority).read_text()))
-                    if raw.get("owner") != args.owner or raw.get("repo") != args.repository:
-                        raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
-                    write_text_atomic(authority, json.dumps(raw) + "\n")
-                    clear_mirror_content(tree)
-                    tree.rmdir()
-                    authority.unlink()
-                    return 0
-                record = tree / ".copy-record.json"
-                previous = (cast(dict[str, object], json.loads(record.read_text()))
-                            if args.action == "mirror-receive" and record.exists() else {})
-                if args.action == "mirror-receive":
-                    if authority.exists():
-                        pending = cast(dict[str, object], json.loads(authority.read_text()))
-                        # A different record identifies a replacement. Keep its content.
-                        if not record.exists() or previous == pending:
-                            clear_mirror_content(tree)
-                        if not previous:
-                            previous = pending
-                write_text_atomic(record, json.dumps({
-                    "kind": "remote-mirror", "owner": previous.get("owner", args.owner),
-                    "repo": previous.get("repo", args.repository),
-                    "session": args.session, "last_use": time.time(), "process_group": os.getpgrp(),
-                }) + "\n")
-                if args.action == "mirror-receive":
-                    write_text_atomic(tree / ".copy-session", args.session + "\n")
-                write_text_atomic(tree / ".mac-test-mirror", "registered remote mirror\n")
-                if args.action == "mirror-receive":
-                    authority.unlink(missing_ok=True)
-        if args.action == "mirror-probe":
-            return 0
-        command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            record = tree / floor_claims.MIRROR_RECORD
+            raw = floor_claims.read_mirror_record(record if record.exists() else authority)
+            if raw.get("owner") != args.owner or raw.get("repo") != args.repository:
+                raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
+            if tree.exists():
+                write_text_atomic(authority, json.dumps(raw) + "\n")
+                clear_mirror_content(tree)
+                tree.rmdir()
+            authority.unlink(missing_ok=True)
+    return 0
+
+
+def command_tail(command: list[str]) -> list[str]:
+    """Remove the CLI separator before command execution."""
+    return command[1:] if command[:1] == ["--"] else command
+
+
+def receive_metadata(tree: Path, args: CopyArguments) -> None:
+    """Finish pending removal and publish all metadata before deleting its authority."""
+    authority = floor_claims.removal_authority_path(tree)
+    record = tree / floor_claims.MIRROR_RECORD
+    previous = floor_claims.read_mirror_record(record) if record.exists() else {}
+    if authority.exists():
+        pending = floor_claims.read_mirror_record(authority)
+        # A different record identifies a complete replacement. Keep its content.
+        if not record.exists() or previous == pending:
+            clear_mirror_content(tree)
+        if not previous:
+            previous = pending
+    mark_mirror(tree, cast(str, previous.get("owner", args.owner)),
+                cast(str, previous.get("repo", args.repository)), args.session,
+                last_use=time.time(), process_group=os.getpgrp())
+    authority.unlink(missing_ok=True)
+
+
+def mirror_run(args: CopyArguments) -> int:
+    tree = floor_claims.mirror_local_path(args.path)
+    with local_mirror_lease(tree, args.session):
+        with mirror_metadata_locks(tree):
+            if args.action == "mirror-receive":
+                receive_metadata(tree, args)
+            else:
+                mark_mirror(tree, args.owner, args.repository, args.session,
+                            last_use=time.time(), process_group=os.getpgrp())
+        command = command_tail(args.command)
         if not command:
             raise CopyError("remote mirror requires a command")
         environment = {**os.environ, "COPIES_MIRROR_LEASE_FDS": ",".join(map(str, COMMAND_LOCKS.get()))}
@@ -1339,14 +1420,12 @@ class CopyArguments(argparse.Namespace):
     host: str = ""
     shell_lease: bool = False
     path: str = ""
-    repository: str = "probe"
-    session: str = "probe"
+    repository: str = ""
+    session: str = ""
     action: str = ""
     owner: str = ""
     repo: str | None = None
     commit: str = ""
-    staged: bool = False
-    staged_tree: str = ""
     apply_uncommitted: str | None = None
     merge: str | None = None
     command: list[str] = []
@@ -1359,22 +1438,25 @@ class CopyArguments(argparse.Namespace):
 def main(argv: list[str] | None = None) -> int:
     parser = CopyParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("mirror-receive", "mirror-use", "mirror-remove", "mirror-probe"):
+    for action in ("mirror-receive", "mirror-use", "mirror-remove"):
         remote = commands.add_parser(action)
-        _ = remote.add_argument("--host", default="")
+        if action == "mirror-remove":
+            _ = remote.add_argument("--host", default="")
         _ = remote.add_argument("--path", required=True)
-        _ = remote.add_argument("--owner", default="probe")
-        _ = remote.add_argument("--repository", default="probe")
-        _ = remote.add_argument("--session", default="probe")
-        _ = remote.add_argument("command", nargs=argparse.REMAINDER)
-    register = commands.add_parser("register-remote")
-    _ = register.add_argument("--owner", default="")
-    _ = register.add_argument("--repo", required=True)
-    _ = register.add_argument("--repository", default="")
-    _ = register.add_argument("--host", required=True)
-    _ = register.add_argument("--path", required=True)
-    _ = register.add_argument("--session", required=True)
-    _ = register.add_argument("--shell-lease", action="store_true")
+        _ = remote.add_argument("--owner", required=True)
+        _ = remote.add_argument("--repository", required=True)
+        _ = remote.add_argument("--session", required=True)
+        if action != "mirror-remove":
+            _ = remote.add_argument("command", nargs=argparse.REMAINDER)
+    for action in ("register-remote", "unregister-remote"):
+        registry = commands.add_parser(action)
+        _ = registry.add_argument("--host", required=True)
+        _ = registry.add_argument("--path", required=True)
+        if action == "register-remote":
+            _ = registry.add_argument("--owner", required=True)
+            _ = registry.add_argument("--repository", required=True)
+            _ = registry.add_argument("--session", required=True)
+            _ = registry.add_argument("--shell-lease", action="store_true")
     clone_command = commands.add_parser("clone", help="create a task-owned test clone")
     _ = clone_command.add_argument("source")
     ends = clone_command.add_mutually_exclusive_group()
@@ -1386,61 +1468,57 @@ def main(argv: list[str] | None = None) -> int:
     _ = clone_command.add_argument("--session", default="")
     run = commands.add_parser("run", help="prepare a standing tree and run a command in it")
     hold = commands.add_parser("hold", help="hold a staged checkout until standard input closes")
-    _ = hold.add_argument("--owner", default="")
     _ = hold.add_argument("--repo", required=True)
-    _ = hold.add_argument("--staged-tree", required=True)
     remove = commands.add_parser("remove", help="remove an owner's idle standing trees")
     for command in (run, remove):
         _ = command.add_argument("--owner", required=True)
     _ = run.add_argument("--repo", required=True)
     _ = remove.add_argument("--repo")
-    _ = run.add_argument("--commit", default="HEAD")
-    _ = run.add_argument("--staged", action="store_true")
-    _ = run.add_argument("--staged-tree", default="")
+    _ = run.add_argument("--commit", required=True)
     _ = run.add_argument("--apply-uncommitted")
     _ = run.add_argument("--merge")
     _ = run.add_argument("command", nargs=argparse.REMAINDER)
     _ = commands.add_parser("list", help="list standing trees and their busy state")
     try:
         args = parser.parse_args(argv, namespace=CopyArguments())
-        if args.action == "register-remote":
-            mirror = RemoteMirror(args.owner or source_owner(Path(args.repo or "")),
-                                  SelectedRepository(args.repository or repository_name(Path(args.repo or ""))),
-                                  args.host, args.path, args.session)
+        if args.action in ("register-remote", "unregister-remote"):
             remote_registry().mkdir(parents=True, exist_ok=True)
-            if args.shell_lease:
-                print(remote_registry() / (remote_key(mirror) + ".lease"))
+            if args.action == "unregister-remote":
+                unregister_remote(args.host, args.path)
             else:
-                register_remote(mirror)
+                mirror = RemoteMirror(args.owner, SelectedRepository(args.repository), args.host, args.path, args.session)
+                if args.shell_lease:
+                    print(remote_lease_path(mirror))
+                else:
+                    register_remote(mirror)
             return 0
         if args.action == "hold":
-            with standing(args.owner or source_owner(Path(args.repo or "")), args.repo or "",
-                          StagedSource(args.staged_tree)) as checkout:
+            source = Path(args.repo or "").expanduser().resolve()
+            staged = StagedSource(staged_tree(source))
+            with standing(source_owner(source), source, staged) as checkout:
+                print(staged.tree)
                 print(checkout, flush=True)
                 _ = sys.stdin.read()
             return 0
-        if args.action.startswith("mirror-"):
-            return mirror_action(args)
+        if args.action == "mirror-remove":
+            return mirror_remove(args)
+        if args.action in ("mirror-receive", "mirror-use"):
+            return mirror_run(args)
         if args.action == "clone":
             task = scratch.parsed_until(args.until) if args.until else args.task
             checkout = clone(Path(args.source), task, args.name)
             if args.owner:
                 with local_mirror_lease(checkout, args.session):
-                    write_text_atomic(checkout / ".copy-record.json", json.dumps({
-                        "kind": "remote-mirror", "owner": checked_owner(args.owner),
-                        "repo": args.repository, "session": args.session,
-                    }) + "\n")
-                    write_text_atomic(checkout / ".mac-test-mirror", "registered remote mirror\n")
+                    mark_mirror(checkout, checked_owner(args.owner), args.repository, args.session)
                     register_remote(RemoteMirror(args.owner, SelectedRepository(args.repository),
                                                 "localhost", str(checkout), args.session))
             print(checkout)
             return 0
         if args.action == "run":
-            command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            command = command_tail(args.command)
             if not command:
                 raise CopyError("run requires a command after --")
-            policy: SourcePolicy = (StagedSource(args.staged_tree) if args.staged or args.staged_tree else
-                                    WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
+            policy: SourcePolicy = (WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
                                     CommittedSource(args.commit))
             merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()
             with standing(args.owner, args.repo or "", policy, merge=merge) as tree:

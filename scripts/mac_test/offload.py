@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import cargo_manifest
 import override_guard
+import build_hold
 import sweep
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import conf
@@ -432,6 +433,8 @@ class OffloadRequest:
     call_id: str
     result: ResultDestination
     nextest_words: tuple[str, ...]
+    owner: str
+    holder_session: str
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
     copy: bool = False
     verb: MacVerb = "nextest"
@@ -441,9 +444,7 @@ class OffloadRequest:
     admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
     environment: tuple[tuple[str, str], ...] = ()
     fetch: FetchFolder | NoFetch = NO_FETCH
-    owner: str = "verify"
     repository_scope: copies.RepositoryScope = copies.ALL_REPOSITORIES
-    holder_session: str = ""
 
     @property
     def source_root(self) -> Path:
@@ -1537,7 +1538,7 @@ def copy_tree(
         ) as exclude_file:
             exclude_path = Path(exclude_file.name)
             try:
-                _ = exclude_file.write("/.git\n/target/\n/.mac-test-mirror\n/.copy-record.json\n/.copy-session\n")
+                _ = exclude_file.write("/.git\n/target/\n")
                 for path in ignored:
                     _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
                 exclude_file.flush()
@@ -2210,14 +2211,14 @@ def run_offload(
 
     try:
         with ExitStack() as admission_leases:
-            slots = int(config.values.get(f"slots.{repository.name}", config.values.get("slots", "1"))) if linux else 1
+            slots = (target_config.slot_capacity(config.values, repository.name,
+                     missing=target_config.MissingSlotCapacity.SINGLE_SLOT) if linux else 1)
             leases: dict[int, ExitStack] = {}
             for slot in range(1, slots + 1):
                 lease = ExitStack()
                 try:
                     lease.enter_context(copies.remote_lease(request_mirror(config, replace(request, slot=slot), repository)))
                 except copies.BusyRemoteMirror:
-                    lease.close()
                     continue
                 leases[slot] = admission_leases.enter_context(lease)
             return leased_offload(controller, config, request, repository, started, linux, leases)
@@ -2231,7 +2232,7 @@ def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: K
         scope = copies.SelectedRepository(repository.name)
     return copies.RemoteMirror(request.owner, scope, config.host,
                                remote_mirror(repository, request.target, request.slot),
-                               request.holder_session or request.call_id or f"pid-{os.getpid()}")
+                               request.holder_session)
 
 
 def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
@@ -2329,6 +2330,14 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def holder_session() -> str:
+    """Use the unit owner session before the shell session."""
+    owner = build_hold.owning_session()
+    if isinstance(owner, build_hold.OwningSession):
+        return owner.session_id
+    return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"
+
+
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
     words = arguments.nextest_words
     if words[:1] == ["--"]:
@@ -2342,7 +2351,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         repo_root=Path(arguments.repo_root).resolve(),
         source=StagedDocSnapshot(Path(arguments.source_root).resolve()) if arguments.source_root else RepositoryWorkingTree(),
         owner=copies.source_owner(Path(arguments.repo_root)),
-        holder_session=os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}",
+        holder_session=holder_session(),
         package=arguments.package,
         call_id=arguments.call_id,
         result=result_destination(arguments.result),

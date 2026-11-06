@@ -892,11 +892,16 @@ class StandingTests(unittest.TestCase):
         self.assertFalse(tree.exists())
 
     def test_invalid_owner_refuses_without_creating_a_tree(self) -> None:
-        for owner in ("../escape", "Verify", "unit/name", "-unit", "unit_name", ""):
+        for owner in ("../escape", "Verify", "unit/name", "-unit", ""):
             with self.subTest(owner=owner):
                 result = self.run_cli("--owner", owner)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.gates.exists())
+
+    def test_underscore_owner_succeeds_and_creates_the_checkout(self) -> None:
+        result = self.run_cli("--owner", "unit_name")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.gates / "unit_name-gate").exists())
 
     def test_record_is_local_metadata_and_repeated_use_preserves_tree(self) -> None:
         with copies.standing("verify-unit", str(self.source), copies.CommittedSource(self.head)) as tree:

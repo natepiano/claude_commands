@@ -9,6 +9,7 @@ import sys
 from unittest import mock
 
 from scripts.lint.memory_test_support import config_environment
+from scripts.copies.copies_test_support import copies_environment
 
 
 @contextmanager
@@ -28,8 +29,8 @@ os.execve('/bin/bash', ['bash', '-c', sys.argv[-1]], environment)
 ''')
     ssh.chmod(0o755)
     with mock.patch.dict(os.environ, {
-        **config_environment(root),
-        "HOME": str(root), "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+        **config_environment(root), **copies_environment(root),
+        "PATH": str(tools) + os.pathsep + os.environ["PATH"],
         "PYTHONPATH": str(repository), "CLAUDE_PYTHON": sys.executable,
         "MAC_TEST_STATE_DIR": str(root / "local-claims"),
         "REMOTE_CLAIM_STATE": str(root / "remote-claims"),

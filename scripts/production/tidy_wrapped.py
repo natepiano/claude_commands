@@ -90,7 +90,7 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
         try:
             for row in unit_lookup.doc_units(document, record):
                 owners.add(row.name)
-                owners.add(row.name.removesuffix("-unit") + "-unit")
+                owners.add(copies.unit_owner(row.name))
         except staff.StaffUnreadable:
             pass  # a production with no showrunner row has no units
     try:
