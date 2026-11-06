@@ -135,6 +135,25 @@ class StandingTests(unittest.TestCase):
         self.assertFalse(checkout.parent.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
 
+    def test_clone_cli_with_one_until_value_ends_only_the_selected_clone(self) -> None:
+        checkouts: list[Path] = []
+        records: list[copy_record.Registered] = []
+        for name in ("first", "second"):
+            result = self.cli("clone", str(self.source), "--until", "2099-01-01 09:30", "--name", name)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            checkout = Path(result.stdout.strip())
+            record = scratch.task_of(checkout.parent)
+            assert isinstance(record, copy_record.Registered)
+            checkouts.append(checkout)
+            records.append(record)
+        self.assertNotEqual(records[0].task, records[1].task)
+
+        self.assertEqual(scratch.end(records[0].task), [checkouts[0].parent])
+        self.assertFalse(checkouts[0].parent.exists())
+        self.assertEqual((checkouts[1] / "tracked.txt").read_text(), "source HEAD\n")
+        self.assertEqual(self.git(checkouts[1], "rev-parse", "HEAD"), self.head)
+        self.assertEqual(scratch.task_of(checkouts[1].parent), records[1])
+
     def symlink_scratch_root(self) -> Path:
         physical = self.base / "physical-scratch"
         physical.mkdir()

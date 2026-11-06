@@ -1710,3 +1710,41 @@ When free space on the Mac is under the floor, the post-run cleanup measures the
 **Gotchas:** `claimed_run` and `parse_cleanup` serve the Mac and the Linux targets. `scripts/direct/verify_ssh_targets_test_support.py` keeps the bare marker because its fixture also stands for the Linux targets; the Mac marker there hides a break.
 
 **Ruled out:** `linux_runner.py` printing the new marker: the line's text says "Mac free", and that runner needs no line.
+
+### Phase 76 — Each --until folder has its own scratch task  · status: done
+
+**Depends on:** none. Showrunner order 2026-11-05: build the root fix only. The two refusals in `end` wait for the user's answer.
+
+#### Work Order
+
+**Goal:** `scratch.py end --task <task>` removes only the folder that the task names, so one session cannot delete the `--until` or default folders of other sessions.
+
+**Measured:**
+1. On 2026-11-05 at 19:54 EST on natedev, `scratch.py end --task until:2026-11-07T0500Z` removed four clones of other units and one gate checkout.
+2. `until_task` (`scripts/lib/scratch.py:482`) makes `until:<stamp>` from the end time alone. Every `--until` or default folder with the same minute shares the task, and `end` (`scratch.py:1216`) removes every folder with that task.
+3. `copy_record.TASK` already allows a `/` in the task name. `copies.py` takes the task from `parsed_until` and `task_or_default`, so `copies.py` needs no change.
+
+**Spec:**
+1. `until_task` returns `until:<stamp>/<id>`. Each call makes a new random id from `SUFFIX_CHARACTERS`, with the scratch.conf `suffix_length`. `parsed_until` and `task_or_default` get the id through `until_task`. One helper makes the random text for `until_task` and for `target`.
+2. `task_end` reads the deadline from the name part before the first `/`. A bad stamp stays `Unknown`. The form with no id still parses.
+3. `target` keeps the folder name as it is today: for an `until` task, the slug holds the stamp and not the id.
+4. The `scratch.py` docstring, the `checked_task` error text and `docs/as-built/build-memory-admission.md` state the new form. The as-built text says that `scratch.py list` shows the task of a folder.
+5. Change nothing else in `end`. Add no guard, refusal or check this Work Order does not ask for. Post blocked to ask instead.
+
+**Files:**
+- `scripts/lib/scratch.py` — `until_task`, `task_end`, `target`, the docstring and the error text.
+- `docs/as-built/build-memory-admission.md` — the task form.
+- `scripts/lib/test_scratch.py` — the task form, `end`, and the deadline.
+- `scripts/copies/test_copies.py` — two real `copies.py` clones with one `--until` value.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` writes `scripts/lib/scratch.py` and `docs/as-built/build-memory-admission.md`.
+- `test` writes `scripts/lib/test_scratch.py` and `scripts/copies/test_copies.py`.
+
+**Acceptance gate:**
+- Two folders made with one `--until` value have different tasks. `end` of one task removes that folder and leaves the other. Observed by `test_scratch.py` and by two real `copies.py clone --until` calls in `test_copies.py`.
+- `end --task until:<stamp>` with no id removes neither folder.
+- Two folders with no task, made in the same minute, have different tasks.
+- A task with an id gives `Live` before its time and `Ended` at its time, with the same `at` as the form with no id.
+- `scripts/lib/test_scratch.py`, `scripts/copies/test_copies.py`, `scripts/lint/test_tmp_sweep.py`, `scripts/lint/test_folder_audit.py` and `scripts/style/test_crate_run.py` pass.
+- basedpyright reports 0 errors and 0 warnings on the changed Python files.
