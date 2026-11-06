@@ -159,7 +159,7 @@ class SshEligibilityTests(unittest.TestCase):
         self.reachable = False
         with redirect_stdout(output):
             self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 0)
-        self.assertIn("aws\texcluded\tstarting\t", output.getvalue())
+        self.assertIn(f"aws\texcluded\tstarting\t{self.root / 'aws_target.conf'}\tlinux\n", output.getvalue())
         self.assertEqual(self.commands, [])
         _ = (paths.directory / "controller.json").write_text('{"state":"running"}')
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
@@ -567,6 +567,7 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["mac", "natedev", "aws"])
         self.assertEqual(rows[0][1:3], ["excluded", "linux_only"])
         self.assertEqual(rows[2][1:3], ["eligible", "-"])
+        self.assertEqual([row[4] for row in rows], ["macos", "-", "linux"])
         self.assertTrue(self.commands)
 
     def test_linux_test_check_and_doc_need_no_mac_repository_setting(self) -> None:

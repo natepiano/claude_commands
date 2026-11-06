@@ -3797,7 +3797,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         help_text = " ".join(output.getvalue().split())
         for recipient_form in (
             "a roster name", "uds:<path>", "session:<id>",
+            "worker:<unit>/<worker> for a pane worker",
             "worker:<run id>/<worker name>", "codex:<thread id>", "user",
+            "worker:<run id>/<worker name> for a run pinned to mesh",
         ):
             self.assertGreaterEqual(help_text.count(recipient_form), 2)
 
@@ -5562,6 +5564,109 @@ class PaneWorkerMessageTests(unittest.TestCase):
                     if isinstance(route, send.CodexWorkerRecipient):
                         self.assertEqual((route.address, route.name, route.session_dir), (address, "impl", str(assigned_run)))
                     self.assertEqual(self.fixture.world.commands, commands)
+
+    def test_local_codex_worker_addresses_select_the_pinned_transport(self) -> None:
+        from scripts.lib import unit_runs
+
+        worker = self.fixture.worker("codex-worker", family="codex")
+        self.fixture.world.add(worker, "w1:p2", family="codex")
+        run_root = self.fixture.root / "recipient-runs"
+        run = run_root / "held-run"
+        run.mkdir(parents=True)
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: self.fixture.parent.id}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(run_root)})))
+        caller_run = self.fixture.root / "run"
+        caller_run.mkdir(exist_ok=True)
+        _ = (caller_run / "worker_transport").write_text("herdr\n")
+        assigned_run = self.fixture.root / "legacy-run"
+        roster_address = "worker:legacy-run/codex-worker"
+        entry = roster.RosterEntry(
+            "natedev", "codex", "worker", worker.name, "working", roster.Messageable(roster_address),
+            str(self.fixture.root), roster.NoShowrunner(), roster.NoDirector(),
+            roster.WorkerAssignment(worker.name, str(assigned_run)), thread=roster.CodexThread(worker.current_session),
+        )
+        observed = roster.Roster([entry], [])
+        addresses = (f"codex:{worker.current_session}", f"session:{worker.current_session}",
+                     worker.name, str(worker.id), str(worker.current_session), "showrunner/unit/codex-worker")
+        for transport in ("herdr", "mesh"):
+            _ = (run / "worker_transport").write_text(transport + "\n")
+            for address in addresses:
+                for scope in (send.LocalOnly(), send.LocalThenPeer()):
+                    with self.subTest(transport=transport, address=address, scope=scope):
+                        route = send.resolve_recipient(address, scope, observed, membership=staff.snapshot())
+                        if transport == "herdr":
+                            self.assertEqual(route, send.PaneWorkerRecipient(worker))
+                        else:
+                            self.assertEqual(route, send.CodexWorkerRecipient(roster_address, worker.name, str(assigned_run)))
+                if transport == "herdr":
+                    with mock.patch.object(roster, "roster", return_value=observed):
+                        result = self.deliver(address, f"Continue the pinned worker through {address}.")
+                    self.assertIsInstance(result, send.PaneTextDelivered)
+        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual([command[2] for command in prompts], ["w1:p2"] * len(addresses))
+        self.assertTrue(all("Continue the pinned worker through " in command[3] for command in prompts))
+
+    def test_worker_socket_address_selects_the_pane_pin_and_keeps_mesh_socket_delivery(self) -> None:
+        run = self.fixture.root / "run"
+        run.mkdir(exist_ok=True)
+        with ShortUnixSocket() as socket_fixture:
+            path = str(socket_fixture.bind_socket())
+            address = f"uds:{path}"
+            record = sessions.SessionRecord(pid=0, sessionId=str(self.row.current_session), name=self.row.name,
+                                            messagingSocketPath=path, updatedAt=1, tmux="", formerNames=[])
+            for transport in ("herdr", "mesh"):
+                with self.subTest(transport=transport):
+                    _ = (run / "worker_transport").write_text(transport + "\n")
+                    route = send.resolve_recipient(address, send.LocalOnly(), roster.Roster([], []),
+                                                   membership=staff.snapshot(), records=[record])
+                    if transport == "herdr":
+                        self.assertEqual(route, send.PaneWorkerRecipient(self.row))
+                        with mock.patch.object(sessions, "running_sessions", return_value=[record]):
+                            result = self.deliver(address, "Continue through the worker pane.")
+                        self.assertIsInstance(result, send.PaneTextDelivered)
+                    else:
+                        self.assertEqual(route, send.ClaudeRecipient(address))
+        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual([command[2] for command in prompts], ["w1:p1"])
+
+    def test_remote_worker_addresses_keep_peer_delivery_with_the_callers_pane_pin(self) -> None:
+        peer_machine = roster.remote.other_machine()
+        holder = fixture_member("unit", name="remote-unit", parent=self.fixture.parent.parent,
+                                worktree=staff.PresentWorktree(peer_machine, self.fixture.root / "remote-worktree"))
+        worker = fixture_worker("remote-worker", holder.id, backend=staff.CodexBackend(self.fixture.root / "remote-codex"))
+        run = self.fixture.root / "run"
+        run.mkdir(exist_ok=True)
+        _ = (run / "worker_transport").write_text("herdr\n")
+        address = "worker:remote-unit/remote-worker"
+        entry = roster.RosterEntry(
+            peer_machine, "codex", "worker", worker.name, "working", roster.Messageable(address),
+            str(self.fixture.root / "remote-worktree"), roster.NoShowrunner(), roster.NoDirector(),
+            roster.WorkerAssignment(worker.name, "/remote/run"), thread=roster.CodexThread(worker.current_session),
+        )
+        snapshot = staff.snapshot()
+        for location in (holder.worktree, staff.RemovedWorktree(peer_machine, self.fixture.root / "remote-worktree")):
+            membership = replace(snapshot, rows=tuple(replace(row, worktree=location) if row.id == holder.id else row
+                                                       for row in snapshot.rows))
+            for target in (f"codex:{worker.current_session}", address):
+                with (self.subTest(location=location, target=target),
+                      mock.patch.object(roster, "peer_roster", return_value=roster.Roster([entry], []))):
+                    route = send.resolve_recipient(target, send.LocalThenPeer(), roster.Roster([], []), membership=membership)
+                    self.assertEqual(route, send.RemoteDelivery(peer_machine, address))
+        self.assertEqual(self.fixture.world.commands, [])
+
+    def test_named_machine_worker_addresses_keep_remote_delivery_for_each_pin(self) -> None:
+        run = self.fixture.root / "run"
+        run.mkdir(exist_ok=True)
+        for transport in ("herdr", "mesh"):
+            _ = (run / "worker_transport").write_text(transport + "\n")
+            for address in (f"codex:{self.row.current_session}", "worker:unit/impl", "impl"):
+                with self.subTest(transport=transport, address=address):
+                    route = send.resolve_recipient(address, send.NamedMachine("fixture-peer"), roster.Roster([], []),
+                                                   membership=staff.snapshot())
+                    expected = (address if address.startswith(("worker:", "codex:"))
+                                else f"session:{self.row.current_session}")
+                    self.assertEqual(route, send.RemoteDelivery("fixture-peer", expected))
+        self.assertEqual(self.fixture.world.commands, [])
 
     def test_delivery_requires_the_callers_snapshot_and_retains_its_holder(self) -> None:
         holder = staff.update_current_session(self.fixture.parent.current_session,

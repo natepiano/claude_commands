@@ -358,8 +358,10 @@ State:
 <HeldProductionDesign>
 The showrunner may hold one lasting Astra designer/reviewer pair for a production
 design through `design_roles.py`. It briefs, records cited rulings and acceptance, and
-keeps the same threads across rounds, restarts and account moves. Configured
-`design_roles` models and explicit access policies apply. A writer needs an authorized
+keeps the same native conversations across rounds, restarts and account moves.
+Each held role uses a worker pane under the showrunner through `worker.py`.
+Pass `astra-designer` or `astra-reviewer` explicitly; reuse the existing worker row.
+Configured `design_roles` models and explicit access policies apply. A writer needs an authorized
 production-design phase with exact output paths, baseline and reservation; until
 that phase exists, hold read-only roles only. New writing scope needs an idle
 rebind. Saved headed prompts and replies stay with the role; pending messages are
@@ -385,13 +387,18 @@ screenshot and visual acceptance duties remain.
 
 <LoadProduction>
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py load
---production <showrunner name> --scratch <SCRATCH>`, adding `--resume` on resume. The command checks
-the checkout and copies state from `<SCRATCH>` when `STATE_DIR` lacks it. It reads the last `### STATE` block of `LOG`.
-It reads each unit's run records and asks git which checkpoints the merge branch holds. It checks each unit's herdr session. Use its lines to restore state. <StartUpdates/> registers this session
-again and retargets the instance. No boot restore unit is installed. `agents restart`
-restores selected sessions from recovery records on their own accounts. It starts or
-adopts herdr and opens a tab for each session. It does not run `pane_restore.py`
-for other panes. See `docs/as-built/herdr-restore.md`.
+--production <showrunner name> --scratch <SCRATCH>`, adding `--resume` on resume.
+The command checks the checkout and copies state from `<SCRATCH>` when `STATE_DIR` lacks it.
+It reads the last `### STATE` block of `LOG` and each unit's run records.
+It asks git which checkpoints the merge branch holds and checks each unit's herdr session.
+Use its lines to restore state.
+<StartUpdates/> registers this session again and retargets the instance.
+No boot restore unit is installed.
+`agents restart` restores selected director tabs and their retained worker panes on their accounts.
+It reuses stopped worker panes and resumes their native conversations.
+Busy workers continue the saved dispatch; transcript evidence prevents another submission.
+A completed rerun prints one `unchanged` line, exits 0, and sends no restart notice.
+Unrelated panes stay unchanged. See `docs/as-built/herdr-restore.md`.
 
 When the production doc's **Production rules** say CI does not apply, pass
 `--no-ci` to this and every lifecycle subcommand.
@@ -411,9 +418,11 @@ after a failed step; it resumes at the first unfinished step.
 ---
 
 <LaunchUnits>
-Each unit owns its read-only reviewers. `assign.sh --role review` resumes
-`review`, then `review2` when the first is busy. Their context lasts across
-phases and plans; unit pause, move and end apply to them too.
+Each unit owns its read-only reviewer panes.
+The assignment launcher uses the run's existing transport pin.
+Pane assignments reuse an idle or resumable reviewer in role-number order.
+Retire, wrap, and promote stop workers and retain their rows and conversations for restore.
+Only worker end or permanent unit removal deletes their rows.
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production <showrunner name> <name> --plan <unit plan>`.
@@ -1119,11 +1128,13 @@ land a phase sooner. Each design check covers every view of the change at once
 </CrossUnitChange>
 
 <StopResume>
-Stop a local session with `agents stop SESSION`. Resume it in its own tab with
-`agents resume SESSION --why "reason"`. Move one session or a group with
-`accounts.py move SESSION_OR_GROUP claudeN --why "reason"`; it stops all selected
-sessions, then resumes each on that account with one message to continue its work
-and its existing workers. See `commands/shutdown.md`.
+Stop a local session with `agents stop SESSION`.
+Resume it with `agents resume SESSION --why "reason"`.
+Worker stops retain their panes at the shell and keep their conversations for restore.
+Move sessions with `accounts.py move SESSION_OR_GROUP claudeN --why "reason"`.
+Worker account moves resume each conversation in its existing pane on the target account.
+Unknown evidence leaves that worker unchanged and prints its reason; other proved moves continue.
+See `commands/shutdown.md` and `docs/accounts.md`.
 </StopResume>
 
 ---
@@ -1157,6 +1168,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
    production's links in the showrunner tree, deletes its own footer, pause,
    open-question and state files, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
+   Wrap stops worker agents and retains their rows and conversations for restore.
    Leave herdr sessions for the user to close.
 </Wrap>
 
@@ -1187,8 +1199,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
     depend on which and start every independent phase now: beside the current
     phase in the same unit, or as its own unit (`/showrunner:add_unit`) when
     its files can be fenced. Packaging is yours, never the user's. User,
-    2026-10-13. Each dailies build prints `parallel check: <unit>: Phase N
-    could start` for these; start them.
+    2026-10-13. Each dailies build identifies independent work; start it.
   - A unit's later phase runs beside its current one, with its own workers, berth
     reservation and checkpoint. A checkpoint commits only its own phase's paths.
     Where files overlap, it claims after the earlier phase and builds on its tree.

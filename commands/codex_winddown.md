@@ -18,6 +18,12 @@ argument-hint: "[start|triage|clear|help]"
 3. `triage`: `~/.claude/scripts/lib/py ~/.claude/scripts/production/codex_winddown.py triage --from <your session name>`. Every showrunner and unit director is told directly to stop each running Codex agent that can stop, onto a resume list, and let the rest finish.
 4. `clear`: `~/.claude/scripts/lib/py ~/.claude/scripts/production/codex_winddown.py clear --from <your session name>`. The user's all clear: the counts stop, and every showrunner and unit director is told to use Codex again; a running Claude agent may finish.
 
+Counts use the shared worker observation and show open panes with their status.
+Stopped panes count as stopped; closed panes count as closed.
+Unknown and incomplete observations retain their reasons and do not prove that a worker stopped.
+An unreadable staff record produces a problem, not an empty count.
+Only an existing run pinned to `mesh` uses its retained roster and server display.
+
 Every one of these messages reaches showrunners and unit directors directly (`broadcast.py`); pass none of them on. A showrunner sent a **Codex count** runs the command it names and pastes its output word for word as the reply.
 
 A unit director asked for its finish runs the `eta` line the message names, and again when its estimate changes. When its count reaches 0 it is told at once that it may work on its own or launch Claude agents for short time frames.
