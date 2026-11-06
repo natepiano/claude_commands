@@ -20,7 +20,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
                          phase_table.build_plan(plan) ◄───────┘  (chain, gates, PhaseHistory)
                                   │                        │
             progress_history.py progress           board_json.py --session <id>
-            (short report / --tables)              writes <staff id>.json, prints {files, watch}
+            (short report / --tables)              writes <staff-id>.json, prints {files, watch}
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
                                        mod: /showrunner:accounts ── runs accounts.py status --json --stored
@@ -77,7 +77,12 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
   - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
   - A run on another plan than its production row (hana `demo`) shows its real phase.
   - `plan` is the Plan cell, and is empty when that file no longer exists.
-- `workers` come from the run's session dir: `mesh_roster.json` (role, status; `done` shows as `idle`, `ended` stays), `impl_worker_<slot>.json` (slot, family/model) and the slot's newest `board.log` line as `doing`.
+- `workers` combines the run roster, slot metadata, and each slot's newest board activity.
+  `recorded_turn_settings` supplies the accepted model and effort.
+  `done` displays as `idle`; `ended` stays unchanged.
+  The reader displays raw role and family values when the records contain them.
+  Missing values display as empty fields.
+  The [worker design](long-lived-workers.md#roster-fields) defines the current records without copied role or family fields.
   - Slots drop the worktree's mesh prefix.
   - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
   - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.

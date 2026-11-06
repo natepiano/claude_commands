@@ -2013,6 +2013,24 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
+    def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
+        from scripts.shutdown.inventory import ListedSession
+
+        inventory = import_module("inventory")
+        owner = ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
+                              self.home / ".claude1", "", "", "")
+        target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
+        outcome = stop_results.ClaudeUp(owner.session_id, "w1:p1", "claude2")
+        for live in ([owner], []):
+            with (self.subTest(live=bool(live)),
+                  patch.object(inventory, "listing", return_value=live) as listing,
+                  patch.object(accounts, "check_move_target", return_value=target),
+                  patch.object(stop_resume, "move_sessions", return_value=[outcome]) as moved):
+                result = accounts.move(owner.session_id, "claude2", why="fixture move")
+            self.assertIsInstance(result, accounts.MoveStarted)
+            listing.assert_called_once_with()
+            moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand")
+
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         from scripts.shutdown.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
 
@@ -6604,7 +6622,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
 
         observed: list[Path] = []
-        def stop(reference: str) -> stop_resume.StopFailed | stop_resume.Stopped:
+        def stop(reference: str, kind: str = "") -> stop_resume.StopFailed | stop_resume.Stopped:
+            self.assertEqual(kind, "codex")
             observed.append(agent_accounts.workers_home())
             return (stop_resume.StopFailed(reference, "source process could not stop") if reference == failed.id
                     else stop_resume.Stopped(pending.current_session, 987654))
@@ -6644,8 +6663,30 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertIn(worker.id, errors)
                 self.assertIn(reason, errors)
                 self.assertIn(action, errors)
-                stopped.assert_called_once_with(worker.id)
+                stopped.assert_called_once_with(worker.id, "codex")
                 self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+
+    def test_worker_move_without_a_server_record_reaches_resume_pending_for_an_identifying_run(self) -> None:
+        _ = self.workers_fixture()
+        worker = self.workers_member()
+        run = self.root / "worker-runs" / "stopped-source"
+        run.mkdir(parents=True)
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            worker.name: {"staff_id": worker.id, "status": "done"}}))
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        with (patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}),
+              patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(worker.current_session)) as stopped):
+            result = accounts.move_workers("codex1")
+        self.assertIsInstance(result, accounts.GroupMoveStartFailed)
+        assert isinstance(result, accounts.GroupMoveStartFailed)
+        self.assertEqual(len(result.outcomes), 1)
+        outcome = result.outcomes[0]
+        self.assertIsInstance(outcome, stop_resume.ResumePending)
+        assert isinstance(outcome, stop_resume.ResumePending)
+        self.assertEqual((outcome.session_id, outcome.account), (worker.id, "codex1"))
+        self.assertIn("assign.sh", outcome.reason)
+        stopped.assert_called_once_with(worker.id, "codex")
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
 
     def test_numbered_workers_targets_keep_the_selected_home_with_real_or_shared_entries(self) -> None:
         target = "codex2"
@@ -6668,7 +6709,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual((code, stderr), (1 if shared else 0, ""))
                 if shared:
                     self.assertIn("pending", stdout)
-                    stop.assert_called_once_with(worker.id)
+                    stop.assert_called_once_with(worker.id, "codex")
                 else:
                     self.assertEqual(stdout, f"{worker.name} ({worker.id}): would stop; restart on {target} stays pending\n")
                     self.assertEqual((self.role_files(), Path(os.environ["STAFF_FILE"]).read_bytes()), before)

@@ -3765,6 +3765,30 @@ class HerdrTests(unittest.TestCase):
                 self.assertEqual([command for command in self.commands() if command[2:4] == ["pane", "list"]],
                                  [["--session", "writing", "pane", "list"]])
 
+    def test_process_sessions_without_scope_reads_does_not_read_the_agent_slice(self) -> None:
+        server = self.process(30, 1, ["herdr", "server"], {})
+        shell = self.process(11, 30, ["zsh"], {})
+        with patch.object(herdr, "agents_slice", side_effect=AssertionError("no scope read")) as setting:
+            self.assertEqual(herdr._process_sessions([server, shell], {30: "writing"}),  # pyright: ignore[reportPrivateUsage]
+                             {11: "writing"})
+        setting.assert_not_called()
+
+    def test_process_sessions_reads_the_agent_slice_once_for_multiple_pane_scopes(self) -> None:
+        server = self.process(30, 1, ["herdr", "server"], {})
+        shell = self.process(11, 30, ["zsh"], {})
+        claude = self.process(12, 11, ["claude"], {})
+        survivor = self.process(13, 1, ["daemon"], {})
+        unrelated = self.process(20, 1, ["unrelated"], {})
+        _ = (server / "cgroup").write_text("0::/app.slice/herdr-writing.service\n")
+        for process in (shell, claude, survivor):
+            _ = (process / "cgroup").write_text("0::/app.slice/app-agents.slice/run-p11.scope\n")
+        _ = (unrelated / "cgroup").write_text("0::/app.slice/app-agents.slice/run-p20.scope\n")
+        with (patch.object(herdr, "agents_slice", return_value="app-agents.slice") as setting,
+              patch.object(herdr, "_pane_shell_pids", return_value=[11])):
+            self.assertEqual(herdr._process_sessions([server, shell, claude, survivor, unrelated], {30: "writing"}),  # pyright: ignore[reportPrivateUsage]
+                             {11: "writing", 12: "writing", 13: "writing"})
+        setting.assert_called_once_with()
+
     def test_server_start_gives_each_pane_shell_a_scope_through_the_wrapper(self) -> None:
         real = self.root / "bin/zsh"
         real.parent.mkdir()
@@ -3806,7 +3830,7 @@ class HerdrTests(unittest.TestCase):
             wrapper = (self.root / "home/.local/state/herdr/pane-shell").read_text()
             self.assertIn("--slice=app-custom.slice", wrapper)
             scope = Path("/app.slice/app-custom.slice/run-p11.scope")
-            self.assertEqual(herdr.pane_scopes([("0", scope)]), [("0", scope)])
+            self.assertEqual(herdr.pane_scopes([("0", scope)], agents_slice()), [("0", scope)])
 
     def test_pane_shell_falls_back_to_bin_sh(self) -> None:
         plain = self.root / "not-executable"

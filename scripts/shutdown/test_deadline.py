@@ -61,7 +61,7 @@ class DeadlineTests(unittest.TestCase):
         launch.assert_not_called()
 
     def test_stop_limits_a_blocking_live_read(self) -> None:
-        def read(_identity: str) -> herdr.StoppedConversation:
+        def read(_identity: str, _kind: str) -> herdr.StoppedConversation:
             _ = herdr.Herdr("agents").panes()
             return herdr.StoppedConversation()
 

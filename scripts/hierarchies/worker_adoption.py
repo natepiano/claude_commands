@@ -34,7 +34,7 @@ def adopt_unit_worker(source: Path, destination: Path, name: str) -> str:
         raise registry.WorkerUnavailable("the source and destination runs must differ")
     initial = worker_record(source, name)
     reference = staff.StaffId(text_field(initial.get("staff_id")))
-    allowed = worker_admission.admit(name, destination, role="", reference=reference)
+    allowed = worker_admission.admit(name, destination, reference=reference)
     store = registry.ledger_for_run(source)
     if store.path != registry.ledger_for_run(destination).path:
         raise registry.WorkerUnavailable("adoption requires the same unit staff owner")

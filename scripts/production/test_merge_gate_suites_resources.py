@@ -263,10 +263,11 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertEqual(self.jobserver_tokens(), b"Q")
 
     @gate_suites("lib")
-    def test_memory_cap_admits_two_overlapping_module_processes(self) -> None:
+    def test_governor_admits_two_overlapping_module_processes(self) -> None:
         self.record_module_peaks({"lib/test_first.py": 48.0, "lib/test_second.py": 48.0})
         self.write(self.state / "barrier", "two")
-        result = self.run_gate("--tests-only", "--memory-cap-mib", "268", ignored_signals=True)
+        self.configure_gate("merge_gate_governor_gib=0.26171875")
+        result = self.run_gate("--tests-only", ignored_signals=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         active: set[int] = set()
         peak = 0
@@ -280,7 +281,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertGreaterEqual(peak, 2)
         self.assertEqual(active, set())
         self.assertEqual(len(events), 2 * self.module_count)
-        self.assertIn("sampled memory cap 268 MiB", result.stdout)
+        self.assertIn("memory governor 0.261719 GiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
@@ -337,40 +338,24 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertEqual(output.getvalue().count("at most 2 modules at once"), 1)
 
     @gate_suites("lib")
-    def test_smaller_memory_cap_serializes_modules_without_dropping_any(self) -> None:
-        # Keep the test process above the gate's cap throughout the call.
-        ballast = bytearray(b"\1") * (192 * 1024 * 1024)
-        self.addCleanup(ballast.clear)
-        # Each unrecorded job reserves 640 MiB, so this cap runs one module at a time;
-        # 128 MiB stays far above the measured peak of the runner and one module (about 48 MiB).
-        result = self.run_gate("--tests-only", "--memory-cap-mib", "128", own_process=True)
+    def test_small_governor_starts_one_module_and_serializes_the_rest(self) -> None:
+        # Each unrecorded job reserves 640 MiB. The governor must still start one job.
+        self.configure_gate("merge_gate_governor_gib=0.125")
+        result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.module_events()
         self.assertEqual(len(events), 2 * self.module_count)
         for start, finish in zip(events[::2], events[1::2], strict=True):
             self.assertEqual((start["event"], finish["event"]), ("start", "finish"))
             self.assertEqual(start["pid"], finish["pid"])
-        self.assertIn("sampled memory cap 128 MiB", result.stdout)
+        self.assertIn("memory governor 0.125 GiB", result.stdout)
 
-    def test_nonpositive_memory_cap_refuses_without_running_modules(self) -> None:
-        result = self.run_gate("--tests-only", "--memory-cap-mib", "0")
+    def test_nonpositive_governor_refuses_without_running_modules(self) -> None:
+        self.configure_gate("merge_gate_governor_gib=0")
+        result = self.run_gate("--tests-only")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("merge_gate_governor_gib", result.stdout + result.stderr)
         self.assertEqual(self.module_events(), [])
-
-    def test_a_module_that_grows_past_the_cap_is_killed_and_the_gate_is_red(self) -> None:
-        self.write(self.state / "grow-memory", "grow")
-        result = self.run_gate("--tests-only", "--memory-cap-mib", "256")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r"(?m)^hooks/test_first\.py killed: sampled memory [\d.]+ GiB is over the 0\.250 GiB cap$")
-        self.assertRegex(result.stdout, r"(?m)^hooks: RED ")
-        self.assertNotIn("never killed", result.stdout)
-        starts = [row for row in self.module_events() if row["event"] == "start"]
-        self.assertEqual(len(starts), self.module_count)
-        cpu_path = self.state / "runner" / "module_cpu_seconds.json"
-        self.assertTrue(cpu_path.is_file())
-        records = merge_gate.read_measures(cpu_path)
-        self.assertNotIn("hooks/test_first.py", records)
-        self.assertIn("types/basedpyright", records)
 
     def test_a_module_still_running_at_the_time_limit_is_killed_and_the_gate_is_red(self) -> None:
         self.write(self.state / "hold-module", "hold")
@@ -424,15 +409,6 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("module time limit must be positive", result.stdout + result.stderr)
         self.assertEqual(self.module_events(), [])
-
-    @gate_suites("lib", "hooks")
-    def test_sampled_overshoot_is_red_but_every_module_still_runs(self) -> None:
-        output = io.StringIO()
-        with mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "process_memory_mib", return_value={os.getpid(): 100.0}), redirect_stdout(output):
-            result = merge_gate.run_suites(self.checkout, 48)
-        self.assertFalse(result.passed)
-        self.assertEqual(len(result.jobs), self.module_count)
-        self.assertIn("sampled memory exceeded the cap", output.getvalue())
 
     @gate_suites("lib", "hooks")
     def test_runner_reports_load_at_its_own_start_and_end(self) -> None:

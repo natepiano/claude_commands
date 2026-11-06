@@ -23,6 +23,8 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_runtime
 from scripts.production import staff  # noqa: E402
 from scripts.astra.design_role_test_support import write_mesh_server_record  # noqa: E402
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
+from scripts.lib import unit_runs
+from scripts.lib.atomic_file import write_text_atomic
 
 SCRIPT = Path(__file__).with_name("astra_review.py")
 # The stand-in for accounts.py: answers `role workers`, and for `exec` records its call and writes
@@ -317,6 +319,35 @@ class ManagedAstraReviewTests(mesh_fixture.MeshCommandFixture):
                    "bash", str(astra_review.SCRIPTS / "direct/assign.sh")]
         _ = (scripts / "direct/assign.sh").write_text("exec " + shlex.join(command) + ' "$@"\n')
         _ = self.enterContext(patch.object(astra_review, "SCRIPTS", scripts))
+
+    def assert_review_transport(self, held_transport: str, configured_transport: str) -> None:
+        config = self.home / "transport-config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", f"WORKER_TRANSPORT={configured_transport}\n")
+        write_text_atomic(self.session_dir / "worker_transport", held_transport + "\n")
+        run = self.session_dir / "astra-review"
+        run.mkdir()
+        write_text_atomic(astra_review.SCRIPTS / "direct/assign.sh", """while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --session-dir) run="$2"; shift ;;
+        --summary) review="$2"; shift ;;
+    esac
+    shift
+done
+cat "$run/worker_transport" > "$review"
+""")
+        review = run / "review.md"
+        with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            code = astra_review.run_review("codex9", review, "Review the proposal.", run / "codex.log")
+        self.assertEqual(code, 0)
+        self.assertEqual(unit_runs.run_pin(run), held_transport)
+        self.assertEqual(review.read_text(), held_transport + "\n")
+
+    def test_mesh_pinned_caller_keeps_mesh_for_astra_review(self) -> None:
+        self.assert_review_transport("mesh", "herdr")
+
+    def test_herdr_pinned_caller_keeps_herdr_for_astra_review(self) -> None:
+        self.assert_review_transport("herdr", "mesh")
 
     def run_review(self) -> tuple[int, str]:
         document = self.session_dir / "proposal.md"
