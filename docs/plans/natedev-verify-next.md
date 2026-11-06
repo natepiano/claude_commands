@@ -43,14 +43,6 @@
 
 **Needed:** fix it in the next phase that touches that module, beside the `verify_hold_wait_test_support.py:327` flake fix.
 
-## Platform column in build_targets.py eligible
-
-**Source:** natest, routed by builds 2026-11-05. Order: third of the three speed items.
-
-**Today:** `verify.sh` starts `build_targets.py platform` again after `eligible` (69 interpreter starts in `test_verify_ssh_targets_routing.py`, about 0.094 s each).
-
-**Needed:** `verify.sh` reads the platform from the `eligible` answer. Change `print_eligible_target` (`build_targets.py:303`) and every reader together, including the table readers in `initialize_step_record`, `target_for_settings` and `route_test`, and their fixtures. Keep selection, refusal, fallback and reservation behavior. Remove the platform interpreter starts from these paths. The historical trace measured 69 starts at about 0.094 s each, about 6.5 s. Measure the current count and time before and after. Natest Phase 24 is already present. Before start, trial-merge origin/builds-resources. After the change reaches builds, send natest the builds commit.
-
 ## Report Phase 28 metadata items
 
 **Source:** builds (showrunner), 2026-11-05. Report Phase 28 (`eb4210b92`) is on this branch.
