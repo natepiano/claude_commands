@@ -598,6 +598,32 @@ class StaffTests(StaffTestCase):
         _ = self.cli("resume", "--production", owner.name)
         self.assertEqual(staff.by_id(selected.id), selected)
 
+    def test_production_pause_except_accepts_the_unit_suffix(self) -> None:
+        owner, selected, worker = self.tree()
+        excluded = fixture_member("unit", name="fastest", parent=owner.id)
+        result = self.cli("pause", "--production", owner.name, "--except", "fastest-unit",
+                          "--why", "review the selected unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(staff.by_id(excluded.id), excluded)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        current = staff.by_id(selected.id)
+        assert current is not None
+        self.assertIsInstance(current.paused, staff.Paused)
+        self.assertEqual(cast(staff.Paused, current.paused).why, "review the selected unit")
+
+    def test_production_pause_except_accepts_the_unit_id(self) -> None:
+        owner, selected, worker = self.tree()
+        excluded = fixture_member("unit", name="fastest", parent=owner.id)
+        result = self.cli("pause", "--production", owner.name, "--except", str(excluded.id),
+                          "--why", "review the selected unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(staff.by_id(excluded.id), excluded)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        current = staff.by_id(selected.id)
+        assert current is not None
+        self.assertIsInstance(current.paused, staff.Paused)
+        self.assertEqual(cast(staff.Paused, current.paused).why, "review the selected unit")
+
     def test_rename_and_move_preserve_the_pause_record(self) -> None:
         owner, unit, worker = self.tree()
         destination = fixture_member("showrunner", name="hana")

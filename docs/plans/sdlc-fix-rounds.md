@@ -291,6 +291,10 @@ From the sdlc showrunner, 2026-11-05. Dropped on 2026-11-06: hash `50bfbdcf6` do
 
 Devtools 3y `finish_repair` in `scripts/direct/assign.py` resolves the round: `landed` on a clean exit, `abandon --edits-landed` on an error. The fix call in `commands/unit/direct.md` sets `UNIT_RESOLVES_ROUND=1`, so a director passes that prefix on each repair round.
 
+### Phase 9v — A production pause keeps each unit named in --except  · status: done
+
+From the sdlc showrunner, 2026-11-06. `staff.py pause --production hana --except fastest-unit` paused every unit, because the exception compares only the row name and id. Resolve each value through the one unit lookup: the name, the -unit form and the id all match. Add a test for each form. A refusal for an unmatched value is a new check, and it waits for the user's answer.
+
 ### Phase 9u — The units hash merges with the staff-name change on sdlc  · status: done
 
 From the sdlc showrunner, 2026-11-06. Devtools 7u replaced the production slug with the showrunner's staff name. Merge sdlc into this branch. Keep that name, and keep the Status column, pause records and anomaly lines from Phase 9. Add no new check.

@@ -599,12 +599,33 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
         row = record.by_current_session(reference.id)
         matches = [row] if row is not None and row.kind == "unit" else []
     else:
-        matches = [row for row in record.find(kind="unit") if row.name == unit_names.name(selector.unit)]
+        name = unit_names.name(selector.unit)
+        units = record.find(kind="unit")
+        matches = [row for row in units if row.name == name]
+        if not matches:
+            matches = [row for row in units if f"{row.name}-unit" == name]
     if isinstance(selector, UnitMember):
         matches = [row for row in matches if isinstance(parent, RequiredParent) and row.parent == staff.ReportsTo(parent.row.id)]
     if len(matches) > 1:
         raise staff.StaffUnreadable(f"{selector.unit}: no unique staff entry")
     return MemberFound(matches[0]) if matches else NoSuchMember(selector)
+
+
+def excluded_unit_ids(members: tuple[staff.StaffRow, ...], values: Iterable[str]) -> set[staff.StaffId]:
+    """Resolve exclusions within the supplied production members."""
+    record = staff.StaffSnapshot(members)
+    excluded: set[staff.StaffId] = set()
+    for value in values:
+        selector = ObservedUnit(value)
+        match = unit_match(selector, record, StoredReference(value))
+        if isinstance(match, NoSuchMember):
+            try:
+                match = unit_match(selector, record)
+            except unit_names.BadName:
+                continue
+        if isinstance(match, MemberFound):
+            excluded.add(match.row.id)
+    return excluded
 
 
 @dataclass(frozen=True)
