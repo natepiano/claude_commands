@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+from scripts.message import send
 from scripts.production import staff, staff_move, unit_config
 import stall_watch
 from scripts.production.staff_test_support import unit_membership
@@ -98,7 +99,7 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(parent.id)))
         changed = {path for path in before if path.read_bytes() != before[path]}
         self.assertEqual(changed, {self.staff_file})
-        expected = [["--to", f"staff:{row.id}", "--from", "showrunners", "--key",
+        expected = [["--to", str(row.id), "--from", "showrunners", "--key",
                      f"transfer:{row.id}:{parent.id}", "--text", "Your unit now belongs to production other."]]
         self.assertEqual(self.messages(), expected)
         self.assertIn("told alpha", result.stdout)
@@ -117,12 +118,22 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertEqual(result.returncode, 1)
         self.assertIn("tab move failed", result.stderr)
         self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(parent.id)))
-        expected = [["--to", f"staff:{row.id}", "--from", "showrunners", "--key",
+        expected = [["--to", str(row.id), "--from", "showrunners", "--key",
                      f"transfer:{row.id}:{parent.id}", "--text", "Your unit now belongs to production other."]]
         self.assertEqual(self.messages(), expected)
         self.assertIn("told alpha", result.stdout)
         self.assert_ok(self.transfer("apply"))
         self.assertEqual(self.messages(), expected)
+
+    def test_transfer_notice_address_resolves_to_the_moved_staff_row(self) -> None:
+        row = unit_membership("demo", "alpha")
+        parent = next(item for item in staff.find(kind="showrunner") if item.name == "other")
+        self.assert_ok(self.transfer("apply"))
+        message = self.messages()[0]
+        target = message[message.index("--to") + 1]
+        self.assertEqual(target, str(row.id))
+        self.assertEqual(send.resolve_staff_recipient(target, staff.snapshot()),
+                         replace(row, parent=staff.ReportsTo(parent.id)))
 
     def test_transfer_preserves_branch_tips_and_plan_bytes(self) -> None:
         plan = self.unit / "docs/plans/alpha.md"

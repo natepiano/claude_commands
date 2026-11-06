@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import broadcast
 import process_table
-from scripts.production import showrunners
+from scripts.production import session_staff, showrunners, staff
 from scripts.message import send_budget
 from scripts.lib.process_failure import failure_detail
 from live_units import live_unit_names
@@ -154,7 +154,30 @@ def agent_counts(table: Mapping[int, process_table.Process], names: Mapping[int,
 
 def current_counts() -> Counter[str]:
     names = {record["pid"]: record["name"] for record in live_sessions() if record["name"]}
-    return agent_counts(process_table.snapshot(), names)
+    counts = agent_counts(process_table.snapshot(), names)
+    try:
+        record = staff.snapshot()
+        for row in record.find(kind="worker"):
+            if record.parent_of(row) is None:
+                print(f"codex wind-down: {row.name}: no staff member for parent {row.parent}", file=sys.stderr)
+        parents = session_staff.pane_parents(record)
+        if not parents:
+            return counts
+        from scripts.herdr import worker_panes
+
+        observed = worker_panes.observe_parents(parents, record)
+        for parent in parents:
+            for worker in observed[parent.id]:
+                if isinstance(worker, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+                    state = "unknown" if isinstance(worker, worker_panes.ProcessUnknownWorker) else "incomplete"
+                    print(f"codex wind-down: {worker.row.name}: {state}: {worker.reason}", file=sys.stderr)
+                elif (isinstance(worker, worker_panes.OpenWorker)
+                      and worker.status.value in ("working", "running", "starting")
+                      and isinstance(record.backends.get(worker.row.id), staff.CodexBackend)):
+                    counts[parent.name] += 1
+    except (staff.StaffUnreadable, OSError, ValueError) as error:
+        print(f"codex wind-down: {error}", file=sys.stderr)
+    return counts
 
 
 def listed(session: str, units: list[str], counts: Mapping[str, int]) -> dict[str, int]:
