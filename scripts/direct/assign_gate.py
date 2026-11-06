@@ -13,7 +13,6 @@ ASSIGN = ROOT / 'scripts/direct/assign.py'
 LAUNCHERS = {
     ROOT / 'scripts/direct/implement.sh',
     ROOT / 'scripts/direct/review.sh',
-    ROOT / 'scripts/ask_a_friend/launch_friend.sh',
     ROOT / 'scripts/agents/agent_bg.sh',
     ROOT / 'scripts/agents/agent_exec.sh',
 }
