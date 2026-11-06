@@ -113,6 +113,26 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertFalse(any(path.exists() for path in state))
         self.assertEqual(self.run_tidy(doc).returncode, 0)
 
+    def test_wrap_removes_unit_suffix_copies_and_keeps_another_units_copy(self) -> None:
+        source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
+                                         "cleanup@example.invalid", {"file.txt": "content"}).checkout
+        doc = self.doc("done", "wrapped")
+        owner = self.owner("done")
+        active = fixture_member("unit", name="alpha", parent=owner.id)
+        retired = fixture_member("unit", name="beta", parent=owner.id,
+                                 worktree=staff.RemovedWorktree("natedev", self.root / "beta"))
+        with copies.standing(copies.unit_owner(active.name), source, copies.CommittedSource("HEAD")) as unit_tree:
+            pass
+        with copies.standing(copies.unit_owner(retired.name), source, copies.CommittedSource("HEAD")) as retired_tree:
+            pass
+        with copies.standing("live-unit", source, copies.CommittedSource("HEAD")) as unrelated:
+            pass
+        result = self.run_tidy(doc)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(unit_tree.exists())
+        self.assertFalse(retired_tree.exists())
+        self.assertTrue(unrelated.exists())
+
     def test_wrap_keeps_state_until_a_damaged_copy_record_is_repaired(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
                                           "cleanup@example.invalid", {"file.txt": "content"}).checkout

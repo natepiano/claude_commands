@@ -682,17 +682,12 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Goal:** sdlc's request of 2026-11-06. The user sees many leftover folders in cargo-port. `copies.remove_trees` runs only in `tidy_wrapped`, so `retire_unit` leaves the unit's gate copies in `~/worktrees/gates`. The rename half waits for a gate-only way in `copies.py`: `remove_trees` ends every clean copy of the owner, and a rename does not stop the unit, so a live worker's copy would go.
 
 **Spec:**
-1. `retire_unit.retire`: after the worktree is removed and `staff.set_worktree` is done, call `copies.remove_trees(unit.name)`. Print each `copies.CopyError`, `OSError` or `scratch.ScratchError` as one `anomaly:` line. The retire still exits 0.
-2. A retire rerun also removes, so a copy that was busy goes on the next retire. The removal is one helper that both paths call.
-3. Do not change `scripts/copies/copies.py` and do not copy its logic. Do not change `tidy_wrapped.py`.
-4. Tests in `scripts/production/test_retire_unit.py`. Each test makes its gate root in a tempdir through `COPIES_CONFIG`:
-   - a retire removes the unit's copies, and another owner's copy stays;
-   - a busy copy prints one anomaly line, the retire ends as normal, and a rerun removes the copy.
-5. Add no check, guard or refusal. Tests never act on a live unit.
+1. natedev-verify phase 41 landed first: `retire_unit` and `tidy_wrapped` remove unit copies through `copies.unit_owner`. Retire refuses on a busy copy, as `docs/as-built/gate-checkouts.md` says. This phase takes that code, with no second owner rule.
+2. Add one test to `scripts/production/test_tidy_wrapped.py`: a wrap removes `alpha-unit` and retired `beta-unit` copies, and a `live-unit` copy stays. No wrap test used the `-unit` form.
+3. Do not change `scripts/copies/copies.py`. Tests never act on a live unit.
 
 **Files:**
-- `scripts/production/retire_unit.py`
-- `scripts/production/test_retire_unit.py`
+- `scripts/production/test_tidy_wrapped.py`
 
 **Workers:** 1 writer, slot impl2.
 
