@@ -56,7 +56,7 @@ from typing import Literal, TextIO, cast
 from scripts.lib import process_group
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
-from scripts.production import change_review, staff  # noqa: E402
+from scripts.production import change_review  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -1453,10 +1453,9 @@ def merge_checkpoint(args: GateArguments) -> int:
     if refused := change_review.missing(commits):
         raise GateRefused(f"checkpoint commits without a {change_review.TRAILER} line: "
                           + "; ".join(refused) + "; " + change_review.HELD_NEXT_STEP)
-    changes: list[change_review.PublicationChange] = []
     if review_list is not None:
         try:
-            changes = change_review.publication_changes(commits, production)
+            _ = change_review.publication_changes(commits, production)
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
@@ -1494,10 +1493,10 @@ def merge_checkpoint(args: GateArguments) -> int:
     _ = checked_git(repo, "push", "origin", str(args.merge_branch))
     notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
-    if review_list is not None:
-        record_changes(repo, review_list, production, changes, str(args.merge_branch))
     if args.promote:
         promote(args)
+    if review_list is not None:
+        record_changes(repo, review_list, production, str(args.merge_branch))
     return 0
 
 
@@ -1524,24 +1523,18 @@ def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
     return production, found
 
 
-def record_changes(repo: Path, review_list: Path, production: Path, changes: list[change_review.PublicationChange],
-                   merge_branch: str) -> None:
-    """Add a row per visible change to the list, then name any landed merge still missing its rows."""
-    merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
+def record_changes(repo: Path, review_list: Path, production: Path, merge_branch: str) -> None:
+    """Scan published merges after every promotion step succeeds."""
     try:
-        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production, record=staff.snapshot())
-        drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED,
-                                      change_review.foreign_units(production))
+        rows = change_review.list_ready(repo, production, merge_branch, review_list=review_list)
     except (change_review.ChangeReviewError, OSError) as error:
-        raise GateRefused(f"pushed {merged}; change review list {review_list} not written: {error}") from error
+        raise GateRefused(f"change review list {review_list} not written: {error}") from error
     if rows:
         ids = [change_review.row_id(row) for row in rows]
         print(f"Change review: {len(rows)} row(s) added to {review_list}: "
               + (ids[0] if len(ids) == 1 else f"{ids[0]}–{ids[-1]}"), flush=True)
     for row in rows:
         print(f"Change review: {row}", flush=True)
-    for line in drifted:
-        print(f"Change review drift: {line}", file=sys.stderr, flush=True)
 
 
 def nightly_owner(args: GateArguments) -> str:
@@ -1743,6 +1736,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                        module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
             if args.promote_only:
                 promote(args)
+                production, review_list = change_review_list(args)
+                if review_list is not None:
+                    record_changes(Path(args.repo).expanduser().resolve(), review_list, production, args.merge_branch)
                 return 0
             return merge_checkpoint(args)
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:

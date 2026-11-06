@@ -1291,75 +1291,45 @@ The run marker uses the Codex id first: `prepare_session.sh` and `end_session.sh
 
 **Ruled out:** a new refusal at the next launch; the end is the whole repair. Other open-marker cases belong to hierarchies.
 
-### Phase 8g — The review links service restarts when its code changes  · status: todo
+### Phase 8g — The review links service restarts when its code changes  · status: done
 
-Source: sdlc [fc249e32], [c4e2eefc], [ecddfb26]. review-links.service ran from 11-05 17:14 EST and kept the old `change_page.py` in memory after 486e87bb0 moved `--production` to the showrunner name. Each Works press then failed: `ValueError: .../natedev-production.md: no showrunner staff row`, POST 400, page "Not saved". natedev restarted it at 09:42 EST 11-06. This is the second time. The user also set the rule "a change cannot be in the change list unless it is ready to check" and said yes to a refusal in `change_review.py add`. The Mac final read shows staff ids in every open row, so the one-off `migrate-owners` command goes.
+#### As-built
 
-**Depends on:** 3z
+A running review links server replaces itself when a module it loaded changes. `ReviewLinksServer.service_actions` in `scripts/review_links/serve.py` runs `loaded_module_stamps()` every `code_check_seconds` (`config/review_links.conf`, default 5). The function reads `st_mtime_ns` and `st_size` of each `sys.modules` file under the server's checkout. A file with no stamp (`ModuleStampUnavailable.UNREADABLE`), a file modified at or after process start (`STARTED_NS`) and a changed stamp each raise `CodeChanged`. `main` prints `review-links: code changed: <path>`, closes the socket through its `with` block and runs `os.execv(sys.executable, sys.orig_argv)`. The pid and the environment stay. A failed start of the new code exits 1, and the service manager starts it again.
 
-#### Work Order
+While a verdict delivery request is live, the check returns and keeps its recorded stamps, so the next check restarts.
 
-**Goal:** a running review links server never serves old code after a merge or a promotion. `change_review.py add` refuses a merged hash that is not on `origin/main`, and the docs state the ready-to-check rule.
-
-**Spec:**
-1. **The check.** `ReviewLinksServer.service_actions` in `scripts/review_links/serve.py` reads the stamp (`st_mtime_ns`, `st_size`) of each loaded module file under the server's own checkout, every `code_check_seconds`. The list comes from `sys.modules`, so it holds every module the server imports and each module it imports later. A file that cannot be read has no stamp, and that counts as a change.
-2. **The restart.** On a change the server prints one line, `review-links: code changed: <path>`, closes its socket and replaces its process with `os.execv(sys.executable, sys.orig_argv)`. The pid and the environment stay, so the page is away for milliseconds and not for the service manager's ten seconds. A failed start of the new code exits 1, and the service manager starts it again, as it does for a lost address.
-3. **Config.** `config/review_links.conf` gets `code_check_seconds=5`, with its comment and range. The server reads it only when a check is due, as the other two checks do.
-4. **Refusal.** `change_review.py add` with `--merged <hash>` runs `git merge-base --is-ancestor <hash> origin/main` in `--repo` before it writes. Any nonzero result prints one line and exits 1: `<hash> is not on origin/main; no row added. A change goes on the list only when the user can check it now. If it just landed, run git fetch and retry.` No `--merged` means no check. `append` and the merge paths do not change.
-5. **Deletion.** Remove the `migrate-owners` action, `migrate_owners`, its by_id and by_path condition, its usage lines, its section in `commands/change_review.md` and its tests. `scripts/lib/unit_runs.py` has its own `migrate_owners`; leave it.
-6. **Docs.** `commands/change_review.md` add and `docs/production_format.md` item 17 state: a row is added only when the user can check it now, merged to where the user runs it and live (rebuild, restart or deploy done); until then, no row. `docs/as-built/review-links.md` states the code check and replaces its "Code changes need a restart" limit.
-
-**Acceptance:**
-- A real child process runs the server loop on a temporary address and checkout. A write to a loaded module makes that process start again with the same pid and the new code, and it answers HTTP on the port. An unchanged tree keeps the process, and it checks again after `code_check_seconds`.
-- `change_review.py add --merged` on a temporary repository with a bare origin: a hash on `origin/main` writes its row; a hash on a side branch and an unknown hash each print the one line, exit 1 and write nothing.
-- `change_review.py migrate-owners` is an argparse error.
+`change_review.py add --merged <hash>` refuses a hash that is not an ancestor of `origin/main`: one line, exit 1, no row. The `migrate-owners` action is gone. `commands/change_review.md` and `docs/production_format.md` item 17 state the rule: a row is added only when the user can check it now, merged to where the user runs it and live.
 
 **Files:**
 - `scripts/review_links/serve.py`, `config/review_links.conf`, `docs/as-built/review-links.md` — the code check.
-- `scripts/review_links/test_serve.py` — its tests.
+- `scripts/review_links/test_serve.py` — a real child process, the same pid, new code, HTTP after the restart.
 - `scripts/production/change_review.py`, `commands/change_review.md`, `docs/production_format.md` — the refusal, the deletion and the rule.
-- `scripts/production/test_change_review.py` — their tests.
+- `scripts/production/test_change_review.py` — `MergedAddTests` on a real bare origin.
 
-**Workers:** `2 writers + 2 testers`. Each worker does one thing.
-- `item41` — the code check source and doc. `item54` — its tests.
-- `item49` — the refusal, the deletion and the rule docs. `item51` — their tests.
+**Gotchas:** a test fixture must set old modification times, because a file written after process start counts as changed.
 
-**State:** none. The phase writes no new lasting record.
+**Ruled out:** a merge-time restart command; the server finds each change itself.
 
-### Phase 8h — A change reaches the list only when it is on main and live  · status: todo
+### Phase 8h — A change reaches the list only when it is on main and live  · status: done
 
-Source: the user via builds, natedev and sdlc [c4e2eefc]: "a change cannot be in the change list unless it is ready to check". sdlc [7c534629]: the rule covers every path that adds a row. One code path for `add`, `merge_checkpoint.py:1444` and `merge_gate.py:1475`, no copies. A change that needs a restart or deploy gets its row when that step is done. The design is this unit's.
+#### As-built
 
-**Depends on:** 8g
+A row reaches a change list only when its change is on `origin/main` and live. `change_review.list_ready(repo, production, merge_branch, *, review_list=None, record=None, selection=_READINESS_SCAN)` is the one path. It fetches `origin main`; a failed fetch prints one line and adds nothing. It reads the merges on the merge branch since `READY_FROM`, takes their lines through `publication_changes`, and adds a row for each line of a merge that is an ancestor of `origin/main`. Rows carry the merge's short hash. `add`, `live`, `merge_checkpoint.record_publication_changes` and `merge_gate.record_changes` all call it; the two merge paths run it after the last promotion step. The `append` and `drift` actions and `_ChangeNotOnMain` are gone.
 
-#### Work Order
+A `Change-Review:` line takes an optional fourth field, `after <step>`. `Visible` holds `ReadyNow` or `AfterStep(step)`. A scan skips an `AfterStep` line and prints one line with the exact command: `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`, with script paths from the tools' own checkout. `live` selects `CompletedStep(merged, step)`, releases only that merge's lines for that step, and raises `ChangeReviewError` when no line waits on that step.
 
-**Goal:** a row reaches a change list only when its change is on `origin/main` and live, through one code path. Git holds what waits: the `Change-Review:` lines of merged commits. The phase adds no store and no waiting section.
-
-**Spec:**
-1. **One path.** `change_review.py` gets one function, `list_ready`. It reads the merges on the production's merge branch since `LANDED`, as `drift` does. For each merge with visible changes and no row, it adds the rows when the merge is an ancestor of `origin/main`. Rows carry that merge's short hash. A second call adds nothing.
-2. **Callers.** `merge_checkpoint.py` and `merge_gate.py` call `list_ready` once after their promotion step. It replaces `record_publication_changes`' append and its `change-review` receipt, and `merge_gate.record_changes`' append. In `merge_gate.py` the call moves after `promote`. A merge that does not reach main adds no row, and the next call adds it when it does.
-3. **`add`.** `add --merged` keeps 8g's refusal, through the same ancestor function that `list_ready` uses.
-4. **Live steps.** A `Change-Review:` line takes an optional fourth field: `<what> | <how to try> | <what you see> | after <step>`. `list_ready` skips such a line and prints one line naming the merge and the step. Whoever finishes the step runs `change_review.py live --merged <hash> --repo <checkout>`, which adds that merge's held lines. A rerun adds nothing, and a hash not on `origin/main` takes the `add` refusal.
-5. **`drift`.** `list_ready` makes `drift`'s report of a missing row impossible for lines it can add. Remove `drift` and its action if no other purpose remains. Otherwise keep only what remains, and state which.
-6. **Docs.** `commands/unit/checkpoint.md` states the fourth field and when to use it. `commands/change_review.md` and `docs/production_format.md` state the one path and `live`. Correct the as-built docs that state when a row is added.
-
-**Acceptance:**
-- A real-path test on a temporary repository with a bare origin: a merge on the merge branch only adds no row and exits 0; the same merge after it reaches `origin/main` adds its rows once, at the next call.
-- A line with `after restart` adds no row on main, prints its one line, and `live --merged` adds it once.
-- `merge_checkpoint.py` and `merge_gate.py` real-path tests: a failed promotion adds no row; a good one adds them.
-- No path outside `list_ready` and `add` calls `append_rows`.
+`_covered(rows, change, repo)` runs under the list lock: a row with the same Change text covers a line unless the row has a known Merged hash that does not hold `change.checkpoint`. So a repeated scan adds nothing and a returned change gets a new row for its later commit. A child production with no list uses the merging production's list and keeps its own credit. `append_rows` prints `change review: no staff row for unit <name>; Producer stays empty` once per unit after a row write. A failed write in `merge_checkpoint` reports `<doc> not written: <error>; retry after the repair`.
 
 **Files:**
-- `scripts/production/change_review.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py` — the path and its callers.
-- `scripts/production/test_change_review.py`, `scripts/production/test_merge_checkpoint.py`, `scripts/production/test_merge_checkpoint_promotion.py`, `scripts/production/test_merge_gate.py` — the tests.
-- `commands/unit/checkpoint.md`, `commands/change_review.md`, `docs/production_format.md`, `docs/as-built/showrunner-automation.md` — the docs. Correct any other as-built doc that states when a row is added.
+- `scripts/production/change_review.py` — `list_ready`, `_covered`, `live`, `ReadyNow`, `AfterStep`, `CompletedStep`, `ReadinessScan`, `PublicationChange`.
+- `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py` — the callers after promotion.
+- `scripts/production/test_change_review.py`, `test_change_routing.py`, `test_merge_checkpoint_handoff.py`, `test_merge_checkpoint_promotion.py`, `test_merge_checkpoint_rerun.py`, `test_merge_checkpoint_validation.py`, `test_merge_gate.py`, `test_merge_gate_promotion.py`, `merge_gate_test_support.py` — the real-path tests on bare origins.
+- `commands/change_review.md`, `commands/unit/checkpoint.md`, `docs/production_format.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/review-links.md` — the rule, the fourth field and who runs `live`.
 
-**Workers:** `1 writer + 1 tester`. One concern.
-- `impl` — the source and docs.
-- `test` — the test files.
+**Gotchas:** `publication_changes` prints nothing, so a read has no side effect. A merge from before `READY_FROM` never adds a row.
 
-**State:** none. The phase writes no new lasting record. Rows go in the existing lists.
+**Ruled out:** a store or waiting section for held lines; Git holds them in `Change-Review:` lines.
 
 ### Phase 8i — A Claude worker starts only through assign  · status: done
 
@@ -1402,4 +1372,3 @@ Source: the user approved on C1119, through sdlc [b8646245]: fold `scripts/direc
 - `names` — comments, docs and samples.
 
 **State:** none. The phase writes no new lasting record.
-
