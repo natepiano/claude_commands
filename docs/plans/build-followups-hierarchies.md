@@ -625,3 +625,27 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Files:** `scripts/production/staff_sources.py`, `scripts/production/test_staff_sources.py`.
 
 **Gotchas:** the gate on this checkpoint was red in 4 modules: `test_progress_history`, `test_session_pane`, `test_roles_audit` and `test_stop_resume`. The cause is outside this phase. Tests with a private staff record read the real timer folder, and the sdlc-devtools fix ec4762af6 repairs it.
+
+### Phase 24 — A worker list prints each run anomaly once  · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the user's fault of 2026-11-06 06:2x, the warning part. One `/unit:worker list` printed about 15 copies of one block of nine `no showrunner staff row` lines. After this phase, one command prints each anomaly once, and one list scans the run folders once. herdr owns the other part of that fault: Morty's bare panes make every worker uncertain.
+
+**Cause (found by the unit director, on sdlc 5918b1e28):**
+- `worker.py list_workers` calls `worker_panes.dispatch_role(row)` per worker. That calls `worker_run(parent)`, `unit_runs.held` with no `scanned`, and a full `held_by_session` scan. `unit_runs.director` prints one line per ownerless folder in each scan. So the block repeats once per worker. Each scan also costs about 0.5 s. The other `dispatch_role` loops in `worker.py` do the same.
+- A read creates a run folder. `session_staff.read_worker_roster` goes through `worker_lifecycle.locked_state`, which makes the folder and a `mesh_roster.json.lock`. So a read with a wrong run path leaves a new folder behind.
+
+**Spec:**
+1. `scripts/lib/unit_runs.py` `director`: print each anomaly line once per process.
+2. `scripts/herdr/worker_panes.py` `dispatch_role`: take the run as an argument. Do not rescan for each worker. `scripts/production/worker.py`: each loop over a parent's workers reads `worker_run(parent)` once and passes it in. Do not change `observe`, `_parent_evidence` or any `scan.unknown` reader: herdr owns them.
+3. A read of a worker roster in a folder that does not exist reads as a missing roster and creates nothing. A write still creates its folder.
+4. Tests: one `worker.py list` over several workers and an ownerless folder prints each anomaly line once and makes one `held_by_session` scan. A roster read of a missing folder leaves no folder.
+5. Delete no folder under `/tmp/claude`. Add no check, guard or refusal.
+
+**Acceptance gate:**
+- basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
+- These modules pass: `scripts.lib.test_unit_runs`, `scripts.herdr.test_worker_panes`, `scripts.production.test_worker`, `scripts.production.test_session_staff`, `scripts.direct.test_workers`, and each caller module of a changed function.
+- Live, read only: `worker.py list` from this checkout prints each anomaly line once.
