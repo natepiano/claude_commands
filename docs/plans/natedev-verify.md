@@ -908,3 +908,67 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `scripts/buildlog/test_mac_idle.py` — `test_tree_writing_lint_wait_is_local_and_next_judgment_counts_again`.
 
 **Binds later work:** a tree-writing step records `natedev_only` for its lifetime; the call's decision comes back before the next read-only step.
+
+### Phase 38 — Publish a step state without starting Python · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** natest, approved by builds 2026-11-05 (next item "Reuse the step-record state").
+
+**Goal:** a `verify.sh` call starts `step_record.py` only for its first record write and its first tree-writing step. Every other state publication and the record removal run in Bash.
+
+**Spec:**
+
+1. **Record form.** `write_fields` in `scripts/direct/step_record.py` writes every record with `selected_target`, `state` and `updated` as the last three keys, in that order. This is the one place that orders them. The JSON schema and the readers do not change.
+2. **Report flag.** `step_record.py write --report` replaces `--clock-offset`. It prints three lines: the wall minus monotonic offset in microseconds, the record path, and the exact text it wrote. `step_record.py` stays the one owner of the path rule and the schema.
+3. **Saved forms.** `initialize_step_record` (`verify.sh:1952`) reads those three lines. It keeps `VERIFY_MONOTONIC_OFFSET_US`, `STEP_RECORD_PATH`, `STEP_RECORD_IDENTITY` (the text before `, "repo":`) and `STEP_RECORD_CALL_HEAD` (the text before `, "selected_target":`). A quote inside a JSON string is escaped, so these two cuts cannot match inside a value.
+4. **Publish.** A new `publish_step_state <state> [target]` does these steps, in Bash, with no interpreter:
+   1. Read the record at `STEP_RECORD_PATH`.
+   2. Refuse when the text does not start with `STEP_RECORD_IDENTITY`. The refusal prints `step record: cannot update step record: <reason>; step refused` to stderr and returns 2. A missing, damaged or other-process record refuses, the same as the Python read check today. This replaces that check and is not a new one.
+   3. Take the text before `, "selected_target":` and add `, "selected_target": "<selected>", "state": "<state>", "updated": "<UTC time>"}`. The selected value is the target when given, `mac` for `on_mac`, `natedev` for `on_natedev`, and empty for other states. `updated` comes from `date -u +%Y-%m-%dT%H:%M:%S+00:00`, because `verify.sh` also runs under bash 3.2.
+   4. Write a `.step-*` temporary file from `mktemp` in the record directory, then `mv` it over the record.
+5. **Callers.** `step_state` (`verify.sh:412`) calls `publish_step_state`, followed by `|| exit 2`. The `on_ssh` call at `verify.sh:1719` becomes `step_state on_ssh "$selected_target"`. The interrupt path at `verify.sh:3478` calls `publish_step_state waiting_hold || true`. `remove_step_record` (`verify.sh:417`) runs `rm -f -- "$STEP_RECORD_PATH"` and keeps its `|| true`.
+6. **Tree-writing steps.** The first tree-writing step of a call runs the Python `write` at `verify.sh:495` with `--report` and saves `STEP_RECORD_LOCAL_HEAD`. Later tree-writing steps swap that head in with no interpreter. After each tree-writing step, `run()` (`verify.sh:476`) restores `STEP_RECORD_CALL_HEAD` with state `local_noncompiling`, with no interpreter. A subshell that loses `STEP_RECORD_LOCAL_HEAD` costs one more Python write and changes no result. `STEP_RECORD_ARGS` keeps its other uses. Phase 37's binding stays: the step records `natedev_only` for its whole lifetime, and the call's decision comes back before the next read-only step.
+7. **Dead code.** Delete the `state` and `remove` CLI verbs, `state_fields`, `state` and `remove` from `step_record.py`, because no production caller stays. A test fixture that used them calls `write` with a changed record, or unlinks `record_path(call_id)`. `start`, `write` and `stopped` keep their current behavior.
+8. **Durability.** The Bash write has no fsync. The record lives only as long as its call. After a crash, its pid is dead and the readers already ignore it as stale.
+9. **Target names.** Read `scripts/build_targets/target_config.py` for the characters a target name can hold. When a quote or backslash is allowed, the publish step escapes those two characters. State the result in the summary.
+
+**Invariants:** `verify.sh` output, exit codes, cache records and build-log records stay the same for every verb. `python_starts` counts in existing tests only go down. Add no other guard, refusal or check.
+
+**Test changes approved:**
+
+- Delete the `test_step_record_cli.py` tests that only drive the `state` or `remove` verbs. The new real-path tests below hold their behavior. Name each deleted test in the summary.
+- `test_verify_tree_cancel_lint.py:83` has a `python3` stand-in that waits on `step_record.py state`. Change that setup so the test still interrupts at the same point. Its assertions stay.
+- `test_verify_step_routes.py::test_unreadable_record_refuses_before_local_or_mac_compile` keeps every assertion.
+
+**Tests.** New file `scripts/direct/test_verify_step_state.py`. Each test runs the real `verify.sh` with its usual fixture and a run-time tempdir:
+
+1. A call with no tree-writing step starts `step_record.py` for `start` and `write` only.
+2. Two tree-writing steps in one call start one more `write` and no more. During each step, `step_record.read` returns `natedev_only`. After each step, it returns the call's own decision.
+3. Each published state reads back through `step_record.read` as a valid record, with `pinned_target`, `eligible_targets`, `mac_targets` and `package` unchanged, and the right `selected_target` for `on_mac`, `on_ssh` and `on_natedev`. Reuse a fixture from `test_verify_step_routes*.py`, and add no copy of a case those files already pin.
+4. A record that is removed, or rewritten by another pid, makes the next state publication exit 2 with `step refused`, before the step runs.
+5. The removal at call end leaves no record and no `.step-*` file.
+
+**Acceptance:**
+
+- Observation: `step_record.py` starts and CPU seconds in `VERIFY_PY_TRACE` rows, with `scripts/test_times/module_run.py`, for `direct/test_verify_token_renew.py` and `direct/test_verify_lint_cache_versions.py`. The director runs the same script on the tree before and after this phase.
+- Comparison: natest's method gave 225 starts and 19.96 process s, and 486 starts and 23.1 CPU s. The trace before and after numbers go in the notice, with one line for the user on the build cost change.
+- Real path: `scripts/direct/test_verify_step_state.py`, and every existing verify test group.
+
+**Files:**
+- `scripts/direct/verify.sh` — `publish_step_state`, its callers and the saved forms.
+- `scripts/direct/step_record.py` — key order, `--report`, deleted verbs and functions.
+- `scripts/direct/test_verify_step_state.py` — new real-path tests.
+- `scripts/direct/test_step_record.py`, `scripts/direct/test_step_record_cli.py`, `scripts/direct/test_verify_tree_cancel_lint.py` — `--report`, the deleted verbs and the test setup.
+- `scripts/buildlog/test_mac_idle.py`, `scripts/aws_target/test_control.py` — fixtures that called `state` or `remove`.
+- `docs/as-built/build-memory-admission.md` — how a step state is published.
+
+**Workers:** 1 writer + 1 tester
+- `fix16` (test, first): every test file above.
+- `merge16` (impl, after the tests): `scripts/direct/verify.sh`, `scripts/direct/step_record.py`, `docs/as-built/build-memory-admission.md`.
+
+**State:** the step record under `VERIFY_STEPS_DIR`, same schema, a different key order and no fsync.
+
+**Verification:** every test module that names `step_record` or `verify.sh`, through `scripts/test_times/module_run.py`; `basedpyright` on each changed Python file; `bash -n scripts/direct/verify.sh` and `shellcheck scripts/direct/verify.sh`; the merge gate before the checkpoint.
