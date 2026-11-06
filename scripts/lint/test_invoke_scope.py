@@ -460,7 +460,6 @@ buildlog_sample_anon "$1" "$2" "$$"
                 'source "$1"; BUILDLOG_SCOPE_SH=$2; '
                 'buildlog_begin() { BUILDLOG_PEAK="$TMPDIR/buildlog.test.peak"; BUILDLOG_START=""; }; '
                 'sweep_after_step() { :; }; '
-                'systemd-run() { while [[ "$1" != -- ]]; do shift; done; shift; "$@"; }; '
                 'run_once sh -c \'test -f "$1.cgroup"\' step "$TMPDIR/buildlog.test.peak" "$TMPDIR/sweep.py"'
             )
             result = subprocess.run(

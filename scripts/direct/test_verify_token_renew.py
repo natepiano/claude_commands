@@ -167,12 +167,17 @@ buildlog_end() {
     printf '%s\n' "$1" >> "$TEST_ROOT/recorded-statuses"
     [[ -z "$BUILDLOG_PEAK" ]] || rm -f "$BUILDLOG_PEAK"
 }
-# Run the real scope shell without requiring a user systemd manager.
-systemd-run() {
-    while [[ "$1" != -- ]]; do shift; done
-    shift
-    printf '%s\n' "$BUILDLOG_PEAK" >> "$TEST_ROOT/scoped-attempts"
-    "$@"
+# Run the scope shell without a user systemd manager.
+eval "$(declare -f buildlog_memory_python | sed '1s/buildlog_memory_python/buildlog_memory_python_actual/')"
+buildlog_memory_python() {
+    if [[ "${2:-}" == --scope-optional ]]; then
+        printf '%s\n' "$BUILDLOG_PEAK" >> "$TEST_ROOT/scoped-attempts"
+        while [[ "$1" != -- ]]; do shift; done
+        shift
+        "$@"
+    else
+        buildlog_memory_python_actual "$@"
+    fi
 }
 sweep_after_step() { :; }
 buildlog_release_memory() {

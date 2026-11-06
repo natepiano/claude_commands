@@ -23,6 +23,7 @@ from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.socket_test_support import short_socket_directory
 
 
 CPU_WORKLOAD = '''
@@ -396,7 +397,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
         cpu_path = self.state / "runner" / "module_cpu_seconds.json"
         merge_gate.save_measures(cpu_path, {"hooks/test_first.py": 12.0})
         self.environment["BUILDLOG_SCOPE"] = "1"
-        runtime = self.root / "scope-runtime"
+        runtime_folder = short_socket_directory()
+        self.addCleanup(runtime_folder.cleanup)
+        runtime = Path(runtime_folder.name)
         (runtime / "systemd").mkdir(parents=True)
         manager = self.enterContext(socket.socket(socket.AF_UNIX))
         manager.bind(str(runtime / "systemd/private"))

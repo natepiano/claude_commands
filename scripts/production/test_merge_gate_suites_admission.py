@@ -86,7 +86,8 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                         self.admission.allow_next_start()
                     with mock.patch.object(progress, "read_counter", side_effect=capture):
                         result = subprocess.run([*command, "--repo", str(self.checkout)],
-                            cwd=self.root, env=self.environment, capture_output=True, text=True,
+                            cwd=self.root, env={**self.environment, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+                            capture_output=True, text=True,
                             check=False, timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assert_gate_released()

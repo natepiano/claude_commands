@@ -10,7 +10,7 @@ class VerifyTokenDetachTests(VerifyTokenWaitFixture):
         result = self.verify(self.detach_environment(0))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.mesh_runs_calls(), [[
-            "start", "--label", "verify.sh check sample", "--",
+            "start", "--supervisor", "--label", "verify.sh check sample", "--",
             "bash", str(VERIFY.resolve()), "check", "sample",
         ]])
         self.assertFalse((self.root / "cargo-calls").exists())

@@ -156,7 +156,9 @@ class MergeGateTestTimesTests(MergeGateFixture):
         runner = str(self.checkout / "scripts/test_times/module_run.py")
         self.assertEqual(len(launches), 4)
         for argv, root, environment in launches:
-            self.assertEqual(argv[1], runner)
+            self.assertEqual(argv[2:4], ["--scope-optional", "--"])
+            self.assertEqual(argv[4], self.environment["MERGE_GATE_PYTHON"])
+            self.assertEqual(argv[5], runner)
             self.assertEqual(environment["TEST_TIMES_OUT"], str(root / "test-times.json"))
             self.assertFalse(root.exists())
 

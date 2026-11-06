@@ -670,7 +670,7 @@ class QueuePlaceTests(unittest.TestCase):
             descendant = int(cast(bytes, holder.stdout.readline()))
             descriptor = os.pidfd_open(descendant)
             try:
-                os.killpg(holder.pid, signal.SIGKILL)
+                send_process_group(holder.pid, signal.SIGKILL)
                 self.assertEqual(holder.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGKILL)
                 self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
                                 "the program's descendant survived the group kill")
