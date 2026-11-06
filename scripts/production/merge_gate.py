@@ -638,7 +638,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     output = log.open("w+")
     started = time.monotonic()
     try:
-        process = subprocess.Popen([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", SUITE_BOOTSTRAP, *argv],
+        process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
                                    cwd=repo, env=environment, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, text=True,
                                    start_new_session=True)
@@ -902,6 +902,14 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     gate_record.write_gate_run(run)
 
 
+def python_shim(repo: Path) -> Path:
+    """Use the Python shim from the tested checkout."""
+    shim = repo / "scripts" / "lib" / "py"
+    if not shim.is_file():
+        raise GateRefused(f"Python shim not found: {shim}")
+    return shim
+
+
 def module_runner(repo: Path) -> Path:
     """Use the test runner from the tested checkout."""
     runner = repo / "scripts" / "test_times" / "module_run.py"
@@ -982,7 +990,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     maximum_load = starting_load
     began = time.monotonic()
     started_at = datetime.now(UTC).timestamp()
-    python = os.environ.get("MERGE_GATE_PYTHON", str(Path(__file__).resolve().parents[1] / "lib/py"))
+    python = os.environ.get("MERGE_GATE_PYTHON", str(python_shim(repo)))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
 
@@ -1009,6 +1017,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
           gate_reservation(repo, temporary, hold, type_dirs=type_dirs) as reservation,
           shared_cpu_pool() as cpu_pool):
         environment = {**os.environ, "TMPDIR": str(temporary)}
+        _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""
         types_suite, types_module = gate_record.TYPE_CHECK_JOB
         if isinstance(types_python, Path):
