@@ -1256,7 +1256,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Ruled out:** A test for a different relative production path: `read_production` and `production_doc` take `row.doc.path` from the staff row, so no caller can pass that path.
 
-### Phase 58 — The hana_shot launch test reads no live build log  · status: todo
+### Phase 58 — The hana_shot launch test reads no live build log  · status: done
 **Depends on:** Phase 57
 
 #### Work Order
