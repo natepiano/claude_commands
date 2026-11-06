@@ -217,9 +217,7 @@ words = sys.argv[1:]
 settings = str(Path(os.environ["CONF_DIR"]) / "aws_target.conf")
 if words[0] == "eligible":
     print("ssh_allowed")
-    print("aws\teligible\t-\t" + settings)
-elif words[0] == "platform":
-    print("linux")
+    print("aws\teligible\t-\t" + settings + "\tlinux")
 elif words[0] == "reserve":
     Path(words[words.index("--reservation-file") + 1]).write_text("aws\t" + settings + "\n")
 elif words[0] in ("register-local", "check-local") and os.environ.get("TEST_PINNED_DOC") == "1":

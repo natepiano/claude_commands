@@ -239,7 +239,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
-        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
+        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
@@ -409,7 +409,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
         tools.mkdir()
         hash_tool = "sha256sum" if shutil.which("sha256sum") else "shasum"
         for name in (
-            "bash", "python3", "awk", "cat", "cut", "date", "dirname", "env", "grep",
+            "bash", "python3", "awk", "cat", "cmp", "cut", "date", "dirname", "env", "grep",
             "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep",
             "sort", "tail", "tee", "tr", "uname", "wc", hash_tool,
         ):

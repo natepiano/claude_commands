@@ -205,7 +205,10 @@ import os
 from pathlib import Path
 records = list(Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"))
 assert len(records) == 1
-row = json.loads(records[0].read_text())
+import sys
+sys.path.insert(0, str(Path.home() / ".claude"))
+from scripts.direct.test_verify_step_state import read_step_row
+row = read_step_row(records[0].stem)
 Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json").write_text(json.dumps(row))
 Path(os.environ["HOME"], ".local/state/build-targets/aws/controller.json").write_text('{"state":"running"}')
 ''')
