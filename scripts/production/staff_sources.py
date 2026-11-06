@@ -11,7 +11,6 @@ import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
 import sys
 from pathlib import Path
 from typing import cast
@@ -286,13 +285,7 @@ class WorkerEvidence:
     diagnostics: tuple[str, ...]
 
 
-class UnavailableWorkerPolicy(Enum):
-    REFUSE = "refuse"
-    LIST = "list"
-
-
 def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
-                    unavailable: UnavailableWorkerPolicy = UnavailableWorkerPolicy.REFUSE,
                     current_only: bool = False) -> WorkerEvidence:
     """Expose the shared scanner without dropping missing rows or acquiring a lock."""
     errors = io.StringIO()
@@ -300,11 +293,7 @@ def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
         scan = _WorkerSources(record, sources)
         observed = scan.collect(current_only=current_only)
     if scan.claude_registry_incomplete:
-        if unavailable is UnavailableWorkerPolicy.REFUSE:
-            raise staff.StaffUnreadable("Claude session registry is incomplete")
         _ = errors.write("Claude session registry is incomplete\n")
-    if scan.codex_scan_incomplete and unavailable is UnavailableWorkerPolicy.REFUSE:
-        raise staff.StaffUnreadable(errors.getvalue().strip())
     diagnostics = tuple(errors.getvalue().splitlines())
     return WorkerEvidence(observed, scan.identities, diagnostics)
 
@@ -317,16 +306,46 @@ def _live_member(row: staff.StaffRow, role: LiveRole, identity: Mapping[str, str
 
 def live() -> dict[str, object]:
     """Read one owner snapshot and project identities without changing any source."""
-    record = staff.snapshot()
-    dependencies = staff.RecordInputs(set(record.inputs))
-    sources = _member_sources(dependencies=dependencies)
+    try:
+        record = staff.snapshot()
+        dependencies = staff.RecordInputs(set(record.inputs))
+        sources = _member_sources(dependencies=dependencies)
+    except staff.StaffUnreadable as error:
+        _problem("staff membership", error)
+        return {"schema": 3, "complete": False, "problems": [str(error)]}
+    pane_workers: dict[staff.StaffId, dict[str, object]] = {}
+    pane_problems: list[str] = []
+    try:
+        parents = session_staff.pane_parents(record)
+        if parents:
+            from scripts.herdr import worker_panes
+
+            for states in worker_panes.observe_parents(parents, record).values():
+                for state in states:
+                    row = state.row
+                    backend = record.backends.get(row.id)
+                    identity = ({"claude": row.current_session} if isinstance(backend, staff.ClaudeBackend) else
+                                {"codex": row.current_session} if isinstance(backend, staff.CodexBackend) else {})
+                    value = _live_member(row, row.name, identity)
+                    value["pane_state"] = ("open" if isinstance(state, worker_panes.OpenWorker) else
+                                           "stopped" if isinstance(state, worker_panes.StoppedWorker) else
+                                           "closed" if isinstance(state, worker_panes.ClosedWorker) else
+                                           "unknown" if isinstance(state, worker_panes.ProcessUnknownWorker) else "incomplete")
+                    if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+                        reason = f"{row.name}: {state.reason}"
+                        pane_problems.append(reason)
+                        _problem(row.name, state.reason)
+                    pane_workers[row.id] = value
+    except (OSError, ValueError) as error:
+        pane_problems.append(str(error))
+        _problem("pane workers", error)
     scan = _WorkerSources(record, sources, dependencies=dependencies)
     observed = scan.collect()
     members: dict[staff.StaffId, dict[str, object]] = {}
     unregistered = sorted(identity for identity in scan.native_running if record.by_current_session(identity) is None)
     for identity in unregistered:
         _problem(identity, "current native session has no staff row; identity publication is incomplete")
-    incomplete = bool(unregistered) or scan.claude_registry_incomplete or scan.codex_scan_incomplete
+    incomplete = bool(unregistered or pane_problems) or scan.claude_registry_incomplete or scan.codex_scan_incomplete
     for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
         for run in sorted({path.parent for path in root.glob("*/*.pending.json")}):
             publications = pending_publication_evidence(run)
@@ -373,6 +392,9 @@ def live() -> dict[str, object]:
         row = entry.row
         if entry.owner.match.id not in active_ids:
             continue
+        if row.id in pane_workers:
+            members[row.id] = pane_workers[row.id]
+            continue
         worker_identity = ({"claude": entry.identity.session_id} if isinstance(entry.identity, ClaudeSession)
                            else {"codex": entry.identity.thread_id} if isinstance(entry.identity, CodexThread) else {})
         if isinstance(entry.identity, BackendUnavailable):
@@ -395,7 +417,8 @@ def live() -> dict[str, object]:
             _problem(parent.id, "parent has no current session evidence")
             members[parent.id] = _live_member(parent, "unit" if parent.kind == "unit" else "showrunner", {})
     return {"schema": 3, "inputs": sorted(scan.inputs), "members": [members[key] for key in sorted(members)],
-            "complete": not incomplete, "unregistered": sorted(set(unregistered))}
+            "complete": not incomplete, "unregistered": sorted(set(unregistered)),
+            **({"problems": pane_problems} if pane_problems else {})}
 
 
 def cli_live() -> int:
@@ -411,6 +434,8 @@ def cli_live() -> int:
 def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId) -> None:
     """Refuse removal while worker or peer evidence still names the native id."""
     evidence = observe_workers(record, session_staff.member_sources(), current_only=True)
+    for diagnostic in evidence.diagnostics:
+        print(f"anomaly: {diagnostic}", file=sys.stderr)
     member = record.by_id(identity)
     current_session = member.current_session if member is not None else identity
     if identity in evidence.identities or any(
@@ -428,8 +453,8 @@ def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId)
                 peer = roster.peer_snapshot(os.environ)
                 if isinstance(peer, roster.PeerNotReached):
                     raise staff.StaffRefused(f"{identity}: remote native session state is uncertain: {peer.reason}")
-                if peer.problems:
-                    raise staff.StaffRefused(f"{identity}: remote native session state is uncertain: {peer.problems[0]}")
+                for diagnostic in peer.problems:
+                    print(f"anomaly: {diagnostic}", file=sys.stderr)
                 for entry in peer.entries:
                     native = (entry.session.session_id if isinstance(entry.session, roster.ClaudeSession)
                               else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "")

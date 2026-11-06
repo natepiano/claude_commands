@@ -14,7 +14,9 @@ at `~/.claude/scripts/production/transfer_unit.py`:
 ```
 
 1. Run `plan` to check the unit and the receiving showrunner against their staff rows.
-2. Run `apply` to change the unit's staff parent and move its tab to the receiving production.
+2. Run `apply` to change the unit's staff parent, send the unit one message that names its new
+   production, and move its tab to its A-Z place in the receiving production. The unit keeps running.
+   A rerun sends no message and prints `unchanged`.
 3. Run `verify` to complete the transfer after a failed tab move.
 4. Send the receiving showrunner the unit name, worktree and branch.
 5. Tell the user that the unit now reports to the receiving showrunner.

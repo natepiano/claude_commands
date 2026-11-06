@@ -1015,7 +1015,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         if not accounts.session_on_account(session, chosen.label))
         else:
             ids = tuple(session["session_id"] for session, _, _ in group)
-        outcomes = accounts.move_sessions(ids, chosen.label, why=why) if ids else ()
+        outcomes = accounts.move_sessions(ids, chosen.label, why=why, cause="refusal") if ids else ()
         by_id = {session["session_id"]: refusal for session, refusal, _ in group}
         for outcome in outcomes:
             lines.append(accounts.move_result_line(outcome))
@@ -1086,7 +1086,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         why = f"complete {group_name} move to {target}"
                         if isinstance(transition.origin, accounts.AutoOrigin):
                             why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
-                        outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why)
+                        outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target, why=why,
+                            cause=accounts.move_origin_fields(transition.origin)["cause"])
                         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original_state:
         _save_state(state)
@@ -1251,7 +1252,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         _save_state(state)
         ids = tuple(member.session_id for member in members[rule.group]
                     if not accounts.session_on_account(member, rule.to))
-        outcomes = accounts.move_sessions(ids, rule.to, why=why) if ids else ()
+        outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto") if ids else ()
         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original:
         _save_state(state)

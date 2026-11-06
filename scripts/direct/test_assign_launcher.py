@@ -161,7 +161,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
 
     def test_review_incomplete_start_keeps_the_pane_without_either_stage(self) -> None:
         self.fixture.fixture.world.outcome = herdr.PromptNotSubmitted("startup hook failed")
-        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "incomplete startup: startup hook failed")
+        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication failed: startup hook failed")
         self.assertEqual(len(self.fixture.fixture.world.launches), 2)
         self.assertEqual(self.fixture.fixture.world.closed, [])
 

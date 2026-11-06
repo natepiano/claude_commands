@@ -228,9 +228,24 @@ An executable invocation runs `assign_gate.py` before dispatch.
 ### Addressable workers
 
 `assign.sh` is the worker launch entry point.
-Codex workers use `codex_mesh.py`; Claude workers use `agent_bg.sh` and the `worker_fill.py` coordinator.
+`assign.py` reads the run's transport pin.
+A mesh run uses `codex_mesh.py` for Codex workers; a herdr run uses `worker.py` and a pane.
+Claude workers of a mesh run use `agent_bg.sh` and the `worker_fill.py` coordinator.
 The [worker design](long-lived-workers.md) owns admission, staff identity, family switches, retries, messages, and server lifecycle.
 The plain `codex exec` worker fallback is absent.
+
+`design_roles.py` uses `worker.py add`, `assign`, and `end` for held Astra roles.
+These roles keep their staff row and current session in a pane.
+Held roles receive messages through `send.py`.
+An ad hoc Astra review outside the staff hierarchy uses the one-turn `codex exec` path in `astra_review.py`.
+`side_pane.py` serves ask-a-friend consultations without a staff row.
+A managed Astra review starts through `assign.sh --role review --operation astra-review`.
+The mesh transport primes, holds, follows, and ends the reviewer through `codex_mesh.py`.
+The herdr transport adds, assigns, and ends the reviewer through `worker.py`.
+The mesh transport keeps the hold until the end of the worker succeeds.
+The pane transport keeps the hold while `assign.sh` runs; after a failed end, the staff row is the record of the reviewer.
+`assign.py` also retains `dispatch`, `adopt`, and `resume-account-move`.
+The two recovery operations remain until Phase 18.
 
 ### Catalog sync (`scripts/agents/sync_codex_catalog.sh`)
 
@@ -299,7 +314,7 @@ Invalid argument counts print usage and return 1.
 | `unit_effort.py` | Shares one editor base through its command. |
 | `progress_history.py` | Reads the [configuration digest](unit-progress-history.md#configuration-digest) without publication. |
 | `add_unit.py` | Resolves `production.director` and requires Claude. |
-| `launch_friend.sh` | Resolves `ask_a_friend.consultation` in the caller's family. |
+| `side_pane.py` | Resolves `ask_a_friend.consultation` in the caller's family. |
 
 [Long-lived workers](long-lived-workers.md) owns worker launch, handoff, and recovery behavior.
 [Unit progress history](unit-progress-history.md) owns recorder events and progress reports.

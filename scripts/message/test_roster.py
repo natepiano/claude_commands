@@ -26,6 +26,9 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.herdr import worker_panes
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.usage import agents_log
 from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, unit_membership, showrunner_relationship, showrunner_launch,
@@ -34,6 +37,7 @@ from scripts.production.staff_test_support import (
 from scripts.astra import design_roles
 from scripts.astra.design_role_test_support import designer_fixture
 from scripts.astra.design_role_test_support import write_empty_binding_record
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import unit_labels
 
@@ -642,6 +646,35 @@ class RosterTests(unittest.TestCase):
             entries = self._entries()
         self.assertEqual(entries["director"].director, roster.DirectsUnit("unit-one"))
         self.assertEqual(reads.call_count, 1)
+
+    def test_stopped_mesh_run_uses_the_display_staff_record(self) -> None:
+        owner = unit_membership("alpha", "unit-one")
+        write_text_atomic(self.director_run / unit_runs.STATE_FILE, json.dumps({
+            unit_runs.OWNER_FIELD: owner.id, "status": "active",
+        }))
+        (self.sessions / "director.json").unlink()
+        (self.director_run / "heartbeat.log").touch()
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            entries = self._entries()
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(entries["alpha-impl"].director, roster.UnitWithoutRunningDirector("unit-one"))
+        self.assertEqual(entries["claude-worker"].director, roster.UnitWithoutRunningDirector("unit-one"))
+
+    def test_bad_run_pin_reports_the_cause_and_keeps_mesh_workers(self) -> None:
+        pin = self.director_run / "worker_transport"
+        for failure in ("invalid", "unreadable"):
+            with self.subTest(failure=failure):
+                if failure == "invalid":
+                    write_text_atomic(pin, "junk\n")
+                else:
+                    pin.unlink()
+                    pin.mkdir()
+                result = roster.roster(os.environ, roster.ThisMachine())
+                entries = {entry.name: entry for entry in result.entries}
+                self.assertEqual(entries["alpha-impl"].reach, roster.Messageable("worker:director-run/alpha-impl"))
+                self.assertTrue(any(str(pin) in problem for problem in result.problems), result.problems)
+                if failure == "invalid":
+                    self.assertTrue(any("junk" in problem for problem in result.problems), result.problems)
 
     def test_backfilled_retired_rows_leave_full_roster_and_fast_session_labels_unchanged(self) -> None:
         before = self._entries()
@@ -2015,6 +2048,11 @@ class RosterTests(unittest.TestCase):
         with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
              mock.patch.object(account, "process_codex_home", side_effect=process_home) as read_home:
             entries = self._entries()
+            worker = entries["alpha-impl"].thread
+            assert isinstance(worker, roster.CodexThread)
+            environment = Path(os.environ["HERDR_PROC"]) / "991001" / "environ"
+            _ = environment.write_bytes(environment.read_bytes() + f"\0CODEX_THREAD_ID={worker.thread_id}".encode())
+            without_worker = self._entries()
         pane = entries["herdr native:w1:p1"]
         self.assertEqual((pane.kind, pane.role, pane.status, pane.cwd), ("codex", "freestanding", "working", str(self.home)))
         self.assertEqual(pane.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
@@ -2027,6 +2065,8 @@ class RosterTests(unittest.TestCase):
         self.assertNotIn(mock.call(991003), read_home.call_args_list)
         self.assertEqual(entries["herdr native:w1:p3"].cwd, str(self.home))
         self.assertNotIn("herdr native:w1:p2", entries)
+        self.assertNotIn("herdr native:w1:p1", without_worker)
+        self.assertIn("herdr native:w1:p3", without_worker)
 
     def test_a_herdr_failure_is_a_problem_and_keeps_the_other_roster_rows(self) -> None:
         binary = self._herdr_fixture({"default": {"code": 1, "stdout": json.dumps({
@@ -2469,6 +2509,69 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.role, "unit director")
         self.assertTrue(any("unit hosts for alpha were not read" in problem for problem in result.problems))
         self.assertEqual(self.ssh_calls(), [])
+
+
+class PaneRosterTests(StaffTestCase):
+    def test_pane_workers_keep_five_states_and_replace_native_session_entries(self) -> None:
+        fixture = self.row_production()
+        rows = [fixture_worker(name, fixture.unit.id,
+                               backend=staff.CodexBackend(self.root / "codex") if name == "open" else staff.ClaudeBackend())
+                for name in ("open", "stopped", "closed", "unknown")]
+        remote_parent = fixture_member("unit", name="remote-parent", parent=fixture.runner.id,
+                                       worktree=staff.PresentWorktree("mac", self.root / "remote-tree"))
+        remote_worker = fixture_worker("remote-worker", remote_parent.id)
+        world = PaneWorld()
+        world.add(fixture.unit, "w1:p0")
+        world.add(rows[0], "w1:p1", family="codex")
+        world.add(rows[1], "w1:p2", live=False)
+        world.add(rows[3], "w1:p4")
+        world.locations["w1:p1"]["agent_status"] = "working"
+        _ = self.session_record(rows[0].current_session, "registry-copy")
+        config = self.root / "config"
+        config.mkdir()
+        write_text_atomic(config / "direct.conf", "# one of: mesh, herdr\nWORKER_TRANSPORT=herdr\n")
+        before = self.staff_file.read_bytes()
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(self.root / "runs")}),
+              mock.patch.object(worker_panes, "_client", return_value=world),
+              mock.patch.object(herdr, "native_process", side_effect=world.native_process),
+              mock.patch.object(herdr, "_startup_processes", side_effect=world.descendants),
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
+              mock.patch.object(herdr, "Herdr", return_value=world),
+              mock.patch.object(herdr, "herdr_processes", return_value=[
+                  herdr.HerdrProcess(world.foreground["w1:p1"][0], herdr.HerdrPlace("agents", "w1:p1"),
+                                     {"CODEX_THREAD_ID": rows[0].current_session}, "codex", str(fixture.worktree))]),
+              mock.patch.object(herdr, "process_environment", side_effect=ProcessLookupError("process exited")),
+              mock.patch.object(codex_daemon, "read_daemons", return_value=[])):
+            with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+                result = roster.roster(os.environ, roster.ThisMachine())
+            self.assertEqual(reads.call_count, 1)
+            entries = {entry.name: entry for entry in result.entries}
+            self.assertEqual(entries["open"].reach, roster.Messageable(f"worker:{fixture.unit.name}/open"))
+            self.assertEqual(entries["open"].status, "working; pane w1:p1")
+            self.assertIn("stopped", entries["stopped"].status)
+            self.assertEqual(entries["closed"].reach, roster.CannotReceiveMessages("closed"))
+            self.assertNotIn("registry-copy", entries)
+            self.assertNotIn("herdr agents:w1:p1", entries)
+            self.assertNotIn(remote_worker.name, entries)
+            world.unknown["w1:p4"] = "process read denied"
+            result = roster.roster(os.environ, roster.ThisMachine())
+            entries = {entry.name: entry for entry in result.entries}
+            self.assertEqual(entries["unknown"].status, "unknown; pane w1:p4: process read denied")
+            self.assertIsInstance(entries["unknown"].reach, roster.CannotReceiveMessages)
+            self.assertIn("incomplete:", entries["closed"].status)
+            self.assertIn("absence", entries["closed"].status)
+            self.assertEqual(self.staff_file.read_bytes(), before)
+            self.assertEqual(list((self.root / "runs").glob("**/worker_transport*")), [])
+
+    def test_roster_names_owner_and_record_failures(self) -> None:
+        _ = self.row_production()
+        _ = self.write_document({"schema": 2, "rows": ["invalid member"]})
+        result = roster.roster(os.environ, roster.ThisMachine(), records=[])
+        self.assertTrue(any("staff membership" in problem for problem in result.problems), result.problems)
+        self.assertTrue(any("staff" in problem for problem in result.problems), result.problems)
+        with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}):
+            result = roster.roster(os.environ, roster.ThisMachine(), records=[])
+        self.assertTrue(any("not reached" in problem for problem in result.problems), result.problems)
 
 
 class CodexHolderLabelsTests(unittest.TestCase):

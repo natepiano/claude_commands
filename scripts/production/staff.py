@@ -3,16 +3,12 @@
 
 from __future__ import annotations
 
-import argparse
 import fcntl
 import json
 import os
 import re
-import shlex
 import stat
-import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
@@ -20,17 +16,16 @@ from dataclasses import dataclass, field, replace
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import ClassVar, Literal, NewType, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, Literal, NewType, Protocol, TypeVar, cast
 from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
     sys.modules["scripts.production.staff"] = sys.modules[__name__]
-from scripts.lib.models_registry import agent_environment
-from scripts.lib import atomic_file, conf  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
-from scripts.agents import worker_lifecycle  # noqa: E402
+# The status line imports this module on each refresh. Defer imports for other paths.
+if TYPE_CHECKING:
+    import argparse
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
@@ -68,11 +63,15 @@ class BackendUnavailable:
 
 
 def _seconds(key: str) -> float:
+    from scripts.lib import conf
+
     source = Path(os.environ["STAFF_CONFIG"]) if os.environ.get("STAFF_CONFIG") else "staff"
     return conf.read(source).number(key)
 
 
 def _wait_seconds(key: str) -> float:
+    from scripts.agents import worker_lifecycle
+
     remaining = worker_lifecycle.effective_deadline() - time.monotonic()
     if remaining <= 0:
         raise worker_lifecycle.OperationDeadlineExpired("staff operation deadline expired")
@@ -104,7 +103,10 @@ def _valid_id(value: str) -> bool:
 
 def runtime_id(pid: int | None = None) -> str:
     """Read the exact Claude registry pid, or the caller's Codex runtime identity."""
+    import subprocess
+    from scripts.agents import worker_lifecycle
     from scripts.message import sessions
+
     if pid is None and (thread := os.environ.get("CODEX_THREAD_ID", "")):
         try:
             return str(native_id(thread))
@@ -598,11 +600,15 @@ def folder_move_path(unit: StaffId) -> Path:
 
 def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
+    from scripts.shutdown import remote
+
     return bool(_file_override()) or remote.other_machine() != OWNER_MACHINE
 
 
 def child_environment(environment: Mapping[str, str]) -> dict[str, str]:
     """Remove row lock proofs, staff hints, and operation state from agent environments."""
+    from scripts.lib.models_registry import agent_environment
+
     return {key: value for key, value in agent_environment(environment).items()
             if not key.startswith("STAFF_ROW_FD_") and key != "STAFF_ID"}
 
@@ -704,6 +710,8 @@ def _operation_lock_holder(path: Path) -> str:
 
 
 def _wait_for_operation_lock(descriptor: int, path: Path) -> None:
+    from scripts.agents import worker_lifecycle
+
     limit = _wait_seconds("OPERATION_LOCK_SECONDS")
     started = time.monotonic()
     try:
@@ -716,6 +724,8 @@ def _wait_for_operation_lock(descriptor: int, path: Path) -> None:
 
 def operation() -> AbstractContextManager[None]:
     """Order source changes, joining only a proven inherited operation lock."""
+    from scripts.agents import worker_lifecycle
+
     @contextmanager
     def locked() -> Generator[None]:
         path = _file().parent / "operation.lock"
@@ -912,6 +922,10 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
 def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     # Direct worker writers run inside the caller's membership lock. Match the
     # local API's row transaction without entering the outer lifecycle operation.
+    import shlex
+    import subprocess
+    from scripts.agents import worker_lifecycle
+
     if arguments[:2] == ["ensure", "worker"] or arguments[0] in ("update-current-session", "ensure-worker"):
         arguments = [*arguments, "--row-write"]
     elif arguments[0] == "retire":
@@ -971,6 +985,8 @@ def local_snapshot() -> StaffSnapshot:
 
 def wait_for_writes() -> None:
     """Read the local record after pending staff transactions finish."""
+    from scripts.agents import worker_lifecycle
+
     path = _file()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
@@ -1007,6 +1023,8 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
 
 
 def _lookup(rows: list[StaffRow], target: str) -> StaffRow | None:
+    from scripts.shutdown import remote
+
     record = StaffSnapshot(tuple(rows))
     row = record.by_member_reference(target) or record.by_path(target)
     if row is None and Path(target).is_absolute():
@@ -1041,6 +1059,8 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
 
 def _under_test_root(path: Path) -> bool:
     """Identify temporary locations before a write to the real staff record."""
+    import tempfile
+
     resolved = path.expanduser().resolve()
     return any(resolved.is_relative_to(root.resolve())
                for root in (Path(tempfile.gettempdir()), Path("/tmp"), Path("/dev/shm")))
@@ -1052,6 +1072,8 @@ def _location_paths(row: StaffRow) -> tuple[Path, ...]:
 
 
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
+    from scripts.lib import atomic_file
+
     retained = cast(dict[str, object], _decode(_file().read_text(encoding="utf-8"))) if _file().exists() else {}
     unknown = [row for row in cast(list[dict[str, object]], retained.get("rows", [])) if row["kind"] not in _KINDS]
     _validate(rows, unknown)
@@ -1064,6 +1086,9 @@ def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
 
 def _copy_to_mac(*, detached: bool = True) -> None:
     """Send the latest default record under one lock, outside the writing process."""
+    import subprocess
+    from scripts.shutdown import remote
+
     try:
         if "STAFF_FILE" in os.environ or remote.local_machine() != OWNER_MACHINE:
             return
@@ -1123,6 +1148,9 @@ mv -f "$temporary" "$directory/staff.json"
 
 
 def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
+    from scripts.lib import atomic_file
+    from scripts.agents import worker_lifecycle
+
     path = _file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1645,7 +1673,7 @@ class _MoveCommand(Protocol):
     def __call__(self, target: str, new_showrunner: str, *, json_output: bool = False) -> int: ...
 
 
-class _Arguments(argparse.Namespace):
+class _Arguments:
     runtime_id: str = ""
     new_id: str = ""
     verb: str = ""
@@ -1672,6 +1700,8 @@ class _Arguments(argparse.Namespace):
 
 
 def _parser() -> argparse.ArgumentParser:
+    import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
     verbs = parser.add_subparsers(dest="verb", required=True)
     show = verbs.add_parser("show", help="show the production staff")
@@ -1881,6 +1911,8 @@ def _main(arguments: _Arguments) -> int:
 
 def cli_result(action: Callable[[], int]) -> int:
     """The one exception-to-exit-code mapping for staff commands."""
+    from scripts.agents import worker_lifecycle
+
     try:
         return action()
     except StaffNotFound as error:
