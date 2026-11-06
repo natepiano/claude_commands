@@ -266,56 +266,25 @@ only I can bump
 
 ### Phase 10o — The admission client starts with only what it uses  · status: done
 
-**Depends on:** 10x. Runs before 10d, which changes `admission_client.py`. Source: builds showrunner, 2026-11-05 08:1x EST (natest trace).
+#### As-built
 
-#### Work Order
-
-**Goal:** Each `verify.sh` admit and release starts faster, because the admission client loads only what the command uses.
-
-**Spec:**
-
-1. **Cause, measured on `f8b7244ac`.** A cold `import admission_client` loads 227 modules, in 0.46 s with bytecode present, against 0.05 s for bare Python. `admission_service` costs 328 ms, and it brings `SystemClock` and `queue_view`. `admission_protocol` costs 399 ms, nearly all of it `memory_admit` at 345 ms. natest traced 2.9 s of admit and release spans per run with no repair, and 6.6 s per run with repairs.
-2. **Behavior.** `release`, `width` and `token_wait` load no `admission_service`, `queue_view`, `head_facts` or `memory_admit`. `admit` and `launch` load the same set, plus the estimator of item 5 inside `step_request`. Replies, wire shapes, stored records, config keys and printed text do not change.
-3. **Clock.** `scripts/build_queue/system_clock.py` holds `SystemClock` and imports no service code. `admission_service` and `admission_client` import it from there. The clock is not copied.
-4. **Records.** `scripts/build_queue/admission_records.py` holds what the client and `admission_protocol` read from `memory_admit`, and the names those reach: `GIB`, `MemoryConfig`, `read_memory_config`, `warn_configuration_diagnostics`, `Waiter`, `Reservation`, `QueueRead`, `QueueExplanation`, `AdmissionWaitSnapshot`, `ProgramProfile`, `StepProfile`, `WaitReason` and its members, `queue_command_actor`, `waiter_identity`, `process_start_time`, `pressure_text`, `head_wait_text`, `test_threads`. A static walk of the file gives 195 names and about 1,000 lines. Code that nothing here reaches stays in `memory_admit`.
-5. **Estimator.** `scripts/build_queue/step_estimator.py` holds `step_estimate` and the code only it reaches: `program_peak_estimate`, `expected_peak`, `build_expected_peak`, `filtered_peak`, `fresh_test_peak`, `git_identity`, `current_worktree_steps`, `history_selection`. A static walk gives 35 names and about 600 lines. `memory_admit` imports what it still calls from this module. `step_request` imports the module inside the function, because the import of the build history is the cost.
-6. **Wait phrases.** `reason_phrase`, `behind_place` and `eligible_head_position` move from `queue_view` to `admission_records`, because they read only records. `queue_view` imports them.
-7. **Test steps.** `TEST_STEPS` moves from `scripts/lint/build_shape.py` to `scripts/lib/test_phase.py`, because `build_shape` loads the build history. `build_shape` imports it.
-8. **One definition.** Each moved name is defined once. `memory_admit` re-exports each moved public name in the form its `test_phase` import uses (`from x import A as A`), so its other callers do not change. `admission_client` and `admission_protocol` import `admission_records as records` in place of `memory_admit as gate`. New modules keep the import form `memory_admit` uses for `conf` and `test_phase`, so each module loads one time only.
-9. **Code identity.** `ADMISSION_CODE_PATHS` in `admission_code.py` adds the three new modules.
-10. **Measure.** Report these before and after, in the notice, with bytecode present and the median of five runs: modules loaded and wall time of `python -X importtime` for `admission_client`, wall time of one `admit` and one `release` against a fixture service, and the wall time and process seconds of `scripts/direct/test_verify_token_renew.py`. natest measured 44 admission commands there at 25.17 process seconds.
-11. **Proof.** The measurements of item 10 and the list of modules loaded for `release` are the proof. Client, queue and verify suites stay green. Add no new import test: a new check goes to the user first (user, 2026-11-05 09:17 EST, via sdlc), and natest is asking the user about import tests.
-12. **Stays out.** The `build_hold.py` import stays out, under the builds file freeze. natest's proposal for it becomes its own item when builds sends natedev's main hash. Tell natest the builds commit when this phase lands.
+- `release`, `width` and `token_wait` load no `admission_service`, `queue_view`, `head_facts` or `memory_admit`. `admit` and `launch` load the estimator inside `step_request`. Replies, wire shapes, stored records, config keys and printed text do not change.
+- `scripts/build_queue/system_clock.py` holds `SystemClock` (`now`, `monotonic`, `sleep`) and imports no service code.
+- `scripts/build_queue/admission_records.py` holds the records, `GIB`, `MemoryConfig`, `read_memory_config`, `warn_configuration_diagnostics`, `AdmissionWaitSnapshot`, `reason_phrase`, `behind_place` and `eligible_head_position`.
+- `scripts/build_queue/step_estimator.py` holds `step_estimate`, `program_peak_estimate` and the code only they reach. `TEST_STEPS` is in `scripts/lib/test_phase.py`.
+- Each moved name has one definition. `memory_admit.py` re-exports each moved public name (`from x import A as A`), and `queue_view.py` re-exports `reason_phrase`. `ADMISSION_CODE_PATHS` holds the three new modules.
 
 **Files:**
-- `scripts/build_queue/system_clock.py`
-- `scripts/build_queue/admission_records.py`
-- `scripts/build_queue/step_estimator.py`
-- `scripts/build_queue/admission_client.py`
-- `scripts/build_queue/admission_protocol.py`
-- `scripts/build_queue/admission_service.py`
-- `scripts/build_queue/admission_code.py`
-- `scripts/build_queue/queue_view.py`
-- `scripts/lint/memory_admit.py`
-- `scripts/lint/build_shape.py`
-- `scripts/lib/test_phase.py`
-- `scripts/build_queue/test_admission_client.py`
-- `scripts/build_queue/test_admission_client_wait.py`
-- `scripts/build_queue/test_admission_service.py`
-- `scripts/build_queue/test_build_queue.py`
-- `scripts/build_queue/test_queue_evidence.py`
-- `scripts/build_queue/test_queue_place.py`
-- `scripts/lint/test_memory_admit.py`
-- `scripts/production/test_merge_gate_suites_admission.py`
+- `scripts/build_queue/system_clock.py`, `scripts/build_queue/admission_records.py`, `scripts/build_queue/step_estimator.py` — new
+- `scripts/build_queue/admission_client.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_code.py`, `scripts/build_queue/queue_view.py`
+- `scripts/lint/memory_admit.py`, `scripts/lint/build_shape.py`, `scripts/lib/test_phase.py`
 - `docs/as-built/build-memory-admission.md`
 
-**Workers:** `1 writer + 1 tester`
-- `impl2` — owns the clock, the records, the estimator, the protocol and the production callers, and the as-built doc.
-- `test2` — owns their tests, the caller suites and the before-and-after measurements.
+**Binds later work:** a test patches a moved name where the code now reads it. `memory_admit.py` imports `conf`, `test_phase` and `build_shape` by bare name, and a second import form loads a second copy whose classes do not match.
 
-**Gate:** the merge gate, and `basedpyright` 0/0/0 on each changed file.
+**Gotchas:** the client still loads 158 modules, and the release list holds `scripts.message` and `scripts.build_hold.override_guard`.
 
-**Change-Review:** none — the notice carries the measured start times.
+**Ruled out:** a new import test; the `build_hold.py` import, under the builds file freeze.
 
 ### Phase 21 — Each moved admission name has one import path  · status: todo
 
