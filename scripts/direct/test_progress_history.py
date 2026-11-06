@@ -3646,6 +3646,7 @@ with patch.object(fcntl, "flock", admission):
         unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.working_dir), expected=unit.worktree)
         roles = ("impl", "test", "fix", "review", "astra-designer", "astra-reviewer")
         plan = self.working_dir / "roles.md"
+        _ = (self.working_dir / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
         _ = plan.write_text("## Delegation Context\n\n- **Project started:** 1970-01-01T00:00:00+00:00\n")
         for owner in (showrunner, unit):
             name = f"roles-{owner.kind}"
