@@ -68,7 +68,9 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
     if document is not None:
         record = identities.record
         try:
-            owners.update(row.name for row in unit_lookup.doc_units(document, record))
+            for row in unit_lookup.doc_units(document, record):
+                owners.add(row.name)
+                owners.add(copies.unit_owner(row.name))
         except staff.StaffUnreadable:
             pass  # a production with no showrunner row has no units
     try:

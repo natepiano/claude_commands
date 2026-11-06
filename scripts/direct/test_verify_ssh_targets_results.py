@@ -67,8 +67,8 @@ import sys
 
 sys.path.insert(0, os.environ["TEST_SOURCE_REPO"])
 if sys.argv[1:3] == ["nextest", "run"]:
-    from scripts.direct import step_record
-    record = json.loads(step_record.record_path(os.environ["BUILDLOG_CALL_ID"]).read_text())
+    from scripts.direct.test_verify_step_state import read_step_row
+    record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     path = Path(os.environ["TEST_RUNNER_STATE"]) / "local-step.json"
     path.write_text(json.dumps(record))
 os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).with_name("cargo-original")), *sys.argv[1:]])
