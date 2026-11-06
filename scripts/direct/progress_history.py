@@ -1187,7 +1187,7 @@ def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchReco
                  "phase": {"id": event.get("phase_id")}}
                 for event in reads.events[path] if event.get("event_type") == "pass_finished")]
         records.extend((path.parent, record) for record in passes
-                       if _string(record.get("status")) in {"active", "completed", "error", "canceled", "interrupted"}
+                       if _string(record.get("status")) in {"active", "refused", "completed", "error", "canceled", "interrupted"}
                        and (record.get("worker_id") == worker_id if record.get("worker_id")
                             else record.get("worker_name") == worker.name))
     task = agents_log.role_at(reads.roles, worker.current_session, datetime.now(UTC))
