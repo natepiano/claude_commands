@@ -662,7 +662,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Files:** `scripts/production/test_update_registration_answers.py`.
 
-### Phase 27 — A worker list numbers each row  · status: todo
+### Phase 27 — A worker list numbers each row  · status: done
 
 **Depends on:** none
 

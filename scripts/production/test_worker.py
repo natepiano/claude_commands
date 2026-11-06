@@ -941,8 +941,8 @@ class WorkerCommandTests(unittest.TestCase):
         with patch.object(herdr, "Herdr", side_effect=AssertionError("mesh list must not read panes")):
             code, output, errors = self.command("list")
             self.assertEqual(code, 0, errors)
-            self.assertIn(f"{running.name} fix running repairing the reader", output)
-            self.assertIn(f"{done.name} review idle", output)
+            self.assertIn(f"1 {running.name} fix running repairing the reader", output)
+            self.assertIn(f"2 {done.name} review idle", output)
             code, output, errors = self.command("list", "--json")
         self.assertEqual(code, 0, errors)
         rows = cast(list[dict[str, object]], json.loads(output))
@@ -1063,6 +1063,21 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(roles.call_count, 1)
         self.assertEqual(enumerated, [self.fixture.root])
         self.assertEqual(self.agent.submitted, [])
+
+    def test_text_list_numbers_rows_and_keeps_the_worker_fields(self) -> None:
+        self.assertEqual(self.command("list"), (0, "", ""))
+        self.assertEqual(self.dispatch("impl01"), worker.ExitCode.OK)
+        self.assertEqual(self.command("list"), (0, "1 impl01 impl OpenWorker done\n", ""))
+        for number in range(2, 11):
+            self.assertEqual(self.dispatch(f"impl{number:02}"), worker.ExitCode.OK)
+
+        code, output, errors = self.command("list")
+
+        self.assertEqual(code, 0, errors)
+        members = staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)
+        numbers = [" 1", " 2", " 3", " 4", " 5", " 6", " 7", " 8", " 9", "10"]
+        self.assertEqual(output.splitlines(), [
+            f"{number} {row.name} impl OpenWorker done" for number, row in zip(numbers, members, strict=True)])
 
     def test_list_keeps_dispatch_role_separate_from_observation(self) -> None:
         opened = self.opened("impl2", "review")
