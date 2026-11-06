@@ -3407,19 +3407,19 @@ class CodexConversations:
     unknown: tuple[str, ...]
 
 
-def codex_conversations() -> CodexConversations:
+def codex_conversations(*, wanted: str = "") -> CodexConversations:
     from scripts.lib import unit_runs
     from scripts.message import codex_daemon
 
     # A static import would close the cycle codex_mesh -> session_staff -> herdr -> codex_mesh.
     loaded_threads = cast(Callable[[Path, float], set[str]], import_module("scripts.agents.codex_mesh").loaded_threads)
     candidates: list[tuple[int, list[str]]] = []
-    unknown: list[str] = []
+    unknown: list[tuple[int, str] | str] = []
     try:
         if _platform() == "darwin":
             for process in _darwin_processes(complete=True):
                 if isinstance(process.arguments, UnreadableProcessArguments):
-                    unknown.append(f"{_process_display_name(process.pid)} (Codex argv unknown)")
+                    unknown.append((process.pid, "Codex argv unknown"))
                 else:
                     candidates.append((process.pid, list(process.arguments.argv)))
         else:
@@ -3431,9 +3431,9 @@ def codex_conversations() -> CodexConversations:
                         candidates.append((int(path.name), _process_arguments(path)))
                 except FileNotFoundError:
                     if path.exists():
-                        unknown.append(f"{_process_display_name(int(path.name))} (process argv unknown)")
+                        unknown.append((int(path.name), "process argv unknown"))
                 except OSError:
-                    unknown.append(f"{_process_display_name(int(path.name))} (process argv unknown)")
+                    unknown.append((int(path.name), "process argv unknown"))
     except (HerdrFailure, OSError, ValueError) as error:
         unknown.append(f"Codex process list unknown: {error}")
     live: dict[str, tuple[int, ...]] = {}
@@ -3457,7 +3457,7 @@ def codex_conversations() -> CodexConversations:
                 runs.add(Path(run))
             observed = native_process(pid, "codex")
             if isinstance(observed.identity, LaunchArgument):
-                unknown.append(f"{_process_display_name(pid)} (Codex thread unknown)")
+                unknown.append((pid, "Codex thread unknown"))
             else:
                 identity = observed.current_identity
                 live[identity] = (*live.get(identity, ()), pid)
@@ -3484,7 +3484,7 @@ def codex_conversations() -> CodexConversations:
                     if home in daemon_reads:
                         # A failed daemon read already has one note for its account.
                         continue
-            unknown.append(f"{_process_display_name(pid)} (Codex thread unknown)")
+            unknown.append((pid, "Codex thread unknown"))
     deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
     for run in sorted(runs):
         try:
@@ -3492,7 +3492,11 @@ def codex_conversations() -> CodexConversations:
                 _ = live.setdefault(identity, ())
         except (OSError, ValueError) as error:
             unknown.append(f"{run.name} (Codex hosted threads unknown: {error})")
-    return CodexConversations(live, tuple(unknown))
+    if wanted in live:
+        return CodexConversations(live, ())
+    return CodexConversations(live, tuple(
+        entry if isinstance(entry, str) else f"{_process_display_name(entry[0])} ({entry[1]})"
+        for entry in unknown))
 
 
 def read_conversation(identity: str, kind: str = "", *,
@@ -3512,7 +3516,7 @@ def read_conversation(identity: str, kind: str = "", *,
         except (HerdrFailure, OSError, ValueError) as error:
             unknown.append(f"{identity} (Claude session unknown: {error})")
     if kind != "claude":
-        codex = codex_conversations() if codex is None else codex
+        codex = codex_conversations(wanted=identity) if codex is None else codex
         if identity in codex.live:
             return LiveConversation("codex", codex.live[identity])
         shared_codex = not unknown and bool(codex.unknown)
@@ -4199,17 +4203,17 @@ def _pane_shell_pids(session: str) -> list[int]:
     return list(_live_pane_reader.get()(session).shells())
 
 
-def pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+def pane_scopes(groups: list[tuple[str, Path]], slice_name: str) -> list[tuple[str, Path]]:
     """Return the populated pane scopes in the configured agent slice."""
-    slice_name = agents_slice()
     return [(hierarchy, scope) for hierarchy, path in groups
             for scope in (path, *path.parents) if scope.parent.name == slice_name]
 
 
-def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int], sessions: dict[int, str]) -> None:
+def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int],
+                      sessions: dict[int, str], slice_name: str) -> None:
     """Record the session of each matched process in its pane scope."""
     for pid in pids:
-        for scope in pane_scopes(_systemd_cgroups(_proc_root() / str(pid))):
+        for scope in pane_scopes(_systemd_cgroups(_proc_root() / str(pid)), slice_name):
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
@@ -4217,6 +4221,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
         return {}
+    slice_name = agents_slice()
     unit_groups: dict[tuple[str, Path], str] = {}
     shared_groups: dict[tuple[str, Path], set[str]] = {}
     for pid, session in servers.items():
@@ -4272,14 +4277,14 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         break
                 if pid in sessions:
                     break
-            if pid not in sessions and (scopes := pane_scopes(groups)):
+            if pid not in sessions and (scopes := pane_scopes(groups, slice_name)):
                 loose[pid] = scopes
         # A pane scope holds one pane's processes, as the unit's cgroup held
         # them before. Only a scope that no matched process explains needs the
         # unit servers' pane shells.
         owners: dict[tuple[str, Path], set[str]] = {}
         if loose:
-            _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions)
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions, slice_name)
             if any(not any(scope in owners for scope in scopes) for scopes in loose.values()):
                 shared_sessions.update(unit_groups.values())
         walked = set(sessions)
@@ -4296,7 +4301,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                     sessions[pid] = owner
                     descendants.extend((child, owner) for child in children.get(pid, []))
         if loose:
-            _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions)
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions, slice_name)
             for pid, scopes in loose.items():
                 found = {session for scope in scopes for session in owners.get(scope, set())}
                 # A scope with two owners holds a server started inside a pane; it names neither.
