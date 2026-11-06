@@ -1186,7 +1186,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the targeted test green on the phase commit merged with `origin/builds`. Until `scripts/production/targeted_test.py` is on main, run the tree's script with `CONF_DIR='{tree}/config'`, or use the merge gate
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 56 — The SSH retained and retry tests run in half their time  · status: todo
+### Phase 56 — The SSH retained and retry tests run in half their time  · status: done
 **Depends on:** none
 
 #### Work Order
