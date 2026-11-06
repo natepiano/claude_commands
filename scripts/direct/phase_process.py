@@ -20,6 +20,7 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import cache
+from io import BytesIO
 from pathlib import Path
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
@@ -29,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "history"))
 from scripts.direct import plan_history  # noqa: E402
 from scripts.history import rounds  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.style.git_process import GitBlob, read_batch_blob
 from scripts.usage import collect, weights  # noqa: E402
 
 
@@ -1033,18 +1035,11 @@ def read_git_documents(root: Path, revisions: Sequence[DocumentRevision]) -> dic
     result = subprocess.run(["git", "--no-optional-locks", "-C", str(root), "cat-file", "--batch"],
                             input=requests.encode(), capture_output=True, timeout=8, check=False)
     documents: dict[str, str] = {}
-    offset = 0
+    replies = BytesIO(result.stdout)
     for revision in revisions:
-        end = result.stdout.find(b"\n", offset)
-        if end < 0:
-            break
-        header = result.stdout[offset:end].split()
-        offset = end + 1
-        if len(header) != 3 or header[1] != b"blob" or not header[2].isdigit():
-            continue
-        length = int(header[2])
-        documents[revision.sha] = result.stdout[offset:offset + length].decode("utf-8", errors="replace")
-        offset += length + 1
+        reply = read_batch_blob(replies)
+        if isinstance(reply, GitBlob):
+            documents[revision.sha] = reply.content.decode("utf-8", errors="replace")
     return documents
 
 

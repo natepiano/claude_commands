@@ -1132,7 +1132,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the full test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 52 — One shared reader for Git blobs, trees and status  · status: todo
+### Phase 52 — One shared reader for Git blobs, trees and status  · status: done
 **Depends on:** Phase 37
 
 #### Work Order

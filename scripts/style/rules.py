@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Literal, TypedDict, cast, final, override
 
-from git_process import GitReadFailed, run_git
+from git_process import GitBlob, GitReadFailed, read_batch_blob, run_git
 
 import style_rules
 from candidate_generators import CandidatesSpec
@@ -231,14 +231,11 @@ class ValidatedRuleHistory:
                     responses = cast(BinaryIO, self.process.stdout)
                     _ = requests.write(blob.encode() + b"\n")
                     requests.flush()
-                    header = responses.readline().split()
-                    if len(header) == 3:
-                        content = responses.read(int(header[2]))
-                        separator = responses.read(1)
-                        if header[1] == b"blob" and len(content) == int(header[2]) and separator == b"\n":
-                            identity = _rule_from_text(
-                                rule.path, rule.origin, rule.path.parent, rule.reach, content, blob,
-                            ).judgment_identity
+                    reply = read_batch_blob(responses)
+                    if isinstance(reply, GitBlob):
+                        identity = _rule_from_text(
+                            rule.path, rule.origin, rule.path.parent, rule.reach, reply.content, blob,
+                        ).judgment_identity
                 except (OSError, ValueError):
                     pass
                 self.identities[key] = identity

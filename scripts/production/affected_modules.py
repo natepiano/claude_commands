@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib.metadata import packages_distributions
+from io import BytesIO
 from pathlib import Path
 import json
 import os
@@ -19,6 +20,7 @@ import tempfile
 from typing import cast
 
 from scripts.production.gate_modules import is_test_module
+from scripts.style.git_process import GitBlob, parse_status_z, parse_tree_listing, read_batch_blob
 
 
 @dataclass(frozen=True)
@@ -166,39 +168,30 @@ def module_dependencies(module: str, tracked: set[str]) -> set[str]:
 
 
 def revision_files(repo: Path, revision: str) -> dict[str, str]:
-    return {path: metadata.split()[2]
-            for entry in git_output(repo, "ls-tree", "-rz", revision).split("\0") if entry
-            for metadata, path in [entry.split("\t", 1)] if metadata.split()[1] == "blob"}
+    return {path: entry.object for path, entry in parse_tree_listing(git_output(repo, "ls-tree", "-rz", revision)).items()
+            if entry.kind == "blob"}
 
 
 def blob_texts(repo: Path, blobs: set[str]) -> dict[str, str]:
-    result = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"],
-                            input=("\n".join(sorted(blobs)) + "\n").encode(), capture_output=True, check=False)
+    try:
+        result = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"],
+                                input=("\n".join(sorted(blobs)) + "\n").encode(), capture_output=True, check=False)
+    except OSError as error:
+        raise GraphError(str(error)) from error
     if result.returncode:
         raise GraphError(result.stderr.decode("utf-8", errors="replace").strip() or "git cat-file failed")
+    replies = BytesIO(result.stdout)
     texts: dict[str, str] = {}
-    offset = 0
     for blob in sorted(blobs):
-        end = result.stdout.index(b"\n", offset)
-        size = int(result.stdout[offset:end].split()[2])
-        offset = end + 1
-        texts[blob] = result.stdout[offset:offset + size].decode("utf-8")
-        offset += size + 1
+        reply = read_batch_blob(replies)
+        if not isinstance(reply, GitBlob):
+            raise GraphError(f"{blob}: invalid Git blob response")
+        texts[blob] = reply.content.decode("utf-8")
     return texts
 
 
 def dirty_paths(repo: Path) -> set[str]:
-    entries = git_output(repo, "status", "--porcelain", "-z", "--untracked-files=all").split("\0")
-    paths: set[str] = set()
-    index = 0
-    while index < len(entries) and entries[index]:
-        entry = entries[index]
-        paths.add(entry[3:])
-        index += 1
-        if "R" in entry[:2] or "C" in entry[:2]:
-            paths.add(entries[index])
-            index += 1
-    return paths
+    return parse_status_z(git_output(repo, "status", "--porcelain", "-z", "--untracked-files=all"))
 
 
 def worktree_files(repo: Path, dirty: set[str]) -> tuple[set[str], dict[str, str]]:
