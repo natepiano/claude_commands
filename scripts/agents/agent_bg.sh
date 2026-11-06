@@ -118,7 +118,6 @@ import json
 import os
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(os.environ["HOME"]) / ".claude"))
 from scripts.message import sessions
 matches = sessions.transcript_locations(os.environ["NATIVE_ID"])
 count = 0

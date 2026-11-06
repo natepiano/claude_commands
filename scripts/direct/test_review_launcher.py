@@ -177,7 +177,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         interpreter = binaries / "python3"
         calls = self.root / "python-calls"
         _ = interpreter.write_text(
-            '#!/bin/bash\nprintf "%s\\n" "$2" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
         )
         interpreter.chmod(0o755)
         environment = self.environment()
@@ -191,7 +191,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         commands = calls.read_text().splitlines()
         self.assertEqual(len(commands), 3)
         self.assertIn("sys.version_info", commands[0])
-        self.assertEqual(commands[1:], ["print('ready')"] * 2)
+        self.assertEqual(commands[1:], ["-P -c print('ready')"] * 2)
         self.assertEqual((self.root / "cold-cache" / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
     def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:

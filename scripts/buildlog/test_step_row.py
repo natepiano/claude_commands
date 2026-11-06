@@ -148,7 +148,7 @@ class RecorderCompatibilityTests(unittest.TestCase):
                 "assert memory.stall_full_s is record.cgroup_capture.Unmeasured.VALUE"
             )
             result = subprocess.run(
-                [sys.executable, "-c", source, str(Path(__file__).resolve().parents[2]), str(peak)],
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, str(Path(__file__).resolve().parents[2]), str(peak)],
                 cwd=temporary, capture_output=True, text=True,
                 env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
             )

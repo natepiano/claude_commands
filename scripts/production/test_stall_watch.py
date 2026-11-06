@@ -480,7 +480,7 @@ always=natedev
             wrapper = ("import runpy,sys; from pathlib import Path; from scripts.lib import unit_runs; "
                        + "unit_runs.RUN_ROOT=Path(sys.argv[1]); unit_runs.FORMER_RUN_ROOT=Path(sys.argv[2]); "
                        + "runpy.run_path(sys.argv[3],run_name='__main__')")
-            return subprocess.run([sys.executable, "-c", wrapper, str(self.root / "held"),
+            return subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", wrapper, str(self.root / "held"),
                                    str(self.root / "former-held"), str(SCRIPT)], env=environment,
                                   capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         # Keep herdr.run_program, its sanitized environment, and every parser.

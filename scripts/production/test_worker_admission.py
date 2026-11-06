@@ -542,7 +542,7 @@ except admission.AdmissionRefused as error:
     raise SystemExit(2)
 '''
             environment = staff.child_environment(os.environ)
-            contender = subprocess.run([sys.executable, "-c", program, old.id, str(allowed.run)],
+            contender = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, old.id, str(allowed.run)],
                 env=environment, cwd=CHECKOUT, capture_output=True, text=True,
                 check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(contender.returncode, 2, contender.stdout + contender.stderr)

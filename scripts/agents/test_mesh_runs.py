@@ -459,7 +459,7 @@ sys.exit(code)
         with contextlib.ExitStack() as children, (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
             processes = [children.enter_context(subprocess.Popen(
-                [sys.executable, "-c", script, str(self.session), WORKER, str(index)],
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(self.session), WORKER, str(index)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
                 for index in range(4)]
             for child in processes:
@@ -507,7 +507,7 @@ sys.exit(code)
                         self.update_record(path, pid=0, started_at=time.time() - 600)
                         unpublished = path.read_bytes()
                         child = children.enter_context(subprocess.Popen(
-                            [sys.executable, "-c", script, verb, str(self.session), WORKER],
+                            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, verb, str(self.session), WORKER],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
                         assert child.stdout is not None
                         self.assertTrue(select.select([child.stdout], [], [], guard.remaining())[0])
@@ -554,7 +554,7 @@ sys.exit(1)
             listener.listen()
             listener.settimeout(guard.remaining())
             started = subprocess.run(
-                [sys.executable, "-c", script, "start", "--session-dir", str(self.session), "--to", WORKER,
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, "start", "--session-dir", str(self.session), "--to", WORKER,
                  "--done-message-file", str(self.root / "unused-done-message"), "--", sys.executable,
                  "-c", command, address, str(guard.remaining())],
                 capture_output=True, text=True, timeout=guard.remaining(), check=False)

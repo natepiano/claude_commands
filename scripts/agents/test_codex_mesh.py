@@ -3747,7 +3747,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
     assert not more_work, "an empty idle thread was reported as queued work"
 """
         result = subprocess.run(
-            [sys.executable, "-c", script, str(self.server.port), THREAD_ID],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(self.server.port), THREAD_ID],
             cwd=Path(codex_mesh.__file__).resolve().parents[2], env=os.environ.copy(),
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
@@ -13436,7 +13436,7 @@ with isolated_source_readers():
     raise SystemExit(codex_mesh.main(['end', '--session-dir', sys.argv[1], '--to', 'worker']))
 """
         with codex_mesh._pending_file(str(self.session_dir), "worker"):  # pyright: ignore[reportPrivateUsage]
-            child = subprocess.Popen([sys.executable, "-c", child_code, str(self.session_dir)],
+            child = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", child_code, str(self.session_dir)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             assert child.stdout is not None
             try:
