@@ -313,9 +313,13 @@ without_progress_frames() {
     done
 }
 
+buildlog_exec_with_progress() {
+    CARGO_TERM_PROGRESS_WHEN=always \
+        CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}} \
+        buildlog_exec "$@"
+}
+
 run_step_attempt() {
-    export CARGO_TERM_PROGRESS_WHEN=always
-    export CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}}
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
@@ -388,7 +392,7 @@ run_step_attempt() {
     if [[ -t 1 ]]; then
         tty=1
         set +e
-        buildlog_exec "$@" 9>&-
+        buildlog_exec_with_progress "$@" 9>&-
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
@@ -398,7 +402,7 @@ run_step_attempt() {
         fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
-        buildlog_exec "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
+        buildlog_exec_with_progress "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e

@@ -1,8 +1,6 @@
 """A waiting shell keeps its queue place through client failures."""
 from __future__ import annotations
 
-from scripts.build_queue import snapshot_codec as codec
-
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
@@ -19,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
+from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
 from scripts.lint import memory_admit as gate
 
