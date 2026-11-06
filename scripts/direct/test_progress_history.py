@@ -171,6 +171,7 @@ class ProgressHistoryTests(unittest.TestCase):
             with self.subTest(field=field):
                 identity = progress_history.resolve_production_unit({
                     "working_dir": str(self.working_dir), field: plan.name,
+                    "production": "old-production", "unit": "old-unit",
                 })
                 self.assertEqual(identity, progress_history.ProductionUnitIdentity("Example", "unit-a"))
         parent = recorded_showrunner("Receiving", document)
@@ -191,6 +192,21 @@ class ProgressHistoryTests(unittest.TestCase):
         for key in ("working_dir", "worktree", "branch"):
             _ = before.pop(key, None)
         self.assertEqual(after, before)
+
+    def test_set_unit_replaces_run_names_with_the_fixed_staff_id(self) -> None:
+        run = self.start_run("named-owner", 1760658000)
+        path = run / "progress_history_state.json"
+        state = self.read_state(run)
+        state.update(production="old-production", unit="old-unit")
+        _ = path.write_text(json.dumps(state))
+        parent = fixture_member("showrunner", name="receiving")
+        row = fixture_member("unit", name="builders", parent=parent.id)
+        _ = self.run_command("set-unit", "--session-dir", str(run), "--production", parent.name,
+                             "--unit", row.name, at=1760658001)
+        current = self.read_state(run)
+        self.assertEqual(current[unit_runs.OWNER_FIELD], row.id)
+        self.assertNotIn("production", current)
+        self.assertNotIn("unit", current)
 
     def test_set_unit_selects_the_staff_name_when_another_document_uses_that_name(self) -> None:
         run = self.start_run("staff-name-owner", 1760658000)
@@ -3193,13 +3209,13 @@ with patch.object(fcntl, "flock", admission):
                 self.assertEqual(phase["production"], {"state": "Recorded", "value": "Hana"})
                 self.assertEqual(phase["state"], "HistoryNotRecorded")
 
-    def test_phase_production_and_unit_each_keep_their_run_state_override(self) -> None:
+    def test_phase_start_reads_names_from_the_staff_row_and_ignores_run_state_names(self) -> None:
         name = "phase-partial-source"
         session, _worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr")
         state_path = session / "progress_history_state.json"
-        for index, (field, value, production, unit) in enumerate((
-            ("unit", "assigned", "natedev", "assigned"),
-            ("production", "assigned-production", "assigned-production", "herdr"),
+        for index, (field, value) in enumerate((
+            ("unit", "assigned"),
+            ("production", "assigned-production"),
         )):
             with self.subTest(field=field):
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
@@ -3211,8 +3227,8 @@ with patch.object(fcntl, "flock", admission):
                 _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", str(index + 1),
                                      "--phase-title", "Independent source fields", at=1010 + index)
                 started = [event for event in self.read_events(name) if event["event_type"] == "phase_started"][-1]
-                self.assertEqual(started["production"], {"state": "Recorded", "value": production})
-                self.assertEqual(started["unit"], {"state": "Recorded", "value": unit})
+                self.assertEqual(started["production"], {"state": "Recorded", "value": "natedev"})
+                self.assertEqual(started["unit"], {"state": "Recorded", "value": "herdr"})
                 report = cast(dict[str, object], json.loads(self.run_command("waits", at=1040)))
                 self.assertEqual(cast(list[dict[str, object]], report["phases"])[-1]["production"], started["production"])
 
@@ -7493,6 +7509,31 @@ with patch.object(fcntl, "flock", admission):
         if isinstance(owners, phase_reservation.Attribution):
             self.assertEqual([phase.phase for phase in owners.by_phase], ["57c"])
             self.assertEqual(owners.refused, [])
+
+    def test_explicit_phase_checkout_stays_selected_after_the_staff_folder_moves(self) -> None:
+        run = self.start_run("phase-checkout", 40_000, unit_owned=True)
+        self.start_numbered_phase(run, "4a", 40_010)
+        row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
+        assert isinstance(row, staff.StaffRow)
+        checkout = self.root / "phase-repository"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], capture_output=True, check=True)
+        _ = subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "phase"],
+                           capture_output=True, check=True)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(phase_reservation.main([
+                "claim", "--session-dir", str(run), "--phase", "4a", "--repo", str(checkout),
+            ]), 0)
+        directory = phase_reservation.phase_directory(run, "4a")
+        state = run / unit_runs.STATE_FILE
+        before = state.read_bytes()
+        moved = self.root / "moved-home"
+        _ = self.working_dir.rename(moved)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", moved), expected=row.worktree)
+        with chdir(self.root):
+            self.assertEqual(phase_reservation.phase_worktree(directory).root, checkout)
+            self.assertEqual(phase_reservation.home_worktree(directory), moved)
+        self.assertEqual(state.read_bytes(), before)
 
     def test_reopening_a_phase_with_a_held_reservation_preserves_its_records(self) -> None:
         for kind in (phase_reservation.ACTIVE, phase_reservation.PENDING):

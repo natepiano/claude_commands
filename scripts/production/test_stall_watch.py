@@ -477,7 +477,7 @@ always=natedev
             if owner is not None and isinstance(owner.parent, staff.ReportsTo):
                 parent = membership.by_id(owner.parent.id)
                 assert parent is not None
-                run_state.update(production=parent.name, unit=owner.name)
+                run_state[unit_runs.OWNER_FIELD] = owner.id
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}

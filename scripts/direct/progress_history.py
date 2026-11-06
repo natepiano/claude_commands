@@ -430,9 +430,6 @@ def _set_owner(state: dict[str, object], production: str, unit: str) -> None:
     """Resolve the command's names once and store the fixed unit id."""
     if state.get(unit_runs.OWNER_FIELD):
         return
-    if state.get("production") and state.get("unit"):
-        state.update(production=production, unit=unit)
-        return
     record = staff.initial_snapshot()
     parents = {row.id for row in record.find(kind="showrunner")
                if row.name == production}
@@ -1635,7 +1632,8 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["percent_started_at"] = None
     state["pending_calibration"] = None
     event = _event(state, "phase_started", started_at)
-    source = _phase_source_identity(state)
+    production, unit = _phase_plan_names(state)
+    source = PhaseSourceIdentity(production, unit, _phase_repository(_string(state.get("working_dir"))))
     event.update(production=_phase_metadata_fields(source.production),
                  unit=_phase_metadata_fields(source.unit),
                  repository=_phase_metadata_fields(source.repository))
@@ -5313,10 +5311,7 @@ class ProductionNotRecorded:
 
 
 def resolve_production_unit(state: Mapping[str, object], *, resolver: session_staff.RowResolver | None = None) -> ProductionUnitIdentity | ProductionNotRecorded:
-    """Keep recorded history; resolve missing ownership from the current row."""
-    production, unit = _string(state.get("production")), _string(state.get("unit"))
-    if production and unit and not state.get(unit_runs.OWNER_FIELD):
-        return ProductionUnitIdentity(production, unit)
+    """Read the production and unit names from the current staff row."""
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
         record = resolver.record
@@ -5345,8 +5340,7 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
         parent = record.parent_of(row)
         if parent is None:
             return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
-        return (ProductionUnitIdentity(parent.name, row.name) if state.get(unit_runs.OWNER_FIELD)
-                else ProductionUnitIdentity(production or parent.name, unit or row.name))
+        return ProductionUnitIdentity(parent.name, row.name)
     except (OSError, ValueError) as error:
         return ProductionNotRecorded(str(error))
 
