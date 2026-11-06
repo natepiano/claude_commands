@@ -3,16 +3,17 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from dataclasses import replace
-from io import StringIO
-import json
 import os
 from pathlib import Path
+import re
+from io import StringIO
+import json
 from unittest import mock
 
 from scripts.lib import unit_runs
 from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import session_staff as labels, staff
+from scripts.production import session_staff as labels, staff, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
 import herdr
 from pane_launch import PaneLaunch
@@ -101,11 +102,97 @@ class StatusDiscoveryTests(StaffTestCase):
                 self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(grouped.units, {"show": {row.name: replace(agent, unit=row.name)}})
 
+    def test_configured_morty_thread_is_placed_but_another_codex_thread_is_an_anomaly(self) -> None:
+        self.write_json(self.staff_file, {"schema": 2, "rows": []})
+        morty = fixture_runtime_id("morty-thread")
+        other = fixture_runtime_id("other-codex-thread")
+        config = self.root / "config"
+        config.mkdir()
+        source = Path(__file__).resolve().parents[2] / "config/send.conf"
+        text = re.sub(r"(?m)^MORTY_NATIVE_ID=.*$", f"MORTY_NATIVE_ID=codex:{morty}", source.read_text())
+        write_text_atomic(config / "send.conf", text)
+        observed = [labels.LabeledSession("", labels.ClaudeUnknown("no registered Claude"),
+                    labels.Place("agents", f"w{index}:p1"), labels.ObservedProcess(910100 + index, "codex"),
+                    labels.LiveSession(identity)) for index, identity in enumerate((morty, other))]
+        errors = StringIO()
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), redirect_stderr(errors),
+              labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
+            grouped = labels.group_labeled_sessions(observed, record=staff.snapshot(),
+                                                    sources=labels.MemberSources(()))
+        self.assertNotIn(morty, "\n".join(lines))
+        self.assertIn(other, "\n".join(lines))
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(grouped.units, {})
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), redirect_stderr(errors),
+              mock.patch.object(staff_sources.CodexProcessThreads, "thread") as recover):
+            ordinary = labels.group_labeled_sessions(observed, record=staff.snapshot(),
+                                                      sources=labels.MemberSources(()))
+        self.assertIn(morty, errors.getvalue())
+        self.assertIn(other, errors.getvalue())
+        self.assertEqual(len(errors.getvalue().splitlines()), 2)
+        self.assertEqual(ordinary.units, {})
+        recover.assert_not_called()
+
+    def test_morty_without_environment_identity_never_uses_the_retained_unit_launch(self) -> None:
+        row = unit_membership("show", "unit")
+        place = labels.Place("agents", "w2C")
+        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+                            name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
+        unknown = labels.LabeledSession("", labels.ClaudeUnknown("no identity"), place,
+                                        labels.ObservedProcess(198033, "codex"))
+        morty = fixture_runtime_id("retained-pane-morty")
+        from scripts.message import codex_daemon
+
+        sessions = [codex_daemon.DaemonSession(morty, "morty", str(self.root), "idle")]
+
+        def configured_morty(identity: str) -> bool:
+            return identity == morty
+
+        with (mock.patch.object(herdr, "shared_session", return_value=place.session),
+              mock.patch.object(herdr, "process_environment", return_value={}),
+              mock.patch.object(herdr, "herdr_place_of", return_value=place),
+              mock.patch.object(herdr.Herdr, "result", return_value={"pane": {"terminal_title_stripped": "morty | idle"}}),
+              mock.patch.object(codex_daemon, "loaded_sessions", return_value=sessions),
+              mock.patch.object(labels, "morty_thread", side_effect=configured_morty),
+              labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
+            grouped = labels.group_labeled_sessions([unknown], record=staff.snapshot(),
+                                                    sources=labels.MemberSources((launch,)))
+        self.assertEqual(grouped.status_units("show"), {})
+        self.assertEqual(lines, [])
+
+    def test_observations_from_both_readers_share_one_process_line(self) -> None:
+        from scripts.message import process_table
+
+        self.write_json(self.staff_file, {"schema": 2, "rows": []})
+        other = fixture_runtime_id("two-readers-codex")
+        unknown = labels.LabeledSession("", labels.ClaudeUnknown("no identity"), labels.Place("agents", "w2C"),
+                                        labels.ObservedProcess(294399, "codex"), labels.LiveSession(other))
+        table = {294399: process_table.Process(294399, 1, "codex", "codex")}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": other}),
+              labels.anomalies() as lines):
+            _ = labels.group_labeled_sessions([unknown], record=staff.snapshot(), sources=labels.MemberSources(()))
+            staff_sources.unplaced_processes(staff.snapshot(), labels.MemberSources(()))
+            labels.report_anomaly("registry is unreadable")
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("in herdr:agents:w2C", lines[0])
+        self.assertIn(f"pid 294399 (codex): {other}: no current staff row", lines[0])
+        self.assertEqual(lines[1], "anomaly: registry is unreadable")
+
+    def test_two_orphan_processes_have_separate_lines(self) -> None:
+        row = replace(unit_membership("show", "unit"), parent=staff.StaffRoot())
+        record = staff.StaffSnapshot((row,))
+        observed = [labels.LabeledSession("", labels.ClaudeUnknown("not registered"), labels.Place("agents", "w2C"),
+                    labels.ObservedProcess(pid, "codex"), labels.LiveSession(row.current_session)) for pid in (1001, 1002)]
+        with labels.anomalies() as lines:
+            _ = labels.group_labeled_sessions(observed, record=record, sources=labels.MemberSources(()))
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("no showrunner staff parent" in line for line in lines))
+
 
 class WorkerRunDiscoveryTests(StaffTestCase):
     def test_run_index_keeps_the_owner_marker_without_a_worker_record(self) -> None:
-        from scripts.lib import unit_runs
-
         owner = unit_membership("show", "owner")
         worker = fixture_worker("worker", owner.id)
         runs = self.root / "runs"
@@ -122,7 +209,6 @@ class WorkerRunDiscoveryTests(StaffTestCase):
 
     def test_release_finds_a_loaded_source_thread_through_the_owner_marker(self) -> None:
         from scripts.agents.test_codex_mesh import StubAppServer, select_fixture_workers
-        from scripts.lib import unit_runs
         from scripts.shutdown import stop_resume
         from scripts.shutdown.stop_results import SourceReleased
 
@@ -170,9 +256,6 @@ class WorkerRunDiscoveryTests(StaffTestCase):
         self.assertEqual([request["method"] for request in server.requests].count("thread/unsubscribe"), 1)
 
     def test_run_index_reads_workers_without_writing_to_the_marker_folder(self) -> None:
-        from scripts.lib import unit_runs
-        import os
-
         owner = unit_membership("show", "owner")
         worker = fixture_worker("worker", owner.id)
         runs = self.root / "runs"
@@ -190,9 +273,6 @@ class WorkerRunDiscoveryTests(StaffTestCase):
         self.assertEqual(after, before)
 
     def test_unreadable_owner_marker_reports_one_anomaly_and_keeps_other_workers_runs(self) -> None:
-        from scripts.lib import unit_runs
-        import os
-
         broken = unit_membership("show", "broken")
         healthy = unit_membership("show", "healthy")
         first = fixture_worker("broken-worker", broken.id)

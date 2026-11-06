@@ -193,8 +193,8 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 </LongLivedWorkers>
 
 <CoreContract>
-- Never modify unrelated files. The unit director may make a worktree, and its
-  branch, for its own workers. The unit's staff row keeps its one home worktree;
+- Never modify unrelated files. The unit director may make a worktree, and its branch, for its own workers, with `scripts/worktree/make_worktree.sh`.
+  The unit's staff row keeps its one home worktree;
   where a worker works stays in its run record, not in staff. The director
   removes each worktree it made when that work ends. In the home worktree, the
   only branch the run may create is the remote branch <PushCheckpoint/> pushes;
@@ -665,6 +665,11 @@ beside the repair being dispatched — then continue. Never stop, ask permission
 re-open a decision the user has already made about this run, or edit
 `~/.claude/config/direct.conf` mid-run to change what gets said.
 
+**The gate reads only the ledger.** `converged` means that no gating finding is
+open. It does not mean that the tests pass: a test result reaches the gate only
+through a finding. Before each `gate` after a repair, read the worker's summary
+and open a blocker for each failing test or lint line that no finding covers.
+A later round gates blockers only, so a red with no finding reads as `converged`.
 Count one repair round per ledger batch with a started fix pass. Relaunches of that batch add no round.
 A refunded batch adds no round unless it later lands.
 
