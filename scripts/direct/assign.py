@@ -638,22 +638,11 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
     return 0 if completed else 2 if code == 2 else 1
 
 
-def switch_start(dispatch: Dispatch, assignment: Path, message: Path, summary: Path, reply: Path, log: Path) -> list[str]:
-    """Start the Codex thread that receives the saved handoff before its assignment."""
-    command = [PYTHON, MESH, "start", "--session-dir", str(dispatch.run), "--name", dispatch.worker,
-               "--role", dispatch.role, "--cwd", str(dispatch.cwd), "--prompt-file", str(message),
-               "--assignment-file", str(assignment),
-               "--summary-file", str(summary), "--reply-file", str(reply), "--log-file", str(log),
-               "--task", f"direct.{dispatch.role}", "--service-tier", dispatch.tier]
-    if dispatch.args.model:
-        command += ["--model", dispatch.args.model]
-    if dispatch.args.effort:
-        command += ["--effort", dispatch.args.effort]
-    if dispatch.role == "review":
-        command += ["--sandbox", "read-only"]
-    if dispatch.args.lens:
-        command += ["--lens", dispatch.args.lens]
-    return command
+def image_note(images: list[str]) -> str:
+    """Name each attached image for a worker that cannot receive it as an option."""
+    if not images:
+        return ""
+    return "\nRead these images:\n" + "\n".join(str(Path(image).resolve()) for image in images)
 
 
 def execute(dispatch: Dispatch, paths: list[str]) -> int:
@@ -691,8 +680,10 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     receipts = phase_dir / f"dispatch_{number}_submissions.jsonl"
     output_instruction = ("Return the complete review result in your final reply; the runner saves the artifacts."
                           if dispatch.role == "review" else f"As your last act, write your summary to {summary}.")
+    # `start` has no image option, so a switched worker opens each image by its path.
     _ = message.write_text(dispatch.prompt.read_text() + "\n" + RULES +
-                           f"\nWorker: {shown}\n{output_instruction}\n")
+                           f"\nWorker: {shown}\n{output_instruction}\n" +
+                           (image_note(args.image) if dispatch.switching else ""))
     if args.style_since:
         end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
         try:
@@ -728,7 +719,10 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     if args.early_ready:
         follow += ["--submission-receipt-file", str(receipts)]
         dispatch.watch_stage_two(shown)
-    code = dispatch.follow(switch_start(dispatch, assignment, message, summary, reply, log) if dispatch.switching else follow, shown, log)
+    launch = follow if dispatch.switching is None else mesh_command(
+        args, dispatch.run, dispatch.worker, NoHeldAssignment(), dispatch.cwd, message, str(summary), str(log),
+        dispatch.model, dispatch.effort, dispatch.tier, SwitchFiles(assignment, reply))
+    code = dispatch.follow(launch, shown, log)
     if code == 0 and dispatch.stage_thread is not None:
         # Stage 1 may finish before the sentinel. Keep the dispatch claim while
         # the native file watcher waits, then follow any still-held Stage 2.
@@ -779,8 +773,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     reply = directory / f"{slot}_reply{suffix}.txt"
     log = directory / f"{slot}_agent{suffix}.log"
     content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
-    if args.image:
-        content += "\nRead these images:\n" + "\n".join(str(Path(image).resolve()) for image in args.image)
+    content += image_note(args.image)
     if not message.is_file() or message.read_text() != content:
         write_text_atomic(message, content)
     end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
@@ -882,25 +875,31 @@ def admit_assignment(worker: str, run: Path,
     return worker_admission.admit(worker, run)
 
 
-def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAllowed,
-                      held: NoHeldAssignment | HeldAssignment, cwd: Path, prompt: Path,
-                      family: str, model: str, effort: str, tier: str, env: dict[str, str]) -> int:
-    """Translate a checked assignment into its backend operation."""
-    run, worker = admitted.run, admitted.name
-    summary = str(Path(args.summary).resolve()) if args.summary else str(run / f"{worker}.reply.txt")
-    log = str(Path(args.log).resolve()) if args.log else str(run / f"{worker}.log")
-    if family == "claude":
-        if args.operation != AssignmentOperation.RESIDENT:
-            refuse("this operation requires a Codex worker")
-        env.update(AGENT_BG_DETACH="1", AGENT_BG_EFFORT=effort)
-        return call(["bash", str(SCRIPTS / "../agents/agent_bg.sh"), "--run", str(run), worker, str(cwd), str(prompt), summary, log,
-                     str(Path(args.id_file).resolve()) if args.id_file else str(run / "friend_id"), model],
-                    env, check=False).returncode
+@dataclass(frozen=True)
+class SwitchFiles:
+    """The files that only the start of a family switch reads."""
+    assignment: Path
+    reply: Path
+
+
+def mesh_command(args: Arguments, run: Path, worker: str, held: NoHeldAssignment | HeldAssignment,
+                 cwd: Path, prompt: Path, summary: str, log: str, model: str, effort: str, tier: str,
+                 switch: SwitchFiles | None = None) -> list[str]:
+    """Build the one codex_mesh command of a checked assignment."""
     command = [PYTHON, MESH]
     context = ["--session-dir", str(run)]
     settings = ["--model", model, "--effort", effort, "--service-tier", tier]
     role = "impl" if args.role == "implement" else args.role
-    if args.operation == AssignmentOperation.PRIME:
+    if switch is not None:
+        command += ["start", *context, "--name", worker, "--role", role, "--cwd", str(cwd),
+                    "--prompt-file", str(prompt), "--assignment-file", str(switch.assignment),
+                    "--summary-file", summary, "--reply-file", str(switch.reply), "--log-file", log,
+                    "--task", f"direct.{role}", *settings]
+        if role == "review":
+            command += ["--sandbox", "read-only"]
+        if args.lens:
+            command += ["--lens", args.lens]
+    elif args.operation == AssignmentOperation.PRIME:
         if not isinstance(held, HeldAssignment) or not isinstance(held.claim, ReservedHeldCreation):
             refuse("prime requires the holder's reserved creation claim")
         sandbox = "read-only" if isinstance(held.access, design_roles.ReadOnlyReviewer) else held.access.launch_sandbox
@@ -924,7 +923,24 @@ def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAll
         command += ["resume-account-move", *context, "--to", worker]
     else:
         refuse("the dispatch operation requires the normal worker coordinator")
-    return call(command, env, check=False).returncode
+    return command
+
+
+def execute_operation(args: Arguments, admitted: worker_admission.WorkerStartAllowed,
+                      held: NoHeldAssignment | HeldAssignment, cwd: Path, prompt: Path,
+                      family: str, model: str, effort: str, tier: str, env: dict[str, str]) -> int:
+    """Translate a checked assignment into its backend operation."""
+    run, worker = admitted.run, admitted.name
+    summary = str(Path(args.summary).resolve()) if args.summary else str(run / f"{worker}.reply.txt")
+    log = str(Path(args.log).resolve()) if args.log else str(run / f"{worker}.log")
+    if family == "claude":
+        if args.operation != AssignmentOperation.RESIDENT:
+            refuse("this operation requires a Codex worker")
+        env.update(AGENT_BG_DETACH="1", AGENT_BG_EFFORT=effort)
+        return call(["bash", str(SCRIPTS / "../agents/agent_bg.sh"), "--run", str(run), worker, str(cwd), str(prompt), summary, log,
+                     str(Path(args.id_file).resolve()) if args.id_file else str(run / "friend_id"), model],
+                    env, check=False).returncode
+    return call(mesh_command(args, run, worker, held, cwd, prompt, summary, log, model, effort, tier), env, check=False).returncode
 
 
 def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> int:

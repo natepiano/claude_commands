@@ -330,6 +330,18 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         )
 
 
+    def test_a_refused_launch_check_removes_a_stale_review_slot(self) -> None:
+        session = self.start_implementation("stale-review-slot")
+        self.finish_implementation(session)
+        phase = session / "phases/99"
+        phase.mkdir(parents=True)
+        slot = phase / "review_slot_contract"
+        _ = slot.write_text("review2\n", encoding="utf-8")
+        result = self.checked_review(session, "--phase", "99", lens="contract")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("unable to check the review launch", result.stderr)
+        self.assertFalse(slot.exists())
+
     def test_codex_reviewers_must_use_assign(self) -> None:
         session = self.start_implementation("codex-refused")
         self.finish_implementation(session)

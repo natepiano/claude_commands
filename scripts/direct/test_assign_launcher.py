@@ -253,7 +253,9 @@ class AssignLauncherTests(AssignLauncherFixture):
                         agents_log.append(row.current_session, "impl", None, datetime.now(timezone.utc))
                     commands.unlink(missing_ok=True)
                     self.server.requests.clear()
-                    result = self.launch("implement", *(("--to", row.name) if named else ()))
+                    image = self.session_dir.parent / "attached.png"
+                    image.touch()
+                    result = self.launch("implement", "--image", str(image), *(("--to", row.name) if named else ()))
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     called = [cast(list[str], json.loads(line))[0] for line in commands.read_text().splitlines()]
                     self.assertIn("start", called)
@@ -269,6 +271,7 @@ class AssignLauncherTests(AssignLauncherFixture):
                     opening = self.turn_inputs[-1]
                     self.assertLess(opening.index(str(extract)), opening.index(self.prompt.read_text()))
                     self.assertIn(str(source), opening)
+                    self.assertIn(str(image.resolve()), opening)
                     stopped = [cast(dict[str, object], json.loads(line)) for line in releases.read_text().splitlines()]
                     self.assertEqual(stopped[-1], {"session": row.current_session, "result": "SourceReleased"})
                     commands.unlink()

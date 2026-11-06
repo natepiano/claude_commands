@@ -118,6 +118,7 @@ An accepted retry prints `unchanged`.
 
 `assign.py` routes a Codex family change or pending delivery to `codex_mesh.py start`.
 Its `--assignment-file` names the original prompt, so a retry computes the same assignment id.
+`start` has no image option, so the generated prompt names each attached image path.
 An accepted record or a record for another prompt keeps the normal follow path.
 `implement.sh` and `review.sh` are Claude launchers. `review.sh` has no pending-dispatch check, and its follow path does not restore a saved extract.
 
