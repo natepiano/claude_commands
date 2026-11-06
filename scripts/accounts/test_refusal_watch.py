@@ -3386,7 +3386,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         transition = accounts.group_transition("showrunners")
         assert isinstance(transition, accounts.GroupTransition)
-        move.assert_called_once_with(("first", "second"), "claude3", why="weekly refusal", cause="by hand", account_config=ANY)
+        move.assert_called_once_with(("first", "second"), "claude3", why="weekly refusal", account_config=ANY)
 
     def test_named_window_without_known_reset_moves(self) -> None:
         _ = self.owner("refused")
