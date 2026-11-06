@@ -28,11 +28,10 @@ chmod +x "$CLAUDE_BIN"
 export PATH="$TEST_DIR/bin:$PATH"
 export AGENT_NOTES_DIR="$TEST_DIR/notes"
 mkdir -p "$AGENT_NOTES_DIR"
-python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
+"$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import json, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import accounts
 from scripts.whoami.account_test_support import write_codex_auth, write_claude_account
 notes = Path.home().parent / "notes"
@@ -202,11 +201,10 @@ CODEX_HOME="$TEST_DIR/caller" agents_exec_main \
 assert_equal "fallback followed its caller instead of the workers role" "$HOME/.codex1" "$(cat "$TEST_CODEX_HOME_FILE")"
 
 # A named Claude route applies only to worker launches and lasts until it closes.
-python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
+"$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import role_map
 from scripts.whoami.account_test_support import create_claude_account
 create_claude_account("claude4", "route@example.invalid")
@@ -284,10 +282,9 @@ export STAFF_FILE="$TEST_DIR/staff.json"
 export AGENT_BG_ROLE=impl
 export FAKE_CLAUDE_PID=$$
 export FIXTURE_CHECKOUT="$SCRIPT_DIR/../.."
-python3 - "$TEST_DIR" <<'PYTHON'
+"$SCRIPT_DIR/../lib/py" - "$TEST_DIR" <<'PYTHON'
 import os, shlex, sys
 from pathlib import Path
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production.staff_test_support import source_environment, unit_membership
 root = Path(sys.argv[1])
 environment = source_environment(root / "sources")
@@ -322,9 +319,8 @@ cat > "$TEST_DIR/bin/claude-bg" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
 printf '%s\n' "${AGENT_BG_WORKERS+set}" > "$TEST_CLAUDE_WORKERS_FLAG_FILE"
-python3 - <<'PYTHON'
+"$FIXTURE_CHECKOUT/scripts/lib/py" - <<'PYTHON'
 import os, sys
-sys.path.insert(0, os.environ["FIXTURE_CHECKOUT"])
 from scripts.production.staff_test_support import record_fixture_claude_start
 record_fixture_claude_start(sys.argv[1:])
 PYTHON
@@ -353,10 +349,9 @@ cp "$MODELS_CONFIG_FILE" "$TEST_DIR/cli.conf"
 write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.commit_prep=claude
 MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
 assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
+"$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import role_map
 from datetime import datetime, timezone
 role_map.write_role_map(role_map.WorkersClaudeRouteChange(

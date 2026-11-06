@@ -1511,7 +1511,7 @@ class LaunchDestinationTests(StaffTestCase):
         command = cast(list[str], cast(Mock, client.run_in_pane).call_args.args[1])
         legacy = "SHOWRUNNER_" + "UNIT"
         unit_id = legacy + "_ID"
-        shell_environment = {"PATH": os.environ["PATH"], legacy: "old production", unit_id: "old-unit",
+        shell_environment = {"PATH": os.environ["PATH"], legacy: "old production", unit_id: "old",
                              "SHOWRUNNER_EXTRA": "old value=with spaces", "CODEX_THREAD_ID": "old-native-id"}
         query = (f"; printf '%s\\n' \"${{{legacy}-unset}}\" \"${{{unit_id}-unset}}\" "
                  '"${SHOWRUNNER_EXTRA-unset}" "$CODEX_THREAD_ID" "$KEPT_SETTING"')
@@ -2063,7 +2063,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_unmarked_child_cannot_inherit_its_directors_staff_identity(self) -> None:
         with patch.dict(os.environ, {"STAFF_ID": "s123456789ab", ('' + 'SHOWRUNNER_' + 'UNIT'): "old",
-                                     ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit", "KEPT_SETTING": "kept"}):
+                                     ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha", "KEPT_SETTING": "kept"}):
             environment = herdr.unmarked_environment()
         self.assertNotIn("STAFF_ID", environment)
         self.assertNotIn(('' + 'SHOWRUNNER_' + 'UNIT'), environment)
@@ -4206,15 +4206,11 @@ class HerdrTests(unittest.TestCase):
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
         _ = self.process(12, 10, ["/bin/claude"], {
-            "HERDR_PANE_ID": "pane-unit",
+            "HERDR_PANE_ID": "pane",
             "CLAUDE_CODE_SESSION_ID": unit.current_session,
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex", "CODEX_THREAD_ID": codex.current_session})
         import unit_lookup as lookup
-        from scripts.production import session_staff
-
-        def current_slug(slug: str) -> str:
-            return slug
         live = lookup.LiveClaude("Unit", unit.id, "/fixture/socket", 12)
         with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
               patch.object(herdr.Herdr, "agents", return_value=[{
@@ -4222,7 +4218,6 @@ class HerdrTests(unittest.TestCase):
               }]),
               patch.object(lookup, "_claudes", return_value=(
                   {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
-              patch.object(session_staff, "lookup_slug", side_effect=current_slug),
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:
@@ -4259,13 +4254,13 @@ class HerdrTests(unittest.TestCase):
         server = self.process(10, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
-        process = self.process(12, 10, ["/bin/claude"], {"HERDR_PANE_ID": "pane-unit", "CODEX_THREAD_ID": "first"})
+        process = self.process(12, 10, ["/bin/claude"], {"HERDR_PANE_ID": "pane", "CODEX_THREAD_ID": "first"})
         with herdr.process_snapshot():
             rows = herdr.herdr_processes()
             expected = herdr.herdr_processes()
             rows[0].marks["CODEX_THREAD_ID"] = "caller change"
             rows.clear()
-            _ = process.joinpath("environ").write_bytes(b"HERDR_PANE_ID=pane-unit\0CODEX_THREAD_ID=second\0")
+            _ = process.joinpath("environ").write_bytes(b"HERDR_PANE_ID=pane\0CODEX_THREAD_ID=second\0")
             self.assertEqual(herdr.herdr_processes(), expected)
         with herdr.process_snapshot():
             self.assertEqual(herdr.herdr_processes()[0].marks["CODEX_THREAD_ID"], "second")
@@ -5829,8 +5824,8 @@ class SavedLayoutTests(unittest.TestCase):
                          expected)
 
     def test_retained_removed_units_and_wrapped_parents_do_not_classify_tabs_as_current_staff(self) -> None:
-        retired = unit_membership("current", "retired-unit")
-        old_child = unit_membership("wrapped", "child-unit")
+        retired = unit_membership("current", "retired")
+        old_child = unit_membership("wrapped", "child")
         _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         assert isinstance(old_child.parent, staff.ReportsTo)
         _ = staff.set_doc(old_child.parent.id, staff.WrappedDoc("natedev", self.root / "archive.md"))
@@ -5863,7 +5858,7 @@ class SavedLayoutTests(unittest.TestCase):
         client = LayoutHerdr()
         cases: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("control", "control", {}),
-            ("control", "roles", {('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "roles-unit"}),
+            ("control", "roles", {('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "roles"}),
             ("scratch", "scratch", {}))
         for space, name, environment in cases:
             with self.subTest(session=name):
@@ -5975,7 +5970,7 @@ class SavedLayoutTests(unittest.TestCase):
             herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", client.tabs[7]["pane_id"]),
                                {"CLAUDE_CODE_SESSION_ID": pinned.id, ('' + 'SHOWRUNNER_' + 'UNIT'): "natedev"}, "claude", "/repo"),
             herdr.HerdrProcess(2, herdr.HerdrPlace("fixture", client.tabs[6]["pane_id"]),
-                               {('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "gone-unit"}, "claude", "/repo"),
+                               {('' + 'SHOWRUNNER_' + 'UNIT'): "sdlc", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "gone"}, "claude", "/repo"),
         ]
         with patch.object(herdr, "herdr_processes", return_value=processes), \
                 patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:

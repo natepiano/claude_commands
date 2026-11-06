@@ -8,23 +8,30 @@ import subprocess
 import unittest
 from collections.abc import Callable
 from pathlib import Path
-from typing import TextIO, cast, final, override
+from typing import TextIO, TypedDict, cast, final, override
 from unittest.mock import patch
 
 from scripts.agents import test_codex_mesh as mesh_fixture
-from scripts.direct import assign
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, LauncherScript, read_object
-from scripts.lint import style_review
+from scripts.direct import assign
+from scripts.direct.findings_test_support import invoke_findings
+import herdr
+
 from scripts.production import staff, test_worker as worker_fixture, worker, worker_admission
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct import progress_history
 from scripts.lib.atomic_file import write_text_atomic
-
-import herdr
+from scripts.lint import style_review
 
 
 def setUpModule() -> None:
     mesh_fixture.setUpModule()
+
+
+class RepairState(TypedDict):
+    rounds: list[dict[str, object]]
+    findings: list[dict[str, object]]
+    in_flight: list[str]
 
 
 @final
@@ -45,9 +52,9 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.phase = self.fixture.run_dir / "phases/8"
         write_text_atomic(self.fixture.run_dir / "worker_transport", "herdr\n")
         write_text_atomic(self.fixture.prompt, "Phase 8 — Workers\nReview Stage 1, then review the final diff in Stage 2.\n")
-        _ = self.fixture.opened("impl", "impl")
+        opened = self.fixture.opened("impl", "impl")
         _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="impl", phase="8", role="impl",
-            worker_name="impl", launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
+            worker_name="impl", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run_worker_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -187,7 +194,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def test_review_role_refusal_keeps_the_active_worker_and_types_neither_stage(self) -> None:
         opened = self.fixture.opened("review", "impl")
         _ = progress_history.begin_dispatch(self.fixture.run_dir, slot="review", phase="8", role="impl",
-            worker_name="review", launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
+            worker_name="review", worker_id=opened.row.id, launcher_command=["previous-launcher"], prompt=self.fixture.prompt, kind="impl", lens="")
         before = self.fixture.fixture.staff_state()
         self.assert_start_not_delivered(worker.ExitCode.REFUSED, "role change blocked by active work: active dispatch has another role")
         self.assertEqual(self.fixture.fixture.staff_state(), before)
@@ -209,6 +216,143 @@ class AssignLauncherTests(AssignLauncherFixture):
         self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
         self.assertEqual(self.prompt.read_bytes(), prompt)
         self.assertEqual((self.session_dir / "phases/7/impl_status").read_text(), "error\n")
+
+    def finding_command(self, verb: str, *options: str, phase: str = "7") -> str:
+        result = invoke_findings([verb, "--session-dir", str(self.session_dir), "--phase", phase, *options],
+                                 os.environ.copy(), self.project)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def repair_state(self, phase: str = "7") -> RepairState:
+        return cast(RepairState, json.loads(self.finding_command("status", phase=phase)))
+
+    def start_repair(self, phase: str = "7") -> None:
+        _ = self.finding_command("open", "--severity", "blocker", "--title", "Repair the worker",
+                                 "--caught-by", "main", phase=phase)
+        _ = self.finding_command("dispatch", "--covers", "F001", "--accepted-checks",
+                                 "none: the fixture has no accepted behavior", phase=phase)
+
+    def test_a_clean_fix_resolves_only_its_named_phase(self) -> None:
+        self.start_repair()
+        self.record("start-phase", "--phase-id", "8", "--phase-title", "Other repairs")
+        self.start_repair("8")
+        other = self.repair_state("8")
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            _ = self.successful("fix")
+        repaired = self.repair_state()
+        self.assertEqual(repaired["rounds"][-1]["outcome"], "landed")
+        self.assertEqual(repaired["findings"][0]["state"], "fixed_pending_review")
+        self.assertEqual(self.repair_state("8"), other)
+        self.assertEqual(self.turn_starts, 1)
+
+    def test_a_failed_fix_abandons_the_round_without_refunding_the_attempt(self) -> None:
+        self.start_repair()
+        self.outcomes = ["failed"]
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            result = self.launch("fix")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        repaired = self.repair_state()
+        self.assertEqual(repaired["rounds"][-1]["outcome"], "abandoned")
+        self.assertTrue(repaired["rounds"][-1]["edits_landed"])
+        self.assertEqual(repaired["findings"][0]["state"], "open")
+        self.assertEqual(repaired["findings"][0]["fix_attempts"], 1)
+
+    def test_a_fix_with_round_resolution_disabled_keeps_the_round_in_flight(self) -> None:
+        self.start_repair()
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "0"}):
+            _ = self.successful("fix")
+        self.assertEqual(self.repair_state()["in_flight"], ["F001"])
+
+    def test_an_implementation_dispatch_does_not_resolve_a_repair_round(self) -> None:
+        self.start_repair()
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            _ = self.successful()
+        self.assertEqual(self.repair_state()["in_flight"], ["F001"])
+
+    def run_resolution_commands(self, stderr: str) -> subprocess.CompletedProcess[str]:
+        commands = stderr.split("assign.sh: repair resolution failed; run these commands:\n", 1)[1]
+        environment = os.environ.copy()
+        _ = environment.pop("PYTHONPATH", None)
+        return subprocess.run(["bash", "-e", "-c", commands], env=environment, cwd=self.session_dir,
+                              capture_output=True, text=True)
+
+    def complete_repair_after_ledger_failure(self, worker_failed: bool) -> None:
+        self.start_repair()
+        if worker_failed:
+            self.outcomes = ["failed"]
+        ledger = self.session_dir / "findings_state.json"
+        saved = self.session_dir / "saved-findings.json"
+        self.instrument_launcher("\n".join((
+            "from pathlib import Path",
+            "from scripts.direct import assign",
+            "original_call = assign.call",
+            "def call(command, env, **options):",
+            f"    ledger, saved = Path({str(ledger)!r}), Path({str(saved)!r})",
+            "    if any(verb in command for verb in ('landed', 'abandon')) and not saved.exists():",
+            "        ledger.rename(saved)",
+            "        ledger.mkdir()",
+            "    return original_call(command, env, **options)",
+            "assign.call = call",
+        )))
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            result = self.launch("fix")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("repair resolution failed", result.stderr)
+        name = next(iter(self.assignment_records()))
+        status = self.session_dir / f"phases/7/{name}_status"
+        self.assertEqual(status.read_text(), "error\n")
+        ended = [event for event in self.events() if event.get("event_type") == "pass_finished"]
+        self.assertEqual([event["status"] for event in ended], ["error"])
+        ledger.rmdir()
+        _ = saved.rename(ledger)
+        repaired = self.run_resolution_commands(result.stderr)
+        self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+        self.assertEqual(self.turn_starts, 1)
+        self.assertEqual(self.repair_state()["rounds"][-1]["outcome"], "abandoned" if worker_failed else "landed")
+        self.assertEqual(status.read_text(), "error\n")
+
+    def test_manual_resolution_lands_a_clean_fix_without_another_worker_turn(self) -> None:
+        self.complete_repair_after_ledger_failure(False)
+
+    def test_manual_resolution_abandons_a_failed_fix_without_another_worker_turn(self) -> None:
+        self.complete_repair_after_ledger_failure(True)
+
+    def test_a_fix_without_an_open_pass_resolves_without_finishing_a_pass(self) -> None:
+        self.start_repair()
+        directory = self.session_dir / "phases/7"
+        directory.mkdir(parents=True, exist_ok=True)
+        summary, status, reply = (directory / name for name in ("fix-summary.txt", "fix-status", "fix-reply.txt"))
+        _ = summary.write_text("The worker failed before its pass opened.\n")
+        args = assign.Arguments()
+        args.role = "fix"
+        dispatch = assign.Dispatch(args, self.session_dir, self.project, self.prompt, "7", "fix", "unstarted-fix",
+                                   "codex", "gpt-kept-sol", "high", "default",
+                                   {**os.environ, "UNIT_RESOLVES_ROUND": "1"}, {})
+        finished: list[list[str]] = []
+        original_call = assign.call
+
+        def observe(command: list[str], env: dict[str, str], *, capture: bool = False,
+                    check: bool = True) -> subprocess.CompletedProcess[str]:
+            if any("finish-pass" in arg for arg in command):
+                finished.append(command)
+            return original_call(command, env, capture=capture, check=check)
+
+        with patch.object(assign, "call", observe):
+            result = assign.settle_dispatch(dispatch, 2, False, "unstarted-fix", status, summary, reply)
+        self.assertEqual(result, 2)
+        self.assertEqual(self.repair_state()["rounds"][-1]["outcome"], "abandoned")
+        self.assertEqual(finished, [])
+        self.assertEqual(status.read_text(), "error\n")
+
+    def test_each_pass_records_the_staff_id_from_the_worker_roster(self) -> None:
+        _ = self.successful()
+        name, worker = next(iter(self.assignment_records().items()))
+        passes = [event for event in self.events() if event.get("event_type") == "pass_started"]
+        self.assertEqual([event["worker_id"] for event in passes], [worker["staff_id"]])
+        self.assertEqual([event["worker_name"] for event in passes], [name])
+        command = cast(list[str], passes[0]["launcher_command"])
+        self.assertEqual(command[:4], ["bash", str(ASSIGN), "--role", "implement"])
+        self.assertEqual(command[command.index("--session-dir") + 1], str(self.session_dir))
 
     def test_only_a_live_claude_or_codex_ancestor_permits_assignment(self) -> None:
         for family in ("claude", "codex"):

@@ -39,7 +39,6 @@ The command creates no commit and makes no push.
 
 Timers and stores keep their staff ids during a rename.
 The command edits no document fields, plan headers, prose, marks, or history.
-The Phase 3y migrations retain their former-name readers for old records.
 Unit folder moves use `rename_unit.py --move-worktree`.
 
 `test_rename*.py` uses private staff records, temporary files, and a fake herdr.

@@ -131,8 +131,8 @@ def typed_texts(text: str) -> list[str]:
 
 
 def named_places(text: str) -> set[str]:
-    """The pane and session names the text gives, in lower case and without "-unit"."""
-    names = {(match.group("name") or match.group("named")).casefold().removesuffix("-unit")
+    """The pane and session names from the text, in lower case."""
+    names = {(match.group("name") or match.group("named")).casefold()
              for match in _PLACE.finditer(text)
              if match.group("named") or not match.group("name").isdecimal()}
     return names - _NOT_NAMES
