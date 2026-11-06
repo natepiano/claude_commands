@@ -30,7 +30,7 @@ from scripts.aws_target import admin_secrets, aws_target, box, config as aws_con
 from scripts.aws_target.config import read_control_settings
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.measurement_test_support import DAY, narrow
-from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet
+from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet, write_aws_claim
 from scripts.buildlog import sync
 from scripts.lib import conf
 from scripts.mac_test import mac_test
@@ -1453,7 +1453,9 @@ else: raise AssertionError(args)
         charges = self.state / 'charges/day.json'
         charges.parent.mkdir(exist_ok=True)
         _ = charges.write_text('retained charge evidence')
-        success, output = self.down_output()
+        with mock.patch.object(box, 'close_routing', wraps=box.close_routing) as close:
+            success, output = self.down_output()
+        close.assert_called_once_with(self.settings)
         self.assertTrue(success, output)
         self.assertIn('data volume; the /home build cache is lost', output)
         self.assertNotIn('down: image kept:', output)
@@ -1512,16 +1514,56 @@ else: raise AssertionError(args)
         devices = self.removal_fixture()
         self.assertIn('devices', devices)
         before = len(self.commands())
-        with mock.patch.object(mac_test, 'live_claims', return_value=('live claim',)):
-            success, output = self.down_output()
+        claim = write_aws_claim(self.state, kept=False)
+        success, output = self.down_output()
         self.assertFalse(success)
         self.assertIn('AWS claims remain live', output)
         self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
         self.assertFalse((self.root / 'controller-enabled').exists())
         self.assertEqual([cast(list[str], row['args'])[5] for row in self.commands()[before:]],
                          ['get-caller-identity', 'describe-stacks'])
+        self.assertTrue(claim.exists())
+        claim.unlink()
         success, output = self.down_output()
         self.assertTrue(success, output)
+
+    def test_down_preserves_a_kept_claim_and_completes(self) -> None:
+        _ = self.removal_fixture()
+        path = write_aws_claim(self.state, kept=True)
+        original = path.read_bytes()
+        with mock.patch.object(box, 'running_claims', wraps=box.running_claims) as claims:
+            success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertEqual(claims.call_count, 2)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_down_ignores_a_reservation_and_preserves_its_file(self) -> None:
+        _ = self.removal_fixture()
+        path = write_aws_claim(self.state, kept=False, remote=False)
+        original = path.read_bytes()
+        with mock.patch.object(box, 'running_claims', wraps=box.running_claims) as claims:
+            success, output = self.down_output()
+        self.assertTrue(success, output)
+        self.assertEqual(claims.call_count, 2)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_down_refuses_a_running_claim_before_device_removal(self) -> None:
+        devices = self.removal_fixture()
+        read_claims = box.running_claims
+        calls = 0
+        def claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                _ = write_aws_claim(self.state, kept=False)
+            return read_claims(paths)
+        with mock.patch.object(box, 'running_claims', side_effect=claims):
+            success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('tailscale-device: refused: AWS claims remain live', output)
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(ledger.rows(devices, 'devices')), 2)
+        self.assertTrue((self.state / 'claims/job.json').exists())
 
     def test_up_after_down_recreates_foundation_compute_and_scaler_key(self) -> None:
         devices = self.removal_fixture()
@@ -2080,6 +2122,7 @@ else: raise AssertionError(args)
         subject = self.deployment()
         _ = subject.prepare()
         _ = subject.apply(approve_resources=True)
+        _ = box.close_routing(self.settings)
         self.set_clock(self.now + 1)
         self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
         self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
@@ -2088,6 +2131,7 @@ else: raise AssertionError(args)
         self.assertEqual(cast(dict[str, object], starts[0]['decision'])['purpose'], 'deployment')
         self.assertEqual(conf.read(self.settings).text('offload'), 'off')
         self.assertFalse((self.state / 'admission.json').exists())
+        self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
         self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'pending')
 
     def test_setup_restart_uses_prepared_parameters_without_the_private_address_file(self) -> None:

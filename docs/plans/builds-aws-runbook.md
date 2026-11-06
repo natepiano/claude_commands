@@ -524,13 +524,21 @@ Any later deletion requires a separate user decision.
 
 ## Activation and proof stages
 
+Configuration, image creation, and the idle stop proof close AWS routing before they change the box.
+Each stage waits without a time limit for AWS jobs that still run.
+Kept claims do not delay the wait.
+A stage with a valid proof leaves routing unchanged.
+Activation opens routing after the idle stop proof.
+An interrupted `up` leaves routing closed until the next `up` reaches activation.
+Jobs use natedev and the Mac while AWS routing stays closed.
+
 Run `python3 scripts/aws_target/deploy.py up --approve-resources` at your terminal.
 
 1. Allow `idle_stop_minutes` plus `idle_stop_margin_s` for the idle-stop proof.
    Without a saved proof, the stage waits for pending or stopping instances to reach a stable state.
    It starts a stopped instance through the existing spending checks and waits for health.
    The command observes EC2 while the box stops itself.
-   Active AWS claims prevent this proof.
+   A job that starts before routing closes resets the proof deadline to the full duration.
    A timeout makes `up` stop the instance and report a refusal.
 2. The activation stage writes `~/.local/state/build-targets/aws/routing.json` and enables `aws-target.service`.
    The reviewed registry already contains `targets=mac,natedev,aws`, `kind.aws=ssh`, `platform.aws=linux`, and `settings.aws=aws_target.conf`.
@@ -583,8 +591,9 @@ Run the approved removal at your terminal.
 AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" python3 scripts/aws_target/deploy.py down --approve-destroy
 ```
 
-The helper disables routing and the controller before checking live claims.
-Let active claims finish before another removal attempt.
+The helper disables routing and the controller before checking jobs that still run.
+Let these jobs finish before another removal attempt.
+Kept claims do not delay removal.
 The helper deletes the tagged Tailscale device, scaler keys, compute resources, foundation, retained volume, and retained Budget.
 The helper removes only the scaler profile from the plain credentials file.
 It keeps the policy rules, encrypted administrator file, ledger, and charge history.

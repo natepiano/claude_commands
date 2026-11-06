@@ -31,6 +31,24 @@ from scripts.mac_test import linux_runner, offload, mac_test
 IMAGE_OWNER_TAG = 'aws-build-image'
 
 
+def running_claims(paths: mac_test.StatePaths) -> tuple[mac_test.HeldClaim, ...]:
+    """Read remote job claims whose owner process still runs without deleting claims."""
+    return tuple(claim for claim in mac_test.read_claims(paths)
+                 if 'remote_host' in claim.record and not mac_test.run_is_kept(claim.record))
+
+
+def close_routing(settings: Path) -> bool:
+    """Disable AWS routing while excluding new claims."""
+    path = target_config.ssh_target_state_directory('aws') / 'routing.json'
+    desired: dict[str, object] = {'enabled': False, 'settings': str(settings.resolve())}
+    paths = mac_test.state_paths('aws')
+    with mac_test.locked(paths.lock):
+        changed = not path.exists() or json_record(path.read_text()) != desired
+        if changed:
+            write_text_atomic(path, json.dumps(desired) + '\n')
+    return changed
+
+
 class BoxRefused(ValueError):
     """A live box check does not permit the next stage."""
 
@@ -445,6 +463,9 @@ class BoxSetup:
             return False
 
     def configure(self) -> None:
+        if self.configuration_present():
+            return
+        self.quiet()
         desired = self._desired_system()
         source = Path(conf.read(self.settings).text('nixos_configuration_directory')).expanduser().resolve()
         built = self._run(['nix', 'build', '--no-link', '--print-out-paths', '--no-write-lock-file',
@@ -614,6 +635,9 @@ class BoxSetup:
                       'sync; printf restored')
 
     def image(self) -> None:
+        if self.image_present():
+            return
+        self.quiet()
         marker = self.directory / 'image-scrub.json'
         if marker.exists():
             _ = self.start()
@@ -727,8 +751,7 @@ class BoxSetup:
     def idle_stop(self) -> None:
         if self.idle_stop_present():
             return
-        if mac_test.live_claims(mac_test.state_paths('aws')):
-            raise BoxRefused('idle stop requires no active AWS claims')
+        self.quiet()
         state = self._instance_state()
         def stable() -> bool:
             nonlocal state
@@ -752,8 +775,8 @@ class BoxSetup:
             with control_lock(self.directory):
                 deadline = self.monotonic() + duration
                 while True:
-                    if mac_test.live_claims(mac_test.state_paths('aws')):
-                        raise BoxRefused('idle stop requires no active AWS claims')
+                    if running_claims(mac_test.state_paths('aws')):
+                        deadline = self.monotonic() + duration
                     state = self._instance_state()
                     if state == 'stopped':
                         self._save_proof('idle-stop')
@@ -776,6 +799,21 @@ class BoxSetup:
                 _ = self._api().call('stop-instances', '--instance-ids', self._instance())
                 self._wait(lambda: self._instance_state() == 'stopped', 'idle stop cleanup did not confirm EC2 stopped')
             raise
+
+    def close_routing(self) -> None:
+        if close_routing(self.settings):
+            print('routing: AWS takes no new work until up finishes')
+
+    def quiet(self) -> None:
+        self.close_routing()
+        paths = mac_test.state_paths('aws')
+        claims = running_claims(paths)
+        if claims:
+            print(f'routing: waiting for {len(claims)} AWS jobs to finish')
+        delay = conf.read(self.settings).number('box_check_delay_s')
+        while claims:
+            _ = self.pause(delay)
+            claims = running_claims(paths)
 
     def _routing_path(self) -> Path:
         return target_config.ssh_target_state_directory('aws') / 'routing.json'

@@ -57,6 +57,14 @@ Each stage checks the live state first. It acts only when the state is not compl
    The folder uses task `gate:aws-routing-proof`.
    The next `up` removes a folder left by a dead run. Run it through the normal pinned queue. Confirm `target=aws` in its record.
 
+Configuration, image creation, and the idle stop proof close AWS routing before they change the box.
+Each stage waits without a time limit for AWS jobs that still run.
+Kept claims do not delay the wait.
+A stage with a valid proof leaves routing unchanged.
+Activation opens routing after the idle stop proof.
+An interrupted `up` leaves routing closed until the next `up` reaches activation.
+Jobs use natedev and the Mac while AWS routing stays closed.
+
 ## Phases
 
 1. **Stack lifecycle.** Stages 1 to 4, `down`, the `up` stage runner and its state record. Fixes: `REVIEW_IN_PROGRESS`, the preparation age, and one settings reader for `price`.

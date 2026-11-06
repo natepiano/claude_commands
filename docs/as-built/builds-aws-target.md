@@ -265,11 +265,19 @@ The controller activation and routing proof remain separate plan stages.
 
 ### Activation and proof
 
+Configuration, image creation, and the idle stop proof close AWS routing before they change the box.
+Each stage waits without a time limit for AWS jobs that still run.
+Kept claims do not delay the wait.
+A stage with a valid proof leaves routing unchanged.
+Activation opens routing after the idle stop proof.
+An interrupted `up` leaves routing closed until the next `up` reaches activation.
+Jobs use natedev and the Mac while AWS routing stays closed.
+
 1. `idle-stop` observes EC2 until the box stops within `idle_stop_minutes` plus `idle_stop_margin_s`.
    Without a saved proof, the stage waits for pending or stopping instances to reach a stable state.
    It starts a stopped instance through the existing spending checks and waits for health.
    It holds the controller lock so the controller cannot satisfy the proof.
-   Active AWS claims prevent the proof.
+   A job that starts before routing closes resets the proof deadline to the full duration.
    A deadline failure requests an EC2 stop, confirms the stop, and refuses the stage.
 2. `activation` writes `routing.json` under `~/.local/state/build-targets/aws`.
    This record enables routing for the configured AWS settings file.
@@ -302,7 +310,7 @@ The price stage still refreshes the public price.
 `deploy.py down --approve-destroy` removes the target in this order.
 
 1. Write disabled `routing.json` and disable `aws-target.service` with `systemctl --user`.
-2. Refuse while an AWS claim remains live.
+2. Refuse while an AWS job still runs. Kept claims do not delay removal.
 3. Save public resource identities in `down.json` before removing any resource.
 4. Delete the tagged `aws-build` Tailscale device and keep the policy rules.
 5. Delete every scaler access key and remove only its credential profile.

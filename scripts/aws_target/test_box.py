@@ -23,10 +23,24 @@ from scripts.aws_target.ledger import mapping
 from scripts.aws_target.aws_target import AwsUnavailable
 from scripts.build_targets import target_config
 from scripts.mac_test import mac_test, offload
-from scripts.lib import conf, copy_record, scratch
+from scripts.lib import conf, copy_record, process_start, scratch
 
 SYSTEM = '/nix/store/' + 'a' * 32 + '-nixos-system-aws-build'
 IMAGE_TAGS = [{'Key': box.IMAGE_OWNER_TAG, 'Value': 'true'}]
+
+
+def write_aws_claim(directory: Path, *, kept: bool, remote: bool = True) -> Path:
+    owner = process_start.process_start(os.getpid())
+    assert isinstance(owner, process_start.Started)
+    record: mac_test.ProcessBoundClaim = {
+        'pid': os.getpid(), 'proc_start': 'ended-owner' if kept else owner.start,
+        'what': 'fixture tests', 'worktree': str(directory), 'since': '2026-11-06T09:00:00+00:00',
+        'repo_name': 'fixture', 'repo_key': 'fixture',
+    }
+    path = directory / 'claims/job.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(json.dumps({**record, **({'remote_host': 'aws-build'} if remote else {})}))
+    return path
 
 FAKE = r'''import json, os, pathlib, shlex, subprocess, sys
 root = pathlib.Path(os.environ['BOX_FIXTURE'])
@@ -286,6 +300,7 @@ class BoxTests(unittest.TestCase):
         self.tailnet = FakeTailnet()
         self.starts = 0
         self.monotonic = FakeMonotonicClock()
+        self.read_live_claims = mac_test.live_claims
         self.subject = box.BoxSetup(self.settings, self.directory, self.start, admin=admin_secrets.AdminSecretSession(self.settings), tailnet=self.tailnet, monotonic=self.monotonic, pause=self.monotonic.advance)
 
     @override
@@ -349,6 +364,8 @@ class BoxTests(unittest.TestCase):
         return [cast(list[str], json.loads(line)) for line in (self.root / 'commands').read_text().splitlines()]
 
     def test_up_records_all_box_stages_and_resumes_after_configuration_failure(self) -> None:
+        self.assertFalse((self.directory / 'routing.json').exists())
+        self.assertEqual(conf.read(self.settings).text('offload'), 'on')
         credentials = self.root / 'credentials'
         _ = credentials.write_text('')
         credentials.chmod(0o600)
@@ -366,6 +383,8 @@ class BoxTests(unittest.TestCase):
                 self.assertFalse(subject.up(approve_resources=True))
             self.assertIn('box-configuration: refused:', output.getvalue())
             self.assertNotIn('checks:', output.getvalue())
+            self.assertFalse(box.json_record((self.directory / 'routing.json').read_text())['enabled'])
+            self.assertFalse(self.subject.activation_present())
             self.change(switch_failure=False)
             output = StringIO()
             with redirect_stdout(output):
@@ -374,6 +393,8 @@ class BoxTests(unittest.TestCase):
             self.assertIn('box-join: present', output.getvalue())
             self.assertIn('box-configuration: done', output.getvalue())
             self.assertIn('checks: done', output.getvalue())
+            self.assertTrue(box.json_record((self.directory / 'routing.json').read_text())['enabled'])
+            self.assertLess(output.getvalue().index('idle-stop: done'), output.getvalue().index('activation: done'))
             commands = len(self.commands())
             output = StringIO()
             with redirect_stdout(output):
@@ -577,8 +598,8 @@ class BoxTests(unittest.TestCase):
 
     def test_failed_image_reports_its_state_reason(self) -> None:
         self.image_record()
-        # The first read resumes the pending image; the next read reports failure.
-        with mock.patch.object(box, 'saved_image', side_effect=[{'State': 'pending'},
+        # The presence and resume checks see the pending image before the wait reports failure.
+        with mock.patch.object(box, 'saved_image', side_effect=[{'State': 'pending'}, {'State': 'pending'},
                 {'State': 'failed', 'StateReason': {'Message': 'snapshot failed'}}]), \
              self.assertRaisesRegex(box.BoxRefused, 'snapshot failed'):
             self.subject.image()
@@ -860,13 +881,119 @@ class BoxTests(unittest.TestCase):
         self.assertEqual(self.starts, 1)
         self.assertTrue(self.subject.idle_stop_present())
 
-    def test_idle_stop_refuses_a_live_claim_before_starting_a_stopped_instance(self) -> None:
-        self.change(ec2='stopped')
-        with mock.patch.object(mac_test, 'live_claims', return_value=('fixture-claim',)):
-            with self.assertRaisesRegex(box.BoxRefused, 'no active AWS claims'):
-                self.subject.idle_stop()
+    def test_idle_stop_waits_for_live_claims_before_starting_with_routing_closed(self) -> None:
+        self.change(ec2='stopped', joined=True, stop_after=3)
+        def pause(seconds: float) -> None:
+            self.assertFalse(box.json_record((self.directory / 'routing.json').read_text())['enabled'])
+            self.monotonic.advance(seconds)
+        output = StringIO()
+        with mock.patch.object(box, 'running_claims', side_effect=[('claim-1', 'claim-2'), ('claim-1',), (), (), ()]), \
+             mock.patch.object(self.subject, 'pause', side_effect=pause), redirect_stdout(output):
+            self.subject.idle_stop()
+        self.assertEqual(self.starts, 1)
+        self.assertTrue(self.subject.idle_stop_present())
+        self.assertEqual(output.getvalue().splitlines(), [
+            'routing: AWS takes no new work until up finishes', 'routing: waiting for 2 AWS jobs to finish'])
+
+    def test_idle_stop_extends_the_deadline_for_a_claim_during_the_proof(self) -> None:
+        def pause(_seconds: float) -> None:
+            self.monotonic.advance(0.03)
+        with mock.patch.object(box, 'running_claims', side_effect=[(), (), ('late-claim',), (), ()]), \
+             mock.patch.object(self.subject, '_instance_state', side_effect=['running', 'running', 'running', 'running', 'stopped']), \
+             mock.patch.object(self.subject, '_health', return_value=True), \
+             mock.patch.object(self.subject, 'pause', side_effect=pause):
+            self.subject.idle_stop()
+        self.assertGreaterEqual(self.monotonic(), 0.09)
+        self.assertTrue(self.subject.idle_stop_present())
+        self.assertFalse((self.root / 'commands').exists())
+
+    def test_configuration_and_image_wait_for_claims_with_routing_closed(self) -> None:
+        self.change(joined=True)
+        for stage in (self.subject.configure, self.subject.image):
+            with self.subTest(stage=stage.__name__):
+                starts = self.starts
+                waiting = True
+                def pause(seconds: float) -> None:
+                    nonlocal waiting
+                    if waiting:
+                        self.assertEqual(self.starts, starts)
+                        waiting = False
+                    self.assertFalse(box.json_record((self.directory / 'routing.json').read_text())['enabled'])
+                    self.monotonic.advance(seconds)
+                with mock.patch.object(box, 'running_claims', side_effect=[('claim',), ()]), \
+                     mock.patch.object(self.subject, 'pause', side_effect=pause):
+                    stage()
+                self.assertGreater(self.starts, starts)
+
+    def test_setup_stages_ignore_a_kept_claim_and_preserve_its_file(self) -> None:
+        self.change(joined=True, stop_after=3)
+        path = write_aws_claim(self.directory, kept=True)
+        original = path.read_bytes()
+        paths = mac_test.StatePaths(self.directory, 'aws')
+        with mock.patch.object(mac_test, 'state_paths', return_value=paths), \
+             mock.patch.object(mac_test, 'live_claims', side_effect=self.read_live_claims), \
+             redirect_stdout(StringIO()) as output:
+            for stage in (self.subject.configure, self.subject.image, self.subject.idle_stop):
+                with self.subTest(stage=stage.__name__):
+                    stage()
+                    self.assertEqual(path.read_bytes(), original)
+        self.assertNotIn('waiting for', output.getvalue())
+        self.assertTrue(self.subject.idle_stop_present())
+
+    def test_setup_stages_ignore_a_reservation_and_preserve_its_file(self) -> None:
+        self.change(joined=True, stop_after=3)
+        path = write_aws_claim(self.directory, kept=False, remote=False)
+        original = path.read_bytes()
+        paths = mac_test.StatePaths(self.directory, 'aws')
+        self.assertTrue(mac_test.run_is_live(mac_test.read_claims(paths)[0].record))
+        self.assertEqual(box.running_claims(paths), ())
+        with mock.patch.object(mac_test, 'state_paths', return_value=paths), \
+             redirect_stdout(StringIO()) as output:
+            for stage in (self.subject.configure, self.subject.image, self.subject.idle_stop):
+                with self.subTest(stage=stage.__name__):
+                    stage()
+                    self.assertEqual(path.read_bytes(), original)
+        self.assertNotIn('waiting for', output.getvalue())
+        self.assertTrue(self.subject.idle_stop_present())
+
+    def test_running_claims_preserves_an_ended_owners_reservation(self) -> None:
+        path = write_aws_claim(self.directory, kept=True, remote=False)
+        original = path.read_bytes()
+        paths = mac_test.StatePaths(self.directory, 'aws')
+        self.assertFalse(mac_test.run_is_live(mac_test.read_claims(paths)[0].record))
+        self.assertEqual(box.running_claims(paths), ())
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_kept_claim_does_not_extend_the_idle_stop_deadline(self) -> None:
+        self.change(joined=True, self_stop=False)
+        path = write_aws_claim(self.directory, kept=True)
+        original = path.read_bytes()
+        paths = mac_test.StatePaths(self.directory, 'aws')
+        def pause(seconds: float) -> None:
+            self.monotonic.advance(seconds)
+            self.assertLessEqual(self.monotonic(), 0.061, 'a kept claim extended the deadline')
+        with mock.patch.object(mac_test, 'state_paths', return_value=paths), \
+             mock.patch.object(mac_test, 'live_claims', side_effect=self.read_live_claims), \
+             mock.patch.object(self.subject, 'pause', side_effect=pause), \
+             self.assertRaisesRegex(box.BoxRefused, 'up stopped the instance'):
+            self.subject.idle_stop()
+        self.assertAlmostEqual(self.monotonic(), 0.06)
+        self.assertTrue(self.live()['forced_stop'])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_present_setup_stages_leave_routing_open(self) -> None:
+        path = self.directory / 'routing.json'
+        original = json.dumps({'enabled': True, 'settings': str(self.settings.resolve())})
+        _ = path.write_text(original)
+        with mock.patch.object(self.subject, 'configuration_present', return_value=True), \
+             mock.patch.object(self.subject, 'image_present', return_value=True), \
+             mock.patch.object(self.subject, 'idle_stop_present', return_value=True), \
+             mock.patch.object(mac_test, 'live_claims', side_effect=AssertionError('present stage waited')):
+            self.subject.configure()
+            self.subject.image()
+            self.subject.idle_stop()
+        self.assertEqual(path.read_text(), original)
         self.assertEqual(self.starts, 0)
-        self.assertFalse(self.subject.idle_stop_present())
 
     def test_idle_stop_stops_its_restart_when_health_fails(self) -> None:
         self.change(ec2='stopped', self_stop=False)
