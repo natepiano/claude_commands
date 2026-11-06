@@ -385,11 +385,11 @@ class BoxSetup:
         finally:
             _ = self.tailnet.call('DELETE', 'keys/' + key_id)
 
-    def _ssh(self, command: str) -> str:
+    def _ssh(self, command: str, *, user: str = 'natepiano') -> str:
         if isinstance(self.joined, UnjoinedBox):
             raise BoxRefused('the box has no SSM-confirmed Tailscale identity')
         connection = offload.read_connection_settings(self.settings)
-        return self._run(['ssh', *offload.ssh_options(connection), 'natepiano@' + self.joined.address, command])
+        return self._run(['ssh', *offload.ssh_options(connection), user + '@' + self.joined.address, command])
 
     def _desired_system(self) -> str:
         return self.desired_system
@@ -441,19 +441,19 @@ class BoxSetup:
         reset_idle = 'rm -f -- ' + shlex.quote(str(idle_record))
         # Hold the controller lock and use a bounded box timer during the copy and detached switch.
         with control_lock(self.directory):
-            _ = self._ssh(f'sudo systemd-run --unit=aws-build-setup-stop --on-active={timeout}s --collect ' +
+            _ = self._ssh(f'systemd-run --unit=aws-build-setup-stop --on-active={timeout}s --collect ' +
                           '/run/current-system/sw/bin/systemctl poweroff && ' +
-                          'sudo systemctl stop aws-build-remote.service && ' +
+                          'systemctl stop aws-build-remote.service && ' +
                           'if systemctl cat aws-build-first-boot-stop.timer >/dev/null 2>&1; then ' +
-                          'sudo systemctl stop aws-build-first-boot-stop.timer; fi')
+                          'systemctl stop aws-build-first-boot-stop.timer; fi', user='root')
             try:
                 self._copy([desired])
                 recovery = reset_idle + '; systemctl start aws-build-remote.service'
                 script = ('trap ' + shlex.quote(recovery) + ' EXIT; ' +
                           shlex.quote(desired + '/bin/switch-to-configuration') + ' switch')
                 try:
-                    _ = self._ssh('sudo systemd-run --unit=aws-build-switch --collect --no-block ' +
-                                  '/run/current-system/sw/bin/bash -c ' + shlex.quote(script))
+                    _ = self._ssh('systemd-run --unit=aws-build-switch --collect --no-block ' +
+                                  '/run/current-system/sw/bin/bash -c ' + shlex.quote(script), user='root')
                 except BoxRefused as error:
                     if 'exit 255' not in str(error):
                         raise
@@ -468,9 +468,9 @@ class BoxSetup:
             finally:
                 # A failed reconnect leaves the poweroff timer armed.
                 try:
-                    _ = self._ssh(reset_idle + ' && sudo systemctl start aws-build-remote.service && ' +
+                    _ = self._ssh(reset_idle + ' && systemctl start aws-build-remote.service && ' +
                                   'systemctl is-active --quiet aws-build-remote.service && ' +
-                                  'sudo systemctl stop aws-build-setup-stop.timer')
+                                  'systemctl stop aws-build-setup-stop.timer', user='root')
                 except (BoxRefused, OSError, subprocess.SubprocessError):
                     pass
 
@@ -480,7 +480,7 @@ class BoxSetup:
         # Nix uses the same bounded SSH connection as the other box commands.
         options = offload.ssh_options(offload.read_connection_settings(self.settings))
         _ = self._run(['env', 'NIX_SSHOPTS=' + shlex.join(options), 'nix', 'copy', '--substitute-on-destination',
-                      '--to', 'ssh://natepiano@' + self.joined.address, *paths])
+                      '--to', 'ssh://root@' + self.joined.address, *paths])
 
     def _versions(self, *, on_box: bool) -> dict[str, str]:
         versions: dict[str, str] = {}
