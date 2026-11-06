@@ -153,7 +153,7 @@ class BoardJsonTests(unittest.TestCase):
         if running:
             process_ids = (os.getpid(), os.getppid(), 1)
             held = fake_showrunner.write_session(
-                self.sessions, f"{slug}-showrunner", row.id,
+                self.sessions, slug, row.id,
                 pid=process_ids[self.production_count],
             )
             self.addCleanup(held.close)

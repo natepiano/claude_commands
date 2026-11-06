@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from scripts.direct import remove_workers, workers
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_worker, fixture_runtime_id, unit_membership
+from scripts.production.staff_test_support import OWNER_CLI, StaffTestCase, fixture_worker, fixture_runtime_id, unit_membership
 from scripts.agents import worker_lifecycle
 
 SCRIPT = Path(__file__).parent / "remove_workers.py"
@@ -145,7 +145,7 @@ class RemoveWorkersTest(unittest.TestCase):
             CLAUDE_CODE_SESSION_ID=fixture_runtime_id(caller) if caller else "",
             SHUTDOWN_STATE_DIR=str(self.state_root),
         )
-        command = [sys.executable, str(SCRIPT), "--run-root", str(self.root)]
+        command = [sys.executable, "-c", OWNER_CLI, str(SCRIPT), "--run-root", str(self.root)]
         for run in [session_dir] if isinstance(session_dir, Path) else session_dir or []:
             command += ["--session-dir", str(run)]
         result = subprocess.run(
