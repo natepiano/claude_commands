@@ -950,6 +950,7 @@ Checkpoint `1f9e9c484` on `verify-not-mac-wait`, merged to builds as `a62793f07`
 - `test_verify_step_routes.py::test_unreadable_record_refuses_before_local_or_mac_compile` keeps every assertion.
 - `test_mac_idle.py::test_tree_writing_lint_wait_is_local_and_next_judgment_counts_again` extracts `publish_step_state` with the other functions, sets the saved values, and keeps the state file with each record snapshot. Its assertions stay.
 - `test_verify_ssh_targets_results.py::test_interruption_preserves_queue_age_and_records_local_state_before_compilation` reads its local step through `step_record.read`. Its expected values stay.
+- `verify_lint_scope_test_support.py::isolate_path_without_taplo` adds `cmp` to its tool list, because publication now runs `cmp`. Its assertions stay.
 
 **Tests.** New file `scripts/direct/test_verify_step_state.py`. Each test runs the real `verify.sh` with its usual fixture and a run-time tempdir:
 
