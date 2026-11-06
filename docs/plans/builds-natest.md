@@ -14,7 +14,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 1. At each phase start, read the merge gate's slowdown warnings; natest-unit owns them. A warned module goes to `builds-natest-next.md`.
 2. At each phase end, re-sort with `show.py top`. Before the last todo phase starts, add a speed phase for the top live module that no phase holds.
-3. `builds-natest-next.md` lists each module with a reported floor. A floored module is a target again only when its gate median rises 20% above its floor.
+3. `builds-natest-next.md` lists each module with a reported floor. A gate median 20% above a floor starts an investigation. A floored module is a target again only when a measure at comparable load confirms the rise.
 4. When no live module has a median over 60 s, the plan holds and tells the showrunner; it does not close.
 
 ## Delegation Context
@@ -975,7 +975,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Goal:** each `copies.py` use does less Git work, with the same copies. Phase 40 measured 803 `refresh_remotes` calls, 1,606 fetches, 3,212 config writes and 1,606 update-refs, about 100 s of a 325 s profiled `style/test_crate_run.py` run. The showrunner assigned this on 2026-11-05 and moved queue's item to it.
 
 **Spec:**
-1. Measure before any edit: `style/test_crate_run.py` (same-load pairs) and one real `copies.py run`.
+1. Measure before any edit: `style/test_crate_run.py` (same-load pairs) and one real `copies.py run`. The module's median is now 89 s, so the 325 s profile above does not give its current cost. Profile the current `standing` and `workspace` costs, then state the gain.
 2. `refresh_remotes` (`scripts/copies/copies.py:372`) does only the work a changed source needs.
 3. Remove the full object scan from `copies.py` initialization (0.39 s per `verify.sh doc` run; item from queue-unit).
 4. Queue-unit keeps the `copies.py` list labels item. On `copies.py`, the second lander resolves.
@@ -994,7 +994,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - Recovery from missing borrowed objects stays (`copies.py:349`, `test_copies.py:980`). If the refresh error path changes, replace `PostUseError.caller_error: BaseException | None` (`copies.py:110`) with named caller outcomes.
 
 **Acceptance gate:**
-- caller suites for `copies.py` green
+- caller suites for `copies.py` green, `style/test_bulk_run.py` included (`bulk_run.test_tree` calls `copies.standing`)
 - measured before and after for `style/test_crate_run.py` and one `copies.py run`, in the checkpoint notice
 - the full test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
@@ -1101,36 +1101,15 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Ruled out:** A write watch on by default wakes on each write in a busy directory, and predicates can read half-written files. `codex_mesh.py` keeps its own copy, because it goes.
 
-### Phase 51 — `direct/test_simplify_lens.py` runs in less time  · status: todo
-**Depends on:** none
-**Blocked by:** devtools 7u on main, about 23:30 EST; the showrunner sends the word. Build on main after it lands. 7s rebases on this phase.
+### Phase 51 — `direct/test_simplify_lens.py` runs in less time  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_simplify_lens.py` (179 s wall, 135 CPU s; its Phase 6 floor is 118 s) falls under its floor again, or a new measured floor shows why it cannot, with every checked behavior kept. The Phase 36 architect review picked it: it is the top module over its floor that no phase holds, outside the routes that other units own.
+- Other work met the goal, and this phase changed no file. devtools 7u and the daily simplify work (`240d8fa4d`) replaced the lens in each phase review, and the module went from 30 tests to 15.
+- Six runs of the new module on 2026-11-06 at load 10-70 took 16.1-38.7 s wall and 15.6-20.3 CPU s, under the Phase 6 floor of 118 s.
 
-**Spec:** Follow the Speed method.
-1. The module had 17 tests at Phase 6, and it has 30 now. Profile before any edit. Name what the added tests cost and what each review-launcher run costs.
-2. `test_report_validation_trims_whitespace_and_requires_pass_or_a_numbered_item` runs the review launcher 8 times, and each run checks the report result, the saved status and the record's `status` and `raised` fields. Keep each check and each process boundary that a check needs.
-3. Cut in the Speed method's order. A cut in a production file or a support file goes to the director first, with the measured gain.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
-
-**Files:**
-- `scripts/direct/test_simplify_lens.py` — the module (recent owner: sdlc-devtools); tell the showrunner at start
-
-**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
-- `impl4` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 6: one real review-launcher run per test takes 3-6 s, and a parse-only call cannot replace the recorder checks.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_simplify_lens.py'` green, with the same test names and assertions
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the full test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- Same-load pairs: no edit exists to compare.
 
 ### Phase 52 — One shared reader for Git blobs, trees and status  · status: done
 **Depends on:** Phase 37
@@ -1171,37 +1150,21 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 ### Phase 54 — The assign launcher reuse and identity tests run in half their time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_assign_launcher_reuse.py` (82 s wall, 68 CPU s) and `scripts/direct/test_assign_launcher_identity.py` (70 s wall, 57 CPU s) each run in half their time, or a measured floor shows why they cannot, with every checked behavior kept. They are the top live modules that no phase holds and no unit edits now.
-
-**Spec:** Follow the Speed method.
-1. Each test runs the launcher 1 to 3 times. `DEFAULT_ASSIGNMENT_EXECUTION` in `assign_launcher_test_support.py` is `LauncherScript(ASSIGN)`, a separate process, with the comment "Worker admission requires the actual assignment process." Profile before any edit. Name what one launcher process costs: `bash assign.sh`, interpreter start, imports, each child process, the recorder, compaction waits. Name what `setUp` costs.
-2. Cut in the Speed method's order. Test first whether each test needs a separate process, and name the admission check that requires one. A test that only needs the state of a first dispatch can share that state. Keep one process test per boundary.
-3. A cut in a production file goes to the director first, with the measured gain. Do not edit `assign.py` or `test_assign_launcher.py`: two sdlc units change them now.
-4. A change to `assign_launcher_test_support.py` keeps every importer green: `direct/test_assign_launcher*.py`, `direct/test_assign_claude_door.py`, `direct/test_assign_gate.py`, `agents/test_agent_bg.py`, `agents/test_agent_exec.py`, `lib/test_nix_env_launches.py`. Keep away from the `set-unit` line: sdlc changes that line.
-5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py` runs one real first dispatch per role and option set, saves its files, and returns `CompletedFirstDispatch` with `FirstDispatchArtifact` and `FirstDispatchObservations`. A later test restores that state. `test_assign_launcher_reuse.py` uses it in 9 of 9 tests and `test_assign_launcher_identity.py` in 5 of 9. Each later dispatch stays a real launcher process. Every test name and assertion stays.
+- Same-load pair medians at load 55-70: reuse 91.7 s to 57.4 s (0.63), CPU 70.5 s to 42.5 s; identity 67.8 s to 55.8 s (0.82), CPU 57.3 s to 47.2 s. Unpaired runs at lower load gave 0.40 and 0.64.
+- Floor: each later dispatch is a real launcher process because `require_live_director` needs a live Claude or Codex ancestor. One process takes 2.6-3.2 s. The coordinator takes 1.80 s of that in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s, model resolver 0.06 s, board and heartbeat 0.09 s.
 
 **Files:**
-- `scripts/direct/test_assign_launcher_reuse.py` — the first module
-- `scripts/direct/test_assign_launcher_identity.py` — the second module
-- `scripts/direct/assign_launcher_test_support.py` — the shared fixture
+- `scripts/direct/assign_launcher_test_support.py` — `FirstDispatchFixture` and its record types
+- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/direct/test_assign_launcher_identity.py` — the modules that use it
 
-**Workers:** 1 writer on slot `impl4` (the files share one fixture and do not split)
-- `impl4` — all files above, role impl
+**Binds later work:** `FirstDispatchFixture` serves `test_assign_launcher.py` with no support file change. Its first-dispatch boundary tests and later dispatches stay real.
 
-**Constraints from prior phases:**
-- Phase 5: the group has four files on one support file. `test_unreadable_staff_starts_no_worker` runs a separate process because the recorder writes its refusal to process stderr.
-- Phase 6: one real launcher run per test takes 3-6 s, and a parse-only call cannot replace the recorder checks.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+**Gotchas:** A restored file replaces the first test's root with the current root. The restore starts the stub server with the current pid and port. `from scripts.whoami import agent_accounts` stays after `scripts.production.staff_test_support` in the support file.
 
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_assign_launcher_reuse.py'` and the same line for `test_assign_launcher_identity.py` green, with the same test names and assertions
-- every importer of the support file green, if the phase changes it
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the full test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** In-process launcher calls: the identity check needs the real process chain.
 
 ### Phase 55 — `direct/test_assign_launcher.py` runs in half its time  · status: todo
 **Depends on:** Phase 54
@@ -1213,7 +1176,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 
 **Spec:** Follow the Speed method.
 1. Take a new baseline after the merge. Recent trees ran 21, 39 and 42 tests in this module, so name the test count at dispatch.
-2. Apply what Phase 54 found about a launcher process. Keep one process test per boundary.
+2. A test that only needs the state of a first dispatch uses `FirstDispatchFixture.first_assignment` in `assign_launcher_test_support.py`. A later dispatch stays a real process. Keep one process test per boundary.
 3. A cut in a production file goes to the director first, with the measured gain.
 4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
 
@@ -1224,6 +1187,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - `impl4` — all files above, role impl
 
 **Constraints from prior phases:**
+- Phase 54: one later launcher process takes 2.6-3.2 s, and `require_live_director` needs a live Claude or Codex ancestor. The coordinator spends 1.80 s in 12 `subprocess.run` calls: follow 0.73 s, compact 0.39 s, recorder children 0.60 s, can-follow plus release-follow 0.66 s.
 - Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
 - Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
 
@@ -1232,3 +1196,38 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
 - the full test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+
+### Phase 56 — The SSH retained and retry tests run in half their time  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_verify_ssh_targets_retained.py` (65 s wall, 32 CPU s) and `scripts/direct/test_verify_ssh_targets_retry.py` (63 s wall, 34 CPU s) each run in half their time, or a measured floor shows why they cannot, with every checked behavior kept. They are the top live modules that no phase holds and no branch edits, and wall time is about twice CPU time in both.
+
+**Spec:** Follow the Speed method.
+1. Each module has 4 tests. `test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup`, `test_mac_memory_retry_recovers_its_claim_without_a_reservation_file` and `test_mac_memory_retry_waits_until_its_retry_deadline` take 17-20 s each. Profile before any edit. Name each wait, what sets its length, and the behavior that needs it.
+2. Cut in the Speed method's order, fixed waits first. A wait that a test can shorten through config or the fixture stays in the test files. A cut in a production file goes to the director first, with the measured gain. Do not edit `build_hold.py`: it is frozen.
+3. A change to `verify_ssh_targets_test_support.py` keeps every importer green: `direct/test_verify_ssh_targets.py`, `_routing.py`, `_results.py`, `_retained.py`, `_retry.py`.
+4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+
+**Files:**
+- `scripts/direct/test_verify_ssh_targets_retained.py` — the first module
+- `scripts/direct/test_verify_ssh_targets_retry.py` — the second module
+- `scripts/direct/verify_ssh_targets_test_support.py` — the shared fixture
+
+**Workers:** 1 writer on slot `impl4` (the files share one fixture and do not split)
+- `impl4` — all files above, role impl
+
+**Constraints from prior phases:**
+- Phase 24: `eligible` and `reserve` start the coordination imports through `build_hold.py`, and that cost sets the routing floor. queue-unit takes the `build_hold.py` import after the freeze. A warm command server in the fixture tests a different process boundary, so do not use one.
+- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
+- Phase 27: the fixture uses `caller_admission`. Do not advance the admission clock by hand, set the spacing to zero or mock the admission result. queue-unit owns the spacing fix in `scripts/build_queue/admission_test_support.py`. Report any measured spacing cost to the director for queue-unit.
+- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets_retained.py'` and the same line for `test_verify_ssh_targets_retry.py` green, with the same test names and assertions
+- every importer of the support file green, if the phase changes it
+- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
+- the full test green on the phase commit merged with `origin/builds`
+- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+

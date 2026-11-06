@@ -28,18 +28,24 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: after Phase 26, only the four modules that call `forbid_real_sender()` are guarded, and the runner finds the marker through that module's stored record. A module that never installs the guard, or a marker variable inherited from a parent, is not checked (Phase 26 adversary round 2). No module in the gate takes either path today.
   - Completion condition: the runner sets one marker path before `unittest.main` for every module and checks that path after it; the four installs reuse it; the gate shows which modules, if any, start the real `send.py`.
   - Revealed by: Phase 26 adversary review round 2, 2026-11-05.
-- [ ] **Select the next speed target after Phases 24 and 27.** Phase 51 takes `direct/test_simplify_lens.py` (Phase 36 architect review, 179.022 s wall, 134.969 CPU s). Phases 54 and 55 take the assign launcher group: `_reuse` and `_identity` now, `test_assign_launcher.py` after models and herdr reach main (showrunner, 2026-11-06).
+- [ ] **Select the next speed target after Phases 24 and 27.** Phase 51 closed with no edit: daily simplify work cut `direct/test_simplify_lens.py` to 15 tests and about 20 s. Phase 54 took `_reuse` and `_identity` of the assign launcher group (floors below). Phase 55 takes `test_assign_launcher.py` after models and herdr reach main. Phase 56 takes `test_verify_ssh_targets_retained.py` and `_retry.py` (2026-11-06).
   - Target: the highest ranked live module in `test_times top --repo ~/.claude` that no phase owns, subject to the plan's floor rule.
   - Completion condition: the module goes through the Speed method with its current path and a measured baseline.
-  - Candidate: `direct/test_verify_mac_only.py`, rank 1 at 358.7 s (CPU 339.3 s, 17 tests) in `top --repo ~/.claude` on 2026-11-05 08:15 EST. Free since verify's Mac retry hang fix landed on builds at 0380fb6ea (showrunner, 2026-11-05). Merge builds first and take a new baseline.
+  - Candidate after Phase 56: `herdr/test_herdr.py`, median 68.3 s wall and 38.3 s CPU, latest 65.9 s (2026-11-06). Confirm owner availability after herdr lands, then measure the current revision. `direct/test_verify_mac_only.py` is at its floor (211.8 s against 212.0 s).
   - Taken: `direct/test_verify_lint_judgment.py`, rank 3 at 210.4 s (CPU 172.2 s), was Phase 31 (floor below). `production/test_fast_track.py`, rank 4 at 216.9 s on 2026-11-05, is Phase 33 (showrunner, 2026-11-05). Rank 2 is `agents/test_codex_mesh.py`, still excluded.
-  - Held: `style/test_style_sync.py`; sdlc-devtools has open edits.
+  - Held: `style/test_style_sync.py`; devtools holds it and `style_sync.py` until its phase is on main, and the showrunner sends the word (2026-11-06).
   - Revealed by: the user's mission (2026-11-03); Phase 24 took `test_verify_ssh_targets_routing.py` and Phase 27 took `production/test_merge_gate_ledger.py` (2026-11-05).
 - [ ] **The next test to speed up is chosen by the CPU it saves each day, not by its time in one run.** The showrunner placed it here on 2026-11-06; if the two orders differ, the showrunner takes the rule question to the user.
   - Target: the Introduction of this file and "Select the next speed target"; proposed text: "Choose eligible modules by expected daily CPU saving: observed daily executions × estimated removable CPU per execution. Include merge executions, selected unit executions, and retries; exclude reused results."
   - Why needed: 5 unit runs ran `direct/test_simplify_lens.py` twice (258 CPU s) and `direct/test_verify_mac_only.py` once (194 CPU s). The sample is small.
   - Completion condition: after a day on builds, report both orders with the count of red merges that a unit full test missed, against the 104-run estimate of 15 (Phase 37).
   - Revealed by: Phase 37 architect review, 2026-11-06.
+- [ ] **Architecture proposal: the assign launcher starts fewer child processes**
+  - Target: `scripts/direct/assign.py` (owner sdlc; models and herdr change it now)
+  - Why needed: Phase 54 profile: one dispatch takes 2.6-3.2 s before the worker starts its turn. The children are check-launch 0.164 s, worker resolve 0.365 s, can-follow 0.292 s, start-pass 0.158 s, finish-pass 0.177 s, release-follow 0.294 s and board 0.04 s. Each real dispatch pays this, and so do the assign launcher tests.
+  - Accepted by sdlc on 2026-11-06: devtools builds it after herdr Phase 15 and models reach main. It runs the recorder and resolver calls in the coordinator process. Estimated gain: about 1.4 s per dispatch, about 15 s in `test_assign_launcher_reuse.py` and 20 s in `test_assign_launcher_identity.py`.
+  - Completion condition: same-load pairs of both modules when devtools' change is on builds; the Floors rows move to the new medians.
+  - Revealed by: Phase 54 profile, 2026-11-06.
 - [ ] **Architecture proposal: the type-check job**
   - Target: `scripts/production/merge_gate.py` (owner sdlc devtools-unit)
   - Why needed: report-unit names `types/basedpyright` among the three highest-CPU gate jobs (2-4 min). One basedpyright job checks every listed folder in each gate.
@@ -55,7 +61,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
   - Why needed: the test starts one Python process for each of the 33 `test_*.py` modules in `scripts/buildlog`: 24.5 s of the 34.8 s suite run at load 70 (11:24 EST, 2026-11-03). It is the slowest test in the index suite, and each new module adds one more process.
   - Completed by Phase 28: eight workers run one process for each discovered module, and each module keeps both checks in its own subTest. Paired module medians: 26.0 s -> 5.8 s.
   - Revealed by: Phase 3
-- [x] **The simplify-lens report validation test starts fewer processes and keeps its recorder checks.** Phase 51 owns this.
+- [x] **The simplify-lens report validation test starts fewer processes and keeps its recorder checks.** The daily simplify work removed this test's cost (Phase 51 as-built).
   - Target: `scripts/direct/test_simplify_lens.py` — `test_report_validation_trims_whitespace_and_requires_pass_or_a_numbered_item` (25 s, 8 review-launcher runs)
   - Why needed: Phase 6 left this test as the module's largest cost. Each of the 8 runs checks the report result, the saved status and the review record's `status` and `raised` fields, so a parse-only call cannot replace them.
   - Completion condition: every existing check stays; the needed process boundaries stay; same-load pairs show the gain.
@@ -63,7 +69,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Each improved module keeps a reference time.**
   - Target: `scripts/test_times/show.py`, `config/test_times.conf`
   - Why needed: the gate's slowdown warning compares with a rolling median, which slowly accepts a slowdown as normal (Astra plan review, 2026-11-04).
-  - Completion condition: each module a speed phase improved has its after median stored as a reference; a gate median 20% over it is reported at phase start.
+  - Completion condition: each module a speed phase improved has its after median, CPU time, revision and load stored as a reference. A gate median 20% over it is reported at phase start and starts an investigation. A measure at comparable load confirms a slowdown before another speed phase is selected.
   - Revealed by: Astra plan review; starts after Phase 14 lands (showrunner ruling 2026-11-04).
 - [x] **`mac_run.sh` uses the sourced configuration reader.**
   - Target: `scripts/production/mac_run.sh` (recent owner: builds-resources)
@@ -109,10 +115,11 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 
 | Module | Floor (pair median wall s) | Limiting operation | Phase |
 | --- | --- | --- | --- |
-| `direct/test_simplify_lens.py` | 118 | one real review-launcher run per test (3-6 s) | 6 |
 | `production/test_fast_track.py` | 97.9 | production Git, CLI children, blocked-hook deadlines and promotion retries | 33 |
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | Python start-up of `eligible` and `reserve` (`build_hold` -> `admission_service` -> `memory_admit`) | 24 |
-| `style/test_crate_run.py` | 257.2 (clean rounds, no pairs) | production Git work: `copies.refresh_remotes` 803 calls, 99.7 s of a 325 s profiled run; Phase 44 cuts it | 40 |
+| `style/test_crate_run.py` | Current floor not measured; historical baseline 257.2 | current gate median 88.6 s; Phase 44 measures current copy costs before it states a gain | 40, 44 |
 | `direct/test_verify_mac_only.py` | 212.0 (load 60-75; 156.5 in clean rounds) | `build_targets.py` and `mac_idle.py` process starts; lazy imports in `build_targets.py` alone gain 1% CPU | 39, 41 |
 | `direct/test_verify_lint_cache_versions.py` | 135.9 (clean rounds, no pairs) | `verify.sh lint` route: `step_record.py` 486 starts and 23.1 of 94.0 CPU s | 45 |
 | `direct/test_verify_lint_judgment.py` | 198.6 | production `verify.sh lint` route: 3.1 s per run with no repair, 5.2 s with repair (step-record and admission client Python starts) plus admission start spacing | 31 |
+| `direct/test_assign_launcher_reuse.py` | 57.4 (load 55-70) | one real launcher process for each later dispatch: 2.6-3.2 s, of which 1.80 s is 12 `subprocess.run` calls in the coordinator | 54 |
+| `direct/test_assign_launcher_identity.py` | 55.8 (load 55-70) | the same launcher process, 14 dispatches in 9 tests | 54 |
