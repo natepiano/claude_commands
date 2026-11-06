@@ -19,7 +19,7 @@ CHECKOUT="${1:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 SHA="${2:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 LOG="${3:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
-conf_value() { "$LIB/py" "$LIB/conf.py" get "$1" "$2"; }
+source "$LIB/conf.sh"
 PORT="${4:-$(conf_value production smoke_port)}"
 READY_SECONDS=$(conf_value production smoke_ready_seconds)
 EXIT_SECONDS=$(conf_value production smoke_exit_seconds)
