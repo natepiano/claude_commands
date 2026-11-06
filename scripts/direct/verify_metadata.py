@@ -76,6 +76,16 @@ def build_targets(meta: CargoMetadata, package_name: str, kind: str, name: str) 
     return "\n".join(lines)
 
 
+def package_has_library(package: CargoPackage) -> bool:
+    return any(target["kind"][0] in {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+               for target in package["targets"])
+
+
+def check_targets(meta: CargoMetadata) -> str:
+    selection = ["--lib"] if any(package_has_library(package) for package in meta["packages"]) else []
+    return "\n".join([*selection, "--bins"])
+
+
 def test_targets(meta: CargoMetadata, package_name: str, feature_flags: str) -> str:
     package = require_package(meta, package_name)
     features = package["features"]
@@ -95,7 +105,7 @@ def test_targets(meta: CargoMetadata, package_name: str, feature_flags: str) -> 
         if other["name"] != package_name
         for target in other["targets"]
     }
-    has_lib = any(target["kind"][0] in {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"} for target in package["targets"])
+    has_lib = package_has_library(package)
     selection = ["--lib"] if has_lib else []
     for target in package["targets"]:
         kind = target["kind"][0]
@@ -167,6 +177,8 @@ def answer(meta: CargoMetadata, request: str) -> str:
         return example_features(meta, arguments[0], arguments[1])
     if name == "test-targets" and len(arguments) == 2:
         return test_targets(meta, arguments[0], arguments[1])
+    if name == "check-targets" and not arguments:
+        return check_targets(meta)
     if name == "build-targets" and len(arguments) == 3:
         return build_targets(meta, arguments[0], arguments[1], arguments[2])
     if name == "untested-examples" and len(arguments) == 1:
