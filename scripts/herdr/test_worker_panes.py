@@ -6,6 +6,7 @@ import json
 import fcntl
 import math
 import os
+import sys
 import time
 import subprocess
 from copy import deepcopy
@@ -26,6 +27,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.herdr import worker_panes
+from scripts.direct import progress_history
 
 import herdr
 import pane_launch
@@ -393,14 +395,101 @@ class WorkerPaneTests(StaffTestCase):
 
     def completed_dispatch(self, row: staff.StaffRow, role: staff.WorkerRole) -> None:
         self.dispatch(row, role, completed=True)
+        self.reply_to_dispatch(row, "dispatch-" + row.name)
+
+    def reply_to_dispatch(self, row: staff.StaffRow, dispatch_id: str) -> None:
         backend = staff.backend(row)
         assert isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
         source = worker_admission.transcript_source(row, backend)
-        message = "The task is complete.\nDONE dispatch-" + row.name
+        message = "The task is complete.\nDONE " + dispatch_id
         entry = ({"type": "event_msg", "payload": {"type": "agent_message", "message": message}}
                  if isinstance(backend, staff.CodexBackend) else
                  {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": message}]}})
         write_text_atomic(source, json.dumps(entry) + "\n")
+
+    def record_command(self, *arguments: str, at: int) -> None:
+        with (patch.dict(os.environ, {"UNIT_PASS_OWNER": "launcher", "UNIT_TEAM_ROLE": "impl",
+                  "UNIT_NOW_EPOCH": str(at), "CODEX_THREAD_ID": self.parent.current_session,
+                  "UNIT_HISTORY_DIR": str(self.root / "history"), "UNIT_SYNC_WRITES": "0"}),
+              patch.object(sys, "argv", ["progress_history.py", *arguments, "--session-dir", str(self.root / "run")]),
+              redirect_stdout(io.StringIO())):
+            progress_history.main()
+
+    def recorded_dispatch(self, row: staff.StaffRow, status: Literal["completed", "error"], *, at: int) -> str:
+        run = self.root / "run"
+        state = run / "progress_history_state.json"
+        if not state.exists():
+            run.mkdir(exist_ok=True)
+            write_text_atomic(run / "worker_transport", "herdr\n")
+            write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
+                "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
+                          "status": "active"}, "pass": {}, "events": [],
+                "history_file": str(run / "history.jsonl"),
+                "main_agent": {"session_id": self.parent.current_session, "family": "claude",
+                               "model": "fixture", "effort": "high"}}))
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Preserve the source behavior.\n")
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": str(at), "CODEX_THREAD_ID": self.parent.current_session}):
+            dispatch = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
+        self.record_command("finish-pass", "--status", status, at=at + 1)
+        self.reply_to_dispatch(row, dispatch)
+        return dispatch
+
+    def test_a_worker_can_close_after_its_completed_pass_crosses_a_phase_boundary(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        dispatch = self.recorded_dispatch(opened.row, "completed", at=10)
+        self.reply_to_dispatch(opened.row, worker_panes.stage_two_completion_id(dispatch))
+        self.record_command("finish-phase", "--status", "completed", at=12)
+        self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=13)
+        self.assertEqual(worker_panes.worker_pass(opened.row, self.root / "run"), {})
+        closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        self.assertIsInstance(closed, worker_panes.Closed)
+        self.assertEqual(self.world.stops, [opened.row.current_session])
+        self.assertEqual(self.world.closed, [(opened.pane, opened.terminal)])
+        self.assertEqual(set(self.world.locations), {"w1:p0"})
+
+    def test_a_newer_error_pass_keeps_a_worker_with_an_older_completed_pass(self) -> None:
+        opened = self.start()
+        assert isinstance(opened, worker_panes.OpenWorker)
+        completed = self.recorded_dispatch(opened.row, "completed", at=10)
+        failed = self.recorded_dispatch(opened.row, "error", at=20)
+        self.assertNotEqual(failed, completed)
+        self.reply_to_dispatch(opened.row, completed)
+        self.record_command("finish-phase", "--status", "completed", at=22)
+        self.record_command("start-phase", "--phase-id", "later", "--phase-title", "Later", at=23)
+        self.assertEqual(worker_panes.worker_pass(opened.row, self.root / "run"), {})
+        closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(opened.row.name))
+        self.assertEqual(closed, worker_panes.Kept("launcher has not recorded a completed pass"))
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_a_completed_pass_in_an_explicit_run_outside_the_run_roots_allows_closure(self) -> None:
+        row = self.worker()
+        self.world.add(row, "w1:p1")
+        self.completed_dispatch(row, "impl")
+        directory = self.root / "private" / "explicit-run"
+        directory.parent.mkdir()
+        directory = (self.root / "run").rename(directory)
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.OpenWorker)
+        result = worker_panes.can_close(observed, run=worker_panes.DispatchRun(directory))
+        self.assertIsInstance(result, worker_panes.CloseAllowed)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
+
+    def test_a_showrunner_workers_completed_pass_allows_closure(self) -> None:
+        self.parent_id = fixture_member("showrunner", name="close-owner").id
+        self.world.add(self.parent, "w1:p0")
+        row = self.worker("showrunner-worker")
+        self.world.add(row, "w1:p1")
+        self.completed_dispatch(row, "impl")
+        observed = self.observation(row)
+        assert isinstance(observed, worker_panes.OpenWorker)
+        self.assertIsInstance(worker_panes.can_close(observed), worker_panes.CloseAllowed)
+        self.assertEqual(self.world.stops, [])
+        self.assertEqual(self.world.closed, [])
 
     def prompts(self) -> list[tuple[str, ...]]:
         return [command for command in self.world.commands if command[:2] == ("agent", "prompt")]

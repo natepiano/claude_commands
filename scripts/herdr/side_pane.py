@@ -146,13 +146,10 @@ def open(label: str, *, question: str = "", cwd: Path | str = ".") -> SidePane:
 
 def _policy() -> worker_panes.LaunchPolicy:
     settings = models_registry.launch_settings("ask_a_friend", "consultation")
-    from scripts.agents.codex_mesh import READ_ONLY_SANDBOX
     try:
-        compact_above_tokens = (conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
-                                if settings.kind == "codex" else worker_panes.ClaudeCompaction.NATIVE)
+        return worker_panes.worker_policy(settings)
     except conf.Unusable as error:
         raise SidePaneRefused(str(error)) from error
-    return worker_panes.LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan", compact_above_tokens)
 
 
 def send(label: str, text: str) -> SidePane:
