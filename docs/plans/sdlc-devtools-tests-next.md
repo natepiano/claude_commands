@@ -22,10 +22,10 @@
   - Why needed: `add_unit.py` already accepts and records both fields (`add_unit.py:1297`, `test_add_unit.py:216`). The documented launch command (`produce.md:420`) does not carry them from planning.
   - Completion condition: preserve both fields through the planning handoff. Pass `--port` and repeated `--responsibility` options to `add_unit.py`. Keep saved `.unit.toml` precedence. Test the handoff and final record.
   - Revealed by: herdr-unit (sdlc [16a2cfa0], [7694b0f3]); Phase 3y architect review.
-- [ ] **Delete `PausedSeat.turn_live`**
-  - Target: `scripts/lib/resume_message.py:97` (`PausedSeat.turn_live`) and its readers at lines 38 and 54.
-  - Why needed: the field repeats the Resumable/Idle tag. The only production caller passes only Resumable seats, so it is always true.
-  - Completion condition: the field is deleted; resume output is unchanged for every caller.
+- [ ] **Name the active and idle worker resume states**
+  - Target: `scripts/shutdown/inventory.py` (`PausedSeat`, `codex_seats`), `scripts/lib/resume_message.py`, and their tests.
+  - Why needed: `turn_live` controls different resume behavior for active and idle workers. `codex_seats` returns both, and `stop_resume.py:517` passes the complete list.
+  - Completion condition: replace the boolean with named states. Preserve active-worker commands, idle-worker text, and existing threads. Test both states through `stop_resume`.
   - Revealed by: models-unit Phase 3s simplify lens (sdlc [89f9ddb9]): do it in the next phase that touches `resume_worker_command`; leave 3t 738d508a3 as is.
 - [ ] **Cut the Git process starts in fast_track and the copies refresh**
   - Target: `scripts/production/fast_track.py` (`reconcile` and its Git calls), `scripts/production/test_fast_track.py`, `scripts/copies/copies.py` (remote refresh).
