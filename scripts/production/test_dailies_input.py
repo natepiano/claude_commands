@@ -34,19 +34,18 @@ from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, W
 
 
 class RowDailiesTests(StaffTestCase):
-    def test_both_live_unit_label_forms_join_the_same_row_and_session(self) -> None:
+    def test_staff_name_joins_the_row_and_session(self) -> None:
         fixture = self.row_production()
         unit = staff.rename(fixture.unit.id, "writer")
         before = self.staff_file.read_bytes()
-        for label in ("writer", "writer-unit"):
-            with self.subTest(label=label):
-                live = unit_lookup.LabeledSession(label, unit_lookup.LiveClaude(
-                    "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
-                    identity=unit_lookup.LiveSession(unit.current_session))
-                with mock.patch.object(unit_lookup, "labeled_sessions", return_value={label: live}):
-                    units = dailies_input.report_units(fixture.runner, staff.snapshot())
-                self.assertEqual([(item.name, item.session) for item in units], [("writer-unit", "live-writer")])
-                self.assertEqual(self.staff_file.read_bytes(), before)
+        label = "writer"
+        live = unit_lookup.LabeledSession(label, unit_lookup.LiveClaude(
+            "live-writer", unit.current_session, "", os.getpid()), HerdrPlace("writer", "w1:p1"),
+            identity=unit_lookup.LiveSession(unit.current_session))
+        with mock.patch.object(unit_lookup, "labeled_sessions", return_value={label: live}):
+            units = dailies_input.report_units(fixture.runner, staff.snapshot())
+        self.assertEqual([(item.name, item.session) for item in units], [("writer", "live-writer")])
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_run_status_uses_the_row_worktree(self) -> None:
         fixture = self.row_production()
@@ -54,7 +53,7 @@ class RowDailiesTests(StaffTestCase):
             self.root / "finished-run.jsonl", UnitState.RUN_FINISHED)})
         with mock.patch.object(unit_lookup, "read_run_states", return_value=runs):
             units = dailies_input.report_units(fixture.runner, staff.snapshot())
-        self.assertEqual([(unit.name, unit.run) for unit in units], [("member-unit", UnitState.RUN_FINISHED)])
+        self.assertEqual([(unit.name, unit.run) for unit in units], [("member", UnitState.RUN_FINISHED)])
 
 
 class DailiesInputTests(DailiesInputFixture):
@@ -76,11 +75,11 @@ class DailiesInputTests(DailiesInputFixture):
         row = staff.by_id(fixed_id)
         assert row is not None
         _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("judgment-clear")))
-        self.rename_unit("renamed-unit")
+        self.rename_unit("renamed")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.unit()["unit"], fixed_id)
-        self.assertEqual(self.unit()["name"], "renamed-unit")
+        self.assertEqual(self.unit()["name"], "renamed")
         current = staff.by_id(fixed_id)
         assert current is not None
         self.assertNotEqual(fixed_id, current.current_session)
@@ -396,7 +395,7 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
                 self.assertIn(
                     "phase tables: unavailable — "
-                    + "phase tables.alpha-unit.current."
+                    + "phase tables.alpha.current."
                     + "repair_rounds_since_first_stated_eta: "
                     + "expected a whole number from 0",
                     built.stdout,
@@ -661,7 +660,7 @@ class DailiesInputTests(DailiesInputFixture):
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
-            "---\nphase_table: true\nproduction: example\nunit: alpha-unit\n---\n\n# Alpha\n",
+            "---\nphase_table: true\nproduction: example\nunit: alpha\n---\n\n# Alpha\n",
             encoding="utf-8",
         )
         _ = self.env.pop("DAILIES_PHASE_TABLE")
@@ -757,7 +756,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(self.output.read_text(encoding="utf-8"), "sentinel\n")
 
     def test_long_session_without_judgment_label_is_refused(self) -> None:
-        self.rename_unit("enh-showrunner-unit")
+        self.rename_unit("enh-showrunner")
         result = self.run_builder()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("judgment: failed", result.stdout)
@@ -765,7 +764,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertFalse(self.output.exists())
 
     def test_long_session_accepts_short_judgment_label(self) -> None:
-        self.rename_unit("enh-showrunner-unit")
+        self.rename_unit("enh-showrunner")
         fields = cast(dict[str, object], json.loads(self.judgment.read_text(encoding="utf-8")))
         units = cast(list[dict[str, object]], fields["units"])
         units[0]["label"] = "showrunn"
@@ -851,8 +850,8 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(result.returncode, 0)
 
     def test_unknown_status_unit_is_refused(self) -> None:
-        self.status_lines("== unknown-unit", "SESSION GONE")
-        _ = self.assert_refused_without_output(mention="unknown-unit")
+        self.status_lines("== unknown", "SESSION GONE")
+        _ = self.assert_refused_without_output(mention="unknown")
 
     def test_activity_before_first_unit_is_refused(self) -> None:
         _ = self.status.write_text(STAMP + "\n● Checking panel labels\n== " + ALPHA + "\n",
@@ -1001,26 +1000,47 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.report()["next_run"], "00:30+1")
 
-    def test_newest_child_handoff_labels_the_merge_topic_without_a_unit_phase(self) -> None:
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 (aaaaaaa) into production")
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 shrink (bbbbbbb) into production")
-        _ = self.git("commit", "--allow-empty", "-m", "chore(example): rename unit alpha-unit to renamed-unit")
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (ccccccc) into production")
+    def record_merge_checkpoint(self, commit: str) -> None:
+        row = unit_membership("example", ALPHA)
+        assert isinstance(row.worktree, staff.PresentWorktree)
+        history = self.root / "history/runs/checkpoints.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        _ = history.write_text(json.dumps({"schema_version": 1, "event_type": "checkpoint", "phase_id": "2",
+                                          "working_dir": str(row.worktree.path), "checkpoint_commit": commit}) + "\n")
+        self.env["UNIT_HISTORY_DIR"] = str(history.parent.parent)
+
+    def test_merge_topic_reports_no_checkpoint_without_run_records(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Integrate completed work")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        merge = next(topic for topic in topics if topic["title"] == "Merge branch")
+        self.assertIn("last merge: no checkpoint merged", str(merge["update"]))
+
+    def test_merge_topic_reports_the_recorded_checkpoint_without_subject_labels(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Integrate completed work")
+        checkpoint = self.git("rev-parse", "HEAD")
+        self.record_merge_checkpoint(checkpoint)
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha phase 2 shrink (bbbbbbb) into production")
+        _ = self.git("commit", "--allow-empty", "-m", "chore(example): rename unit alpha to renamed")
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha hand-off (ccccccc) into production")
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         topics = cast(list[dict[str, object]], self.report()["topics"])
         merge_topics = [topic for topic in topics if topic["title"] == "Merge branch"]
         self.assertEqual(len(merge_topics), 1)
-        self.assertIn("last merge: alpha-unit style hand-off (ccccccc)", str(merge_topics[0]["update"]))
-        self.assertNotIn("alpha-unit phase", str(merge_topics[0]["update"]))
-        self.assertNotIn("renamed-unit", str(merge_topics[0]["update"]))
+        self.assertIn(f"last merge: {ALPHA} phase 2 ({checkpoint[:7]})", str(merge_topics[0]["update"]))
+        self.assertNotIn("shrink", str(merge_topics[0]["update"]))
+        self.assertNotIn("renamed", str(merge_topics[0]["update"]))
 
     def test_unpushed_merge_appears_as_merge_branch_topic_until_pushed(self) -> None:
         _ = self.git("checkout", "-b", "alpha")
         _ = (self.checkout / "alpha.txt").write_text("panel change\n", encoding="utf-8")
         _ = self.git("add", "alpha.txt")
         _ = self.git("commit", "-m", "panel change")
-        short = self.git("rev-parse", "--short=7", "HEAD")
+        checkpoint = self.git("rev-parse", "HEAD")
+        short = checkpoint[:7]
+        self.record_merge_checkpoint(checkpoint)
         _ = self.git("checkout", "production")
         _ = self.git("merge", "--no-ff", "-m",
                      f"Merge {ALPHA} phase 2 ({short}) into production", "alpha")
@@ -1029,7 +1049,7 @@ class DailiesInputTests(DailiesInputFixture):
         topics = cast(list[dict[str, object]], self.report()["topics"])
         merge_topics = [item for item in topics if item["title"] == "Merge branch"]
         self.assertEqual(len(merge_topics), 1)
-        self.assertIn(ALPHA, str(merge_topics[0]["update"]))
+        self.assertIn(f"{ALPHA} phase 2 ({short})", str(merge_topics[0]["update"]))
         _ = self.git("push", "origin", "production")
         pushed = self.run_builder()
         self.assertEqual(pushed.returncode, 0, pushed.stdout + pushed.stderr)
@@ -1247,15 +1267,15 @@ class DailiesInputTests(DailiesInputFixture):
         seen = cast(dict[str, object], json.loads(before))
         self.assertEqual(set(seen), {f"{identity}|Phase 2 of 3: panel labels stay clear"})
         row = staff.rename(identity, "renamed")
-        self.status_lines("== renamed-unit", "● Checking panel labels", "ETA 23:40")
+        self.status_lines("== renamed", "● Checking panel labels", "ETA 23:40")
         renamed = self.run_builder("--at", "2026-10-06T17:20")
         self.assertEqual(renamed.returncode, 0, renamed.stdout + renamed.stderr)
-        self.assertEqual((self.unit()["unit"], self.unit()["name"]), (identity, "renamed-unit"))
+        self.assertEqual((self.unit()["unit"], self.unit()["name"]), (identity, "renamed"))
         self.assertEqual(seen_path.read_bytes(), before)
         _ = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("screen-eta-cleared")))
         cleared = self.run_builder("--at", "2026-10-06T17:40")
         self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
-        self.assertEqual((self.unit()["unit"], self.unit()["name"]), (identity, "renamed-unit"))
+        self.assertEqual((self.unit()["unit"], self.unit()["name"]), (identity, "renamed"))
         self.assertEqual(seen_path.read_bytes(), before)
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
         self.assertNotIn("request /unit:eta:", renamed.stdout + cleared.stdout)

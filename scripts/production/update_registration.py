@@ -25,9 +25,9 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production.production_doc import Production, Refusal, read_production
-from merge_checkpoint import NoMerge, merge_branch_history, report
+from merge_checkpoint import merged_checkpoints, report
 
-from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup, unit_names
+from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
 from issues import Issue, frontmatter
@@ -314,7 +314,7 @@ class QuestionStaff:
 
     def display(self, row: staff.StaffRow) -> tuple[str, str]:
         parent = row if row.kind == "showrunner" else self.record.parent_of(row)
-        return parent.name if parent else "", row.name if row.kind == "showrunner" else unit_names.unit_id(row.name)
+        return parent.name if parent else "", row.name
 
     def documents(self) -> dict[str, staff.StaffRow]:
         """Return local showrunner rows by name."""
@@ -1311,14 +1311,15 @@ def withdraw(production: Production, words: str, *, identities: QuestionStaff | 
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
-    history = merge_branch_history(production.checkout, production.merge_branch)
     judgments = {unit.unit: unit for unit in state.units}
     unit_lines: list[str] = []
-    for row in staff.snapshot().find(kind="unit", parent=production.owner.id):
-        name = unit_names.unit_id(row.name)
+    record = staff.snapshot()
+    checkpoints = {entry.unit: entry for entry in merged_checkpoints(production, record=record)}
+    for row in record.find(kind="unit", parent=production.owner.id):
+        name = row.name
         judgment = judgments.get(row.id)
-        merged = history.last_code_for_unit(name)
-        last = "none" if isinstance(merged, NoMerge) else f"phase {merged.phase} ({merged.short})"
+        entry = checkpoints.get(name)
+        last = f"phase {entry.phase} ({entry.commit[:7]})" if entry is not None else "none"
         phase = judgment.phase if judgment is not None else "not stated"
         wait = judgment.wait if judgment is not None else "not stated"
         unit_lines.append(f"{name}: {phase}; last merged {last}; waits on {wait}")

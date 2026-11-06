@@ -14,7 +14,6 @@ from typing import cast, final, override
 from scripts.production.staff_test_support import isolated_staff_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from merge_checkpoint import ChildHandoffEntry, CodeCheckpoint, MergeEntry, NoMerge, ShrinkCommit, merge_branch_history
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
@@ -85,20 +84,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn(f"checkpoint {checkpoint[:7]} is not on example-style's merge branch alpha-branch", result.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.events("send.py"), [])
-    def test_child_checkpoint_must_descend_from_last_merged_handoff(self) -> None:
-        _ = self.child_production()
-        first = self.checkpoint()
-        self.assertEqual(self.run_handoff(first).returncode, 0)
-        self.write(self.other, "src/beta.txt", "divergent history\n")
-        _ = self.git("commit", "-am", "Divergent child", cwd=self.other)
-        divergent = self.git("rev-parse", "HEAD", cwd=self.other)
-        _ = self.git("reset", "--hard", divergent, cwd=self.unit)
-        before, notices = self.git("rev-parse", "HEAD"), self.events("send.py")
-        result = self.run_handoff(divergent)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not descend from example-style's last merged hand-off", result.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), before)
-        self.assertEqual(self.events("send.py"), notices)
     def test_root_style_handoff_merges_itself_without_an_attachment(self) -> None:
         _ = self.child_production(parent="")
         checkpoint = self.checkpoint()
@@ -271,39 +256,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.stdout.strip(), "merge_checkpoint: --from-child is separate from unit checkpoint arguments")
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.events("send.py"), [])
-    def test_mixed_history_keeps_child_identity_separate_from_renamed_unit_phases(self) -> None:
-        subjects = (
-            "Merge old-unit phase 1 (aaaaaaa) into production",
-            "Merge old-unit hand-off (bbbbbbb) into production",
-            "Merge old-unit phase 1 shrink (ccccccc) into production",
-            "chore(example): rename unit old-unit to new-unit",
-            "Merge style-child hand-off (ddddddd) into production",
-            "Merge new-unit phase 2 (eeeeeee) into production",
-            "Merge old-unit hand-off (fffffff) into production",
-        )
-        hashes: list[str] = []
-        for subject in subjects:
-            _ = self.git("commit", "--allow-empty", "-m", subject)
-            hashes.append(self.git("rev-parse", "HEAD"))
-        history = merge_branch_history(self.checkout, "production")
-        self.assertEqual(history.entries, (
-            ChildHandoffEntry("old-unit", "fffffff", "production", hashes[6]),
-            MergeEntry("new-unit", "2", "eeeeeee", "production", hashes[5], CodeCheckpoint()),
-            ChildHandoffEntry("style-child", "ddddddd", "production", hashes[4]),
-            MergeEntry("new-unit", "1", "ccccccc", "production", hashes[2], ShrinkCommit()),
-            ChildHandoffEntry("old-unit", "bbbbbbb", "production", hashes[1]),
-            MergeEntry("new-unit", "1", "aaaaaaa", "production", hashes[0], CodeCheckpoint()),
-        ))
-        self.assertEqual(history.last_merge(), history.entries[0])
-        self.assertEqual(history.last_for_unit("new-unit"), history.entries[1])
-        self.assertEqual(history.last_code_for_unit("new-unit"), history.entries[1])
-        self.assertEqual(history.last_for_unit("old-unit"), NoMerge())
-        self.assertEqual(history.last_code_for_unit("style-child"), NoMerge())
-        self.assertEqual(history.code_merge_count(), 2)
-        self.assertTrue(history.has_code_merge("new-unit", "1"))
-        self.assertFalse(history.has_code_merge("old-unit", "style hand-off"))
-        self.assertEqual(history.last_handoff_for_child("old-unit"), history.entries[0])
-        self.assertEqual(history.last_handoff_for_child("new-unit"), NoMerge())
 
 
 if __name__ == "__main__":

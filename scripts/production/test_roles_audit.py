@@ -788,11 +788,11 @@ class ProductionNameTests(unittest.TestCase):
     def test_reads_staff_units_and_finds_cross_role_collisions(self) -> None:
         doc = Path("/fixture/one.md")
         first = audit.parse_production("one", doc, owned_units(doc, "render", "old", retired=("old",), production_name="one"))
-        second = audit.ProductionNames("render-unit", "/fixture/two.md", ("tools-unit",))
+        second = audit.ProductionNames("render", "/fixture/two.md", ("tools",))
         rows = audit.measure_production_names((first, second))
-        self.assertEqual(first.units, ("render-unit", "old-unit"))
+        self.assertEqual(first.units, ("render", "old"))
         self.assertEqual(rows, (
-            audit.ProductionNameFinding("shared name", "render-unit", ("one", "render-unit"), ("/fixture/one.md", "/fixture/two.md")),
+            audit.ProductionNameFinding("shared name", "render", ("one", "render"), ("/fixture/one.md", "/fixture/two.md")),
         ))
 
 
@@ -805,15 +805,15 @@ class MessageTests(unittest.TestCase):
                  message(start, recipient="another", to_role="showrunner", to_production="two", **director),
                  message(start, recipient="own", to_role="showrunner", to_production="one", **director),
                  message(start, recipient="unknown", to_role="showrunner", **director),
-                 message(start, sender="named-unit"),
+                 message(start, sender="named"),
                  message(start, sender="unresolved", machine=""),
-                 message(start, sender="mac-unit", machine="mac", **director),
+                 message(start, sender="mac", machine="mac", **director),
                  message(start, outcome="skipped", **director),
                  message(end, **director), message(start - timedelta(seconds=1), **director)]
         source = audit.parse_messages("\n".join(lines))
         counts = audit.measure_sent_contacts(source.records, audit.AuditWindow(start, end))
         self.assertEqual(counts.senders, (audit.SenderContacts("alpha", 1, 1, 0, 1, 4),
-                                         audit.SenderContacts("named-unit", 0, 0, 1, 0, 1)))
+                                         audit.SenderContacts("named", 0, 0, 1, 0, 1)))
         self.assertEqual((counts.window_records, counts.sent_records, counts.other_machine_records, counts.machine_unknown),
                          (8, 5, 1, 1))
 
@@ -1055,14 +1055,14 @@ other_names = []
         at = datetime(2026, 10, 1, tzinfo=timezone.utc)
         result = audit.report(
             (term("worker", defined_in=("docs/a.md#Words", "docs/b.md#Words")),), (),
-            (audit.ProductionNames("one", "one.md", ("shared-unit",)),
-             audit.ProductionNames("two", "two.md", ("shared-unit",))),
+            (audit.ProductionNames("one", "one.md", ("shared",)),
+             audit.ProductionNames("two", "two.md", ("shared",))),
             audit.parse_messages(""), audit.AuditWindow(at, at + timedelta(days=1)), (),
             source_result=audit.SourceCheck((), (), (), ()), unread_production_docs=())
         self.assertIn("Definitions: n=1 findings across n=1 terms.", result)
         self.assertIn("Definition: 'worker' has definitions in docs/a.md, docs/b.md.", result)
         self.assertIn("Unit and session names: n=1 findings across n=2 production docs", result)
-        self.assertIn("Name: 'shared-unit' is shared by one, two.", result)
+        self.assertIn("Name: 'shared' is shared by one, two.", result)
 
     def test_unreadable_sources_have_individual_warnings_in_the_short_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

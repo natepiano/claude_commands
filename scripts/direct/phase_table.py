@@ -1560,7 +1560,7 @@ def _production_reference(plan_path: Path, *, resolver: session_staff.RowResolve
     if not isinstance(doc, session_staff.ProductionDoc):
         print(f"phase_table: {member.row.name}: {doc.reason}", file=sys.stderr)
         return PlanOutsideProduction()
-    unit = unit_names.unit_id(member.row.name)
+    unit = member.row.name
     return ProductionReference(doc.owner.name, unit, str(doc.path))
 
 
@@ -1855,7 +1855,7 @@ def prune(production_doc: Path) -> None:
     resolver = session_staff.RowResolver(staff.snapshot())
     production = read_production(production_doc, resolver=resolver)
     live_units = {
-        unit_names.unit_id(unit_plan.unit) for unit_plan in _production_unit_plans(production, resolver=resolver)
+        unit_plan.unit for unit_plan in _production_unit_plans(production, resolver=resolver)
     }
     vault_root = _vault_root()
     for candidate in vault_root.glob("*/*.md"):
@@ -1863,7 +1863,7 @@ def prune(production_doc: Path) -> None:
         if (
             not isinstance(ownership, NoteOwnership)
             or not _owns_note(ownership, production.name, ownership.unit, resolver.record)
-            or any(row.id == ownership.unit and unit_names.unit_id(row.name) in live_units
+            or any(row.id == ownership.unit and row.name in live_units
                    for row in resolver.record.find(kind="unit"))
         ):
             continue

@@ -661,14 +661,14 @@ class InventoryTests(ShutdownTestCase):
 
     def build_git_checkout(self) -> None:
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "shutdown-unit", cwd=self.checkout)
+        _ = self.git("init", "-b", "shutdown", cwd=self.checkout)
         _ = self.git("config", "user.name", "Shutdown Test")
         _ = self.git("config", "user.email", "shutdown@example.invalid")
         _ = self.git("remote", "add", "origin", str(self.origin))
         _ = (self.checkout / "dirty.txt").write_text("base\n", encoding="utf-8")
         _ = self.git("add", "dirty.txt")
         _ = self.git("commit", "-m", "base")
-        _ = self.git("push", "-u", "origin", "shutdown-unit")
+        _ = self.git("push", "-u", "origin", "shutdown")
         for number in (1, 2):
             _ = (self.checkout / f"ahead-{number}.txt").write_text(
                 f"ahead {number}\n", encoding="utf-8"
@@ -772,7 +772,7 @@ elif "comm=" in joined:
         self.write_session(
             UNIT_PID,
             UNIT_ID,
-            "shutdown-unit",
+            "shutdown",
             self.checkout,
             tmux="old-label:@1.%4",
             updated_at=50,
@@ -797,7 +797,7 @@ elif "comm=" in joined:
         self.write_session(UNKNOWN_PID, UNKNOWN_ID, "hidden-account", plain, updated_at=10)
 
     def make_production_state(self) -> None:
-        member = unit_membership("build-followups", "shutdown-unit")
+        member = unit_membership("build-followups", "shutdown")
         _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.checkout), expected=member.worktree)
         assert isinstance(member.parent, staff.ReportsTo)
         parent = staff.by_id(member.parent.id)
@@ -830,7 +830,7 @@ elif "comm=" in joined:
         self.herdr_process(72_001, 1, ["/fixture/herdr", "--session", "unit-renamed", "server"], {})
         self.herdr_process(UNIT_PID, 72_001, ["/bin/claude"], {
             "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+            "SHOWRUNNER_UNIT_ID": "shutdown",
         })
         for name, started_at, plan in (
             ("newer", 20, "docs/shutdown-plan.md"),
@@ -842,7 +842,7 @@ elif "comm=" in joined:
                 "main_agent": {"session_id": UNIT_ID},
                 "working_dir": str(self.checkout),
                 "plan_doc": plan,
-                "branch": "shutdown-unit",
+                "branch": "shutdown",
             }
             _ = (self.history / "runs" / f"{name}.jsonl").write_text(
                 json.dumps(event) + "\n", encoding="utf-8"
@@ -960,7 +960,7 @@ elif "comm=" in joined:
             {
                 "kind": "git",
                 "path": str(self.checkout),
-                "head": {"kind": "branch", "name": "shutdown-unit"},
+                "head": {"kind": "branch", "name": "shutdown"},
                 "upstream": {"kind": "tracking", "ahead": 2},
                 "dirty": ["dirty.txt"],
             },
@@ -1035,7 +1035,7 @@ elif "comm=" in joined:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "unit-herdr", "server"], {})
         self.herdr_process(UNIT_PID, 71_001, ["/bin/claude"], {
             "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+            "SHOWRUNNER_UNIT_ID": "shutdown",
         })
         found = inventory.inventory(TARGET_LOGIN)
         unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)

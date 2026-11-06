@@ -260,8 +260,6 @@ class WorkerPaneTests(StaffTestCase):
         showrunner = fixture_member("showrunner", name="showrunner")
         self.parent_id = fixture_member("unit", name="unit", parent=showrunner.id,
                                         worktree=staff.PresentWorktree("natedev", self.root)).id
-        self.world = PaneWorld()
-        self.world.add(self.parent, "w1:p0")
         config = self.root / "conf"
         config.mkdir()
         write_text_atomic(config / "direct.conf", "WORKER_TRANSPORT=mesh\n# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n")
@@ -272,6 +270,8 @@ class WorkerPaneTests(StaffTestCase):
             "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(self.root),
             "UNIT_RUN_DIR": str(self.root / "run"),
         })))
+        self.world = PaneWorld()
+        self.world.add(self.parent, "w1:p0")
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.world))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit-runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former-runs"))

@@ -38,7 +38,7 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_resume_preserves_existing_config_settings_and_launches_with_the_same_staff_id(self) -> None:
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
-        row = unit_membership("build-followups", "alpha-unit")
+        row = unit_membership("build-followups", "alpha")
         fixed_id = row.id
         row = staff.update_current_session(row.current_session, staff.native_id("3001165e-ca76-59c2-9490-878224585fad"))
         row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
@@ -64,7 +64,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.staff.staff_file.parent.mkdir(parents=True, exist_ok=True)
         _ = self.staff.staff_file.write_text("broken record", encoding="utf-8")
         before = (self.doc.read_bytes(), self.git("rev-parse", "HEAD"), self.staff.staff_file.read_bytes())
-        stopped = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(),
+        stopped = unit_lookup.LabeledSession("alpha", unit_lookup.ClaudeNotRunning(),
                                         HerdrPlace("old-host", "w2:p3"), identity=unit_lookup.LiveSession(fixture_runtime_id("unreadable-stopped-session")))
         with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(stopped)),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
@@ -83,11 +83,11 @@ class AddUnitResumeTests(AddUnitTestCase):
         row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
-        stopped = unit_lookup.LabeledSession("alpha-unit", unit_lookup.ClaudeNotRunning(),
-                                        HerdrPlace("old-host", "w2:p3"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
-        running = unit_lookup.LabeledSession("alpha-unit",
+        stopped = unit_lookup.LabeledSession("alpha", unit_lookup.ClaudeNotRunning(),
+                                        HerdrPlace("old-host", "w2:p3"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha").current_session))
+        running = unit_lookup.LabeledSession("alpha",
             unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture/socket", 4242),
-            HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha-unit").current_session))
+            HerdrPlace("agents", "w1:p1"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha").current_session))
         order = Mock()
         with (patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(stopped)),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
@@ -104,8 +104,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(order.mock_calls[0][0], "close")
         self.assertEqual(order.mock_calls[1][0], "start")
         waited.assert_called_once()
-        self.assertIn("alpha-unit started:", result.stdout)
-        row = unit_membership("build-followups", "alpha-unit")
+        self.assertIn("alpha started:", result.stdout)
+        row = unit_membership("build-followups", "alpha")
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
         self.assertEqual(self.git("rev-parse", "build-followups"), old_head)
         self.assertTrue((self.root / "project-alpha").is_dir())
@@ -122,8 +122,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                           "--cwd", str(prior), "--account", "claude2")
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertIn(f"alpha-unit: trust anomaly: Claude has not trusted {prior}", result.stderr)
-        self.assertIn("alpha-unit started:", result.stdout)
+        self.assertIn(f"alpha: trust anomaly: Claude has not trusted {prior}", result.stderr)
+        self.assertIn("alpha started:", result.stdout)
         self.assertEqual(self.opened()[7], str(prior))
 
     def test_running_resume_refuses_before_any_launch_write(self) -> None:
@@ -169,7 +169,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior.mkdir()
         self.write_resume_registry_record("a-previous-process-start")
         result = self.successful("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
-        self.assertIn("alpha-unit started:", result.stdout)
+        self.assertIn("alpha started:", result.stdout)
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--resume") + 1], "62ccbd64-f22e-5647-b20e-7899aa39d766")
         self.assertIn(str(prior), self.opened())
@@ -186,8 +186,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(arguments[arguments.index("--resume") + 1], "62ccbd64-f22e-5647-b20e-7899aa39d766")
         self.assertFalse(any(key.startswith("SHOWRUNNER_") for key in self.pane_environment()))
         self.assertIn(str(prior), self.opened())
-        self.assertIn("attached 62ccbd64-f22e-5647-b20e-7899aa39d766 as alpha-unit: one process, pid 202", result.stdout)
-        row = unit_membership("build-followups", "alpha-unit")
+        self.assertIn("attached 62ccbd64-f22e-5647-b20e-7899aa39d766 as alpha: one process, pid 202", result.stdout)
+        row = unit_membership("build-followups", "alpha")
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
         self.assertNotIn("STAFF_ID", self.pane_environment())
         arguments = self.agent_arguments()
@@ -259,7 +259,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         recorded = self.commit_row_off_the_naming_pattern()
         result = self.cli("trunk", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                           "--cwd", str(recorded), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
-        # The fixture marks only alpha-unit, so the launch ends at the mark wait, after the row check.
+        # The fixture marks only alpha, so the launch ends at the mark wait, after the row check.
         self.assertNotIn("Worktree is", result.stderr)
         self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
 
@@ -273,13 +273,13 @@ class AddUnitResumeTests(AddUnitTestCase):
                           "--cwd", str(elsewhere), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(result.stderr,
-                         f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its staff row names {recorded}\n")
+                         f"add_unit: unit trunk resumes in {elsewhere.resolve()}; its staff row names {recorded}\n")
         self.assert_no_launch_change(document, head)
 
     def test_retired_plan_resume_cannot_bypass_the_retained_row_restore(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        row = unit_membership("build-followups", "alpha-unit")
+        row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         before = self.repository_state()
@@ -290,7 +290,7 @@ class AddUnitResumeTests(AddUnitTestCase):
                               "--cwd", str(prior))
 
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(result.stderr, "add_unit: unit alpha-unit is retired; resume that unit, "
+        self.assertEqual(result.stderr, "add_unit: unit alpha is retired; resume that unit, "
                          + "or remove it for good to free the name\n")
         worktree_step.assert_not_called()
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
@@ -304,7 +304,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.git("branch", "build-followups-alpha")
-        row = unit_membership("build-followups", "alpha-unit")
+        row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         before = self.repository_state()
@@ -312,7 +312,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
 
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(result.stderr, "add_unit: unit alpha-unit is retired; resume that unit, "
+        self.assertEqual(result.stderr, "add_unit: unit alpha is retired; resume that unit, "
                          + "or remove it for good to free the name\n")
         self.assertFalse(any(call[2:4] == ["agent", "start"] for call in self.herdr_calls()))
         self.assertEqual(staff.by_id(row.id), row)
@@ -360,7 +360,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         result = self.cli("alpha", "--plan", changed_plan, "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                           "--cwd", str(worktree), "--check")
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn(f"unit alpha-unit Plan is {plan!r}; expected {changed_plan!r}", result.stderr)
+        self.assertIn(f"unit alpha Plan is {plan!r}; expected {changed_plan!r}", result.stderr)
         self.assertEqual(self.repository_state(), before)
         self.assertEqual([call for call in self.herdr_calls()
                           if call[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
@@ -387,7 +387,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
         self.assertEqual(writes, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach agents, workspace build-followups, tab alpha\n")
+        self.assertEqual(output.getvalue(), "alpha started: herdr session attach agents, workspace build-followups, tab alpha\n")
 
     def test_resume_from_a_brief_is_refused(self) -> None:
         result = self.cli("alpha", "--brief", "Do it.", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(self.root))
@@ -417,7 +417,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         ])
         self.assert_director_flags("opus", "xhigh")
         command = self.opening_prompt()
-        self.assertIn("You are now alpha-unit in production build-followups", command)
+        self.assertIn("You are now alpha in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
         self.assertIn(f"Run /unit:direct {promoted_plan}", command)
@@ -426,7 +426,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         plan = Path("docs/style-production/units/alpha-unit.md")
         source = self.checkout / plan
         source.parent.mkdir(parents=True)
-        header = "# Standing plan\n\n> **Production: build-followups** — unit `alpha-unit`\n"
+        header = "# Standing plan\n\n> **Production: build-followups** — unit `alpha`\n"
         standing = header + "> **Standing:** style_plan.py\n"
         _ = source.write_text(standing, encoding="utf-8")
         initial = self.repository_state()

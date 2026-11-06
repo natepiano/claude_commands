@@ -22,7 +22,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 
 import rules
 import style_ledger
-from scripts.production import staff, unit_lookup, unit_names
+from scripts.production import staff, unit_lookup
 from user_zone import user_zone
 from add_style import NoStyleProduction, standing_style_production
 
@@ -66,9 +66,9 @@ def git(repo: Path, *arguments: str) -> str:
 
 def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
     standing = standing_style_production(ledger.repo)
-    units = tuple(f"{standing.name}-{family}-unit" for family in ("modules", "names", "values", "types"))
+    units = tuple(f"{standing.name}-{family}" for family in ("modules", "names", "values", "types"))
     if not isinstance(standing, NoStyleProduction):
-        declared = tuple(unit for unit in (unit_names.unit_id(row.name) for row in unit_lookup.doc_units(standing.doc, staff.snapshot()))
+        declared = tuple(unit for unit in (row.name for row in unit_lookup.doc_units(standing.doc, staff.snapshot()))
                          if not isinstance(rules.style_family(unit), rules.NotStyleUnit))
         return StyleProduction(standing.name, standing.branch_point, declared or units)
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()

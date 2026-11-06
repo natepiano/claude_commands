@@ -88,25 +88,25 @@ class DirectorResolutionTests(StaffTestCase):
         )))
 
     def test_live_unit_director_keeps_a_running_director_without_a_messaging_socket(self) -> None:
-        parent = unit_membership("demo", "builders-unit")
-        registry = self.session_record(parent.current_session, "builders-unit")
-        run = self.worker_run("demo", "builders-unit", parent.current_session)
+        parent = unit_membership("demo", "builders")
+        registry = self.session_record(parent.current_session, "builders")
+        run = self.worker_run("demo", "builders", parent.current_session)
         self.assertEqual(json_object(registry)["messagingSocketPath"], "")
 
         self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(parent.current_session, os.getpid()))
 
     def test_live_unit_director_prefers_the_newest_running_name_match(self) -> None:
-        parent = unit_membership("demo", "builders-unit")
-        older = self.session_record(parent.current_session, "builders-unit")
+        parent = unit_membership("demo", "builders")
+        older = self.session_record(parent.current_session, "builders")
         current = staff.update_current_session(parent.current_session, staff.native_id(fixture_runtime_id("newer-director")))
-        newer = self.session_record(current.current_session, "builders-unit")
+        newer = self.session_record(current.current_session, "builders")
         record = json_object(newer)
         record["updatedAt"] = 2
         self.write_json(newer, record)
-        run = self.worker_run("demo", "builders-unit", "former-director")
+        run = self.worker_run("demo", "builders", "former-director")
         self.write_json(self.root / "shutdown/account/history/restart.json", {"session": {
-            "session_id": "former-director", "name": "builders-unit", "run_dirs": [str(run)],
-            "host": {"kind": "unit", "unit": "builders-unit", "session_name": "builders-unit"},
+            "session_id": "former-director", "name": "builders", "run_dirs": [str(run)],
+            "host": {"kind": "unit", "unit": "builders", "session_name": "builders"},
         }})
         registry = sessions.read_registry()
         entries = {item.record["sessionId"]: item for item in registry.entries}

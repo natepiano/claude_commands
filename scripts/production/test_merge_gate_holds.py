@@ -63,7 +63,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
     def test_each_mode_waits_before_tests_types_or_promotion(self) -> None:
         arguments = ["--repo", str(self.gate.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
-                     "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit",
+                     "--previous-checkpoint", self.gate.base, "--unit", "fixture",
                      "--phase", "hold", "--type-dirs", "scripts/production",
                      "--production", "quiet",
                           "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
@@ -176,7 +176,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
             code = merge_gate.main([
                 "--repo", str(self.gate.checkout), "--merge-branch", "integration",
                 "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
-                "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit", "--phase", "hold",
+                "--previous-checkpoint", self.gate.base, "--unit", "fixture", "--phase", "hold",
                 "--production", "quiet", "--type-dirs", "scripts/production",
             ])
         self.assertNotEqual(code, 0, output.getvalue())

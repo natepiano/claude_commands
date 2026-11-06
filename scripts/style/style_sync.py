@@ -30,7 +30,7 @@ from add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
 from scripts.copies import copies
 from scripts.message import send_result, send_budget, session_send
-from scripts.production import showrunners, unit_names
+from scripts.production import showrunners
 import style_ledger
 from process_failure import failure_detail
 import scratch
@@ -491,7 +491,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
             return
         for wait in waits:
             try:
-                unit = unit_names.unit_id(ledger.unit_name(wait.unit))
+                unit = ledger.unit_name(wait.unit)
                 addresses = [director.address for director in directors if director.unit == unit]
                 if not addresses:
                     raise Refusal("no live director")

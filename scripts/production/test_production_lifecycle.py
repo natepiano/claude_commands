@@ -77,7 +77,7 @@ class LifecycleTests(LifecycleFixture):
         before = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.calls()
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("permanent child nightly-unit: transfer it before wrapping", result.stdout)
+        self.assertIn("permanent child nightly: transfer it before wrapping", result.stdout)
         self.assertTrue(self.alpha.is_dir())
         self.assertTrue(self.beta.is_dir())
         self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.calls()), before)
@@ -246,7 +246,7 @@ class LifecycleTests(LifecycleFixture):
         before = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("permanent child nightly-unit: transfer it before wrapping", result.stdout)
+        self.assertIn("permanent child nightly: transfer it before wrapping", result.stdout)
         for row in (runner, alpha, beta, child, permanent):
             self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
@@ -259,7 +259,7 @@ class LifecycleTests(LifecycleFixture):
             with self.subTest(attempt=attempt), mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture before permanent transfer")):
                 result = self.run_lifecycle("wrap", "--no-ci")
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-            self.assertIn("permanent child nightly-unit", result.stdout)
+            self.assertIn("permanent child nightly", result.stdout)
             self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
         for row in (runner, alpha, beta, child, permanent):
             self.assertEqual(staff.by_id(row.id), row)
@@ -350,7 +350,7 @@ class LifecycleTests(LifecycleFixture):
         self.assert_step(resumed, "ok")
         self.assertIn("state: ok — merge alpha; check beta", resumed.stdout)
         self.assertNotIn("old next item", resumed.stdout)
-        self.assertIn("alpha-unit: no code checkpoint", resumed.stdout)
+        self.assertIn("alpha: no code checkpoint", resumed.stdout)
 
     def test_load_copies_the_scratchpad_state_once_and_never_replaces_it(self) -> None:
         scratch = self.root / "scratch"
@@ -370,25 +370,47 @@ class LifecycleTests(LifecycleFixture):
         self.assertNotIn("copied", again.stdout)
         self.assertIn('"new"', (target / "showrunner_state.json").read_text())
 
-    def test_load_reports_each_last_code_merge_even_after_shrink(self) -> None:
+    def record_checkpoint(self, worktree: Path, phase: str, commit: str) -> None:
+        history = self.root / "history/runs/checkpoints.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        with history.open("a") as output:
+            _ = output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint", "phase_id": phase,
+                                         "working_dir": str(worktree), "checkpoint_commit": commit}) + "\n")
+        self.env["UNIT_HISTORY_DIR"] = str(history.parent.parent)
+
+    def test_load_reports_code_checkpoints_after_a_parked_branch_is_deleted(self) -> None:
         self.running()
-        _, alpha_merge = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "2")
-        _, beta_merge = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "2", shrink=True)
+        alpha_tip, _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "2")
+        beta_tip, _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "2", shrink=True)
+        self.record_checkpoint(self.alpha, "2", alpha_tip)
+        self.record_checkpoint(self.beta, "1", beta_tip)
+        self.park_fixture_unit("alpha", self.alpha, "alpha-branch")
+        _ = self.git("worktree", "remove", "--force", str(self.alpha))
+        _ = self.git("branch", "-D", "alpha-branch")
         _ = (self.state / "live-alpha").touch()
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
         self.assertIn("state: ok — no next list", result.stdout)
-        self.assertIn("alpha-unit", result.stdout)
-        self.assertIn("beta-unit", result.stdout)
-        self.assertIn(alpha_merge[:7], result.stdout)
-        self.assertIn(beta_merge[:7], result.stdout)
-        self.assertIn("session: ok — alpha-unit: gone", result.stdout)
-        self.assertIn("session: ok — beta-unit: gone", result.stdout)
+        self.assertIn("alpha", result.stdout)
+        self.assertIn("beta", result.stdout)
+        self.assertIn(f"alpha: phase 2 ({alpha_tip[:7]})", result.stdout)
+        self.assertIn(f"beta: phase 1 ({beta_tip[:7]})", result.stdout)
+        self.assertIn("session: ok — alpha: gone", result.stdout)
+        self.assertIn("session: ok — beta: gone", result.stdout)
+
+    def test_wrap_reports_recorded_phase_counts_and_last_checkpoints(self) -> None:
+        self.merged_units()
+        alpha_tip = self.git("rev-parse", "alpha-branch")
+        self.record_checkpoint(self.alpha, "2", alpha_tip)
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn(f"alpha: 1 phases merged, last {alpha_tip[:7]}", result.stdout)
+        self.assertIn("beta: no phases merged", result.stdout)
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
-        beta = unit_membership("example", "beta-unit")
+        beta = unit_membership("example", "beta")
         fake_unit_host.write(self.env, [
             HostedUnit("alpha", "w1:p1", {}),
             HostedUnit("renamed-since-launch", "w2:p1", {"CODEX_THREAD_ID": beta.current_session}),
@@ -407,8 +429,8 @@ class LifecycleTests(LifecycleFixture):
         fake_unit_host.place_process(self.env, pid, "w2:p1", exec_shell=True)
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
-        self.assertIn("alpha-unit: gone", result.stdout)
-        self.assertIn("beta-unit: renamed-since-launch live", result.stdout)
+        self.assertIn("alpha: gone", result.stdout)
+        self.assertIn("beta: renamed-since-launch live", result.stdout)
 
     def test_open_holds_when_production_is_wrapped(self) -> None:
         self.running()
@@ -457,7 +479,7 @@ class LifecycleTests(LifecycleFixture):
         self.assert_step(first, "ok")
         missing_reports = [line for line in first.stdout.splitlines() if "no plan yet" in line]
         self.assertEqual(len(missing_reports), 1, first.stdout)
-        self.assertIn("beta-unit", missing_reports[0])
+        self.assertIn("beta", missing_reports[0])
         self.assertIn("docs/plans/beta.md", missing_reports[0])
         self.assertFalse((self.checkout / "docs/plans/beta.md").exists())
         self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
@@ -753,8 +775,8 @@ class LifecycleTests(LifecycleFixture):
     def test_wrap_rejects_verdict_for_other_tip_before_retirement(self) -> None:
         self.running()
         other = self.git("rev-parse", "HEAD")
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         tip = self.git("rev-parse", "HEAD")
         origin_before = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
         result = self.run_lifecycle("wrap", "--ci-green", other, "--smoke-passed", tip)
@@ -769,8 +791,8 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_accepts_exact_close_out_completion(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         item = "Archive records to safe location."
         self.production_doc("running", close_out=f"- {item}")
         _ = self.git("add", str(self.doc))
@@ -784,7 +806,7 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_requires_merged_remote_branch_when_worktree_is_gone(self) -> None:
         self.running()
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         self.write(self.alpha / "unmerged.txt", "unmerged\n")
         _ = self.git("add", "unmerged.txt", cwd=self.alpha)
         _ = self.git("commit", "-m", "unmerged", cwd=self.alpha)
@@ -800,8 +822,8 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_reports_already_retired_unit_with_no_branches(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
         self.park_fixture_unit("alpha", self.alpha, "alpha-branch")
         _ = self.git("worktree", "remove", str(self.alpha))
@@ -809,13 +831,13 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("push", "origin", "--delete", "alpha-branch")
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertIn("alpha-unit", result.stdout)
+        self.assertIn("alpha", result.stdout)
         self.assertIn("already retired", result.stdout)
 
     def test_wrap_releases_reservation_from_unit_worktree_through_python_wrapper(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
         alpha = {"reservation_id": "alpha-reservation", "target": "refs/heads/production",
                  "holder": {"worktree_root": str(self.alpha), "branch": "alpha-branch"},
@@ -879,8 +901,8 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_resumes_after_final_push_rejection_without_second_commit(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
         marker = self.root / "reject-production"
         marker.touch()
@@ -923,8 +945,8 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_without_ci_retires_units_removes_notifier_and_reports(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
@@ -944,8 +966,8 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/example-production.md"
         kept.parent.mkdir()
         _ = self.git("mv", str(self.doc), str(kept))
@@ -973,8 +995,8 @@ class LifecycleTests(LifecycleFixture):
 
     def test_same_wrap_command_finishes_after_the_doc_was_moved(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/example-production.md"
         kept.parent.mkdir()
         _ = self.git("mv", str(self.doc), str(kept))
@@ -1005,8 +1027,8 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_recovers_the_archive_move_before_staff_document_publication(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/different-production.md"
         kept.parent.mkdir()
         _ = self.git("mv", str(self.doc), str(kept))
@@ -1194,12 +1216,12 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_archives_owned_phase_note_and_keeps_other_files(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
         owned = self.write_phase_note("alpha", "example", next(row.id for row in staff.find(kind="unit") if row.name == "alpha"))
         owned_bytes = owned.read_bytes()
-        other = self.write_phase_note("other", "other", unit_membership("other", "alpha-unit").id)
+        other = self.write_phase_note("other", "other", unit_membership("other", "alpha").id)
         other_bytes = other.read_bytes()
         handwritten = self.phase_table_vault / "showrunner" / "notes.md"
         self.write(handwritten, "kept by a person\n")
@@ -1222,8 +1244,8 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_stays_running_when_phase_note_archive_fails(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
         note = self.write_phase_note("alpha", "example", next(row.id for row in staff.find(kind="unit") if row.name == "alpha"))
         archive = self.phase_table_vault.parent / "archive"
@@ -1252,5 +1274,5 @@ class PermanentUnitTests(StaffTestCase):
             _ = (self.root / name / ".unit.toml").write_text(f'plan = "{plan}"\nresponsibilities = []\n')
             _ = fixture_member("unit", name=name, parent=owner.id,
                                worktree=staff.PresentWorktree("natedev", self.root / name))
-        with self.assertRaisesRegex(production_lifecycle.LifecycleStop, "permanent child nightly-review-unit: transfer it before wrapping"):
+        with self.assertRaisesRegex(production_lifecycle.LifecycleStop, "permanent child nightly-review: transfer it before wrapping"):
             _ = production_lifecycle.units(owner, staff.snapshot())

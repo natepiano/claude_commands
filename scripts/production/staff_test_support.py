@@ -24,6 +24,7 @@ from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import pane_record, remote
@@ -289,29 +290,41 @@ class ClaudeBackendFixture:
 
 @contextmanager
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
-    """Use private staff and notifier paths in this process and its fixture children."""
+    """Use private staff and registry paths in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
     _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
     _ = environment.setdefault("NOTIFIER_STATE_DIR", str(path.parent / "notifier"))
+    for key, folder in (
+        ("SHOWRUNNER_STATE_DIR", "showrunners"),
+        ("NOTIFIER_SESSIONS_DIR", "sessions"),
+        ("HERDR_PANE_RECORD_DIR", "panes"),
+        ("XDG_CONFIG_HOME", "config"),
+    ):
+        _ = environment.setdefault(key, str(path.parent / folder))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
             "NOTIFIER_STATE_DIR": environment["NOTIFIER_STATE_DIR"],
+            "SHOWRUNNER_STATE_DIR": environment["SHOWRUNNER_STATE_DIR"],
+            "NOTIFIER_SESSIONS_DIR": environment["NOTIFIER_SESSIONS_DIR"],
+            "HERDR_PANE_RECORD_DIR": environment["HERDR_PANE_RECORD_DIR"],
+            "XDG_CONFIG_HOME": environment["XDG_CONFIG_HOME"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
             "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
         })))
         for name in ("showrunners", "scripts.production.showrunners"):
             module = sys.modules.get(name)
             if module is not None:
+                for key in ("NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
+                    _ = contexts.enter_context(mock.patch.object(module, key, Path(environment[key])))
+        for name in ("pane_record", "scripts.shutdown.pane_record"):
+            module = sys.modules.get(name)
+            if module is not None:
                 _ = contexts.enter_context(mock.patch.object(
-                    module, "NOTIFIER_STATE_DIR", Path(environment["NOTIFIER_STATE_DIR"]),
+                    module, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
                 ))
-        if "HERDR_PANE_RECORD_DIR" in environment:
-            _ = contexts.enter_context(mock.patch.object(
-                pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
-            ))
         yield
 
 
@@ -826,8 +839,8 @@ class StaffTestCase(unittest.TestCase):
 
     @contextmanager
     def lock_notice(self, lock: Path) -> Generator[socket.socket]:
-        path = self.root / "operation-notice.sock"
-        with socket.socket(socket.AF_UNIX) as listener:
+        with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+            path = Path(directory) / "operation-notice.sock"
             listener.bind(str(path))
             listener.listen()
             listener.settimeout(TEST_HANG_GUARD_SECS)

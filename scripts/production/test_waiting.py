@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.production.fake_unit_host import labeled as labeled_host
+from scripts.direct import progress_history
 
 import fcntl
 import io
@@ -46,9 +47,9 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("waiting.py")
-ALPHA = "alpha-unit"
-BETA = "beta-unit"
-GAMMA = "gamma-unit"
+ALPHA = "alpha"
+BETA = "beta"
+GAMMA = "gamma"
 PHASE = "Phase 2 of 3: panel labels stay clear"
 PHASE_IDENTITY = "Phase 2 of 3"
 BERTH_STUB = '''#!__PYTHON__
@@ -82,7 +83,7 @@ import sys
 with Path(os.environ["WAITING_TEST_SENDS"]).open("a", encoding="utf-8") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
 recipient = sys.argv[sys.argv.index("--to") + 1]
-codes = {"alpha-unit": 0, "beta-unit": 1, "gamma-unit": 3}
+codes = {"alpha": 0, "beta": 1, "gamma": 3}
 print(f"delivery outcome for {recipient}")
 raise SystemExit(codes[recipient])
 '''
@@ -318,7 +319,7 @@ class WaitingTests(unittest.TestCase):
         _ = self.git("push", "-u", "origin", "alpha-branch", cwd=self.alpha)
 
     def scratch_log(self, output: str) -> Path:
-        found = re.search(r"\(([^\n()]*scratch-test-alpha-unit-[^\n()]*\.log)\)", output)
+        found = re.search(r"\(([^\n()]*scratch-test-alpha-[^\n()]*\.log)\)", output)
         self.assertIsNotNone(found, output)
         path = Path(found.group(1)) if found else Path()
         self.assertTrue(path.is_file(), output)
@@ -824,9 +825,16 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                     self.assertIn(message, result.stdout)
                 self.assertNotIn("Traceback", result.stdout + result.stderr)
 
+    def record_phase_start(self, start: datetime, phase: str = "2") -> None:
+        self.env["UNIT_HISTORY_DIR"] = str(self.root / "history")
+        event = {"schema_version": 1, "event_type": "phase_started", "phase_id": phase,
+                 "working_dir": str(self.alpha), "timestamp_epoch": start.timestamp()}
+        self.write(self.root / "history/runs/alpha.jsonl", json.dumps(event) + "\n")
+
     def agenda_log(self, start: datetime, phase: str, *, eta: datetime | None = None,
                    wait: datetime | None = None, eta_identifier: str = ALPHA,
                    ) -> None:
+        self.record_phase_start(start)
         events = [(start, self.producer_launch_line(start))]
         if eta is not None:
             eta_moment = start + timedelta(minutes=10)
@@ -839,10 +847,40 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         lines.append(self.producer_state_block(datetime.now(start.tzinfo), {ALPHA: phase}))
         self.write(self.log, "\n".join((*lines, "")))
 
+    def test_arbitrary_merge_subjects_preserve_merged_work_and_phase_start(self) -> None:
+        from merge_checkpoint import MergedCheckpoint, merged_checkpoints
+        from scripts.production.production_doc import read_production
+
+        start = datetime.now(ZoneInfo("America/Los_Angeles")).replace(microsecond=0) - timedelta(hours=9)
+        self.agenda_log(start, PHASE)
+        tip = self.commit(self.alpha, "alpha.txt", "completed work\n")
+        with (self.root / "history/runs/alpha.jsonl").open("a") as output:
+            _ = output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint", "phase_id": "2",
+                                         "working_dir": str(self.alpha), "checkpoint_commit": tip}) + "\n")
+        for subject in ("Integrate completed work", "Merge unrelated words"):
+            with self.subTest(subject=subject):
+                if subject == "Integrate completed work":
+                    _ = self.git("merge", "--no-ff", "-m", subject, "alpha-branch")
+                else:
+                    _ = self.git("commit", "--amend", "-m", subject)
+                with mock.patch.dict(os.environ, self.env):
+                    production = read_production("showrunner-example")
+                    unit = next(row for row in waiting.units_from_doc(production) if row.name == ALPHA)
+                    self.assertEqual(merged_checkpoints(production), (MergedCheckpoint(ALPHA, "2", tip),))
+                    starts = progress_history.events_for_worktrees((unit.worktree,), frozenset({"phase_started"}))
+                    self.assertEqual(waiting.phase_start(unit, "2", starts), waiting.PhaseStart(start))
+                _ = (self.state / "agenda_seen.json").unlink(missing_ok=True)
+                result = self.run_waiting("agenda", "--state-dir", str(self.state))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
+
     def test_agenda_opens_phase_started_nine_hours_ago_only_once(self) -> None:
         start = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(hours=9)
         self.agenda_log(start, PHASE)
-        first = self.run_waiting("agenda", "--state-dir", str(self.state))
+        with mock.patch.object(progress_history, "events_for_worktrees",
+                               wraps=progress_history.events_for_worktrees) as reads:
+            first = self.run_waiting("agenda", "--state-dir", str(self.state))
+        self.assertEqual(reads.call_count, 1)
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", first.stdout)
         seen = cast(dict[str, object], json.loads((self.state / "agenda_seen.json").read_text()))
@@ -858,12 +896,13 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
 
-    def test_agenda_uses_previous_merge_time_in_log_instead_of_git_commit_time(self) -> None:
+    def test_agenda_uses_the_recorded_phase_start_instead_of_git_commit_time(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "first phase\n")
         _ = self.git("merge", "--no-ff", "-m",
                      f"Merge {ALPHA} phase 1 ({unit_tip[:7]}) into production", "alpha-branch")
         merge_tip = self.git("rev-parse", "HEAD")
         old = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(hours=9)
+        self.record_phase_start(old)
         self.write(self.log, "\n".join((
             "# Production log — example",
             self.producer_merge_line(old, unit_tip, merge_tip),
@@ -902,6 +941,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         now = datetime.now(zone)
         launched = now - timedelta(hours=12)
         phase_started = now - timedelta(hours=1)
+        self.record_phase_start(phase_started)
         unit_tip = self.commit(self.alpha, "alpha.txt", "first phase\n")
         _ = self.git("merge", "--no-ff", "-m",
                      f"Merge {ALPHA} phase 1 ({unit_tip[:7]}) into production", "alpha-branch")
@@ -981,6 +1021,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         now = datetime.now(ZoneInfo("America/Los_Angeles")).replace(second=0, microsecond=0)
         moments = [now - timedelta(hours=hours) for hours in (50, 40, 26, 14, 2)]
         start = moments[0]
+        self.record_phase_start(start)
         lines = [
             "# Production log — example",
             self.producer_launch_line(start),
@@ -1009,12 +1050,14 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertFalse(self.sends.exists())
         self.assertEqual(list(self.state.glob("*quota*")), [])
 
-    def test_agenda_reports_missing_merge_branch_without_traceback(self) -> None:
+    def test_agenda_uses_unit_records_without_the_merge_branch(self) -> None:
+        start = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(hours=9)
+        self.agenda_log(start, PHASE)
         self.write(self.doc, self.doc.read_text(encoding="utf-8").replace(
             "- **Merge branch:** `production`", "- **Merge branch:** `missing-merge-branch`"))
         result = self.run_waiting("agenda", "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("agenda: failed —", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_showrunner_and_dailies_use_one_state_directory_for_waiting_records(self) -> None:

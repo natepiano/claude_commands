@@ -47,7 +47,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.write(exclude, (exclude.read_text() if exclude.exists() else "") + ".unit.toml\n")
         runner = recorded_showrunner("fixture-showrunner", doc)
         self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
-        unit = fixture_unit_location(runner, "fixture-unit", self.unit)
+        unit = fixture_unit_location(runner, "fixture", self.unit)
         return unit.id
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
@@ -88,11 +88,11 @@ class MergeGateCheckpointTests(MergeGateFixture):
         with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
             result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(observed, ["fixture-unit"])
+        self.assertEqual(observed, ["fixture"])
 
     def test_checkpoint_restores_the_unit_after_success_and_failure(self) -> None:
         checkpoint = merge_gate.merge_checkpoint
-        for previous in (None, "previous-unit"):
+        for previous in (None, "previous"):
             for outcome in ("pass", "red", "exception"):
                 with self.subTest(previous=previous, outcome=outcome):
                     if previous is None:
@@ -102,7 +102,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     restored: list[str | None] = []
 
                     def suites(_repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
-                        self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture-unit")
+                        self.assertEqual(os.environ.get(memory_admit.BUILDLOG_UNIT), "fixture")
                         if outcome == "exception":
                             raise GateRefused("injected suite failure")
                         return merge_gate.GateRun((), 0, 0, memory_within_cap=outcome != "red", tests_reused=True)
@@ -269,7 +269,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
     def test_a_local_production_doc_commit_goes_out_with_the_merge(self) -> None:
         # retire_unit, add_unit and promote_showrunner leave their doc commit to the next merge push.
         self.write(self.checkout / "local.txt", "retired\n")
-        local = self.commit(self.checkout, "production(fixture): retire alpha-unit")
+        local = self.commit(self.checkout, "production(fixture): retire alpha")
         result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"Local doc commit goes out with this merge: {local[:12]}", result.stdout)
@@ -280,7 +280,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_red_gate_keeps_the_local_production_doc_commit(self) -> None:
         self.write(self.checkout / "local.txt", "retired\n")
-        local = self.commit(self.checkout, "production(fixture): retire alpha-unit")
+        local = self.commit(self.checkout, "production(fixture): retire alpha")
         self.write(self.state / "modify-tracked", "modify")
         result = self.run_gate()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -435,7 +435,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
                          [head, self.base, self.checkpoint])
         message = self.git(self.checkout, "log", "-1", "--format=%B")
-        self.assertIn(f"Merge fixture-unit phase-2 ({self.checkpoint}) into integration", message)
+        self.assertIn(f"Merge fixture phase-2 ({self.checkpoint}) into integration", message)
         self.assertIn("Fixture checkpoint gate.", message)
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertCountEqual([(row["suite"], row["module"]) for row in starts],
@@ -495,7 +495,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         arguments = ["--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
-                     "--previous-checkpoint", self.base, "--unit", "fixture-unit", "--phase", "phase-2",
+                     "--previous-checkpoint", self.base, "--unit", "fixture", "--phase", "phase-2",
                      "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
                      "--main-repo", str(self.main),
                      "--ssh", str(self.bin / "ssh"), "--production", "quiet"]

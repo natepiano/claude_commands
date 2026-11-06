@@ -1027,7 +1027,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         raise InputError(f"{where}.held: required; the reason the phase's checkpoint is not merged, or null when no checkpoint waits")
     unit = text(fields, "unit", where)
     name = optional_text(fields, "name", where) or unit
-    label = optional_text(fields, "label", where) or name.removesuffix("-unit")
+    label = optional_text(fields, "label", where) or name
     if len(label) > LABEL_LIMIT:
         raise InputError(f"{where}.label: {label!r} is longer than {LABEL_LIMIT}; give a short label")
     phase = text(fields, "phase", where)

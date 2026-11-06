@@ -59,13 +59,13 @@ class NoticeRetryTests(unittest.TestCase):
             showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
         output = io.StringIO()
         with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
-              mock.patch.object(codex_winddown, "current_counts", return_value={"healthy-unit": 1}),
-              mock.patch.object(codex_winddown, "live_unit_names", return_value=["healthy-unit"]) as units,
+              mock.patch.object(codex_winddown, "current_counts", return_value={"healthy": 1}),
+              mock.patch.object(codex_winddown, "live_unit_names", return_value=["healthy"]) as units,
               mock.patch.object(codex_winddown, "read_projections", return_value={}),
               redirect_stdout(output)):
             self.assertEqual(codex_winddown.main(["status"]), 1)
         units.assert_called_once_with(runner)
-        self.assertIn("healthy-unit", output.getvalue())
+        self.assertIn("healthy", output.getvalue())
 
     def test_quiet_claim_is_retried_after_a_stop_before_delivery(self) -> None:
         class Killed(BaseException):
@@ -581,10 +581,10 @@ class MessageTests(unittest.TestCase):
             fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other),
         )
         runner = fixture_member("showrunner", name="show", runtime_id=fixture_runtime_id("showrunner::show"))
-        _ = unit_membership("show", "trunk-unit")
+        _ = unit_membership("show", "trunk")
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
         fake_unit_host.write({**os.environ, **self.environment}, [
-            labeled_host("trunk", "w1:p1", "trunk-unit", production_name="show")])
+            labeled_host("trunk", "w1:p1", "trunk", production_name="show")])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
         self.set_processes()
 

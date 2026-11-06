@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
 from scripts.production.production_doc import Production, Refusal, read_production
-from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history, merge_lock
+from merge_checkpoint import git, merged_checkpoints, merge_lock
 
 
 class CiDue(NamedTuple):
@@ -106,12 +106,10 @@ def ci_record(state_dir: Path) -> CiRecord | NoCiRecord:
 def due(production: Production, state_dir: Path, no_ci: bool) -> CiDue | CiNotDue | CiNotUsed:
     if no_ci:
         return CiNotUsed()
-    count = merge_branch_history(production.checkout, production.merge_branch).code_merge_count()
+    count = len(merged_checkpoints(production))
     record = ci_record(state_dir)
     since = count - (record.merges_collected if isinstance(record, CiRecord) else 0)
-    if since < 0:
-        raise PointFailure("due", "merge history predates the last collected CI point")
-    return CiDue() if since >= 5 else CiNotDue(since)
+    return CiDue() if since >= 5 or since < 0 else CiNotDue(since)
 
 
 def write_json(path: Path, fields: dict[str, object]) -> None:
@@ -150,10 +148,8 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
     tip = branch_tip(production)
     push_origin = required(git(production.checkout, "remote", "get-url", "--push", "origin"), "ci start")
-    history = merge_branch_history(production.checkout, tip)
-    last_code = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and isinstance(entry.kind, CodeCheckpoint)), None)
-    checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
-                  else "production wrap")
+    checkpoints = merged_checkpoints(production)
+    checkpoint = (f"{checkpoints[-1].unit} phase {checkpoints[-1].phase}" if checkpoints else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
     with copies.standing(production.name, production.checkout, tip) as checkout:
         source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
@@ -228,7 +224,7 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
         return
     run = read_run(state_dir)
     tip = branch_tip(production)
-    count = merge_branch_history(production.checkout, tip).code_merge_count()
+    count = len(merged_checkpoints(production))
     _ = command("ci collect", "gh", "run", "watch", run.run_id, "--repo", run.repo,
                 "--exit-status", cwd=production.checkout)
     view = run_view(run, production.checkout)

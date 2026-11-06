@@ -62,7 +62,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertTrue((self.worktree / ".git").is_file())
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
-        row = unit_membership("alpha", "alpha-unit")
+        row = unit_membership("alpha", "alpha")
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.worktree))
         self.assertIsInstance(resume_unit.find_unit("alpha", "alpha"), resume_unit.NoRecoveryRequired)
 
@@ -77,12 +77,12 @@ class ResumeUnitTests(unittest.TestCase):
     launch_code: int = 0
 
     def test_resume_command_uses_the_row_name_and_current_native_session(self) -> None:
-        row = unit_membership("alpha", "alpha-unit")
+        row = unit_membership("alpha", "alpha")
         self.assertNotEqual(row.id, row.current_session)
         unit = resume_unit.find_unit("alpha", "alpha")
         assert isinstance(unit, resume_unit.RetiredUnitRecovery)
         self.assertEqual(unit.branch, row.name)
-        command = resume_unit.launch_command(replace(unit, name="stale-table-unit"))
+        command = resume_unit.launch_command(replace(unit, name="stale-table"))
         self.assertEqual(command[command.index("--production") + 2], row.name)
         self.assertEqual(command[command.index("--resume") + 1], row.current_session)
         self.assertNotIn("STAFF_ID", " ".join(command))
@@ -90,7 +90,7 @@ class ResumeUnitTests(unittest.TestCase):
     def test_recovery_refuses_an_empty_session_id(self) -> None:
         unit = resume_unit.find_unit("alpha", "alpha")
         assert isinstance(unit, resume_unit.RetiredUnitRecovery)
-        with self.assertRaisesRegex(resume_unit.Refused, "^alpha-unit: recovery requires a session id$"):
+        with self.assertRaisesRegex(resume_unit.Refused, "^alpha: recovery requires a session id$"):
             _ = replace(unit, session_id=" ")
 
     def test_recovery_requires_each_retirement_fact(self) -> None:
@@ -104,7 +104,7 @@ class ResumeUnitTests(unittest.TestCase):
 
     def test_neither_config_refuses_with_the_backfill_instruction_before_any_change(self) -> None:
         _ = self.staff.record_production("alpha", self.doc)
-        row = unit_membership("alpha", "alpha-unit")
+        row = unit_membership("alpha", "alpha")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         unit_config.discard_parked(row.id)
@@ -113,7 +113,7 @@ class ResumeUnitTests(unittest.TestCase):
             with self.subTest(flags=flags):
                 code, output = self.resume(*flags)
                 self.assertEqual(code, 1, output)
-                self.assertEqual(output, f"alpha-unit: no .unit.toml in {self.worktree} or "
+                self.assertEqual(output, f"alpha: no .unit.toml in {self.worktree} or "
                                  + f"~/.local/state/staff/units/{row.id}.toml; ask the showrunner\n")
                 self.assertFalse(self.worktree.exists())
                 self.assertEqual(unit_config.place(row.id, self.worktree), unit_config.Nowhere())
@@ -163,7 +163,7 @@ class ResumeUnitTests(unittest.TestCase):
             owner = staff.by_current_session(DIRECTOR)
             entries = [entry for entry in pane_record.launches()
                        if owner is not None and entry["session_id"] == owner.id]
-            return (unit_lookup.LabeledSession("alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
+            return (unit_lookup.LabeledSession("alpha", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
                                           HerdrPlace("agents", entries[-1]["pane_id"]))
                     if entries else None)
 
@@ -176,7 +176,7 @@ class ResumeUnitTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
                                        "HERDR_PANE_RECORD_DIR": str(self.root / "pane-launches")})))
         _ = self.staff.record_production("alpha", self.doc)
-        row = unit_membership("alpha", "alpha-unit")
+        row = unit_membership("alpha", "alpha")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         self.retained_config()
@@ -216,11 +216,11 @@ class ResumeUnitTests(unittest.TestCase):
                                           "--cwd", str(self.worktree), "--plan", "docs/plans/alpha.md"])
         self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha")
         self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "main"))
-        self.assertIn("alpha-unit resumed", output)
+        self.assertIn("alpha resumed", output)
 
     def test_resume_unit_rerun(self) -> None:
         _ = self.staff.record_production("alpha", self.doc)
-        row = unit_membership("alpha", "alpha-unit")
+        row = unit_membership("alpha", "alpha")
         row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
             unit_config.AppPort(1), ("scripts",),
@@ -273,7 +273,7 @@ class ResumeUnitTests(unittest.TestCase):
                 production = read_production(argv[argv.index("--production") + 1])
                 row = add_unit.ensure_staff_unit(production, argv[4])
                 launched_ids.append(row.id)
-                retirement.marked = unit_lookup.LabeledSession("alpha-unit",
+                retirement.marked = unit_lookup.LabeledSession("alpha",
                     unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
                 pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(retirement.worktree),
                     {}, ["claude", "--resume", DIRECTOR]))
@@ -328,8 +328,8 @@ class ResumeUnitTests(unittest.TestCase):
         before = (self.staff.staff_file.read_bytes(), pane_record.record_path("agents").read_bytes(),
                   unit_config.parked_path(row.id).read_bytes())
         with self.subTest(evidence="fixed owner for the live current conversation"):
-            self.assertTrue(resume_unit.resumed_session_proven("alpha", "alpha-unit", DIRECTOR, row))
-        current = unit_lookup.LabeledSession("alpha-unit",
+            self.assertTrue(resume_unit.resumed_session_proven("alpha", "alpha", DIRECTOR, row))
+        current = unit_lookup.LabeledSession("alpha",
             unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
         other_session = fixture_runtime_id("unrelated-resume-conversation")
         for marked, expected_session in (
@@ -339,7 +339,7 @@ class ResumeUnitTests(unittest.TestCase):
         ):
             with self.subTest(marked=marked, expected_session=expected_session), mock.patch.object(
                     unit_lookup, "labeled_session", return_value=marked):
-                self.assertFalse(resume_unit.resumed_session_proven("alpha", "alpha-unit", expected_session, row))
+                self.assertFalse(resume_unit.resumed_session_proven("alpha", "alpha", expected_session, row))
         self.assertEqual((self.staff.staff_file.read_bytes(), pane_record.record_path("agents").read_bytes(),
                           unit_config.parked_path(row.id).read_bytes()), before)
 
@@ -357,11 +357,11 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
 
     def test_resume_child_joins_the_operation_until_the_parked_facts_are_discarded(self) -> None:
-        source = self.staff.production("alpha", "alpha-unit")
+        source = self.staff.production("alpha", "alpha")
         source.unlink()
         source.symlink_to(self.doc)
         _ = self.staff.record_production("alpha", source)
-        row = unit_membership("alpha", "alpha-unit")
+        row = unit_membership("alpha", "alpha")
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         wrapper = self.root / "resume-launch.py"
         # The inner launcher boundary supplies no live pane. Its public main and
@@ -485,7 +485,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = git(self.checkout, "branch", "alpha", "main")
         code, output = self.resume()
         self.assertEqual(code, 1, output)
-        self.assertIn(f"refused: alpha-unit: no account has the transcript of session {DIRECTOR}", output)
+        self.assertIn(f"refused: alpha: no account has the transcript of session {DIRECTOR}", output)
         self.assertIn("refused: branch alpha still exists; retire did not finish", output)
         self.assertEqual(self.calls, [])
         self.assertFalse(self.worktree.exists())
@@ -529,7 +529,7 @@ class ResumeUnitTests(unittest.TestCase):
         for pane, identity, at in (("w1:p1", "older", "2026-10-27T23:00:00+00:00"),
                                     ("w1:p2", DIRECTOR, "2026-10-28T23:00:00+00:00")):
             launch = pane_record.launch(pane, identity, str(self.worktree),
-                {('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
+                {('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
             launch["written_at"] = at
             pane_record.write("agents", launch)
         current_backend = unit_lookup.labeled_session
@@ -601,12 +601,12 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(self.doc.read_bytes(), before)
 
     def test_resume_uses_a_changed_staff_folder_without_rewriting_retirement_facts(self) -> None:
-        row = unit_membership("alpha", "alpha-unit")
+        row = unit_membership("alpha", "alpha")
         parked = unit_config.parked_path(row.id)
         before = parked.read_bytes(), parked.stat().st_mtime_ns
         destination = self.root / "changed-staff-folder"
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", destination), expected=row.worktree)
-        unit = resume_unit.find_unit("alpha", "alpha-unit")
+        unit = resume_unit.find_unit("alpha", "alpha")
         assert isinstance(unit, resume_unit.RetiredUnitRecovery)
         command = resume_unit.launch_command(unit)
         self.assertEqual(command[command.index("--cwd") + 1], str(destination))

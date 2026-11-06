@@ -66,7 +66,7 @@ def _pilot_units(arguments: list[str], repository: Path) -> AllStyleUnits | Pilo
     seen: set[str] = set()
     for argument in arguments:
         unit, separator, selected = argument.partition("=")
-        family = rules.style_family(f"{unit}-unit" if unit in FAMILIES else unit)
+        family = rules.style_family(unit)
         if isinstance(family, rules.NotStyleUnit):
             raise Refusal(f"unknown pilot unit {unit!r}")
         if family in seen:
@@ -241,7 +241,7 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
         family for family in FAMILIES
         if (style.repository.parent / f"{style.name}-{family}").exists()
     }
-    units = ", ".join(f"{style.name}-{family}-unit" for family in FAMILIES if family in launched or family in selected)
+    units = ", ".join(f"{style.name}-{family}" for family in FAMILIES if family in launched or family in selected)
     _set_fields(style, {"Pilot units": units})
     for family in FAMILIES:
         if family in launched:
@@ -266,11 +266,11 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
 
 def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, name: str) -> tuple[str, ...]:
     if isinstance(pilot, AllStyleUnits):
-        units = ", ".join(f"{name}-{family}-unit" for family in FAMILIES)
+        units = ", ".join(f"{name}-{family}" for family in FAMILIES)
         return (*steps[:4], steps[4] + f"; units {units}", *steps[5:])
-    units = "; ".join(f"{name}-{unit.family}-unit" for unit in pilot.units)
+    units = "; ".join(f"{name}-{unit.family}" for unit in pilot.units)
     scopes = "; ".join(
-        f"{name}-{unit.family}-unit: {', '.join(unit.packages) if unit.packages else 'all crates'}"
+        f"{name}-{unit.family}: {', '.join(unit.packages) if unit.packages else 'all crates'}"
         for unit in pilot.units
     )
     return (*steps[:3], steps[3] + f"; pilot units {units}",

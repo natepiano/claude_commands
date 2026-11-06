@@ -114,7 +114,7 @@ class ReviewLauncherFixture(LauncherFixture):
     def staff_parent(self) -> str:
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         with isolated_staff_file(self.root / "staff.json", {}):
-            member = unit_membership("fixture", "fixture-unit")
+            member = unit_membership("fixture", "fixture")
             return staff.ensure("unit", name=member.name, parent=member.parent,
                                 runtime_id=member.current_session,
                                 worktree=staff.PresentWorktree("natedev", self.working_dir)).current_session

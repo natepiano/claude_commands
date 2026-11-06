@@ -93,14 +93,14 @@ class TidyWrappedTests(unittest.TestCase):
                                           "cleanup@example.invalid", {"file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         owner = self.owner("done")
-        _ = fixture_member("unit", name="alpha-unit", parent=owner.id)
-        _ = fixture_member("unit", name="beta-unit", parent=owner.id,
+        _ = fixture_member("unit", name="alpha", parent=owner.id)
+        _ = fixture_member("unit", name="beta", parent=owner.id,
                            worktree=staff.RemovedWorktree("natedev", self.root / "beta"))
         state = self.state_files("done")
-        with copies.standing("alpha-unit", source, "HEAD") as unit_tree:
+        with copies.standing("alpha", source, "HEAD") as unit_tree:
             with copies.standing("done", source, "HEAD") as production_tree:
                 pass
-            with copies.standing("beta-unit", source, "HEAD") as retired_tree:
+            with copies.standing("beta", source, "HEAD") as retired_tree:
                 pass
             with copies.standing("live", source, "HEAD") as unrelated:
                 pass

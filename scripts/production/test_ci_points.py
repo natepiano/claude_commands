@@ -163,6 +163,7 @@ class CiPointsTests(unittest.TestCase):
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "DAILIES_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
+                    "UNIT_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
                     "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions")}
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
@@ -183,7 +184,9 @@ class CiPointsTests(unittest.TestCase):
         from scripts.production import staff
         self.env["STAFF_FILE"] = str(self.root / "staff.json")
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            _ = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
+            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
+            _ = fixture_member("unit", name="alpha", parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", self.checkout))
         _ = self.git("push", "-u", "origin", "production")
         self.ci_result(self.git("rev-parse", "HEAD"))
 
@@ -561,13 +564,20 @@ PY
         self.assertFalse((self.stub_state / "pushes").exists())
         self.assertFalse((self.state / "ci_run.json").exists())
 
-    def merge(self, number: int, *, shrink: bool = False, unit: str = "alpha-unit") -> str:
+    def merge(self, number: int, *, shrink: bool = False, unit: str = "alpha") -> str:
         branch = f"unit-{number}{'-shrink' if shrink else ''}"
         _ = self.git("switch", "-c", branch)
         self.write(self.checkout / f"{branch}.txt", branch + "\n")
         _ = self.git("add", f"{branch}.txt")
         _ = self.git("commit", "-m", f"work {branch}")
         unit_tip = self.git("rev-parse", "HEAD")
+        if not shrink:
+            path = self.root / "history/runs/unit.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as output:
+                _ = output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "working_dir": str(self.checkout), "checkpoint_commit": unit_tip,
+                    "phase_id": str(number), "timestamp_epoch": number}) + "\n")
         _ = self.git("switch", "production")
         subject = f"Merge {unit} phase {number}{' shrink' if shrink else ''} ({unit_tip[:7]}) into production"
         _ = self.git("merge", "--no-ff", "-m", subject, branch)
@@ -605,6 +615,21 @@ PY
         sixth = self.run_ci("due", "--state-dir", str(self.state))
         self.assert_step(sixth, "due", True)
         self.assertIn("CI point due", sixth.stdout)
+
+    def test_a_lower_checkpoint_count_starts_a_new_ci_interval(self) -> None:
+        _ = self.merge(1)
+        self.write(self.state / "ci_points.json", json.dumps({"count": 50, "tip": self.git("rev-parse", "HEAD")}))
+        result = self.run_ci("due", "--state-dir", str(self.state))
+        self.assert_step(result, "due", True)
+        self.assertIn("CI point due", result.stdout)
+        self.ci_result(self.git("rev-parse", "HEAD"))
+        _ = self.start_point()
+        self.assert_step(self.collect_point(), "ci collect", True)
+        record = cast(dict[str, object], json.loads((self.state / "ci_points.json").read_text()))
+        self.assertEqual(record["count"], 1)
+        after = self.run_ci("due", "--state-dir", str(self.state))
+        self.assert_step(after, "due", True)
+        self.assertIn("0 of 5 code merges", after.stdout)
 
     def test_no_ci_skips_due_start_and_collect_without_side_effects(self) -> None:
         for args, step in (("due", "due"), ("ci start", "ci start"), ("ci collect", "ci collect")):
@@ -808,7 +833,8 @@ PY
         _ = self.start_point()
         hook = self.stub_state / "merge-during-watch.py"
         self.write(hook, textwrap.dedent('''\
-            import subprocess
+            import json, os, subprocess
+            from pathlib import Path
 
             def git(*args: str) -> str:
                 result = subprocess.run(["git", *args], check=True, capture_output=True, text=True)
@@ -817,8 +843,12 @@ PY
             git("switch", "-c", "unit-6")
             git("commit", "--allow-empty", "-m", "work unit-6")
             unit_tip = git("rev-parse", "HEAD")
+            with (Path(os.environ["UNIT_HISTORY_DIR"]) / "runs/unit.jsonl").open("a") as output:
+                output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "working_dir": str(Path.cwd()), "checkpoint_commit": unit_tip,
+                    "phase_id": "6", "timestamp_epoch": 6}) + "\\n")
             git("switch", "production")
-            git("merge", "--no-ff", "-m", f"Merge alpha-unit phase 6 ({unit_tip[:7]}) into production", "unit-6")
+            git("merge", "--no-ff", "-m", f"Merge alpha phase 6 ({unit_tip[:7]}) into production", "unit-6")
             git("push", "origin", "production")
             '''))
         self.env["CI_POINTS_TEST_WATCH_HOOK"] = str(hook)
@@ -965,10 +995,10 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         for number in range(1, 5):
             _ = self.merge(number)
         for subject in (
-            "Merge alpha-unit hand-off (aaaaaaa) into production",
+            "Merge alpha hand-off (aaaaaaa) into production",
             "Merge style-child hand-off (bbbbbbb) into production",
-            "Merge alpha-unit phase 4 shrink (ccccccc) into production",
-            "chore(example): rename unit alpha-unit to renamed-unit",
+            "Merge alpha phase 4 shrink (ccccccc) into production",
+            "chore(example): rename unit alpha to renamed",
         ):
             _ = self.git("commit", "--allow-empty", "-m", subject)
         due = self.run_ci("due", "--state-dir", str(self.state))
@@ -980,12 +1010,31 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         record = cast(dict[str, object], json.loads((self.state / "ci_points.json").read_text()))
         self.assertEqual(record["count"], 4)
 
+    def test_ci_fix_label_uses_git_order_across_unit_records(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        _ = self.merge(1, unit="beta")
+        _ = self.merge(2)
+        other = self.root / "beta"
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "example")
+            _ = fixture_member("unit", name="beta", parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", other))
+        path = self.root / "history/runs/unit.jsonl"
+        events = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+        events[0]["working_dir"] = str(other)
+        self.write(path, "".join(json.dumps(event) + "\n" for event in events))
+        _ = self.start_point()
+        self.assertIn("ci(example): validation fixes after alpha phase 2",
+                      (self.stub_state / "validate-calls").read_text())
+
     def test_ci_fix_commit_label_uses_last_unit_phase_when_a_handoff_is_newest(self) -> None:
         _ = self.merge(2)
-        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (aaaaaaa) into production")
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha hand-off (aaaaaaa) into production")
         _ = self.start_point()
         command = (self.stub_state / "validate-calls").read_text()
-        self.assertIn("ci(example): validation fixes after alpha-unit phase 2", command)
+        self.assertIn("ci(example): validation fixes after alpha phase 2", command)
         self.assertNotIn("hand-off", command)
 
 

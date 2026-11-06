@@ -141,7 +141,7 @@ class UnitPhasesTests(unittest.TestCase):
 
     def test_table_has_one_row_per_unit_and_escapes_pipes(self) -> None:
         records: dict[str, object] = {"one-unit": {"current": None, "phases": phase_rows("todo")}}
-        self.assertEqual(unit_phases.table([unit("one-unit", live("a|b")), unit("two-unit", None)], records), "\n".join([
+        self.assertEqual(unit_phases.table([unit("one-unit", live("a|b")), unit("two", None)], records), "\n".join([
             "| Unit | Phase | Task |",
             "| --- | --- | --- |",
             "| a\\|b | not started | — |",
@@ -195,7 +195,7 @@ class UnitPhasesTests(unittest.TestCase):
         out = io.StringIO()
         with (patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "caller"}),
               patch.object(showrunners, "own_name", return_value="show") as found,
-              patch.object(live_units, "units_of", return_value=[unit("a-unit", live("a"))]),
+              patch.object(live_units, "units_of", return_value=[unit("a", live("a"))]),
               patch.object(phase_table, "show_production", return_value="{}"),
               contextlib.redirect_stdout(out)):
             self.assertEqual(unit_phases.main([]), 0)
@@ -218,8 +218,8 @@ class UnitPhasesTests(unittest.TestCase):
         owner = fixture_member("showrunner", name="show", doc=staff.LiveDoc("natedev", doc))
         _ = fixture_member("unit", name="names", parent=owner.id,
                            worktree=staff.PresentWorktree("natedev", self.root))
-        units = [unit("names-unit", live("names"))]
-        records: dict[str, object] = {"names-unit": {"plan": "/tmp/claude/names.md"}}
+        units = [unit("names", live("names"))]
+        records: dict[str, object] = {"names": {"plan": "/tmp/claude/names.md"}}
         output = io.StringIO()
         with (patch.object(live_units, "units_of", return_value=units),
               patch.object(phase_table, "show_production", return_value=json.dumps(records)),
@@ -229,7 +229,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(unit_phases, "table") as phases,
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
-        tickets.assert_called_once_with(units, records, doc=doc, ledger_paths={"names-unit": self.root / "ledger.sqlite"})
+        tickets.assert_called_once_with(units, records, doc=doc, ledger_paths={"names": self.root / "ledger.sqlite"})
         locate.assert_called_once_with(self.root)
         phases.assert_not_called()
         self.assertEqual(output.getvalue(), "ticket table\n")
@@ -240,7 +240,7 @@ class UnitPhasesTests(unittest.TestCase):
                 doc = self.root / "phase-production.md"
                 _ = doc.write_text("# Production\n" + kind, encoding="utf-8")
                 self.production_document(doc)
-                units = [unit("a-unit", live("a"))]
+                units = [unit("a", live("a"))]
                 output = io.StringIO()
                 with (patch.object(live_units, "units_of", return_value=units),
                       patch.object(phase_table, "show_production", return_value="{}"),
@@ -260,7 +260,7 @@ class UnitPhasesTests(unittest.TestCase):
             _ = fixture_member("unit", name=name, parent=owner.id,
                                worktree=staff.PresentWorktree("natedev", folder))
         decision = self.root / "decision.md"
-        _ = decision.write_text("---\nstatus: open\nunit: names-unit\nplan: approved\n---\n")
+        _ = decision.write_text("---\nstatus: open\nunit: names\nplan: approved\n---\n")
         names = next(row for row in staff.initial_snapshot().find(kind="unit", parent=owner.id) if row.name == "names")
         database = style_ledger.ledger_location(self.root).database
         database.parent.mkdir(parents=True)
@@ -277,11 +277,11 @@ class UnitPhasesTests(unittest.TestCase):
                 + "'global:rust/read.md','alpha','[]','[]','[]','[\"one\"]','assigned','2026-10-01')", (str(names.id),))
             _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','12','')", (str(decision),))
         output = io.StringIO()
-        with (patch.object(live_units, "units_of", return_value=[unit("names-unit", live("names")),
-                                                                        unit("types-unit", live("types"))]),
+        with (patch.object(live_units, "units_of", return_value=[unit("names", live("names")),
+                                                                        unit("types", live("types"))]),
               patch.object(phase_table, "show_production", return_value=json.dumps({
-                  "names-unit": {"unavailable": "plan cannot be read"},
-                  "types-unit": {"unavailable": "worktree cannot be read"}})),
+                  "names": {"unavailable": "plan cannot be read"},
+                  "types": {"unavailable": "worktree cannot be read"}})),
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         self.assertIn("| names | #12 · read · alpha · 1 finding | starting 1 finding | — | 0 | 0 | 1 |", output.getvalue())
@@ -308,8 +308,8 @@ from scripts.production.staff_test_support import StaffTestCase
 class BranchLedgerLocationTests(StaffTestCase):
     def test_style_ledger_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        paths = unit_phases.style_ledger_paths(fixture.doc, [live_units.LiveUnit("member-unit", None)])
-        self.assertEqual(paths, {"member-unit": style_ledger.ledger_location(fixture.worktree).database})
+        paths = unit_phases.style_ledger_paths(fixture.doc, [live_units.LiveUnit("member", None)])
+        self.assertEqual(paths, {"member": style_ledger.ledger_location(fixture.worktree).database})
 
 
 if __name__ == "__main__":

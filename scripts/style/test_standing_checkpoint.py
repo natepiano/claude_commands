@@ -99,7 +99,7 @@ class StandingCheckpointTests(unittest.TestCase):
         self.write(self.doc, self.production("style/main", self.style) + "\n- **Kind:** style\n- **Branch point:** main\n")
         _ = recorded_showrunner("sample", parent)
         owner = recorded_showrunner("sample-style", self.doc, parent="sample")
-        _ = fixture_unit_location(owner, "names-unit", self.unit)
+        _ = fixture_unit_location(owner, "names", self.unit)
         self.plan = self.unit / "docs/style-production/units/names-unit.md"
         _ = unit_config.write(self.unit, unit_config.UnitConfig(
             unit_config.PlanFile(self.plan.relative_to(self.unit)), unit_config.NoAppPort(), ()))
@@ -145,10 +145,10 @@ class StandingCheckpointTests(unittest.TestCase):
         ])
 
     def refill(self) -> subprocess.CompletedProcess[str]:
-        return self.cli("style_plan.py", "next-phase", "--unit", "names-unit", "--plan", str(self.plan), "--repo", str(self.unit))
+        return self.cli("style_plan.py", "next-phase", "--unit", "names", "--plan", str(self.plan), "--repo", str(self.unit))
 
     def open_ticket(self) -> style_ledger.TicketRecord:
-        result = self.cli("style_ledger.py", "ticket", "open", "--repo", str(self.unit), "--unit", "names-unit")
+        result = self.cli("style_ledger.py", "ticket", "open", "--repo", str(self.unit), "--unit", "names")
         self.assertEqual(result.returncode, 0, result.stderr)
         return cast(style_ledger.TicketRecord, json.loads(result.stdout))
 
@@ -179,7 +179,7 @@ class StandingCheckpointTests(unittest.TestCase):
                 finding = ledger.hold(self.rule, path, 2, "1", "type", "1", "2", rule_blob, "outside")
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: {unit_staff_id("names-unit")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
+                             + f'unit: {unit_staff_id("names")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
                              + f'style_rule_blob: {rule_blob}\nstyle_count: 1\n---\n')
         _ = self.doc.write_text(self.doc.read_text() + f"- **Proposals:** {issue.parent}\n")
         result = self.refill()

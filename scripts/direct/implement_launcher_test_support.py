@@ -148,7 +148,7 @@ class ImplementLauncherFixture(LauncherFixture):
     def staff_parent(self) -> str:
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         with isolated_staff_file(self.root / "staff.json", {}):
-            parent = unit_membership("fixture", "fixture-unit")
+            parent = unit_membership("fixture", "fixture")
             from scripts.production import staff
             parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.working_dir), expected=parent.worktree)
         return parent.id

@@ -59,9 +59,9 @@ class RegistrationTests(RegistrationFixture):
         owner = self.root / "question-owner-checkout"
         unit = self.root / "question-unit-checkout"
         _ = self.git("worktree", "add", "-b", "question-owner", str(owner))
-        _ = self.git("worktree", "add", "-b", "question-unit", str(unit))
+        _ = self.git("worktree", "add", "-b", "question", str(unit))
         owner_id = self.fixture_staff_id()
-        asker_id = self.fixture_staff_id("alpha-unit")
+        asker_id = self.fixture_staff_id("alpha")
         _ = staff.set_doc(owner_id, staff.LiveDoc("natedev", owner / relative))
         self.checkout = unit
         self.doc = unit / relative
@@ -92,7 +92,7 @@ class RegistrationTests(RegistrationFixture):
 
     def test_ask_uses_the_staff_name_when_checkouts_share_a_document_path(self) -> None:
         document, first, second = self.ambiguous_question_document()
-        asker_id = self.fixture_staff_id("alpha-unit")
+        asker_id = self.fixture_staff_id("alpha")
         staff_file = self.state / "staff/staff.json"
         before = staff_file.read_bytes()
         self.checkout = document.parents[2]
@@ -130,7 +130,7 @@ class RegistrationTests(RegistrationFixture):
         main = self.checkout
         relative = self.doc.relative_to(main)
         owner_id = self.fixture_staff_id()
-        asker_id = self.fixture_staff_id("alpha-unit")
+        asker_id = self.fixture_staff_id("alpha")
         owner = self.root / "owner-checkout"
         unit = self.root / "unit-checkout"
         _ = self.git("worktree", "add", "-b", "owner-copy", str(owner))
@@ -215,11 +215,11 @@ class RegistrationTests(RegistrationFixture):
             with self.subTest(action=action):
                 self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Reminder"},
                                     {"since": "2026-10-06T08:00", "text": "unit question?", "question": "Keep the layout?",
-                                     "asked_by": "alpha-unit"})
+                                     "asked_by": "alpha"})
                 path = self.outstanding()
                 history = path.with_suffix(".history.jsonl")
                 before = path.read_bytes()
-                command = (("ask", "--text", "new question?", "--question", "Try the new layout?", "--unit", "alpha-unit")
+                command = (("ask", "--text", "new question?", "--question", "Try the new layout?", "--unit", "alpha")
                            if action == "ask" else ("mark-important", "--item", "Reminder")
                            if action == "mark-important" else
                            ("questions", "--state", str(self.question_state(["Reminder", "New reminder"]))))
@@ -247,7 +247,7 @@ class RegistrationTests(RegistrationFixture):
                 saved = self.open_rows()
                 unit_question = next(item for item in saved if item["text"] == "unit question?")
                 self.assertEqual((unit_question["question"], unit_question["asked_by"]),
-                                 ("Keep the layout?", self.fixture_staff_id("alpha-unit")))
+                                 ("Keep the layout?", self.fixture_staff_id("alpha")))
                 if action == "ask":
                     self.assertEqual(sum(item["text"] == "new question?" for item in saved), 1)
                     entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
@@ -274,9 +274,9 @@ class RegistrationTests(RegistrationFixture):
 
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Retry it?")):
             with mock.patch.object(os, "replace", side_effect=stop), self.assertRaises(KeyboardInterrupt):
-                _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
+                _ = self.run_ask("retry?", "Retry it?", "alpha")
             self.assertEqual((path.read_bytes(), history.read_bytes()), before)
-            _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
+            _ = self.run_ask("retry?", "Retry it?", "alpha")
         self.assertEqual([item.text for item in self.read_items(path)], ["Reminder", "retry?"])
         entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual([item["text"] for item in entries], ["Earlier registration", "retry?"])

@@ -27,7 +27,7 @@ import display_cells
 from scripts.agents import worker_lifecycle
 from scripts.direct import phase_table, plan_history
 from scripts.lib import unit_runs
-from scripts.production import session_staff, showrunners, staff, unit_run, unit_config, unit_names
+from scripts.production import session_staff, showrunners, staff, unit_run, unit_config
 from scripts.shutdown import remote
 
 
@@ -325,7 +325,6 @@ def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str,
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"
     current = record.current
-    ledger_unit = unit_names.unit_id(unit_name)
     standing = is_standing_plan(record.plan)
     tickets = unit_ticket_progress(worktree, unit_id, sources) if standing else UnitTicketProgress()
     ticket = tickets.open_ticket
@@ -337,14 +336,14 @@ def unit(unit_name: str, unit_id: staff.StaffId, worktree: Path, plan_text: str,
     if isinstance(current, phase_table.OpenPhase):
         if standing:
             if isinstance(ticket, NoTicketInProgress):
-                title_id = re.match(rf"{re.escape(ledger_unit)}-\d+(?=\s|$)", current.title)
+                title_id = re.match(rf"{re.escape(unit_name)}-\d+(?=\s|$)", current.title)
                 ticket = TicketInProgress(title_id[0] if title_id else current.phase)
             title = re.sub(rf"^{re.escape(ticket.id)}(?:\s+—(?:\s+|$)|\s+|$)", "", current.title, count=1)
             current_phase = {"kind": "ticket", "id": ticket.id, "title": title, "merged": tickets.merged}
         else:
             current_phase = {"kind": "plan", "id": current.phase, "of": len(record.phases), "title": current.title}
     summary = next((text(event.get("activity")) for event in reversed(events) if event.get("event_type") == "progress_reported"), "")
-    return {"key": unit_name.removesuffix("-unit"), "plan": plan_text if plan.is_file() else "", "state": state,
+    return {"key": unit_name, "plan": plan_text if plan.is_file() else "", "state": state,
             "phase": current_phase,
             "phases": [clock.phase(row) for row in record.phases], "finish": clock.finish(record.plan_finish),
             "stage": stage(events, state, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,

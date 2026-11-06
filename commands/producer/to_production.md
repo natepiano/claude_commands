@@ -84,7 +84,7 @@ and merged units.
 3. **Links between units.** In every unit plan, including the kept source:
    - a fact in **Constraints from prior phases** that comes from a phase now in
      another unit names that unit and phase, for example "from
-     geometry-material-unit phase 2, on `<merge branch>` before this phase
+     geometry-material phase 2, on `<merge branch>` before this phase
      starts";
    - record a start-order wait as an owed action in the showrunner's notes;
    - use `cargo-berth sequence` for merge order;

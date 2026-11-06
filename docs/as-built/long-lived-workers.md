@@ -36,7 +36,7 @@ reviewer can take the work.
 
 One renderer makes every worker's thread title and message prefix:
 `workers.shown_name`. A unit run gives `<production> · <unit> · <job>[ <n>]`,
-with the unit's `-unit` suffix removed. The job label comes from
+with the unit's staff name. The job label comes from
 `config/names.toml`: `implementer`, `tester`, `repair_worker` or
 `code_reviewer` for the `impl`, `test`, `fix` and `review` roles, and `worker`
 for any other role. The second holder of a role gets the number 2, and so on.

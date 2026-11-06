@@ -46,9 +46,9 @@ LEDGER = """# Plan backlog
 
 - 2026-10-09 Open idea (a.md) — proposed
 - 2026-10-09 Waiting idea (b.md) — accepted 2026-10-12, build after the reviewers
-- 2026-10-09 Handed out (c.md) — accepted 2026-10-12, assigned enh-showrunner-unit
+- 2026-10-09 Handed out (c.md) — accepted 2026-10-12, assigned enh-showrunner
 - 2026-10-09 Done (d.md) — accepted 2026-10-09, applied (nixos b5c7d91)
-- 2026-10-09 Shipped (e.md) — accepted 2026-10-10, built by message-unit
+- 2026-10-09 Shipped (e.md) — accepted 2026-10-10, built by message
 - 2026-10-11 Not taken (f.md) — declined for the production 2026-10-12
 - 2026-10-11 Later (g.md) — deferred
 """
@@ -249,12 +249,12 @@ class FooterCountsTests(unittest.TestCase):
     def test_backlog_and_issue_count_matches_each_productions_own_next_proposals(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
-        top = production_doc(self.root, "top", folder, "top-unit")
-        child = production_doc(self.root, "child", folder, "child-unit")
+        top = production_doc(self.root, "top", folder, "top")
+        child = production_doc(self.root, "child", folder, "child")
         self.tree = {"top": top, "child": child}
         self.below = {"top": ["child"]}
-        issue(folder, "own issue", "open", "proposal", unit_membership("top", "top-unit").id)
-        issue(folder, "child issue", "open", "proposal", unit_membership("child", "child-unit").id)
+        issue(folder, "own issue", "open", "proposal", unit_membership("top", "top").id)
+        issue(folder, "child issue", "open", "proposal", unit_membership("child", "child").id)
         for doc, titles in ((top, ["Own plan"]), (child, ["Child plan", "Second child plan"])):
             ledger = doc.with_suffix(".ledger.md")
             _ = ledger.write_text("".join(f"- 2026-10-28 {title} — proposed\n" for title in titles),
@@ -310,16 +310,16 @@ class FooterCountsTests(unittest.TestCase):
     def test_a_shared_folder_counts_only_the_productions_own_proposals(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
-        top = production_doc(self.root, "tool-based-ui", folder, "trunk-unit")
-        child = production_doc(self.root, "cargo-liner-style", folder, "types-unit")
-        other = production_doc(self.root, "build-followups", folder, "followups-unit")
-        trunk = unit_membership("tool-based-ui", "trunk-unit").id
-        types = unit_membership("cargo-liner-style", "types-unit").id
+        top = production_doc(self.root, "tool-based-ui", folder, "trunk")
+        child = production_doc(self.root, "cargo-liner-style", folder, "types")
+        other = production_doc(self.root, "build-followups", folder, "followups")
+        trunk = unit_membership("tool-based-ui", "trunk").id
+        types = unit_membership("cargo-liner-style", "types").id
         for name, proposer in (("own", trunk), ("by the production", recorded_showrunner("tool-based-ui", top).id),
                                ("by a child", recorded_showrunner("cargo-liner-style", child).id), ("by a unit below", types),
                                ("named with its production", types), ("quoted link", f"'[[{trunk}]]'"),
-                               ("other production", unit_membership("build-followups", "followups-unit").id),
-                               ("other unit in a known production", unit_membership("build-followups", "trunk-unit").id),
+                               ("other production", unit_membership("build-followups", "followups").id),
+                               ("other unit in a known production", unit_membership("build-followups", "trunk").id),
                                ("no proposer", "")):
             issue(folder, name, "open", "issue, proposal", proposer)
         issue(folder, "closed own", "closed", "issue, proposal", trunk)
@@ -466,7 +466,7 @@ class FooterCountsTests(unittest.TestCase):
     def test_the_proposal_count_leaves_out_approved_and_active_proposals(self) -> None:
         folder = self.root / "issues"
         folder.mkdir()
-        approval = f'unit: "{unit_membership("production", "names-unit").id}"'
+        approval = f'unit: "{unit_membership("production", "names").id}"'
         issue(folder, "waiting", "open", "issue, proposal", self.production, "stage: backlog")
         issue(folder, "approved at backlog", "open", "issue, proposal", self.production, "stage: backlog", approval)
         issue(folder, "approved at active", "open", "issue, proposal", self.production, "stage: active", approval)

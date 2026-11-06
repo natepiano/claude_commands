@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import showrunners, staff, unit_names
+from scripts.production import showrunners, staff
 import unit_lookup
 
 
@@ -37,7 +37,7 @@ def units_of(production_name: str) -> list[LiveUnit]:
 def units_in(production_name: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
     """Join the named production to the caller's session snapshot."""
     marked = every.status_units(production_name)
-    return [LiveUnit(unit if unit in marked else unit_names.unit_id(unit), marked.get(unit))
+    return [LiveUnit(unit, marked.get(unit))
             for unit in every.members.get(production_name, ())]
 
 

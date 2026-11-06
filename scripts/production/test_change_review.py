@@ -153,7 +153,7 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("config", "user.name", "Producer fixture")
         _ = self.git("config", "user.email", "producer@example.invalid")
         _ = self.git("commit", "--allow-empty", "-m", "Initial")
-        self.unit = self.branch_unit("new-unit", "unit", "old-branch", "old-plan.md")
+        self.unit = self.branch_unit("new", "unit", "old-branch", "old-plan.md")
         _ = self.doc.write_text(f"# Top\n- **Repository:** `{self.repo}`\n"
             + f"- **Showrunner checkout:** `{self.repo}`\n- **Change review:** `{self.listing}`\n")
 
@@ -186,7 +186,7 @@ class ProducerWriterTests(ProducerFixture):
         assert isinstance(parent, staff.ReportsTo)
         destination = fixture_member("showrunner", name="destination")
         _ = staff.rename(parent.id, "renamed-production")
-        _ = staff.rename(self.unit.id, "renamed-unit")
+        _ = staff.rename(self.unit.id, "renamed")
         _ = staff.move(self.unit.id, staff.ReportsTo(destination.id))
         snapshot = change_review.review_snapshot(self.listing)
         unit, production = snapshot.pending
@@ -197,14 +197,14 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual(router.owner(unit, self.listing).tab, "destination")
         self.assertEqual(router.owner(production, self.listing).tab, "renamed-production")
         self.assertIn("Production: destination", change_review.describe(unit))
-        self.assertIn("Producer: renamed-unit", change_review.describe(unit))
+        self.assertIn("Producer: renamed", change_review.describe(unit))
         self.assertEqual(self.listing.read_bytes(), before)
 
     def legacy_list(self, name: str) -> Path:
         path = self.root / name
         _ = path.write_text("## To review\n\n| # | Change | Production | Producer |\n| --- | --- | --- | --- |\n"
             + f"| C1 | Unit | top | {self.unit.id} |\n| C2 | Production | top | |\n"
-            + "| C3 | Unknown producer | top | lost-unit |\n| C4 | Unknown production | lost-production | |\n\n"
+            + "| C3 | Unknown producer | top | lost |\n| C4 | Unknown production | lost-production | |\n\n"
             + "## Reviewed\n\n| # | Change | Production | Verdict | Date |\n| --- | --- | --- | --- | --- |\n"
             + "| C5 | History | top | works | 2026-11-01 |\n", encoding="utf-8")
         return path
@@ -214,7 +214,7 @@ class ProducerWriterTests(ProducerFixture):
         before = path.read_bytes()
         messages = change_review.migrate_owners([path], write=False)
         self.assertEqual(path.read_bytes(), before)
-        self.assertTrue(any("C3" in line and "lost-unit" in line for line in messages))
+        self.assertTrue(any("C3" in line and "lost" in line for line in messages))
         self.assertTrue(any("C4" in line and "lost-production" in line for line in messages))
         with redirect_stdout(io.StringIO()):
             self.assertEqual(change_review.main(["migrate-owners", "--list", str(path), "--write"]), 0)
@@ -232,7 +232,7 @@ class ProducerWriterTests(ProducerFixture):
         interrupted = [self.legacy_list(f"retry-{index}.md") for index in range(2)]
         clean = [self.legacy_list(f"clean-{index}.md") for index in range(2)]
         original_write = atomic_file.write_text_atomic
-        new_session = staff.StaffId(fixture_runtime_id("cleared-unit"))
+        new_session = staff.StaffId(fixture_runtime_id("cleared"))
 
         def write(path: Path, text: str) -> None:
             if path == interrupted[1]:
@@ -254,14 +254,14 @@ class ProducerWriterTests(ProducerFixture):
         finished.assert_not_called()
 
     def colliding_units(self) -> staff.StaffRow:
-        _ = self.branch_unit("new-unit", "unit", "branch-a", "branch-b.md")
-        return self.branch_unit("second-unit", "second", "branch-b", "second.md")
+        _ = self.branch_unit("new", "unit", "branch-a", "branch-b.md")
+        return self.branch_unit("second", "second", "branch-b", "second.md")
 
     def test_an_exact_branch_wins_over_an_earlier_unit_alias(self) -> None:
         _ = self.colliding_units()
         source = change_review.unit_branches([self.doc])["branch-b"]
         self.assertEqual(source.worktree, self.root / "second")
-        self.assertEqual(source.name, "second-unit")
+        self.assertEqual(source.name, "second")
 
     def test_merge_publication_uses_the_exact_branch_producer_before_an_alias(self) -> None:
         second = self.colliding_units()
@@ -1401,7 +1401,7 @@ class ProductionMergeCommitsTest(unittest.TestCase):
 
     def test_linked_worktree_excludes_commits_reviewed_in_the_common_repository(self) -> None:
         checkout = self.repo.parent / "unit-checkout"
-        _ = self.git("worktree", "add", "-q", "-b", "linked-unit", str(checkout), "unit")
+        _ = self.git("worktree", "add", "-q", "-b", "linked", str(checkout), "unit")
         self.repo = checkout
         own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
         self.assertEqual([commit.sha for commit in self.commits()], [own])
@@ -1647,7 +1647,7 @@ class RepositoryTest(unittest.TestCase):
                             + "| C3 | no hash | 2026-10-15 | x |\n\n"
                             + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
         before = path.read_text(encoding="utf-8")
-        _ = recorded_unit("kid", "u-unit", self.repo / "u", kid, plan="docs/u-plan.md")
+        _ = recorded_unit("kid", "u", self.repo / "u", kid, plan="docs/u-plan.md")
         top_owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
         tree = change_review.Tree([top, kid])
         kid_owner = staff.snapshot().by_doc("natedev", kid)
@@ -1671,7 +1671,7 @@ class RepositoryTest(unittest.TestCase):
         style = folder / "top-style-production.md"
         _ = style.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** style/main\n- **Kind:** style\n"
                              + f"- **Parent production:** {top}\n", encoding="utf-8")
-        _ = recorded_unit("top-style", "u-unit", self.repo / "u", style, plan="docs/u-plan.md")
+        _ = recorded_unit("top-style", "u", self.repo / "u", style, plan="docs/u-plan.md")
         owner = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", top))
         child = staff.snapshot().by_doc("natedev", style)
         assert child is not None
@@ -1690,7 +1690,7 @@ class RepositoryTest(unittest.TestCase):
         _ = top.write_text("# Top\n", encoding="utf-8")
         commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE}", ()),
                    change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE}", ())]
-        _ = recorded_unit("kid", "u-unit", self.repo, kid, plan="docs/u-plan.md")
+        _ = recorded_unit("kid", "u", self.repo, kid, plan="docs/u-plan.md")
         _ = recorded_showrunner("top", top)
         _ = recorded_showrunner("kid", kid, parent="top")
         with mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}):

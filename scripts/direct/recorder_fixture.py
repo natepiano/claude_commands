@@ -34,7 +34,7 @@ def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
     import json
     with isolated_staff_file(root / "staff.json", environment):
         owner = fixture_member("showrunner", name="wait-owner")
-        parent = fixture_member("unit", name="wait-unit", parent=owner.id,
+        parent = fixture_member("unit", name="wait", parent=owner.id,
                                 runtime_id=fixture_runtime_id("fixture-director"),
                                 worktree=staff.PresentWorktree("natedev", root))
         roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}

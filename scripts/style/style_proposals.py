@@ -34,7 +34,7 @@ from approved_renames import (ApprovedRename, BindingRename, BindingScope, NoApp
 from add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
 from declarations import declaration_line
 from issues import Issue, frontmatter, open_issues, plain
-from scripts.production import session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production import session_staff, staff, unit_config, unit_lookup
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
                             UnansweredDecision, staff_reference, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import file_text, git, unit_file_holders
@@ -298,7 +298,7 @@ def family_units(doc: Path) -> dict[rules.Family, staff.StaffId]:
         raise style_ledger.LedgerError(str(error)) from error
     units: dict[rules.Family, staff.StaffId] = {}
     for row in rows:
-        unit = unit_names.unit_id(row.name)
+        unit = row.name
         family = rules.style_family(unit)
         if isinstance(family, rules.NotStyleUnit) or isinstance(row.worktree, staff.RemovedWorktree):
             continue

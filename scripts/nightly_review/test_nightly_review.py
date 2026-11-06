@@ -305,8 +305,8 @@ class TonightTests(NightlyReviewTests):
         self.assertEqual(len(calls), 1)
 
     def test_a_night_with_no_production_holding_the_unit_is_skipped(self) -> None:
-        lines, calls = self.tonight([], [], production="no running production has a permanent nightly-review-unit row")
-        self.assertEqual(lines, ["skipped: no running production has a permanent nightly-review-unit row"])
+        lines, calls = self.tonight([], [], production="no running production has a permanent nightly-review row")
+        self.assertEqual(lines, ["skipped: no running production has a permanent nightly-review row"])
         self.assertEqual(calls, [])
 
     def test_a_failed_send_is_reported(self) -> None:
@@ -447,7 +447,7 @@ class NightlyProductionTests(NightlyReviewTests):
             self.assertIn("no running production", cast(str, nightly_review.nightly_production()))
         twice = self.runners(("one", self.doc("one", "permanent")), ("two", self.doc("two", "permanent")))
         with mock.patch.object(showrunners, "registered_showrunners", return_value=twice):
-            self.assertEqual(nightly_review.nightly_production(), "2 productions hold nightly-review-unit: one-owner, two-owner")
+            self.assertEqual(nightly_review.nightly_production(), "2 productions hold nightly-review: one-owner, two-owner")
 
 
 if __name__ == "__main__":

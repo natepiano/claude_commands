@@ -211,7 +211,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_names_use_a_fresh_snapshot_under_the_row_lock(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
-        row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                              current_session=identity)
         for reference in (row.name, row.id, identity):
             self.launched.clear()
@@ -226,9 +226,9 @@ class StopResumeTests(unittest.TestCase):
 
     def test_unknown_ambiguous_and_remote_names_refuse(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
-        row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                              current_session=identity)
-        other = staff.StaffRow(staff.StaffId("other-unit"), "unit", "accounts", staff.StaffRoot(),
+        other = staff.StaffRow(staff.StaffId("other"), "unit", "accounts", staff.StaffRoot(),
                                current_session=staff.StaffId("other-session"))
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row, other))):
             for reference, text in (("absent", "unknown name"), ("accounts", "ambiguous name")):
@@ -236,8 +236,8 @@ class StopResumeTests(unittest.TestCase):
                 assert isinstance(result, stop_resume.ResumeFailed)
                 self.assertIn(text, result.reason)
                 if reference == "accounts":
-                    self.assertIn("accounts-unit", result.reason)
-                    self.assertIn("other-unit", result.reason)
+                    self.assertIn("accounts", result.reason)
+                    self.assertIn("other", result.reason)
                 else:
                     self.assertEqual(result.reason, "unknown name")
         remote_row = staff.StaffRow(row.id, row.kind, row.name, row.parent,
@@ -273,7 +273,7 @@ class StopResumeTests(unittest.TestCase):
 
         machine = remote.local_machine()
         rows = (
-            staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", staff.StaffRoot(),
+            staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                 current_session=staff.StaffId("accounts-session"),
                 worktree=staff.PresentWorktree(machine, self.root)),
             staff.StaffRow(staff.StaffId("team-accounts"), "showrunner", "team-accounts", staff.StaffRoot(),
@@ -324,7 +324,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_by_name_of_a_running_session_reports_success_without_a_launch(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
-        row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", staff.StaffRoot(),
+        row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                              current_session=identity)
         self.client.native_ids["w1:p2"] = identity
         self.live.return_value = sessions.LiveSessionProcess(123)
@@ -1583,8 +1583,8 @@ class StopResumeTests(unittest.TestCase):
         owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))))
         for probe in (False, True):
-            for outcome in ("watchdog: alpha-unit restarted on claude3",
-                            "watchdog: alpha-unit: folder no longer exists; restore dropped"):
+            for outcome in ("watchdog: alpha restarted on claude3",
+                            "watchdog: alpha: folder no longer exists; restore dropped"):
                 with self.subTest(probe=probe, outcome=outcome):
                     self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
                     pane_record.write("agents", self.entry)

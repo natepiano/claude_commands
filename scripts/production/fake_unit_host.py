@@ -253,7 +253,7 @@ class PaneShellFixture:
     """One session-qualified pane host for lifecycle operations."""
 
     def __init__(self, case: unittest.TestCase, worktree: Path, process_root: Path, *,
-                 live: bool, production_name: str = "demo", unit: str = "alpha-unit",
+                 live: bool, production_name: str = "demo", unit: str = "alpha",
                  env: dict[str, str] | None = None) -> None:
         import herdr
         import unit_lookup
@@ -270,7 +270,7 @@ class PaneShellFixture:
         self.shell: int = 991001
         self.director: int = 4242
         from scripts.production import staff
-        owner = staff.by_path(f"{production_name}/{unit.removesuffix('-unit')}")
+        owner = staff.by_path(f"{production_name}/{unit}")
         assert owner is not None
         self.native_id: str = owner.current_session
         self.stop_calls: list[str] = []

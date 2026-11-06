@@ -767,8 +767,8 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         with mock.patch.dict(os.environ, self.environment()), \
                 mock.patch.object(showrunners, "SEND", self.send_script):
             delivery = showrunners.send_to_address("session:unit-id", "transfer-key", "new production\nkeep running",
-                                                   recipient="alpha-unit", sender="transfer_unit")
-        self.assertEqual(delivery, showrunners.NoticeDelivery(("told alpha-unit",)))
+                                                   recipient="alpha", sender="transfer_unit")
+        self.assertEqual(delivery, showrunners.NoticeDelivery(("told alpha",)))
         sent = [json.loads(line) for line in self.sent.read_text().splitlines()]
         self.assertEqual(sent, [["--to", "session:unit-id", "--from", "transfer_unit", "--key", "transfer-key",
                                  "--text", "new production\nkeep running"]])

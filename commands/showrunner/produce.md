@@ -41,10 +41,8 @@ State:
 - `DAILIES_STATE_DIR` — `<STATE_DIR>/dailies_input_state`, the dailies builder's
   `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
   `--state-dir` for every `ci_points.py` and stateful `waiting.py` call.
-- `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
-  merge commit subjects on `MERGE_BRANCH`, never from memory. A
-  `chore(<showrunner name>): rename unit <old> to <new>` commit carries the merges under
-  `<old>` before it over to `<new>`.
+- `LAST_MERGED[unit]` — the shared Git ancestor of the unit branch and `MERGE_BRANCH`.
+  Unit records identify each phase checkpoint. Commit subjects supply no state.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
 - `UPDATES` — `showrunner-<staff id>`, where `<staff id>` is the showrunner row id.
 - `PROMPT_FILE` — `~/.local/state/showrunner/<staff id>/prompt.txt`.
@@ -388,9 +386,8 @@ screenshot and visual acceptance duties remain.
 <LoadProduction>
 Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 --production <showrunner name> --scratch <SCRATCH>`, adding `--resume` on resume. The command checks
-the checkout, copies any state that `<SCRATCH>` holds and `STATE_DIR` does not, reads the last `### STATE` block of `LOG`, rebuilds each unit's
-last code checkpoint from first-parent merge history, and checks its herdr
-session. Use its lines to restore state. <StartUpdates/> registers this session
+the checkout and copies state from `<SCRATCH>` when `STATE_DIR` lacks it. It reads the last `### STATE` block of `LOG`.
+It reads each unit's run records and asks git which checkpoints the merge branch holds. It checks each unit's herdr session. Use its lines to restore state. <StartUpdates/> registers this session
 again and retargets the instance. No boot restore unit is installed. `agents restart`
 restores selected sessions from recovery records on their own accounts. It starts or
 adopts herdr and opens a tab for each session. It does not run `pane_restore.py`
@@ -420,7 +417,7 @@ phases and plans; unit pause, move and end apply to them too.
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production <showrunner name> <name> --plan <unit plan>`.
-`<name>` is the unit's staff row name without `-unit`; the existing row is adopted.
+`<name>` is the unit's staff row name; the existing row is adopted.
 Use `--standby` for a unit waiting for an assignment. Tell the user one line
 per unit director: its session name and the place add_unit printed (its tab in `agents`).
 
@@ -572,8 +569,7 @@ Routing arrivals and ordering that queue are the showrunner's calls.
 <MergeCheckpoint>
 Input: the unit, phase, hash, shots, and `review trial:` line from its notice.
 File each `Held simplify:` item under <Throughout/> → Open questions before processing the checkpoint.
-Take the phase start time from the unit's previous merge time in `LOG`, or
-from its launch line in `LOG` for the first phase.
+Read the phase start time from the unit's `phase_started` record in `progress_history`.
 
 The showrunner first judges the following points. A held judgment returns the
 notice to the unit director before any merge command runs:

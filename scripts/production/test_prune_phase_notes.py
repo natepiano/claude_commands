@@ -40,7 +40,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
         write_text_atomic(self.root / "staff.json", '{"schema":2,"rows":[]}\n')
 
     def production(self, name: str) -> Path:
-        """A production with one live unit, alpha-unit, and its update timer."""
+        """A production with one live unit, alpha, and its update timer."""
         checkout = self.root / name
         alpha = self.root / f"{name}-alpha"
         alpha.mkdir(parents=True)
@@ -58,9 +58,9 @@ class PrunePhaseNotesTests(unittest.TestCase):
             "- **Log:** `production.log`", "",
         )), encoding="utf-8")
         self.timer(name, doc)
-        unit = unit_membership(name, "alpha-unit")
+        unit = unit_membership(name, "alpha")
         _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha), expected=unit.worktree)
-        retired = unit_membership(name, "beta-unit")
+        retired = unit_membership(name, "beta")
         _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / f"{name}-beta"),
                                expected=retired.worktree)
         return doc
@@ -85,25 +85,25 @@ class PrunePhaseNotesTests(unittest.TestCase):
 
     def test_a_retired_units_note_is_archived_and_a_live_ones_stays(self) -> None:
         _ = self.production("example")
-        live = self.planted("alpha-unit")
-        retired = self.planted("beta-unit")
+        live = self.planted("alpha")
+        retired = self.planted("beta")
         # Another production's note for the same unit name is that production's to prune.
         other = self.vault / "elsewhere" / "beta-unit.md"
         other.parent.mkdir(parents=True)
-        _ = other.write_text(note(unit_membership("other", "beta-unit")), encoding="utf-8")
+        _ = other.write_text(note(unit_membership("other", "beta")), encoding="utf-8")
 
         result = self.run_script()
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertTrue(live.exists())
         self.assertFalse(retired.exists())
-        self.assertTrue((self.root / "vault/archive/natedev/example/beta-unit.md").exists())
+        self.assertTrue((self.root / "vault/archive/natedev/example/beta.md").exists())
         self.assertTrue(other.exists())
 
     def test_a_production_that_fails_is_reported_and_the_next_is_still_pruned(self) -> None:
         self.timer("aaa-broken", self.root / "missing/aaa-broken-production.md")
         _ = self.production("example")
-        retired = self.planted("beta-unit")
+        retired = self.planted("beta")
 
         result = self.run_script()
 
@@ -125,7 +125,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
 
     def test_nothing_to_prune_prints_nothing(self) -> None:
         _ = self.production("example")
-        live = self.planted("alpha-unit")
+        live = self.planted("alpha")
         # Only update timers name productions: other notifier jobs are not read.
         (self.notifier / "stall-watch").mkdir()
 
