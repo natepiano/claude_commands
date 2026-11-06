@@ -2112,7 +2112,7 @@ def worker_transport(run: Path) -> Literal["mesh", "herdr"]
 - `WorkerLockHold.bind` acquires the fixed-id lock before creation serialization ends; startup and close accept the holder's lock without rejecting that holder.
 - Fieldless `CloseAllowed` permits closure; fieldless `Closed` proves completion. `Kept` prints its blocker, exits 7, and retains the row, pane, and conversation.
 - Default-team failures print `anomaly: <role>: <detail>` and continue; only the selected slot requires proved readiness. Input uses the observed pane and `check_target`.
-- `dispatch_role` still uses `_passes` and `_worker_pass` by name; `last_dispatch` and fixed `worker_id` registration remain unavailable. Staff rows contain no role.
+- `dispatch_role` still uses `_passes` and `worker_pass` by name; `last_dispatch` and fixed `worker_id` registration remain unavailable. Staff rows contain no role.
 - `restart.stop_row` still receives no deadline; `Pilot and default switch` requires deadline integration before herdr becomes the default.
 - `remove_workers.run_workers` limits removal to run membership; herdr-pinned members avoid mesh removal. Astra `_pane_binding` returns the binding, and recovery checks only the selected slot.
 - `worker_transport` retains `<run>/worker_transport` under `worker_transport.lock`; mesh branches remain available, and simplify retains its existing launch path.
@@ -2718,7 +2718,7 @@ No Python or new rerun test is required for this text phase.
 **Spec:**
 1. Cause of the blind list: `worker.list_workers` calls `worker_panes.observe` with no read of the run's pin. A mesh worker has no pane, so every row reads as uncertain or closed. When `unit_runs.parent_transport(caller.current_session, record=record)` is `mesh` and the caller holds a run, `list` reads that run through `board_json.workers(run, sources, record=record)`, the one path Hierarchies Phase 22 gave a mesh-pinned run. Copy no roster reading. Add the worker's full name to each `board_json.workers` mesh row, so that `list` prints name, role, state and activity. `--json` also carries `id` and `current_session` from the staff row of that name. A caller that holds no run keeps the pane read.
 2. `list`, `check` and `restore` read workers through one function in `worker.py` that honors the run pin. Fix the read once there. For a mesh-pinned run, `check` prints each row whose state is `incomplete` and exits 1 only when one exists, and `restore` opens no pane and prints `unchanged`. Add no refusal. Showrunner ruling, 2026-11-06.
-3. Cause of the `unavailable` roles: `dispatch_role` reads `progress_history_state.json`'s `pass` map, and `start-phase` clears that map, so a worker idle since an earlier phase loses its role. `review4` and `review5` last ran in phase 11 and the run is at phase 18. Switch `worker_panes.dispatch_role` to `progress_history.last_dispatch(row.id)`, preserve `WorkerRoleUnavailable`, and delete each by-name reader with no remaining caller. `_worker_pass` stays for the two readers of an open pass, `can_close` and `_start_locked`, which accounts Phase 11 renames.
+3. Cause of the `unavailable` roles: `dispatch_role` reads `progress_history_state.json`'s `pass` map, and `start-phase` clears that map, so a worker idle since an earlier phase loses its role. `review4` and `review5` last ran in phase 11 and the run is at phase 18. Switch `worker_panes.dispatch_role` to `progress_history.last_dispatch(row.id)`, preserve `WorkerRoleUnavailable`, and delete each by-name reader with no remaining caller. `worker_pass` stays for the two readers of an open pass, `can_close` and `_start_locked`, which accounts Phase 11 renames.
 4. Pass `deadline=<monotonic>` from `_start_locked` and `close` in `worker_panes.py` to `restart.stop_row`.
 5. An Astra review follows its caller's transport: `astra_review.run_review` writes `unit_runs.parent_transport(caller.current_session)` into the new run folder's `worker_transport` pin, because that folder is a separate run and otherwise pins the configured default. A mesh-pinned caller keeps a mesh review across the default switch.
 
@@ -2741,13 +2741,13 @@ No Python or new rerun test is required for this text phase.
 
 ### Phase 15 — Pilot and default switch  · status: todo
 
-**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14d
+**Depends on:** Phase 3, Phase 3n, Phase 4, Phase 6, Phase 7, Phase 8, Phase 9, Phase 9a, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 14a, Phase 14b, Phase 14e. The pilot does not wait on Phase 14d. The switch waits for Phase 14d item 5, because an Astra review from a mesh-pinned caller stays on the mesh (user and sdlc, 2026-11-06).
 
 #### Work Order
 
 **Goal:** herdr-unit's own next run works on panes, then the default becomes `herdr` and units switch at their run boundaries, Mac units after a Mac probe of Phases 6-7.
 
-**Spec:** Pilot one run; it includes a simplify review, a detached result delivery, a review Stage 2 and a launcher recovery. Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
+**Spec:** End the mesh run and pilot Phase 14d in a new pane run; it includes a detached result delivery, a review Stage 2 and a launcher recovery. It has no simplify review, because the user turned simplify off on 2026-11-06. Record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs natedev's edits 1(c) and 1(e) and the user's rebuild.
 
 **Files:**
 - `config/direct.conf` — `WORKER_TRANSPORT=herdr`.
