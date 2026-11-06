@@ -315,7 +315,7 @@ only I can bump
 
 **Change-Review:** none — no behavior changes.
 
-### Phase 10h — A memory wait names what holds it  · status: todo
+### Phase 10h — A memory wait names what holds it  · status: done
 
 **Depends on:** 10z and 10x (it rewrites the admission client and service).
 

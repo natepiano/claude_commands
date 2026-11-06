@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import (TYPE_CHECKING, BinaryIO, Literal, Protocol, TypedDict, cast)
 from itertools import chain
 
-from scripts.build_queue import progress_profile as progress, snapshot_codec as codec
+from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
 
@@ -617,6 +617,7 @@ class PassRow:
     reason: WaitReason
     blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested
     admission: ProposedAdmission | NotAdmitted
+    holder: records.WaitHolder = field(default_factory=records.NoHolder)
 
 
 @dataclass(frozen=True)
@@ -2016,6 +2017,42 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     return decisions
 
 
+def wait_holder_identity(session_id: str, session_name: str, unit: str) -> records.WaitHolder:
+    """Prefer the recorded session, then the recorded unit."""
+    if session_id:
+        return records.SessionHolder(session_id, session_name)
+    if unit:
+        return records.UnitHolder(unit)
+    return records.NoHolder()
+
+
+def admission_wait_holder(decision: AdmissionDecision, reason: WaitReason,
+                          inputs: QueueInputs, room: MemoryRoom | ReadingUnavailable) -> records.WaitHolder:
+    """Name the recorded order hold or the largest grouped charge."""
+    cause = reason.cause if isinstance(reason, HeadAdmissionStatus) else reason
+    if (decision.state != "hold" or not isinstance(room, MemoryRoom) or not isinstance(decision.pressure, NoPressureHold)
+            or decision.starts_at or not isinstance(cause, (BehindHead, NeedsMemory))):
+        return records.NoHolder()
+    if isinstance(decision.order_hold, HeldBehindHead):
+        waiter = decision.order_hold.waiter
+        return wait_holder_identity(waiter.get("session_id", ""), waiter.get("session_name", ""), waiter.get("unit", ""))
+    if not room.runs:
+        return records.NoHolder()
+    largest = max(room.runs, key=lambda held: (
+        held.bytes + (held.memory.use.bytes if isinstance(held.memory.use, AnonymousRunUse) else 0),
+        held.memory.owner))
+    identities: list[tuple[str, str, str]] = []
+    reservations = iter(inputs.reservations)
+    for step in inputs.running:
+        row = next(reservations) if running_has_reservation(step) else NoReservation()
+        if reservation_owner(row, step) == largest.memory.owner:
+            identities.append((step.session_id, step.session_name, step.unit))
+    if not identities:
+        return records.NoHolder()
+    session_id, session_name, unit = max(identities, key=lambda identity: (bool(identity[0]), bool(identity[2]), identity))
+    return wait_holder_identity(session_id, session_name, unit)
+
+
 def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> PassResult:
     next_start = start_spacing_after(now, policy)
     resolved = head_policy(inputs, now, policy, next_start)
@@ -2053,7 +2090,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
                 endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,)), policy), now, policy)
                                 for ended in range(len(inputs.running)))
             blocker = blocking_index(owner, endings)
-        rows.append(PassRow(owner, decision, reason, blocker, proposal))
+        rows.append(PassRow(owner, decision, reason, blocker, proposal,
+                            admission_wait_holder(decision, reason, inputs, resolved.room)))
     return PassResult(tuple(rows), resolved)
 
 def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[int]) -> int:

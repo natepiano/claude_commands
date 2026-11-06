@@ -36,7 +36,7 @@ from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 import conf
-from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun
+from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted
@@ -434,6 +434,137 @@ class MemoryRoomRulesTests(unittest.TestCase):
                 self.assertEqual(room.used, 4 * GIB)
                 self.assertEqual(room.kept, 8 * GIB)
                 self.assertEqual(room.room, 9 * GIB)
+
+
+class WaitHolderRulesTests(unittest.TestCase):
+    ZERO_ANONYMOUS_USE: records.AnonymousRunUse = records.AnonymousRunUse(0)
+    NO_LIVE_RUN: NoLiveBuildRun = NoLiveBuildRun()
+
+    def waiter(self, pid: int, *, session: str = "waiting", unit: str = "", need: int = 20 * GIB) -> records.Waiter:
+        return {"pid": pid, "start_time": str(pid), "need": need, "since": NOW_EPOCH,
+                "session_id": session, "session_name": session, "unit": unit,
+                "step": "check", "folder": "/tree"}
+
+    def inputs(self, *steps: records.RunningStep) -> records.QueueInputs:
+        reservations: list[records.Reservation] = []
+        for step in steps:
+            if not gate.running_has_reservation(step):
+                continue
+            assert isinstance(step.pid, int)
+            row = fixture_reservation(step.pid, step.promise, step=step.step, folder=step.folder)
+            row.update(session_id=step.session_id, session_name=step.session_name,
+                       unit=step.unit, build_run=step.run)
+            reservations.append(row)
+        return records.QueueInputs([(Path("waiting"), self.waiter(999))], tuple(steps), tuple(reservations),
+            records.HostMemory(4 * GIB, 64 * GIB), records.NoPressureHold(), records.ReadyToStart(),
+            records.NoHeadAdmissionOverride(), NOW_EPOCH)
+
+    def running(self, pid: int, need: int, *, session: str = "runner", unit: str = "",
+                use: records.AnonymousRunUse | records.RunUseUnavailable = ZERO_ANONYMOUS_USE,
+                run: LiveBuildRun | NoLiveBuildRun = NO_LIVE_RUN) -> records.RunningStep:
+        return records.RunningStep(session, session, "check", "/tree", need,
+            records.MeasuredMemory(0, anonymous=use), run=run, pid=pid, unit=unit)
+
+    def test_room_wait_names_the_largest_grouped_run_instead_of_the_largest_step(self) -> None:
+        run = LiveBuildRun(900, "900", NOW_EPOCH - 60)
+        inputs = self.inputs(self.running(1, 5 * GIB, session="group", run=run),
+                             self.running(2, 5 * GIB, session="group", run=run),
+                             self.running(3, 8 * GIB, session="single"))
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual(result.rows[0].holder, records.SessionHolder("group", "group"))
+        self.assertEqual(result.rows[0].decision.state, "hold")
+
+    def test_room_wait_uses_the_progress_charge_instead_of_the_full_reservation(self) -> None:
+        inputs = self.inputs(self.running(1, 20 * GIB, session="late"),
+                             self.running(2, 6 * GIB, session="larger"))
+        first = inputs.running[0]
+        reading = records.ProgressAdjustedMemory(0, anonymous=records.AnonymousRunUse(0),
+            counter=progress.ProgressCounter("build:1", 90, 100),
+            window=progress.WindowPeak(GIB, 20), remaining_need=GIB)
+        inputs = replace(inputs, running=(replace(first, measured=reading), inputs.running[1]))
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual(result.rows[0].holder, records.SessionHolder("larger", "larger"))
+
+    def test_unavailable_run_use_keeps_its_full_charge_when_selecting_the_holder(self) -> None:
+        inputs = self.inputs(self.running(1, 12 * GIB, session="unreadable",
+            use=records.RunUseUnavailable("anonymous reading missing")),
+            self.running(2, 8 * GIB, session="measured", use=records.AnonymousRunUse(7 * GIB)))
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual(result.rows[0].holder, records.SessionHolder("unreadable", "unreadable"))
+
+    def test_a_running_unit_without_a_session_is_the_holder(self) -> None:
+        inputs = self.inputs(self.running(1, 8 * GIB, session="", unit="compiler"))
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual(result.rows[0].holder, records.UnitHolder("compiler"))
+
+    def test_a_waiter_behind_the_protected_head_names_that_head(self) -> None:
+        inputs = self.inputs(self.running(1, 8 * GIB, session="unrelated"))
+        inputs = replace(inputs, ordered=[(Path("head"), self.waiter(100, session="head")),
+                                         (Path("tail"), self.waiter(200, session="tail"))])
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual(result.rows[1].holder, records.SessionHolder("head", "head"))
+        self.assertIsInstance(result.rows[1].decision.order_hold, records.HeldBehindHead)
+
+    def test_a_protected_head_without_a_session_names_its_unit(self) -> None:
+        inputs = self.inputs(self.running(1, 8 * GIB))
+        inputs = replace(inputs, ordered=[(Path("head"), self.waiter(100, session="", unit="head-unit")),
+                                         (Path("tail"), self.waiter(200))])
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual(result.rows[1].holder, records.UnitHolder("head-unit"))
+
+    def test_a_continuation_extra_protects_its_waiter_before_the_ordinary_head(self) -> None:
+        run = LiveBuildRun(900, "900", NOW_EPOCH - 60)
+        head = self.waiter(100, session="ordinary")
+        continuation = self.waiter(200, session="continuation", need=10 * GIB)
+        continuation["build_run"] = run
+        inputs = self.inputs(self.running(1, GIB, session="other"))
+        slot = records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10)
+        inputs = replace(inputs, ordered=[(Path("head"), head), (Path("continuation"), continuation)],
+            slots=(records.ContinuationSlot(slot, records.waiter_owner(continuation)),))
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        ordinary = next(row for row in result.rows if row.owner == records.waiter_owner(head))
+        self.assertEqual(ordinary.holder, records.SessionHolder("continuation", "continuation"))
+
+    def test_pressure_unreadable_reading_spacing_and_refresh_name_no_holder(self) -> None:
+        inputs = self.inputs(self.running(1, 12 * GIB))
+        expired = self.waiter(999)
+        expired["estimated_at"] = NOW_EPOCH - 10000
+        cases = (
+            replace(inputs, pressure=records.MemoryPressure(10, 20, 0)),
+            replace(inputs, pressure=records.PressureUnavailable("PSI missing")),
+            replace(inputs, host=records.ReadingUnavailable("meminfo missing")),
+            replace(inputs, spacing=records.NextStartAt(NOW_EPOCH + 5)),
+            replace(inputs, ordered=[(Path("waiting"), expired)]),
+        )
+        for current in cases:
+            with self.subTest(pressure=current.pressure, host=current.host, spacing=current.spacing,
+                              waiter=current.ordered[0][1]):
+                result = gate.admission_pass(current, current.now, admission_policy_fixture())
+                self.assertEqual(result.rows[0].holder, records.NoHolder())
+                self.assertEqual(result.rows[0].decision.state, "hold")
+
+    def test_an_unregistered_ci_job_is_never_the_holder(self) -> None:
+        ci = ci_step(30 * GIB, RunningServiceJob(NOW_EPOCH - 60))
+        inputs = self.inputs(self.running(1, 4 * GIB, session="build"), ci)
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual(result.rows[0].holder, records.SessionHolder("build", "build"))
+
+    def test_overlapping_processes_select_the_same_holder_in_both_reservation_orders(self) -> None:
+        run = LiveBuildRun(900, "900", NOW_EPOCH - 60)
+        shared = records.ProcessAnonymousUse(700, records.AnonymousRunUse(10 * GIB))
+        steps = [self.running(1, GIB, session="shared", run=run),
+                 self.running(2, GIB, session="shared", run=run)]
+        steps = [replace(step, measured=records.MeasuredMemory(10 * GIB,
+            anonymous=records.AnonymousRunUse(10 * GIB), anonymous_source=records.ProcessSource((shared,))))
+            for step in steps]
+        for ordered in (steps, list(reversed(steps))):
+            with self.subTest(order=[step.pid for step in ordered]):
+                inputs = self.inputs(*ordered, self.running(3, 12 * GIB, session="larger"))
+                result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+                self.assertEqual(result.rows[0].holder, records.SessionHolder("larger", "larger"))
+                room = result.policy.room
+                assert isinstance(room, records.MemoryRoom)
+                self.assertEqual(room.used, 10 * GIB)
 
 
 class DecisionTests(unittest.TestCase):

@@ -5,9 +5,12 @@ from scripts.build_queue import snapshot_codec as codec
 
 from scripts.lint.memory_test_support import admission_policy_fixture
 
+from contextlib import redirect_stderr
 from dataclasses import replace
+import io
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import unittest
@@ -16,14 +19,44 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import admission_protocol as wire, queue_evidence
-from scripts.build_queue import admission_code
+from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
+from scripts.build_queue import admission_code, admission_records as records
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NOW
+from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
 
 
 class ProtocolTests(unittest.TestCase):
 
+
+    def test_wait_holder_identity_survives_the_wire_for_each_holder_kind(self) -> None:
+        for holder in (records.SessionHolder("session-id", "worker"), records.UnitHolder("compiler"), records.NoHolder()):
+            with self.subTest(holder=holder):
+                reply = wait_reply(records.NeedsMemory())
+                reply = replace(reply, snapshot=replace(reply.snapshot, holder=holder))
+                parsed = wire.parse_reply(wire.encode_reply(reply))
+                self.assertEqual(parsed, reply)
+                assert isinstance(parsed, wire.Wait)
+                self.assertEqual(parsed.snapshot.holder, holder)
+
+    def test_an_unknown_snapshot_field_keeps_the_reply_and_the_client_wait(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            reply = wait_reply(records.NeedsMemory())
+            encoded = cast(dict[str, object], json.loads(wire.encode_reply(reply)))
+            data = cast(dict[str, object], encoded["data"])
+            snapshot = cast(dict[str, object], data["snapshot"])
+            snapshot["future_wait_evidence"] = {"kind": "UnknownFutureEvidence", "value": 17}
+            line = json.dumps(encoded) + "\n"
+            self.assertEqual(wire.parse_reply(line), reply)
+            granted = admitted_reply()
+            transport = ScriptedTransport(fixture.clock, Exchange((line + wire.encode_reply(granted)).encode()))
+            waits: list[wire.Wait] = []
+            with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(
+                    socket, "socket", side_effect=transport.socket), redirect_stderr(io.StringIO()):
+                result = client.admit(request, waits.append, lambda: request)
+            self.assertEqual(waits, [reply])
+            self.assertEqual(result, granted)
+            self.assertEqual(len(transport.requests), 1)
 
     def test_room_cap_and_unavailable_pressure_survive_the_service_reply(self) -> None:
         from scripts.build_queue.queue_fixture import QueueFixture
