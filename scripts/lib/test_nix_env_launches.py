@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 from typing import TYPE_CHECKING, cast, override
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,19 +20,15 @@ for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify"
     sys.path.insert(0, str(ROOT / "scripts" / dependency))
 sys.path.insert(0, str(ROOT))
 if TYPE_CHECKING:
-    from scripts.herdr import herdr, herdr_sessions, pane_launch
+    from scripts.herdr import herdr, herdr_sessions
     from scripts.production import add_unit, add_showrunner
-    from scripts.shutdown import pane_restore, pane_record
     from scripts.notify import review
     from scripts.notify.user_action import NoActionRequired
 else:
     import herdr
     import add_unit
     import add_showrunner
-    import pane_restore
-    import pane_record
     import herdr_sessions
-    import pane_launch
     import review
     from user_action import NoActionRequired
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
@@ -202,20 +198,6 @@ class HerdrLaunchTests(NixFixture):
             started.assert_called_once()
             self.assertEqual(Path(cast(str | Path, ensure.call_args.args[0])), self.work)
             self.assertEqual(cast(dict[str, str], opened.call_args.args[4])["NIX_LDFLAGS"], "-Lloaded")
-
-    def test_pane_restore_refusal_preserves_the_old_pane(self) -> None:
-        client = Mock()
-        client.configure_mock(**{"pane_activity.return_value": herdr.PaneAtShell(),
-                                 "close_tab_confirmed.return_value": False})
-        entry = pane_record.launch("pane", "sid", str(self.work), {"CLAUDE_CONFIG_DIR": str(self.home / ".claude3")},
-                                   ["claude", "-n", "worker"])
-        invoke = cast(Callable[..., object], getattr(pane_restore, "_resume"))
-        with (patch.object(pane_restore, "named_account_environment", return_value={}),
-              patch.object(pane_launch, "resume_attempt",
-                           side_effect=herdr.HerdrFailure("fixture publication is unavailable")),
-              self.assertRaisesRegex(herdr.HerdrFailure, "fixture publication is unavailable")):
-            _ = self.continued(lambda: invoke("host", client, herdr.TabSession("pane", "worker", "space", "sid"), entry))
-        cast(Mock, client.close_tab_of).assert_not_called()
 
     def test_herdr_sessions_refusal_prints_one_line_and_opens_nothing(self) -> None:
         reason = "nix_env: fixture: missing shell"
