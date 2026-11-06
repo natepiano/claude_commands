@@ -648,3 +648,40 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - No check, guard or refusal is added.
 
 **Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
+
+### Phase 26 — An answer replay after a rename names the current production and unit  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** sdlc's answer of 2026-11-06 on the next item. Store the asker and the production as staff ids, and read the current names at use. A rename needs no code in `rename.py`, `rename_unit.py` or `rename_state.py`.
+
+**What the director read on origin/sdlc 016475b0f:**
+- `outstanding_file` and `outstanding_path` in `scripts/production/update_registration.py` key the list and its answered record by the owner's staff id.
+- `remove_open_item` stores `asked_by` as the asker's staff id. `answer` sets the saved item's `name` from the current owner. `relay_line` reads the current names from staff.
+- `rename_state.py` holds no reader of this list.
+- So the design may already hold. No test proves it for a replay.
+
+**Spec:**
+1. In `scripts/production/test_update_registration_answers.py`, add tests that answer an item, then change staff, then replay the same answer. Use `staff.rename` and `staff.move` on fixture rows. The cases are:
+   - the asking unit is renamed;
+   - the production owner is renamed;
+   - the asking unit moves to another production.
+2. Each replay exits 0, prints `already answered <time>` with the original answer time, and names the current destination in its relay line. The answered record's bytes do not change.
+3. If a case fails, fix the cause in `update_registration.py` only. Store staff ids and read names at use. Add no code to `rename.py`, `rename_unit.py` or `rename_state.py`.
+4. The 48-hour life of the answered record stays as it is. It is the replay's own rule, not a rename rule.
+5. Add no check, guard or refusal. Tests never act on a live unit.
+
+**Files:**
+- `scripts/production/test_update_registration_answers.py`
+- `scripts/production/update_registration.py`
+
+**Workers:** 1 writer, slot impl2.
+
+**State:** none
+
+**Acceptance gate:**
+- basedpyright on every changed .py file ends `0 errors, 0 warnings, 0 notes`.
+- These modules pass: `scripts/production/test_update_registration_answers.py`, `scripts/production/test_update_registration_questions.py`, `scripts/production/test_update_registration.py`.
+- The merge gate on the merged tree is green.
