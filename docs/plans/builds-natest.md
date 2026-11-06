@@ -1057,7 +1057,7 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 **Ruled out:**
 - Moving `module_run.py` to tmpfs as a saving: it times one module for a director, and it is not part of a suite run.
 
-### Phase 48 — The queue's sentences say `full test`, and one file lists the suite runners  · status: todo
+### Phase 48 — The queue's sentences say `full test`, and one file lists the suite runners  · status: done
 **Depends on:** Phase 36
 
 #### Work Order

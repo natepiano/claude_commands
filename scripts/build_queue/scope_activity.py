@@ -8,13 +8,11 @@ from pathlib import Path
 from typing import Protocol
 
 
-SUITE_RUNNERS = frozenset({"merge_gate.py", "full_test.py"})
-SUITE_MODULES = frozenset(("-m", f"scripts.production.{Path(name).stem}") for name in SUITE_RUNNERS)
+from scripts.lib.suite_runners import starts_suite_runner
 
 
 def runs_suite_runner(command: tuple[str, ...]) -> bool:
-    names = {Path(argument).name for argument in command}
-    return bool(names & SUITE_RUNNERS) or any(tuple(pair) in SUITE_MODULES for pair in zip(command, command[1:]))
+    return any(starts_suite_runner(command[index:]) for index in range(len(command)))
 
 
 class ProcessIdentity(Protocol):

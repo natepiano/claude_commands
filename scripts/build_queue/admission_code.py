@@ -12,7 +12,7 @@ ADMISSION_CODE_PATHS = (
     "build_queue/admission_code.py", "build_queue/admission_client.py", "build_queue/admission_protocol.py",
     "build_queue/admission_service.py", "build_queue/queue_place.py",
     "build_queue/scope_activity.py", "build_queue/queue_snapshot.py",
-    "lib/build_steps.py", "lib/inotify.py", "lib/conf.py", "lib/atomic_file.py", "lib/test_phase.py",
+    "lib/suite_runners.py", "lib/build_steps.py", "lib/inotify.py", "lib/conf.py", "lib/atomic_file.py", "lib/test_phase.py",
     "lint/build_shape.py", "buildlog/store.py", "buildlog/record.py", "buildlog/repository.py", "buildlog/parse.py",
 )
 

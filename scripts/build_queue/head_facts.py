@@ -15,6 +15,7 @@ from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
+from scripts.lib.build_steps import StepNames
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
@@ -374,7 +375,7 @@ def clock(instant: float, zone: ZoneInfo, *, seconds: bool = True, zone_name: bo
     return datetime.fromtimestamp(instant, zone).strftime(form + (" %Z" if zone_name else ""))
 
 
-def bump_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
+def bump_text(facts: HeadFacts, zone: ZoneInfo, *, names: StepNames, short: bool = False) -> str:
     bumps = facts.bumps
     if isinstance(bumps, BumpsUnavailable):
         return "bumps: unknown" if short else f"Bumps since it joined: unknown ({bumps.reason})"
@@ -384,7 +385,7 @@ def bump_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
         most = bumps.groups[0]
         folder = Path(most.folder).name or "unknown"
         noun = "bump" if bumps.total == 1 else "bumps"
-        return f"{bumps.total} {noun} since it joined, most: {folder} {most.step} ({most.count})"
+        return f"{bumps.total} {noun} since it joined, most: {folder} {names.prose(most.step)} ({most.count})"
     count = str(bumps.total) if bumps.groups else "none"
     return f"Bumps since it joined at {clock(facts.joined_at, zone)}: {count}"
 
@@ -393,10 +394,10 @@ def _session_label(session: str, labels: Mapping[str, unit_labels.UnitLabels]) -
     return labels[session].session if session in labels else session or "unknown"
 
 
-def bump_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
+def bump_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels], *, names: StepNames) -> list[str]:
     if isinstance(facts.bumps, BumpsUnavailable):
         return []
-    lines = [f"  {_session_label(group.session, labels)} {group.step}, {group.folder}: {group.count} bumps; "
+    lines = [f"  {_session_label(group.session, labels)} {names.prose(group.step)}, {group.folder}: {group.count} bumps; "
              + f"by {', '.join(_session_label(actor, labels) for actor in group.actors)}; "
              + f"last bump {clock(group.last_at, zone)}"
              for group in facts.bumps.groups[:BUMP_TABLE_ROWS]]
@@ -421,7 +422,7 @@ def order_text(facts: HeadFacts) -> str:
     return "; ".join(filter(None, [priority_text(facts.priority), order_rule(facts)]))
 
 
-def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
+def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels], *, names: StepNames) -> list[str]:
     if isinstance(facts.token_waits, TokenWaitsNotRecorded):
         return ["Cargo token waits: unknown"]
     if not facts.token_waits.waits:
@@ -429,7 +430,7 @@ def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, uni
     lines: list[str] = []
     for wait in facts.token_waits.waits:
         session = _session_label(wait.session_id, labels)
-        prefix = f"Cargo token: {session} {wait.step}: "
+        prefix = f"Cargo token: {session} {names.prose(wait.step)}: "
         lines.append(prefix + token_wait_text((wait,), zone))
     if facts.token_waits.has_unknown:
         lines.append("Cargo token waits: unknown")

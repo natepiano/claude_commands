@@ -29,15 +29,14 @@ else:
     import step_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 if TYPE_CHECKING:
     from ..buildlog import store
+    from ..lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 else:
     import store
-
-
-SUITE_RUNNERS = frozenset({"merge_gate.py", "full_test.py"})
-SUITE_MODULES = frozenset(("-m", f"scripts.production.{Path(name).stem}") for name in SUITE_RUNNERS)
+    from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
 
 @dataclass(frozen=True)
@@ -145,20 +144,16 @@ def python_target(arguments: tuple[str, ...]) -> tuple[str, ...]:
     return ()
 
 
-def runs_suite_runner(target: tuple[str, ...]) -> bool:
-    return target[:2] in SUITE_MODULES or bool(target) and Path(target[0]).name in SUITE_RUNNERS
-
-
 def is_waiting_gate(process: build_hold.AuditProcess) -> bool:
     # These scripts wait themselves. A quoted mention in a shell command is not a script path.
     if not process.argv:
         return False
     executable = Path(process.argv[0]).name
-    if executable == "verify.sh" or runs_suite_runner(process.argv):
+    if executable == "verify.sh" or starts_suite_runner(process.argv):
         return True
     if executable.startswith("python"):
         target = python_target(process.argv[1:])
-        return runs_suite_runner(target)
+        return starts_suite_runner(target)
     if executable not in {"bash", "sh", "dash", "zsh"}:
         return False
     for argument in process.argv[1:]:
@@ -189,7 +184,7 @@ def is_build(process: build_hold.AuditProcess) -> bool:
             return True
         target = python_target(process.argv[1:])
         return (target[:2] in {("-m", "unittest"), ("-m", "pytest")}
-                or runs_suite_runner(target)
+                or starts_suite_runner(target)
                 or bool(target) and (Path(target[0]).name in {"pytest", "py.test", "basedpyright"}
                                      or Path(target[0]).match("test_*.py")))
     if names & {"node", "nodejs"}:

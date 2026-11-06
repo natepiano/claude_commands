@@ -145,7 +145,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
                 and isinstance(running.step.measured.job_state, NotServiceSlice)):
             continue
         prefix = "Selected running step: " if selected else ""
-        add(prefix + queue_evidence.running_text(running, explanation, model.labels, model.zone))
+        add(prefix + queue_evidence.running_text(running, explanation, model.labels, model.zone, names=model.names))
     if not running_steps:
         add("None.")
     add(f"Total current use: {queue_evidence.gib(explanation.totals.measured)}")
@@ -155,7 +155,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         return lines
     if isinstance(head, gate.TokenWaitersOnly):
         add("All waiting steps are waiting for the cargo token.")
-        add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone) + ".")
+        add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone, names=model.names) + ".")
         return lines
     add()
     if not head_card:
@@ -167,11 +167,11 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
     add(queue_evidence.need_details(head.need_source))
     if isinstance(model.facts, head_facts.HeadFacts):
         facts = model.facts
-        add(head_facts.bump_text(facts, model.zone))
-        for text in head_facts.bump_lines(facts, model.zone, model.labels):
+        add(head_facts.bump_text(facts, model.zone, names=model.names))
+        for text in head_facts.bump_lines(facts, model.zone, model.labels, names=model.names):
             add(text)
         add("Order rule: " + head_facts.order_rule(facts))
-        for text in head_facts.cargo_token_lines(facts, model.zone, model.labels):
+        for text in head_facts.cargo_token_lines(facts, model.zone, model.labels, names=model.names):
             add(text)
     else:
         add("Order history: unavailable")
@@ -188,7 +188,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
             + f"oldest waiting {age(followers.oldest_since, explanation.now)} min")
     else:
         add("Followers: none")
-    add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone) + ".")
+    add("Frees when: " + queue_evidence.release_text(model.release, explanation, model.labels, model.zone, names=model.names) + ".")
     return lines
 
 

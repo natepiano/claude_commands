@@ -215,14 +215,14 @@ def estimate_refresh_text(reason: gate.EstimateExpired, zone: ZoneInfo) -> str:
 
 
 def release_text(release: gate.HeadAfterEnd, explanation: gate.QueueExplanation,
-                 labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo) -> str:
+                 labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     if isinstance(release, gate.HeadRelease):
         if not release.ended:
             text = "no running step needs to end"
         else:
-            names = [step_labels(explanation.running[index].step, labels).session
-                     + " " + explanation.running[index].step.step for index in release.ended]
-            text = (f"{' + '.join(names)} end (keep-aside drops {gib(release.growth_drop)}; "
+            ended = [explanation.running[index].step for index in release.ended]
+            ended_steps = [step_labels(step, labels).session + " " + names.prose(step.step) for step in ended]
+            text = (f"{' + '.join(ended_steps)} end (keep-aside drops {gib(release.growth_drop)}; "
                     + f"free memory rises {gib(release.freed)})")
         if isinstance(release, gate.HeadStartsAt):
             starts_at = head_facts.clock(release.at, zone, zone_name=True)
@@ -268,7 +268,7 @@ def service_text(memory: gate.CompilerServiceMemory | gate.UnownedSliceMemory, n
 
 
 def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExplanation,
-                 labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo) -> str:
+                 labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     memory = running.step.measured
     if isinstance(memory, gate.CompilerServiceMemory) or (
             isinstance(memory, gate.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
@@ -296,7 +296,7 @@ def running_text(running: gate.ExplainedRunningStep, explanation: gate.QueueExpl
     evidence = keep_aside_text(keep) if keep is not None else f"anonymous use {using}; no accepted run hold"
     phase = ("; " + test_phase_text(running.basis)
              if isinstance(running.basis, gate.TestPhaseCharge) else "")
-    return (f"{pid_text(step_pid(running.step))} · {identity.showrunner} / {identity.unit} / {identity.session}, {running.step.step}: {started}; "
+    return (f"{pid_text(step_pid(running.step))} · {identity.showrunner} / {identity.unit} / {identity.session}, {names.prose(running.step.step)}: {started}; "
             + evidence + phase + swap)
 
 

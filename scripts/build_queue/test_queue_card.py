@@ -27,6 +27,18 @@ class QueueCardTests(QueueFixtureTests):
         self.assertIn(" · full test · ", heading)
         self.assertNotIn("full-test", heading)
 
+    def test_running_and_release_sentences_use_step_prose(self) -> None:
+        _ = (self.fixture.root / "pressure").write_text("full avg10=0\nsome avg10=0\n")
+        for position in range(1, len(self.fixture.paths) + 1):
+            self.fixture.change(position, need=21 * gate.GIB)
+        for step, prose in (("build", "release build"),):
+            with self.subTest(step=step):
+                self.fixture.write_running(used=int(5.1 * gate.GIB), need=int(11.1 * gate.GIB), step=step)
+                model = self.fixture.model()
+                text = plain(queue_card.render_card(model, [1], 400))
+                self.assertIn(f", {prose}: admitted ", text)
+                self.assertIn(f"Frees when: widget-enhancements-title {prose} end ", text)
+
     def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
         model = self.fixture.model()
         for position in (1, 2, 4):

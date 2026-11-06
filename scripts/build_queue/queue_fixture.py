@@ -289,7 +289,7 @@ class QueueFixture(ExitStack):
         if path.write_text(json.dumps(row, separators=(",", ":"))) <= 0:
             raise OSError("empty fixture row")
 
-    def write_running(self, *, used: int, need: int) -> None:
+    def write_running(self, *, used: int, need: int, step: str = "nextest") -> None:
         write_process(self.proc, 900, used)
         scope = self.root / "widget.scope"
         scope.mkdir(exist_ok=True)
@@ -301,10 +301,10 @@ class QueueFixture(ExitStack):
         self.write_json(self.reservation, {"pid": 900, "start_time": "900", "need": need,
             "admitted_at": store.utc_iso(NOW - 25), "repo": "hana", "worktree": "/tmp/widget",
             "sidecar": str(sidecar), "session_id": "id-widget", "session_name": "widget-enhancements-title",
-            "step": "nextest", "folder": "/tmp/widget",
+            "step": step, "folder": "/tmp/widget",
             "queue_waiter": {"pid": 900, "start_time": "900", "need": need, "since": NOW - 25,
                 "session_id": "id-widget", "session_name": "widget-enhancements-title",
-                "step": "nextest", "folder": "/tmp/widget"}})
+                "step": step, "folder": "/tmp/widget"}})
 
     def write_waiter(self, row: dict[str, object]) -> Path:
         pid = int(str(row["pid"]))

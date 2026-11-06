@@ -278,10 +278,26 @@ class QueueEvidenceTests(unittest.TestCase):
         reading = gate.queue_read()
         running = replace(reading.explanation.running[0], admitted_at=gate.AdmissionTimeNotRecorded())
         explanation = replace(reading.explanation, running=(running, *reading.explanation.running[1:]))
-        text = queue_evidence.running_text(running, explanation, {}, user_zone())
+        text = queue_evidence.running_text(running, explanation, {}, user_zone(), names=read_step_names())
         self.assertIn("admission time unknown", text)
         self.assertIn("need 10.8 GiB; anonymous use 0.8 GiB; held slot 0.0 GiB; kept aside 10.0 GiB", text)
         self.assertNotIn("admitted 00:00", text)
+
+    def test_running_and_release_sentences_use_step_prose(self) -> None:
+        reading = gate.queue_read()
+        names = read_step_names()
+        for step, prose in (("full-test", "full test"), ("merge-gate", "merge gate")):
+            with self.subTest(step=step):
+                running = replace(reading.explanation.running[0],
+                                  step=replace(reading.explanation.running[0].step, step=step))
+                explanation = replace(reading.explanation, running=(running, *reading.explanation.running[1:]))
+                text = queue_evidence.running_text(running, explanation, {}, user_zone(), names=names)
+                self.assertIn(f" {prose}: admitted ", text)
+                self.assertNotIn(step, text)
+                release = gate.HeadStartsAt(NOW + 30, (0,), 0, 0, 0)
+                text = queue_evidence.release_text(release, explanation, {}, user_zone(), names=names)
+                self.assertIn(f" {prose} end ", text)
+                self.assertNotIn(step, text)
 
     def test_optional_load_failure_preserves_evidence_and_release_advice(self) -> None:
         load = self.proc / "loadavg"
