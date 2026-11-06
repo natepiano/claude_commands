@@ -81,6 +81,7 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 - [ ] **Measure `test_verify_lint_judgment.py` again when its owners' changes land.**
   - Target: `direct/test_verify_lint_judgment.py` (198.6 s after Phase 31)
   - Owners (showrunner, 2026-11-05): queue-unit fixes the admission start spacing in `scripts/build_queue/admission_test_support.py` (first after 10x) and takes the lighter admission client start (`scripts/lint/memory_gate.sh:17-22`), with the `build_hold.py` import proposal. verify-unit takes step-record state reuse (`verify.sh:356-358`, `verify.sh:1925-1934`), next after its Phase 35, then a callable repair decision (`verify.sh:3711-3714`).
+  - Phase 45 also measures the step-record reuse on `direct/test_verify_lint_cache_versions.py`: 486 starts, 23.1 of 94.0 CPU s. Pair both modules when it lands.
   - Completion condition: same-load pairs on builds after each change lands; the Floors row moves to the new median.
   - Revealed by: Phase 31, 2026-11-05.
 - [x] **Document the gate's discover form without PYTHONPATH.** Phase 34 corrected the Mac instructions. Every code runner already uses discover. The report unit owns the `docs/plans/builds-report.md:76` command. No package or import rewrite remains.
@@ -117,4 +118,5 @@ Median wall time of the last 5 gate runs, from `~/.local/state/merge-gate/module
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | Python start-up of `eligible` and `reserve` (`build_hold` -> `admission_service` -> `memory_admit`) | 24 |
 | `style/test_crate_run.py` | 257.2 (clean rounds, no pairs) | production Git work: `copies.refresh_remotes` 803 calls, 99.7 s of a 325 s profiled run; Phase 44 cuts it | 40 |
 | `direct/test_verify_mac_only.py` | 212.0 (load 60-75; 156.5 in clean rounds) | `build_targets.py` and `mac_idle.py` process starts; lazy imports in `build_targets.py` alone gain 1% CPU | 39, 41 |
+| `direct/test_verify_lint_cache_versions.py` | 135.9 (clean rounds, no pairs) | `verify.sh lint` route: `step_record.py` 486 starts and 23.1 of 94.0 CPU s | 45 |
 | `direct/test_verify_lint_judgment.py` | 198.6 | production `verify.sh lint` route: 3.1 s per run with no repair, 5.2 s with repair (step-record and admission client Python starts) plus admission start spacing | 31 |

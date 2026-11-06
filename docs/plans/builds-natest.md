@@ -1084,35 +1084,19 @@ From the user (via natedev): Mission: find the longest-running ~/.claude tests a
 - the full test green on the phase commit merged with `origin/builds`
 - `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
 
-### Phase 45 — `direct/test_verify_lint_cache_versions.py` runs in half its time  · status: todo
+### Phase 45 — `direct/test_verify_lint_cache_versions.py` runs in half its time  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_verify_lint_cache_versions.py` (rank 9 in `test_times top` at 139 s median, 91.4 CPU s, 2026-11-05) runs in half its time, or a measured floor shows why it cannot, with every checked behavior kept.
+- No repository change. The phase ended at a measured floor, with every test name and assertion kept.
+- Three clean rounds at base 5d459b8bb with the helper trace on: median 135.9 s wall, 94.0 CPU s, 7 tests, load 41-75. Load changed during the rounds, so they find the cost and do not measure a gain.
+- The module has no fixed wait, and the fixture already builds one seed per class. Five tests make 29 full `verify.sh lint` calls at 22-34 s per test; two tests call the code in-process and take under 0.2 s.
+- Floor: production process starts. `step_record.py` has 486 starts and 23.1 CPU s (about 17 starts per `verify.sh` call), `tree_watch.py` has 155 starts and 7.8 CPU s, and `build_folders.py` has 50 starts and 3.2 CPU s. The trace attributes 40.0 of 94.0 CPU s.
+- Proposal, sent to the showrunner 2026-11-05: this module measures verify-unit's step-record reuse item at up to 21.7 CPU s (estimate, 457 of 486 starts).
 
-**Spec:** Follow the Speed method. Ranks 1 and 5 are excluded. Ranks 2, 3, 4, 6, 8 are floors whose CPU has not risen, and rank 7 is Phase 43.
-1. Profile before any edit, per group: five integration tests make 29 `verify.sh` calls, and two tests are direct (`test_verify_lint_cache_versions.py:16-79`). The module average does not name either cost.
-2. Cut in the Speed method's order: fixed waits first, then repeated setup, then process starts.
-3. A cut in a production file or a support file goes to the director first, with the measured gain.
-4. Keep every test name and assertion. Add no guard, refusal or check that this Work Order does not name (user rule, 2026-11-05).
-
-**Files:**
-- `scripts/direct/test_verify_lint_cache_versions.py` — the module
-
-**Workers:** 1 writer on slot `review3` (one module; the file does not split; other slots hold other phases)
-- `review3` — all files above, role impl
-
-**Constraints from prior phases:**
-- Phase 31: the `verify.sh lint` route costs 3.1 s per run with no repair (step-record and admission client Python starts).
-- The fixture uses `caller_admission`, whose server advances its clock with real time. queue-unit owns the start spacing fix. Do not advance the admission clock by hand: Phase 31 ruled that out.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/direct -p 'test_verify_lint_cache_versions.py'` green, with the same test names and assertions
-- same-load pair medians (`pairs.sh`) before and after, in the checkpoint notice
-- the full test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:**
+- Another seed or a removed test: the four named-tool tests each check a different tool, and the fixture has no repeated setup.
 
 ### Phase 46 — style test runs do less Git work outside `copies.py`  · status: todo
 **Depends on:** none
