@@ -354,9 +354,12 @@ FLOOR_FILESYSTEM: ContextVar[FilesystemFloor | UseConfiguredValue] = ContextVar(
 
 
 def on_floor_filesystem(path: str) -> bool:
-    """Keep paths on the current floor filesystem."""
+    """Keep paths on the current floor filesystem. A missing target is on no filesystem."""
     filesystem = FLOOR_FILESYSTEM.get()
-    return not isinstance(filesystem, FilesystemFloor) or output_device(path) == filesystem.device
+    try:
+        return not isinstance(filesystem, FilesystemFloor) or output_device(path) == filesystem.device
+    except FileNotFoundError:
+        return False
 
 
 def cargo_output_cache_path() -> Path:
@@ -1939,6 +1942,14 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
             TRIM_TAKES.reset(token)
 
 
+def stamp_newer(root: str, moment: float) -> bool:
+    """Return whether the use stamp is newer than moment. A missing stamp returns False."""
+    try:
+        return os.stat(os.path.join(root, USE_STAMP)).st_mtime > moment
+    except FileNotFoundError:
+        return False
+
+
 def recover_pending_trims(locked_targets: Sequence[str] = (), *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
@@ -1970,8 +1981,7 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                                 break
                         if not acquired:
                             continue
-                        if any(os.path.exists(os.path.join(root, USE_STAMP))
-                               and os.stat(os.path.join(root, USE_STAMP)).st_mtime > take.at for root in roots):
+                        if any(stamp_newer(root, take.at) for root in roots):
                             continue
                     trees = [tree for root in roots for tree in _build_trees(root, tree_depth, lint_settings=lint_settings)]
                     trees = output_lock_trees(roots, trees, [entry.path for entry in take.pending])
@@ -3446,7 +3456,10 @@ def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf
         path = os.path.realpath(os.path.expanduser(path))
         if not os.path.isdir(path):
             continue
-        device = output_device(path)
+        try:
+            device = output_device(path)
+        except FileNotFoundError:
+            continue
         _ = devices.setdefault(device, [])
         _ = probes.setdefault(device, path)
         if path in targets:
@@ -3759,9 +3772,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             ci_seen: set[InodeKey] = set()
             ci_bytes = sum(directory_blocks(os.path.expanduser(path), ci_seen)
                            for path in lint_settings.words("sweep_ci_targets")
-                           if (not isinstance(filesystem, FilesystemFloor)
-                               or (output_device(os.path.expanduser(path)) == filesystem.device
-                                   if os.path.isdir(os.path.expanduser(path)) else filesystem.root_device)))
+                           if on_floor_filesystem(os.path.expanduser(path)))
             unchanged_caches = held_bytes + ci_bytes
             before_caches = total + unchanged_caches
         # The growth check compares this pair with the previous record. The scan takes minutes, so
@@ -3812,7 +3823,12 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             after_caches = sum(scan.blocks[key] for key in unchanged) + unchanged_caches
             after_caches += sum(directory_blocks(path, unchanged, excluded_targets)
                                 for path in idle if path in scan.changed_targets and on_floor_filesystem(path))
-            removed = max(0, before_caches - after_caches)
+            # This pass did not remove these blocks.
+            externally_removed_keys = {key for root in idle if root not in taken and not os.path.lexists(root)
+                                      for key in scan.target_links.get(root, {})
+                                      if key not in unchanged
+                                      and (not isinstance(filesystem, FilesystemFloor) or key[0] == filesystem.device)}
+            removed = max(0, before_caches - after_caches - sum(scan.blocks[key] for key in externally_removed_keys))
             try:
                 with locked_floor_record(record_path) as previous:
                     base = floor_record_or_new(previous, after_free)
