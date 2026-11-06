@@ -90,25 +90,25 @@ class DirectorResolutionTests(StaffTestCase):
         )))
 
     def test_live_unit_director_keeps_a_running_director_without_a_messaging_socket(self) -> None:
-        parent = unit_membership("demo", "builders-unit")
-        registry = self.session_record(parent.current_session, "builders-unit")
-        run = self.worker_run("demo", "builders-unit", parent.current_session)
+        parent = unit_membership("demo", "builders")
+        registry = self.session_record(parent.current_session, "builders")
+        run = self.worker_run("demo", "builders", parent.current_session)
         self.assertEqual(json_object(registry)["messagingSocketPath"], "")
 
         self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(parent.current_session, os.getpid()))
 
     def test_live_unit_director_prefers_the_newest_running_name_match(self) -> None:
-        parent = unit_membership("demo", "builders-unit")
-        older = self.session_record(parent.current_session, "builders-unit")
+        parent = unit_membership("demo", "builders")
+        older = self.session_record(parent.current_session, "builders")
         current = staff.update_current_session(parent.current_session, staff.native_id(fixture_runtime_id("newer-director")))
-        newer = self.session_record(current.current_session, "builders-unit")
+        newer = self.session_record(current.current_session, "builders")
         record = json_object(newer)
         record["updatedAt"] = 2
         self.write_json(newer, record)
-        run = self.worker_run("demo", "builders-unit", "former-director")
+        run = self.worker_run("demo", "builders", "former-director")
         self.write_json(self.root / "shutdown/account/history/restart.json", {"session": {
-            "session_id": "former-director", "name": "builders-unit", "run_dirs": [str(run)],
-            "host": {"kind": "unit", "unit": "builders-unit", "session_name": "builders-unit"},
+            "session_id": "former-director", "name": "builders", "run_dirs": [str(run)],
+            "host": {"kind": "unit", "unit": "builders", "session_name": "builders"},
         }})
         registry = sessions.read_registry()
         entries = {item.record["sessionId"]: item for item in registry.entries}
@@ -807,7 +807,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                 _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
                 self.open_worker(name="impl")
                 child = subprocess.Popen([
-                    sys.executable, "-c",
+                    str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c",
                     "from pathlib import Path; import sys; from scripts.direct import workers; " +
                     "print(workers.resolve(Path(sys.argv[1]), 'impl'), flush=True)",
                     str(self.session_dir),
@@ -862,7 +862,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             fcntl.flock(owner, fcntl.LOCK_EX)
             _ = roster.truncate(0)
             roster.flush()
-            child = subprocess.Popen([sys.executable, "-c", script, str(self.session_dir), str(SCRIPT.parents[2])],
+            child = subprocess.Popen([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(self.session_dir), str(SCRIPT.parents[2])],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
             try:
                 assert child.stdout is not None

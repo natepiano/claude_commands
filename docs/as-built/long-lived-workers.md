@@ -36,7 +36,7 @@ reviewer can take the work.
 
 One renderer makes every worker's thread title and message prefix:
 `workers.shown_name`. A unit run gives `<production> · <unit> · <job>[ <n>]`,
-with the unit's `-unit` suffix removed. The job label comes from
+with the unit's staff name. The job label comes from
 `config/names.toml`: `implementer`, `tester`, `repair_worker` or
 `code_reviewer` for the `impl`, `test`, `fix` and `review` roles, and `worker`
 for any other role. The second holder of a role gets the number 2, and so on.
@@ -208,7 +208,8 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/direct/
 `~/.local/state/unit-workers/<production>/<unit>.json` (`UNIT_WORKERS_STATE`
 selects a private root). On first ledger binding, a production unit's run
 saves explicit production and unit fields in `progress_history_state.json`.
-Plan headers accept both Production forms and resolve former production names.
+The unit staff row selects its parent showrunner.
+The parent row's `name` and `doc.path` give the production name and document.
 Later reads use the saved identity, so moving a worktree does not change owners.
 `rename_unit.py` changes the unit row and repairs its session and display names.
 An explicit `--move-worktree --to-folder <path> --to-branch <name>` request also moves the worktree.
@@ -270,7 +271,7 @@ See `unit-rename.md`.
 
 - Codex workers open once per run and end only at `end_session.sh`. A held design role is not a run worker: run end unbinds it and never ends its thread. Phase cleanup never ends a Codex thread. A new worker opens only when no open worker can take the work.
 - Claude workers keep their per-phase lifecycle; this design covers Codex workers only.
-- Only the unit director starts a finished worker's next turn through `implement.sh --to <worker>` or `review.sh --to <worker>`. A peer message sent with `send` is held for that turn, which receives it before its dispatch prompt, so the prompt is the last text the worker reads.
+- Only the unit director starts a finished Codex worker's next turn through `assign.sh --role <role> --to <worker>`. The turn receives held peer messages before its dispatch prompt. Claude workers keep `implement.sh`.
 - Compaction, the worker claim and the identity check run under one launcher lock (`impl_worker_claim.lock`); each mesh operation also holds its worker lifecycle lock. A live compaction turn (exit 3) or changed roster (exit 4) blocks the follow-up. Other compaction failures post one board line and allow the follow-up.
 - A worker's identity file is anchored to the implementation model, whichever launcher opened the worker.
 - A assigned review claims its worker before writing any artifact, and fails if the working tree changed in any of HEAD, status, tracked diff or untracked content.
@@ -333,7 +334,7 @@ Phase-bound `open` and `adopt` use the resolved design checkout when `--checkout
 
 Role IDs are `<design_id>/designer` and `<design_id>/reviewer`. Instance names are `<production>-<area>-astra-designer` / `-astra-reviewer`; an adopted role keeps its old mesh name.
 
-**Types.** Frozen dataclasses, tagged by `kind` at the JSON boundary (`../type_design.md`): `UnitHolder(production_slug, unit_name)` | `ShowrunnerHolder(production_slug)`; `DesignUnbound` | `DesignBoundToPhase(run_directory, phase, repository, output_paths)`; `PhaseBoundDesigner(binding_generation, launch_sandbox)` | `ReadOnlyReviewer` (`ThreadAccessPolicy`); `RoleNotOpened(claim)` | `RoleOpen(thread_id)` | `RolePausedForMove(thread_id)` | `RoleNeedsRecovery(thread_id, reason)` | `RoleEnded(thread_id)`; `DesignPlacement(design_id, host, generation)`; `RoleInstance`, `HeldDesign`, `PendingMessage`, `HolderReach(session_id)` | `HolderUnavailable(reason)`. Refusals raise `RoleRefused(ValueError)`.
+**Types.** Frozen dataclasses, tagged by `kind` at the JSON boundary (`../type_design.md`): `DesignUnbound` | `DesignBoundToPhase(run_directory, phase, repository, output_paths)`; `PhaseBoundDesigner(binding_generation, launch_sandbox)` | `ReadOnlyReviewer` (`ThreadAccessPolicy`); `RoleNotOpened(claim)` | `RoleOpen(thread_id)` | `RolePausedForMove(thread_id)` | `RoleNeedsRecovery(thread_id, reason)` | `RoleEnded(thread_id)`; `DesignPlacement(design_id, host, generation)`; `RoleInstance`, `HeldDesign`, `PendingMessage`, `HolderReach(session_id)` | `HolderUnavailable(reason)`. Refusals raise `RoleRefused(ValueError)`.
 
 **CLI** (exit 2 and one `roles:` stderr line on any refusal):
 

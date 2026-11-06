@@ -111,11 +111,18 @@ class CheckpointTestFolderTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_merge_uses_the_staff_name_with_a_different_document_name(self) -> None:
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            _ = staff.rename(showrunners.owner_for("example").id, "hana")
+        result = self.run_checkpoint(self.checkpoint(), "--production", "hana")
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production", cwd=self.origin))
+
     def test_checkpoint_refuses_another_staff_parent_without_changes_on_retry(self) -> None:
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             parent = recorded_showrunner("receiving", self.root / "receiving-production.md")
-            unit = unit_membership("example", "alpha-unit")
+            unit = unit_membership("example", "alpha")
             _ = staff.move(unit.id, staff.ReportsTo(parent.id))
         before = self.git("show-ref"), self.git("status", "--porcelain")
         origin = self.git("show-ref", cwd=self.origin)
@@ -125,7 +132,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             with self.subTest(attempt=attempt):
                 result = self.run_checkpoint(checkpoint).process
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("alpha-unit: staff parent is", result.stdout)
+                self.assertIn("alpha: staff parent is", result.stdout)
                 self.assertIn("receiving", result.stdout)
                 self.assertEqual((self.git("show-ref"), self.git("status", "--porcelain")), before)
                 self.assertEqual(self.git("show-ref", cwd=self.origin), origin)
@@ -143,21 +150,21 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.git("branch", "-f", "production", "HEAD")
         _ = self.git("checkout", "production")
         self.assertNotIn(code_merge, self.git("rev-list", "--first-parent", "HEAD").splitlines())
-        self.assertTrue(merge_checkpoint.merge_branch_history(self.checkout, "production").has_code_merge("alpha-unit", "2"))
+        self.assertEqual(self.git("merge-base", "--is-ancestor", code_merge, "production"), "")
         result = self.run_checkpoint(self.as_built_commit(), "--as-built", review=False)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         self.assertIn("test: ok — as-built has no package tests", result.process.stdout)
         tree = self.git("ls-tree", "-r", "--name-only", "HEAD")
         self.assertIn("docs/as-built/alpha.md", tree)
         self.assertNotIn("docs/plans/alpha.md", tree)
-        self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha-unit phase \S+ as-built \(")
+        self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha phase \S+ as-built \(")
 
     def test_checkpoint_merges_into_its_staff_parent_and_ignores_unavailable_worktrees(self) -> None:
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            row = unit_membership("example", "retired-unit")
+            row = unit_membership("example", "retired")
             _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
-            _ = unit_membership("example", "standby-unit")
+            _ = unit_membership("example", "standby")
         result = self.run_checkpoint(checkpoint)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
@@ -276,7 +283,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.git("push", "origin", "--delete", "alpha-branch", cwd=self.unit)
         never_pushed = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(never_pushed, "held", "ancestry: held — commit is not on origin")
-        self.assertIn("send alpha-unit: push your branch to origin and resend the checkpoint",
+        self.assertIn("send alpha: push your branch to origin and resend the checkpoint",
                       never_pushed.process.stdout)
         self.assertEqual(never_pushed.process.stdout, unpushed.process.stdout)
     def test_checkpoint_on_second_origin_branch_merges_the_checkpoint_and_names_branch(self) -> None:
@@ -290,7 +297,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                      "+refs/heads/alpha-branch:refs/remotes/origin/alpha-branch")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
-        self.assertIn("ancestry: ok — checkpoint exists, follows history, and is on origin/alpha-phase\n",
+        self.assertIn("ancestry: ok — checkpoint exists and is on origin/alpha-phase\n",
                       result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
         self.assertNotEqual(self.git("rev-parse", "HEAD^2"), later)
@@ -306,7 +313,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with mock.patch.object(merge_checkpoint, "git", wraps=merge_checkpoint.git) as commands:
             result = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(result, "held", "ancestry: held — commit is not on origin")
-        self.assertIn("send alpha-unit: push your branch to origin and resend the checkpoint", result.process.stdout)
+        self.assertIn("send alpha: push your branch to origin and resend the checkpoint", result.process.stdout)
         commands.assert_any_call(self.checkout, "fetch", "--prune", "origin",
                                  "+refs/heads/*:refs/remotes/origin/*")
         self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/alpha-phase"), "")
@@ -333,16 +340,16 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.git("remote", "set-url", "origin", str(self.root / "absent.git"))
         result = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(result, "failed", "ancestry: failed")
-        self.assertIn("send alpha-unit: the showrunner will inspect the failed command", result.process.stdout)
+        self.assertIn("send alpha: the showrunner will inspect the failed command", result.process.stdout)
     def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
         plan = self.root / "scratch-plan.md"
         _ = plan.write_text("### Phase 2 — Checkpoint\n\n### Phase 3 — Later work\n")
         with mock.patch.dict(os.environ, self.env), mock.patch.object(scratch, "registered_plan", return_value=plan):
-            done = [scratch.new("phase:alpha-unit/2", word) for word in ("gate", "copy")]
-            later = scratch.new("phase:alpha-unit/3")
+            done = [scratch.new("phase:alpha/2", word) for word in ("gate", "copy")]
+            later = scratch.new("phase:alpha/3")
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha-unit/2: ", result.process.stdout)
+        self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha/2: ", result.process.stdout)
         self.assertFalse(any(path.exists() for path in done))
         self.assertTrue(later.is_dir())
     def test_real_merge_tests_run_only_the_two_commands_before_commentary(self) -> None:
@@ -476,7 +483,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         lines = self.log.read_text().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0], first_log.decode().strip())
-        self.assertIn(f"alpha-unit phase 2 ({sha}) merged as {pushed}; ", lines[1])
+        self.assertIn(f"alpha phase 2 ({sha}) merged as {pushed}; ", lines[1])
 
 
 @final

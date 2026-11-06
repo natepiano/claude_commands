@@ -17,6 +17,7 @@ import time
 import unittest
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, NamedTuple, cast, override
@@ -35,6 +36,7 @@ from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, session_staff, worker_admission
+from scripts.usage import agents_log
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_worker, fixture_session
 
 WORKER = "unit-impl"
@@ -482,7 +484,7 @@ sys.exit(code)
         with contextlib.ExitStack() as children, (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
             processes = [children.enter_context(subprocess.Popen(
-                [sys.executable, "-c", script, str(self.session), WORKER, str(index)],
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(self.session), WORKER, str(index)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
                 for index in range(4)]
             for child in processes:
@@ -530,7 +532,7 @@ sys.exit(code)
                         self.update_record(path, pid=0, started_at=time.time() - 600)
                         unpublished = path.read_bytes()
                         child = children.enter_context(subprocess.Popen(
-                            [sys.executable, "-c", script, verb, str(self.session), WORKER],
+                            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, verb, str(self.session), WORKER],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
                         assert child.stdout is not None
                         self.assertTrue(select.select([child.stdout], [], [], guard.remaining())[0])
@@ -577,7 +579,7 @@ sys.exit(1)
             listener.listen()
             listener.settimeout(guard.remaining())
             started = subprocess.run(
-                [sys.executable, "-c", script, "start", "--session-dir", str(self.session), "--to", WORKER,
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, "start", "--session-dir", str(self.session), "--to", WORKER,
                  "--done-message-file", str(self.root / "unused-done-message"), "--", sys.executable,
                  "-c", command, address, str(guard.remaining())],
                 capture_output=True, text=True, timeout=guard.remaining(), check=False)
@@ -878,15 +880,32 @@ sys.exit(1)
         active.mkdir()
         _ = (active / "director-session").write_text(f"{self.session}\n", encoding="utf-8")
         self.write_roster(THREAD_ONE, "done", DEAD_PID, port=4100)
-        record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(2)"]))
+        path = self.record([sys.executable, "-c", "raise SystemExit(2)"])
+        with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.root / "usage")}):
+            agents_log.append(THREAD_ONE, "test", None, datetime.now(timezone.utc))
+            record = self.supervise(path)
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0].session_id, self.unit.current_session)
         for part in (f"Worker {WORKER}'s run", f"Worker: {WORKER}",
-                     f"Dispatch the worker (implement.sh --to {WORKER})",
+                     f"Dispatch the worker (assign.sh --role test --to {WORKER})",
                      "Command: ", "FAIL (exit 2)", "Log: "):
             self.assertIn(part, self.sent[0].text)
         self.assertEqual(self.pending(), {})
         self.assertIn("sent to director", record.get("delivery", ""))
+
+    def test_director_hint_uses_the_current_role_after_the_worker_changes_roles(self) -> None:
+        self.write_roster(THREAD_ONE, "done", DEAD_PID, port=4100)
+        with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.root / "usage")}):
+            agents_log.append(THREAD_ONE, "impl", None, datetime.now(timezone.utc))
+            with (patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)),
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(mesh_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
+                                                "--", sys.executable, "-c", "pass"]), 0)
+            path = next((self.session / codex_mesh.DETACHED_RUNS_DIR).glob("*.json"))
+            agents_log.append(THREAD_ONE, "review", "contract", datetime.now(timezone.utc))
+            record = self.supervise(path)
+        self.assertNotIn("role", record)
+        self.assertIn(f"Dispatch the worker (assign.sh --role review --to {WORKER})", self.sent[0].text)
 
     def test_a_run_started_for_the_seats_role_reaches_the_seat(self) -> None:
         # tool-based-ui-trunk-box started its runs with `--to box` (2026-10-20): each was lost.

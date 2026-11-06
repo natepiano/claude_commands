@@ -286,7 +286,7 @@ def staff_name(identity: str) -> str:
 def proposal_unit(issue: Issue) -> str:
     """Read the unit id from the proposal's stored staff id."""
     identity = issue.value("unit")
-    return unit_names.unit_id(staff_reference(identity, "unit").name) if identity else ""
+    return staff_reference(identity, "unit").name if identity else ""
 
 
 def calling_showrunner() -> str:

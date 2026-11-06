@@ -33,7 +33,7 @@ class ActionConflictTests(unittest.TestCase):
     def test_words_that_give_no_second_action(self) -> None:
         for body in ("You approved it.", "The pane shows the prompt.", "It does no work until you type the go.",
                      "A type of build failed.", "Done! The build works.", "The tile session waits.",
-                     "The tile-unit session waits.", "a != b", "tile's session waits.", "In a Claude session, it waits."):
+                     "The tile session waits.", "a != b", "tile's session waits.", "In a Claude session, it waits."):
             with self.subTest(body=body):
                 self.assertEqual(action_conflicts(TILE, body), [])
 

@@ -112,10 +112,10 @@ class DurableRolesTests(unittest.TestCase):
         membership = StaffTestCase()
         membership.setUp()
         self.addCleanup(membership.doCleanups)
-        document = membership.production("demo", "design-unit")
+        document = membership.production("demo", "design")
         _ = recorded_showrunner("demo", document)
-        production_membership("demo", "design-unit")
-        unit = unit_membership("demo", "design-unit")
+        production_membership("demo", "design")
+        unit = unit_membership("demo", "design")
         _ = staff.update_current_session(unit.current_session, staff.native_id(self.holder_session))
         self.repository = self.root / "checkout"
         self.repository.mkdir()
@@ -279,7 +279,7 @@ class DurableRolesTests(unittest.TestCase):
         directory = self.root / name
         phase = directory / "phases/1"
         phase.mkdir(parents=True)
-        owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repository)
+        owner = fixture_unit_location(showrunner_relationship("demo"), "design", self.repository)
         _ = (phase / "delegated_phase_reservation_state.json").write_text(json.dumps({
             "kind": "enrolled_awaiting_first_touch", "phase": "1"}))
         _ = (phase / "files").write_text("design.md\n")
@@ -716,8 +716,8 @@ class DurableRolesTests(unittest.TestCase):
         self.addCleanup(backend.doCleanups)
         self.addCleanup(backend.tearDown)
         _ = recorded_showrunner("demo", document)
-        production_membership("demo", "design-unit")
-        _ = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repository)
+        production_membership("demo", "design")
+        _ = fixture_unit_location(showrunner_relationship("demo"), "design", self.repository)
         parent = staff.by_path(parent_path)
         assert parent is not None
         os.environ["CODEX_THREAD_ID"] = parent.current_session

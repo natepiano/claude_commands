@@ -29,7 +29,7 @@ must not drift from it:
   makes the visual choices, clears waits between units, relays the user's words
   and reports when asked. It writes no implementation code.
 - **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
-  branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
+  branch. A unit is named for its area, e.g. `widget`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
 - **Unit director** — the Claude session that runs a unit: the `/unit:direct`
   session the showrunner launches in its own herdr session. It receives messages,
@@ -51,16 +51,15 @@ must not drift from it:
 - **Lease** — one reviewer's assignment to one unit's phase, cleared at phase end.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
-  named `trunk-unit`.
+  named `trunk`.
 - **Parent, child and root showrunner** — a production's showrunner may report
   to another production's (`/showrunner:attach`). The one at the top of a tree is
   the root: it shows every item that needs the user from the productions below
   it, and the user may still work with any showrunner directly. A child showrunner is never a
   unit: it keeps its own production doc, merge branch and units, and its staff
   row is a showrunner row. Which production reports to which is state on the
-  machine, `~/.local/state/showrunner/<child slug>/parent`, and no line in either
-  production doc, so either side attaches without a commit in the other's
-  checkout. Look it up with `showrunners.py parent|children|root <slug>`.
+  staff row. Either side attaches without a commit in the other's checkout.
+  Read the relationship with `showrunners.py parent|children|root <showrunner name>`.
 
 User, 2026-09-28: production, showrunner and unit were chosen because Hana is a
 DCC app and the film words are short.
@@ -72,6 +71,7 @@ User, 2026-10-01: the session that runs a unit is its unit director.
 ## Production doc structure
 
 The production doc sits beside the source plan as `<source-stem>-production.md`.
+The showrunner staff row gives its path. The row's `name` is the production name.
 
 ```markdown
 # Production — <name>
@@ -80,8 +80,6 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 
 ## Production Context
 
-- **Formerly:** `<old>`, `<older>` — previous production slugs, newest first, written by
-  `/showrunner:rename`; old names keep resolving through it; omit before the first rename
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
@@ -92,7 +90,6 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Parent production:** <path to parent production doc> — style productions only:
   the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
-- **Showrunner session:** <name> — the showrunner's session name; it also names the production's workspace in the shared herdr session (the slug when absent)
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **Updates:** `on demand` (the default, also when the line is missing), or every <N>
   minutes when the user asks for a schedule; each update reports every unit in full; the
@@ -110,7 +107,7 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   nothing users see changes
 - **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`;
   required. One list per top-level showrunner, named for its session name, never the
-  production slug (`change-review - natedev.md`); a child production names its root's
+  document file name (`change-review - natedev.md`); a child production names its root's
   list. `change_review.py` resolves the list from the root showrunner while it runs and
   falls back to this path when it does not, warning when the two differ.
   `merge_checkpoint.py` adds a row per `Change-Review:` line a merged checkpoint names, and
@@ -128,12 +125,8 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   proposed and deferred lines show as `N efficiency` in the `For you:`
   line on the status line and in the dailies footer
 
-The **Showrunner session** line can be out of date: a name can change, so look
-it up when needed. `~/.claude/scripts/lib/py
-~/.claude/scripts/production/showrunners.py name <slug>` prints it as it is now.
-A unit sends to the address `showrunners.py address <slug>` prints, not to the
-name: the address is the showrunner's session on this machine, and `SendMessage`
-refuses a name that another session of the same account also has.
+Read the current showrunner name from its staff row.
+Send to the address from `showrunners.py address <showrunner name>`.
 
 ## Hub files
 
@@ -156,16 +149,15 @@ The row gives its name, parent and worktree; git there gives the repository and 
 The units appear in staff.json row order. Untracked `.unit.toml` at the worktree root gives
 the plan, app port and short duty names. Responsibilities do not limit changed paths.
 
-The unit id (`<name>-unit`) names the unit everywhere: in the log, the dailies, the waits and
+The staff name names the unit everywhere: in the log, the dailies, the waits and
 every tool's arguments. A unit's session name can change, so find the unit at that moment:
-`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
-prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
-session name now. `<slug>` is this doc's file name without `-production.md`; a former
-slug from the Formerly line also works.
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <showrunner name> <unit>`
+prints its pane, and `unit_lookup.py list <showrunner name>` prints every unit's pane and its
+session name now. `<showrunner name>` is the parent showrunner row's `name`.
 
 To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
 between phases. Never edit the staff row or `.unit.toml` by hand. The rename stops the unit,
-moves its branch, worktree and state, and commits `chore(<slug>): rename unit <old> to <new>` on
+moves its branch, worktree and state, and commits `chore(<showrunner name>): rename unit <old> to <new>` on
 the merge branch. Merge history follows that commit, so the unit's past merges still count under
 the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
 
@@ -185,9 +177,9 @@ reviewer.
 
 <ProductionUnit>
 Applies when your staff row has a parent showrunner.
-Read your staff row with `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py --json get <sessionId>`.
+Read your staff row with `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py get <sessionId> --json`.
 Read its `parent` row with the same command.
-The parent row gives the production name and its `doc.path`.
+The parent row's `name` is the production name. Its `doc.path` gives the document.
 Read that document at the start of the run and after every compaction.
 Your staff row gives your name and worktree. Git in that worktree gives the branch.
 The untracked `.unit.toml` in your worktree gives your plan, port and short duty names. Responsibilities do not limit changed paths.

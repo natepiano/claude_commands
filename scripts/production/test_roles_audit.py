@@ -576,7 +576,7 @@ class SourceCheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_check_root(root, {"scripts/error.py":
-                'raise ValueError(f"showrunner {runner.slug} is not running")\n'})
+                'raise ValueError(f"showrunner {runner.name} is not running")\n'})
             output = StringIO()
             with redirect_stdout(output):
                 status = audit.main(["check", "--root", str(root), "--prose"])

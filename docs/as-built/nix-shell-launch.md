@@ -218,7 +218,7 @@ The local five-minute sweep is a notifier timer, registered on main on natedev:
 
 The showrunner still owns the bare `claude` and `codex` PATH wrappers in
 `/etc/nixos`; each must call this helper with the real absolute executable.
-Accounts-unit owns `accounts.py exec`, which calls `launch_shell_environment`;
+Accounts owns `accounts.py exec`, which calls `launch_shell_environment`;
 the scan recognizes that function as a guard.
 
 

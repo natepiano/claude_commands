@@ -926,7 +926,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_unit_suffix_alias_uses_staff_instead_of_the_registry_label(self) -> None:
         self.session("resources-current", "different transport label")
         self.staff_member("resources-current", "resources")
-        for name in ("resources-unit", "resources"):
+        for name in ("resources", "resources"):
             result = send.send(local_options(["--to", name, "--from", "test", "--text", name]))
             self.assertEqual(result.outcome, "sent")
         self.assertEqual([message.to for message in self.relayed],
@@ -948,7 +948,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         rows = [parent, *(staff.StaffRow(staff.StaffId(identity), "unit", "resources", staff.ReportsTo(parent.id),
                                         current_session=staff.StaffId(identity)) for identity in ("one", "two"))]
         self.staff_rows = {row.id: row for row in rows}
-        for target in ("resources-unit", "builds/resources-unit"):
+        for target in ("resources", "builds/resources"):
             errors = io.StringIO()
             with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
                 _ = send.send(local_options(["--to", target, "--text", "hello"]))
@@ -962,9 +962,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.staff_rows.clear()
         errors = io.StringIO()
         with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
-            _ = send.send(local_options(["--to", "resources-unit", "--text", "hello"]))
+            _ = send.send(local_options(["--to", "resources", "--text", "hello"]))
         self.assertEqual(stopped.exception.code, 2)
-        self.assertEqual(errors.getvalue(), "send.py: no staff row or live session for 'resources-unit'\n")
+        self.assertEqual(errors.getvalue(), "send.py: no staff row or live session for 'resources'\n")
         self.assertEqual(self.relayed, [])
         self.assertFalse((self.root / "queue").exists())
 
@@ -1019,8 +1019,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                              current_session=staff.StaffId("director"))
         self.staff_rows = {row.id: row for row in (runner, unit)}
         record = staff.StaffSnapshot(tuple(self.staff_rows.values()))
-        self.assertEqual(send.resolve_staff_recipient("builds/resources-unit", record), unit)
-        self.assertEqual(send.repeat_notice_owner("resources-unit"), "session:runner-current")
+        self.assertEqual(send.resolve_staff_recipient("builds/resources", record), unit)
+        self.assertEqual(send.repeat_notice_owner("resources"), "session:runner-current")
         self.assertEqual(send.send(local_options(["--to", "builds", "--text", "hello"])).outcome, "sent")
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'runner-current.sock'}")
 
@@ -1031,7 +1031,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         records = sessions.running_sessions()
         with mock.patch.object(staff, "snapshot", return_value=record) as snapshots, \
                 mock.patch.object(roster, "roster", return_value=roster.Roster([], [])) as transport:
-            self.assertEqual(send.send(local_options(["--to", "resources-unit", "--text", "hello"])).outcome, "sent")
+            self.assertEqual(send.send(local_options(["--to", "resources", "--text", "hello"])).outcome, "sent")
         snapshots.assert_called_once_with()
         transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record, records=records)
 
@@ -1235,7 +1235,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             machine="fixture", kind="claude", role="worker", name="fixed-sender-address", status="working",
             reach=roster.Messageable("session:sender"), cwd="/fixture",
             showrunner=roster.UnderShowrunner("sdlc", "runner", "session:runner"),
-            director=roster.UnderDirector("roles-unit", "director", "session:director"),
+            director=roster.UnderDirector("roles", "director", "session:director"),
             assignment=roster.WorkerAssignment("test", "/fixture/run", "test", "test"),
             session=roster.ClaudeSession("sender"),
         )
@@ -1268,7 +1268,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             machine="fixture", kind="claude", role="worker", name="sender-address", status="working",
             reach=roster.Messageable("session:sender"), cwd="/fixture",
             showrunner=roster.UnderShowrunner(production, "runner", "session:runner"),
-            director=roster.UnderDirector("roles-unit", "director", "session:director"),
+            director=roster.UnderDirector("roles", "director", "session:director"),
             assignment=roster.WorkerAssignment("test", "/fixture/run", "test", "test"),
             session=roster.ClaudeSession("sender"),
         )
@@ -1648,7 +1648,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                                current_session=staff.StaffId("current"))
         self.staff_rows = {row.id: row for row in (runner, member)}
         started = send.now()
-        targets = ("resources", "fixed", "resources-unit", "builds/resources-unit", "session:fixed",
+        targets = ("resources", "fixed", "resources", "builds/resources", "session:fixed",
                    "session:current", "codex:current", f"uds:{self.root / 'current.sock'}")
         with mock.patch.object(send, "now", return_value=started):
             for index, target in enumerate(targets):
@@ -4318,14 +4318,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertIn("--value needs distinct key=value pairs", errors.getvalue())
 
     def test_sender_and_session_values_lose_the_unit_suffix_but_free_text_keeps_per_unit(self) -> None:
-        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-unit"}))
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
-        options = local_options(self.auto_mode_arguments(session="types-unit", commands=("save_counts.py --per-unit",),
-                                                         waits="The trunk-unit plan waits for it"))
+        options = local_options(self.auto_mode_arguments(session="types", commands=("save_counts.py --per-unit",),
+                                                         waits="The trunk plan waits for it"))
         self.assertEqual(options.summary, "cargo-liner: auto mode stopped types")
         self.assertEqual(options.sender, "cargo-liner")
         self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, approve the prompt or add an allow rule"))
-        self.assertIn("Auto mode refused a shell command in the types session. The trunk-unit plan waits for it.\n"
+        self.assertIn("Auto mode refused a shell command in the types session. The trunk plan waits for it.\n"
                       + "save_counts.py --per-unit", options.text or "")
 
     def test_a_free_text_auto_mode_refusal_is_held_with_the_template_call(self) -> None:
@@ -5288,6 +5288,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             blocked.chmod(0o755)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
+            "CLAUDE_PYTHON": sys.executable,
             "CONF_DIR": str(self.root / "config"),
             "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),

@@ -467,7 +467,7 @@ def message(comparison: ComparisonReport, phases: PhaseReport, extracted: Extrac
     dropped = sum(sum(session["dropped"].values()) for session in extracted["sessions"])
     since = [since_pooled_line(history)] if not isinstance(history, NotRecorded) else []
     measures = measure_lines(comparison)
-    lines = [f"From model-study-unit: {kind} director model study — {verdict(comparison, phases)}.",
+    lines = [f"From model-study: {kind} director model study — {verdict(comparison, phases)}.",
              *measures, *since,
              "Verdict:", *verdict_lines(comparison, phases), "Per-director comparison:"]
     table = director_table(comparison, phases)

@@ -1,11 +1,11 @@
 ---
 description: Promote a unit to child showrunner.
-argument-hint: "<unit> <production doc> [check]"
+argument-hint: "<unit> <showrunner name> --doc <path> [check]"
 ---
 
 # Promote showrunner
 
-**Usage:** `/showrunner:promote_showrunner <unit> <production doc>`, or with
+**Usage:** `/showrunner:promote_showrunner <unit> <showrunner name> --doc <path>`, or with
 `check` to see whether it would go ahead.
 
 Run this in the showrunner session of a running production. The unit keeps its
@@ -17,12 +17,13 @@ the time)". The other direction, a session becoming a unit, is
 `/showrunner:promote_unit`.
 
 First the unit writes the new production's doc in the production format and
-commits it. This command writes no doc.
+commits it. Pass its path with the required `--doc` option.
+Use the same path for a rerun. This command writes no doc.
 
 Run, with the sandbox off:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/promote_showrunner.py" <unit> --production <PRODUCTION_DOC> --model <your model id> --effort <your effort level> [--check]
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/promote_showrunner.py" <unit> --production <showrunner name> --doc <path> --model <your model id> --effort <your effort level> [--check]
 ```
 
 Pass your own model id and effort level, as for `/showrunner:add_showrunner`.

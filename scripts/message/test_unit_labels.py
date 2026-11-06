@@ -8,7 +8,6 @@ import os
 from contextlib import redirect_stderr
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 from typing import TYPE_CHECKING, cast
 import unittest
@@ -62,7 +61,7 @@ class FileOnlyLabelTests(unittest.TestCase):
 
     def test_failed_discovery_keeps_healthy_rows_and_reports_each_problem_once(self) -> None:
         from scripts.message import unit_labels
-        from scripts.production import fake_showrunner, session_staff, showrunners
+        from scripts.production import session_staff, showrunners
         from scripts.production.staff_test_support import fixture_runtime_id
         from scripts.shutdown import remote
 
@@ -77,12 +76,15 @@ class FileOnlyLabelTests(unittest.TestCase):
             missing = staff.StaffRow(missing_id, "showrunner", "missing-owner", staff.StaffRoot(),
                                      current_session=missing_id,
                                      doc=staff.LiveDoc("natedev", root / "missing-production.md"))
-            _ = fake_showrunner.write_timer(root, "healthy-alias", identity, "UTC", doc)
+            timer_path = root / f"showrunner-{identity}"
+            timer_path.mkdir()
+            _ = (timer_path / "conf").write_text(
+                f"TARGET=session:{identity}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
             record: SessionRecord = {
                 "pid": 123, "sessionId": identity, "name": "healthy", "messagingSocketPath": "",
                 "updatedAt": 1, "tmux": "", "formerNames": [],
             }
-            healthy = showrunners.Showrunner(session="healthy", socket="", slug="healthy-alias",
+            healthy = showrunners.Showrunner(session="healthy", socket="", name="healthy-owner",
                                              zone="UTC", doc=str(doc))
             resolver = session_staff.RowResolver(staff.StaffSnapshot((healthy_owner, missing)))
             problems: list[str] = []
@@ -130,7 +132,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                         resolver = session_staff.RowResolver(snapshot)
                         if reader == "registrations":
                             registered = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems), known_sessions={}, resolver=resolver)
-                            self.assertEqual([row["slug"] for row in registered], ["healthy-alias"])
+                            self.assertEqual([row["name"] for row in registered], ["healthy-owner"])
                         else:
                             places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot, resolver=resolver)
                             self.assertEqual(set(places), {rows[3].current_session})
@@ -141,7 +143,7 @@ class FileOnlyLabelTests(unittest.TestCase):
 
     def test_unreadable_timer_file_does_not_remove_another_showrunners_rows(self) -> None:
         from scripts.message import unit_labels
-        from scripts.production import fake_showrunner, session_staff, showrunners
+        from scripts.production import session_staff, showrunners
         from scripts.production.staff_test_support import fixture_runtime_id
         from scripts.shutdown import remote
 
@@ -158,8 +160,11 @@ class FileOnlyLabelTests(unittest.TestCase):
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
                                           worktree=staff.PresentWorktree("natedev", root / name)))
-                _ = fake_showrunner.write_timer(timers, name + "-alias", owner_id, "UTC", document)
-            unreadable = timers / "showrunner-broken-alias/conf"
+                timer_path = timers / f"showrunner-{owner_id}"
+                timer_path.mkdir(parents=True)
+                _ = (timer_path / "conf").write_text(
+                    f"TARGET=session:{owner_id}\nCHECK=zsh /scripts/production_check.sh {document}\n")
+            unreadable = timers / f"showrunner-{rows[0].id}" / "conf"
             unreadable.unlink()
             unreadable.mkdir()
             snapshot = staff.StaffSnapshot(tuple(rows))
@@ -172,7 +177,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                         resolver = session_staff.RowResolver(snapshot)
                         if reader == "registrations":
                             registered = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(problems), known_sessions={}, resolver=resolver)
-                            self.assertIn("healthy-alias", [row["slug"] for row in registered])
+                            self.assertIn("healthy-owner", [row["name"] for row in registered])
                         else:
                             places = unit_labels.production_places([], set(), unit_labels.StaffDiagnostics(problems), record=snapshot, resolver=resolver)
                             self.assertIn(rows[3].current_session, places)
@@ -240,7 +245,7 @@ print(json.dumps({
 """
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
-                [sys.executable, "-c", program, directory], input=json.dumps(record),
+                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, directory], input=json.dumps(record),
                 cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
                 check=False, timeout=10,
             )

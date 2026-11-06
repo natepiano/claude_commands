@@ -196,7 +196,7 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 
 <ProductionUnit>
 Your staff row identifies your unit and its parent showrunner.
-The parent row identifies your production and its document.
+The parent row's `name` is your production name. Its `doc.path` gives the document.
 Read `~/.claude/docs/production_format.md` → <ProductionUnit/> at <PrepareSession/> and after every compaction.
 Apply it throughout the run when your staff row has a parent showrunner. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
