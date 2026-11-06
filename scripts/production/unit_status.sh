@@ -32,14 +32,13 @@ PY=$REPO/scripts/lib/py
 staff_lines=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
 import sys
 sys.path.insert(0, sys.argv[1])
-from scripts.production import staff, unit_names
+from scripts.production import staff
 from scripts.production.showrunners import owner_for
 arguments = sys.argv[2:]
 record = staff.snapshot()
 owner = owner_for(arguments[1] if arguments[0] == "--production" else arguments[0], record=record)
 for row in record.find(parent=owner.id, kind="unit"):
-    for label in {row.name, unit_names.unit_id(row.name)}:
-        print(f"{label}\t{row.id}")
+    print(f"{row.name}\t{row.id}")
 PYTHON
 ) || exit 1
 staff_rows=("${(@f)staff_lines}")

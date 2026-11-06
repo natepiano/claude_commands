@@ -43,7 +43,7 @@ class ReviewRegimeTests(unittest.TestCase):
         return output.getvalue()
 
     def add_row(self, plan: str, phase: str) -> None:
-        _ = self.add("--unit", "dashboard-unit", "--plan", plan, "--phase", phase)
+        _ = self.add("--unit", "dashboard", "--plan", plan, "--phase", phase)
 
     def report(self) -> str:
         output = io.StringIO()
@@ -53,7 +53,7 @@ class ReviewRegimeTests(unittest.TestCase):
 
     def test_add_stores_and_reports_simplify_fields_without_using_the_note(self) -> None:
         self.add_row(FIRST_PLAN, "1")
-        _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "2",
+        _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "2",
                      "--simplify-findings", "0", "--simplify-minutes", "2.5", "--note", "user note")
 
         record = cast(dict[str, object], json.loads(self.ledger.read_text().splitlines()[1]))
@@ -67,7 +67,7 @@ class ReviewRegimeTests(unittest.TestCase):
         self.assertIn("| simplify minutes per phase (mean) | - | - | 2.5 |", report)
 
     def test_add_without_simplify_fields_preserves_the_legacy_record_and_report(self) -> None:
-        _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "1",
+        _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1",
                      "--ux-findings", "2", "--code-findings", "3", "--review-minutes", "14")
         row = review_regime.read_rows()[0]
         self.assertEqual((row.ux_findings, row.code_findings, row.review_minutes), (2, 3, 14))
@@ -78,9 +78,9 @@ class ReviewRegimeTests(unittest.TestCase):
         self.assertIn("| code findings per phase (mean) | - | - | 3.0 |", report)
 
     def test_legacy_add_keeps_the_serialized_record_bytes(self) -> None:
-        _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "1")
+        _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1")
         expected = {
-            "unit": "dashboard-unit", "plan": FIRST_PLAN, "phase": "1", "regime": "after",
+            "unit": "dashboard", "plan": FIRST_PLAN, "phase": "1", "regime": "after",
             "started": STARTED, "merged": MERGED, "holds": 0, "merge_defects": 0,
             "ux_findings": None, "code_findings": None, "review_minutes": None,
             "ux_check_minutes": None, "ux_repair_minutes": None, "note": None, "excluded": None,
@@ -116,7 +116,7 @@ class ReviewRegimeTests(unittest.TestCase):
             ("2", "--simplify-minutes", "simplify_minutes", "0", "simplify_findings"),
         ):
             with self.subTest(flag=flag):
-                _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", phase, flag, value)
+                _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", phase, flag, value)
                 record = cast(dict[str, object], json.loads(self.ledger.read_text().splitlines()[-1]))
                 self.assertEqual(record[field], float(value))
                 self.assertNotIn(absent, record)
@@ -126,18 +126,18 @@ class ReviewRegimeTests(unittest.TestCase):
         self.add_row(SECOND_PLAN, "1")
 
         self.assertEqual([(row.unit, row.plan, row.phase) for row in review_regime.read_rows()], [
-            ("dashboard-unit", FIRST_PLAN, "1"),
-            ("dashboard-unit", SECOND_PLAN, "1"),
+            ("dashboard", FIRST_PLAN, "1"),
+            ("dashboard", SECOND_PLAN, "1"),
         ])
 
     def test_the_same_unit_plan_and_phase_keeps_the_first_merge(self) -> None:
         self.add_row(FIRST_PLAN, "1")
         before = self.ledger.read_bytes()
 
-        output = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "1",
+        output = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1",
                           "--note", "repair merge", merged="2026-10-13T11:00:00-04:00")
 
-        self.assertEqual(output, f"kept dashboard-unit phase 1 of {FIRST_PLAN}: "
+        self.assertEqual(output, f"kept dashboard phase 1 of {FIRST_PLAN}: "
                          + f"a row exists from the merge at {MERGED}; nothing added\n")
         self.assertEqual(self.ledger.read_bytes(), before)
         self.assertEqual(len(review_regime.read_rows()), 1)
@@ -154,13 +154,13 @@ class ReviewRegimeTests(unittest.TestCase):
         ):
             with self.subTest(started=started, merged=merged):
                 with self.assertRaises(SystemExit) as refused:
-                    _ = self.add("--unit", "dashboard-unit", "--plan", FIRST_PLAN, "--phase", "1",
+                    _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1",
                                  started=started, merged=merged)
                 self.assertEqual(str(refused.exception), expected)
                 self.assertEqual(self.ledger.read_bytes(), before)
 
     def test_a_row_written_before_the_plan_was_recorded_reads_and_blocks_nothing(self) -> None:
-        old = {"unit": "dashboard-unit", "phase": "1", "regime": "after", "started": STARTED, "merged": MERGED,
+        old = {"unit": "dashboard", "phase": "1", "regime": "after", "started": STARTED, "merged": MERGED,
                "holds": 0, "merge_defects": 0}
         _ = self.ledger.write_text(json.dumps(old) + "\n")
 
@@ -170,7 +170,7 @@ class ReviewRegimeTests(unittest.TestCase):
 
     def test_add_needs_the_plan(self) -> None:
         with self.assertRaises(SystemExit) as refused:
-            _ = self.add("--unit", "dashboard-unit", "--phase", "1")
+            _ = self.add("--unit", "dashboard", "--phase", "1")
 
         self.assertEqual(refused.exception.code, 2)
         self.assertFalse(self.ledger.exists())

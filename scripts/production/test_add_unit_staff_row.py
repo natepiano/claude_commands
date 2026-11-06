@@ -18,7 +18,7 @@ def setUpModule() -> None:
 
 class AddUnitStaffRowTests(AddUnitTestCase):
     def test_unit_under_another_showrunner_refuses_with_move_command_without_adding_rows_or_tabs(self) -> None:
-        row = unit_membership("sdlc", "alpha-unit")
+        row = unit_membership("sdlc", "alpha")
         before = self.staff.staff_file.read_bytes()
         repository = self.repository_state()
 
@@ -41,7 +41,7 @@ class AddUnitStaffRowTests(AddUnitTestCase):
             row = unit_membership(self.production_name, "alpha")
             before = self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns
             with patch.object(staff, "ensure", wraps=staff.ensure) as ensure:
-                found = add_unit.ensure_staff_unit(production, "alpha-unit")
+                found = add_unit.ensure_staff_unit(production, "alpha")
             self.assertEqual(found, row)
             ensure.assert_not_called()
             self.assertEqual((self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns), before)
@@ -55,7 +55,7 @@ class AddUnitStaffRowTests(AddUnitTestCase):
             before = staff.snapshot()
             worktree = self.root / "project-alpha"
             _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
-            row = add_unit.ensure_staff_unit(production, "alpha-unit",
+            row = add_unit.ensure_staff_unit(production, "alpha",
                                              worktree=staff.PresentWorktree("natedev", worktree),
                                              runtime_id=fixture_runtime_id("new-alpha-unit-backend"))
             parent = before.by_path(self.production_name)

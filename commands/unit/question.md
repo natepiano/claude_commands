@@ -29,7 +29,7 @@ those to the showrunner as before.
    - each choice, and what it does;
    - the recommended choice, and why: `(recommended — <reason>)`.
    Also write a one-line text for it, the name the lists use (for example
-   `alpha-unit: keep the old key binding?`).
+   `alpha: keep the old key binding?`).
 3. **File it.** Run
    ```sh
    python3 ~/.claude/scripts/production/update_registration.py ask --production <showrunner name> --unit <your unit> --text "<one line>" --question "<the full question>" [--urgency blocks]

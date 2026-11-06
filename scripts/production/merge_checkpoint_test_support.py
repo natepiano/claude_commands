@@ -423,7 +423,16 @@ class MergeCheckpointFixture(unittest.TestCase):
                        review: bool = True, trial: str = TRIAL,
                        delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
         before = self.git("rev-parse", "HEAD")
-        arguments = ["--production", "example", "alpha-unit", phase, sha,
+        runs = self.root / "history/runs"
+        fixture_records = runs / "fixture.jsonl"
+        if "--shrink" not in extra and "--as-built" not in extra and not any(
+                path != fixture_records for path in runs.glob("*.jsonl")):
+            runs.mkdir(parents=True, exist_ok=True)
+            with fixture_records.open("a") as output:
+                _ = output.write(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "working_dir": str(self.unit), "checkpoint_commit": sha,
+                    "phase_id": phase, "timestamp_epoch": fixture_records.stat().st_size}) + "\n")
+        arguments = ["--production", "example", "alpha", phase, sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
                      "--trailer", "Co-authored-by: Test <test@example.invalid>"]
         if review:
@@ -449,10 +458,10 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.env["BUMP_TEST_ORIGIN"] = str(self.origin)
         self.env.update(fake_unit_host.environment(self.state))
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            production_membership("example", "alpha-unit")
+            production_membership("example", "alpha")
             runner = fixture_member("showrunner", name="example")
-            director = unit_membership("example", "alpha-unit")
-            fake_unit_host.write(self.env, [labeled_host("fixture-unit", "w1:p1", "alpha-unit", production_name="example")])
+            director = unit_membership("example", "alpha")
+            fake_unit_host.write(self.env, [labeled_host("fixture", "w1:p1", "alpha", production_name="example")])
         records = self.root / "sessions"
         records.mkdir()
         self.env["NOTIFIER_SESSIONS_DIR"] = str(records)
@@ -637,7 +646,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.events("checkpoint-test"), [])
         self.assertEqual(self.events("review_regime.py"), [])
-        self.assertIn("send alpha-unit:", result.process.stdout)
+        self.assertIn("send alpha:", result.process.stdout)
 
     def receipts(self) -> list[dict[str, object]]:
         path = self.root / "history" / "merge_receipts.jsonl"

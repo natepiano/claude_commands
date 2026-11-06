@@ -1562,7 +1562,7 @@ def _production_reference(plan_path: Path, *, resolver: session_staff.RowResolve
     parent = resolver.record.parent_of(member.row)
     if parent is None or parent.kind != "showrunner":
         return PlanOutsideProduction()
-    unit = unit_names.unit_id(member.row.name)
+    unit = member.row.name
     return ProductionReference(parent.name, unit, str(doc.path))
 
 
@@ -1859,7 +1859,7 @@ def prune(production_doc: Path) -> None:
     production = read_production(production_doc)
     identity = production.name
     live_units = {
-        unit_names.unit_id(unit_plan.unit) for unit_plan in _production_unit_plans(production)
+        unit_plan.unit for unit_plan in _production_unit_plans(production)
     }
     vault_root = _vault_root()
     for candidate in vault_root.glob("*/*.md"):
@@ -1867,7 +1867,7 @@ def prune(production_doc: Path) -> None:
         if (
             not isinstance(ownership, NoteOwnership)
             or not _owns_note(ownership, identity, ownership.unit)
-            or any(row.id == ownership.unit and unit_names.unit_id(row.name) in live_units
+            or any(row.id == ownership.unit and row.name in live_units
                    for row in staff.snapshot().find(kind="unit"))
         ):
             continue

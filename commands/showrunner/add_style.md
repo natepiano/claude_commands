@@ -17,20 +17,20 @@ Show the output; stop on a nonzero exit.
 On creation, repeat `--pilot` to launch only named units. They go in the doc's
 `**Pilot units:**` field, and the style showrunner launches only them. Package names after
 `=` restrict that unit's crates. All four plans are still written. Example:
-`--pilot modules --pilot cargo-liner-style-names-unit=cargo-handler --pilot types-unit=cargo-port`.
-A pilot accepts a family, its old `<family>-unit` id, or its full id.
+`--pilot modules --pilot cargo-liner-style-names=cargo-handler --pilot types=cargo-port`.
+A pilot accepts a family or its full staff name.
 `--check` lists the units and scopes. An existing production refuses `--pilot`.
 An interrupted bootstrap can change only units whose worktrees do not exist;
 after launch, edit scope only in that unit's own plan copy (see
 `docs/style_production.md`, Pilot scope).
 
-A unit id is `<style showrunner name>-<family>-unit`; the style showrunner name is `<repo>-style`,
+A unit id is `<style showrunner name>-<family>`; the style showrunner name is `<repo>-style`,
 independent of the parent production's name. Worktrees and branches use
 `<style showrunner name>-<family>`.
 
 | Family | Unit id |
 | --- | --- |
-| names | `<style showrunner name>-names-unit` |
-| values | `<style showrunner name>-values-unit` |
-| types | `<style showrunner name>-types-unit` |
-| modules | `<style showrunner name>-modules-unit` |
+| names | `<style showrunner name>-names` |
+| values | `<style showrunner name>-values` |
+| types | `<style showrunner name>-types` |
+| modules | `<style showrunner name>-modules` |

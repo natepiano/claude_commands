@@ -1,8 +1,4 @@
-"""The one naming rule for a production unit: its id, stem, branch and worktree.
-
-`add_unit.py` names a new unit with it, and both renames name the destination with it, so a
-unit created, renamed or moved with its production always gets the same names.
-"""
+"""Derive branch and worktree names from the unit staff name."""
 from __future__ import annotations
 
 import re
@@ -16,23 +12,19 @@ class BadName(ValueError):
 
 
 def name(given: str) -> str:
-    """The unit's name without its `-unit` suffix; a given id is not suffixed twice."""
+    """The unit's staff name."""
     if not NAME.fullmatch(given):
         raise BadName("name must contain only letters, numbers, hyphens, or underscores")
-    return given[: -len("-unit")] if given.replace("_", "-").endswith("-unit") else given
-
-
-def unit_id(given: str) -> str:
-    return f"{name(given)}-unit"
+    return given
 
 
 def stem(unit: str) -> str:
-    """The branch and worktree stem of a unit id: its name with underscores as hyphens."""
-    return unit.removesuffix("-unit").replace("_", "-")
+    """Return the staff name with underscores as hyphens."""
+    return unit.replace("_", "-")
 
 
 def branch(production_name: str, unit_stem: str) -> str:
-    """The production_name names the branch, as it names the production; the merge branch may differ."""
+    """Prefix the branch with the production name when necessary."""
     return unit_stem if unit_stem.startswith(f"{production_name}-") else f"{production_name}-{unit_stem}"
 
 

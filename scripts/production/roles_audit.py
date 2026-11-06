@@ -27,7 +27,7 @@ from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import showrunners, staff, unit_lookup, unit_names
+from scripts.production import showrunners, staff, unit_lookup
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402
@@ -443,7 +443,7 @@ def measure_definitions(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) ->
 
 def parse_production(production_name: str, doc: Path, record: staff.StaffSnapshot) -> ProductionNames:
     row = showrunners.owner_for(production_name, record=record)
-    units = tuple(unit_names.unit_id(row.name) for row in unit_lookup.doc_units(doc, record))
+    units = tuple(row.name for row in unit_lookup.doc_units(doc, record))
     return ProductionNames(row.name, str(doc), row.name, units)
 
 

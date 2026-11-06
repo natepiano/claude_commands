@@ -104,7 +104,7 @@ class UnitRunsTest(StaffTestCase):
 
     def test_director_without_progress_state_resolves_roster_parent_without_output(self) -> None:
         production = fixture_member("showrunner", name="roster-production")
-        owner = fixture_member("unit", name="roster-unit", parent=production.id)
+        owner = fixture_member("unit", name="roster", parent=production.id)
         worker = fixture_worker("impl", owner.id)
         run = self.root / "roster-run"
         run.mkdir()

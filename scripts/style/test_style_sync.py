@@ -209,7 +209,7 @@ class StyleSyncTests(unittest.TestCase):
         checkpoint = self.git("rev-parse", "HEAD")
         with style_ledger.open_ledger(self.repo) as ledger:
             ledger.set_tip(self.tip, "style/main")
-            ledger.ticket_add("3001", ticket_owner_id("modules-unit"), "read", "modules", ".",
+            ledger.ticket_add("3001", ticket_owner_id("modules"), "read", "modules", ".",
                               ["src/lib.rs"], [rule])
             ledger.ticket_assign("3001", "main")
             blob = ledger.pinned_rule_texts("3001")[0].blob
@@ -226,16 +226,16 @@ class StyleSyncTests(unittest.TestCase):
             rows = cast(list[tuple[str]], connection.execute("SELECT unit FROM sync_waits ORDER BY unit").fetchall())
         return [unit for (unit,) in rows]
 
-    def wake_roster(self, units: tuple[str, ...] = ("names-unit", "types-unit")) -> None:
+    def wake_roster(self, units: tuple[str, ...] = ("names", "types")) -> None:
         entries: list[dict[str, str]] = [
             {"role": "unit director", "production": "sample-style", "unit": unit,
-             "name": unit.removesuffix("-unit"), "address": "session:fake-" + unit}
+             "name": unit, "address": "session:fake-" + unit}
             for unit in units
         ]
         entries.extend([
-            {"role": "unit director", "production": "another-style", "unit": "names-unit",
+            {"role": "unit director", "production": "another-style", "unit": "names",
              "name": "names", "address": "session:wrong-production"},
-            {"role": "worker", "production": "sample-style", "unit": "names-unit",
+            {"role": "worker", "production": "sample-style", "unit": "names",
              "name": "names-impl", "address": "seat:wrong-worker"},
         ])
         roster = self.root / "roster.py"
@@ -317,27 +317,27 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_unavailable_wait_owner_does_not_block_a_later_healthy_wait(self) -> None:
         self.production()
-        self.waiting_units("names-unit")
+        self.waiting_units("names")
         self.wake_sender()
         with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("INSERT INTO sync_waits (unit,since,token) VALUES ('missing-unit','2000-01-01','bad-wait')")
+            _ = connection.execute("INSERT INTO sync_waits (unit,since,token) VALUES ('missing','2000-01-01','bad-wait')")
         output = io.StringIO()
         with redirect_stdout(output):
             style_sync.wake_waiters(self.repo, "14")
-        self.assertIn("style_ledger: wake missing-unit:", output.getvalue())
-        self.assertEqual(self.remaining_waiters(), ["missing-unit"])
-        self.assertEqual([arguments[1] for arguments in self.recorded_wakes()], ["session:fake-names-unit"])
+        self.assertIn("style_ledger: wake missing:", output.getvalue())
+        self.assertEqual(self.remaining_waiters(), ["missing"])
+        self.assertEqual([arguments[1] for arguments in self.recorded_wakes()], ["session:fake-names"])
 
     def test_ticket_merge_wakes_two_waiters_once_and_clears_their_rows(self) -> None:
         self.production()
         self.checkpoint_for_wake()
-        self.waiting_units("names-unit", "types-unit")
+        self.waiting_units("names", "types")
         self.wake_sender()
         self.assertEqual(self.merge_for_wake(), (0, "", ""))
         self.assertEqual(self.recorded_wakes(), [
             ["--to", "session:fake-" + unit, "--from", "sample-style", "--text",
              "From the showrunner of sample-style: ticket 3001 merged; refill.", "--timeout", "10"]
-            for unit in ("names-unit", "types-unit")
+            for unit in ("names", "types")
         ])
         self.assertEqual(self.remaining_waiters(), [])
         self.assertEqual((self.root / "roster-args").read_text(), "--json")
@@ -390,7 +390,7 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_an_older_in_flight_wake_cannot_erase_the_units_new_wait(self) -> None:
         self.production()
-        self.waiting_units("names-unit")
+        self.waiting_units("names")
         self.wake_sender()
         with style_ledger.open_ledger(self.repo) as ledger:
             first = ledger.sync_waits()[0]
@@ -406,7 +406,7 @@ class StyleSyncTests(unittest.TestCase):
                     self.assertEqual(ledger.sync_waits(), ())
                     # Equal timestamps ensure that only a wait identity protects the new row.
                     with mock.patch.object(style_ledger, "_now", return_value=first.since):
-                        ledger.wait_for_sync(ticket_owner_id("names-unit"))
+                        ledger.wait_for_sync(ticket_owner_id("names"))
             return cast(object, mock.DEFAULT)
 
         with mock.patch.object(subprocess, "run", wraps=subprocess.run, side_effect=refill_during_send):
@@ -425,8 +425,8 @@ class StyleSyncTests(unittest.TestCase):
     def test_failed_wake_keeps_only_that_waiter_and_an_already_merged_ticket_retries_it(self) -> None:
         self.production()
         self.checkpoint_for_wake()
-        self.waiting_units("names-unit", "types-unit")
-        self.wake_sender("names-unit")
+        self.waiting_units("names", "types")
+        self.wake_sender("names")
         self.assertEqual(self.merge_for_wake(), (0, f"style_ledger: wake {style_unit_id('names')}: send.py: stdout: FAILED: unavailable\n", ""))
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
         with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
@@ -434,7 +434,7 @@ class StyleSyncTests(unittest.TestCase):
         self.wake_sender()
         self.assertEqual(self.merge_for_wake(), (0, "", ""))
         self.assertEqual(self.remaining_waiters(), [])
-        self.assertEqual([arguments[1] for arguments in self.recorded_wakes()], ["session:fake-names-unit", "session:fake-types-unit", "session:fake-names-unit"])
+        self.assertEqual([arguments[1] for arguments in self.recorded_wakes()], ["session:fake-names", "session:fake-types", "session:fake-names"])
 
     def test_merge_without_waiters_or_a_standing_production_sends_nothing(self) -> None:
         self.checkpoint_for_wake()
@@ -443,7 +443,7 @@ class StyleSyncTests(unittest.TestCase):
         self.wake_sender()
         self.assertEqual(self.merge_for_wake(), (0, "", ""))
         self.doc.unlink()
-        self.waiting_units("names-unit")
+        self.waiting_units("names")
         self.assertEqual(self.merge_for_wake(), (0, "", ""))
         self.assertEqual(self.recorded_wakes(), [])
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
@@ -451,13 +451,13 @@ class StyleSyncTests(unittest.TestCase):
     def test_director_without_an_address_does_not_block_other_waiters(self) -> None:
         self.production()
         self.checkpoint_for_wake()
-        self.waiting_units("names-unit", "types-unit")
+        self.waiting_units("names", "types")
         self.wake_sender()
         roster = self.root / "roster.py"
-        _ = roster.write_text(roster.read_text().replace("session:fake-names-unit", ""))
+        _ = roster.write_text(roster.read_text().replace("session:fake-names", ""))
         self.assertEqual(self.merge_for_wake(), (0, f"style_ledger: wake {style_unit_id('names')}: no live director\n", ""))
         self.assertEqual(self.recorded_wakes(), [[
-            "--to", "session:fake-types-unit", "--from", "sample-style", "--text",
+            "--to", "session:fake-types", "--from", "sample-style", "--text",
             "From the showrunner of sample-style: ticket 3001 merged; refill.", "--timeout", "10",
         ]])
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
@@ -465,7 +465,7 @@ class StyleSyncTests(unittest.TestCase):
     def test_merge_without_a_matching_director_keeps_the_wait_and_reports_why(self) -> None:
         self.production()
         self.checkpoint_for_wake()
-        self.waiting_units("names-unit")
+        self.waiting_units("names")
         self.wake_sender()
         self.wake_roster(())
         self.assertEqual(self.merge_for_wake(), (0, f"style_ledger: wake {style_unit_id('names')}: no live director\n", ""))
@@ -475,9 +475,9 @@ class StyleSyncTests(unittest.TestCase):
     def test_ambiguous_or_unreadable_roster_does_not_send_or_forget_the_wait(self) -> None:
         self.production()
         self.checkpoint_for_wake()
-        self.waiting_units("names-unit")
+        self.waiting_units("names")
         self.wake_sender()
-        self.wake_roster(("names-unit", "names-unit"))
+        self.wake_roster(("names", "names"))
         self.assertEqual(self.merge_for_wake(), (0, f"style_ledger: wake {style_unit_id('names')}: 2 directors\n", ""))
         self.assertEqual(self.recorded_wakes(), [])
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
@@ -489,7 +489,7 @@ class StyleSyncTests(unittest.TestCase):
     def test_refused_checkpoint_merge_does_not_wake_or_clear_waiters(self) -> None:
         self.production()
         self.checkpoint_for_wake(on_style_branch=False)
-        self.waiting_units("names-unit")
+        self.waiting_units("names")
         self.wake_sender()
         code, output, errors = self.merge_for_wake()
         self.assertEqual(code, 2)

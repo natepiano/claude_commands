@@ -153,7 +153,7 @@ class PhaseTableTests(unittest.TestCase):
             **fake_unit_host.environment(self.root),
         }
 
-    def write_production(self, unit: str = "table-unit") -> Path:
+    def write_production(self, unit: str = "table") -> Path:
         path = self.working_dir / "docs" / "different-document.md"
         _ = path.write_text(
             plan_text(
@@ -276,7 +276,7 @@ class PhaseTableTests(unittest.TestCase):
             env=self.environment(),
         )
 
-    def unit_id(self, production: str = "show", unit: str = "table-unit") -> str:
+    def unit_id(self, production: str = "show", unit: str = "table") -> str:
         row = unit_membership(production, unit)
         if isinstance(row.worktree, staff.WorktreeUnfilled):
             row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / row.id), expected=row.worktree)
@@ -372,7 +372,7 @@ class PhaseTableTests(unittest.TestCase):
         unit = next(row for row in staff.snapshot().find(kind="unit", parent=owner.id)
                     if row.name == "table")
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
-            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table-unit"})])
+            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table"})])
         if not live_name:
             return
         if not self.live_unit_pid:
@@ -2037,7 +2037,7 @@ class PhaseTableTests(unittest.TestCase):
             "### Phase 3 — Notice  · status: todo",
             "**Depends on:** Phase 1",
             "### Phase 4 — Resources  · status: todo",
-            "**Depends on:** Phase 1 (resources-unit waits until 2026-10-29 00:00)",
+            "**Depends on:** Phase 1 (resources waits until 2026-10-29 00:00)",
         )
 
         result = subprocess.run(
@@ -3017,7 +3017,7 @@ class PhaseTableTests(unittest.TestCase):
     def test_refresh_replaces_three_key_note_with_current_heading(self) -> None:
         self.write_production_plan()
         self.mark_unit("table")
-        note = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        note = self.write_phase_note("showrunner", "table", "show", "table")
         self.assertNotIn("now:", note.read_text(encoding="utf-8"))
 
         result = self.run_refresh()
@@ -3042,7 +3042,7 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertTrue(
-            (self.vault_root / "showrunner" / "table-unit.md").is_file()
+            (self.vault_root / "showrunner" / "table.md").is_file()
         )
 
     def test_renamed_live_session_moves_its_note(self) -> None:
@@ -3394,9 +3394,9 @@ class PhaseTableTests(unittest.TestCase):
 
     def test_note_follows_staff_rename_and_transfer_without_rewrite(self) -> None:
         self.write_production_plan()
-        path = self.write_phase_note("runner", "table", "show", "table-unit")
+        path = self.write_phase_note("runner", "table", "show", "table")
         before = path.read_bytes()
-        unit = unit_membership("show", "table-unit")
+        unit = unit_membership("show", "table")
         other = showrunner_relationship("other")
         _ = staff.rename(unit.id, "renamed")
         _ = staff.move(unit.id, staff.ReportsTo(other.id))
@@ -3410,14 +3410,14 @@ class PhaseTableTests(unittest.TestCase):
         self,
     ) -> None:
         production = self.write_units_production()
-        first = self.write_phase_note("runner-one", "alpha", "show", "alpha-unit")
-        second = self.write_phase_note("runner-two", "beta", "show", "beta-unit")
+        first = self.write_phase_note("runner-one", "alpha", "show", "alpha")
+        second = self.write_phase_note("runner-two", "beta", "show", "beta")
         first_bytes = (
-            f"---\nphase_table: true\nunit: {self.unit_id(unit='alpha-unit')}\n---\n".encode()
+            f"---\nphase_table: true\nunit: {self.unit_id(unit='alpha')}\n---\n".encode()
             + b"# Alpha\n\nFirst table.\n"
         )
         second_bytes = (
-            f"---\nphase_table: true\nunit: {self.unit_id(unit='beta-unit')}\n---\n".encode()
+            f"---\nphase_table: true\nunit: {self.unit_id(unit='beta')}\n---\n".encode()
             + b"# Beta\n\nSecond table.\n"
         )
         _ = first.write_bytes(first_bytes)
@@ -3454,7 +3454,7 @@ class PhaseTableTests(unittest.TestCase):
         _ = handwritten.write_text("kept by a person\n", encoding="utf-8")
         missing_production = folder / "missing-production.md"
         _ = missing_production.write_text(
-            "---\nphase_table: true\nunit: table-unit\n---\nkept\n",
+            "---\nphase_table: true\nunit: table\n---\nkept\n",
             encoding="utf-8",
         )
         missing_unit = folder / "missing-unit.md"
@@ -3463,7 +3463,7 @@ class PhaseTableTests(unittest.TestCase):
             encoding="utf-8",
         )
         other = self.write_phase_note(
-            "showrunner", "other", "other", "table-unit"
+            "showrunner", "other", "other", "table"
         )
         before = {
             path: path.read_bytes()
@@ -3479,7 +3479,7 @@ class PhaseTableTests(unittest.TestCase):
 
     def test_archive_keeps_existing_target_and_adds_numeric_suffix(self) -> None:
         production = self.write_units_production()
-        source = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        source = self.write_phase_note("showrunner", "table", "show", "table")
         source_bytes = source.read_bytes() + b"source\n"
         _ = source.write_bytes(source_bytes)
         target = (
@@ -3517,7 +3517,7 @@ class PhaseTableTests(unittest.TestCase):
     ) -> None:
         self.write_production_plan(register_showrunner=False)
         self.mark_unit("table")
-        source = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        source = self.write_phase_note("showrunner", "table", "show", "table")
         source_bytes = source.read_bytes()
 
         archive_result = self.run_archive(
@@ -3553,7 +3553,7 @@ class PhaseTableTests(unittest.TestCase):
             plan_text(
                 "# Delivery plan",
                 "",
-                "> **Production: other** — unit `table-unit`; production doc `docs/other-production.md`",
+                "> **Production: other** — unit `table`; production doc `docs/other-production.md`",
                 "",
                 "### Phase 1 — Current delivery  · status: todo",
             )
@@ -3564,7 +3564,7 @@ class PhaseTableTests(unittest.TestCase):
         recipient = recorded_showrunner("other", other_production)
         _ = staff.move(unit.id, staff.ReportsTo(recipient.id))
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
-            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
+            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table"})])
         live_record = cast(dict[str, object], json.loads(
             (self.sessions_dir / f"record-{self.live_record_number}.json").read_text(encoding="utf-8")
         ))
@@ -3598,7 +3598,7 @@ class PhaseTableTests(unittest.TestCase):
 
     def test_prune_leaves_archived_notes_in_place(self) -> None:
         production = self.write_units_production()
-        _ = self.write_phase_note("showrunner", "retired", "show", "retired-unit")
+        _ = self.write_phase_note("showrunner", "retired", "show", "retired")
         archive_result = self.run_archive(production)
         self.assertEqual(archive_result.returncode, 0)
         archived = (
@@ -3763,8 +3763,8 @@ class PhaseTableTests(unittest.TestCase):
         )
         production = self.write_units_production(("live-unit", "plan.md", live_worktree))
         live = self.write_linked_phase_note("old-runner", "live", "show", "live-unit")
-        gone = self.write_linked_phase_note("old-runner", "gone", "show", "gone-unit")
-        unrelated = self.write_linked_phase_note("old-runner", "other", "unrelated", "gone-unit")
+        gone = self.write_linked_phase_note("old-runner", "gone", "show", "gone")
+        unrelated = self.write_linked_phase_note("old-runner", "other", "unrelated", "gone")
         before = {path: path.read_bytes() for path in (live, gone, unrelated)}
 
         result = self.run_prune(production)

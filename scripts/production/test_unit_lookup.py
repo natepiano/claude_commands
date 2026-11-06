@@ -379,7 +379,7 @@ print(observed.row.id)
         doc = self.root / "production.md"
         _ = doc.write_text("# show\n")
         _ = recorded_showrunner("show", doc)
-        owner = unit_membership("show", "alpha-unit")
+        owner = unit_membership("show", "alpha")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
         self.claude("alpha", "w4:p1", session_id=owner.id)
         registry = self.records / f"{os.getpid()}.json"
@@ -435,7 +435,7 @@ print(observed.row.id)
         doc = self.root / "production.md"
         _ = doc.write_text("# show\n")
         _ = recorded_showrunner("show", doc)
-        owner = unit_membership("show", "alpha-unit")
+        owner = unit_membership("show", "alpha")
         _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root), expected=owner.worktree)
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
         self.claude("organon", "w4:p1", session_id=owner.id)
@@ -565,9 +565,9 @@ print(observed.row.id)
         scan.assert_not_called()
 
     def test_grouping_uses_the_current_row_name_after_a_rename(self) -> None:
-        row = unit_membership("show", "old-name-unit")
+        row = unit_membership("show", "old-name")
         row = staff.rename(row.id, "renamed")
-        pane = unit_lookup.LabeledSession("old-name-unit", ClaudeUnknown("unreadable record"),
+        pane = unit_lookup.LabeledSession("old-name", ClaudeUnknown("unreadable record"),
             herdr.HerdrPlace("agents", "w1:p1"), session_staff.ObservedProcess(991099, "claude"),
             session_staff.LiveSession(row.current_session))
         record = staff.snapshot()

@@ -95,7 +95,7 @@ class WorkerAdmissionTests(StaffTestCase):
         self.assertEqual(allowed.parent, unit.id)
         self.assertEqual(staff.by_id(unit.id), changed)
         self.assertEqual(self.staff_file.read_bytes(), before)
-        worker = worker_admission.publish(allowed, fixture_runtime_id("worker-of-codex-unit"))
+        worker = worker_admission.publish(allowed, fixture_runtime_id("worker-of-codex"))
         self.assertEqual(worker.row.parent, staff.ReportsTo(unit.id))
         self.assertEqual(staff.by_current_session(current), changed)
         self.assertIsNone(staff.by_current_session(unit.id))

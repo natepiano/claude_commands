@@ -37,7 +37,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
-from scripts.production import showrunners, staff, unit_names, session_staff
+from scripts.production import showrunners, staff, session_staff
 import unit_lookup
 from session_pane import HerdrFailure, agent_status, read_place
 
@@ -1032,7 +1032,7 @@ def prompt_report(watch: WatchedUnit, session_id: str, pending: PendingTool | No
 
 def prompt_alert(watch: WatchedUnit, pane: str, since: float, zone: ZoneInfo,
                  pending: PendingTool | None = None, report: rca.Report | None = None) -> Delivery:
-    rendered = push_texts.render(PROMPT_TEXT_ID, unit=watch.name.removesuffix("-unit"), machine=machine_name(),
+    rendered = push_texts.render(PROMPT_TEXT_ID, unit=watch.name, machine=machine_name(),
                                  since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
                                  request=prompt_request(pane, pending))
     # end_prompt() retires the alert when its prompt is gone.
@@ -1230,10 +1230,9 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                     raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
                 row = unit_lookup.unit_row(name, record, reference=unit.identity)
                 if row.parent not in members_by_parent:
-                    members_by_parent[row.parent] = tuple(alias
+                    members_by_parent[row.parent] = tuple(member.name
                         for member in (record.find(kind="unit", parent=row.parent.id) if isinstance(row.parent, staff.ReportsTo) else ())
-                        if not isinstance(member.worktree, staff.RemovedWorktree)
-                        for alias in (member.name, unit_names.unit_id(member.name)))
+                        if not isinstance(member.worktree, staff.RemovedWorktree))
                 work.append(PaneInspection(production_name, configured, zone, members_by_parent[row.parent], name, unit, row))
         except (OSError, UnicodeError, ValueError) as error:
             print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
@@ -1338,7 +1337,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             # assistant text is authoritative when it supplies a turn-end status.
             turn = transcript_turn_end(session_id) or (turns[-1] if turns else None)
             last = turn.group("status").strip() if turn else "none on screen"
-            peers = (*(member for member in members if member not in (row.name, unit_names.unit_id(row.name))),
+            peers = (*(member for member in members if member != row.name),
                      configured["session"], production_name)
             own_names = (name, unit.unit, claude.name, labels.get(unit.place.pane, ""), f"session:{session_id}")
             try:
@@ -1396,9 +1395,8 @@ def migrate_staff_ids() -> int:
         if parent is None:
             continue
         targets[str(row.id)] = (row, parent.name)
-        for name in (row.name, unit_names.unit_id(row.name)):
-            digest = hashlib.sha256(f"{parent.name}\0{name}".encode()).hexdigest()
-            targets[digest] = (row, parent.name)
+        digest = hashlib.sha256(f"{parent.name}\0{row.name}".encode()).hexdigest()
+        targets[digest] = (row, parent.name)
     result = 0
     for source in sorted(STATE_DIR.glob("*.json")):
         if source.name.endswith(".case.json"):
@@ -1427,7 +1425,7 @@ def migrate_staff_ids() -> int:
             retire = retire_key(target, prompt["key"])
             _ = subprocess.run(retire.command, check=True, timeout=30)
             if not prompt["retiring"]:
-                alert = prompt_alert(watched_staff_unit(production_name, unit_names.unit_id(row.name), row), "", prompt["since"], ZoneInfo("UTC"))
+                alert = prompt_alert(watched_staff_unit(production_name, row.name, row), "", prompt["since"], ZoneInfo("UTC"))
                 _ = subprocess.run(alert.command, check=True, timeout=30)
         prompt["key"] = key
         if "case_pending" in prompt:

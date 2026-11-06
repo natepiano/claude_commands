@@ -325,7 +325,7 @@ class RemoveWorkersTest(unittest.TestCase):
 
     def test_successful_run_cleanup_does_not_launch_an_implicit_server_sweep(self) -> None:
         own = self.run_dir("own", [], orchestrator=ORCHESTRATOR)
-        arguments = [str(SCRIPT), "--session-dir", str(own)]
+        arguments = [str(SCRIPT), "--session-dir", str(own), "--run-root", str(self.root)]
         with (patch.object(sys, "argv", arguments),
               patch.object(remove_workers, "list_sessions", return_value=[]),
               patch.object(subprocess, "run", side_effect=AssertionError("run cleanup launched a server sweep")) as commands):
@@ -364,7 +364,7 @@ class RemoveWorkersTest(unittest.TestCase):
 
         result, removed = self.run_remove_workers()
 
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(set(removed), {"first1", "second1"})
         self.assertNotIn("shutdown state could not be read", result.stderr)
 

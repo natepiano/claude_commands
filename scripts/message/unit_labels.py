@@ -100,7 +100,7 @@ class UnitLabels:
 def make_labels(name: str, showrunner: ShowrunnerRelationship,
                  director: DirectorRelationship) -> UnitLabels:
     production = " ".join(production_of(showrunner).split())
-    unit = short_unit(" ".join(unit_of(director).split()))
+    unit = " ".join(unit_of(director).split())
     return UnitLabels(" ".join(name.split()), production or "—", unit or "—")
 
 
@@ -112,11 +112,6 @@ def production_of(showrunner: ShowrunnerRelationship) -> str:
 
 def unit_of(director: DirectorRelationship) -> str:
     return director.unit if isinstance(director, (DirectsUnit, UnderDirector, UnitWithoutRunningDirector)) else ""
-
-
-def short_unit(unit: str) -> str:
-    """The shown unit name: the unit id without its "-unit" suffix."""
-    return unit.removesuffix("-unit")
 
 
 @dataclass(frozen=True)

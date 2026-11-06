@@ -29,7 +29,7 @@ SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
 `worker:` addresses queue through codex_mesh.py; `codex:` addresses queue through
 the shared Codex daemon. One staff snapshot selects each staff recipient.
-Unit names accept the optional `-unit` suffix. Ambiguous staff names stop delivery.
+Unit names use the staff names. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
 A non-staff name uses a unique live roster session, locally before the peer.
 A name without a staff row or live session is refused without a relay or queue.

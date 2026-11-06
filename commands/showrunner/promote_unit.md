@@ -15,4 +15,4 @@ The other direction, a unit becoming the showrunner of its own production under 
 4. **Check.** Run `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production <showrunner name> <unit name> --attach <sessionId> --cwd <cwd> --plan <plan> --check`. On exit 2, stop and tell the user its line; the session remains running.
 5. **Attach and record.** Run the same command without `--check`. add_unit stops the session safely, then resumes it as the unit.
    The unit director launch takes its model and effort from `/default_models production.director`.
-6. **Tell the user** one line: `<unit name>` is now `<unit name>-unit`, and the place add_unit printed. If the name changed, name the original ListAgents name too.
+6. Tell the user the staff name and the place that add_unit printed.

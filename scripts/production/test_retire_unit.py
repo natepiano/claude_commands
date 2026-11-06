@@ -307,7 +307,7 @@ class RetireUnitTests(unittest.TestCase):
             owner = next((item for item in self.claude if item["sessionId"] == session_id), None)
             if owner:
                 return sessions.LiveSessionProcess(owner["pid"])
-            marked = unit_lookup.labeled_session("alpha", "alpha-unit")
+            marked = unit_lookup.labeled_session("alpha", "alpha")
             if marked and isinstance(marked.claude, unit_lookup.LiveClaude) and marked.claude.session_id == session_id:
                 return sessions.LiveSessionProcess(marked.claude.pid)
             return sessions.SessionNotLive()
@@ -319,7 +319,7 @@ class RetireUnitTests(unittest.TestCase):
                                                        "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}))
         roster: dict[str, object] = {}
         home = self.root / "codex"
-        store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha-unit"))
+        store = workers.UnitWorkerLedger(workers.ledger_path("alpha", "alpha"))
         with store.locked() as ledger:
             for name, status in (("alpha-impl", "running"), ("alpha-old", "ended")):
                 row = fixture_worker(name, self.unit_staff_id, backend=staff.CodexBackend(home))
@@ -336,7 +336,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(sessions, "session_processes", session_processes))
         _ = self.enterContext(mock.patch.object(sessions, "session_liveness", session_liveness))
         self.marked = unit_lookup.LabeledSession(
-            "alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
+            "alpha", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
 
         def labeled_session(_production_name: str, _name: str) -> unit_lookup.LabeledSession | None:
             return self.marked
@@ -346,7 +346,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         _ = self.enterContext(mock.patch.object(staff_pane_record, "RECORD_DIR", self.root / "panes"))
         pane_record.write("alpha", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
-            {"CLAUDE_CONFIG_DIR": str(self.config), ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha-unit"}, ["claude", "-n", "alpha"]))
+            {"CLAUDE_CONFIG_DIR": str(self.config), ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "alpha"}, ["claude", "-n", "alpha"]))
         def process_info(*_arguments: str, deadline: float = math.inf) -> dict[str, object]:
             del deadline
             # Existing cases launch Claude with exec: it replaces the pane's shell.
@@ -529,7 +529,7 @@ class RetireUnitTests(unittest.TestCase):
             ["stop_resume.stop", SEAT],
             ["build_hold.py", "release", "--holder", DIRECTOR],
         ])
-        self.assertIn("alpha-unit retired", output)
+        self.assertIn("alpha retired", output)
         self.assertEqual(self.unit_worktree(), staff.RemovedWorktree("natedev", self.worktree))
         row = staff.by_id(self.unit_staff_id)
         assert row is not None

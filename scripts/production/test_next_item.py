@@ -198,7 +198,7 @@ class NextItemTests(unittest.TestCase):
 
     def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = unit_membership("demo", "fixture-unit")
+        _ = unit_membership("demo", "fixture")
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
         doc = self.root / "docs" / "plans" / "demo-production.md"
         doc.parent.mkdir(parents=True)

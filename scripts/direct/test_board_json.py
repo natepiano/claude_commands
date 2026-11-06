@@ -130,7 +130,7 @@ class BoardJsonTests(unittest.TestCase):
         production_membership("fixture")
 
     def production(self, name: str = "show", *, running: bool = True,
-                   unit_name: str = "alpha-unit") -> ProductionFixture:
+                   unit_name: str = "alpha") -> ProductionFixture:
         checkout = self.root / f"{name}-checkout"
         worktree = self.root / f"{name}-unit"
         checkout.mkdir()
@@ -168,7 +168,7 @@ class BoardJsonTests(unittest.TestCase):
     def plan(self, fixture: ProductionFixture, *, all_done: bool = False) -> None:
         status = "done" if all_done else "todo"
         _ = fixture.plan.write_text("\n".join((
-            f"> **Production: {fixture.name}** — unit `alpha-unit`; production doc `{fixture.document}`",
+            f"> **Production: {fixture.name}** — unit `alpha`; production doc `{fixture.document}`",
             "", "### Phase 1 — First delivery  · status: done", "",
             f"### Phase 2 — Current delivery  · status: {status}", "",
             f"### Phase 3 — Next delivery  · status: {status}", "",
@@ -198,7 +198,7 @@ class BoardJsonTests(unittest.TestCase):
         parent = next(row for row in staff.find(kind="showrunner") if row.name == production)
         return next(row for row in staff.find(kind="unit", parent=parent.id) if row.name == name)
 
-    def standing_plan(self, fixture: ProductionFixture, *, phase_id: str = "alpha-unit-63",
+    def standing_plan(self, fixture: ProductionFixture, *, phase_id: str = "alpha-63",
                       title: str = "Fix names") -> None:
         # A real linked worktree pins the ledger's main-repository namespace,
         # which differs from both the Unit cell and the worktree basename.
@@ -236,7 +236,7 @@ class BoardJsonTests(unittest.TestCase):
         database = root / fixture.checkout.name / "ledger.sqlite"
         database.parent.mkdir(parents=True, exist_ok=True)
         parent = next(row for row in staff.find(kind="showrunner") if row.name == fixture.name)
-        unit_ids = {f"{row.name}-unit": row.id for row in staff.find(kind="unit", parent=parent.id)}
+        unit_ids = {row.name: row.id for row in staff.find(kind="unit", parent=parent.id)}
         connection = sqlite3.connect(database)
         try:
             _ = connection.execute(
@@ -245,12 +245,12 @@ class BoardJsonTests(unittest.TestCase):
             _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?)", [
                 (ticket, unit_ids.get(owner, fixture_runtime_id(owner)), state, created_at)
                 for ticket, owner, state, created_at in [
-                    ("alpha-unit-1", "alpha-unit", "merged", 1),
-                    ("alpha-unit-2", "alpha-unit", "merged", 2),
-                    ("alpha-unit-3", "alpha-unit", "open", 3),
-                    ("alpha-unit-4", "alpha-unit", "rejected", 4),
-                    ("other-unit-1", "other-unit", "merged", 5),
-                    ("alpha-1", "alpha", "merged", 6),
+                    ("alpha-1", "alpha", "merged", 1),
+                    ("alpha-2", "alpha", "merged", 2),
+                    ("alpha-3", "alpha", "open", 3),
+                    ("alpha-4", "alpha", "rejected", 4),
+                    ("other-1", "other", "merged", 5),
+                    ("alpha-1", "unrelated", "merged", 6),
                     *tickets,
             ]])
             connection.commit()
@@ -521,7 +521,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_missing_staff_id_and_launch_records_have_no_showrunner_board(self) -> None:
         _ = self.production(running=False)
-        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board-unit")), "unit", "alpha", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("absent-board-unit")))
+        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board")), "unit", "alpha", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("absent-board")))
         self.staff_launch(missing, missing.id, pane="missing")
 
         for session in ("no-launch-session", missing.id):
@@ -532,7 +532,7 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_unit_without_a_showrunner_ancestor_has_no_board(self) -> None:
         _ = self.production(running=False)
-        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board-unit")), "unit", "orphan", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("orphan-board-unit")))
+        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board")), "unit", "orphan", staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("orphan-board")))
         self.staff_launch(orphan, orphan.id)
         # The writer forbids orphan units; pin the reader's defensive boundary
         # with the same snapshot shape should an incomplete ancestry reach it.
@@ -729,7 +729,7 @@ class BoardJsonTests(unittest.TestCase):
         as_built = fixture.worktree / "as-built.md"
         _ = as_built.write_text("# Delivered feature\n", encoding="utf-8")
 
-        _ = recorded_unit(fixture.name, "alpha-unit", fixture.worktree, fixture.document, plan="as-built.md")
+        _ = recorded_unit(fixture.name, "alpha", fixture.worktree, fixture.document, plan="as-built.md")
         _, unit = self.unit(fixture)
 
         self.assertEqual(unit["plan"], str(as_built))
@@ -808,12 +808,12 @@ class BoardJsonTests(unittest.TestCase):
                 })
 
     def test_numeric_phase_names_the_assigned_ledger_ticket_with_one_read_only_connection(self) -> None:
-        fixture = self.production(unit_name="names-unit")
-        self.standing_plan(fixture, phase_id="63", title="names-unit-63")
+        fixture = self.production(unit_name="names")
+        self.standing_plan(fixture, phase_id="63", title="names-63")
         database = self.ledger(fixture, tickets=(
-            ("names-unit-1", "names-unit", "merged", 1),
-            ("names-unit-2", "names-unit", "merged", 2),
-            ("names-unit-63", "names-unit", "assigned", 63),
+            ("names-1", "names", "merged", 1),
+            ("names-2", "names", "merged", 2),
+            ("names-63", "names", "assigned", 63),
         ))
         before = database.read_bytes()
 
@@ -821,9 +821,9 @@ class BoardJsonTests(unittest.TestCase):
             document, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "names-unit-63", "title": "", "merged": 2,
+            "kind": "ticket", "id": "names-63", "title": "", "merged": 2,
         })
-        self.assertEqual(unit["stage"], "Ticket names-unit-63 running")
+        self.assertEqual(unit["stage"], "Ticket names-63 running")
         self.assertIn(str(database), array_items(document["sources"]))
         self.assertEqual(database.read_bytes(), before)
         self.assertEqual(connect.call_count, 1)
@@ -831,13 +831,13 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(connect.call_args.kwargs, {"uri": True, "timeout": 0})
 
     def test_unit_rename_preserves_merged_count_and_active_ticket(self) -> None:
-        fixture = self.production(unit_name="names-unit")
+        fixture = self.production(unit_name="names")
         self.standing_plan(fixture, phase_id="124", title="Current work")
         owner = self.unit_member(fixture.name, "names")
         database = self.ledger(fixture, tickets=(
-            ("123", "names-unit", "merged", 123),
-            ("124", "names-unit", "merged", 124),
-            ("125", "names-unit", "assigned", 125),
+            ("123", "names", "merged", 123),
+            ("124", "names", "merged", 124),
+            ("125", "names", "assigned", 125),
         ))
         before = database.read_bytes(), database.stat().st_mtime_ns
         _ = staff.rename(owner.id, "renamed")
@@ -852,32 +852,32 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual((database.read_bytes(), database.stat().st_mtime_ns), before)
 
     def test_renamed_unit_selects_the_open_phase_by_its_unchanged_ledger_ticket_id(self) -> None:
-        fixture = self.production(unit_name="cargo-liner-style-names-unit")
-        self.standing_plan(fixture, phase_id="63", title="names-unit-63 — Fix names")
+        fixture = self.production(unit_name="cargo-liner-style-names")
+        self.standing_plan(fixture, phase_id="63", title="names-63 — Fix names")
         with fixture.plan.open("a", encoding="utf-8") as stream:
-            _ = stream.write("### Phase 64 — names-unit-64 — Later work · status: todo\n")
+            _ = stream.write("### Phase 64 — names-64 — Later work · status: todo\n")
         _ = self.write_run(fixture, [
             self.event("phase_started", NOW - 120, phase="63", instance="ticket-63",
-                       phase_title="names-unit-63 — Fix names"),
+                       phase_title="names-63 — Fix names"),
             self.event("phase_started", NOW - 60, phase="64", instance="ticket-64",
-                       phase_title="names-unit-64 — Later work"),
+                       phase_title="names-64 — Later work"),
         ])
         database = self.ledger(fixture, tickets=(
-            ("names-unit-63", "cargo-liner-style-names-unit", "assigned", 63),
+            ("names-63", "cargo-liner-style-names", "assigned", 63),
         ))
         before = database.read_bytes()
 
         _, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "names-unit-63", "title": "Fix names", "merged": 0,
+            "kind": "ticket", "id": "names-63", "title": "Fix names", "merged": 0,
         })
-        self.assertEqual(unit["stage"], "Ticket names-unit-63 running")
+        self.assertEqual(unit["stage"], "Ticket names-63 running")
         self.assertEqual(database.read_bytes(), before)
 
     def test_ledger_ahead_of_the_run_uses_the_newest_assigned_or_checkpointed_ticket(self) -> None:
-        fixture = self.production(unit_name="types-unit")
-        self.standing_plan(fixture, phase_id="124", title="types-unit-124")
+        fixture = self.production(unit_name="types")
+        self.standing_plan(fixture, phase_id="124", title="types-124")
         database = self.ledger(fixture)
         unit_id = self.unit_member(fixture.name, "types").id
         for state in ("assigned", "checkpointed"):
@@ -886,13 +886,13 @@ class BoardJsonTests(unittest.TestCase):
                 try:
                     _ = connection.execute("DELETE FROM tickets")
                     _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?)", [
-                        ("types-unit-125", unit_id, state, 500),
-                        ("types-unit-126", unit_id, "assigned", 300),
-                        ("types-unit-124", unit_id, "checkpointed", 400),
-                        ("types-unit-127", unit_id, "merged", 600),
-                        ("types-unit-128", unit_id, "rejected", 700),
-                        ("types-unit-129", unit_id, "open", 800),
-                        ("types-unit-extra-999", fixture_runtime_id("types-unit-extra"), "assigned", 900),
+                        ("types-125", unit_id, state, 500),
+                        ("types-126", unit_id, "assigned", 300),
+                        ("types-124", unit_id, "checkpointed", 400),
+                        ("types-127", unit_id, "merged", 600),
+                        ("types-128", unit_id, "rejected", 700),
+                        ("types-129", unit_id, "open", 800),
+                        ("types-extra-999", fixture_runtime_id("types-extra"), "assigned", 900),
                     ])
                     connection.commit()
                 finally:
@@ -901,45 +901,45 @@ class BoardJsonTests(unittest.TestCase):
                 _, unit = self.unit(fixture)
 
                 self.assertEqual(unit["phase"], {
-                    "kind": "ticket", "id": "types-unit-125", "title": "types-unit-124", "merged": 1,
+                    "kind": "ticket", "id": "types-125", "title": "types-124", "merged": 1,
                 })
-                self.assertEqual(unit["stage"], "Ticket types-unit-125 running")
+                self.assertEqual(unit["stage"], "Ticket types-125 running")
 
     def test_no_open_ledger_row_falls_back_to_the_ticket_word_in_the_phase_title(self) -> None:
-        fixture = self.production(unit_name="names-unit")
-        self.standing_plan(fixture, phase_id="63", title="names-unit-63")
+        fixture = self.production(unit_name="names")
+        self.standing_plan(fixture, phase_id="63", title="names-63")
         _ = self.ledger(fixture, tickets=(
-            ("names-unit-62", "names-unit", "merged", 62),
-            ("names-unit-99", "names-unit", "rejected", 99),
+            ("names-62", "names", "merged", 62),
+            ("names-99", "names", "rejected", 99),
         ))
 
         _, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "names-unit-63", "title": "", "merged": 1,
+            "kind": "ticket", "id": "names-63", "title": "", "merged": 1,
         })
-        self.assertEqual(unit["stage"], "Ticket names-unit-63 running")
+        self.assertEqual(unit["stage"], "Ticket names-63 running")
 
     def test_missing_ledger_falls_back_to_the_title_ticket_and_zero_merged(self) -> None:
-        fixture = self.production(unit_name="names-unit")
-        self.standing_plan(fixture, phase_id="63", title="names-unit-63")
+        fixture = self.production(unit_name="names")
+        self.standing_plan(fixture, phase_id="63", title="names-63")
 
         _, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "names-unit-63", "title": "", "merged": 0,
+            "kind": "ticket", "id": "names-63", "title": "", "merged": 0,
         })
-        self.assertEqual(unit["stage"], "Ticket names-unit-63 running")
+        self.assertEqual(unit["stage"], "Ticket names-63 running")
         self.assertFalse((self.root / "style-ledgers").exists())
 
     def test_ticket_title_removes_only_its_leading_id_and_separator(self) -> None:
-        fixture = self.production(unit_name="values-unit")
-        self.standing_plan(fixture, phase_id="8", title="values-unit-8")
+        fixture = self.production(unit_name="values")
+        self.standing_plan(fixture, phase_id="8", title="values-8")
         for title, remaining in (
-            ("values-unit-8", ""),
-            ("values-unit-8 — read time", "read time"),
-            ("values-unit-8   read time", "read time"),
-            ("values-unit-8 — read values-unit-8 time", "read values-unit-8 time"),
+            ("values-8", ""),
+            ("values-8 — read time", "read time"),
+            ("values-8   read time", "read time"),
+            ("values-8 — read values-8 time", "read values-8 time"),
         ):
             with self.subTest(title=title):
                 _ = fixture.plan.write_text(
@@ -953,15 +953,15 @@ class BoardJsonTests(unittest.TestCase):
                 _, unit = self.unit(fixture)
 
                 self.assertEqual(unit["phase"], {
-                    "kind": "ticket", "id": "values-unit-8", "title": remaining, "merged": 0,
+                    "kind": "ticket", "id": "values-8", "title": remaining, "merged": 0,
                 })
-                self.assertEqual(unit["stage"], "Ticket values-unit-8 running")
+                self.assertEqual(unit["stage"], "Ticket values-8 running")
 
     def test_non_ticket_title_word_keeps_the_phase_id_and_uses_the_ticket_stage(self) -> None:
-        fixture = self.production(unit_name="names-unit")
+        fixture = self.production(unit_name="names")
         self.standing_plan(fixture, phase_id="63", title="Fix names")
-        for title in ("Fix names", "other-unit-63 — read time", "names-unit-63suffix",
-                      "names-unit-nope", "Read names-unit-63"):
+        for title in ("Fix names", "other-63 — read time", "names-63suffix",
+                      "names-nope", "Read names-63"):
             with self.subTest(title=title):
                 _ = fixture.plan.write_text(
                     "> **Standing:** style_plan.py\n\n"
@@ -979,11 +979,11 @@ class BoardJsonTests(unittest.TestCase):
                 self.assertEqual(unit["stage"], "Ticket 63 running")
 
     def test_locked_ledger_discards_open_ticket_and_count_then_uses_title_fallback(self) -> None:
-        fixture = self.production(unit_name="types-unit")
-        self.standing_plan(fixture, phase_id="124", title="types-unit-124")
+        fixture = self.production(unit_name="types")
+        self.standing_plan(fixture, phase_id="124", title="types-124")
         database = self.ledger(fixture, tickets=(
-            ("types-unit-123", "types-unit", "merged", 123),
-            ("types-unit-125", "types-unit", "assigned", 125),
+            ("types-123", "types", "merged", 123),
+            ("types-125", "types", "assigned", 125),
         ))
         writer = sqlite3.connect(database)
         self.addCleanup(writer.close)
@@ -994,21 +994,21 @@ class BoardJsonTests(unittest.TestCase):
             document, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "types-unit-124", "title": "", "merged": 0,
+            "kind": "ticket", "id": "types-124", "title": "", "merged": 0,
         })
-        self.assertEqual(unit["stage"], "Ticket types-unit-124 running")
+        self.assertEqual(unit["stage"], "Ticket types-124 running")
         self.assertIn(str(database), array_items(document["sources"]))
         connect.assert_called_once_with(f"file:{database}?mode=ro", uri=True, timeout=0)
 
     def test_ticket_keeps_build_test_review_and_repair_stages(self) -> None:
-        fixture = self.production(unit_name="names-unit")
-        self.standing_plan(fixture, phase_id="63", title="names-unit-63")
+        fixture = self.production(unit_name="names")
+        self.standing_plan(fixture, phase_id="63", title="names-63")
         for kind, label in (("impl", "Build"), ("test", "Tests"), ("review", "Review"),
                             ("fix", "Repair round 3")):
             with self.subTest(kind=kind):
                 _ = self.write_run(fixture, [
                     self.event("phase_started", NOW - 120, phase="63", instance="ticket-63",
-                               phase_title="names-unit-63"),
+                               phase_title="names-63"),
                     self.event("pass_started", NOW - 60, phase="63", instance="ticket-63",
                                pass_instance_id="pass", pass_kind=kind, fix_pass=3),
                 ])
@@ -1016,7 +1016,7 @@ class BoardJsonTests(unittest.TestCase):
                 _, unit = self.unit(fixture)
 
                 self.assertEqual(unit["phase"], {
-                    "kind": "ticket", "id": "names-unit-63", "title": "", "merged": 0,
+                    "kind": "ticket", "id": "names-63", "title": "", "merged": 0,
                 })
                 self.assertEqual(unit["stage"], label)
 
@@ -1036,7 +1036,7 @@ class BoardJsonTests(unittest.TestCase):
             document, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 2,
+            "kind": "ticket", "id": "alpha-63", "title": "Fix names", "merged": 2,
         })
         self.assertIn(str(database), array_items(document["sources"]))
         self.assertEqual(database.read_bytes(), before)
@@ -1058,7 +1058,7 @@ class BoardJsonTests(unittest.TestCase):
             document, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+            "kind": "ticket", "id": "alpha-63", "title": "Fix names", "merged": 0,
         })
         self.assertIn(str(database), array_items(document["sources"]))
         connect.assert_called_once_with(f"file:{database}?mode=ro", uri=True, timeout=0)
@@ -1071,7 +1071,7 @@ class BoardJsonTests(unittest.TestCase):
         document, unit = self.unit(fixture)
 
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+            "kind": "ticket", "id": "alpha-63", "title": "Fix names", "merged": 0,
         })
         self.assertFalse(ledger_root.exists())
         self.assertFalse(any(str(path).endswith("ledger.sqlite")
@@ -1088,7 +1088,7 @@ class BoardJsonTests(unittest.TestCase):
                 document, unit = self.unit(fixture)
 
                 self.assertEqual(unit["phase"], {
-                    "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+                    "kind": "ticket", "id": "alpha-63", "title": "Fix names", "merged": 0,
                 })
                 self.assertIn(str(database), array_items(document["sources"]))
                 self.assertEqual(database.read_bytes(), contents)
@@ -1111,7 +1111,7 @@ class BoardJsonTests(unittest.TestCase):
         _, before = self.unit(fixture)
         connection = sqlite3.connect(database)
         try:
-            _ = connection.execute("UPDATE tickets SET state = 'merged' WHERE id = 'alpha-unit-3'")
+            _ = connection.execute("UPDATE tickets SET state = 'merged' WHERE id = 'alpha-3'")
             connection.commit()
         finally:
             connection.close()
@@ -1120,7 +1120,7 @@ class BoardJsonTests(unittest.TestCase):
 
         self.assertEqual(object_fields(before["phase"])["merged"], 2)
         self.assertEqual(after["phase"], {
-            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 3,
+            "kind": "ticket", "id": "alpha-63", "title": "Fix names", "merged": 3,
         })
 
     def test_standing_marker_is_read_from_the_runs_plan_rather_than_the_display_plan(self) -> None:
@@ -1141,7 +1141,7 @@ class BoardJsonTests(unittest.TestCase):
 
         self.assertEqual(unit["plan"], str(fixture.plan))
         self.assertEqual(unit["phase"], {
-            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 2,
+            "kind": "ticket", "id": "alpha-63", "title": "Fix names", "merged": 2,
         })
         self.assertIn(str(active_plan), array_items(document["sources"]))
 
@@ -1150,9 +1150,9 @@ class BoardJsonTests(unittest.TestCase):
         self.standing_plan(fixture)
         _ = self.ledger(fixture)
         _ = self.write_run(fixture, [
-            self.event("phase_started", NOW - 120, phase="alpha-unit-63", instance="ticket-63",
+            self.event("phase_started", NOW - 120, phase="alpha-63", instance="ticket-63",
                        phase_title="Fix names"),
-            self.event("phase_finished", NOW - 60, phase="alpha-unit-63", instance="ticket-63",
+            self.event("phase_finished", NOW - 60, phase="alpha-63", instance="ticket-63",
                        status="completed", phase_elapsed_seconds=60),
         ])
 

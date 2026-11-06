@@ -12,7 +12,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.production import showrunners, staff, staff_move, staff_sources, unit_names
+from scripts.production import showrunners, staff, staff_move, staff_sources
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.rename_state import RenameRefused
 
@@ -35,7 +35,7 @@ def build(from_name: str, given: str, to_name: str) -> UnitTransfer:
     parent = staff_sources.member(staff_sources.ShowrunnerMember(receiving.name), record)
     if isinstance(found, staff_sources.NoSuchMember) or isinstance(parent, staff_sources.NoSuchMember):
         raise ValueError(f"{given}: no unit or destination staff row")
-    return UnitTransfer(found.row, parent.row, receiving, unit_names.unit_id(found.row.name))
+    return UnitTransfer(found.row, parent.row, receiving, found.row.name)
 
 
 def apply(from_name: str, unit: str, to_name: str) -> UnitTransfer:

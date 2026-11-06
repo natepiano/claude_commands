@@ -29,7 +29,6 @@ import berth_board
 import progress_history
 import unit_lookup
 import unit_move
-import unit_names
 import unit_runs
 from scripts.production.production_doc import Production, Refusal, read_production
 
@@ -414,7 +413,7 @@ def find_unit(production_name: str, given: str, *,
     if location.path.is_dir():
         result = run(["git", "-C", str(location.path), "branch", "--show-current"], settings=settings)
         branch = result.stdout.strip()
-    return Unit(production, unit_names.unit_id(member.name), location.path, branch, member)
+    return Unit(production, member.name, location.path, branch, member)
 
 
 def last_session(unit: Unit) -> str:

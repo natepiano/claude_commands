@@ -666,7 +666,7 @@ class LocalReviewTests(unittest.TestCase):
         question = "Should handler-enh go ahead with phases 1 and 2?"
         request = "Say go and I'll have cargo-liner do it."
         choice = ("Allow (recommended, since both requests are a day old): "
-                  + "the shutdown unit runs the cancel once, then moves dashboard-unit to claude 4.")
+                  + "the shutdown unit runs the cancel once, then moves dashboard to claude 4.")
         self.assertEqual(reply_asks.user_reply_questions(question + "\n" + request + "\n" + choice),
                          reply_asks.ReplyAsks((question, request), True, (choice,)))
 

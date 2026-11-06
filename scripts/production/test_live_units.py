@@ -44,7 +44,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
                 with (redirect_stderr(errors),
                       mock.patch("unit_lookup.every_labeled_session", return_value=every)):
                     units = live_units.units_of_doc(fixture.doc)
-                self.assertEqual([item.unit for item in units], ["member-unit"])
+                self.assertEqual([item.unit for item in units], ["member"])
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
                 self.assertIn(fixture.unit.name, errors.getvalue())
                 self.assertIn(str(fixture.worktree), errors.getvalue())
@@ -58,7 +58,7 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         every = session_staff.LabeledProductions({}, {fixture.runner.name: ("member",)})
         before = self.staff_file.read_bytes()
         selected = live_units.units_in(fixture.doc, every)
-        self.assertEqual([unit.unit for unit in selected], ["member-unit"])
+        self.assertEqual([unit.unit for unit in selected], ["member"])
         self.assertEqual(self.staff_file.read_bytes(), before)
 
 
@@ -138,7 +138,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.hosts({})
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "offline-unit\t\tgone\t\n")
+        self.assertEqual(result.stdout, "offline\t\tgone\t\n")
 
     def test_short_unit_ids_keep_their_pane_spelling(self) -> None:
         self.members("writer", "hook")
@@ -146,7 +146,7 @@ class LiveUnitsTests(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(result.stdout.splitlines()), [
-            "hook-unit\t\tgone\t", "writer\therdr:director:w4:p1\tunknown\t",
+            "hook\t\tgone\t", "writer\therdr:director:w4:p1\tunknown\t",
         ])
 
     def test_record_membership_wins_over_a_stale_pane_mark(self) -> None:

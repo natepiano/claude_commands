@@ -14,7 +14,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import session_staff, staff, staff_sources, unit_config, unit_names
+from scripts.production import session_staff, staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -24,10 +24,10 @@ import showrunner_tree
 import tidy_wrapped
 import unit_lookup
 from scripts.production.production_doc import Production, Refusal, production_field, read_production
-from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
+from merge_checkpoint import (
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
                               Stop,
-                              git, good, merge_branch_history, promote_local_checkout,
+                              git, good, merged_checkpoints, promote_local_checkout,
                               pull_mac_checkout, report)
 from scripts.production import production_doc
 from update_registration import QuestionStaff, RegistrationFailure, judgment_state
@@ -115,7 +115,7 @@ def units(runner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow,
     """The runner's unit rows in staff order; a parked retirement names the branch, else git does."""
     resolver = session_staff.RowResolver(record)
     rows = record.find(kind="unit", parent=runner.id)
-    permanent = [unit_names.unit_id(row.name) for row in rows
+    permanent = [row.name for row in rows
                  if isinstance(config := resolver.unit_config(row), unit_config.UnitConfig)
                  and isinstance(config.plan, unit_config.PermanentPlan)]
     if permanent:
@@ -123,7 +123,7 @@ def units(runner: staff.StaffRow, record: staff.StaffSnapshot) -> tuple[UnitRow,
             f"permanent child {name}: transfer it before wrapping" for name in permanent))
     parsed: list[UnitRow] = []
     for row in rows:
-        name = unit_names.unit_id(row.name)
+        name = row.name
         if isinstance(row.worktree, staff.WorktreeUnfilled):
             raise LifecycleStop("retire", "held", f"{name}: worktree is unfilled")
         parked = unit_config.read_parked(row.id, cleanup=False)
@@ -182,17 +182,16 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
     except (RegistrationFailure, OSError, ValueError, UnicodeError) as error:
         print(f"anomaly: {error}", file=sys.stderr)
     report("state", "ok", "; ".join(owed) if owed else "no next list")
-    history = (merge_branch_history(production.checkout, production.merge_branch)
-               if isinstance(state, PlanLanded) else None)
     try:
         marked = unit_lookup.labeled_sessions(production.name)
     except OSError as error:
         raise LifecycleStop("session", "failed", str(error)) from error
-    for row in unit_lookup.doc_units(production.doc, staff.snapshot()):
-        name = unit_names.unit_id(row.name)
-        last: MergeEntry | NoMerge = history.last_code_for_unit(name) if history else NoMerge()
-        detail = (f"phase {last.phase} at {last.merge_hash}" if isinstance(last, MergeEntry)
-                  else "no code checkpoint")
+    checkpoints = {entry.unit: entry for entry in merged_checkpoints(production)} if isinstance(state, PlanLanded) else {}
+    record = staff.snapshot()
+    for row in unit_lookup.doc_units(production.doc, record):
+        name = row.name
+        entry = checkpoints.get(name)
+        detail = f"phase {entry.phase} ({entry.commit[:7]})" if entry is not None else "no code checkpoint"
         report("last-merged", "ok", f"{name}: {detail}")
         found = marked.get(row.name)
         report("session", "ok", f"{name}: " + (f"{found.place.session} live" if found is not None else "gone"))
@@ -227,7 +226,7 @@ def open_production(production: Production, lines: list[str]) -> None:
     report("doc", "ok", "running")
     paths = [doc_path_in_checkout(production, production.doc)]
     for row in rows:
-        name = unit_names.unit_id(row.name)
+        name = row.name
         match resolver.unit_config(row):
             case unit_config.UnitConfig(plan=unit_config.PlanFile(path=relative)):
                 plan = production.checkout / relative
@@ -555,6 +554,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     if isinstance(runner, staff_sources.NoSuchMember):
         raise LifecycleStop("staff", "held", "no showrunner staff row")
     rows = units(runner.row, record)
+    checkpoints = merged_checkpoints(production)
     if isinstance(status, ProductionRunning):
         for item in close_out_items(lines):
             if item not in done:
@@ -677,15 +677,11 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         subject = checked(production.checkout, "wrap", "log", "-1", "--format=%s")
         if subject == f"production({production.name}): wrapped":
             tip = checked(production.checkout, "wrap", "rev-parse", "HEAD^")
-    history = merge_branch_history(production.checkout, production.merge_branch)
     print("| Area | Result |\n| --- | --- |")
     for unit in rows:
-        merges = [entry for entry in history.entries
-                  if isinstance(entry, MergeEntry) and entry.unit == unit.name
-                  and isinstance(entry.kind, CodeCheckpoint)]
-        last = history.last_code_for_unit(unit.name)
-        detail = (f"{unit.name}: {len(merges)} phases merged, last {last.merge_hash[:7]}"
-                  if isinstance(last, MergeEntry) else f"{unit.name}: no phases merged")
+        merged = [entry for entry in checkpoints if entry.unit == unit.name]
+        detail = (f"{unit.name}: {len(merged)} phases merged, last {merged[-1].commit[:7]}" if merged
+                  else f"{unit.name}: no phases merged")
         print(f"| Units | {detail} |")
     print(f"| Merge branch | `{production.merge_branch}` at {current_tip[:7]}, pushed |")
     print(f"| CI | {'skipped: no CI' if no_ci else 'green'} |")

@@ -296,7 +296,6 @@ def launch_request(args: argparse.Namespace, *,
     record = staff.initial_snapshot() if record is None else record
     production = read_production(cast(str, args.production), record=record)
     try:
-        # A name given as its unit id would get the suffix twice: feature-log-unit-unit.
         name = unit_names.name(cast(str, args.name))
     except unit_names.BadName as error:
         raise Refusal(str(error)) from error
@@ -308,7 +307,7 @@ def launch_request(args: argparse.Namespace, *,
     attached = cast(str | None, getattr(args, "attach", None))
     if (not any((given_plan is not None, given_brief is not None, standby, permanent))
             and (resumed is not None or attached is not None)):
-        member = checked_unit_member(production, unit_names.unit_id(name), record,
+        member = checked_unit_member(production, name, record,
                                      identity=session_staff.LiveSession(resumed or attached or ""))
         if not isinstance(member, staff_sources.MemberFound) or not isinstance(member.row.worktree, staff.PresentWorktree):
             raise Refusal(f"unit {name}: resume needs a filled present worktree")
@@ -324,7 +323,7 @@ def launch_request(args: argparse.Namespace, *,
             permanent = isinstance(saved.plan, unit_config.PermanentPlan)
     if sum((given_plan is not None, given_brief is not None, standby, permanent)) != 1:
         raise Refusal("give exactly one of --plan, --brief, --standby, or --permanent")
-    kebab = unit_names.stem(unit_names.unit_id(name))
+    kebab = unit_names.stem(name)
     branch = unit_names.branch(production.name, kebab)
     worktree = unit_names.worktree(production.checkout, kebab)
     plan: PlanGiven | BriefGiven | Standby
@@ -356,7 +355,7 @@ def launch_request(args: argparse.Namespace, *,
     return RequestedUnitLaunch(
         production=production,
         requested_name=name,
-        unit=unit_names.unit_id(name),
+        unit=name,
         branch=branch,
         worktree=worktree,
         plan=plan,

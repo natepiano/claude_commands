@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Generator, Iterable, Mapping
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -443,7 +443,7 @@ def _set_owner(state: dict[str, object], production: str, unit: str) -> None:
     parents = {row.id for row in record.find(kind="showrunner")
                if row.name == production}
     matches = [row for row in record.find(kind="unit")
-               if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents and row.name.removesuffix("-unit") == unit.removesuffix("-unit")]
+               if isinstance(row.parent, staff.ReportsTo) and row.parent.id in parents and row.name == unit]
     if len(matches) != 1:
         raise ValueError(f"{production}/{unit}: no unique unit staff row")
     state[unit_runs.OWNER_FIELD] = matches[0].id
@@ -1935,11 +1935,12 @@ def _disarm_review(args: argparse.Namespace) -> None:
     )
 
 
-def _load_events() -> tuple[list[dict[str, object]], int]:
+def _load_events(event_types: Collection[str] = ()) -> tuple[list[dict[str, object]], int]:
     events: list[dict[str, object]] = []
     record = staff.initial_snapshot()
     ignored = 0
     runs_dir = plan_history.history_root() / "runs"
+    wanted = re.compile(r'"event_type"\s*:\s*"(?:' + "|".join(map(re.escape, event_types)) + r')"')
     if not runs_dir.exists():
         return events, ignored
     for path in sorted(runs_dir.glob("*.jsonl")):
@@ -1952,12 +1953,22 @@ def _load_events() -> tuple[list[dict[str, object]], int]:
             ignored += 1
             continue
         for line in lines:
+            if event_types and not wanted.search(line):
+                continue
             event = _json_object(line)
             if event is None or _integer(event.get("schema_version")) != SCHEMA_VERSION:
                 ignored += 1
                 continue
-            events.append(plan_history.staff_directory(event, record))
+            if not event_types or event.get("event_type") in event_types:
+                events.append(plan_history.staff_directory(event, record))
     return events, ignored
+
+
+def events_for_worktrees(worktrees: tuple[Path, ...], event_types: frozenset[str]) -> list[dict[str, object]]:
+    """Read selected records once for the units' current staff worktrees."""
+    directories = {str(worktree.resolve()) for worktree in worktrees}
+    return sorted((event for event in _load_events(event_types)[0] if event.get("working_dir") in directories),
+                  key=lambda event: _number(event.get("timestamp_epoch")))
 
 
 def _agent_fields(event: dict[str, object], key: str) -> tuple[str, str]:

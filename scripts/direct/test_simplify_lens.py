@@ -84,7 +84,7 @@ class SimplifyDispatchTests(NixFixture):
         self.env["AGENT_NOTES_DIR"] = str(self.root / "notes")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
         owner = fixture_member("showrunner", name="simplify-owner")
-        _ = fixture_member("unit", name="simplify-unit", parent=owner.id,
+        _ = fixture_member("unit", name="simplify", parent=owner.id,
                        runtime_id=self.env["CODEX_THREAD_ID"],
                        worktree=staff.PresentWorktree("natedev", self.work))
         self.claude_quota("claude1", 100)

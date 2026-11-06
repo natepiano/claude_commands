@@ -7,7 +7,7 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 `/showrunner:transfer_unit <unit> <receiving showrunner name>` (`commands/showrunner/transfer_unit.md`)
 moves one natedev unit director from one production to another. The giving showrunner runs it. The
 script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `apply` and `verify`
-(user, 2026-10-21: "yes i want this"). The first use is hierarchies-unit from build-followups to sdlc.
+(user, 2026-10-21: "yes i want this"). The first use is hierarchies from build-followups to sdlc.
 
 ## What stays and what moves
 

@@ -175,19 +175,19 @@ class CoverageReportTests(unittest.TestCase):
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
             self.assertEqual(set(coverage_report.production(ledger, self.tip).units), {
-                "sample-style-names-unit", "sample-style-types-unit",
-                "sample-style-values-unit", "sample-style-modules-unit",
+                "sample-style-names", "sample-style-types",
+                "sample-style-values", "sample-style-modules",
             })
-            self.staff_units("names-unit", "sample-style-types-unit", "feature-unit")
+            self.staff_units("names", "sample-style-types", "feature")
             self.assertEqual(coverage_report.production(ledger, self.tip).units,
-                             ("names-unit", "sample-style-types-unit"))
+                             ("names", "sample-style-types"))
 
     def test_report_finds_a_moved_ticket_by_the_declared_full_unit_id(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.staff_units("names-unit")
+        self.staff_units("names")
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
             ledger.ticket_assign("1", "main")
             from scripts.production import staff
@@ -200,9 +200,9 @@ class CoverageReportTests(unittest.TestCase):
     def test_report_shows_each_widened_path_of_an_open_ticket_under_its_line(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.staff_units("names-unit")
+        self.staff_units("names")
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
             ledger.ticket_assign("1", "main")
             database = ledger.database
@@ -423,7 +423,7 @@ class CoverageReportTests(unittest.TestCase):
         selected = self.rule("selected")
         other = self.rule("other")
         self.sync()
-        units = ("names-unit", "sample-style-names-unit", "other-style-names-unit", "types-unit")
+        units = ("names", "sample-style-names", "other-style-names", "types")
         self.staff_units(*units)
         with style_ledger.open_ledger(self.repo) as ledger:
             for number, rule in enumerate((selected, selected, selected, other), start=1):
@@ -447,13 +447,13 @@ class CoverageReportTests(unittest.TestCase):
     def test_crate_filter_limits_cells_and_prints_the_oldest_open_ticket(self) -> None:
         read = self.rule("read")
         self.sync()
-        self.staff_units("names-unit", "sample-style-names-unit", "types-unit")
+        self.staff_units("names", "sample-style-names", "types")
         for path in self.sources[:2]:
             self.record(read, path)
         with style_ledger.open_ledger(self.repo) as ledger:
-            for identity, unit, crate in (("1", "names-unit", "alpha"), ("2", "sample-style-names-unit", "alpha"), ("2001", "types-unit", "beta")):
+            for identity, unit, crate in (("1", "names", "alpha"), ("2", "sample-style-names", "alpha"), ("2001", "types", "beta")):
                 with mock.patch.object(style_ledger, "_now", return_value=(
-                    "2026-10-01T12:00:00+00:00" if unit == "names-unit" else "2026-10-02T12:00:00+00:00"
+                    "2026-10-01T12:00:00+00:00" if unit == "names" else "2026-10-02T12:00:00+00:00"
                 )):
                     ledger.ticket_add(identity, ticket_owner_id(unit), "read", "names", "crates/" + crate,
                                       [f"crates/{crate}/src/lib.rs"], [read])

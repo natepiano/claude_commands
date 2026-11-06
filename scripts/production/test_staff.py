@@ -162,7 +162,7 @@ class NativeRuntimeIdentityTests(StaffTestCase):
 
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
         runner, unit, _ = self.tree()
-        location = self.root / "retired-unit"
+        location = self.root / "retired"
         unit = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", location), expected=unit.worktree)
         record = staff.snapshot()
         self.assertEqual(record.unit_by_worktree("natedev", location), unit)
@@ -197,7 +197,7 @@ class NativeRuntimeIdentityTests(StaffTestCase):
 
     def test_schema_two_decoder_keeps_native_sessions_and_wire_parent_fields(self) -> None:
         owner = fixture_runtime_id("stored-owner")
-        unit = fixture_runtime_id("stored-unit")
+        unit = fixture_runtime_id("stored")
         current = fixture_runtime_id("stored-unit-after-clear")
         rows: list[dict[str, object]] = [
             {"id": owner, "kind": "showrunner", "name": "owner", "parent": None,

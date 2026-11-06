@@ -35,7 +35,7 @@ class NativeSessionLabelTests(StaffTestCase):
         unit = staff.update_current_session(unit.current_session, current)
         self.assertNotEqual(unit.id, unit.current_session)
         labels = session_labels.StaffLabels(staff.snapshot())
-        environment = {"STAFF_ID": worker.id, "SHOWRUNNER_" + "UNIT_ID": "models-unit"}
+        environment = {"STAFF_ID": worker.id, "SHOWRUNNER_" + "UNIT_ID": "models"}
         selected = labels.environment(environment, unit.current_session)
         self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": unit.current_session})
         self.assertEqual(labels.environment(environment, worker.current_session),
@@ -251,7 +251,7 @@ class RowResolverTests(StaffTestCase):
     def test_stored_references_keep_the_member_after_a_session_change_without_a_name_match(self) -> None:
         fixture = self.row_production()
         record = staff.snapshot()
-        selector = session_staff.ObservedUnit("unrelated-unit", session_staff.NoSession())
+        selector = session_staff.ObservedUnit("unrelated", session_staff.NoSession())
         self.assertEqual(session_staff.unit_match(selector, record,
                          session_staff.StoredReference(fixture.unit.id)), session_staff.MemberFound(fixture.unit))
         self.assertEqual(session_staff.unit_match(selector, record,

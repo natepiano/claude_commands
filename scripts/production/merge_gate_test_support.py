@@ -531,7 +531,7 @@ class MergeGateFixture(unittest.TestCase):
              "--merge-branch", "integration", "--unit-branch", "unit-phase",
              "--checkpoint", checkpoint or self.checkpoint,
              "--previous-checkpoint", previous or self.base,
-             "--unit", "fixture-unit", "--phase", "phase-2",
+             "--unit", "fixture", "--phase", "phase-2",
              "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
              "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),

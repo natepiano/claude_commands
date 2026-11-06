@@ -43,7 +43,7 @@ from user_zone import user_zone  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
 from proposals_folder import owner_docs, scope_docs  # noqa: E402
-from scripts.production import change_routing, session_staff, staff, unit_config, unit_lookup, unit_names
+from scripts.production import change_routing, session_staff, staff, unit_config, unit_lookup
 from scripts.production.production_doc import Refusal, production_field
 from scripts.shutdown import remote
 
@@ -868,7 +868,7 @@ def _unit_branches(docs: Iterable[Path], record: staff.StaffSnapshot) -> dict[st
             tree = row.worktree
             worktree = (tree.path if isinstance(tree, staff.PresentWorktree) and tree.machine == machine
                         else MissingUnitWorktree())
-            source = UnitSource(doc, worktree, unit_names.unit_id(row.name), row.id)
+            source = UnitSource(doc, worktree, row.name, row.id)
             branch = resolver.unit_branch(row)
             if isinstance(branch, session_staff.Branch):
                 _ = found.setdefault(branch.name, source)

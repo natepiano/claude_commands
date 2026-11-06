@@ -143,7 +143,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             self.assertGreater(showrunner_admit.call_count, 0)
             with (patch.dict(os.environ, self.env),
                   patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
-                unit = add_unit.ensure_staff_unit(read_production("kid"), "probe-unit",
+                unit = add_unit.ensure_staff_unit(read_production("kid"), "probe",
                     worktree=staff.PresentWorktree("natedev", self.root / "probe"),
                     runtime_id=fixture_runtime_id("probe-unit-backend"))
             unit_admit.assert_called_once()
@@ -701,7 +701,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_showrunner_launch_carries_no_marks_or_caller_account_variables(self) -> None:
         self.env["CLAUDE_CODE_OAUTH_TOKEN"] = "caller-token"
         self.env["SHOWRUNNER_UNIT"] = "parent"
-        self.env["SHOWRUNNER_UNIT_ID"] = "parent-unit"
+        self.env["SHOWRUNNER_UNIT_ID"] = "parent"
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)

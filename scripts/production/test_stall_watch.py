@@ -334,7 +334,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             before = (watch.stretch_path, watch.prompt_path, PROMPT_KEY)
             _ = staff.rename(row.id, "renamed")
             moved = staff.move(row.id, staff.ReportsTo(parent.id))
-            watch = stall_watch.watched_staff_unit("receiver", "renamed-unit", moved)
+            watch = stall_watch.watched_staff_unit("receiver", "renamed", moved)
             self.assertEqual((watch.stretch_path, watch.prompt_path, watch.prompt_key), before)
 
     def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
@@ -477,7 +477,7 @@ always=natedev
             if owner is not None and isinstance(owner.parent, staff.ReportsTo):
                 parent = membership.by_id(owner.parent.id)
                 assert parent is not None
-                run_state.update(production=parent.name, unit=f"{owner.name}-unit")
+                run_state.update(production=parent.name, unit=owner.name)
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}
@@ -2016,12 +2016,12 @@ always=natedev
                 self.assertIn(f"Last status: {status}", tell["text"])
 
     def test_malformed_owner_captures_preserve_other_units_and_pending_deliveries(self) -> None:
-        self.configure({"showrunner": ["unit-one", "bad-unit", "following-unit"]})
-        _ = self.unit("bad-unit")
-        _ = self.unit("following-unit")
-        for name in ("unit-one", "following-unit"):
+        self.configure({"showrunner": ["unit-one", "bad", "following"]})
+        _ = self.unit("bad")
+        _ = self.unit("following")
+        for name in ("unit-one", "following"):
             self.panes[name]["pane"] = PANE
-        self.panes["bad-unit"]["pane"] = "holding: waiting on the showrunner\n"
+        self.panes["bad"]["pane"] = "holding: waiting on the showrunner\n"
         for pattern in (r"\bwaiting\b(?P<owner>never)?", r"\bwaiting\b(?P<owner>)", r"\bwaiting\b"):
             with self.subTest(pattern=pattern):
                 _ = self.watch_settings(prompt_grace_seconds="0", external_wait_pattern=pattern)
@@ -2032,12 +2032,13 @@ always=natedev
                 for at in (START, START + 300):
                     result = self.tick(at)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn("bad-unit: no bump: invalid status rule", result.stderr)
+                    self.assertIn("bad: no bump: invalid status rule", result.stderr)
                     self.assertIn("external_wait_pattern must capture a nonempty owner", result.stderr)
                 sent = self.sent()
                 self.assertEqual(len(sent), 4)
                 self.assertEqual({item["to"] for item in sent if item["key"].endswith(":bump")},
-                                 {f"uds:{self.root / '204f532d-a97a-59e7-a6a7-caf86af3f5ee.sock'}", f"uds:{self.root / '21fe8b33-87b0-5239-90de-7fe05cc304e1.sock'}"})
+                                 {f"uds:{self.root / (unit_session(name) + '.sock')}"
+                                  for name in ("unit-one", "following")})
                 self.assertEqual(len([item for item in sent if item["key"].endswith(":tell")]), 2)
 
     def test_a_waiting_unit_below_compaction_stays_quiet_and_resets_its_stretch(self) -> None:
@@ -2366,7 +2367,7 @@ always=natedev
                     self.assertIn("nothing running; bumped", tell["text"])
 
     def test_a_sentence_period_ends_the_units_own_shown_label(self) -> None:
-        self.panes["unit-one"].update(session="agents", label="metrics-unit", pane="holding: metrics-unit.\n")
+        self.panes["unit-one"].update(session="agents", label="metrics", pane="holding: metrics.\n")
         for at in (START, START + 300, START + 600):
             result = self.tick(at)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -2692,22 +2693,22 @@ always=natedev
         self.assertFalse(self.watches["unit-one"].stretch_path.exists())
 
     def test_a_unit_named_review_unit_is_bumped(self) -> None:
-        self.configure_registered({"showrunner": [("review-unit", "running")]})
-        _ = self.unit("review-unit")
+        self.configure_registered({"showrunner": [("review", "running")]})
+        _ = self.unit("review")
 
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         sent = self.sent()
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
-        self.assertTrue(all(item["key"].startswith(f"stall-watch:{unit_session('review-unit')}:") for item in sent), sent)
+        self.assertTrue(all(item["key"].startswith(f"stall-watch:{unit_session('review')}:") for item in sent), sent)
 
     def test_finished_units_are_skipped_while_a_running_unit_is_bumped(self) -> None:
         self.configure_registered({"showrunner": [
-            ("build-report-unit", "run-finished"),
-            ("hook-unit", "running"),
-            ("notifier-unit", "run-finished"),
+            ("build-report", "run-finished"),
+            ("hook", "running"),
+            ("notifier", "run-finished"),
         ]})
-        for name in ("build-report-unit", "hook-unit", "notifier-unit"):
+        for name in ("build-report", "hook", "notifier"):
             _ = self.unit(name)
 
         self.assertEqual(self.tick(START).returncode, 0)
@@ -2715,8 +2716,8 @@ always=natedev
         sent = self.sent()
         self.assertEqual(len(sent), 2)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
-        self.assertTrue(all(item["key"].startswith(f"stall-watch:{unit_session('hook-unit')}:") for item in sent))
-        for name in ("build-report-unit", "notifier-unit"):
+        self.assertTrue(all(item["key"].startswith(f"stall-watch:{unit_session('hook')}:") for item in sent))
+        for name in ("build-report", "notifier"):
             self.assertFalse(self.watches[name].stretch_path.exists())
 
     def test_a_marked_session_of_a_unit_the_doc_does_not_list_is_not_watched(self) -> None:
@@ -2799,7 +2800,7 @@ always=natedev
                 pending = [stall_watch.Delivery(old, "retire", [sys.executable,
                     str(self.bin / "send.py"), "retire", "--key", "old-alert"]),
                     stall_watch.Delivery(relay, "bump", [sys.executable, str(self.bin / "send.py"),
-                        "--key", "pending-relay", "--to", "fake-unit", "--text", "pending"])]
+                        "--key", "pending-relay", "--to", "fake", "--text", "pending"])]
                 # The pending retire is independent of process liveness; inspection is not.
                 with (mock.patch.object(stall_watch, "tick", side_effect=bounded_tick),
                       mock.patch.object(stall_watch, "reconcile_prompts", return_value=pending)):
@@ -2925,7 +2926,7 @@ always=natedev
                     pending = [stall_watch.Delivery(retiring, "retire", [sys.executable,
                         str(self.bin / "send.py"), "retire", "--key", "old-alert"]),
                         stall_watch.Delivery(relay, "bump", [sys.executable, str(self.bin / "send.py"),
-                            "--key", "pending-relay", "--to", "fake-unit", "--text", "pending"])]
+                            "--key", "pending-relay", "--to", "fake", "--text", "pending"])]
                     original = stall_watch.tick
                     began = time.monotonic()
                     deadline = began + 5

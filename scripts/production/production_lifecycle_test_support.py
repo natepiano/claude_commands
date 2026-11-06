@@ -235,7 +235,7 @@ class LifecycleFixture(unittest.TestCase):
             _ = unit_config.write(worktree, unit_config.UnitConfig(
                 unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
             self.staff.pane(f"fixture:{name}", session_id=row.id, environment={
-                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": f"{name}-unit",
+                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": name,
             })
             _ = self.staff.session_transcript(row.id, worktree, home=self.home)
         common_dir = Path(self.git("rev-parse", "--git-common-dir"))
@@ -327,8 +327,8 @@ class LifecycleFixture(unittest.TestCase):
 
     def merged_units(self) -> None:
         self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
 
     def calls(self) -> str:

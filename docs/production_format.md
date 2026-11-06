@@ -29,7 +29,7 @@ must not drift from it:
   makes the visual choices, clears waits between units, relays the user's words
   and reports when asked. It writes no implementation code.
 - **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
-  branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
+  branch. A unit is named for its area, e.g. `widget`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
 - **Unit director** — the Claude session that runs a unit: the `/unit:direct`
   session the showrunner launches in its own herdr session. It receives messages,
@@ -51,7 +51,7 @@ must not drift from it:
 - **Lease** — one reviewer's assignment to one unit's phase, cleared at phase end.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
-  named `trunk-unit`.
+  named `trunk`.
 - **Parent, child and root showrunner** — a production's showrunner may report
   to another production's (`/showrunner:attach`). The one at the top of a tree is
   the root: it shows every item that needs the user from the productions below
@@ -149,7 +149,7 @@ The row gives its name, parent and worktree; git there gives the repository and 
 The units appear in staff.json row order. Untracked `.unit.toml` at the worktree root gives
 the plan, app port and short duty names. Responsibilities do not limit changed paths.
 
-The unit id (`<name>-unit`) names the unit everywhere: in the log, the dailies, the waits and
+The staff name names the unit everywhere: in the log, the dailies, the waits and
 every tool's arguments. A unit's session name can change, so find the unit at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <showrunner name> <unit>`
 prints its pane, and `unit_lookup.py list <showrunner name>` prints every unit's pane and its
@@ -177,7 +177,7 @@ reviewer.
 
 <ProductionUnit>
 Applies when your staff row has a parent showrunner.
-Read your staff row with `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py --json get <sessionId>`.
+Read your staff row with `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py get <sessionId> --json`.
 Read its `parent` row with the same command.
 The parent row's `name` is the production name. Its `doc.path` gives the document.
 Read that document at the start of the run and after every compaction.

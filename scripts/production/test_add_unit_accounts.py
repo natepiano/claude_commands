@@ -78,7 +78,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         # The pane mark joins its unit only through the unit's staff row.
-        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha")
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
         self.persist_herdr_unit("alpha", prior)
         transcript = Path(self.env["HOME"]) / ".claude/projects/project/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
@@ -197,7 +197,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         before = self.repository_state()
         result = self.set_unit_autocompact("200k")
         self.assertEqual(result.stdout.strip(),
-                         "trunk-unit: auto-compact 200k applies to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
+                         "trunk: auto-compact 200k applies to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
         with patch.dict(os.environ, self.env):
             self.assertEqual(autocompact.recorded("3001165e-ca76-59c2-9490-878224585fad"), "200k")
         self.assertEqual(self.repository_state(), before)
@@ -218,7 +218,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         before = self.repository_state()
         result = self.set_unit_autocompact("300k", "--check")
         self.assertEqual(result.stdout.strip(),
-                         "trunk-unit: auto-compact 300k would apply to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
+                         "trunk: auto-compact 300k would apply to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
         self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.herdr_calls(), [])
@@ -417,7 +417,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
             f"add_unit: ERROR: [production.director] missing set section [production.claude] in {self.agent_config}."])
         self.assert_no_launch_change(document, head)
 
-    def test_names_without_table_rows_keep_suffix_across_productions(self) -> None:
+    def test_names_without_table_rows_keep_the_staff_name_across_productions(self) -> None:
         sample_doc = self.doc.with_name("sample-production.md")
         _ = sample_doc.write_text(self.production_doc(), encoding="utf-8")
         _ = self.staff.record_production("sample", sample_doc)
@@ -431,7 +431,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
                         resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
                         probe=False,
                     ))
-                    self.assertEqual(request.unit, name + "-unit")
+                    self.assertEqual(request.unit, name)
 
 
 if __name__ == "__main__":

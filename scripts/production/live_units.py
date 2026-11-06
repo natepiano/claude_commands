@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import showrunners, staff, unit_names
+from scripts.production import showrunners, staff
 from scripts.shutdown import remote
 import unit_lookup
 
@@ -51,7 +51,7 @@ def units_in(doc: Path, every: unit_lookup.LabeledProductions) -> list[LiveUnit]
 def _joined(production_name: str, every: unit_lookup.LabeledProductions) -> list[LiveUnit]:
     """Units in staff row order, each with its pane."""
     marked = every.status_units(production_name)
-    return [LiveUnit(unit if unit in marked else unit_names.unit_id(unit), marked.get(unit))
+    return [LiveUnit(unit, marked.get(unit))
             for unit in every.members.get(production_name, ())]
 
 

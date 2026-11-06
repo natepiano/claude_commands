@@ -2903,7 +2903,7 @@ def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str,
 def rename_saved_tab(session: str, workspace: str, old_titles: Set[str], title: str) -> None:
     """Replace an outside caller's old saved titles with the staff row id."""
     record = _tab_staff()
-    row = record.by_path(f"{workspace}/{title}") or record.by_path(f"{workspace}/{title}-unit")
+    row = record.by_path(f"{workspace}/{title}")
     if row is None:
         print(f"herdr {session}: staff row for {workspace}/{title} is unknown; layout retained", file=sys.stderr)
         return

@@ -708,7 +708,7 @@ class AddUnitTestCase(ShutdownTestCase):
     ) -> tuple[int, str, list[list[str]], int, int]:
         request = add_unit.UnitLaunch(
             production=read_production(self.production_name),
-            identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            identity=add_unit.UnitIdentity("alpha", "alpha"),
             branch="build-followups-alpha",
             worktree=self.root / "project-alpha",
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
@@ -716,8 +716,8 @@ class AddUnitTestCase(ShutdownTestCase):
             session=add_unit.NewSession(),
             timeout=1.0,
         )
-        marked = unit_lookup.LabeledSession("alpha-unit", claude, place, identity=unit_lookup.LiveSession(unit_membership(self.production_name, "alpha-unit").current_session))
-        launched = (marked if already_labeled else unit_lookup.LabeledSession("alpha-unit", claude, HerdrPlace(SHARED, "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(self.production_name, "alpha-unit").current_session)))
+        marked = unit_lookup.LabeledSession("alpha", claude, place, identity=unit_lookup.LiveSession(unit_membership(self.production_name, "alpha").current_session))
+        launched = (marked if already_labeled else unit_lookup.LabeledSession("alpha", claude, HerdrPlace(SHARED, "w1:p1"), identity=unit_lookup.LiveSession(unit_membership(self.production_name, "alpha").current_session)))
         ready = add_unit.ReadyToLaunch(
             request,
             # A rerun or restore reuses a row. Only a fresh launch has no row.

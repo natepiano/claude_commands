@@ -38,8 +38,8 @@ CI_POINTS = SCRIPT.with_name("ci_points.py")
 WAITING = SCRIPT.with_name("waiting.py")
 STAMP = "at 10:00 PDT / 17:00 UTC"
 AT = "2026-10-06T17:00"
-ALPHA = "alpha-unit"
-BETA = "beta-unit"
+ALPHA = "alpha"
+BETA = "beta"
 NOTIFIER = '''#!__PYTHON__
 import json
 import os

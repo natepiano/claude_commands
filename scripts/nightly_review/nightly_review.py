@@ -2,7 +2,7 @@
 """The nightly review: one read-only unit, one improvement proposal per mode, queued for the user.
 
 `launch` runs on demand on natedev; the 01:00 nightly-review timer that ran it was retired by
-/etc/nixos cc9a0e9 (2026-10-19). The review is the permanent nightly-review-unit of one production:
+/etc/nixos cc9a0e9 (2026-10-19). The review is the permanent nightly-review of one production:
 wrap never retires it, so it keeps one conversation across nights. Each launch sends that unit the
 night's job, `/nightly_review config rust messages` for NIGHT=<date>. When the unit is gone, launch
 first starts it through add_unit.py --permanent, which uses the configured units account, checks shutdown holds and trust,
@@ -306,7 +306,7 @@ def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduct
     if not found:
         return "no running production has a unit configuration that assigns nightly-review"
     if len(found) > 1:
-        return f"{len(found)} productions hold nightly-review-unit: " + ", ".join(item.name for item in found)
+        return f"{len(found)} productions hold nightly-review: " + ", ".join(item.name for item in found)
     return found[0]
 
 

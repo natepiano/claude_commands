@@ -276,13 +276,13 @@ atomic_file.os.replace = interrupted_replace
         snapshot = self.root / "bootstrap-at-launch.json"
         self.env["TEST_BOOTSTRAP_AT_LAUNCH"] = str(snapshot)
 
-        _ = self.run_bootstrap("--pilot", "modules-unit", "--pilot", "names-unit=cargo-handler,cargo-port",
-                               "--pilot", "types-unit=cargo-port")
+        _ = self.run_bootstrap("--pilot", "modules", "--pilot", "names=cargo-handler,cargo-port",
+                               "--pilot", "types=cargo-port")
 
         launched = cast(BootstrapAtLaunch, json.loads(snapshot.read_text()))
         self.assertEqual(launched["production"], self.doc.read_text())
         self.assertEqual(production_field(launched["production"].splitlines(), "Pilot units"),
-                         "sample-style-names-unit, sample-style-types-unit, sample-style-modules-unit")
+                         "sample-style-names, sample-style-types, sample-style-modules")
         self.assertEqual(set(launched["plans"]), {f"sample-style-{family}-unit.md" for family in add_style.FAMILIES})
         for unit, scope in (("names", "cargo-handler, cargo-port"), ("types", "cargo-port")):
             lines = launched["plans"][f"sample-style-{unit}-unit.md"].splitlines()
@@ -304,7 +304,7 @@ atomic_file.os.replace = interrupted_replace
         paths = (self.doc, *(self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))
         before = {path: path.read_bytes() for path in paths}, self.calls(), self.sync()
         for extra in ((), ("--check",)):
-            result = self.run_bootstrap("--pilot", "names-unit=sample", *extra, success=False)
+            result = self.run_bootstrap("--pilot", "names=sample", *extra, success=False)
             self.assertEqual(result.returncode, 2)
             self.assertEqual(result.stderr.strip(), "add_style: --pilot applies only while creating sample-style")
             self.assertEqual(({path: path.read_bytes() for path in paths}, self.calls(), self.sync()), before)
@@ -312,11 +312,11 @@ atomic_file.os.replace = interrupted_replace
     def test_invalid_pilot_units_packages_and_duplicate_units_refuse_before_writes(self) -> None:
         self.add_workspace_packages()
         for arguments, bad in (
-            (("--pilot", "unknown-unit"), "unknown-unit"),
-            (("--pilot", "names-unit=absent"), "absent"),
-            (("--pilot", "names-unit=crates/handler"), "crates/handler"),
-            (("--pilot", "names-unit", "--pilot", "names-unit=sample"), "names-unit"),
-            (("--pilot", "names-unit="), "''"),
+            (("--pilot", "unknown"), "unknown"),
+            (("--pilot", "names=absent"), "absent"),
+            (("--pilot", "names=crates/handler"), "crates/handler"),
+            (("--pilot", "names", "--pilot", "names=sample"), "names"),
+            (("--pilot", "names="), "''"),
         ):
             for extra in ((), ("--check",)):
                 with self.subTest(arguments=arguments, extra=extra):
@@ -330,8 +330,8 @@ atomic_file.os.replace = interrupted_replace
     def test_interrupted_pilot_changes_only_unlaunched_units_and_plan_scopes(self) -> None:
         self.add_workspace_packages()
         self.env["TEST_FAIL_LAUNCH"] = "1"
-        self.assertEqual(self.run_bootstrap("--pilot", "names-unit=cargo-handler", "--pilot", "types-unit=cargo-handler",
-                                           "--pilot", "values-unit=sample", success=False).returncode, 2)
+        self.assertEqual(self.run_bootstrap("--pilot", "names=cargo-handler", "--pilot", "types=cargo-handler",
+                                           "--pilot", "values=sample", success=False).returncode, 2)
         launched = self.root / "sample-style-names"
         launched.mkdir()
         names_plan = self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md"
@@ -344,11 +344,11 @@ atomic_file.os.replace = interrupted_replace
         sync, excluded = self.sync(), (self.repo / ".git/info/exclude").read_bytes()
         del self.env["TEST_FAIL_LAUNCH"]
 
-        _ = self.run_bootstrap("--pilot", "types-unit=cargo-port", "--pilot", "modules-unit")
+        _ = self.run_bootstrap("--pilot", "types=cargo-port", "--pilot", "modules")
 
         self.assertEqual((names_plan.read_bytes(), names_plan.stat().st_mtime_ns), names_before)
         self.assertEqual(production_field(self.doc.read_text().splitlines(), "Pilot units"),
-                         "sample-style-names-unit, sample-style-types-unit, sample-style-modules-unit")
+                         "sample-style-names, sample-style-types, sample-style-modules")
         self.assertIn("- **Pilot scope:** cargo-port\n", types_plan.read_text())
         self.assertNotIn("**Pilot scope:** cargo-handler", types_plan.read_text())
         self.assertIn("Unlaunched notes retained.", types_plan.read_text())
@@ -358,31 +358,31 @@ atomic_file.os.replace = interrupted_replace
 
     def test_check_lists_pilot_units_and_scopes_in_steps_four_and_five_without_writes(self) -> None:
         self.add_workspace_packages()
-        result = self.run_bootstrap("--check", "--pilot", "modules-unit", "--pilot", "names-unit=cargo-handler",
-                                    "--pilot", "types-unit=cargo-port")
+        result = self.run_bootstrap("--check", "--pilot", "modules", "--pilot", "names=cargo-handler",
+                                    "--pilot", "types=cargo-port")
         lines = result.stdout.splitlines()
         self.assertEqual(len(lines), 7)
-        for unit in ("sample-style-modules-unit", "sample-style-names-unit", "sample-style-types-unit"):
+        for unit in ("sample-style-modules", "sample-style-names", "sample-style-types"):
             self.assertIn(unit, lines[3])
-        self.assertIn("sample-style-modules-unit: all crates", lines[4])
-        self.assertIn("sample-style-names-unit: cargo-handler", lines[4])
-        self.assertIn("sample-style-types-unit: cargo-port", lines[4])
-        self.assertNotIn("values-unit", lines[3] + lines[4])
+        self.assertIn("sample-style-modules: all crates", lines[4])
+        self.assertIn("sample-style-names: cargo-handler", lines[4])
+        self.assertIn("sample-style-types: cargo-port", lines[4])
+        self.assertNotIn("values", lines[3] + lines[4])
         self.assertFalse(self.checkout.exists())
         self.assertFalse((self.root / "ledger").exists())
         self.assertEqual(self.calls(), [])
 
     def test_pilot_family_old_id_and_full_id_produce_the_same_check(self) -> None:
         checks = [self.run_bootstrap("--check", "--pilot", f"{name}=sample").stdout
-                  for name in ("names", "names-unit", "sample-style-names-unit")]
+                  for name in ("names", "names", "sample-style-names")]
         self.assertEqual(checks[1:], [checks[0], checks[0]])
-        self.assertIn("sample-style-names-unit: sample", checks[0])
+        self.assertIn("sample-style-names: sample", checks[0])
         self.assertFalse(self.checkout.exists())
         self.assertFalse((self.root / "ledger").exists())
 
     def test_pilot_aliases_cannot_select_the_same_family_twice(self) -> None:
         result = self.run_bootstrap("--check", "--pilot", "names=sample",
-                                    "--pilot", "sample-style-names-unit=sample", success=False)
+                                    "--pilot", "sample-style-names=sample", success=False)
         self.assertEqual(result.returncode, 2)
         self.assertFalse(self.checkout.exists())
         self.assertEqual(self.calls(), [])
@@ -668,7 +668,7 @@ atomic_file.os.replace = interrupted_replace
         _ = self.run_bootstrap()
         plan = add_style.PLAN_DIRECTORY / "sample-style-names-unit.md"
         request = add_unit.RequestedUnitLaunch(
-            production=read_production("sample-style"), requested_name="sample-style-names", unit="sample-style-names-unit",
+            production=read_production("sample-style"), requested_name="sample-style-names", unit="sample-style-names",
             branch="sample-style-names", worktree=self.root / "sample-style-names",
             plan=add_unit.PlanGiven(plan), port=add_unit.OmittedCell(), session=add_unit.NewSession(), timeout=1.0,
         )
@@ -690,7 +690,7 @@ atomic_file.os.replace = interrupted_replace
             ready = add_unit.preflight(request, NamedAccount("test", self.root / "account"))
 
         self.assertEqual(ready.launch.plan_path, plan)
-        self.assertEqual(ready.launch.identity.unit, "sample-style-names-unit")
+        self.assertEqual(ready.launch.identity.unit, "sample-style-names")
         self.assertEqual((self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()), before)
         self.assertFalse(request.worktree.exists())
 

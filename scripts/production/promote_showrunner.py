@@ -50,7 +50,7 @@ POLL_S = 0.5
 
 
 class Promotion(NamedTuple):
-    # The unit id, `<name>-unit`, as its row and its mark name it.
+    # The unit name comes from its staff row.
     unit: str
     parent: Production
     child: Production
@@ -115,15 +115,14 @@ def checked(name: str, child_name: str, doc: Path, *,
     parent = read_production(parent_name, record=record)
     child = read_new_production(doc, child_name)
     child_doc = child.doc
-    unit = name if name.replace("_", "-").endswith("-unit") else f"{name}-unit"
-    pending = promotion_record(parent, unit)
+    pending = promotion_record(parent, name)
     if pending.exists():
         fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
         if Path(fields["child_doc"]).resolve() != child_doc.expanduser().resolve():
-            raise Refusal(f"{unit} has an unfinished promotion to {fields['child_doc']}")
+            raise Refusal(f"{name} has an unfinished promotion to {fields['child_doc']}")
         owner = record.by_current_session(fields["session_id"])
         if owner is None:
-            raise Refusal(f"{unit}: no staff row for the saved promotion session")
+            raise Refusal(f"{name}: no staff row for the saved promotion session")
         if (owner.kind == "showrunner" and isinstance(owner.worktree, staff.WorktreeUnfilled)
                 and owner.doc == staff.LiveDoc(remote.local_machine(), child_doc.expanduser().resolve())):
             # Promotion clears the location before child registration publishes it.
@@ -131,33 +130,33 @@ def checked(name: str, child_name: str, doc: Path, *,
         else:
             location = unit_lookup.local_worktree(staff_sources.MemberFound(owner))
             if not isinstance(location, staff.PresentWorktree):
-                raise Refusal(f"{unit}: staff worktree is removed")
+                raise Refusal(f"{name}: staff worktree is removed")
             worktree = location.path
         claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
-        marked = unit_lookup.LabeledSession(unit, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
-        return Promotion(unit, parent, child, marked, claude, worktree)
+        marked = unit_lookup.LabeledSession(name, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
+        return Promotion(name, parent, child, marked, claude, worktree)
     try:
-        selected = staff_sources.member(staff_sources.UnitMember(parent.name, unit), record)
+        selected = staff_sources.member(staff_sources.UnitMember(parent.name, name), record)
         if isinstance(selected, staff_sources.NoSuchMember):
-            raise Refusal(f"{unit} has no staff row under {parent.name}")
+            raise Refusal(f"{name} has no staff row under {parent.name}")
         location = unit_lookup.local_worktree(selected)
         if not isinstance(location, staff.PresentWorktree):
-            raise Refusal(f"{unit} is retired")
+            raise Refusal(f"{name} is retired")
         worktree = location.path
-        marked = unit_lookup.labeled_session(parent.name, unit)
+        marked = unit_lookup.labeled_session(parent.name, name)
     except (OSError, UnicodeError) as error:
         raise Refusal(str(error)) from error
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
-        raise Refusal(f"{unit} has no live session under {parent.name}")
+        raise Refusal(f"{name} has no live session under {parent.name}")
     claude = marked.claude
-    _quiet(unit, marked, claude)
-    _settled(unit, claude, worktree)
+    _quiet(name, marked, claude)
+    _settled(name, claude, worktree)
     _committed(child.doc)
     # Only the unit's herdr tab will end before the same-named destination starts.
     directory = showrunner_account_directory()
     ending = add_showrunner.EndingUnitTab(marked.place.pane)
     _ = add_showrunner.checked(child, parent.name, ending=ending, start_in=worktree, config_dir=directory)
-    return Promotion(unit, parent, child, marked, claude, worktree)
+    return Promotion(name, parent, child, marked, claude, worktree)
 
 
 def promotion_record(parent: Production, unit: str) -> Path:
@@ -255,7 +254,7 @@ def restore_line(promotion: Promotion) -> str:
     if isinstance(config, unit_config.ConfigMissing):
         return f"add_unit.py with --resume {promotion.claude.session_id}; {config.reason}"
     return "~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py " + shlex.join([
-        "--production", promotion.parent.name, promotion.unit.removesuffix("-unit"),
+        "--production", promotion.parent.name, promotion.unit,
         *unit_config.plan_arguments(config.plan),
         "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 
@@ -275,7 +274,6 @@ def _main(argv: list[str]) -> int:
         if parent_name:
             parent = read_production(parent_name, record=record)
             unit_name = cast(str, args.unit)
-            unit_name = unit_name if unit_name.replace("_", "-").endswith("-unit") else f"{unit_name}-unit"
             completed = promotion_record(parent, unit_name).with_suffix(".done.json")
             receipt = completion_receipt.read_receipt(completed, record)
             if isinstance(receipt, completion_receipt.OwnedReceipt):

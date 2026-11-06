@@ -30,7 +30,7 @@ from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, 
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
                             parse_style_summary)
-from merge_checkpoint import ChildHandoffEntry, NoMerge, git, merge_branch_history
+from merge_checkpoint import git, merged_checkpoints
 from update_registration import (QuestionStaff, read_open_items, RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
                                  update_schedule)
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
@@ -324,7 +324,7 @@ def report_units(doc: Path, name: str, record: staff.StaffSnapshot) -> tuple[Uni
         claude = found.claude if found is not None else None
         run = (runs.state(row.worktree.path) if isinstance(row.worktree, staff.PresentWorktree)
                else UnitRunUnavailable("the unit has no present worktree"))
-        units.append(UnitRow(unit_names.unit_id(row.name),
+        units.append(UnitRow(row.name,
                              claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run, row.id))
     return tuple(units)
 
@@ -934,7 +934,7 @@ def run(args: argparse.Namespace) -> int:
         row = staff_record.by_id(staff.StaffId(unit_id))
         if row is None or row.kind != "unit" or row.parent != staff.ReportsTo(owner_id):
             raise DailiesFailure("judgment", f"{where}: no unit with this fixed id belongs to this production")
-        unit_name = unit_names.unit_id(row.name)
+        unit_name = row.name
         if unit_name in by_session:
             raise DailiesFailure("judgment", f"{where}: duplicate unit")
         by_session[unit_name] = fields
@@ -1042,8 +1042,6 @@ def run(args: argparse.Namespace) -> int:
                            "eta": "no ETA stated yet",
                            "needs_user": isinstance(upgrade, OpenBevyUpgradeWatch) and upgrade.needs_user})
         report("bevy upgrade", "ok" if isinstance(upgrade, OpenBevyUpgradeWatch) else "unavailable", update)
-    history = merge_branch_history(production.checkout, production.merge_branch)
-    last = history.last_merge()
     local = git(production.checkout, "rev-parse", production.merge_branch)
     remote = git(production.checkout, "rev-parse", f"origin/{production.merge_branch}")
     if local.returncode:
@@ -1052,9 +1050,9 @@ def run(args: argparse.Namespace) -> int:
     merge = as_map(judgment.get("merge", {}), f"{judgment_path}.merge")
     held, testing = merge.get("held"), merge.get("testing")
     if held or testing or not pushed:
-        latest = ("no checkpoint merged" if isinstance(last, NoMerge) else
-                  f"{last.child} style hand-off ({last.short})" if isinstance(last, ChildHandoffEntry) else
-                  f"{last.unit} phase {last.phase} ({last.short})")
+        checkpoints = merged_checkpoints(production)
+        latest = (f"{checkpoints[-1].unit} phase {checkpoints[-1].phase} ({checkpoints[-1].commit[:7]})" if checkpoints
+                  else "no checkpoint merged")
         details = [f"last merge: {latest}", "pushed" if pushed else "not pushed"]
         if held:
             details.append(f"held: {held}")

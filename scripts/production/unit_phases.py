@@ -17,7 +17,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import live_units
-from scripts.production import showrunners, staff, unit_lookup, unit_names
+from scripts.production import showrunners, staff, unit_lookup
 from scripts.production.production_doc import Refusal, production_field, read_production
 from scripts.shutdown import remote
 
@@ -90,7 +90,7 @@ def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str,
     import style_ledger
 
     try:
-        rows = {unit_names.unit_id(row.name): row for row in unit_lookup.doc_units(doc, staff.snapshot())}
+        rows = {row.name: row for row in unit_lookup.doc_units(doc, staff.snapshot())}
     except (OSError, staff.StaffRefused) as error:
         print(f"unit_phases: {error}", file=sys.stderr)
         return {}

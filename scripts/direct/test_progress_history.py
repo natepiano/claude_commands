@@ -161,10 +161,10 @@ class ProgressHistoryTests(unittest.TestCase):
         run = self.start_run("staff-name-owner", 1760658000)
         hana = fixture_member("showrunner", name="hana",
                               doc=staff.LiveDoc("natedev", self.root / "tool-based-ui-production.md"))
-        _ = fixture_member("unit", name="alpha-unit", parent=hana.id)
+        _ = fixture_member("unit", name="alpha", parent=hana.id)
         owner = fixture_member("showrunner", name="tool-based-ui",
                                doc=staff.LiveDoc("natedev", self.root / "other-production.md"))
-        unit = fixture_member("unit", name="alpha-unit", parent=owner.id)
+        unit = fixture_member("unit", name="alpha", parent=owner.id)
         _ = self.run_command("set-unit", "--session-dir", str(run), "--production", "tool-based-ui",
                              "--unit", "alpha", at=1760658001)
         state = cast(dict[str, object], json.loads((run / "progress_history_state.json").read_text()))
@@ -174,7 +174,7 @@ class ProgressHistoryTests(unittest.TestCase):
         run = self.start_run("document-name-owner", 1760658000)
         owner = fixture_member("showrunner", name="hana",
                                doc=staff.LiveDoc("natedev", self.root / "tool-based-ui-production.md"))
-        _ = fixture_member("unit", name="alpha-unit", parent=owner.id)
+        _ = fixture_member("unit", name="alpha", parent=owner.id)
         path = run / "progress_history_state.json"
         before = path.read_bytes()
         environment = os.environ.copy()
@@ -1907,7 +1907,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def wait_worker_roster(self, session: Path, workers: dict[str, str]) -> None:
         owner = fixture_member("showrunner", name="wait-owner")
-        unit = fixture_member("unit", name="wait-unit", parent=owner.id)
+        unit = fixture_member("unit", name="wait", parent=owner.id)
         entries = {name: {"staff_id": fixture_worker(name, unit.id, runtime_id=native).id}
                    for name, native in workers.items()}
         _ = (session / "mesh_roster.json").write_text(json.dumps(entries))
@@ -2417,7 +2417,7 @@ with patch.object(fcntl, "flock", admission):
             for first_is_session in (True, False):
                 with self.subTest(kind=kind, first_is_session=first_is_session):
                     owners = (("--holder-session", "other-session", {"state": "SessionHolder", "session_id": "other-session"}),
-                              ("--holder-unit", "other-unit", {"state": "UnitHolder", "unit": "other-unit"}))
+                              ("--holder-unit", "other", {"state": "UnitHolder", "unit": "other"}))
                     first, second = owners if first_is_session else tuple(reversed(owners))
                     wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", kind,
                         "--owner-session", "waiting-session", "--holder-resource-kind", resource_kind,
@@ -2938,15 +2938,15 @@ with patch.object(fcntl, "flock", admission):
         name = "phase-source-explicit"
         session, worktree, plan = self.phase_source_fixture(name, recorded=False)
         owner = fixture_member("showrunner", name="Other production")
-        _ = fixture_member("unit", name="other-unit", parent=owner.id,
+        _ = fixture_member("unit", name="other", parent=owner.id,
                            worktree=staff.PresentWorktree("natedev", worktree))
         _ = self.run_command("set-unit", "--session-dir", str(session), "--production", "Other production",
-                             "--unit", "other-unit", at=1005)
+                             "--unit", "other", at=1005)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
                              "--phase-title", "Phase source", at=1010)
         started = next(event for event in self.read_events(name) if event["event_type"] == "phase_started")
         self.assertEqual((started["production"], started["unit"]),
-                         ({"state": "Recorded", "value": "Other production"}, {"state": "Recorded", "value": "other-unit"}))
+                         ({"state": "Recorded", "value": "Other production"}, {"state": "Recorded", "value": "other"}))
         self.assertNotIn("working_dir", started)
         current = plan_history.staff_directory(dict(started), staff.snapshot())
         self.assertEqual(current["working_dir"], str(worktree))
@@ -3026,7 +3026,7 @@ with patch.object(fcntl, "flock", admission):
     def test_plain_production_names_do_not_require_a_production_doc(self) -> None:
         name = "phase-production-plain-name"
         session, worktree, plan = self.phase_source_fixture(name, production="tool-based-ui",
-                                                               unit="geometry-material-unit")
+                                                               unit="geometry-material")
         _ = plan.write_text("# Geometry material\n",
                             encoding="utf-8")
         self.assertFalse((worktree / "tool-based-ui").exists())
@@ -3073,11 +3073,11 @@ with patch.object(fcntl, "flock", admission):
 
     def test_phase_production_and_unit_each_keep_their_run_state_override(self) -> None:
         name = "phase-partial-source"
-        session, _worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr-unit")
+        session, _worktree, plan = self.phase_source_fixture(name, production="natedev", unit="herdr")
         state_path = session / "progress_history_state.json"
         for index, (field, value, production, unit) in enumerate((
-            ("unit", "assigned-unit", "natedev", "assigned-unit"),
-            ("production", "assigned-production", "assigned-production", "herdr-unit"),
+            ("unit", "assigned", "natedev", "assigned"),
+            ("production", "assigned-production", "assigned-production", "herdr"),
         )):
             with self.subTest(field=field):
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
@@ -5876,7 +5876,7 @@ with patch.object(fcntl, "flock", admission):
         _ = (session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
         native = fixture_runtime_id("main-repaired")
         owner = fixture_member("showrunner", name="repair-owner")
-        unit = fixture_member("unit", name="repair-unit", parent=owner.id, runtime_id=native)
+        unit = fixture_member("unit", name="repair", parent=owner.id, runtime_id=native)
         worker = fixture_worker("repair-worker", unit.id)
         _ = (session_dir / "mesh_roster.json").write_text(json.dumps({worker.name: {"staff_id": worker.id}}))
         self.write_claude_transcript(native, "sonnet-5", "low")
@@ -7030,19 +7030,19 @@ with patch.object(fcntl, "flock", admission):
         ):
             report = self.run_progress(session_dir, at=started_at + 100)
 
-        note = vault_root / "example-showrunner" / "unit-a-unit.md"
+        note = vault_root / "example-showrunner" / "unit-a.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         unit = staff.snapshot().by_path("Example/unit-a")
         assert unit is not None
         self.assertEqual(note.read_text(encoding="utf-8").splitlines()[:8], [
             "---", "phase_table: true", f"unit: {unit.id}",
-            'now: "Phase 3 of 1 — Retry handling"', "---", "", "# unit-a-unit", "",
+            'now: "Phase 3 of 1 — Retry handling"', "---", "", "# unit-a", "",
         ])
         self.assertIn("**Phase 3 of 1 — Retry handling**", note.read_text(encoding="utf-8"))
         self.assertIn("| Phase 3 |", report)
         self.assertEqual(
             [path.relative_to(vault_root) for path in vault_root.rglob("*.md")],
-            [Path("example-showrunner/unit-a-unit.md")],
+            [Path("example-showrunner/unit-a.md")],
         )
         self.assertEqual(
             {path.relative_to(self.history_dir) for path in self.history_dir.rglob("*")},
@@ -7109,7 +7109,7 @@ with patch.object(fcntl, "flock", admission):
         )
 
         self.assertEqual(result, "ETA recorded: 13:00 UTC")
-        note = vault_root / "example-showrunner" / "unit-a-unit.md"
+        note = vault_root / "example-showrunner" / "unit-a.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         note_text = note.read_text(encoding="utf-8")
         self.assertIn("phase_table: true", note_text)
@@ -7811,11 +7811,11 @@ class PublicPhaseHelperTests(unittest.TestCase):
                 ["3", "4", "5"],
             ),
             (
-                "phases-unit Phase 11 (the wait-holder field and the phase origin fields) "
+                "phases Phase 11 (the wait-holder field and the phase origin fields) "
                 + "merged into sdlc; sdlc said 2026-10-29 its ETA is 19:00 EDT.",
                 [],
             ),
-            ("Phase 7; postmaster-unit's reply record (main abc8344f)", ["7"]),
+            ("Phase 7; postmaster's reply record (main abc8344f)", ["7"]),
             ("Phase 19 (numbering only)", ["19"]),
             ("Phase 10b, Phase 11", ["10b", "11"]),
             ("none", []),
@@ -7844,9 +7844,9 @@ class PublicPhaseHelperTests(unittest.TestCase):
     def test_plan_dependencies_skip_other_unit_spans_but_keep_local_references(self) -> None:
         plan = self.root / "dependencies.md"
         for external in (
-            "phases-unit Phase 11",
-            "models-unit's phase 4",
-            "models-unit’s Phases 4, 5 and 6",
+            "phases Phase 11",
+            "models's phase 4",
+            "models’s Phases 4, 5 and 6",
         ):
             with self.subTest(external=external):
                 _ = plan.write_text(
@@ -8192,6 +8192,32 @@ class LastDispatchTests(StaffTestCase):
 
 
 class StaffProgressHistoryTests(StaffTestCase):
+    def test_selected_events_follow_staff_for_multiple_worktrees_without_parsing_other_events(self) -> None:
+        owner = fixture_member("showrunner", name="records")
+        first, second = self.root / "first", self.root / "second"
+        row = fixture_member("unit", name="first", parent=owner.id,
+                             worktree=staff.PresentWorktree("natedev", first))
+        runs = self.root / "history/runs"
+        runs.mkdir(parents=True)
+        events = [
+            {"schema_version": 1, "event_type": "checkpoint", "owner_staff_id": row.id,
+             "checkpoint_commit": "first", "timestamp_epoch": 3},
+            {"schema_version": 1, "event_type": "phase_started", "working_dir": str(second), "timestamp_epoch": 1},
+            {"schema_version": 99, "event_type": "checkpoint", "working_dir": str(second), "timestamp_epoch": 0},
+            {"schema_version": 1, "event_type": "checkpoint", "working_dir": str(self.root / "other"), "timestamp_epoch": 2},
+        ]
+        compact = json.dumps(events[0], separators=(",", ":"))
+        _ = (runs / "a.jsonl").write_text(compact + "\n" + json.dumps(events[1]) + "\n")
+        _ = (runs / "b.jsonl").write_text("\n".join(json.dumps(event) for event in events[2:]) +
+                                            '\n{"event_type":"progress_reported",broken JSON}\n')
+        decode = cast(Callable[[str], dict[str, object] | None], getattr(progress_history, "_json_object"))
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(runs.parent)}), \
+             patch.object(progress_history, "_json_object", wraps=decode) as parsed:
+            found = progress_history.events_for_worktrees((first, second), frozenset({"checkpoint", "phase_started"}))
+        self.assertEqual([event["timestamp_epoch"] for event in found], [1, 3])
+        self.assertEqual([event["working_dir"] for event in found], [str(second), str(first)])
+        self.assertEqual(parsed.call_count, 4)
+
     def test_fixed_run_owner_survives_clear_and_uses_the_current_staff_folder_and_git_branch(self) -> None:
         owner = fixture_member("showrunner", name="progress")
         first, second = self.root / "first", self.root / "second"
