@@ -638,7 +638,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - A merge can bring a new caller of a changed signature. The sdlc merge brought `pane_moves.py`, and only the full gate found it.
 - `ROSTER_RUN_ROOT` selects the scanned runs in a worker list. The `test_worker` fixture sets it to its root folder.
 
-### Phase 25 — A new tab takes its place past saved worker tabs  · status: todo
+### Phase 25 — A new tab takes its place past saved worker tabs  · status: done
 
 **Depends on:** none
 
