@@ -43,30 +43,23 @@
 
 **Needed:** fix it in the next phase that touches that module, beside the `verify_hold_wait_test_support.py:327` flake fix.
 
-## A callable repair decision
-
-**Source:** natest, approved by builds 2026-11-05. Order: second of the three speed items.
-
-**Today:** the repair decision is inline at `verify.sh:3731-3735`. It uses the lint hold, Cargo status, killed-attempt flag and compiler signal text.
-
-**Needed:** give it one callable home. Move the 10-case status table to direct tests, and keep one end-to-end run for each route. This saves about 31 s on `test_verify_lint_judgment.py`. Measure before and after, and tell the user the build cost change in one line.
-
 ## Platform column in build_targets.py eligible
 
 **Source:** natest, routed by builds 2026-11-05. Order: third of the three speed items.
 
 **Today:** `verify.sh` starts `build_targets.py platform` again after `eligible` (69 interpreter starts in `test_verify_ssh_targets_routing.py`, about 0.094 s each).
 
-**Needed:** `verify.sh` reads the platform from the `eligible` answer. Change the answer format and every reader together. Keep selection, refusal, fallback and reservation behavior. The estimate is 6.5 s on the routing module and one interpreter start fewer per SSH-target run. Before start, trial-merge origin/builds-resources and take natest Phase 24. On landing, send natest the builds commit.
+**Needed:** `verify.sh` reads the platform from the `eligible` answer. Change `print_eligible_target` (`build_targets.py:303`) and every reader together, including the table readers in `initialize_step_record`, `target_for_settings` and `route_test`, and their fixtures. Keep selection, refusal, fallback and reservation behavior. Remove the platform interpreter starts from these paths. The historical trace measured 69 starts at about 0.094 s each, about 6.5 s. Measure the current count and time before and after. Natest Phase 24 is already present. Before start, trial-merge origin/builds-resources. After the change reaches builds, send natest the builds commit.
 
 ## Report Phase 28 metadata items
 
-**Source:** builds (showrunner), 2026-11-05. Build on report Phase 28 (`eb4210b92`) once it lands on builds. Its ledger is `/tmp/claude/unit/b090f8f1-cf8e-4d44-8e52-b223d94de9cc/findings_state.json`.
+**Source:** builds (showrunner), 2026-11-05. Report Phase 28 (`eb4210b92`) is on this branch.
 
 **Needed:**
-1. `verify.sh` reads the metadata near line 2697 without an export (F013).
-2. `verify.sh` and `verify_metadata.py` export through a `verify_metadata.py` request, in place of the output-roots verb (F014).
-3. `verify.sh test` reads Cargo's folders once. `tree_watch.py:245` takes them from the `BUILDLOG_OUTPUT_ROOTS` export when its evidence matches, else from `read_cargo_output_roots`. Put the before and after time per test run in the notice.
+1. `verify.sh` reads the metadata before the first export (`verify.sh:2717-2732`), through `set_gate_metadata` and `load_metadata`.
+2. `BUILDLOG_OUTPUT_ROOTS` comes from a `verify_metadata.py` request, in place of the `step_context.py output-roots` call at `verify.sh:725`.
+3. `verify.sh test` reads Cargo's folders once. `tree_watch.py:245` takes them from the `BUILDLOG_OUTPUT_ROOTS` export when its evidence matches, else from `read_cargo_output_roots`.
+4. Keep `test_metadata_reuse_keeps_the_export_after_a_config_change` and the output-folder tests. Put the before and after time per test run in the notice.
 
 ## FixtureHang in test_verify_ssh_targets_retry.py
 

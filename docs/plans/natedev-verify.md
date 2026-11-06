@@ -293,20 +293,20 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Spec:**
 
-1. **Flags.** `phase_wait_start` (`verify.sh:1236`) passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | build target | memory> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none. None records `HolderNotNamed`.
-2. **Memory holder.** `scripts/lint/memory_gate.sh` (near line 178) pipes each line of `scripts/build_queue/admission_client.py --wait-events` to `buildlog_memory_event` (`verify.sh:1278`). Add a `holder <json>` case there. No change goes into `memory_gate.sh` or the admission client.
+1. **Flags.** `phase_wait_start` (`verify.sh:1254`) passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | build target | memory> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none. None records `HolderNotNamed`.
+2. **Memory holder.** `scripts/lint/memory_gate.sh` (near line 178) pipes each line of `scripts/build_queue/admission_client.py --wait-events` to `buildlog_memory_event` (`verify.sh:1296`). Add a `holder <json>` case there. No change goes into `memory_gate.sh` or the admission client.
    - The client prints `holder` after `first`, and again only when the holder changes.
    - `{"kind":"session","session_id":…,"session_name":…}` gives `--holder-resource-kind memory --holder-resource memory --holder-session <session_id>`.
    - `{"kind":"unit","unit":…}` gives `--holder-resource-kind memory --holder-resource memory --holder-unit <unit>`.
    - `{"kind":"none"}` is an explicit absence: `wait-holder` with no flags.
    - An unchanged holder prints no event, so a steady wait starts no process.
 3. **Same shell.** The event loop runs in the pipe's subshell, and each wait id is in `$HOLD_WAIT_DIR/phase-wait.<BASHPID>.<key>`. `first`, `holder`, `done` and `left` for one client run use that one subshell. Keep the holder state in that subshell.
-4. **Token holder.** In `acquire_token` (`verify.sh:3008`, wait starts near 3041 and 3079) the holder is the board token owner, with kind `slot` and resource `cargo`. Read it in Bash on each pass of the wait loop. Call `wait-holder` only when it changes.
-5. **Build hold.** At `verify.sh:2766` and `:3370`, and in the SSH route (`route_test` at `:2263`, wait at `:2389`; `:3248` copies that body to `route_test_without_renewal`, and `:3249` wraps it with the token renewal), the holder is the hold's holder, with kind `slot` and the held target as the resource.
+4. **Token holder.** In `acquire_token` (`verify.sh:3031`, wait starts near 3064 and 3102) the holder is the board token owner, with kind `slot` and resource `cargo`. Read it in Bash on each pass of the wait loop. Call `wait-holder` only when it changes.
+5. **Build hold.** At `verify.sh:2789` and `:3393`, and in the SSH route (`route_test` at `:2286`, wait at `:2412`; `:3271` copies that body to `route_test_without_renewal`, and `:3272` wraps it with the token renewal), the holder is the hold's holder, with kind `slot` and the held target as the resource.
 6. **Mac busy.** For the Mac-only wait (`phase_wait_start hold "Mac busy"`), the holder is the session that holds the Mac claim, with kind `slot` and resource `mac`. Name it again on each poll.
 7. **Changes.** A changed holder calls `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags. A holder that goes away calls it with no flags. No watcher process runs beside a wait. A change during one blocking wait call shows at the next pass.
 8. **Recorder failure.** A failed `start-wait` or `wait-holder` prints the existing `NotRecorded` line. It never changes admission or the step's exit. The next `holder` event or pass tries again.
-9. **Queue age.** `mem_wait_s` and the waiting lines count from the first queued time in `BUILDLOG_MEM_WAIT_FIRST_FILE`, normally `$HOLD_WAIT_DIR/first-queued-at` (`verify.sh:1955-1959`). Step setup writes that file before routing, so a memory event never creates it. Each recorder interval runs from its own `first` line to its `done` or `left` line. A rejoin after a refused Mac claim opens a new interval and keeps the first queued time. A first check that admits opens no interval and makes no holder call.
+9. **Queue age.** `mem_wait_s` and the waiting lines count from the first queued time in `BUILDLOG_MEM_WAIT_FIRST_FILE`, normally `$HOLD_WAIT_DIR/first-queued-at` (`verify.sh:1978-1983`). Step setup writes that file before routing, so a memory event never creates it. Each recorder interval runs from its own `first` line to its `done` or `left` line. A rejoin after a refused Mac claim opens a new interval and keeps the first queued time. A first check that admits opens no interval and makes no holder call.
 
 **Files:**
 - `scripts/direct/verify.sh` — the `holder` case, the lookups and the `wait-holder` calls.
@@ -325,12 +325,13 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 - Phase 23: a group TERM of a lint run exits 143, repeated INT, TERM and HUP during cleanup are ignored, and no verify process, admission place or step record remains.
 - Phases 7, 28, 31 and 36: token ownership and the step token boundary stay as they are.
 - Phases 29 and 37: a tree-writing step stays on natedev and records `natedev_only` for its lifetime.
+- Phase 38: keep Bash state publication and cleanup. Read a step's state, target, `updated` and run location through `step_record.read`. A fixture that hides tools names `cmp` in its tool list.
 - verify help: a `verify.sh` header edit keeps the `# Usage:` and `# Help <command>:` blocks and the doc gate sentence.
 
 **Acceptance gate:**
 - Through the real event pipe, the recorded wait shows: a holder of each kind; a holder change; an explicit absence; a recorder failure and its retry; a rejoin after a refused Mac claim, with a new interval and the same first queued time; and an immediate admission with no interval and no holder call.
 - The recorded wait names the token owner, the hold's holder and the Mac claim's session, and a change on the next pass.
-- `test_verify_tree_cancel_lint.py`, `test_verify_python_starts`, the verify token, memory-kill and Mac-step suites and `test_verify_lint_local_writes.py` pass.
+- `test_verify_step_state.py`, `test_verify_tree_cancel_lint.py`, `test_verify_python_starts`, the verify token, memory-kill and Mac-step suites and `test_verify_lint_local_writes.py` pass.
 - basedpyright 0/0/0 on the changed Python files; merge gate `--tests-only` green on a tree merged with origin/builds.
 
 ### Phase 9 — Remove Phase 7's new Python starts  · status: done
@@ -983,3 +984,51 @@ Direct tests of the join in `scripts/direct/test_step_record.py`: no state file,
 **State:** the step record under `VERIFY_STEPS_DIR`, same schema, written once; a new `<call id>.state` file beside it, removed with it.
 
 **Verification:** every test module that names `step_record` or `verify.sh`, through `scripts/test_times/module_run.py`; `basedpyright` on each changed Python file; `bash -n scripts/direct/verify.sh` and `shellcheck scripts/direct/verify.sh`; the merge gate before the checkpoint.
+
+### Phase 39 — The first lint judgment's repair decision has one callable home · status: todo
+
+**Depends on:** none
+
+#### Work Order
+
+**Source:** natest, approved by builds 2026-11-05 (next item "A callable repair decision").
+
+**Goal:** the choice to repair after the first Clippy judgment is one Bash function, so its status table runs as direct tests and `test_verify_lint_judgment.py` costs less.
+
+**Spec:**
+
+1. **Function.** Add `first_judgment_permits_repair <status> <log path>` to `scripts/direct/verify.sh`, before the first command that uses it. It runs the condition now inline at `verify.sh:3756`, with the same four parts and the same text pattern, and starts no process other than `grep`. It returns 0 when a repair is permitted:
+   - `HOLD_LINT` is 0;
+   - the status is 101;
+   - `RUN_LAST_ATTEMPT_KILLED` (default 0) is 0;
+   - `grep -qE "process didn.t exit successfully:.*signal:"` does not match the log.
+2. **Caller.** `verify.sh:3756-3758` calls the function with `"$clippy_status"` and `"$CLIPPY_LOG"`, and sets `clippy_repair=1` when it returns 0. The read of the `lint-held` file at `verify.sh:3755` stays at the call site, because it sets `HOLD_LINT` for later steps. The two comment lines at `verify.sh:3752-3753` move to the function.
+3. **Direct tests.** Add a test class to `scripts/direct/test_verify_lint_judgment.py`. It extracts the function with `shell_functions` from `scripts/lib/shell_test_support.py` and runs it in `bash`, with a log file in a `tempfile.TemporaryDirectory`. It has no `VerifyLintCacheFixture`. Cases:
+   - every status in today's table (1, 2, 3, 10, 75, 76, 77, 125, 130, 137, 143), each with a lint finding in the log: no repair;
+   - status 101 with a lint finding in the log: repair;
+   - status 101 with a compile error in the log: repair;
+   - status 101 with `HOLD_LINT=1`: no repair;
+   - status 101 with `RUN_LAST_ATTEMPT_KILLED=1`: no repair;
+   - status 101 with the signal text in the log: no repair.
+4. **End-to-end runs.** `test_first_judgment_nonlint_status_never_repairs` keeps its assertions and runs one status, 1, with no `subTest`. Read `run` in `scripts/lint/invoke.sh` first. When a table status takes its own path through `run`, keep one end-to-end status for each such path, and name them in the summary. All other tests in the file stay as they are.
+
+**Invariants:** `verify.sh` output, exit codes, cache records and build-log records stay the same for every verb. Fix, format, final judgment and `clippy_fix_pass_limit` behavior do not change. Add no other guard, refusal or check.
+
+**Test changes approved:** only the reduction of the status table in `test_first_judgment_nonlint_status_never_repairs`, as item 4 says.
+
+**Acceptance:**
+
+- Observation: wall and CPU seconds of `python3 ~/.claude/scripts/test_times/module_run.py scripts/direct test_verify_lint_judgment.py`. The director runs the same script on the tree before and after this phase. The earlier estimate of 31 s comes from before Phase 38, so the new baseline is the comparison.
+- Comparison: the numbers go in the notice, with one line for the user on the build cost change.
+- Real path: `test_verify_lint_judgment.py` and every `test_verify_lint*.py` module.
+
+**Files:**
+- `scripts/direct/verify.sh` — the function and its caller.
+- `scripts/direct/test_verify_lint_judgment.py` — the direct tests and the reduced table.
+
+**Workers:** 1 writer
+- `merge16` (impl): both files. The test lane is not real for one function and its table.
+
+**State:** none.
+
+**Verification:** `test_verify_lint*.py` through `scripts/test_times/module_run.py`; `basedpyright scripts/direct/test_verify_lint_judgment.py`; `bash -n scripts/direct/verify.sh` and `shellcheck scripts/direct/verify.sh`; the merge gate before the checkpoint.
