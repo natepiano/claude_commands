@@ -362,7 +362,7 @@ Git proves the merge. A shrink passes when its parent commit is an ancestor of t
 
 As built: `ancestry` holds a shrink or as-built commit only when `git rev-list --no-merges <merge_branch>..<commit>^` prints a commit. The literal rule (the parent is an ancestor) holds a shrink for good after a unit-side merge of the merge branch, because that merge commit never reaches the merge branch. `test_shrink_after_criss_cross_merge_scopes_only_its_doc` covers that case. `merged_checkpoints` stays for its other callers.
 
-### Phase 10c — `/unit:direct` loads a core and reads other sections when they apply  · status: in progress
+### Phase 10c — `/unit:direct` loads a core and reads other sections when they apply  · status: done
 
 From the user, through accounts and the sdlc showrunner, 2026-11-07 15:10 EST: "tell sdlc to cut direct.md down to the core so that it loads other instructions as it needs them". A director reads `commands/unit/direct.md` (116 KB, about 29k tokens) again after each compaction. A core of 30-40 KB saves about 20k tokens per cycle.
 
@@ -388,6 +388,8 @@ The moved groups:
 | `codex_dispatch_wait.md` | CodexDispatchWait | when the director is Codex |
 | `final_gate_commit.md` (exists) | FinalGate, RunSummary | at the final gate |
 
+As built: the core is 45 KB, not 30-40 KB. The five largest core sections are needed by every run, so they stay. Each moved group has one stub and one `<TagReferenceContract/>` row, so `_contract_revision` and `tag_inventory.py` cover every new file. After compaction, the hooks say to read the core in full, then each stub file whose moment is live.
+
 ### Phase 10d — A merge adds change rows only for its own production, with the producing unit  · status: todo
 **Depends on:** Phase 10c
 
@@ -396,5 +398,18 @@ From the sdlc showrunner, 2026-11-07, a defect from builds. When builds merges m
 Fix where the rows are made:
 1. A merge adds rows only for its own production's checkpoints.
 2. Each row's Producer is the unit that made the checkpoint.
+3. Each row's Production cell is the fixed staff id of the showrunner whose production made the checkpoint.
+
+The user, through builds and sdlc, 2026-11-07: "shutdown was part of sdlc not natedev - it got renamed but whatever - the fix needs to keep changes in the production that made them based on the id of the showruner for that production". So a merged row's Production cell is the fixed staff id of the showrunner whose production made the checkpoint, not the production that merges it. Example: shutdown's 9e8e10895 (subject natedev-shutdown), rows C1195-C1197, landed in builds; they belong to sdlc.
 
 Add no new check.
+
+### Phase 10e — Two test rules in the direct contract  · status: todo
+**Depends on:** Phase 10c (it moves FixDispatch)
+
+From the user, through natest and the sdlc showrunner, 2026-11-07 (the user's words: "do rules 1 and 2"). The suite grew from 263 tests (Oct 1) to 18,879 (Nov 7), with one narrow test for each review finding.
+
+1. A fix adds its case to the existing test of the same behavior (a table row), not a new test method. Add a new test only when no test covers the behavior.
+2. Write or keep a rare-case test (an edge case, a refusal, malformed input, a failure path) only when its defect would show the user a wrong result, damage saved state (a file, Git, a ledger, staff, a config), or lose work (a commit, an edit, a message, a worker result). Every main-path test stays.
+
+Places: the FixDispatch regression-test sentence ("writes, for each testable finding, the regression test that would have caught it"), the test rules line in `write_prompt_contract.md`, and the test worker prompt. Each rule has one place; the other places point to it. This phase is doc-only.
