@@ -24,7 +24,7 @@ from scripts.model_study import results as study_results
 from scripts.model_study.turns import RECORDED_ZONE, Compaction, Dropped, Turn, load_roster, read_session, recompute_switch_turns, session_ids
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from unit_runs import history_root  # noqa: E402
+from scripts.lib.unit_runs import history_root  # noqa: E402
 
 DEFAULT_STATE = Path.home() / ".local/state/model-study"
 DEFAULT_ROSTER = Path(__file__).with_name("roster.json")

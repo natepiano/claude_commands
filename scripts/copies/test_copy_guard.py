@@ -50,7 +50,7 @@ def shell_policy_cases() -> tuple[ShellPolicyCase, ...]:
         ("git -c alias.clone=show status", ""),
         ("git show clone", ""),
         ("git -C repo worktree add dst HEAD", "git worktree add"),
-        ('copies.py run --owner unit --repo "$(git clone a b)" --commit HEAD -- true', "git clone"),
+        ('copies.py run --repo "$(git clone a b)" --commit HEAD -- true', "git clone"),
         ('value=$(git clone a b)', "git clone"),
         ('cat >"$(git clone a b)"', "git clone"),
         ("bash <<'DOC'\ngit clone a b\nDOC", "git clone"),
@@ -314,9 +314,9 @@ class CopyGuardTests(unittest.TestCase):
         ordinary = self.root / "documents"
         ordinary.mkdir()
         commands = [
-            f"python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit --repo {self.repo} --commit HEAD -- true",
-            "copies.py run --owner verify-unit --repo . --commit HEAD -- true",
-            "python3 -m scripts.copies.copies run --owner verify-unit --repo . --commit HEAD -- true",
+            f"python3 ~/.claude/scripts/copies/copies.py run --repo {self.repo} --commit HEAD -- true",
+            "copies.py run --repo . --commit HEAD -- true",
+            "python3 -m scripts.copies.copies run --repo . --commit HEAD -- true",
             f"cp -a {ordinary} destination", f"rsync -a {ordinary}/ destination/",
             f"cp {self.repo}/tracked destination", "git worktree list", "git status",
             "echo 'git clone source destination'", "# git clone source destination\ngit status",

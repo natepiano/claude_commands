@@ -1597,7 +1597,7 @@ def nightly_owner(args: GateArguments) -> str:
         if len(matching) != 1:
             return copies.fallback_owner("nightly")
         doc = matching[0]
-    return unit_lookup.doc_owner(doc, staff.snapshot()).name
+    return str(unit_lookup.doc_owner(doc, staff.snapshot()).id)
 
 
 def type_check_summaries(output: str) -> list[str]:
@@ -1664,7 +1664,8 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
             detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
             if summaries:
                 detail += "\n" + summaries[-1]
-        outcome = showrunners.tell(nightly_owner(args), f"merge-gate-nightly:{tree}",
+        name = copies.owner_name(copies.copy_owner(nightly_owner(args)))
+        outcome = showrunners.tell(name, f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
     except (GateRefused, change_review.ChangeReviewError, OSError, ValueError) as error:

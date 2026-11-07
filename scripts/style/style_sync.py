@@ -350,10 +350,13 @@ def sweep_stale_lint_dirs() -> None:
 
 def gate_owner(repo: Path) -> str:
     """Use the registered style production, or the calling production."""
+    from scripts.production import staff, unit_lookup
+
     standing = standing_style_production(repo)
     if not isinstance(standing, NoStyleProduction):
-        return standing.name
-    return showrunners.own_name() or copies.fallback_owner("style")
+        return str(unit_lookup.doc_owner(standing.doc, staff.local_snapshot()).id)
+    row = staff.local_snapshot().owner_of(staff.caller_identity())
+    return str(row.id) if row is not None else copies.fallback_owner("style")
 
 
 def lint(repo: Path, checkout: Path, tip: str) -> int:

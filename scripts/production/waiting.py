@@ -276,7 +276,7 @@ def scratch_test(production: Production, name: str, tests: str, state_dir: Path)
     log = state_dir / f"scratch-test-{unit.name}-{stamp}.log"
     passed = False
     try:
-        with copies.standing(production.name, production.checkout, copies.CommittedSource(unit.branch),
+        with copies.standing(str(production.owner.id), production.checkout, copies.CommittedSource(unit.branch),
                              merge=copies.MergeRevision(production.merge_branch)) as worktree:
             try:
                 with log.open("w", encoding="utf-8") as output:

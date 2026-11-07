@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
     import script_prompts
-    import unit_runs
+    from scripts.lib import unit_runs
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     from scripts.message.relay_identity import message_sender_name
 

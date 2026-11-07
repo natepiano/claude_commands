@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, NewType, Protocol, TypeVar, cast
 from uuid import UUID
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
     sys.modules["scripts.production.staff"] = sys.modules[__name__]
@@ -104,6 +103,11 @@ def _valid_id(value: str) -> bool:
     except StaffRefused:
         # Transitional records are readable only so the one-time migration can run.
         return bool(re.fullmatch(r"s[a-z0-9]{11}", value))
+
+
+def caller_identity() -> str:
+    """Read the caller's exported session identity."""
+    return os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
 
 
 def runtime_id(pid: int | None = None) -> str:
@@ -457,6 +461,11 @@ class StaffSnapshot:
 
     def parent_of(self, row: StaffRow) -> StaffRow | None:
         return self.by_id(row.parent.id) if isinstance(row.parent, ReportsTo) else None
+
+    def owner_of(self, reference: str) -> StaffRow | None:
+        """Return the member, or the parent unit when the member is a worker."""
+        row = self.by_member_reference(reference)
+        return self.parent_of(row) if row is not None and row.kind == "worker" else row
 
     def by_current_session(self, session_id: str) -> StaffRow | None:
         return next((row for row in self.rows if row.current_session == session_id), None)
