@@ -784,22 +784,45 @@ class RestartTests(RestartTestCase):
             reason = str(result) if isinstance(result, herdr.UnreadableTrustFile) else f"Claude has not trusted {self.root}"
             self.assertEqual(output.getvalue(), f"test: trust anomaly: {reason}\n")
 
-    def test_saved_codex_record_restores_its_home_without_claude_trust(self) -> None:
+    def test_saved_codex_record_uses_workers_home_without_claude_trust(self) -> None:
         row = self.rows[0]
         home = self.root / ".codex2"
+        workers = self.root / ".codex1"
         entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(home)}, ["codex"], kind="codex")
         entry["config_dir"] = str(home)
         pane_record.write("agents", entry)
-        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+        with (patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", workers)) as role,
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
               patch.object(stop_resume, "heal_account_trust") as trust,
               patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                   "w1:p0", herdr.PromptSubmissionNotRequired())),
               patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
-                  self.root, {"CODEX_HOME": str(home)})) as prepare):
+                  self.root, {"CODEX_HOME": str(workers)})) as prepare):
             _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"))
         trust.assert_not_called()
-        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(home))
+        role.assert_called_once_with("workers")
+        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(workers))
+
+    def test_saved_codex_restart_uses_explicit_account(self) -> None:
+        row = self.rows[0]
+        home = self.root / ".codex2"
+        target = self.root / ".codex3"
+        entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(home)}, ["codex"], kind="codex")
+        entry["config_dir"] = str(home)
+        pane_record.write("agents", entry)
+        with (patch.object(accounts, "role_account") as role,
+              patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(stop_resume, "heal_account_trust") as trust,
+              patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                  "w1:p0", herdr.PromptSubmissionNotRequired())),
+              patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                  self.root, {"CODEX_HOME": str(target)})) as prepare):
+            _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"), target_account="codex3")
+        role.assert_not_called()
+        trust.assert_not_called()
+        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(target))
 
     def test_dry_run_names_a_morty_agent_with_an_unproved_native_identity(self) -> None:
         row = replace(self.rows[0], kind="agent", name="morty", worktree=staff.WORKTREE_UNFILLED)
