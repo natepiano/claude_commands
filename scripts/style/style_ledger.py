@@ -34,6 +34,7 @@ from typing import Concatenate, Literal, TypedDict, cast
 
 from scripts.production.issues import Issue, frontmatter
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_blob import git_blob_id
 from scripts.production import staff, session_staff
 
 from scripts.style.git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
@@ -2805,8 +2806,7 @@ class Ledger:
             texts: list[PinnedRuleText] = []
             for rule_id, definition in definitions.items():
                 text = definition.path.read_bytes()
-                result = _git_bytes(self.repo, "hash-object", "--stdin", input=text)
-                hashed = result.stdout.decode().strip()
+                hashed = git_blob_id(text)
                 if hashed != definition.blob:
                     raise ChangedBeforeLock(f"{rule_id}: rule changed while pinning; rerun")
                 texts.append(PinnedRuleText(rule_id, hashed, text))
