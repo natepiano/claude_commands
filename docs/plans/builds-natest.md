@@ -1658,70 +1658,38 @@ The verify hold and token wait fixtures keep every run root inside the test root
 **Gotchas:** `staff.py pause` finds its caller through `runtime_id()`, which walks the parent processes. An in-process call has no such parent, so `pause` keeps `self.script(STAFF_SCRIPT, "pause", ...)`.
 
 ### Phase 79 — `style/test_add_style.py` uses half its CPU  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/style/test_add_style.py` (49.2 CPU s per gate, 31 tests) uses half its CPU, or a measured floor shows why it cannot, with every checked behavior kept.
+`style/test_add_style.py` uses half its CPU, with all 31 tests and their assertions kept. Three same-load pairs: CPU 57.09 to 27.73 s (down 51.4%); 22 mutations still fail their tests. The module passes at 27.4 CPU s on the branch.
 
-**Spec:** Follow the Speed method.
-1. Profile with `module_cost.py --tests 10 --commands 10` before any edit. Name the 10 tests with the most CPU and what each one pays for. Name each process start and Git call count. Add the cost of each real `add_style.py` launch and each Git repository a test makes.
-2. Look first for repeated first launches and repeated setup. Cut in the Speed method's order, direct calls first. Cuts add up, so state a floor only after the available cuts.
-3. A cut in a production file goes to the director first, with the measured gain.
-4. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- `AddStyleTests.setUpClass` builds one repository seed through `prepare_repository`. Each `setUp` copies the seed with `shutil.copytree`.
+- The bootstrap runs in process through `invoke_cli(add_style, lambda: add_style.main(argv), argv, self.env, self.repo)` from `scripts/production/cli_fixture.py`.
+- Two `run_bootstrap_process` tests and the rules-listing CLI keep one real process each.
 
 **Files:**
 - `scripts/style/test_add_style.py` — the module
 
-**Workers:** 1 writer on slot `impl3` (one module; the file does not split)
-- `impl3` — all files above, role impl
+**Gotchas:** the local seed adds an origin, an upstream branch and its own commit message, so `initial_tip` depends on it.
 
-**Constraints from prior phases:**
-- Phase 74: one class seed made in `setUpClass` and copied per test took `copies/test_copy_guard.py` from 64.15 to 31.36 CPU s. A cached scan is valid only while no test writes into the scanned tree.
-- Phase 75: one module patch of a launch through `unittest.enterModuleContext` took `production/test_add_unit.py` from 59.76 to 20.34 CPU s. Keep one real CLI process for each command boundary a test names.
-- Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
-- Phase 47: pairs run with `TMPDIR` under `/dev/shm`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-
-**Acceptance gate:**
-- the module passes under `scripts/test_times/module_run.py`; the behavior map has one row per moved assertion; for each moved check, breaking the function fails the new test on a tempdir copy
-- CPU s, processes, execs and wall s before and after, from three same-load pairs, in the checkpoint notice
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed files prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** a shared `ImmutableGitSeed`; it changes the repository state the tests assert on.
 
 ### Phase 80 — Claim tests catch a reply with no mirrors and a server with no admission lock  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/copies/test_review_remote_copies.py` fails when a claim reply leaves out the mirrors, and when the claim server runs with no admission lock. The six claim mutations that fail now still fail.
+`scripts/copies/test_review_remote_copies.py` fails when a claim reply leaves out the mirrors, and when the claim server takes no admission lock. All eight claim mutations fail the 29-test module.
 
-**Spec:** The verify unit sent this item through the showrunner on 2026-11-07. Both gaps are older than Phase 69.
-1. Gap 1: a claim reply that leaves out the mirrors still passes `test_idle_removal_exempts_its_lease_and_keeps_a_busy_sibling` (`test_review_remote_copies.py:72`). Find where the claim server builds its reply. Make the test, or one new test named for the behavior, read the mirrors the reply carries.
-2. Gap 2: a claim server with no admission lock still passes `test_cancelled_sweep_releases_real_locks_for_admission_and_owner_removal` (`test_review_remote_copies.py:670`). Find where the server takes the admission lock. Make a test show that a second admission waits while the lock is held.
-3. Prove each check on a tempdir copy: make the mutation, run the module, and show that the named test fails. Run the six existing claim mutations again, and show each still fails.
-4. Use the warm claim servers (`scripts/copies/remote_test_support.py`) and the class seed from Phase 69. Add no new process start that the check does not need. Report the module CPU s before and after.
-5. Edit only the test file. queue-unit owns `copies.py` and the claim server code. Add no guard, refusal or check in production code (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time.
+- A test reads the mirrors that the claim reply carries.
+- `test_claim_server_keeps_a_second_admission_waiting_until_release` shows that a second admission waits while the lock is held.
+- `RemoteEntryTests.setUp` sets `UNIT_ACTIVE_DIR` inside the test root before `warm_claim_servers()`, so admission reads no live active marker.
 
 **Files:**
 - `scripts/copies/test_review_remote_copies.py` — the module
 
-**Workers:** 1 writer on slot `impl4` (one module; the file does not split)
-- `impl4` — all files above, role impl
+**Gotchas:** an inherited `UNIT_RUN_DIR` moves the active folder outside the test root unless `UNIT_ACTIVE_DIR` is set.
 
-**Constraints from prior phases:**
-- Phase 69: each test class copies one immutable Git seed with `ImmutableGitSeed.copy_to`, and `warm_claim_servers()` runs a warm fork `ClaimServer` over the real `floor_claims` source. The threaded cancellation test keeps fresh subprocesses.
-- Phase 76: a fixture that sets `ROSTER_RUN_ROOT`, `UNIT_RUN_ROOT` and `SCRATCH_ROOT` inside its test root makes no live `/tmp/claude/unit` read.
-- Phase 47: runs use `TMPDIR` under `/dev/shm`.
-- Tests never read or write live state: `~/.claude` main, `~/.local/state/merge-gate`, `/tmp/claude`.
-- `RemoteEntryTests.setUp` sets `UNIT_ACTIVE_DIR` inside the test root before `warm_claim_servers()`. An inherited `UNIT_RUN_DIR` must not move it outside the root.
-
-**Acceptance gate:**
-- the module passes under `scripts/test_times/module_run.py`
-- each of the two mutations fails a named test on a tempdir copy, and the six existing claim mutations still fail
-- module CPU s before and after, from `module_cost.py`
-- the targeted test green on the phase commit merged with `origin/builds`
-- `basedpyright` on the changed file prints `0 errors, 0 warnings, 0 notes`
+**Ruled out:** a CPU claim; the before and after samples ran under different loads.
 
 ### Phase 81 — Affected-module tests remove their Git repository without a race  · status: done
 
