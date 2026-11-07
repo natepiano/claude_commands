@@ -1555,7 +1555,7 @@ The goal was not reached: the hang is not fixed and its cause stays open. The ha
 
 **Gotchas:** one unproved condition is PID reuse at `verify.sh:2953-2956`. The gate deletes its temporary log, so the report stays readable only in a log that the gate's caller keeps. The next recurrence names the wait.
 
-### Phase 71 — Index refreshes leave reads and unchanged indexes alone  · status: todo
+### Phase 71 — Index refreshes leave reads and unchanged indexes alone  · status: done
 **Depends on:** Phase 65
 
 #### Work Order
@@ -1608,7 +1608,7 @@ The goal was not reached: the hang is not fixed and its cause stays open. The ha
 **Spec:**
 1. `direct/test_findings_simplify.py`, `test_held_finding_survives_a_repair_round_and_phase_end`: `progress_history` start-run reads the live staff file through `staff.initial_snapshot`. On a tree with an older `staff.py` it fails with `StaffUnreadable`. `FindingsLedgerFixture.environment()` at `findings_test_support.py:101` copies `os.environ`, so it inherits `STAFF_FILE`. Use `isolated_staff_file` from `scripts/production/staff_test_support.py` around the recorder sequence. Prove it: run the test with `STAFF_FILE` set to an unreadable file, and show that it fails before the fix and passes after.
 2. `production/test_production_lifecycle.py`: the first failure is `OSError: [Errno 39] Directory not empty: '.../lifecycle-test-cz0_xeap/case/origin.git/objects'` in the `shutil.rmtree` cleanup. The next 16 tests then fail with `FileExistsError` at `production_lifecycle_test_support.py:119`, because `LifecycleFixture` reuses one directory. Find the process that writes to `origin.git/objects` after its test ends, before you select a teardown fix. A retry in `rmtree` hides that process, so do not use one unless the evidence shows the writer ends by itself. Keep one failure from turning into 17.
-3. `production/test_merge_gate_suites_admission.py`: the hang is in `admission_client._line` at load 140, and the module passes alone on the base in 12.7 s. No cause is proved. Capture the blocked stack, the admission state and the child processes under forced load or a forced delay, before you select a fix. A cause in `scripts/build_queue/` goes to queue-unit, with the failing line, the source line and a reproduction.
+3. `production/test_merge_gate_suites_admission.py`: the hang is in `admission_client._line` at load 140, and the module passes alone on the base in 12.7 s. No cause is proved. Capture the blocked stack, the admission state and the child processes under forced load or a forced delay, before you select a fix. Forced case, 2026-11-06: `AdmissionFixture.loop_turn` waits 3 s for the loop lock, its error stops the server thread, and the client then waits for a reply that never comes. `scripts/build_queue/admission_test_support.py` is a test file, so this phase changes it. A cause in a production file goes to queue-unit, with the failing line, the source line and a reproduction.
 4. Quote the failing line and the source line before any fix. Reproduce with a forced delay or at gate load. State what is proved and what is not.
 5. Add no guard, refusal or check (user rule, 2026-11-05). Make any project that a test needs in a tempdir at run time. A cut in a production file goes to the director first.
 
@@ -1619,10 +1619,11 @@ The goal was not reached: the hang is not fixed and its cause stays open. The ha
 - `scripts/production/production_lifecycle_test_support.py`
 - `scripts/production/test_merge_gate_suites_admission.py`
 - `scripts/production/merge_gate_suites_test_support.py`
+- `scripts/build_queue/admission_test_support.py`
 
 **Workers:** 2 writers; the admission fixture has no shared file with the other two
 - `impl3` — `test_findings_simplify.py`, `findings_test_support.py`, `test_production_lifecycle.py`, `production_lifecycle_test_support.py`, role impl
-- `impl4` — `test_merge_gate_suites_admission.py`, `merge_gate_suites_test_support.py`, role impl
+- `impl4` — `test_merge_gate_suites_admission.py`, `merge_gate_suites_test_support.py`, `admission_test_support.py`, role impl
 
 **Constraints from prior phases:**
 - Phase 63: a flake fix publishes a file atomically and waits on events. A forced case fails before the fix and passes after it.

@@ -408,10 +408,10 @@ def open_report_index() -> sqlite3.Connection:
     path = index.complete_gate_index_in(store.root())
     if isinstance(path, index.NoCompleteGateIndex):
         _ = index.update()
-        connection = index.read_only()
-    else:
-        connection = sqlite3.connect(index.read_only_path_uri(path), uri=True)
-        _ = connection.execute("PRAGMA query_only = ON")
+        path = index.index_path()
+    connection = sqlite3.connect(index.read_only_path_uri(path), uri=True,
+                                 timeout=index.BUSY_TIMEOUT_MS / 1000)
+    _ = connection.execute("PRAGMA query_only = ON")
     try:
         connection.execute(f"SELECT 1 FROM {', '.join(index.GATE_TABLES)} LIMIT 0").close()
     except BaseException:
@@ -421,7 +421,7 @@ def open_report_index() -> sqlite3.Connection:
 
 
 def rows_as_of(connection: sqlite3.Connection) -> None:
-    """Show the time of the last complete update in the user's zone."""
+    """Show the time of the last row change in the user's zone."""
     completed = cast(tuple[str] | None, connection.execute(
         "SELECT value FROM meta WHERE key = 'updated_at'"
     ).fetchone())

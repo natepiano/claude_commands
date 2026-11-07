@@ -617,9 +617,10 @@ def complete_gate_index_in(root: Path) -> Path | NoCompleteGateIndex:
                 if statement.startswith("CREATE TABLE ") and statement.split()[2] in GATE_TABLES}
     current = index_path_in(root)
     candidates: list[tuple[float, Path]] = []
+    read_wait = conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS")
     for path in root.glob(f"{INDEX_PREFIX}-*{INDEX_SUFFIX}"):
         try:
-            connection = sqlite3.connect(read_only_path_uri(path), uri=True, timeout=0)
+            connection = sqlite3.connect(read_only_path_uri(path), uri=True, timeout=read_wait)
             try:
                 completed = cast(tuple[str] | None, connection.execute(
                     "SELECT value FROM meta WHERE key = 'updated_at'"
@@ -721,7 +722,8 @@ def open_for_update(path: Path) -> sqlite3.Connection:
     for statement in schema_statements():
         if statement.startswith("CREATE INDEX") and statement.split(" ON ", 1)[0].split()[-1] not in indexes:
             _ = connection.execute(statement)
-    connection.execute("PRAGMA journal_mode = WAL").close()
+    spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
+    connection.execute(f"PRAGMA cache_spill = {spill_pages}").close()
     _ = connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 
@@ -1174,6 +1176,20 @@ def update() -> int:
     return update_in(store.root())
 
 
+def has_numeric_update_time(connection: sqlite3.Connection) -> bool:
+    """Return whether the index has a numeric completion time."""
+    completed = cast(tuple[str | None] | None, connection.execute(
+        "SELECT value FROM meta WHERE key = 'updated_at'"
+    ).fetchone())
+    if completed is None:
+        return False
+    try:
+        _ = float(str(completed[0]))
+    except ValueError:
+        return False
+    return True
+
+
 def update_in(root: Path) -> int:
     """Update the index in the selected build log root."""
     root.mkdir(parents=True, exist_ok=True)
@@ -1184,9 +1200,7 @@ def update_in(root: Path) -> int:
             now = time.time()
             settings = conf.read("buildlog")
             touch_minutes = settings.number("INDEX_TOUCH_MINUTES")
-            previous_stamp = current.stat()
-            touch_due = now - previous_stamp.st_mtime > touch_minutes * 60
-            if touch_due:
+            if now - current.stat().st_mtime > touch_minutes * 60:
                 os.utime(current, (now, now))
             _ = connection.execute("BEGIN IMMEDIATE")
             known = {
@@ -1209,9 +1223,9 @@ def update_in(root: Path) -> int:
                 forget(connection, gone)
             if touched_calls:
                 resolve_mac_repositories(connection, touched_calls)
-            data_changed = connection.total_changes != 0
-            _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('updated_at', ?)",
-                                   (str(time.time()),))
+            if connection.total_changes or not has_numeric_update_time(connection):
+                _ = connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('updated_at', ?)",
+                                       (str(time.time()),))
             _ = connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -1219,8 +1233,6 @@ def update_in(root: Path) -> int:
             raise
         finally:
             connection.close()
-        if not data_changed and not touch_due:
-            os.utime(current, ns=(current.stat().st_atime_ns, previous_stamp.st_mtime_ns))
         cleanup_unused_indexes(root, current, settings)
     return lines
 

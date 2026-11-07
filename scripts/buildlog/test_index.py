@@ -302,7 +302,7 @@ class IndexTests(unittest.TestCase):
         self.write(self.host_file, step("retained"))
         _ = index.update()
         with closing(index.open_for_update(index.index_path())) as writer:
-            writer.execute("BEGIN EXCLUSIVE").close()
+            writer.execute("BEGIN IMMEDIATE").close()
             writer.execute("DELETE FROM steps").close()
             with closing(index.read_only()) as reader:
                 reader.execute("PRAGMA busy_timeout=0").close()
