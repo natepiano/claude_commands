@@ -893,6 +893,8 @@ class WorkerPaneTests(StaffTestCase):
         arguments = self.world.requests[-1][1]
         self.assertIn(["-c", "model_auto_compact_token_limit=43000"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
         config = self.root / "conf/direct.conf"
         write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
                                                              "UNIT_COMPACT_ABOVE_TOKENS=67000"))
@@ -904,6 +906,8 @@ class WorkerPaneTests(StaffTestCase):
         arguments = self.world.requests[-1][1]
         self.assertEqual(arguments[:2], ["resume", str(first.row.current_session)])
         self.assertIn(["-c", "model_auto_compact_token_limit=67000"],
+                      [arguments[index:index + 2] for index in range(len(arguments) - 1)])
+        self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
         self.assertEqual(len(self.world.launches), 2)
 

@@ -2997,7 +2997,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
             try:
-                herdr.Herdr(herdr.shared_session()).prompt(state.pane, text, target=str(worker.current_session))
+                herdr.Herdr(herdr.shared_session()).prompt(
+                    state.pane, text, target=str(worker.current_session), proof=herdr.SubmitStarts(int(timeout * 1000)))
                 return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
             except (herdr.HerdrFailure, OSError) as error:
                 reason = str(error)

@@ -2880,7 +2880,7 @@ Preserve historical transcript behavior and safety checks for pinned runs.
 
 ### Phase 19 — Delete the mesh and rename the detached runs  · status: todo
 
-**Depends on:** Phase 16, Phase 17, Phase 18, and the drain gate below.
+**Depends on:** Phase 16, Phase 17, Phase 18, Phase 21, and the drain gate below.
 Require the devtools-unit 3t checkpoint, with the `implement.sh` and `review.sh` Codex branches deleted, merged to sdlc.
 Unrelated staff stores and deletions can follow panes without the whole-4g barrier.
 
@@ -3061,6 +3061,44 @@ No live caller names `implement.sh` or `review.sh`; list historical text separat
 All repository callers enter through `assign.sh`, which executes `assign.py`.
 Search `resume_message.py` and its tests with the other caller files.
 Keep no compatibility wrapper without a named external caller. The one launcher still records each pass once and uses `worker.py`; affected caller and command-mirror suites pass.
+
+### Phase 21 — A detached run result reaches an idle pane worker  · status: done
+
+**Depends on:** Phase 18. Phase 19 waits for this phase.
+
+sdlc ruled it urgent (2026-11-07): "a detached run delivers its result to a pane worker". The fastest unit's pane worker ended its turn after `mesh_runs.py start`; the run ended exit 0 and the record says `sent: worker … at w14:pW`, but no user turn reached the worker. At 13:37:20 UTC the worker transcript shows three `thread_settings_applied` events (reasoning effort medium, high, medium) and no user message: the typed text reached the Codex TUI as key input outside the composer. The Phase 21 dispatch to impl6 at 14:05 UTC repeated it. The cause is the Codex rate-limit model nudge ("… for lower credit usage?"): near the weekly limit, Codex shows a model-switch popup after a turn, the typed text answers it, and Enter applies new thread settings. Both workers changed from gpt-6.1-sol to gpt-6-luna this way. herdr-unit corrected the approach (2026-11-07): `submit_opening_prompt` reads only Claude screens and transcripts, so the worker path uses the native `herdr agent prompt --wait` proof that worker dispatch already uses.
+
+#### Work Order
+
+**Goal:** a Codex pane worker never shows the rate-limit model nudge, so typed input reaches its composer. A message to a pane worker, the detached run result included, is proved to start the worker's turn. When herdr sees no turn start, the holder gets the message, as the existing fallback does.
+
+**Spec:**
+
+0. `worker_panes._policy_arguments` (`scripts/herdr/worker_panes.py:576`), Codex branch: add `-c notice.hide_rate_limit_model_nudge=true`. Every Codex pane launch (workers, consultation panes, held roles) uses this one function.
+1. `Herdr.prompt` (`scripts/herdr/herdr.py:2343`) takes a keyword `proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED`. `SubmitStarts(timeout_ms: int)` adds `--wait --until working --until blocked --timeout <ms>` to the `herdr agent prompt` call. herdr then fails with `agent_prompt_stalled` when the agent shows no working or blocked state within 5 seconds; the existing `HerdrFailure` carries that code. `SubmitUnproved` keeps the current call. Every other caller and `submit_opening_prompt` keep `SubmitUnproved`.
+2. `send.deliver_worker_text` (`scripts/message/send.py:2987-3016`) calls `Herdr.prompt(..., proof=SubmitStarts(<timeout in ms>))`, from its `timeout` argument (seconds). Success returns `PaneTextDelivered("sent", ...)`, as now. A `HerdrFailure` (the stall included) or `OSError` goes to the existing holder fallback, `Worker <name>: <reason>` plus the text.
+3. Add no retry, no wait loop and no transcript read. Add no check, refusal or validation.
+4. `mesh_runs.deliver` does not change: its `Detached run: <run id>` marker and `_result_received` keep a result from a second delivery.
+
+`submit_opening_prompt` is not used here: its composer parser and recipient check read only the Claude screen and the Claude session registry, and `TranscriptCursor` reads only Claude `projects` transcripts.
+
+**Files:**
+- `scripts/herdr/worker_panes.py`, `scripts/herdr/test_worker_panes.py` — Spec item 0; extend the existing Codex launch argument test to require the nudge flag.
+- `scripts/herdr/herdr.py` — Spec item 1.
+- `scripts/message/send.py` — Spec item 2.
+- `scripts/message/test_send.py` — tests in `PaneWorkerMessageTests`: (a) a delivered message sends one `agent prompt` with `--wait --until working --until blocked --timeout <ms>` and returns `sent`; (b) a prompt that herdr reports as `agent_prompt_stalled` routes the message and the stall reason to the holder. Keep the existing delivery tests passing.
+
+**Workers:** `1 writer` — `impl`: all five files.
+
+**State:** none.
+
+**Constraints from prior phases:** `PaneWorld` (`scripts/herdr/test_worker_panes.py`) is shared by the accounts, shutdown, production, message and hooks suites; a fixture change needs those suites too. Phase 18 lines and tests stay as they are.
+
+**Acceptance gate:**
+- The new tests and `python3 -m unittest discover -s scripts/message -p 'test_send.py'` pass.
+- `-s scripts/herdr -p 'test_herdr.py'`, `-p 'test_worker_panes.py'` and `-s scripts/agents -p 'test_mesh_runs.py'` pass.
+- basedpyright on the five files reads `0 errors, 0 warnings, 0 notes`.
+- The full gate passes.
 
 ## Reference
 
