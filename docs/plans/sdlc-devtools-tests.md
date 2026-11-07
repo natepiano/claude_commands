@@ -1365,3 +1365,45 @@ Source: sdlc [3512fc77]: two older defects, after 4a. A wrong result goes first 
 **State:** `impl_claim_<slot>.json` gains `started`. A claim lasts one launcher life, so there is no conversion. A claim from a launcher that runs across the landing reads as ended; its worker is busy, so `assign_claude._claim` refuses at its idle check and `assign.claim_worker` refuses at its `launcher_pid` check.
 
 **Constraints from prior phases:** Phase 8i: `assign_claude.py` has no `__main__` and runs in the assign process; the claim holds `os.getpid()`; `run` releases it in `finally`. `_release` and `assign.py`'s interrupted path compare only `pid` with `os.getpid()`, and they stay. The import rule: `from scripts.<folder> import <module>`, no `sys.path` line.
+
+### Phase 8k — A Claude worker launch runs in one Python process  · status: todo
+
+Source: sdlc [4d62a4d8], natest's measure: 20.9 CPU s over 143 inline Python starts in one profile of the Claude launcher records test, and the same starts run on each real launch. Sdlc [3684c30a] dropped the `launcher_pid` item, so this item is next.
+
+Recount on the 8j tree, CPU of one start: `agent_bg.sh:7` `assign_gate` 32 ms; `:79` `coordinate-claude` 146 ms; `claude_account.sh:6` 228 ms; `:153` settings 46 ms; `:195` `nix_env.py exec` 28 ms; `:211` role 48 ms; `:227` `send.py` 180 ms; `:243` status 24 ms per 15 s poll; `:116` transcript count 56 ms, twice or more on a follow-up; `:299` summary 24 ms. `heartbeat_watch.sh:24` 24 ms per minute. The assign process already imports `staff`, `worker_admission` and `codex_mesh`.
+
+**Depends on:** 8j
+
+#### Work Order
+
+**Goal:** a Claude worker launch uses the assign process for every step of `agent_bg.sh`, so a launch starts one Python child for delivery and no other launcher Python.
+
+**Spec:**
+1. **One module.** `scripts/direct/claude_worker.py` holds each step of `scripts/agents/agent_bg.sh` as functions that run in the assign process. It has no `__main__`. `assign_claude._run` calls them. `scripts/agents/agent_bg.sh` and the `worker_fill.py coordinate-claude` command do not exist. `assign_gate.LAUNCHERS` holds no `agent_bg.sh`, and `assign_gate.PYTHON_HOPS` does not exist. `worker_fill.py member` and `end-friend` stay.
+2. **No protocol.** The Bash and Python lines `launch`, `attach`, `published`, `dispatched` and `unchanged` become direct calls. `worker_admission.switch_worker` keeps its `start` and `dispatch` callbacks. `start` starts `claude --bg` and returns the native id through the existing registry wait and `CLAUDE_WORKER_REGISTER_WAIT_SECS`. `dispatch` appends the role, delivers the prompt and returns `ASSIGNMENT_ACCEPTED`. The transcript check that gives one unchanged result stays, the `TranscriptHandoff` opening stays, and `record_dispatch` stays in the same order.
+3. **Account, settings and start.** The account step calls `accounts.account_for_unscoped_launch` with the launch environment and gives the same result as `claude_launch_environment`: `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` set or removed, `CLAUDE_CODE_OAUTH_TOKEN` removed. `claude_account.sh` stays for its other callers. The settings JSON keeps the same filter and values. One `nix_env.ensure` serves the settings and the start, so direnv runs once. The start environment removes the same names as the `env -u` list and `models_agent_environment`. The id comes only from the `backgrounded` line of the banner. A failed start writes the banner to the log and returns 1.
+4. **Role and delivery.** `agents_log.append` runs before delivery, and it prints the same `agents_log:` line on an error. Delivery stays one child: `send.py --to session:<id> --from launcher --file <prompt>`, with the same `SENT:` and `SKIPPED:` check. The reason: delivery has its own exit paths, and an in-process import still pays most of its cost. `AGENT_BG_SEND_SCRIPT` becomes `CLAUDE_WORKER_SEND_SCRIPT`.
+5. **The wait.** Each poll runs `claude agents --json` and `claude logs`, and it parses in process, with the same state map and the same `gone` results. The follow-up transcript count and the summary fallback run in process. `config/direct.conf` holds `CLAUDE_WORKER_POLL_SECS=15`. `UNIT_TURN_POLL_SECS` overrides it for a test, and `docs/as-built/merge-gate-and-test-speed.md` lists it.
+6. **assign_claude.** `_record` runs after publication, so the probe loop around `agent.poll()` goes, with `UNIT_WORKER_WAIT_ATTEMPTS` if it has no other reader. `heartbeat_watch.sh` watches `os.getpid()` from the start of the wait. A TERM, INT or HUP during the launch stops an unpublished session with `claude stop`, as `close_switch` does. The exit codes stay: 127 no binary, 2 refused or not delivered, 1 no banner or gone with no summary, 143, 130 and 129 on a signal. The finish records run for each code, as they do today.
+7. **Out of scope.** `heartbeat_watch.sh` stays: `review.sh` and `assign.py` share it, and it costs 24 ms each minute. The recorder and resolver children of `assign_claude._run` stay: sdlc placed them later. The Codex path does not change. Add no new check, guard or refusal.
+
+**Acceptance:**
+- Every test that ran `agent_bg.sh` runs the new functions or `bash scripts/direct/assign.sh` with the fixture Claude binary, with the same assertions. Spec item 1 approves only two kinds of change: a case that names `agent_bg.sh` or `coordinate-claude` as a launcher leaves with that file, and a fixture that rewrote shell text uses `UNIT_TURN_POLL_SECS`. The summary lists each changed assertion.
+- `scripts/direct/test_claude_worker.py` holds the moved `test_agent_bg.py` behaviors: role before delivery, no role keeps the history, publication precedes work, the registry wait, and a refused publication stops only the created session.
+- The director reports the children CPU of `direct.test_assign_claude_records` before and after: `S/phases/8k/launch_cpu.py`.
+- Live check on the installed form of the tree: one real Claude worker through `assign.sh` reaches board `register` and `done`, and a follow-up to it reaches `done`.
+- basedpyright `0 errors, 0 warnings, 0 notes` on each worker's files. The full gate passes.
+
+**Files:**
+- `scripts/direct/claude_worker.py`, `scripts/direct/assign_claude.py`, `scripts/direct/assign_gate.py`, `scripts/production/worker_fill.py`, `scripts/agents/agent_bg.sh`, `config/direct.conf` — the launch.
+- `scripts/direct/test_claude_worker.py`, `scripts/agents/test_agent_bg.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/direct/assign_claude_test_support.py`, `scripts/direct/assign_claude_native_test_support.py`, `scripts/direct/test_assign_claude.py`, `scripts/direct/test_assign_claude_probes.py`, `scripts/direct/test_assign_gate.py`, `scripts/direct/test_one_launch_path.py`, `scripts/production/test_worker_fill.py`, `scripts/lib/test_nix_env_launches.py`, `scripts/accounts/test_launch_accounts.py` — the tests.
+- `docs/as-built/agent-registry.md`, `docs/as-built/build-followups-fn-length-hook.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/nix-shell-launch.md`, `docs/as-built/session-roster.md`, `docs/as-built/staff-accessors.md`, `docs/as-built/usage-ledger.md` — the docs.
+
+**Workers:** `1 writer + 1 tester + 1 docs writer`
+- `impl` — the launch files.
+- `test` — the test files.
+- `docs` — the doc files.
+
+**State:** none. The saved `--launcher-command` holds the `assign.sh` command, and it does not change. A running `agent_bg.sh` keeps its open file across the landing and finishes.
+
+**Constraints from prior phases:** Phase 8i: `assign_claude.py` has no `__main__`, `run` releases the claim in `finally`, and a signal raises `SystemExit` through `_interrupted`. Phase 8j: the claim holds `pid`, `started` and `worker`. The import rule: `from scripts.<folder> import <module>`, no `sys.path` line. A `claude --bg` start in a scratch copy reports an untrusted workspace, so a live check uses `--cwd` on the home worktree.
