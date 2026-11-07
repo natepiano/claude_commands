@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Find local Claude quota refusals and start safe, account-grouped moves."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl

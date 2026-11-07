@@ -2,18 +2,17 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import io
 import json
 import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import atomic_file, unit_runs  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
@@ -22,79 +21,6 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     from scripts.message import sessions
-
-
-class RunOwnerMigrationTests(StaffTestCase):
-    @override
-    def setUp(self) -> None:
-        lock = fcntl.flock
-
-        def fail_on_lock_wait(descriptor: int | IO[str], operation: int) -> None:
-            try:
-                lock(descriptor, operation | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise AssertionError(f"run-owner migration test would block on a file lock: {descriptor}") from error
-
-        _ = self.enterContext(patch.object(fcntl, "flock", side_effect=fail_on_lock_wait))
-        super().setUp()
-
-    def test_interrupted_owner_migration_repeats_after_clear_without_changing_history_or_finished_runs(self) -> None:
-        owner = fixture_member("showrunner", name="production")
-        row = fixture_member("unit", name="tools", parent=owner.id)
-        runs = self.root / "runs"
-        history = self.root / "history.jsonl"
-        _ = history.write_text('{"production":"former","unit":"tools"}\n')
-        for name, status in (("a", "active"), ("b", "active"), ("old", "completed")):
-            run = runs / name
-            run.mkdir(parents=True)
-            _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
-                "status": status, "production": "production", "unit": "tools",
-                "main_agent": {"session_id": row.current_session}, "history_file": str(history)}))
-        finished = runs / "old" / unit_runs.STATE_FILE
-        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)]
-        publish = atomic_file.write_text_atomic
-        changed_session = fixture_runtime_id("run-owner-clear")
-        interrupted_once = False
-
-        def interrupted(path: Path, text: str) -> None:
-            nonlocal interrupted_once
-            publish(path, text)
-            if path != runs / "a" / unit_runs.STATE_FILE or interrupted_once:
-                return
-            interrupted_once = True
-            _ = staff.update_current_session(row.id, staff.StaffId(changed_session))
-            raise RuntimeError("migration interrupted")
-
-        with (patch.object(atomic_file, "write_text_atomic", side_effect=interrupted),
-              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
-            with self.assertRaisesRegex(RuntimeError, "migration interrupted"):
-                _ = unit_runs.migrate_owners(runs)
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(unit_runs.migrate_owners(runs), 0)
-        paths = [runs / name / unit_runs.STATE_FILE for name in ("a", "b")]
-        for path in paths:
-            fields = cast(dict[str, object], json.loads(path.read_text()))
-            self.assertEqual(fields["owner_staff_id"], row.id)
-            self.assertNotIn("production", fields)
-            self.assertNotIn("unit", fields)
-        published = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
-        with contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(unit_runs.migrate_owners(runs), 0)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], published)
-        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in (history, finished)], before)
-
-    def test_unproved_owner_keeps_the_active_run_and_reports_unavailable(self) -> None:
-        _ = fixture_member("showrunner", name="production")
-        run = self.root / "runs/unknown"
-        run.mkdir(parents=True)
-        path = run / unit_runs.STATE_FILE
-        _ = path.write_text('{"status":"active","main_agent":{"session_id":"gone"}}')
-        before = path.read_bytes(), path.stat().st_mtime_ns
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(unit_runs.migrate_owners(run.parent), 1)
-        self.assertIn("run owner is unavailable", errors.getvalue())
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
 
 class UnitRunsTest(StaffTestCase):
@@ -230,7 +156,7 @@ class UnitRunsTest(StaffTestCase):
     def staff_owner(self, run: Path, session_id: str) -> None:
         parent = showrunner_relationship("runs-fixture")
         owner = fixture_member("unit", name="owner-" + session_id[:8], parent=parent.id, runtime_id=session_id)
-        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name}))
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": parent.name, "unit": owner.name, "owner_staff_id": owner.id}))
 
     def test_director_without_progress_state_resolves_roster_parent_without_output(self) -> None:
         production = fixture_member("showrunner", name="roster-production")

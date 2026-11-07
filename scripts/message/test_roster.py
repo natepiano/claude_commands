@@ -1329,10 +1329,11 @@ class RosterTests(unittest.TestCase):
             "held_design_id": design_id, "held_role": "reviewer"}).render(), "review-address")
 
     def test_docless_row_keeps_repeated_mesh_title_reads_silent(self) -> None:
-        owner = fixture_member("showrunner", name="docless")
+        showrunner = fixture_member("showrunner", name="docless")
+        owner = fixture_member("unit", name="docless", parent=showrunner.id)
         run = self.root / "unplaced-run"
         run.mkdir()
-        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({"production": owner.name}))
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({unit_runs.OWNER_FIELD: owner.id}))
         errors = io.StringIO()
         with redirect_stderr(errors):
             for _ in range(2):

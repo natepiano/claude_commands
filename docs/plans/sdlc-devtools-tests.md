@@ -1183,7 +1183,7 @@ Codex workers start only through `assign.sh`, and that path does what the old Co
 1. Shared hash, in progress: the `scripts/lib/py` shim sets the package root, every managed entry runs through it, the rewrite script is committed, and `style`, `usage`, `prioritize`, `lint` and `settings` are converted. Old `sys.path` lines stay until their folder converts. The gate starts each test run through the checked tree's shim and drops the caller's `PYTHONPATH` (sdlc [4547aef2]).
 2. One hash per folder group that remains. Each converts that group's imports and deletes its `sys.path` lines. Run the script on the newest sdlc tip just before each hash. Files with a `sys.path` change on 2026-11-06: `production` 80, `direct` 39, `hooks` 36, `whoami` 23, `lib` 23, `buildlog` 21, `shutdown` 12, `message` 12, `agents` 10, `mac_test` 10, `astra` 8, `accounts` 6, `herdr` 6, `build_hold` 6, every other folder 5 or fewer.
 3. Group order: before each hash, check the open unit branches (all productions on `~/.claude`) for changes in the group's folders. Convert untouched groups first. Convert a group a unit is changing right after that unit's merge lands.
-4. Last step: convert `scripts/lib` and the other shared files (`hook_dispatch`, `merge_gate`, `fast_track`, `module_run`), because every folder imports `scripts/lib`. Then delete the rewrite script and its tests, when no `sys.path` line is left.
+4. Last step: convert `scripts/lib` and the other shared files (`hook_dispatch`, `merge_gate`, `fast_track`, `module_run`), because every folder imports `scripts/lib`. Then delete the import conversion from the rewrite script and its tests, when no `sys.path` line is left outside `scripts/lib/package_root.py`. Keep the `bootstrap` command and its tests.
 
 **Depends on:** Phase 3y
 
@@ -1191,14 +1191,14 @@ Source: sdlc [c27b7d82] 2026-11-05 (the item); plan by a read-only worker at `a7
 
 #### Work Order
 
-**Goal:** every repository import is package-qualified, one place sets the package root, and no file changes `sys.path`.
+**Goal:** every repository import is package-qualified, one place sets the package root, and no file changes `sys.path` except `scripts/lib/package_root.py`, which each entry file loads (phase 8n).
 
 **Spec:**
 1. **Imports.** Every repository import is `from scripts.<folder> import module` or `from scripts.<folder>.<module> import name`. Convert bare imports (2,276 in 499 files), relative imports (338), import names built in strings, and mock patch targets. At `a74569610`: 758 `sys.path` calls in Python (409 per folder, 322 to the package root, 27 dynamic), 21 in shell, 124 inside Python strings and generated fixtures.
 2. **One package root.** The `scripts/lib/py` shim sets the root, before both its cached and uncached exits. For a script path it uses that script's checkout; for `-m`, `-c` and stdin it uses the shim's checkout. It keeps the caller's working directory, the `CLAUDE_PYTHON` override, the interpreter cache and the version floor. Today both exits (`py:42` cached, `py:74` resolved) exec with no package root. The two statusline `-I` calls (`statusline.sh:66`, `:76`) use one central isolated form that keeps isolation. Keep the startup hooks that `test_simplify_lens.py:75` and `merge_gate.py:714` use.
-3. **No path changes.** No file inserts, appends, assigns or slices `sys.path` (`counts_row.py` slices, `hook_dispatch.py` replaces). `module_run.py` and `fast_track.py` load tests by package name, with no folder paths.
+3. **No path changes.** No file inserts, appends, assigns or slices `sys.path` (`counts_row.py` slices, `hook_dispatch.py` replaces). The one exception is `scripts/lib/package_root.py`, which each entry file loads by path so that bare `python3 <path>` works (phase 8n). `module_run.py` and `fast_track.py` load tests by package name, with no folder paths.
 4. **Entries through the shim.** Every managed entry runs through the shim: hook commands in `settings.json`, transient systemd commands (`accounts/unit_watchdog.py:219` runs `-m`, `build_hold/hold_enforcer.py:449`, `build_queue/queue_place.py:309`, `agents/mesh_runs.py:398`), shell lines that call `python3` (`statusline/statusline.sh:66`), `sys.executable` calls by path, `-m` and `-c` (`production/merge_gate.py:722`), shebang scripts (`agents/codex_mesh.py:1`), and command documents and their generated skill copies (`commands/producer/to_production.md:127` runs bare `berth.work_order`). `herdr.py:2722` starts a native server through `Herdr.argv`; it stays a non-Python command. Two entries keep a foreign interpreter: `banned_word_analysis/banned-word-gradient.py` (`uv`, for Pillow) and the Blender script in `commands/blender/bake_textures.md:12` (`bpy`). Their launch line sets `PYTHONPATH` to the checkout; the file has no `sys.path` line (`banned-word-gradient.py:36` goes).
-5. **Rewrite script, committed.** One script converts plain imports, patch targets and inserts in a tree with one command. Each unit converts its own branch with it at its next merge. Run it on the newest sdlc tip just before each hash. The last hash deletes it, when no `sys.path` line is left.
+5. **Rewrite script, committed.** One script converts plain imports, patch targets and inserts in a tree with one command. Each unit converts its own branch with it at its next merge. Run it on the newest sdlc tip just before each hash. The last hash deletes its import conversion, when no `sys.path` line is left outside `scripts/lib/package_root.py`. It keeps `add_bootstrap`, `_bootstrap_tree`, the `bootstrap <checkout>` command and their tests, because they add the phase 8n block to each new entry file.
 6. **Guard.** Dropped (sdlc [e00ba3f9]): no guard test.
 7. **Outside callers.** Inventory saved commands outside this repository on natedev and the Mac (timers, staff rows, notifier configs, other units' state) that call a script by path without the shim. Convert them in the shared step.
 8. Delete more than you add, in each hash: source lines (tests and `*_test_support.py` excluded) deleted exceed those added, by `git diff --numstat <hash base> -- 'scripts/**/*.py' 'scripts/**/*.sh' ':!scripts/**/test_*' ':!scripts/**/*_test_support.py'`. The phase estimate is about 1,240 added and 1,685 deleted.
@@ -1218,14 +1218,14 @@ Source: sdlc [c27b7d82] 2026-11-05 (the item); plan by a read-only worker at `a7
 - `accounts` — `accounts`, `whoami`.
 - `style` — `hooks`, `nightly_review` and any other folder of this group that keeps a `sys.path` change.
 - `remaining` — every other folder that keeps one (`test_times` and the rest).
-Merging the newest sdlc into this branch is one round of `1 writer + 1 tester`: `impl` owns the merge, the shim and `package_imports.py`; `test` owns their tests. Before a group hash starts, the director gives each cross-folder edit of Spec item 9 to that folder's owner.
+Merging the newest sdlc into this branch is one round of `1 writer + 1 tester`: `impl` owns the merge, the shim and `package_imports.py`; `test` owns their tests. After the conflicts are settled, `impl` runs `python3 scripts/lint/package_imports.py bootstrap <checkout>` and owns each block it adds. `test` keeps `scripts/lib/test_package_root.py` and the bootstrap tests in `scripts/lint/test_package_imports.py`. Before a group hash starts, the director gives each cross-folder edit of Spec item 9 to that folder's owner.
 
 **State:** saved outside commands on both machines change to the shim form, once.
 
-**Constraints from prior phases:** Phase 3t: run test modules alone or in small groups; one process over many modules leaks state and shows false reds. Tests run as `~/.claude/scripts/lib/py -m unittest scripts.<folder>.<test module>` with the checkout as the root. Phase 3y: `codex_mesh.main` gates seven verbs; tests that call it in process patch `scripts.direct.assign_gate.called_by_assign` (`test_role_map.py:731`); keep that target. `recorded_turn_settings` stays in `scripts/agents/worker_lifecycle.py:35`; an import from `codex_mesh` brings back the `progress_history` cycle. Keep the `last_dispatch` tests (`test_progress_history.py:8121`, `:8191`, `:8203`, `:8217`). Phases 7u, 8a and 8d: `Production.slug` is gone; `ProductionDocument` and `ProductionDocument.for_owner` exist, and `Production.owner` holds the found row; identities are staff names with no `-unit` suffix; `production_members` and `unit_lookup.unit_metadata` take no `sources`; `record.parent_of` reads no document. Conflict settling restores none of the removed APIs. Phase 8e: `staff.py` defers its imports into functions so the status line imports it faster. The conversion keeps each import at its deferred place.
+**Constraints from prior phases:** Phase 3t: run test modules alone or in small groups; one process over many modules leaks state and shows false reds. Tests run as `~/.claude/scripts/lib/py -m unittest scripts.<folder>.<test module>` with the checkout as the root. Phase 3y: `codex_mesh.main` gates seven verbs; tests that call it in process patch `scripts.direct.assign_gate.called_by_assign` (`test_role_map.py:731`); keep that target. `recorded_turn_settings` stays in `scripts/agents/worker_lifecycle.py:35`; an import from `codex_mesh` brings back the `progress_history` cycle. Keep the `last_dispatch` tests (`test_progress_history.py:8121`, `:8191`, `:8203`, `:8217`). Phases 7u, 8a and 8d: `Production.slug` is gone; `ProductionDocument` and `ProductionDocument.for_owner` exist, and `Production.owner` holds the found row; identities are staff names with no `-unit` suffix; `production_members` and `unit_lookup.unit_metadata` take no `sources`; `record.parent_of` reads no document. Conflict settling restores none of the removed APIs. Phase 8e: `staff.py` defers its imports into functions so the status line imports it faster. The conversion keeps each import at its deferred place. Phase 8n: each entry file loads `scripts/lib/package_root.py` through a 4-line `try` block after its docstring and `from __future__` imports. `package_imports.py convert` adds a missing block over all of `scripts/`, and `package_imports.py bootstrap <checkout>` repairs a tree.
 
 **Acceptance gate:**
-1. No `sys.path` change and no bare or relative repository import remain (a grep at the checkpoint). Two forms stay: the isolated form in `scripts/lib/py`, and the inputs in `test_package_imports.py:29-32` until the last step deletes the converter and that test.
+1. No `sys.path` change and no bare or relative repository import remain (a grep at the checkpoint). Three forms stay: `scripts/lib/package_root.py` with the 4-line block in each entry file (phase 8n), the isolated form in `scripts/lib/py`, and the inputs in `test_package_imports.py:29-32` until the last step deletes the import conversion and those inputs.
 2. Hooks run from `/`, `/tmp`, a checkout and a folder whose name has a space.
 3. A conflicting inherited `PYTHONPATH` still loads the selected checkout, copied launcher fixtures included.
 4. Systemd commands run with a bare manager environment.
@@ -1234,7 +1234,7 @@ Merging the newest sdlc into this branch is one round of `1 writer + 1 tester`: 
 7. Each hash: the numstat check in item 8 shows a net delete, basedpyright `0 errors, 0 warnings, 0 notes`, and the full gate passes.
 8. Each hash notice lists each open unit branch, all productions on `~/.claude`, that conflicts with that hash, from `git merge-tree`.
 
-### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: todo
+### Phase 4a — Run owner and showrunner timers keyed by staff id  · status: done
 
 Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3u and 3z. Reduced by the Phase 3t architect review (2026-11-05): most of both stores already shipped. Phase 8g's architect review names the two defects that remain: `phase_table.build` uses `Path.cwd()`, and `timer_scratch` collapses its outcomes into `None`.
 
@@ -1245,9 +1245,9 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 **Goal:** the two largest name-keyed stores hold the staff id with no reader left on the old key: the run owner in progress history and the update timer folders.
 
 **Spec:**
-1. **Run owner.** Already shipped: `progress_history.py:435` records the fixed owner, and `unit_runs.py:237` moves active run ownership and keeps history. Remaining: each reader that `grep -rln progress_history_state scripts` finds reads the staff id. The search misses `phase_table.build` (`phase_table.py:1245`), which reads the state through `plan_history.STATE_FILENAME` and uses `Path.cwd()` when `working_dir` is absent: it takes the folder from the staff row. The unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`; workers through `session_staff.py:144`). A separate phase checkout comes from `phase_reservation.py claim --repo`. No rule routes by an absolute Plan path or keeps a worker folder copy. Finished runs keep their recorded paths as history; worker threads stay.
+1. **Run owner.** Already shipped: `progress_history.py:435` records the fixed owner. Active runs from before that code still hold names: on 2026-11-06 natedev had 40 such runs, and 39 resolve through their session id. So one conversion program outside the repository converts active runs at this phase's landing, on natedev and the Mac (user rule 2026-11-05: convert once at deploy, then delete the program). `unit_runs.migrate_owners` leaves the repository in this phase. `_set_owner` no longer keeps names on a run, and active readers (`resolve_production_unit`, the start path of `_start_phase`) read only the staff row. A saved event keeps its own names as history. Remaining: each reader that `grep -rln progress_history_state scripts` finds reads the staff id. The search misses `phase_table.build` (`phase_table.py:1245`), which reads the state through `plan_history.STATE_FILENAME` and uses `Path.cwd()` when `working_dir` is absent: it takes the folder from the staff row. The unit folder comes only from the staff row (`unit_lookup.py:93`, `progress_history.py:437`; workers through `session_staff.py:144`). A separate phase checkout comes from `phase_reservation.py claim --repo`. No rule routes by an absolute Plan path or keeps a worker folder copy. Finished runs keep their recorded paths as history; worker threads stay.
 2. **Showrunner timers.** Already shipped: `update_registration.py:625-631` writes `showrunner-<staff id>` folders and staff-id `CHECK` lines, and `showrunners.py:146` reads timers by staff id. Remaining: every reader that a search of `scripts`, `commands` and the Codex mirror finds for the timer folder (`produce.md`'s `UPDATES` included) uses the staff-id folder. The two question readers already switched: `showrunner_footer.py:93,116` reads the document through staff ownership, and `tidy_wrapped.wrapped_owner` (`tidy_wrapped.py:98`) checks the staff-id timer folder. `showrunners.timer_scratch` (`showrunners.py:402`) returns one `Path | None` for an unreadable conf, an unknown owner and no scratch folder: it returns a named result for each, and `adopt_session_state` prints the unreadable case and keeps going. This adds no refusal.
-3. **Deployment evidence.** Phase 3t deleted `migrate_showrunner_timers.py`; sdlc ran that migration from `c6e9f5555` on 2026-11-05. Its output on natedev and the Mac is the migration proof; this phase runs no migration.
+3. **Deployment evidence.** Phase 3t deleted `migrate_showrunner_timers.py`; sdlc ran that migration from `c6e9f5555` on 2026-11-05. Its output on natedev and the Mac is the migration proof; this phase runs no timer migration.
 
 **Files:**
 - `scripts/direct/progress_history.py`, `scripts/direct/phase_table.py`, `scripts/production/update_registration.py`, `scripts/production/production_check.sh`, `scripts/production/showrunners.py`, `scripts/statusline/statusline.sh`, `scripts/production/rename.py` — the remaining readers; every other reader that a search for the two paths finds joins them.
@@ -1260,7 +1260,7 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 - `runs` — the run readers and their tests: `scripts/direct/progress_history.py`, `scripts/direct/phase_table.py`, `scripts/lib/unit_runs.py`, `scripts/direct/test_progress_history.py`, `scripts/direct/test_phase_table.py`, `scripts/lib/test_unit_runs.py`.
 - `timers` — the timer results, adoption reporting and their tests: the other non-messaging files above; hub: `scripts/production/showrunners.py` (`registered_showrunners`, the timer reader every caller uses).
 
-**State:** none; the timer and run-owner migrations already ran.
+**State:** run records. New runs hold the staff id. The one conversion at landing moves active runs to the staff id. The timer migration already ran.
 
 **Constraints from prior phases:** Phase 3t reads the document from the showrunner row. Staff records the director folder; each worker's run record holds its location. Phase 4p resolves relative question folders from the staff owner's document through `update_registration.question_folder`. Unreadable ownership is not confirmed absence. Keep the linked-checkout, ambiguous-owner, and shared-question tests. Staff rows hold canonical unit names from `unit_names.name`. A requested checkpoint refuses with the unit and folder; unrelated rows do not block it (`merge_checkpoint.py:277-306`). Read-only consumers report the bad row and keep the other rows. Keep `test_unit_lookup.py`, the requested-checkpoint regressions in `test_merge_checkpoint.py`, and the partial-report regressions. Run-folder paths stay the same across `/clear`. Keep the native-session and socket resolution that shipped. Add no store registry, identity alias or live-rekey journal. Phase 3y: `progress_history.last_dispatch(staff_id)` takes no run, searches every run of the staff parent, and returns `RecordedDispatch`, `NoDispatchRecorded` or `DispatchDetailNotRecorded.UNRECORDED`; keep all three.
 
@@ -1373,3 +1373,85 @@ Source: the user approved on C1119, through sdlc [b8646245]: fold `scripts/direc
 
 **State:** none. The phase writes no new lasting record.
 
+
+### Phase 8l — A worker whose launcher and server died recovers on its own thread  · status: done
+
+#### As-built
+
+A Codex worker whose launcher and app-server died recovers on its recorded thread through one more `assign.sh --to` dispatch.
+
+- `assign.py` `claim_worker` calls `codex_mesh.py reopen` for an `ended` worker, and for a worker in `ROSTER_LIVE` or `WAITING_CAPACITY` whose launcher is not attached (`codex_mesh.worker_launcher_attached`).
+- `command_reopen` accepts `WAITING_CAPACITY` and sets `dead_launcher_recovery` on the paused entry. A follow-up with that mark refuses a replacement thread when `thread/resume` fails.
+- `codex_mesh.command_end` keeps the staff row and thread id; a second `end` on an ended worker retries the cleanup. `workers.ending_worker` records the end and keeps the worker in the unit ledger.
+- Each caller that removes a worker for good retires the row itself: unit retirement (`workers.end_unit`), `remove_workers.py`, `worker.py end`, `worker_fill.end_friend` (after `command_end` returns 0; on `staff.StaffRefused` it stops the server, then returns 1) and `assign.py` `execute_astra_review` (end, release the role, then retire through `session_staff.worker_row`).
+- The account move tries each recorded server, the recorded port first, and uses the one that has the thread loaded. When `_server_availability` cannot prove that no server holds the thread, it refuses.
+
+**Files:**
+- `scripts/direct/assign.py` — reopen on a dead launcher; the Astra reviewer retire.
+- `scripts/agents/codex_mesh.py` — end keeps the row; the recovery mark; the account move server choice.
+- `scripts/direct/workers.py` — the unit ledger keeps ended workers.
+- `scripts/production/worker_fill.py` — the end-friend retire.
+- `docs/as-built/long-lived-workers.md`, `docs/as-built/session-roster.md` — end, reopen and retire rules.
+- `scripts/direct/test_assign_launcher_reuse.py`, `scripts/agents/test_codex_mesh.py`, `scripts/ask_a_friend/test_end_friend.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_review.py` — the tests.
+
+**Binds later work:** `codex_mesh.py end` never retires a staff row; a new caller that ends a worker for good retires it after `end` exits 0.
+
+**Gotchas:** find permanent-removal callers by their `end` calls, not by `staff.retire` calls. Look up a worker's row by its staff id (`session_staff.worker_row`); a lookup by session id can match an unrelated row when the session is empty.
+
+**Ruled out:** a second recovery mark beside `dead_launcher_recovery`.
+
+### Phase 8m — The end-session test does not read the live session  · status: done
+
+#### As-built
+
+`direct.test_end_session` gives the same result whatever session identity its caller has. `EndSessionTests.environment` removes `CODEX_THREAD_ID` and every `PLAN_DELEGATE_*` name from the environment it gives `end_session.sh`, and keeps its own `CLAUDE_CODE_SESSION_ID`. The in-process test patches `os.environ` with `clear=True` to that same environment.
+
+**Files:**
+- `scripts/direct/test_end_session.py` — the fixture.
+
+**Gotchas:** `unit_runs.environ` and `unit_env.sh` read every `PLAN_DELEGATE_*` suffix, so a fixture that removes only the known names leaks the rest.
+
+### Phase 8n — Entry scripts run under bare python3  · status: done
+
+#### As-built
+
+Every entry script under `scripts/` runs under bare `python3 <path>` from any working directory, with no change to a doc or a caller.
+
+- `scripts/lib/package_root.py` puts the checkout root (the folder above `scripts/`, from its own resolved `__file__`) on `sys.path` directly after the entry script's folder. It adds nothing when an entry already resolves to that root. It imports only the standard library and defines no public names.
+- Each entry file with a `scripts.` import (a statement, `__import__` or `importlib.import_module`) and a `__main__` block or shebang loads it after its docstring and `from __future__` imports, with one `../` for each folder level below `scripts/`:
+
+  ```python
+  try:
+      with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+  except FileNotFoundError:
+      pass
+  ```
+
+  A copy outside the checkout finds no file and runs with the root from `PYTHONPATH`. The block costs under 2 ms for each start.
+- `scripts/lint/package_imports.py`: `add_bootstrap(file: Path) -> bool` adds the block, replaces an older one-line form, keeps CRLF and skips `test_*` and `*_test_support.py`. `_bootstrap_tree(root) -> int` runs it over `scripts/**/*.py`; `convert` and the `bootstrap <checkout>` command both call it.
+
+**Files:**
+- `scripts/lib/package_root.py` — the bootstrap.
+- `scripts/lint/package_imports.py` — the block function, the tree helper and the `bootstrap` command.
+- `scripts/lib/test_package_root.py` — bare, relative-path (`runpy.run_path` under `-I`) and copied-entry runs.
+- `scripts/lint/test_package_imports.py` — block insertion, old-form replacement, dynamic imports and convert reruns.
+
+**Binds later work:** `scripts/lib/package_root.py` is the one allowed `sys.path` change; the 4-line block holds no `sys.path` text. `package_imports.py bootstrap <checkout>` adds a missing block over a tree and stays when the import conversion is deleted.
+
+**Gotchas:** `__file__.rpartition("/")[0]` is empty for a `__file__` with no folder part and gives `/../lib/...`; the block uses `rfind`. A `runpy` or `pathlib` form costs about 15 ms for each start; `open` + `exec` costs under 1 ms.
+
+**Ruled out:** hand-written blocks after the converter goes — they drift.
+
+### Phase 8o — Screen recording finds a window with no client list  · status: done
+
+#### As-built
+
+`find_window` in `screen_record.py` reads `xprop -root _NET_CLIENT_LIST`. When the property is missing or the list is empty, it reads `xwininfo -root -tree` and takes each window id and title from `TREE_WINDOW`. The fallback keeps the 10 s lookup limit, the poll, the one-match rule, the stop before ffmpeg on two or more matches, and the list of titles seen on no match. Tree titles are read as printed, with literal quotes and backslashes. `xwininfo` is required only on the fallback path: a missing binary gives `screen_record: missing on PATH: xwininfo`.
+
+**Files:**
+- `scripts/screen_record/screen_record.py` — window lookup with the tree fallback.
+- `scripts/screen_record/test_screen_record.py` — fake `xprop` and `xwininfo`; tests for a missing and an empty client list, two matches, literal quotes, literal backslashes and a missing `xwininfo`.
+
+**Gotchas:** `xwininfo` prints a title with no escapes, so `TREE_WINDOW` reads to the last `": (` on the line. natedev has `xwininfo` only in the nix store, not on PATH.
+
+**Ruled out:** unescaping tree titles — `xwininfo` does not escape them.

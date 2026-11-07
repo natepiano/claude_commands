@@ -17,6 +17,10 @@ turn that just ended. Use it directly. Reading from `transcript_path` would
 race the JSONL flush: at Stop time the assistant entry has not been written
 yet, so the file scan returns an empty string and the hook silently passes.
 """
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import sys

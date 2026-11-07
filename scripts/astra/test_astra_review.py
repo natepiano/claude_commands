@@ -412,6 +412,8 @@ class ManagedAstraReviewTests(mesh_fixture.MeshCommandFixture):
         _ = self.enterContext(patch.object(astra_review, "SCRIPTS", scripts))
 
     def assert_review_transport(self, held_transport: str, configured_transport: str) -> None:
+        owner = unit_membership("natedev", "models")
+        write_text_atomic(self.session_dir / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": owner.id}))
         config = self.home / "transport-config"
         config.mkdir()
         write_text_atomic(config / "direct.conf", f"WORKER_TRANSPORT={configured_transport}\n")
