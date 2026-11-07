@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.shutdown import remote
+
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 import fcntl
@@ -93,6 +95,7 @@ class DirectorResolutionTests(StaffTestCase):
         parent = unit_membership("demo", "builders")
         registry = self.session_record(parent.current_session, "builders")
         run = self.worker_run("demo", "builders", parent.current_session)
+        self.write_json(run / workers.STATE, {**json_object(run / workers.STATE), "owner_staff_id": parent.id})
         self.assertEqual(json_object(registry)["messagingSocketPath"], "")
 
         self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(parent.current_session, os.getpid()))
@@ -106,6 +109,7 @@ class DirectorResolutionTests(StaffTestCase):
         record["updatedAt"] = 2
         self.write_json(newer, record)
         run = self.worker_run("demo", "builders", "former-director")
+        self.write_json(run / workers.STATE, {**json_object(run / workers.STATE), "owner_staff_id": parent.id})
         self.write_json(self.root / "shutdown/account/history/restart.json", {"session": {
             "session_id": "former-director", "name": "builders", "run_dirs": [str(run)],
             "host": {"kind": "unit", "unit": "builders", "session_name": "builders"},
@@ -117,6 +121,16 @@ class DirectorResolutionTests(StaffTestCase):
             (entries[older.stem], entries[newer.stem]), registry.unreadable,
         )):
             self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(current.current_session, os.getpid()))
+
+    def test_live_director_resolves_the_renamed_owner_despite_old_state_names(self) -> None:
+        parent = unit_membership("demo", "builders")
+        run = self.worker_run("demo", "builders", parent.current_session)
+        context = json_object(run / workers.STATE)
+        context["owner_staff_id"] = parent.id
+        self.write_json(run / workers.STATE, context)
+        renamed = staff.rename(parent.id, "renamed-builders")
+        _ = self.session_record(renamed.current_session, renamed.name)
+        self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(renamed.current_session, os.getpid()))
 
 
 class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
@@ -134,9 +148,11 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         from scripts.message import sessions
         from scripts.herdr.herdr import HerdrPlace
 
-        _ = (self.session_dir / workers.STATE).write_text(json.dumps({"production": "demo", "unit": "builders"}))
         _ = (self.session_dir / "director").write_text("old-director")
         parent = unit_membership("demo", "builders")
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps({
+            "production": "demo", "unit": "builders", "owner_staff_id": parent.id,
+        }))
         member = staff.update_current_session(parent.current_session, staff.native_id(fixture_runtime_id("new-director")))
         current = unit_lookup.LabeledSession("builders", unit_lookup.LiveClaude("Builders", member.current_session, "/socket", 4321),
                                          HerdrPlace("agents", "w1:p2"))
@@ -154,7 +170,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         working.mkdir()
         owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert owner is not None
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", working), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), working), expected=owner.worktree)
         self.patches.enter_context(patch.dict(os.environ, {
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
             "USAGE_STATE_DIR": str(self.session_dir.parent / "usage-state"),
@@ -175,6 +191,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         _ = (run / "progress_history_state.json").write_text(json.dumps({
             "status": "active", "working_dir": str(self.session_dir.parent / "repository"),
             "run_id": run.name, "production": parent.name, "unit": owner.name,
+            "owner_staff_id": owner.id,
         }))
 
     def next_run(self, name: str) -> Path:
@@ -475,7 +492,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         state = json_object(self.session_dir / workers.STATE)
         owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         assert owner is not None
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", nested), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), nested), expected=owner.worktree)
         del state["working_dir"]
         _ = (self.session_dir / workers.STATE).write_text(json.dumps(state))
         expected = subprocess.run(["bash", str(SCRIPT.with_name("worker_name.sh")), str(nested), "review", "review"],
@@ -516,7 +533,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         (self.session_dir / "working_dir").unlink()
         owner = staff.by_current_session(os.environ["CODEX_THREAD_ID"])
         assert owner is not None
-        _ = staff.set_worktree(owner.id, staff.RemovedWorktree("natedev", self.session_dir.parent / "repository"),
+        _ = staff.set_worktree(owner.id, staff.RemovedWorktree(remote.local_machine(), self.session_dir.parent / "repository"),
                               expected=owner.worktree)
         with self.assertRaisesRegex(workers.WorkerUnavailable, "^invalid worker state: missing working_dir$"):
             _ = workers.resolve(self.session_dir, "review")
@@ -582,7 +599,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         assert worker is not None
         owner = membership.parent_of(worker)
         assert owner is not None
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", checkout), expected=owner.worktree)
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), checkout), expected=owner.worktree)
         _ = record.write_text(json.dumps({"staff_id": worker.id, "worker": "w7", "status": "running", "pid": child.pid}))
         self.assertEqual([path for path, _ in workers.live_detached_runs(self.session_dir.resolve())], [record])
         self.assertEqual(workers.protected_working_directories(self.session_dir.resolve()), (checkout.resolve(),))

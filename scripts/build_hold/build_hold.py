@@ -1768,7 +1768,7 @@ def main(arguments: list[str]) -> int:
             # Use the local gate's hold and caller check; recording a notice recipient permits no build.
             import importlib
             check_local_hold = cast(Callable[[], int], getattr(
-                importlib.import_module("build_targets"), "command_check_local"))
+                importlib.import_module('scripts.build_targets.build_targets'), "command_check_local"))
             return check_local_hold()
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])

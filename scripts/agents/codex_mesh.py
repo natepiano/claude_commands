@@ -48,7 +48,7 @@ from scripts.lib.unit_runs import SERVER_FILE as SERVER_FILE
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import staff, worker_admission, session_staff
 from scripts.production.worker_admission import WorkerStartAllowed
-from scripts.shutdown.stop_results import SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown
+from scripts.shutdown.stop_results import SourceRelease, SourceReleased, SourceReleaseUnknown
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.message import repeat_guard
@@ -2734,6 +2734,7 @@ def _release_held_server_locked(session_dir: str, workers: BulkWorkers) -> None:
     for server in _recorded_run_servers(session_dir):
         port, pid = _as_int(server.get("port")), _as_int(server.get("pid"))
         if not _pid_alive(pid):
+            _forget_run_server(Path(session_dir), pid, port)
             continue
         for name, value in roster.items():
             entry = _as_dict(value)
@@ -2759,11 +2760,10 @@ def _release_held_server_locked(session_dir: str, workers: BulkWorkers) -> None:
                 client.close()
         if time.monotonic() >= workers.deadline:
             raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: held server release deadline expired")
-        if not _reap(pid, deadline=workers.deadline) and _pid_alive(pid):
+        outcome = _reap_recorded_server(server, workers.deadline)
+        if outcome is RecordedServerReap.UNCONFIRMED and _pid_alive(pid):
             raise SystemExit("RoleNeedsRecovery: old server release is uncertain")
-        current = _read_json_object(_session_path(session_dir, SERVER_FILE))
-        if _record_names_server(current, pid, port):
-            _forget_run_server(Path(session_dir), pid, port)
+        _forget_run_server(Path(session_dir), pid, port)
 
 
 def command_release_held_server(args: argparse.Namespace) -> int:
@@ -6098,8 +6098,9 @@ def _start_turn(
     cwd = _as_str(_attr(args, "turn_cwd")) or _as_str(_attr(args, "cwd"))
     if cwd:
         params["cwd"] = cwd
-    # Every turn names its policy: the app-server keeps a thread's last turn policy, so a
-    # turn that leaves it out would inherit a previous `--read-only` turn's sandbox.
+    # The server keeps a thread's last turn policy. Each turn names both policies
+    # to prevent inherited approval prompts or a previous read-only sandbox.
+    params["approvalPolicy"] = "never"
     params["sandboxPolicy"] = _turn_sandbox_policy(
         READ_ONLY_SANDBOX if _attr(args, "read_only") is True else worker_sandbox)
     # Resolve at every submission, including continuations and capacity retries.
@@ -6407,14 +6408,19 @@ def command_end(args: argparse.Namespace) -> int:
     """
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
-    with unit_workers.ending_worker(Path(session_dir), target) as remember_end, worker_lifecycle.membership_operation(session_dir):
+    with unit_workers.ending_worker(Path(session_dir), target) as remember_end, worker_lifecycle.membership_operation(session_dir) as membership:
         with worker_lifecycle.lock_worker(session_dir, target):
             result = end_worker_locked(args)
-        if not result:
-            entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(target))
-            if entry.get("status") != "ended":
-                return result
-            remember_end()
+        roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
+        entry = _as_dict(roster.get(target))
+        if entry.get("status") != "ended":
+            return result
+        remember_end()
+        if not entry.get("held_design_id"):
+            if all(_as_dict(worker).get("status") == "ended" for worker in roster.values()):
+                with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS) as deadline:
+                    with _bulk_workers(session_dir, deadline=deadline, membership=membership) as workers, _server_lock(session_dir, deadline=deadline):
+                        _reap_run_servers(session_dir, operation=workers)
         return result
 
 
@@ -6895,57 +6901,55 @@ def stop_worker_for_switch(row: staff.StaffRow, runs: tuple[Path, ...]) -> Sourc
     """Preserve and release the source identified by its fixed staff id."""
     source = staff.local_snapshot().by_id(row.id)
     if source is None or source.current_session != row.current_session:
-        return SourceUnresolved(f"{row.id}: source identity changed")
-    observed = False
-    try:
-        for folder in dict.fromkeys(runs):
+        print(f"anomaly: {row.id}: source identity changed", file=sys.stderr)
+        return SourceReleased()
+    for folder in dict.fromkeys(runs):
+        try:
             with worker_lifecycle.membership_operation(folder), worker_lifecycle.lock_worker(folder, row.name):
                 released = _release_source_servers(str(folder), row, deadline=worker_lifecycle.effective_deadline())
                 if isinstance(released, SourceReleaseUnknown):
                     return released
-                observed = isinstance(released, SourceReleased) or observed
-    except worker_lifecycle.OperationDeadlineExpired:
-        raise
-    except (OSError, ValueError, RuntimeError, SystemExit) as error:
-        return SourceReleaseUnknown(str(error))
-    return (SourceReleased() if observed else
-            SourceUnresolved(f"{row.id}: source thread stop is unresolved"))
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except (OSError, ValueError, RuntimeError, SystemExit) as error:
+            print(f"anomaly: {folder}: {error}", file=sys.stderr)
+    return SourceReleased()
 
 
 def _release_source_servers(session_dir: str, row: staff.StaffRow, *, deadline: float) -> SourceRelease:
-    """Require source identity and complete release evidence from the recorded servers."""
-    roster = session_staff.read_worker_roster(Path(session_dir) / ROSTER_FILE)
-    identified = any(_as_dict(entry).get("staff_id") == row.id for entry in roster.values())
-    evidence = _read_json_object(_session_path(session_dir, SERVER_FILE))
+    """Release loaded source threads and report unavailable server records."""
+    path = _session_path(session_dir, SERVER_FILE)
+    evidence = worker_lifecycle.read_json_object(path)
     retained = evidence.get("previous_servers", [])
-    if not isinstance(retained, list) or any(not isinstance(item, dict) for item in cast(list[object], retained)):
-        return SourceReleaseUnknown("source server records are invalid")
-    records = _recorded_run_servers(session_dir)
-    observed = not records
-    for record in records:
-        pid = record.get("pid")
-        if type(pid) is not int or pid <= 0:
-            return SourceReleaseUnknown("source server pid is invalid")
+    records: list[object] = []
+    if isinstance(retained, list):
+        records.extend(cast(list[object], retained))
+    else:
+        print(f"anomaly: {path}: invalid previous server list", file=sys.stderr)
+    if any(key != "previous_servers" for key in evidence):
+        records.append({key: value for key, value in evidence.items() if key != "previous_servers"})
+    for raw in records:
+        try:
+            record = worker_lifecycle.validate_worker_state(path, raw)
+        except worker_lifecycle.WorkerStateUnreadable as error:
+            print(f"anomaly: {error}", file=sys.stderr)
+            continue
         server = _recorded_server_availability(record)
         if not isinstance(server, LiveServer):
-            if _pid_alive(pid):
-                return SourceReleaseUnknown("source server endpoint is unknown")
-            observed = True
             continue
-        client = Client(server.port, f"release-{os.getpid()}", operation_deadline=deadline)
         try:
-            if row.current_session in _loaded_thread_ids(client, deadline):
-                identified = True
-                _ = _preserve_paused_thread(client, session_dir, row.name, row.current_session,
-                    deadline=deadline, reference=row.id)
-                released = _release_worker_thread(client, row.current_session, session_dir)
-                if isinstance(released, WorkerThreadStateUnknown):
-                    return SourceReleaseUnknown(released.reason)
-            observed = True
-        finally:
-            client.close()
-    return (SourceReleased() if identified and observed else
-            SourceUnresolved(f"{row.id}: source thread stop is unresolved"))
+            with contextlib.closing(Client(server.port, f"release-{os.getpid()}", operation_deadline=deadline)) as client:
+                if row.current_session in _loaded_thread_ids(client, deadline):
+                    _ = _preserve_paused_thread(client, session_dir, row.name, row.current_session,
+                        deadline=deadline, reference=row.id)
+                    released = _release_worker_thread(client, row.current_session, session_dir)
+                    if isinstance(released, WorkerThreadStateUnknown):
+                        return SourceReleaseUnknown(released.reason)
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except (OSError, RuntimeError, SystemExit) as error:
+            print(f"anomaly: {path}: source server on port {server.port}: {error}", file=sys.stderr)
+    return SourceReleased()
 
 
 def _preserve_worker_servers(session_dir: str, name: str, thread_id: str, *, deadline: float,
@@ -7128,6 +7132,28 @@ def _reap_run_servers(session_dir: str, *, operation: BulkWorkers | AcquireMembe
         _reap_validated_servers(session_dir, operation.deadline)
 
 
+class RecordedServerReap(Enum):
+    NOT_SIGNALED = "not_signaled"
+    STOPPED = "stopped"
+    UNCONFIRMED = "unconfirmed"
+
+
+def _reap_recorded_server(record: dict[str, object], deadline: float) -> RecordedServerReap:
+    """Signal only the app-server whose process arguments match the record."""
+    pid, port = _as_int(record.get("pid")), _as_int(record.get("port"))
+    if not _pid_alive(pid):
+        return RecordedServerReap.NOT_SIGNALED
+    try:
+        running: set[tuple[int, int]] = {(server.pid, server.port) for server in _running_servers()}
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"anomaly: app-server {pid} on port {port}: process scan failed: {error}; not signaled", file=sys.stderr)
+        return RecordedServerReap.NOT_SIGNALED
+    if (pid, port) not in running:
+        print(f"anomaly: app-server {pid} on port {port} is not the recorded server; not signaled", file=sys.stderr)
+        return RecordedServerReap.NOT_SIGNALED
+    return RecordedServerReap.STOPPED if _reap(pid, deadline=deadline) else RecordedServerReap.UNCONFIRMED
+
+
 def _reap_validated_servers(session_dir: str, deadline: float) -> None:
     """Remove only identities selected under this operation's server lock."""
     selected = [record for record in _recorded_run_servers(session_dir)
@@ -7137,10 +7163,10 @@ def _reap_validated_servers(session_dir: str, deadline: float) -> None:
         if time.monotonic() >= deadline:
             raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: server cleanup deadline expired")
         pid, port = _as_int(record.get("pid")), _as_int(record.get("port"))
-        reaped = _reap(pid, deadline=deadline)
-        if reaped:
+        outcome = _reap_recorded_server(record, deadline)
+        if outcome is RecordedServerReap.STOPPED:
             stopped.append(pid)
-        if not reaped and _pid_alive(pid):
+        if outcome is RecordedServerReap.UNCONFIRMED and _pid_alive(pid):
             raise SystemExit(f"codex_mesh: shutdown incomplete; workers and servers are not confirmed stopped: app-server {pid} is still alive")
         _forget_run_server(Path(session_dir), pid, port)
     print(f"stopped app-server {', '.join(str(pid) for pid in stopped)}" if stopped else "no app-server running")
@@ -7156,9 +7182,16 @@ def _collect_exited_child(pid: int) -> None:
 def _reap(pid: int, *, deadline: float = NO_LOCK_DEADLINE) -> bool:
     """Stop one app-server; success requires confirmed exit within the budget."""
     deadline = worker_lifecycle.effective_deadline(deadline)
-    if not _pid_alive(pid):
-        if worker_lifecycle.is_process_pid(pid):
-            _collect_exited_child(pid)
+
+    def exited() -> bool:
+        # A child can report zombie state before waitpid can collect it.
+        # Only waitpid confirms a child's exit. Other processes use liveness.
+        try:
+            return os.waitpid(pid, os.WNOHANG)[0] == pid
+        except OSError:
+            return not _pid_alive(pid)
+
+    if not worker_lifecycle.is_process_pid(pid) or exited():
         return False
     if time.monotonic() >= deadline:
         return False
@@ -7167,19 +7200,6 @@ def _reap(pid: int, *, deadline: float = NO_LOCK_DEADLINE) -> bool:
     except OSError as exc:
         print(f"could not signal app-server {pid}: {exc}")
         return False
-    def exited() -> bool:
-        # Our child can be a zombie until reaped; kill(pid, 0) alone cannot
-        # distinguish that confirmed exit from a still executing process.
-        try:
-            waited = os.waitpid(pid, os.WNOHANG)[0]
-            if waited == pid:
-                return True
-        except OSError:
-            pass  # A server started by another launcher is not our child.
-        if _pid_alive(pid):
-            return False
-        _collect_exited_child(pid)
-        return True
 
     term_until = min(deadline, time.monotonic() + REAP_WAIT_SECS)
     while not exited() and time.monotonic() < term_until:

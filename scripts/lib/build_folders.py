@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Name temporary build folders and preserve their caller's lifetime."""
 from __future__ import annotations
 try:
@@ -16,7 +16,6 @@ import signal
 import stat
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import tempfile
 import threading
 from typing import TYPE_CHECKING, Literal, cast, override
@@ -166,12 +165,17 @@ def _settings() -> ConfigRead:
     return conf.read("build_folders")
 
 
-def repository_key(repository: Path) -> str:
-    """Distinguish repositories with equal basenames using their canonical paths."""
+def repository_key_for(name: str, identity: str) -> str:
+    """Append the configured identity hash to a readable repository name."""
     from hashlib import sha256
 
+    return f"{name}-{sha256(os.fsencode(identity)).hexdigest()[:_settings().whole('names.repository_key_length')]}"
+
+
+def repository_key(repository: Path) -> str:
+    """Distinguish repositories with equal basenames using their canonical paths."""
     canonical = repository.resolve()
-    return f"{canonical.name}-{sha256(os.fsencode(canonical)).hexdigest()[:_settings().whole("names.repository_key_length")]}"
+    return repository_key_for(canonical.name, str(canonical))
 
 
 def build_folder_path(spec: BuildFolderSpec) -> Path:
@@ -445,5 +449,4 @@ def main(argv: Sequence[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     raise SystemExit(main(sys.argv[1:]))

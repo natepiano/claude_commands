@@ -2,16 +2,10 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
-from typing import TYPE_CHECKING
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-if TYPE_CHECKING:
-    from ..lib import conf
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    from scripts.lib import conf
+from scripts.lib import conf
 
 
 @dataclass(frozen=True)

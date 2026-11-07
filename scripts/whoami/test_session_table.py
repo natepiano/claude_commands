@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import os
 import difflib
 import json
@@ -15,7 +14,6 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Self, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.message import roster
 

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from ..hooks import showrunner_footer as showrunner_footer
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    import showrunner_footer as showrunner_footer
+    from scripts.hooks import showrunner_footer as showrunner_footer
 
 
 ActionState = Literal["untouched", "attempted", "done", "skipped"]

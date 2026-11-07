@@ -11,9 +11,10 @@ import sys
 import tempfile
 import unittest
 from types import ModuleType
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import ClassVar, cast, override
+from collections.abc import Generator
 from unittest import mock
 
 
@@ -38,6 +39,29 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 
 REAL_RUN = subprocess.run
+CLASS_RULES = (
+    "module-structure",
+    "types-live-with-their-behavior",
+    "split-by-type-ownership",
+    "test-module-allow-boilerplate",
+    "prefer-type-named-fields-and-bindings",
+)
+
+
+@contextmanager
+def private_class_catalog(root: Path) -> Generator[None]:
+    """Provide a fixed catalog independent of the mechanical class list."""
+    catalog = root / "class-catalog"
+    (catalog / "rust").mkdir(parents=True, exist_ok=True)
+    for name in CLASS_RULES:
+        _ = (catalog / "rust" / f"{name}.md").write_text(f"---\ntier: E\n---\n# {name}\n")
+    mechanical_classes.classes.cache_clear()
+    try:
+        with (mock.patch.object(style_rules, "NATE_STYLE_DIR", catalog),
+              mock.patch.dict(os.environ, {"STYLE_HISTORY_NATE_STYLE_DIR": str(catalog)})):
+            yield
+    finally:
+        mechanical_classes.classes.cache_clear()
 
 
 def unit_staff_id(name: str) -> str:
@@ -113,7 +137,8 @@ class StylePlanFixture(unittest.TestCase):
 
     def configure_fixture(self) -> None:
         _ = self.enterContext(unqueued_style_children())
-        listed = mechanical_classes.classes()
+        with private_class_catalog(self.fixture_root.parent):
+            listed = mechanical_classes.classes()
         _ = self.enterContext(mock.patch.object(mechanical_classes, "classes", return_value=listed))
         self.root = self.fixture_root
         self.pending_judge_tickets = frozenset()

@@ -7,17 +7,11 @@ import os
 import shlex
 import signal
 import time
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.mac_test import offload
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.lib import test_hang_guard
 
 
 class OffloadForwardTests(OffloadCommandFixture):

@@ -14,6 +14,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
+from zoneinfo import TZPATH
 
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
@@ -585,7 +586,8 @@ class AccountTests(unittest.TestCase):
             arguments,
             capture_output=True,
             check=True,
-            env={"PATH": os.environ["PATH"]},
+            env={"PATH": os.environ["PATH"], "TZ": "America/New_York",
+                 "TZDIR": next(str(path) for folder in TZPATH if (path := Path(folder)).joinpath("America/New_York").is_file())},
             input=json.dumps(document),
             text=True,
         )

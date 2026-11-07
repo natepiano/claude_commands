@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -18,7 +17,6 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.whoami import usage_store

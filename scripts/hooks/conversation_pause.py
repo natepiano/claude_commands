@@ -34,7 +34,7 @@ else:
     import script_prompts
     import unit_runs
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    from relay_identity import message_sender_name
+    from scripts.message.relay_identity import message_sender_name
 
 
 QUIET_SECONDS = 900
@@ -418,7 +418,7 @@ def pauses(source: PromptSource) -> bool:
 
 
 def is_showrunner_session(session_id: str) -> bool:
-    import showrunner_footer
+    from scripts.hooks import showrunner_footer
 
     return bool(showrunner_footer.targeted_instances(session_id))
 
@@ -432,17 +432,25 @@ def is_showrunner_or_unit_director(session_id: str) -> bool:
 
 
 def session_reports(session_id: str) -> list[Report]:
+    from scripts.hooks import showrunner_footer
+
     reports: list[Report] = []
     try:
         entries = list(notifier_root().iterdir())
     except OSError:
         return reports
+    try:
+        showrunner_instances = showrunner_footer.targeted_instances(session_id)
+    except (OSError, UnicodeError) as error:
+        print(f"conversation-pause: timer lookup: {first_error_line(str(error))}", file=sys.stderr)
+        showrunner_instances = []
     for entry in entries:
         try:
             if not entry.is_dir():
                 continue
             conf_lines = (entry / "conf").read_text(encoding="utf-8").splitlines()
-            if f"TARGET=session:{session_id}" not in conf_lines:
+            if (f"TARGET=session:{session_id}" not in conf_lines
+                    and entry not in showrunner_instances):
                 continue
             if any(line.startswith("RUN=") for line in conf_lines):
                 continue
@@ -1002,7 +1010,7 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 
 
 def tick(now: int) -> tuple[str, ...]:
-    import showrunner_footer
+    from scripts.hooks import showrunner_footer
 
     scheduled_root = state_root() / "scheduled-prompts"
     try:

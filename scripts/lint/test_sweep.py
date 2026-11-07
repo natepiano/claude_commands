@@ -558,6 +558,11 @@ class SweepTests(SweepCase):
 
 
 class RebuildTests(SweepCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
+
     def test_rebuild_report_fails_when_an_enumerated_month_disappears(self) -> None:
         path = Path(os.environ["BUILDLOG_DIR"]) / "natedev" / "2026-10.jsonl"
         path.parent.mkdir(parents=True)

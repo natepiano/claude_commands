@@ -18,10 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
-SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("message", "production", "notify", "herdr", "lib"):
-    sys.path.insert(0, str(SCRIPTS / dependency))
-
 from scripts.lib import detached
 from scripts.shutdown.stop_results import shutdown_state_root
 from scripts.production import session_pane

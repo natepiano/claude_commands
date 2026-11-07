@@ -46,7 +46,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.user_zone import user_zone, zone_label  # noqa: E402
 from scripts.notify import push_reference
 

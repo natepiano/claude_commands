@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypeVar, cast
 from scripts.production import change_review
 from scripts.production import proposals_folder
 from scripts.production import proposals_table
-from footer_counts import efficiency_ledger
+from scripts.production.footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
 from scripts.production import staff
 from scripts.production.production_doc import Refusal, read_production

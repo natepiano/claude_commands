@@ -392,7 +392,7 @@ def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> s
     from scripts.production import unit_names
 
     row = fixture_member("unit", name=unit_names.name(unit), parent=owner.id)
-    return staff.set_worktree(row.id, staff.PresentWorktree("natedev", location), expected=row.worktree)
+    return staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), location), expected=row.worktree)
 
 
 def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
@@ -400,7 +400,7 @@ def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
     """Record private unit locations and configuration through the shared fixture writers."""
     _ = recorded_showrunner(showrunner, doc)
     row = unit_membership(showrunner, unit)
-    row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
+    row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=row.worktree)
     worktree.mkdir(parents=True, exist_ok=True)
     if not (worktree / ".git").exists():
         _ = run_fixture_git([FIXTURE_GIT, "init", "-b", "fixture", str(worktree)],
@@ -651,9 +651,8 @@ class StaffTestCase(unittest.TestCase):
             _ = contexts.enter_context(mock.patch(
                 "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
             ))
-            _ = contexts.enter_context(mock.patch(
-                "scripts.shutdown.remote.local_machine", return_value=machine,
-            ))
+            for module in {remote, sys.modules.get("remote", remote)}:
+                _ = contexts.enter_context(mock.patch.object(module, "local_machine", return_value=machine))
             _ = contexts.enter_context(isolated_source_readers())
             if machine == "mac":
                 _ = os.environ.pop("STAFF_FILE", None)
@@ -782,7 +781,7 @@ class StaffTestCase(unittest.TestCase):
         production_membership(production_name, *units)
         for unit in units:
             row = unit_membership(production_name, unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source_root / "worktrees" / unit),
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.source_root / "worktrees" / unit),
                                    expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
         registry = self.source_root / "showrunners.json"
@@ -807,9 +806,9 @@ class StaffTestCase(unittest.TestCase):
         doc = repository / "docs" / "row-production.md"
         doc.parent.mkdir()
         write_text_atomic(doc, "# Production\n")
-        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc("natedev", doc))
+        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc(remote.local_machine(), doc))
         unit = fixture_member("unit", name="member", parent=runner.id,
-                              worktree=staff.PresentWorktree("natedev", folder))
+                              worktree=staff.PresentWorktree(remote.local_machine(), folder))
         worker = fixture_worker("reader", unit.id)
         runner = staff.update_current_session(runner.current_session, staff.native_id(fixture_runtime_id("row-owner-current")))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("row-member-current")))

@@ -25,7 +25,6 @@ import sys
 import time
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
 from scripts.lib.git_blob import git_blob_id
 

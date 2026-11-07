@@ -202,7 +202,7 @@ class RemoteAgentTests(ControlFixture):
         self.assertEqual(self.stops, [self.clock.now] * 3)
         self.assertEqual(self.signals, [])
 
-    def test_active_groups_read_each_process_once_for_multiple_retained_markers(self) -> None:
+    def test_active_groups_read_old_and_new_mirrors_with_each_process_read_once(self) -> None:
         proc = self.root / "proc"
         process = proc / "808"
         process.mkdir(parents=True)
@@ -210,8 +210,9 @@ class RemoteAgentTests(ControlFixture):
         _ = (process / "stat").write_text("808 (cargo check) " + " ".join(fields))
         environment = process / "environ"
         _ = environment.write_bytes(b"BUILD_TARGET_RUN_TOKEN=first-run\0")
-        for slot, token in ((1, "first-run"), (2, "second-run")):
-            mirror = self.root / f".local/state/build-target/mirror/repository/{slot}"
+        for slot, token, relative in ((1, "first-run", "repository/1"),
+                                      (2, "second-run", "repository-key/aws-s2")):
+            mirror = self.root / ".local/state/build-target/mirror" / relative
             mirror.mkdir(parents=True)
             _ = (mirror / ".linux-run.json").write_text(json.dumps({
                 "pid": 320 + slot, "start_time": 123, "process_group": 320 + slot,

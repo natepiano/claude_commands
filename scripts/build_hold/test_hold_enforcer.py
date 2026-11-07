@@ -16,7 +16,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, cast, override
+from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold, hold_enforcer
@@ -26,10 +26,7 @@ from scripts.build_hold.override_guard import require_checkout
 require_checkout(Path(__file__))
 
 
-if TYPE_CHECKING:
-    from ..direct import step_record
-else:
-    from scripts.direct import step_record
+from scripts.direct import step_record
 
 
 EMPTY_PROCESS_ENVIRONMENT: Mapping[str, str] = MappingProxyType({})

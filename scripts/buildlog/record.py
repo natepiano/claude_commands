@@ -65,7 +65,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from scripts.lib.test_phase import (
     CallRecord,
     NoCallRecord,
@@ -89,16 +88,10 @@ from scripts.buildlog.repository import (
     repository_key as repository_key,
 )
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 if TYPE_CHECKING:
-    from ..lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
-else:
-    from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
-if TYPE_CHECKING:
-    from ..aws_target.config import MeasurementUnavailable
+    from scripts.aws_target.config import MeasurementUnavailable
 
 
 __all__ = ["_target_hosts"]
