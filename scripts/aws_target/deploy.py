@@ -996,7 +996,7 @@ class Deployment:
                 'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
                 'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
                 'GateExpiryMinutes': str(values.whole('expiry_schedule_minutes')),
-                'GateExpiryTimeout': str(values.number('expiry_timeout_s')),
+                'GateExpiryTimeout': str(values.whole('expiry_timeout_s')),
                 'GateExpiryMemory': str(values.whole('expiry_memory_mib')),
             }
             book = ledger.CostLedger(self.directory)
@@ -1014,6 +1014,7 @@ class Deployment:
             name = 'gate-' + uuid4().hex
             executed = False
             try:
+                print('cloud-gate: preparing the stack change (about 1 minute)', flush=True)
                 _ = api.call('create-change-set', '--stack-name', stack_id, '--change-set-name', name,
                              '--change-set-type', 'UPDATE', '--template-body', 'file://' + str(template),
                              '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(changes),
@@ -1030,14 +1031,16 @@ class Deployment:
                     "didn't contain changes", 'no updates are to be performed', 'no changes'))
                 if not empty:
                     if change.get('Status') != 'CREATE_COMPLETE':
-                        raise DeploymentRefused('The gate change set is incomplete')
+                        raise DeploymentRefused(f"The gate change set is {change.get('Status')}: {change.get('StatusReason', 'no reason given')}")
                     for item in ledger.rows(change, 'Changes'):
                         resource = ledger.mapping(item['ResourceChange'])
                         if not ledger.text(resource, 'LogicalResourceId').startswith('Gate'):
                             raise DeploymentRefused('The gate change set changes a Rust resource')
+                        print(f"cloud-gate: {resource.get('Action', 'Change')} {ledger.text(resource, 'LogicalResourceId')}", flush=True)
                     _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name,
                                  service='cloudformation')
                     executed = True
+                    print('cloud-gate: applying the change (several minutes)', flush=True)
                     _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
             finally:
                 if not executed:

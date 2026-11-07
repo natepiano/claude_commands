@@ -101,7 +101,7 @@ class GateResourcesTests(unittest.TestCase):
                 suffix = '-expiry' if name in ('GateExpiryRole', 'GateExpiryFunction', 'GateExpirySchedule', 'GateExpiryLog') else ''
                 prefix = '/aws/lambda/' if name == 'GateExpiryLog' else ''
                 self.assertEqual(properties[field], {'Fn::Sub': prefix + 'cloud-claude-gate-${DeploymentId}' + suffix})
-                if name == 'GateProfile':
+                if name in ('GateProfile', 'GateExpirySchedule'):
                     continue
                 tags = (ledger.rows(properties, 'Tags') if name != 'GateLaunchTemplate' else
                         ledger.rows(ledger.rows(properties, 'TagSpecifications')[0], 'Tags'))

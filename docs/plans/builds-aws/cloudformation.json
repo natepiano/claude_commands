@@ -1661,17 +1661,7 @@
         ],
         "Name": {
           "Fn::Sub": "cloud-claude-gate-${DeploymentId}-expiry"
-        },
-        "Tags": [
-          {
-            "Key": "Workload",
-            "Value": "cloud-claude-gate"
-          },
-          {
-            "Key": "Name",
-            "Value": "cloud-claude-gate"
-          }
-        ]
+        }
       }
     },
     "GateExpiryPermission": {
