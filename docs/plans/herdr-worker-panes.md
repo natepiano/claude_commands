@@ -2973,6 +2973,7 @@ Missing evidence for any step blocks dispatch. A completed folder keeps its pin 
 - sdlc merge 2fc784207: `write_mesh_server_record` and `owned_server_record` start a real process and stop it at cleanup. In `test_astra_review.py` the record exits through the worker fixture, after the `PaneWorld` `os.kill` guard ends; keep that order when the mesh server record goes.
 - Phase 21: every Codex pane launch passes `-c notice.hide_rate_limit_model_nudge=true` (`worker_panes._policy_arguments`), and `send.deliver_worker_text` submits with `Herdr.prompt(..., proof=SubmitStarts(...))`; a stall goes to the holder. Keep both when the mesh goes.
 - Phase 22: `worker._dispatch_turn` completes a DONE dispatch whose only pending runs are finished, with one `anomaly: <worker>: run <run id> finished, but its result is not in the transcript` line per run. Keep it and its two `test_worker.py` tests when `mesh_runs.py` becomes `detached_runs.py`.
+- Phase 23: `Herdr.wait_for_prompt_input` sends `ctrl+s` once when a ready Claude composer holds a draft (`PromptInputHoldsDraft`). Keep it in the one submit path.
 
 **Acceptance gate:** Verify that the devtools-unit 3t checkpoint is merged to sdlc before the final reference search.
 Verify that its `implement.sh` and `review.sh` Codex branches are deleted.
@@ -3101,44 +3102,22 @@ Keep no compatibility wrapper without a named external caller. The one launcher 
 
 **Ruled out:** a new check, retry or wait (sdlc: "Add no new check"); hand edits of run records.
 
-### Phase 23 — A draft in the composer does not block an opening prompt  · status: todo
+### Phase 23 — A draft in the composer does not block an opening prompt  · status: done
 
-**Depends on:** Phase 22. Phase 19 waits for this phase.
+#### As-built
 
-sdlc ordered it (2026-11-07), from the user: "it is unacceptable for the user to do any work to move any unit or showrunner to a different account other than to say 'move'". After the units moved to claude3 at 10:0x EST, the resume resend skipped fastest because its composer held unsent text. `Herdr.submit_opening_prompt` (`scripts/herdr/herdr.py:2185`) waits in `wait_for_prompt_input` (`:2148`) for an empty composer, and `prompt_input_state` (`:2130`) reports a composer with text as `PromptInputNotReady("destination has no empty composer")`. The wait runs to its deadline, and the message is not sent. The accounts unit fixes the missing-resume cause on branch `move-anomalies`; this phase does not touch it.
-
-Claude Code 2.1.319 has a prompt stash: `ctrl+s` (`chat:stash`) moves a non-empty composer into the stash and clears the composer. When a prompt that is not a slash command is submitted, Claude puts the stashed text back in the composer and shows "Draft restored". After a slash command submit, the text stays in the stash, and `ctrl+s` on the empty composer restores it.
-
-#### Work Order
-
-**Goal:** an opening prompt reaches a Claude pane whose composer holds a draft. The draft stays the user's: Claude puts it back after the submit. The submit path stays one path.
-
-**Spec:**
-
-1. Add `PromptInputHoldsDraft(screen)` beside `PromptInputNotReady` (`herdr.py:278`). `prompt_input_state` returns it when the pane is ready and the composer holds text. Every other result does not change.
-2. `wait_for_prompt_input` (`:2148`): on `PromptInputHoldsDraft`, send `ctrl+s` once with `self._send_keys(pane, "ctrl+s")`, then keep waiting for the empty composer as now. Send it at most once per call. A second draft in the same call waits, as an occupied composer waits now.
-3. Do not change `check_target`, the "destination input contains other text" failures after the first typing, or the retype and Enter logic. They see the empty composer after the stash.
-4. Add no check, refusal, validation or retry. Add no new wait.
+- `herdr.PromptInputHoldsDraft(screen)`: `Herdr.prompt_input_state` returns it when the pane is ready and its composer holds text. Every other result does not change.
+- `Herdr.wait_for_prompt_input`, on `PromptInputHoldsDraft`, sends `ctrl+s` once per call (`self._send_keys(pane, "ctrl+s")`), then keeps waiting for the empty composer. A second draft in the same call waits to the deadline: "destination never became ready for input".
+- Claude Code 2.1.319 binds `ctrl+s` to `chat:stash`. After a submit that is not a slash command, Claude puts the stashed draft back and shows "Draft restored". After a slash command, the draft stays in the stash; `ctrl+s` on an empty composer restores it.
+- `check_target`, the "destination input contains other text" failures after the first typing, and the retype and Enter logic do not change. `submit_opening_prompt` stays the one submit path.
 
 **Files:**
-- `scripts/herdr/herdr.py` — Spec items 1 and 2.
-- `scripts/herdr/test_herdr.py`:
-  - Repin `test_untracked_pane_with_text_in_the_composer_is_not_ready` (`:4252`): the state is `PromptInputHoldsDraft`; rename it for the behavior.
-  - Add a test: `submit_opening_prompt` on a ready pane with a draft sends `ctrl+s` once, then types and submits the prompt. The fixture screen shows an empty composer after the `ctrl+s`.
-  - Add a test: a composer that holds text again after the `ctrl+s` gets no second `ctrl+s` and ends with the existing "destination never became ready for input" failure.
-  - Keep every other test in the module.
+- `scripts/herdr/herdr.py` — the draft state and the one stash key.
+- `scripts/herdr/test_herdr.py` — `test_opening_prompt_stashes_a_draft_once_before_typing_and_submission`, `test_a_second_draft_waits_until_the_deadline_without_a_second_stash`, `test_untracked_ready_pane_with_text_in_the_composer_holds_a_draft`; `test_other_text_in_the_composer_is_never_overwritten` now covers a failed stash.
 
-**Workers:** `1 writer` — `impl`: both files.
+**Gotchas:** herdr accepts the key name `ctrl+s` and sends byte 0x13; `ctrl-s` and `C-s` exit 1 with `invalid_key` (director proof, 2026-11-07). In a plain shell pane 0x13 is XOFF and stops the output until `ctrl+q`. A stash that already holds text is replaced.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 21: Codex panes use the native `herdr agent prompt --wait` proof, not `submit_opening_prompt`. Callers in `scripts/production` (`add_unit.py`, `add_showrunner.py`, `promote_showrunner.py`) and `scripts/shutdown/stop_resume.py` keep their calls.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/herdr -p 'test_herdr.py'` passes.
-- `-s scripts/shutdown -p 'test_stop_resume.py'`, `-p 'test_pane_restore.py'`, and `-s scripts/production -p 'test_add_unit_rerun.py'`, `-p 'test_add_showrunner.py'`, `-p 'test_promote_showrunner.py'` pass.
-- basedpyright on both files reads `0 errors, 0 warnings, 0 notes`.
-- The full gate passes.
+**Ruled out:** a second submit path for drafts; a new check or retry (sdlc: "Keep one submit path. Add no new check.").
 
 ### Phase 24 — Long worker names stay unique agent names  · status: todo
 
